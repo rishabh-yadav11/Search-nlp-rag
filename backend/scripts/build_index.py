@@ -53,16 +53,22 @@ def ensure_collection(client: QdrantClient):
     info = client.get_collection(collection_name=config.QDRANT_COLLECTION)
     sparse_cfg = info.config.sparse_vectors_config.get("sparse")
     needs_idf = sparse_cfg is not None and sparse_cfg.modifier == Modifier.IDF
-    if not needs_idf:
-        print(
-            f"Collection '{config.QDRANT_COLLECTION}' exists with a mismatched sparse "
-            f"configuration (expected modifier=idf). Deleting and recreating it so "
-            f"indexed vectors share the fastembed BM25 vocab with queries.",
-        )
-        client.delete_collection(collection_name=config.QDRANT_COLLECTION, wait=True)
-        create_collection(client)
-    else:
+
+    vectors = info.config.params.vectors
+    dense_size = vectors.get("dense").size if isinstance(vectors, dict) else vectors.size
+    dim_matches = dense_size == config.EMBED_DIM
+
+    if needs_idf and dim_matches:
         print(f"Collection '{config.QDRANT_COLLECTION}' already exists, resuming upserts into it")
+        return
+
+    print(
+        f"Collection '{config.QDRANT_COLLECTION}' exists but is incompatible "
+        f"(dense size={dense_size} vs {config.EMBED_DIM}, sparse modifier idf={needs_idf}). "
+        f"Deleting and recreating it so indexed vectors match the current config.",
+    )
+    client.delete_collection(collection_name=config.QDRANT_COLLECTION)
+    create_collection(client)
 
 
 def create_collection(client: QdrantClient):

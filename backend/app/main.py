@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 from contextlib import asynccontextmanager
 from functools import partial
@@ -10,7 +11,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import NamedVector, NamedSparseVector, SparseVector, Prefetch, FusionQuery, Fusion
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app.config import config
 from app.redis_cache import cache
@@ -22,6 +23,7 @@ state = {}
 async def lifespan(app: FastAPI):
     state["model"] = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
     state["sparse_model"] = SparseTextEmbedding(config.SPARSE_MODEL)
+    state["reranker"] = CrossEncoder(config.RERANK_MODEL, device="cpu")
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
     state["llm"] = AsyncOpenAI(api_key=config.GROQ_API_KEY, base_url=config.GROQ_BASE_URL) if config.GROQ_API_KEY else None
     yield
@@ -100,6 +102,27 @@ async def hybrid_search(query: str, top_k: int, min_dense_score: float | None = 
     ]
 
 
+async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle]:
+    """Cross-encoder rerank of RRF candidates, in place. Rewrites score with a
+    sigmoid-normalized relevance score (0-1) so both ordering and the score the
+    frontend shows reflect reranked relevance."""
+    if len(results) <= 1:
+        return results
+    pairs = [(query, a.title) for a in results]
+    logits = await asyncio.to_thread(state["reranker"].predict, pairs)
+    for a, s in zip(results, logits):
+        a.score = float(1 / (1 + math.exp(-s)))
+    results.sort(key=lambda a: a.score, reverse=True)
+    return results
+
+
+def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
+    """Relevance first, recency second: score desc, then published_date desc
+    (missing dates last)."""
+    results.sort(key=lambda a: (a.score, a.published_date or ""), reverse=True)
+    return results
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K, ge=1, le=50)):
     start = time.perf_counter()
@@ -108,7 +131,8 @@ async def search(q: str = Query(..., min_length=1), top_k: int = Query(config.TO
     if cached_results is not None:
         return SearchResponse(query=q, results=cached_results, cached=True, latency_ms=(time.perf_counter() - start) * 1000)
 
-    results = await hybrid_search(q, top_k)
+    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES))
+    results = sort_results(await rerank(q, candidates))[:top_k]
     await cache.set(cache_key, [r.model_dump() for r in results])
     return SearchResponse(query=q, results=results, cached=False, latency_ms=(time.perf_counter() - start) * 1000)
 
@@ -137,12 +161,15 @@ async def ask(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K
         return AskResponse(query=q, answer=cached["answer"], sources=cached["sources"], cached=True,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
-    sources = await hybrid_search(q, top_k, min_dense_score=config.ASK_MIN_SCORE)
-    if not sources:
+    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES), min_dense_score=config.ASK_MIN_SCORE)
+    if not candidates:
+        sources = []
         answer = "No sufficiently relevant articles were found for this query."
-        await cache.set(cache_key, {"answer": answer, "sources": [s.model_dump() for s in sources]})
+        await cache.set(cache_key, {"answer": answer, "sources": []})
         return AskResponse(query=q, answer=answer, sources=sources, cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000)
+
+    sources = sort_results(await rerank(q, candidates))[:top_k]
 
     context = "\n".join(f"[{i+1}] {s.title} ({s.published_date or 'n/a'})" for i, s in enumerate(sources))
     prompt = ANSWER_PROMPT.format(context=context, question=q)

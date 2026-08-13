@@ -21,13 +21,17 @@ class Config:
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # Embeddings
-    EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-    EMBED_DIM = 384  # matches bge-small; change if you swap models
+    EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
+    EMBED_DIM = 768  # matches bge-base; change if you swap models
     EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "256"))
     EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 
     # Sparse (BM25) embeddings — must match the model used at index time
     SPARSE_MODEL = os.getenv("SPARSE_MODEL", "Qdrant/bm25")
+
+    # Reranker (cross-encoder) applied to RRF candidates before the top_k is kept
+    RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "16"))
 
     # LLM (Groq, OpenAI-compatible API)
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

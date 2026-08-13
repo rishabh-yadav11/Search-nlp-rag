@@ -35,15 +35,21 @@ frontend/              Next.js app (App Router + TypeScript)
 ## How it works
 
 - **Hybrid retrieval** — every article is embedded twice at index time:
-  `BAAI/bge-small-en-v1.5` (dense, cosine) and `Qdrant/bm25` sparse vectors
+  `BAAI/bge-base-en-v1.5` (dense, cosine) and `Qdrant/bm25` sparse vectors
   with IDF. At query time both are searched in a single Qdrant prefetch and
   fused with RRF, using `"<title>. <summary>"` as the searchable text.
+- **Reranking** — the RRF candidates are re-scored with a cross-encoder
+  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) so the final `top_k` reflects true
+  relevance, and the score shown to the user is that reranked score (0-1).
+- **Result ordering** — relevance first (rerank score desc), recency second
+  (`published_date` desc as the tie-break, missing dates last).
 - **Ask mode (RAG)** — retrieves articles above `ASK_MIN_SCORE`, packs them
   into a numbered context, and asks Groq (`llama-3.3-70b-versatile`) for an
   answer with inline `[n]` citations. If nothing clears the threshold it says
   so instead of guessing.
-- **Caching** — in-process TTL cache (`cachetools`) for both `/search` and
-  `/ask`, keyed by query + top_k.
+- **Caching** — Redis-backed JSON cache shared across workers (falls back to
+  an in-process cache if Redis is down) for both `/search` and `/ask`, keyed
+  by query + top_k.
 
 ## Prerequisites
 
@@ -193,7 +199,8 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint |
 | `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
-| `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-small-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
+| `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
+| `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `16` | Cross-encoder reranker; how many RRF candidates to re-score |
 | `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `256` / `cpu` | Indexing batch size; `cuda` for a GPU |
 | `GROQ_API_KEY` / `GROQ_BASE_URL` / `LLM_MODEL` | — | Groq-compatible endpoint for `/ask` |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
@@ -201,16 +208,15 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 
 ## Production notes (POC shortcuts to fix before real prod)
 
-1. **Embeddings run on CPU.** Query-time embedding is offloaded off the event
-   loop in `hybrid_search`, so the API stays responsive, but latency is higher
-   than a GPU-backed embedder. Set `EMBED_DEVICE=cuda` for lower latency.
-2. **No re-ranker.** RRF fusion output is returned as-is; add a cross-encoder
-   pass if top-few precision matters.
-3. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
+1. **Embeddings and the reranker run on CPU.** Query-time embedding and
+   cross-encoder re-scoring are offloaded off the event loop, so the API stays
+   responsive, but latency is higher than a GPU-backed embedder. Set
+   `EMBED_DEVICE=cuda` for lower latency.
+2. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
    down it silently degrades to a per-worker in-process cache (which no longer
    benefits the other workers until Redis returns).
-4. **No auth/rate limiting** on the API — add before exposing beyond localhost.
-5. **`published_date` payload index** assumes MySQL returns a parseable
+3. **No auth/rate limiting** on the API — add before exposing beyond localhost.
+4. **`published_date` payload index** assumes MySQL returns a parseable
    date/datetime string; adjust the payload schema if your column type differs.
-6. **Manual process start** in the reference deployment — gunicorn and
+5. **Manual process start** in the reference deployment — gunicorn and
    `next start` won't survive a reboot; wrap them in systemd when staging.
