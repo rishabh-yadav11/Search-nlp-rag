@@ -1,6 +1,8 @@
 'use client'
 
 import { useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 type Result = {
   id: number
@@ -120,7 +122,11 @@ function ResultBlock({ status, mode }: { status: Status; mode: 'search' | 'ask' 
     case 'done':
       return (
         <div>
-          {mode === 'ask' && status.answer && <div className="answer-block">{status.answer}</div>}
+          {mode === 'ask' && status.answer && (
+            <div className="answer-block markdown-body">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{status.answer}</ReactMarkdown>
+            </div>
+          )}
           {renderResults(status.results)}
         </div>
       )
