@@ -78,6 +78,26 @@ ensure_node() {
     echo "node $(node -v) installed"
 }
 
+ensure_pm2() {
+    if ! have pm2; then
+        echo "installing pm2..."
+        npm install -g pm2 >/tmp/pm2-install.log 2>&1 || {
+            echo "pm2 install failed:" >&2; tail -3 /tmp/pm2-install.log >&2; return 1
+        }
+        local nbin
+        nbin="$(npm prefix -g)/bin"
+        mkdir -p ~/.local/bin
+        ln -sf "$nbin/pm2" ~/.local/bin/pm2
+        ln -sf "$nbin/pm2-dev" ~/.local/bin/pm2-dev
+    fi
+    if have pm2; then
+        echo "pm2 $(pm2 -v) available"
+    else
+        echo "pm2 not on PATH" >&2
+        return 1
+    fi
+}
+
 docker_up() {
     if ! have docker || ! docker info >/dev/null 2>&1; then
         echo "ERROR: docker is required (install it, then re-run)." >&2
@@ -194,8 +214,11 @@ run_services() {
         --workers "$GUNICORN_WORKERS" --bind "0.0.0.0:$API_PORT" \
         --timeout 120 -p "$PID_DIR/gunicorn.pid" app.main:app
     wait_http "http://localhost:$API_PORT/health"
-    (cd frontend && start_service next "$PID_DIR/next.pid" "$LOGS/frontend.log" \
-        "$SCRIPT_DIR/frontend/node_modules/.bin/next" start -p "$NEXT_PORT")
+    ensure_pm2
+    pm2 delete vccircle-frontend >/dev/null 2>&1 || true
+    (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
+        --name vccircle-frontend -- start -p "$NEXT_PORT")
+    pm2 save >/dev/null 2>&1
     wait_http "http://localhost:$NEXT_PORT/"
 }
 
@@ -228,6 +251,13 @@ run_stop_backend() {
 run_stop_frontend() {
     stage "stop-frontend"
     stop_service next "$PID_DIR/next.pid" "next.*start"
+    if have pm2; then
+        if pm2 delete vccircle-frontend >/dev/null 2>&1; then
+            echo "'vccircle-frontend' stopped (pm2)"
+        else
+            echo "'vccircle-frontend' not managed by pm2"
+        fi
+    fi
 }
 
 run_stop() {
