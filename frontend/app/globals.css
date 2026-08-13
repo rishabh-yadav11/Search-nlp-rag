@@ -172,6 +172,16 @@ input[type='text']:focus-visible,
   margin-bottom: 28px;
 }
 
+.weak-note {
+  background: #fff8e6;
+  border-left: 3px solid #d9a400;
+  color: #6b5200;
+  padding: 10px 14px;
+  margin-bottom: 24px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .answer-block {
   background: white;
   border-left: 3px solid var(--accent);

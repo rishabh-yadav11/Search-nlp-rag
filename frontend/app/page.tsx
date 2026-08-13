@@ -24,12 +24,13 @@ type ResponseData = {
   answer?: string
   cached: boolean
   latency_ms: number
+  note?: string
 }
 
 type Status =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'done'; mode: Mode; answer?: string; results: Result[] }
+  | { kind: 'done'; mode: Mode; answer?: string; results: Result[]; note?: string }
   | { kind: 'error'; mode: Mode; message: string }
 
 const API_BASE =
@@ -83,6 +84,7 @@ function sanitizeResponse(raw: unknown): ResponseData {
     answer: typeof data.answer === 'string' ? data.answer : undefined,
     cached: data.cached === true,
     latency_ms: typeof data.latency_ms === 'number' ? data.latency_ms : 0,
+    note: typeof data.note === 'string' && data.note.length ? data.note : undefined,
   }
 }
 
@@ -138,7 +140,7 @@ export default function Page() {
       }
 
       const data = sanitizeResponse(await res.json())
-      setStatus({ kind: 'done', mode, answer: data.answer, results: data.results })
+      setStatus({ kind: 'done', mode, answer: data.answer, results: data.results, note: data.note })
       const cached = data.cached ? 'cached · ' : ''
       setMeta(`${cached}${data.latency_ms.toFixed(0)}ms server · ${(performance.now() - t0).toFixed(0)}ms round-trip`)
     } catch (err) {
@@ -234,6 +236,11 @@ function ResultBlock({ status }: { status: Status }) {
           {status.mode === 'ask' && status.answer && (
             <div className="answer-block markdown-body">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{status.answer}</ReactMarkdown>
+            </div>
+          )}
+          {status.note && (
+            <div className="weak-note" role="note">
+              {status.note}
             </div>
           )}
           {renderResults(status.results)}

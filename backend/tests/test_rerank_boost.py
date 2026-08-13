@@ -1,0 +1,103 @@
+from dataclasses import dataclass
+
+from app.rerank_boost import (
+    BOOST_SUMMARY,
+    BOOST_TITLE,
+    apply_entity_boost,
+    extract_entities,
+)
+
+
+@dataclass
+class FakeResult:
+    id: int
+    title: str
+    score: float
+    summary: str = ""
+
+
+def _res(id: int, title: str, score: float, summary: str = "") -> FakeResult:
+    return FakeResult(id=id, title=title, score=score, summary=summary)
+
+
+def test_extract_entities_brands_and_caps():
+    assert extract_entities("who acquired Housing.com") == ["housing.com"]
+    assert "ola electric" in extract_entities("Ola Electric IPO price band")
+    assert extract_entities("latest funding news") == []
+    assert extract_entities("") == []
+
+
+def test_title_mention_outranks_nonmention():
+    hit = _res(1, "Housing.com raises $100M from investors", 0.8)
+    miss = _res(2, "Flipkart closes Series J round", 0.9)
+    out = apply_entity_boost("who acquired Housing.com", [miss, hit])
+    assert out[0].id == hit.id
+
+
+def test_summary_boost_between_title_and_plain():
+    plain = _res(1, "Funding round closes", 0.9, "Generic market update")
+    summary = _res(2, "Company files prospectus", 0.85, "Ola Electric's price band revealed")
+    title = _res(3, "Ola Electric price band set", 0.8, "")
+    out = apply_entity_boost("Ola Electric IPO price band", [plain, summary, title])
+    assert [r.id for r in out] == [title.id, summary.id, plain.id]
+
+
+def test_boost_multipliers():
+    title = _res(1, "Nykaa expands retail", 2.0)
+    summary = _res(2, "Retail expansion", 2.0, "Nykaa reported growth")
+    plain = _res(3, "Retail expansion", 2.0)
+    out = apply_entity_boost("Nykaa growth", [plain, summary, title])
+    assert out[0].id == title.id
+    assert abs(out[0].score - 2.0 * BOOST_TITLE) < 1e-9
+    assert out[1].id == summary.id
+    assert abs(out[1].score - 2.0 * BOOST_SUMMARY) < 1e-9
+    assert out[2].id == plain.id
+    assert abs(out[2].score - 2.0) < 1e-9
+
+
+def test_no_entity_query_order_preserved():
+    a = _res(1, "Latest funding deals", 0.7)
+    b = _res(2, "New fintech round", 0.9)
+    c = _res(3, "M&A activity", 0.5)
+    out = apply_entity_boost("latest funding news", [a, b, c])
+    assert out == [a, b, c]
+
+
+def test_case_insensitive_match():
+    a = _res(1, "BYJU'S raises $200M round", 0.8)
+    b = _res(2, "Edtech funding activity", 0.9)
+    out = apply_entity_boost("byju's funding", [b, a])
+    assert out[0].id == a.id
+
+
+def test_multi_entity_boosts_any():
+    paytm = _res(1, "Paytm reports Q2 results", 0.8)
+    ola = _res(2, "Ola Electric files for IPO", 0.85)
+    plain = _res(3, "Market wrap", 0.9)
+    out = apply_entity_boost("Paytm and Ola Electric funding", [plain, paytm, ola])
+    assert out[0].id in (paytm.id, ola.id)
+    assert out[-1].id == plain.id
+
+
+def test_equal_scores_keep_input_order():
+    a = _res(1, "Paytm wallet", 2.0)
+    b = _res(2, "Paytm payments", 2.0)
+    out = apply_entity_boost("Paytm news", [a, b])
+    assert [r.id for r in out] == [a.id, b.id]
+
+
+def test_input_not_mutated():
+    a = _res(1, "Housing.com deal", 0.8)
+    b = _res(2, "Other news", 0.7)
+    lst = [a, b]
+    out = apply_entity_boost("Housing.com acquisition", lst)
+    assert lst == [a, b]
+    assert a.score == 0.8 and b.score == 0.7
+    assert out is not lst
+    assert out[0] is not a
+    assert out[0].score == 0.8 * BOOST_TITLE
+
+
+def test_boost_constants():
+    assert BOOST_TITLE == 1.25
+    assert BOOST_SUMMARY == 1.10

@@ -70,5 +70,11 @@ class Config:
     RECENCY_STRENGTH = float(os.getenv("RECENCY_STRENGTH", "0.25"))
     RECENCY_DECAY_DAYS = float(os.getenv("RECENCY_DECAY_DAYS", "90"))
 
+    # Retrieval-quality tuning (see app/query_expand.py, app/rerank_boost.py,
+    # app/answer_fallback.py). Toggles can be disabled per-deployment.
+    ENABLE_QUERY_EXPANSION = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() in ("1", "true", "yes")
+    ENABLE_ENTITY_BOOST = os.getenv("ENABLE_ENTITY_BOOST", "true").lower() in ("1", "true", "yes")
+    ENABLE_WEAK_FALLBACK = os.getenv("ENABLE_WEAK_FALLBACK", "true").lower() in ("1", "true", "yes")
+
 
 config = Config()

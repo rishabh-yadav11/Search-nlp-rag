@@ -339,6 +339,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
+| `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
 
 ## Testing and CI
 

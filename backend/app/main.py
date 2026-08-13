@@ -23,11 +23,14 @@ from qdrant_client.models import (
 )
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
+from app.answer_fallback import fallback_answer, search_note, weak_results
 from app.config import config
 from app.health import router as health_router
 from app.llm import LLMUnavailableError, generate_answer
+from app.query_expand import expand_query
 from app.query_intent import extract_year_range, rewrite_year_in_review, top_k_hint
 from app.redis_cache import cache
+from app.rerank_boost import apply_entity_boost
 
 state = {}
 
@@ -91,6 +94,7 @@ class SearchResponse(BaseModel):
     results: list[SourceSummary]
     cached: bool
     latency_ms: float
+    note: str | None = None
 
 
 class AskResponse(BaseModel):
@@ -99,6 +103,7 @@ class AskResponse(BaseModel):
     sources: list[SourceSummary]
     cached: bool
     latency_ms: float
+    note: str | None = None
 
 
 def to_summary(a: SourceArticle) -> SourceSummary:
@@ -280,26 +285,34 @@ async def search(
 ):
     start = time.perf_counter()
     retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
+    if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
+        retrieval_q = expand_query(retrieval_q)
     eff_top_k = min(max(top_k, top_k_hint(q) or 0), 50)
     cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
+        summaries = [SourceSummary.model_validate(d) for d in cached_results]
         return SearchResponse(
             query=q,
-            results=[SourceSummary.model_validate(d) for d in cached_results],
+            results=summaries,
             cached=True,
             latency_ms=(time.perf_counter() - start) * 1000,
+            note=search_note([s.score for s in summaries]),
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-    results = sort_results(await rerank(retrieval_q, candidates))[:eff_top_k]
+    reranked = await rerank(retrieval_q, candidates)
+    if config.ENABLE_ENTITY_BOOST:
+        reranked = apply_entity_boost(q, reranked)
+    results = sort_results(reranked)[:eff_top_k]
     await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
     return SearchResponse(
         query=q,
         results=[to_summary(r) for r in results],
         cached=False,
         latency_ms=(time.perf_counter() - start) * 1000,
+        note=search_note([r.score for r in results]),
     )
 
 
@@ -350,26 +363,42 @@ async def ask(
 
     start = time.perf_counter()
     retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
+    if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
+        retrieval_q = expand_query(retrieval_q)
     eff_top_k = min(max(top_k, top_k_hint(q) or 0), 20)
     cache_key = f"ask:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached = await cache.get(cache_key)
     if cached is not None:
+        sources = [SourceSummary.model_validate(s) for s in cached["sources"]]
         return AskResponse(
             query=q,
             answer=cached["answer"],
-            sources=[SourceSummary.model_validate(s) for s in cached["sources"]],
+            sources=sources,
             cached=True,
             latency_ms=(time.perf_counter() - start) * 1000,
+            note=cached.get("note"),
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-    sources = [s for s in sort_results(await rerank(retrieval_q, candidates)) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
+    reranked = await rerank(retrieval_q, candidates)
+    if config.ENABLE_ENTITY_BOOST:
+        reranked = apply_entity_boost(q, reranked)
+    sources = [s for s in sort_results(reranked) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
+
+    note = search_note([s.score for s in sources]) if config.ENABLE_WEAK_FALLBACK else None
+
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
-        await cache.set(cache_key, {"answer": answer, "sources": []})
+        await cache.set(cache_key, {"answer": answer, "sources": [], "note": note})
         return AskResponse(query=q, answer=answer, sources=[], cached=False,
-                            latency_ms=(time.perf_counter() - start) * 1000)
+                            latency_ms=(time.perf_counter() - start) * 1000, note=note)
+
+    if config.ENABLE_WEAK_FALLBACK and weak_results(q, [s.score for s in sources]):
+        answer = fallback_answer(q, len(sources))
+        await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
+        return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
+                            latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
     prompt = ANSWER_PROMPT.format(context=context, question=q)
@@ -382,6 +411,6 @@ async def ask(
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
 
-    await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources]})
+    await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
     return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
-                        latency_ms=(time.perf_counter() - start) * 1000)
+                        latency_ms=(time.perf_counter() - start) * 1000, note=note)

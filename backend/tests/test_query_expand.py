@@ -1,0 +1,67 @@
+from app.query_expand import expand_query, has_ambiguous_entity
+
+
+def test_expand_layoffs_query_with_job_cut_terms():
+    expanded = expand_query("startup layoffs India 2025")
+    assert expanded.startswith("startup layoffs India 2025")
+    assert "job cuts" in expanded
+    assert "downsizing" in expanded
+
+
+def test_expand_acquired_query_with_acquisition_synonyms():
+    expanded = expand_query("who acquired Housing.com")
+    assert expanded.startswith("who acquired Housing.com")
+    assert "acquisition" in expanded
+    assert "buyout" in expanded
+
+
+def test_expand_funding_query():
+    expanded = expand_query("startups raising money")
+    assert expanded.startswith("startups raising money")
+    assert "fundraise" in expanded
+    assert "investment" in expanded
+
+
+def test_expand_ipo_query():
+    expanded = expand_query("Ola Electric IPO")
+    assert expanded.startswith("Ola Electric IPO")
+    assert "initial public offering" in expanded
+    assert "public listing" in expanded
+
+
+def test_expand_edtech_query():
+    expanded = expand_query("top edtech companies")
+    assert "education technology" in expanded
+
+
+def test_expand_no_concept_returns_unchanged():
+    assert expand_query("top 10 companies in India") == "top 10 companies in India"
+    assert expand_query("") == ""
+
+
+def test_expand_is_bounded_to_six_extra_tokens():
+    for q in ("startup layoffs India 2025", "who acquired Housing.com", "startups raising money"):
+        original_tokens = len(q.split())
+        expanded = expand_query(q)
+        assert len(expanded.split()) - original_tokens <= 6
+
+
+def test_has_ambiguous_entity_finds_known_brands():
+    assert has_ambiguous_entity("who acquired Housing.com") == ["Housing.com"]
+    assert has_ambiguous_entity("BYJU'S funding round") == ["BYJU'S"]
+    assert has_ambiguous_entity("Ola Electric IPO") == ["Ola Electric"]
+    assert has_ambiguous_entity("Razorpay raises Series C") == ["Razorpay"]
+
+
+def test_has_ambiguous_entity_case_insensitive_and_possessive():
+    assert has_ambiguous_entity("byju's funding") == ["BYJU'S"]
+    assert has_ambiguous_entity("ola electric ipo") == ["Ola Electric"]
+
+
+def test_has_ambiguous_entity_misses_generic_words():
+    assert has_ambiguous_entity("startup layoffs India 2025") == []
+    assert has_ambiguous_entity("top edtech companies") == []
+
+
+def test_has_ambiguous_entity_orders_by_appearance():
+    assert has_ambiguous_entity("Blinkit and PhonePe deals") == ["Blinkit", "PhonePe"]
