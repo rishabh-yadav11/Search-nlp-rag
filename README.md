@@ -130,7 +130,8 @@ index is rebuilt. After wiping, rebuild with
 
 ```bash
 cd backend
-uvicorn app.main:app --reload --port 8000
+./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 2 \
+  --bind 0.0.0.0:8000 --timeout 120 app.main:app
 ```
 
 | Endpoint | Description |
@@ -142,14 +143,6 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 curl "http://localhost:8000/search?q=fintech%20funding&top_k=3"
 curl "http://localhost:8000/ask?q=who%20is%20investing%20in%20fintech&top_k=5"
-```
-
-For production the same app runs under gunicorn with uvicorn workers:
-
-```bash
-cd backend
-./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 2 \
-  --bind 0.0.0.0:8001 --timeout 120 app.main:app
 ```
 
 ## 6. Run the frontend
