@@ -226,8 +226,9 @@ Hardening baked into `setup.sh`:
   header; without it, plain HTTP is used. Certificates renew automatically via
   the certbot timer.
 - **Pinned images** — Qdrant/Redis run from pinned tags
-  (`QDRANT_IMAGE=qdrant/qdrant:v1.11.3`, `REDIS_IMAGE=redis:7-alpine`); override
-  them to pin an exact `@sha256:` digest for full reproducibility.
+  (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`, `REDIS_IMAGE=redis:7-alpine`); the
+  Qdrant digest is the default. When overriding, keep Qdrant >= the version that
+  wrote any existing collection — older releases cannot read newer storage formats.
 
 ## Supported settings
 

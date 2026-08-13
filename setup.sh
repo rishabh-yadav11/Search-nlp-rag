@@ -14,9 +14,11 @@ PUBLIC_PORT="${PUBLIC_PORT:-80}"
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 
-# Pinned docker images. Pin to a specific tag; for full reproducibility resolve
-# and append a digest: qdrant/qdrant:v1.11.3@sha256:<digest>, redis:7-alpine@sha256:<digest>
-QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.11.3}"
+# Pinned docker images with digests for reproducibility. IMPORTANT: the Qdrant
+# version must be >= the version that wrote an existing collection (older
+# versions cannot deserialize newer storage formats). Current default matches
+# the deployment that created the live collection.
+QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 
 # Optional TLS (see the `tls` stage). When TLS_DOMAIN is non-empty nginx is
@@ -53,7 +55,7 @@ stages (run in order):
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
-  QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.11.3, redis:7-alpine)
+  QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
   TLS_DOMAIN TLS_EMAIL   enable HTTPS via certbot (tls stage); run_nginx emits an
                          ssl config + HSTS when TLS_DOMAIN is set
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
