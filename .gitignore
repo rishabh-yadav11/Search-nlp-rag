@@ -11,6 +11,7 @@ backend/.env
 # Data (fetched articles, index checkpoints, generated vocab)
 backend/data/
 qdrant_data/
+logs/
 
 # OS
 .DS_Store
