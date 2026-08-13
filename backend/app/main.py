@@ -2,6 +2,7 @@ import asyncio
 import math
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from functools import partial
 
 from fastapi import FastAPI, HTTPException, Query
@@ -10,7 +11,18 @@ from fastembed import SparseTextEmbedding
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import NamedVector, NamedSparseVector, SparseVector, Prefetch, FusionQuery, Fusion
+from qdrant_client.models import (
+    NamedVector,
+    NamedSparseVector,
+    SparseVector,
+    Prefetch,
+    FusionQuery,
+    Fusion,
+    Filter,
+    FieldCondition,
+    MatchAny,
+    DatetimeRange,
+)
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app.config import config
@@ -48,6 +60,11 @@ class SourceArticle(BaseModel):
     url: str
     published_date: str | None = None
     category: str | None = None
+    summary: str = ""
+    body: str = ""
+    author_names: list[str] = []
+    industry_names: list[str] = []
+    dealtype_names: list[str] = []
     score: float
 
 
@@ -66,7 +83,69 @@ class AskResponse(BaseModel):
     latency_ms: float
 
 
-async def hybrid_search(query: str, top_k: int, min_dense_score: float | None = None) -> list[SourceArticle]:
+def _parse_date(s: str) -> datetime | None:
+    """'YYYY-MM-DD', 'YYYY-MM-DD HH:MM:SS', or RFC3339 -> aware datetime (UTC)."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = datetime.fromisoformat(s.replace(" ", "T", 1))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def build_facet_filter(
+    industry: str | None,
+    dealtype: str | None,
+    author: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> Filter | None:
+    """Qdrant filter for the faceted search params, or None when unfiltered."""
+    conditions = []
+    for key, raw in (("industry_names", industry), ("dealtype_names", dealtype), ("author_names", author)):
+        if raw:
+            values = [v.strip() for v in raw.split(",") if v.strip()]
+            if values:
+                conditions.append(FieldCondition(key=key, match=MatchAny(any=values)))
+    if from_date:
+        dt = _parse_date(from_date)
+        if dt is None:
+            raise HTTPException(status_code=400, detail=f"invalid from_date: {from_date!r}")
+        conditions.append(FieldCondition(key="published_date", range=DatetimeRange(gte=dt.isoformat())))
+    if to_date:
+        dt = _parse_date(to_date)
+        if dt is None:
+            raise HTTPException(status_code=400, detail=f"invalid to_date: {to_date!r}")
+        end = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+        conditions.append(FieldCondition(key="published_date", range=DatetimeRange(lte=end.isoformat())))
+    if not conditions:
+        return None
+    return Filter(must=conditions)
+
+
+def facet_cache_token(
+    industry: str | None,
+    dealtype: str | None,
+    author: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> str:
+    return f"{industry or ''}|{dealtype or ''}|{author or ''}|{from_date or ''}|{to_date or ''}"
+
+
+async def hybrid_search(
+    query: str,
+    top_k: int,
+    min_dense_score: float | None = None,
+    qfilter: Filter | None = None,
+) -> list[SourceArticle]:
     # Sentence-transformers and fastembed are CPU/sync-bound: run them off the
     # event loop so the async handlers stay responsive under load.
     dense_vec = (await asyncio.to_thread(partial(state["model"].encode, query, normalize_embeddings=True))).tolist()
@@ -85,6 +164,7 @@ async def hybrid_search(query: str, top_k: int, min_dense_score: float | None = 
         collection_name=config.QDRANT_COLLECTION,
         prefetch=[dense_prefetch, sparse_prefetch],
         query=FusionQuery(fusion=Fusion.RRF),
+        query_filter=qfilter,
         limit=top_k,
         with_payload=True,
     )
@@ -96,6 +176,11 @@ async def hybrid_search(query: str, top_k: int, min_dense_score: float | None = 
             url=p.payload.get("url", ""),
             published_date=p.payload.get("published_date"),
             category=p.payload.get("category"),
+            summary=p.payload.get("summary", ""),
+            body=p.payload.get("body", ""),
+            author_names=p.payload.get("author_names") or [],
+            industry_names=p.payload.get("industry_names") or [],
+            dealtype_names=p.payload.get("dealtype_names") or [],
             score=p.score,
         )
         for p in result.points
@@ -108,7 +193,7 @@ async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle
     frontend shows reflect reranked relevance."""
     if len(results) <= 1:
         return results
-    pairs = [(query, a.title) for a in results]
+    pairs = [(query, f"{a.title}. {a.summary or ''}".strip()) for a in results]
     logits = await asyncio.to_thread(state["reranker"].predict, pairs)
     for a, s in zip(results, logits):
         a.score = float(1 / (1 + math.exp(-s)))
@@ -116,22 +201,43 @@ async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle
     return results
 
 
+def _recency_multiplier(published_date: str | None) -> float:
+    """1 - STRENGTH * (1 - exp(-age_days / DECAY)); no boost for missing dates."""
+    dt = _parse_date(published_date)
+    if dt is None:
+        return 1.0
+    age_days = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
+    return 1.0 - config.RECENCY_STRENGTH * (1.0 - math.exp(-age_days / config.RECENCY_DECAY_DAYS))
+
+
 def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
-    """Relevance first, recency second: score desc, then published_date desc
-    (missing dates last)."""
-    results.sort(key=lambda a: (a.score, a.published_date or ""), reverse=True)
+    """Recency-tempered relevance first, recency second: blended score desc,
+    then published_date desc (missing dates last)."""
+    results.sort(
+        key=lambda a: (a.score * _recency_multiplier(a.published_date), a.published_date or ""),
+        reverse=True,
+    )
     return results
 
 
 @app.get("/search", response_model=SearchResponse)
-async def search(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K, ge=1, le=50)):
+async def search(
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(config.TOP_K, ge=1, le=50),
+    industry: str | None = Query(None),
+    dealtype: str | None = Query(None),
+    author: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+):
     start = time.perf_counter()
-    cache_key = f"search:{q}:{top_k}"
+    cache_key = f"search:{q}:{top_k}:{facet_cache_token(industry, dealtype, author, from_date, to_date)}"
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
         return SearchResponse(query=q, results=cached_results, cached=True, latency_ms=(time.perf_counter() - start) * 1000)
 
-    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES))
+    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
+    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
     results = sort_results(await rerank(q, candidates))[:top_k]
     await cache.set(cache_key, [r.model_dump() for r in results])
     return SearchResponse(query=q, results=results, cached=False, latency_ms=(time.perf_counter() - start) * 1000)
@@ -149,19 +255,44 @@ Question: {question}
 Answer (with inline [n] citations):"""
 
 
+def source_context(s: SourceArticle, idx: int) -> str:
+    meta = s.published_date or "n/a"
+    if s.author_names:
+        meta += f" | Authors: {', '.join(s.author_names)}"
+    if s.industry_names:
+        meta += f" | Industry: {', '.join(s.industry_names)}"
+    if s.dealtype_names:
+        meta += f" | Dealtype: {', '.join(s.dealtype_names)}"
+    parts = [f"[{idx}] {s.title} ({meta})"]
+    if s.summary:
+        parts.append(s.summary)
+    if s.body:
+        parts.append(s.body[:1500])
+    return "\n".join(parts)
+
+
 @app.get("/ask", response_model=AskResponse)
-async def ask(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K, ge=1, le=20)):
+async def ask(
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(config.TOP_K, ge=1, le=20),
+    industry: str | None = Query(None),
+    dealtype: str | None = Query(None),
+    author: str | None = Query(None),
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+):
     if state["llm"] is None:
         raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured")
 
     start = time.perf_counter()
-    cache_key = f"ask:{q}:{top_k}"
+    cache_key = f"ask:{q}:{top_k}:{facet_cache_token(industry, dealtype, author, from_date, to_date)}"
     cached = await cache.get(cache_key)
     if cached is not None:
         return AskResponse(query=q, answer=cached["answer"], sources=cached["sources"], cached=True,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
-    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES))
+    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
+    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
     sources = [s for s in sort_results(await rerank(q, candidates)) if s.score >= config.ASK_MIN_SCORE][:top_k]
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
@@ -169,7 +300,7 @@ async def ask(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K
         return AskResponse(query=q, answer=answer, sources=sources, cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
-    context = "\n".join(f"[{i+1}] {s.title} ({s.published_date or 'n/a'})" for i, s in enumerate(sources))
+    context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
     prompt = ANSWER_PROMPT.format(context=context, question=q)
 
     response = await state["llm"].chat.completions.create(

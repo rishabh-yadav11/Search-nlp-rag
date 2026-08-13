@@ -3,12 +3,17 @@ Reads data/articles.jsonl, embeds in batches (dense + BM25 sparse for hybrid
 search), and upserts into Qdrant. Checkpoints progress so a crash/interrupt
 can resume without re-embedding everything.
 
+Dense encoding and upserting are pipelined across thread pool workers
+(INDEXER_WORKERS) so encode of a later batch overlaps upsert of an earlier one.
+
 Usage:
     python scripts/build_index.py
 """
 import json
 import os
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
@@ -27,6 +32,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
+from app.index_text import compose_index_text
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint")
@@ -76,11 +82,34 @@ def create_collection(client: QdrantClient):
         collection_name=config.QDRANT_COLLECTION,
         vectors_config={"dense": VectorParams(size=config.EMBED_DIM, distance=Distance.COSINE)},
         sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
-        hnsw_config=qmodels.HnswConfigDiff(m=16, ef_construct=128),
+        hnsw_config=qmodels.HnswConfigDiff(m=32, ef_construct=256),
     )
     client.create_payload_index(config.QDRANT_COLLECTION, "category", PayloadSchemaType.KEYWORD)
     client.create_payload_index(config.QDRANT_COLLECTION, "published_date", PayloadSchemaType.DATETIME)
+    client.create_payload_index(config.QDRANT_COLLECTION, "author_names", PayloadSchemaType.KEYWORD)
+    client.create_payload_index(config.QDRANT_COLLECTION, "industry_names", PayloadSchemaType.KEYWORD)
+    client.create_payload_index(config.QDRANT_COLLECTION, "dealtype_names", PayloadSchemaType.KEYWORD)
     print(f"Created collection '{config.QDRANT_COLLECTION}'")
+
+
+def to_point(row: dict, dvec, svec) -> PointStruct:
+    return PointStruct(
+        id=row["id"],
+        vector={
+            "dense": dvec.tolist(),
+            "sparse": SparseVector(indices=svec.indices.tolist(), values=svec.values.tolist()),
+        },
+        payload={
+            "title": row["title"],
+            "url": row["url"],
+            "published_date": row.get("published_date"),
+            "category": row.get("category"),
+            "body": (row.get("body") or "")[: config.BODY_CHAR_LIMIT],
+            "author_names": row.get("author_names") or [],
+            "industry_names": row.get("industry_names") or [],
+            "dealtype_names": row.get("dealtype_names") or [],
+        },
+    )
 
 
 def main():
@@ -103,54 +132,60 @@ def main():
     total = len(lines)
     print(f"{total} articles in dataset, resuming from line {start_line}")
 
-    batch_rows, batch_texts = [], []
-
-    def flush(line_num: int):
-        if not batch_rows:
-            return
+    def encode_batch(batch_texts):
         dense_vecs = model.encode(
             batch_texts,
-            batch_size=config.EMBED_BATCH_SIZE,
+            batch_size=len(batch_texts),
             normalize_embeddings=True,
             show_progress_bar=False,
         )
         sparse_vecs = list(sparse_model.embed(batch_texts))
-        points = []
-        for row, dvec, svec in zip(batch_rows, dense_vecs, sparse_vecs):
-            points.append(
-                PointStruct(
-                    id=row["id"],
-                    vector={
-                        "dense": dvec.tolist(),
-                        "sparse": SparseVector(indices=svec.indices.tolist(), values=svec.values.tolist()),
-                    },
-                    payload={
-                        "title": row["title"],
-                        "url": row["url"],
-                        "published_date": row.get("published_date"),
-                        "category": row.get("category"),
-                    },
-                )
-            )
+        return dense_vecs, sparse_vecs
+
+    batch_rows, batch_texts = [], []
+    pending = deque()  # (end_line, future of encode_batch)
+
+    def submit_batch(end_line: int):
+        pending.append((end_line, executor.submit(encode_batch, batch_texts)))
+
+    def upsert_and_checkpoint():
+        if not pending:
+            return
+        end_line, future = pending.popleft()
+        dense_vecs, sparse_vecs = future.result()
+        points = [to_point(row, dvec, svec) for row, dvec, svec in zip(batch_frames[end_line], dense_vecs, sparse_vecs)]
         client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=False)
-        save_checkpoint(line_num)
+        save_checkpoint(end_line)
+        pbar.update(len(batch_frames[end_line]))
 
+    batch_frames = {}
+    executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
     pbar = tqdm(total=total - start_line, desc="Embedding + indexing")
-    for i, line in enumerate(lines):
-        if i < start_line:
-            continue
-        row = json.loads(line)
-        text = f"{row['title']}. {row.get('summary') or ''}".strip()
-        batch_rows.append(row)
-        batch_texts.append(text)
 
-        if len(batch_rows) >= config.EMBED_BATCH_SIZE:
-            flush(i + 1)
-            pbar.update(len(batch_rows))
-            batch_rows, batch_texts = [], []
+    try:
+        for i, line in enumerate(lines):
+            if i < start_line:
+                continue
+            row = json.loads(line)
+            batch_rows.append(row)
+            batch_texts.append(compose_index_text(row))
 
-    flush(total)
-    pbar.update(len(batch_rows))
+            if len(batch_rows) >= config.EMBED_BATCH_SIZE:
+                batch_frames[i + 1] = batch_rows
+                submit_batch(i + 1)
+                batch_rows, batch_texts = [], []
+                while len(pending) >= config.INDEXER_WORKERS:
+                    upsert_and_checkpoint()
+
+        if batch_rows:
+            batch_frames[len(lines)] = batch_rows
+            submit_batch(len(lines))
+
+        while pending:
+            upsert_and_checkpoint()
+    finally:
+        executor.shutdown(wait=False)
+
     pbar.close()
     print("Index build complete.")
 

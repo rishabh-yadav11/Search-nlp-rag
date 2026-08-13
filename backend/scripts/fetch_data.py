@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
+from app.index_text import normalize_date, split_names
 
 OUTPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 PAGE_SIZE = 5000
@@ -70,14 +71,17 @@ async def fetch_all():
     # Only published content ('article'/'interview'/'video'); the table pk is `feid`.
     query = f"""
         SELECT
-            feid,
-            title,
-            summary,
-            slug,
-            {_EXT} AS ext_url,
-            publish,
-            content_type,
-            dealtype_names
+feid,
+    title,
+    summary,
+    body,
+    slug,
+    {_EXT} AS ext_url,
+    publish,
+    content_type,
+    author_names,
+    industry_names,
+    dealtype_names
         FROM {config.MYSQL_TABLE}
         WHERE status = 1 AND feid > %s
         ORDER BY feid ASC
@@ -105,9 +109,13 @@ async def fetch_all():
                             "id": row["feid"],
                             "title": clean(row["title"]),
                             "summary": clean(row["summary"]),
+                            "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
                             "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
-                            "published_date": str(row["publish"]) if row["publish"] is not None else None,
+                            "published_date": normalize_date(row["publish"]),
                             "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
+                            "author_names": split_names(row["author_names"]),
+                            "industry_names": split_names(row["industry_names"]),
+                            "dealtype_names": split_names(row["dealtype_names"]),
                         }
                         out_f.write(json.dumps(rec, default=str) + "\n")
 

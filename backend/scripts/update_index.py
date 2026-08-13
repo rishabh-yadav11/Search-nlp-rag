@@ -22,12 +22,15 @@ import json
 import os
 import sys
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import aiomysql
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
+from app.index_text import compose_index_text, normalize_date, split_names
 from fetch_data import clean
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -64,6 +67,10 @@ def fingerprint(rec: dict) -> str:
             rec.get("url") or "",
             rec.get("published_date") or "",
             rec.get("category") or "",
+            rec.get("body") or "",
+            ",".join(rec.get("author_names") or []),
+            ",".join(rec.get("industry_names") or []),
+            ",".join(rec.get("dealtype_names") or []),
         ]
     )
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -86,10 +93,13 @@ async def fetch_records() -> dict[int, dict]:
             feid,
             title,
             summary,
+            body,
             slug,
             {_EXT} AS ext_url,
             publish,
             content_type,
+            author_names,
+            industry_names,
             dealtype_names
         FROM {config.MYSQL_TABLE}
         WHERE status = 1
@@ -104,9 +114,13 @@ async def fetch_records() -> dict[int, dict]:
                         "id": row["feid"],
                         "title": clean(row["title"]),
                         "summary": clean(row["summary"]),
+                        "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
                         "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
-                        "published_date": str(row["publish"]) if row["publish"] is not None else None,
+                        "published_date": normalize_date(row["publish"]),
                         "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
+                        "author_names": split_names(row["author_names"]),
+                        "industry_names": split_names(row["industry_names"]),
+                        "dealtype_names": split_names(row["dealtype_names"]),
                     }
                     records[rec["id"]] = rec
     finally:
@@ -154,38 +168,52 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
 
     state_fps = state.setdefault("fingerprints", {})
     last_id = state.get("last_id", 0)
-    rows = [records[i] for i in sorted(to_index)]
+    to_index = sorted(to_index)
     batch_size = config.EMBED_BATCH_SIZE
 
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start : start + batch_size]
-        texts = [f"{r['title']}. {r.get('summary') or ''}".strip() for r in batch]
+    def encode_batch(texts):
         dense_vecs = model.encode(
             texts,
-            batch_size=batch_size,
+            batch_size=len(texts),
             normalize_embeddings=True,
             show_progress_bar=False,
         )
         sparse_vecs = list(sparse_model.embed(texts))
-        points = [
-            PointStruct(
-                id=r["id"],
-                vector={
-                    "dense": dvec.tolist(),
-                    "sparse": SparseVector(
-                        indices=svec.indices.tolist(),
-                        values=svec.values.tolist(),
-                    ),
-                },
-                payload={
-                    "title": r["title"],
-                    "url": r["url"],
-                    "published_date": r.get("published_date"),
-                    "category": r.get("category"),
-                },
-            )
-            for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)
-        ]
+        return dense_vecs, sparse_vecs
+
+    def build_point(rec, dvec, svec):
+        return PointStruct(
+            id=rec["id"],
+            vector={
+                "dense": dvec.tolist(),
+                "sparse": SparseVector(
+                    indices=svec.indices.tolist(),
+                    values=svec.values.tolist(),
+                ),
+            },
+            payload={
+                "title": rec["title"],
+                "url": rec["url"],
+                "published_date": rec.get("published_date"),
+                "category": rec.get("category"),
+                "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
+                "author_names": rec.get("author_names") or [],
+                "industry_names": rec.get("industry_names") or [],
+                "dealtype_names": rec.get("dealtype_names") or [],
+            },
+        )
+
+    executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
+    pending = deque()
+
+    def submit(batch):
+        pending.append((batch, executor.submit(encode_batch, [compose_index_text(r) for r in batch])))
+
+    def upsert_one():
+        nonlocal last_id
+        batch, future = pending.popleft()
+        dense_vecs, sparse_vecs = future.result()
+        points = [build_point(r, dvec, svec) for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)]
         client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=False)
 
         for r in batch:
@@ -195,6 +223,17 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
         log(f"upserted {len(batch)} points (last_id={last_id})")
+
+    try:
+        for start in range(0, len(to_index), batch_size):
+            batch = [records[i] for i in to_index[start : start + batch_size]]
+            submit(batch)
+            while len(pending) >= config.INDEXER_WORKERS:
+                upsert_one()
+        while pending:
+            upsert_one()
+    finally:
+        executor.shutdown(wait=False)
 
 
 def verify_state(state: dict, records: dict[int, dict]):

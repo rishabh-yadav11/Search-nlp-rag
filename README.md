@@ -37,19 +37,29 @@ frontend/              Next.js app (App Router + TypeScript)
 - **Hybrid retrieval** — every article is embedded twice at index time:
   `BAAI/bge-base-en-v1.5` (dense, cosine) and `Qdrant/bm25` sparse vectors
   with IDF. At query time both are searched in a single Qdrant prefetch and
-  fused with RRF, using `"<title>. <summary>"` as the searchable text.
+  fused with RRF. The searchable text is `title + authors + industry + dealtype
+  + summary + body` — metadata first so it survives the embedder's 512-token
+  truncation. The article `body` and facet arrays (`author_names`,
+  `industry_names`, `dealtype_names`) are stored in the payload.
+- **Faceted filtering** — `/search` and `/ask` accept optional `industry`,
+  `dealtype`, `author` and `from_date`/`to_date` params, applied as a Qdrant
+  filter to both prefetches. Any value can be comma-separated for multi-select.
+  Cache keys include the filters so distinct queries don't collide.
 - **Reranking** — the RRF candidates are re-scored with a cross-encoder
-  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) so the final `top_k` reflects true
-  relevance, and the score shown to the user is that reranked score (0-1).
-- **Result ordering** — relevance first (rerank score desc), recency second
-  (`published_date` desc as the tie-break, missing dates last).
+  (`cross-encoder/ms-marco-MiniLM-L-6-v2`) over `title + summary` so the final
+  `top_k` reflects true relevance, and the score shown to the user is that
+  reranked score (0-1).
+- **Result ordering** — recency-tempered relevance first: blended score desc
+  (`score * (1 - RECENCY_STRENGTH * (1 - exp(-age_days / RECENCY_DECAY_DAYS)))`),
+  then `published_date` desc as the tie-break (missing dates last).
 - **Ask mode (RAG)** — retrieves articles above `ASK_MIN_SCORE`, packs them
-  into a numbered context, and asks Groq (`llama-3.3-70b-versatile`) for an
-  answer with inline `[n]` citations. If nothing clears the threshold it says
-  so instead of guessing.
+  (title, date, authors/industry/dealtype, summary and a body excerpt) into a
+  numbered context, and asks Groq (`llama-3.3-70b-versatile`) for an answer
+  with inline `[n]` citations. If nothing clears the threshold it says so
+  instead of guessing.
 - **Caching** — Redis-backed JSON cache shared across workers (falls back to
   an in-process cache if Redis is down) for both `/search` and `/ask`, keyed
-  by query + top_k.
+  by query + top_k + facets.
 
 ## Prerequisites
 
@@ -149,6 +159,7 @@ cd backend
 
 ```bash
 curl "http://localhost:8000/search?q=fintech%20funding&top_k=3"
+curl "http://localhost:8000/search?q=funding&industry=Finance,TMT&from_date=2024-01-01"
 curl "http://localhost:8000/ask?q=who%20is%20investing%20in%20fintech&top_k=5"
 ```
 
@@ -200,11 +211,14 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
+| `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `6000` / `6000` | Chars sent to the embedder; body chars kept in the payload |
+| `INDEXER_WORKERS` | `8` | Threads pipelining dense encode + upsert during a build |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `16` | Cross-encoder reranker; how many RRF candidates to re-score |
-| `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `256` / `cpu` | Indexing batch size; `cuda` for a GPU |
+| `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `512` / `cpu` | Indexing batch size; `cuda` for a GPU |
 | `GROQ_API_KEY` / `GROQ_BASE_URL` / `LLM_MODEL` | — | Groq-compatible endpoint for `/ask` |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
-| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | Query cache TTL; size of the in-process fallback cache |
+| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |
+| `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 
 ## Production notes (POC shortcuts to fix before real prod)
 
