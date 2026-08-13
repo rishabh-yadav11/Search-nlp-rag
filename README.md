@@ -171,12 +171,12 @@ pattern below). For local dev (`next dev` on :3000 with the API on :8000) set
 ## Deployment (nginx)
 
 Port map: Qdrant `6333` (internal), API `8001` (internal), Next.js `3000`
-(internal, or a static build), nginx `8080` (public). nginx serves the app and
+(internal, or a static build), nginx `80` (public). nginx serves the app and
 proxies the API paths on the same origin so the UI works with zero CORS setup:
 
 ```nginx
 server {
-    listen 8080;
+    listen 80;
     server_name _;
 
     location /search { proxy_pass http://127.0.0.1:8001; }

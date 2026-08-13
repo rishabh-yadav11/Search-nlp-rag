@@ -10,7 +10,7 @@ QDRANT_PORT="${QDRANT_PORT:-6333}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 API_PORT="${API_PORT:-8001}"
 NEXT_PORT="${NEXT_PORT:-3000}"
-PUBLIC_PORT="${PUBLIC_PORT:-8080}"
+PUBLIC_PORT="${PUBLIC_PORT:-80}"
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 
@@ -41,7 +41,7 @@ stages (run in order):
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
-  PUBLIC_BASE_URL   e.g. http://your-host:8080 (baked into the Next.js build)
+  PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
 EOF
 }
 
@@ -318,6 +318,7 @@ server {
 }
 NGINX
     sudo ln -sf "$conf" "$site"
+    sudo rm -f /etc/nginx/sites-enabled/default
     sudo nginx -t
     sudo systemctl reload nginx
     echo "nginx configured on port $PUBLIC_PORT"
