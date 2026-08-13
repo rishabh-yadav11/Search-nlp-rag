@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Environment
+.env
+backend/.env
+
+# Data (fetched articles, index checkpoints, generated vocab)
+backend/data/
+qdrant_data/
+
+# OS
+.DS_Store
