@@ -26,6 +26,7 @@ from qdrant_client.models import (
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app.config import config
+from app.query_intent import extract_year_range, rewrite_year_in_review, top_k_hint
 from app.redis_cache import cache
 
 state = {}
@@ -140,6 +141,22 @@ def facet_cache_token(
     return f"{industry or ''}|{dealtype or ''}|{author or ''}|{from_date or ''}|{to_date or ''}"
 
 
+def _effective_intent(
+    q: str,
+    from_date: str | None,
+    to_date: str | None,
+) -> tuple[str, str | None, str | None]:
+    """Rewrite year-in-review queries for retrieval and derive an auto date
+    filter from the query's year intent. Explicit user dates always win."""
+    retrieval_q, _ = rewrite_year_in_review(q)
+    if from_date or to_date:
+        return retrieval_q, from_date, to_date
+    rng = extract_year_range(q)
+    if rng:
+        return retrieval_q, rng[0], rng[1]
+    return retrieval_q, from_date, to_date
+
+
 async def hybrid_search(
     query: str,
     top_k: int,
@@ -231,21 +248,27 @@ async def search(
     to_date: str | None = Query(None),
 ):
     start = time.perf_counter()
-    cache_key = f"search:{q}:{top_k}:{facet_cache_token(industry, dealtype, author, from_date, to_date)}"
+    retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
+    eff_top_k = min(max(top_k, top_k_hint(q) or 0), 50)
+    cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
         return SearchResponse(query=q, results=cached_results, cached=True, latency_ms=(time.perf_counter() - start) * 1000)
 
-    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
-    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-    results = sort_results(await rerank(q, candidates))[:top_k]
+    qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
+    candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
+    results = sort_results(await rerank(retrieval_q, candidates))[:eff_top_k]
     await cache.set(cache_key, [r.model_dump() for r in results])
     return SearchResponse(query=q, results=results, cached=False, latency_ms=(time.perf_counter() - start) * 1000)
 
 
 ANSWER_PROMPT = """You are answering a question using ONLY the numbered articles below. \
 Cite the article number(s) for every factual claim, like [1] or [2][3]. \
-If the articles don't contain enough information to answer, say so plainly instead of guessing.
+If the question asks for a list or ranking (e.g. "top N deals", "top articles", "which companies/funds"), \
+extract and enumerate every matching item that appears in the articles, with citations. \
+Do not refuse because the list is long; list as many as the articles mention, and say how many \
+were found if fewer than the requested number. \
+If the articles genuinely contain no information relevant to the question, say so plainly instead of guessing.
 
 Articles:
 {context}
@@ -285,15 +308,17 @@ async def ask(
         raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured")
 
     start = time.perf_counter()
-    cache_key = f"ask:{q}:{top_k}:{facet_cache_token(industry, dealtype, author, from_date, to_date)}"
+    retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
+    eff_top_k = min(max(top_k, top_k_hint(q) or 0), 20)
+    cache_key = f"ask:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached = await cache.get(cache_key)
     if cached is not None:
         return AskResponse(query=q, answer=cached["answer"], sources=cached["sources"], cached=True,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
-    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
-    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-    sources = [s for s in sort_results(await rerank(q, candidates)) if s.score >= config.ASK_MIN_SCORE][:top_k]
+    qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
+    candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
+    sources = [s for s in sort_results(await rerank(retrieval_q, candidates)) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
         await cache.set(cache_key, {"answer": answer, "sources": []})
@@ -305,7 +330,7 @@ async def ask(
 
     response = await state["llm"].chat.completions.create(
         model=config.LLM_MODEL,
-        max_tokens=600,
+        max_tokens=1200,
         messages=[{"role": "user", "content": prompt}],
     )
     answer = response.choices[0].message.content or ""
