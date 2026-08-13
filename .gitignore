@@ -18,4 +18,7 @@ qdrant_config.yaml
 .qdrant-initialized
 
 # OS
-.DS_Store.pid/
+.DS_Store
+
+# Runtime
+.pid/
