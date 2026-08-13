@@ -21,11 +21,6 @@ PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 
-# Optional TLS (see the `tls` stage). When TLS_DOMAIN is non-empty nginx is
-# configured with certbot-managed certs; TLS_EMAIL is the certbot registration address.
-TLS_DOMAIN="${TLS_DOMAIN:-}"
-TLS_EMAIL="${TLS_EMAIL:-}"
-
 VENV="$SCRIPT_DIR/backend/venv"
 VENV_PY="$VENV/bin/python"
 LOGS="$SCRIPT_DIR/logs"
@@ -48,16 +43,13 @@ stages (run in order):
   stop       stop both backend + frontend
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
-  tls        optional HTTPS via certbot (needs TLS_DOMAIN + TLS_EMAIL)
 
-  all        deps backend index frontend services pm2-startup cron nginx tls
+  all        deps backend index frontend services pm2-startup cron nginx
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
-  TLS_DOMAIN TLS_EMAIL   enable HTTPS via certbot (tls stage); run_nginx emits an
-                         ssl config + HSTS when TLS_DOMAIN is set
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
 EOF
 }
@@ -370,57 +362,7 @@ run_nginx() {
         echo "ERROR: nginx not installed." >&2
         exit 1
     fi
-    if [ -n "$TLS_DOMAIN" ]; then
-        local cert="/etc/letsencrypt/live/$TLS_DOMAIN/fullchain.pem"
-        sudo tee "$conf" >/dev/null <<NGINX
-server {
-    listen 80;
-    server_name $TLS_DOMAIN;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
-    listen $PUBLIC_PORT ssl;
-    server_name $TLS_DOMAIN;
-
-    ssl_certificate $cert;
-    ssl_certificate_key /etc/letsencrypt/live/$TLS_DOMAIN/privkey.pem;
-
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options "DENY" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-
-    location /search { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /health { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /live { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /ask {
-        proxy_pass http://127.0.0.1:$API_PORT;
-        proxy_read_timeout 300s;
-    }
-
-    location / {
-        proxy_pass http://127.0.0.1:$NEXT_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-NGINX
-        sudo ln -sf "$conf" "$site"
-        sudo rm -f /etc/nginx/sites-enabled/default
-        if [ -f "$cert" ]; then
-            sudo nginx -t
-            sudo systemctl reload nginx
-            echo "nginx configured for HTTPS on port $PUBLIC_PORT ($TLS_DOMAIN)"
-        else
-            echo "nginx TLS config written for $TLS_DOMAIN; certs not present yet."
-            echo "run './setup.sh tls' to provision them via certbot."
-        fi
-    else
-        sudo tee "$conf" >/dev/null <<NGINX
+    sudo tee "$conf" >/dev/null <<NGINX
 server {
     listen $PUBLIC_PORT;
     server_name _;
@@ -447,31 +389,11 @@ server {
     }
 }
 NGINX
-        sudo ln -sf "$conf" "$site"
-        sudo rm -f /etc/nginx/sites-enabled/default
-        sudo nginx -t
-        sudo systemctl reload nginx
-        echo "nginx configured on port $PUBLIC_PORT"
-    fi
-}
-
-run_tls() {
-    stage "tls"
-    if [ -z "$TLS_DOMAIN" ]; then
-        echo "TLS_DOMAIN not set; skipping TLS provisioning (plain HTTP)."
-        return
-    fi
-    if [ -z "$TLS_EMAIL" ]; then
-        echo "ERROR: TLS_DOMAIN is set but TLS_EMAIL is empty; certbot needs it for registration." >&2
-        return 1
-    fi
-    if ! have certbot; then
-        sudo apt-get update -y -q
-        sudo apt-get install -y -q certbot python3-certbot-nginx
-    fi
-    sudo certbot --nginx -d "$TLS_DOMAIN" --non-interactive --agree-tos -m "$TLS_EMAIL"
+    sudo ln -sf "$conf" "$site"
+    sudo rm -f /etc/nginx/sites-enabled/default
+    sudo nginx -t
     sudo systemctl reload nginx
-    echo "TLS enabled for $TLS_DOMAIN (certbot + HSTS)"
+    echo "nginx configured on port $PUBLIC_PORT"
 }
 
 STAGES=()
@@ -480,14 +402,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         all) ALL=1 ;;
         -h|--help) usage; exit 0 ;;
-        deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx|tls) STAGES+=("$1") ;;
+        deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx) STAGES+=("$1") ;;
         *) echo "unknown stage: $1"; usage; exit 1 ;;
     esac
     shift
 done
 
 if [ $ALL -eq 1 ]; then
-    STAGES=(deps backend index frontend services pm2-startup cron nginx tls)
+    STAGES=(deps backend index frontend services pm2-startup cron nginx)
 fi
 if [ ${#STAGES[@]} -eq 0 ]; then
     usage
@@ -507,7 +429,6 @@ for s in "${STAGES[@]}"; do
         stop) run_stop ;;
         cron) run_cron ;;
         nginx) run_nginx ;;
-        tls) run_tls ;;
     esac
 done
 

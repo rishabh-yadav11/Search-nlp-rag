@@ -45,7 +45,7 @@ frontend/              Next.js app (App Router + TypeScript)
   app/globals.css
   next.config.ts       security headers (CSP, nosniff, etc.)
   eslint.config.mjs    flat config for eslint 9
-setup.sh               one-command deploy (deps, services, index, nginx, TLS, cron)
+setup.sh               one-command deploy (deps, services, index, nginx, cron)
 .github/workflows/ci.yml   backend + frontend + security gates
 ```
 
@@ -115,13 +115,12 @@ stages):
 ./setup.sh pm2-startup  # systemd unit so services restore on reboot
 ./setup.sh cron         # 15-min incremental sync
 ./setup.sh nginx        # reverse proxy + security headers on :80
-./setup.sh tls          # optional HTTPS via certbot (needs TLS_DOMAIN + TLS_EMAIL)
-./setup.sh all          # deps backend index frontend services pm2-startup cron nginx tls
+./setup.sh all          # deps backend index frontend services pm2-startup cron nginx
 ```
 
 Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`,
 `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`,
-`REDIS_IMAGE`, `TLS_DOMAIN`, `TLS_EMAIL`, `ALLOW_UNSUPPORTED_PY`.
+`REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`.
 
 If you'd rather run pieces manually, keep reading.
 
@@ -298,24 +297,18 @@ Hardening baked into `setup.sh`:
   API), never the internet. If containers were previously created with public
   binds, `setup.sh backend` detects it and recreates them with the local bind
   (Qdrant's data volume is preserved).
-- **Host firewall** — enable with UFW (recommended): allow only SSH, HTTP and
-  HTTPS, deny the rest:
+- **Host firewall** — enable with UFW (recommended): allow only SSH and HTTP,
+  deny the rest:
   ```bash
   sudo ufw default deny incoming
-  sudo ufw allow OpenSSH && sudo ufw allow 80/tcp && sudo ufw allow 443/tcp
+  sudo ufw allow OpenSSH && sudo ufw allow 80/tcp
   sudo ufw --force enable
   ```
-  Also restrict the cloud security group (e.g. AWS) to ports 22/80/443.
+  Also restrict the cloud security group (e.g. AWS) to ports 22/80.
 - **nginx security headers** — `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY` and `Referrer-Policy: strict-origin-when-cross-origin`
   on every location. CSP is set by the frontend (`next.config` headers), so it
-  is not duplicated at nginx.
-- **Optional TLS** — set `TLS_DOMAIN` (and `TLS_EMAIL`) then run
-  `TLS_DOMAIN=your.domain TLS_EMAIL=you@example.com ./setup.sh tls` to install
-  certbot and issue certificates. With `TLS_DOMAIN` set, `setup.sh nginx` emits
-  an HTTPS config with an HTTP→HTTPS redirect, certbot-managed certs and an HSTS
-  header; without it, plain HTTP is used. Certificates renew automatically via
-  the certbot timer.
+  is not duplicated at nginx. Plain HTTP only.
 - **Pinned images** — Qdrant/Redis run from pinned, digest-resolvable tags
   (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`,
   `REDIS_IMAGE=redis:7-alpine`). When overriding Qdrant, keep it >= the version
