@@ -1,0 +1,61 @@
+import json
+import logging
+
+import redis.asyncio as aioredis
+from cachetools import TTLCache
+
+from app.config import config
+
+logger = logging.getLogger("cache")
+
+
+class HybridCache:
+    """Redis-backed JSON cache with an in-process TTLCache fallback.
+
+    Redis lets multiple gunicorn workers share one cache. If Redis is
+    unreachable the module degrades silently to a per-worker local cache so
+    the API keeps working.
+    """
+
+    def __init__(self, redis_url: str, ttl: int, maxsize: int):
+        self._url = redis_url
+        self._ttl = ttl
+        self._mem = TTLCache(maxsize=maxsize, ttl=ttl)
+        self._redis = None
+        self._warned = False
+
+    def _client(self) -> aioredis.Redis:
+        if self._redis is None:
+            self._redis = aioredis.from_url(
+                self._url, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
+            )
+        return self._redis
+
+    def _degraded(self, exc: Exception) -> None:
+        if not self._warned:
+            logger.warning("Redis unavailable (%s); using in-process cache", exc)
+            self._warned = True
+
+    async def get(self, key: str):
+        try:
+            raw = await self._client().get(key)
+            if raw is not None:
+                return json.loads(raw)
+        except Exception as exc:
+            self._degraded(exc)
+        return self._mem.get(key)
+
+    async def set(self, key: str, value) -> None:
+        try:
+            await self._client().set(key, json.dumps(value), ex=self._ttl)
+            return
+        except Exception as exc:
+            self._degraded(exc)
+        self._mem[key] = value
+
+    async def close(self) -> None:
+        if self._redis is not None:
+            await self._redis.aclose()
+
+
+cache = HybridCache(config.REDIS_URL, config.CACHE_TTL_SECONDS, config.CACHE_MAX_SIZE)

@@ -3,7 +3,6 @@ import time
 from contextlib import asynccontextmanager
 from functools import partial
 
-from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastembed import SparseTextEmbedding
@@ -14,9 +13,9 @@ from qdrant_client.models import NamedVector, NamedSparseVector, SparseVector, P
 from sentence_transformers import SentenceTransformer
 
 from app.config import config
+from app.redis_cache import cache
 
 state = {}
-cache: TTLCache = TTLCache(maxsize=config.CACHE_MAX_SIZE, ttl=config.CACHE_TTL_SECONDS)
 
 
 @asynccontextmanager
@@ -27,6 +26,7 @@ async def lifespan(app: FastAPI):
     state["llm"] = AsyncOpenAI(api_key=config.GROQ_API_KEY, base_url=config.GROQ_BASE_URL) if config.GROQ_API_KEY else None
     yield
     await state["qdrant"].close()
+    await cache.close()
 
 
 app = FastAPI(title="VCCircle Semantic Search POC", lifespan=lifespan)
@@ -104,12 +104,12 @@ async def hybrid_search(query: str, top_k: int, min_dense_score: float | None = 
 async def search(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K, ge=1, le=50)):
     start = time.perf_counter()
     cache_key = f"search:{q}:{top_k}"
-    if cache_key in cache:
-        results = cache[cache_key]
-        return SearchResponse(query=q, results=results, cached=True, latency_ms=(time.perf_counter() - start) * 1000)
+    cached_results = await cache.get(cache_key)
+    if cached_results is not None:
+        return SearchResponse(query=q, results=cached_results, cached=True, latency_ms=(time.perf_counter() - start) * 1000)
 
     results = await hybrid_search(q, top_k)
-    cache[cache_key] = results
+    await cache.set(cache_key, [r.model_dump() for r in results])
     return SearchResponse(query=q, results=results, cached=False, latency_ms=(time.perf_counter() - start) * 1000)
 
 
@@ -132,15 +132,15 @@ async def ask(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K
 
     start = time.perf_counter()
     cache_key = f"ask:{q}:{top_k}"
-    if cache_key in cache:
-        answer, sources = cache[cache_key]
-        return AskResponse(query=q, answer=answer, sources=sources, cached=True,
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        return AskResponse(query=q, answer=cached["answer"], sources=cached["sources"], cached=True,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
     sources = await hybrid_search(q, top_k, min_dense_score=config.ASK_MIN_SCORE)
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
-        cache[cache_key] = (answer, sources)
+        await cache.set(cache_key, {"answer": answer, "sources": [s.model_dump() for s in sources]})
         return AskResponse(query=q, answer=answer, sources=sources, cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
@@ -154,7 +154,7 @@ async def ask(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K
     )
     answer = response.choices[0].message.content or ""
 
-    cache[cache_key] = (answer, sources)
+    await cache.set(cache_key, {"answer": answer, "sources": [s.model_dump() for s in sources]})
     return AskResponse(query=q, answer=answer, sources=sources, cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000)
 

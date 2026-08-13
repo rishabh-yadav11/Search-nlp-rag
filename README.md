@@ -61,11 +61,12 @@ cp .env.example .env        # fill in MySQL creds + GROQ_API_KEY
 ```
 
 Configuration is read from `.env` (see [Supported settings](#supported-settings)
-below). Qdrant, local:
+below). Qdrant and Redis, local:
 
 ```bash
 docker run -d --name qdrant -p 6333:6333 \
   -v $(pwd)/qdrant_data:/qdrant/storage --restart unless-stopped qdrant/qdrant
+docker run -d --name redis -p 6379:6379 --restart unless-stopped redis:7
 ```
 
 ## 2. Build the index (run once)
@@ -130,7 +131,7 @@ index is rebuilt. After wiping, rebuild with
 
 ```bash
 cd backend
-./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 2 \
+./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 4 \
   --bind 0.0.0.0:8000 --timeout 120 app.main:app
 ```
 
@@ -191,11 +192,12 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE/TABLE` | `localhost/3306/root//vccircle/articles` | Source DB (`vcc_frontend`, pk `feid`, `status=1`) |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint |
 | `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
+| `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-small-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
 | `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `256` / `cpu` | Indexing batch size; `cuda` for a GPU |
 | `GROQ_API_KEY` / `GROQ_BASE_URL` / `LLM_MODEL` | — | Groq-compatible endpoint for `/ask` |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
-| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | In-memory query cache |
+| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | Query cache TTL; size of the in-process fallback cache |
 
 ## Production notes (POC shortcuts to fix before real prod)
 
@@ -204,8 +206,9 @@ All optional (`backend/.env`), see `.env.example` for the full list:
    than a GPU-backed embedder. Set `EMBED_DEVICE=cuda` for lower latency.
 2. **No re-ranker.** RRF fusion output is returned as-is; add a cross-encoder
    pass if top-few precision matters.
-3. **In-memory cache** — fine for a single process; use Redis if you run more
-   than one API worker so the cache is shared.
+3. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
+   down it silently degrades to a per-worker in-process cache (which no longer
+   benefits the other workers until Redis returns).
 4. **No auth/rate limiting** on the API — add before exposing beyond localhost.
 5. **`published_date` payload index** assumes MySQL returns a parseable
    date/datetime string; adjust the payload schema if your column type differs.
