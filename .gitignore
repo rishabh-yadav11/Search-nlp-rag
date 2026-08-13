@@ -18,4 +18,4 @@ qdrant_config.yaml
 .qdrant-initialized
 
 # OS
-.DS_Store
+.DS_Store.pid/
