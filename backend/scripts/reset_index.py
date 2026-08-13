@@ -70,7 +70,7 @@ def main():
     client = QdrantClient(url=config.QDRANT_URL, timeout=30)
     existing = [c.name for c in client.get_collections().collections]
     if config.QDRANT_COLLECTION in existing:
-        client.delete_collection(collection_name=config.QDRANT_COLLECTION, wait=True)
+        client.delete_collection(collection_name=config.QDRANT_COLLECTION)
         log(f"dropped collection '{config.QDRANT_COLLECTION}'")
     else:
         log(f"collection '{config.QDRANT_COLLECTION}' did not exist")
