@@ -206,17 +206,20 @@ start_service() {
 run_services() {
     stage "services"
     mkdir -p "$LOGS" "$PID_DIR"
+    ensure_pm2
+    pm2 delete vccircle-backend >/dev/null 2>&1 || true
+    pm2 delete vccircle-frontend >/dev/null 2>&1 || true
     pkill -f "gunicorn.*$API_PORT" 2>/dev/null || true
     pkill -f "next-server" 2>/dev/null || true
     sleep 2
-    start_service gunicorn "$PID_DIR/api.pid" "$LOGS/api.log" \
-        "$VENV_PY" -m gunicorn --chdir "$SCRIPT_DIR/backend" \
+
+    (cd backend && pm2 start "$VENV_PY" \
+        --name vccircle-backend -- -m gunicorn \
         -k uvicorn.workers.UvicornWorker \
         --workers "$GUNICORN_WORKERS" --bind "0.0.0.0:$API_PORT" \
-        --timeout 120 -p "$PID_DIR/gunicorn.pid" app.main:app
+        --timeout 120 app.main:app)
     wait_http "http://localhost:$API_PORT/health"
-    ensure_pm2
-    pm2 delete vccircle-frontend >/dev/null 2>&1 || true
+
     (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
         --name vccircle-frontend -- start -p "$NEXT_PORT")
     pm2 save >/dev/null 2>&1
@@ -260,6 +263,9 @@ run_pm2_startup() {
 
 run_stop_backend() {
     stage "stop-backend"
+    if have pm2; then
+        pm2 delete vccircle-backend >/dev/null 2>&1 || true
+    fi
     stop_service gunicorn "$PID_DIR/api.pid" "gunicorn.*$API_PORT"
 }
 
