@@ -41,6 +41,48 @@ checkpoint file. `build_index.py` downloads the embedding models on first run:
 > project, it detects the mismatch and recreates the collection automatically
 > (you'll need to re-index).
 
+## Keep the index current (incremental sync)
+
+`scripts/update_index.py` keeps Qdrant in sync with MySQL without touching the
+running app: it fingerprints every published row, then embeds/upserts new and
+edited articles and deletes removed ones. It never recreates the collection.
+
+```bash
+cd backend
+python scripts/update_index.py --init   # seed once, AFTER a full build (no embedding)
+python scripts/update_index.py          # scheduled runs; cheap no-op when nothing changed
+```
+
+State (`last_id` + per-row fingerprints) lives in `backend/data/index_state.json`
+(gitignored). A run is a no-op with zero model load if nothing changed, and
+holds a `flock` so overlapping runs skip. Safe to run while the API is up.
+
+Schedule via cron (every 15 min), deprioritized with `nice`:
+
+```
+*/15 * * * * flock -n ~/search-nlp-rag/backend/data/update.lock \
+  nice -n 15 ~/search-nlp-rag/backend/venv/bin/python \
+  ~/search-nlp-rag/backend/scripts/update_index.py \
+  >> ~/search-nlp-rag/logs/update_index.log 2>&1
+```
+
+## Reset the index (start from zero)
+
+`scripts/reset_index.py` drops the Qdrant collection and deletes the local data
+artifacts (`articles.jsonl`, build checkpoint, incremental state), so the next
+build starts fresh. Model caches, venv and `.env` are kept.
+
+```bash
+cd backend
+python scripts/reset_index.py            # interactive confirmation
+python scripts/reset_index.py --yes      # skip confirmation
+python scripts/reset_index.py --keep-data  # drop the collection only
+```
+
+It warns if the API is still listening (port 8001); live queries 500 until the
+index is rebuilt. After wiping, rebuild with:
+`fetch_data.py` → `build_index.py` → `update_index.py --init` → (re)start API.
+
 ## Run the API
 
 ```bash
@@ -69,10 +111,10 @@ npm run build && npm run start   # production
 ```
 
 Open http://localhost:3000, type a query, toggle SEARCH vs ASK, hit Run (or
-Enter). The UI calls the API at `http://localhost:8000` by default — override
-with `NEXT_PUBLIC_API_BASE` (see `.env.local.example`) or `window.API_BASE`
-before the page loads if the API is elsewhere. It uses `location.origin` when
-the app is served same-origin with the API (e.g. behind nginx).
+Enter). The UI calls the API same-origin by default (`location.origin`) — right
+when nginx proxies the API paths on the same port. For local dev (`next dev`
+on :3000 with the API on :8000) set `NEXT_PUBLIC_API_BASE=http://localhost:8000`
+(see `.env.local.example`); `window.API_BASE` before page load overrides too.
 
 The API has CORS wide open (`allow_origins=["*"]`) so the browser can call it
 from :3000 — fine for local POC use, tighten to your actual frontend origin

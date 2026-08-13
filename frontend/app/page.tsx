@@ -29,7 +29,7 @@ type Status =
 const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
-  'http://localhost:8000'
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
 
 export default function Page() {
   const [query, setQuery] = useState('')
