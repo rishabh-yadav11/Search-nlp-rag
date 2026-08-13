@@ -386,6 +386,8 @@ server {
 
     location /search { proxy_pass http://127.0.0.1:$API_PORT; }
     location /health { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /live { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
     location /ask {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_read_timeout 300s;
@@ -422,6 +424,8 @@ server {
 
     location /search { proxy_pass http://127.0.0.1:$API_PORT; }
     location /health { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /live { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
     location /ask {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_read_timeout 300s;
