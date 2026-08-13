@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
-from app.index_text import compose_index_text
+from app.index_text import compose_dense_text, compose_sparse_text
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint")
@@ -137,21 +137,21 @@ def main():
     total = len(lines)
     print(f"{total} articles in dataset, resuming from line {start_line}")
 
-    def encode_batch(batch_texts):
+    def encode_batch(dense_texts, sparse_texts):
         dense_vecs = model.encode(
-            batch_texts,
-            batch_size=len(batch_texts),
+            dense_texts,
+            batch_size=len(dense_texts),
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        sparse_vecs = list(sparse_model.embed(batch_texts))
+        sparse_vecs = list(sparse_model.embed(sparse_texts))
         return dense_vecs, sparse_vecs
 
-    batch_rows, batch_texts = [], []
+    batch_rows, dense_texts, sparse_texts = [], [], []
     pending = deque()  # (end_line, future of encode_batch)
 
     def submit_batch(end_line: int):
-        pending.append((end_line, executor.submit(encode_batch, batch_texts)))
+        pending.append((end_line, executor.submit(encode_batch, dense_texts, sparse_texts)))
 
     def upsert_and_checkpoint():
         if not pending:
@@ -174,12 +174,13 @@ def main():
                 continue
             row = json.loads(line)
             batch_rows.append(row)
-            batch_texts.append(compose_index_text(row))
+            dense_texts.append(compose_dense_text(row))
+            sparse_texts.append(compose_sparse_text(row))
 
             if len(batch_rows) >= config.EMBED_BATCH_SIZE:
                 batch_frames[i + 1] = batch_rows
                 submit_batch(i + 1)
-                batch_rows, batch_texts = [], []
+                batch_rows, dense_texts, sparse_texts = [], [], []
                 while len(pending) >= config.INDEXER_WORKERS:
                     upsert_and_checkpoint()
 

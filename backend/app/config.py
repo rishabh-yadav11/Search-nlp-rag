@@ -26,10 +26,11 @@ class Config:
     EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "256"))
     EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 
-    # Indexed text limits. compose_index_text() orders metadata (title, authors,
-    # industry, dealtype) BEFORE summary/body so the facet values survive the
-    # embedder's 512-token truncation.
-    EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "6000"))  # chars sent to the embedder
+    # Indexed text limits. The dense embedder gets title+facets+summary only
+    # (kept short so CPU builds stay fast); the sparse/lexical embedder gets the
+    # full text including body so body keywords stay searchable.
+    EMBED_DENSE_CHAR_LIMIT = int(os.getenv("EMBED_DENSE_CHAR_LIMIT", "1500"))  # chars for the dense vector
+    EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "6000"))  # chars for the sparse/lexical vector
     BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "6000"))    # body chars kept in the payload
 
     # In-flight encode batches during indexing. Keep this small: CPU dense

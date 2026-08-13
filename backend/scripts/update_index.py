@@ -30,7 +30,7 @@ import aiomysql
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
-from app.index_text import compose_index_text, normalize_date, split_names
+from app.index_text import compose_dense_text, compose_sparse_text, normalize_date, split_names
 from fetch_data import clean
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -171,14 +171,14 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
     to_index = sorted(to_index)
     batch_size = config.EMBED_BATCH_SIZE
 
-    def encode_batch(texts):
+    def encode_batch(dense_texts, sparse_texts):
         dense_vecs = model.encode(
-            texts,
-            batch_size=len(texts),
+            dense_texts,
+            batch_size=len(dense_texts),
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        sparse_vecs = list(sparse_model.embed(texts))
+        sparse_vecs = list(sparse_model.embed(sparse_texts))
         return dense_vecs, sparse_vecs
 
     def build_point(rec, dvec, svec):
@@ -207,7 +207,9 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
     pending = deque()
 
     def submit(batch):
-        pending.append((batch, executor.submit(encode_batch, [compose_index_text(r) for r in batch])))
+        dense_texts = [compose_dense_text(r) for r in batch]
+        sparse_texts = [compose_sparse_text(r) for r in batch]
+        pending.append((batch, executor.submit(encode_batch, dense_texts, sparse_texts)))
 
     def upsert_one():
         nonlocal last_id

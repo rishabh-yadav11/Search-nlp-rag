@@ -37,10 +37,12 @@ frontend/              Next.js app (App Router + TypeScript)
 - **Hybrid retrieval** — every article is embedded twice at index time:
   `BAAI/bge-base-en-v1.5` (dense, cosine) and `Qdrant/bm25` sparse vectors
   with IDF. At query time both are searched in a single Qdrant prefetch and
-  fused with RRF. The searchable text is `title + authors + industry + dealtype
-  + summary + body` — metadata first so it survives the embedder's 512-token
-  truncation. The article `body` and facet arrays (`author_names`,
-  `industry_names`, `dealtype_names`) are stored in the payload.
+  fused with RRF. The **dense** vector is `title + authors + industry + dealtype
+  + summary` (metadata first, no body, so it stays short and fast to encode on
+  CPU); the **sparse (BM25)** vector is the same plus the full `body`, so
+  keyword matches inside article bodies stay searchable at lexical cost. The
+  article `body` and facet arrays (`author_names`, `industry_names`,
+  `dealtype_names`) are stored in the payload.
 - **Faceted filtering** — `/search` and `/ask` accept optional `industry`,
   `dealtype`, `author` and `from_date`/`to_date` params, applied as a Qdrant
   filter to both prefetches. Any value can be comma-separated for multi-select.
@@ -211,7 +213,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
-| `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `6000` / `6000` | Chars sent to the embedder; body chars kept in the payload |
+| `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `6000` / `6000` | Chars for the dense vector; sparse/lexical vector; body chars kept in the payload |
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `16` | Cross-encoder reranker; how many RRF candidates to re-score |
 | `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `256` / `cpu` | Embedder batch size; `cuda` for a GPU |
