@@ -68,7 +68,7 @@ async def hybrid_search(query: str, top_k: int, min_dense_score: float | None = 
     # Sentence-transformers and fastembed are CPU/sync-bound: run them off the
     # event loop so the async handlers stay responsive under load.
     dense_vec = (await asyncio.to_thread(partial(state["model"].encode, query, normalize_embeddings=True))).tolist()
-    sparse_emb = (await asyncio.to_thread(state["sparse_model"].embed, [query]))[0]
+    sparse_emb = list(await asyncio.to_thread(state["sparse_model"].embed, [query]))[0]
     sparse_vec = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
 
     dense_prefetch = Prefetch(
