@@ -15,7 +15,7 @@ Helpers shared by the index scripts (fetch/build/update) and the API.
   DATETIME payload index, range filters and recency blending all parse them.
 """
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.config import config
 
@@ -57,7 +57,7 @@ def normalize_date(value):
         except ValueError:
             return s
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt.isoformat()
 
 

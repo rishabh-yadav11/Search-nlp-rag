@@ -11,6 +11,14 @@ A fingerprint is the md5 of the *indexed* row values (cleaned title, summary,
 url, published_date, category), so any edit that would change the payload or
 the embedded text is caught.
 
+Durability & reconciliation (audit items #4, #5):
+  * Upserts are acknowledged (wait=True); state fingerprints/last_id are
+    updated only after a successful upsert, so a failed batch is retried from
+    the previous state on the next run.
+  * reconcile() scrolls all point IDs in the collection and compares them to
+    the DB row id set after every run (normal and --init), logging a WARNING
+    with sample missing/extra IDs on any mismatch.
+
 Usage:
     python scripts/update_index.py            # scheduled run (safe no-op when current)
     python scripts/update_index.py --init     # seed state from current DB rows (no embedding)
@@ -24,14 +32,15 @@ import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aiomysql
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from fetch_data import clean
+
 from app.config import config
 from app.index_text import compose_dense_text, compose_sparse_text, normalize_date, split_names
-from fetch_data import clean
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 STATE_PATH = os.path.join(DATA_DIR, "index_state.json")
@@ -41,7 +50,7 @@ _EXT = "COALESCE(NULLIF(external_url, ''), NULLIF(canonical_url, ''))"
 
 
 def log(msg: str):
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
+    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def load_state() -> dict:
@@ -106,23 +115,22 @@ async def fetch_records() -> dict[int, dict]:
     """
     records: dict[int, dict] = {}
     try:
-        async with pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(query)
-                async for row in cur:
-                    rec = {
-                        "id": row["feid"],
-                        "title": clean(row["title"]),
-                        "summary": clean(row["summary"]),
-                        "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
-                        "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
-                        "published_date": normalize_date(row["publish"]),
-                        "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
-                        "author_names": split_names(row["author_names"]),
-                        "industry_names": split_names(row["industry_names"]),
-                        "dealtype_names": split_names(row["dealtype_names"]),
-                    }
-                    records[rec["id"]] = rec
+        async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(query)
+            async for row in cur:
+                rec = {
+                    "id": row["feid"],
+                    "title": clean(row["title"]),
+                    "summary": clean(row["summary"]),
+                    "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
+                    "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
+                    "published_date": normalize_date(row["publish"]),
+                    "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
+                    "author_names": split_names(row["author_names"]),
+                    "industry_names": split_names(row["industry_names"]),
+                    "dealtype_names": split_names(row["dealtype_names"]),
+                }
+                records[rec["id"]] = rec
     finally:
         pool.close()
         await pool.wait_closed()
@@ -131,7 +139,7 @@ async def fetch_records() -> dict[int, dict]:
 
 def sync_delta(state: dict, records: dict[int, dict]):
     state_fps = state.setdefault("fingerprints", {})
-    state_ids = set(int(k) for k in state_fps)
+    state_ids = {int(k) for k in state_fps}
     db_ids = set(records)
 
     new = db_ids - state_ids
@@ -216,13 +224,20 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
         batch, future = pending.popleft()
         dense_vecs, sparse_vecs = future.result()
         points = [build_point(r, dvec, svec) for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)]
-        client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=False)
+        try:
+            client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
+        except Exception as e:
+            log(
+                f"ERROR: upsert of batch ending at id {batch[-1]['id']} failed; state "
+                f"NOT updated (batch will be retried next run): {e}",
+            )
+            raise
 
         for r in batch:
             state_fps[str(r["id"])] = fingerprint(r)
         last_id = max(last_id, max(r["id"] for r in batch))
         state["last_id"] = last_id
-        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state["updated_at"] = datetime.now(UTC).isoformat()
         save_state(state)
         log(f"upserted {len(batch)} points (last_id={last_id})")
 
@@ -238,19 +253,47 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
         executor.shutdown(wait=False)
 
 
-def verify_state(state: dict, records: dict[int, dict]):
+def reconcile(state: dict, records: dict[int, dict]):
+    """Compare the full Qdrant point-id set to the DB row id set.
+
+    Scrolls the whole collection in batches of 500 with payloads and vectors
+    disabled (bounded, fast). Logs a WARNING listing the count mismatch plus
+    sample missing/extra IDs. Never raises.
+    """
     from qdrant_client import QdrantClient
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=30)
     try:
-        info = client.get_collection(config.QDRANT_COLLECTION)
-        count = info.points_count
-        if count != len(records):
-            log(f"WARNING: Qdrant has {count} points but DB has {len(records)} rows")
+        point_ids = set()
+        next_offset = None
+        while True:
+            batch, next_offset = client.scroll(
+                collection_name=config.QDRANT_COLLECTION,
+                limit=500,
+                offset=next_offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            point_ids.update(str(p.id) for p in batch)
+            if next_offset is None:
+                break
+
+        db_ids = {str(i) for i in records}
+        missing = db_ids - point_ids
+        extra = point_ids - db_ids
+        if missing or extra:
+            log(
+                f"WARNING: reconcile mismatch — Qdrant has {len(point_ids)} points "
+                f"but DB has {len(db_ids)} rows ({len(missing)} missing, {len(extra)} extra)",
+            )
+            for i in sorted(missing)[:10]:
+                log(f"  MISSING in Qdrant: {i}")
+            for i in sorted(extra)[:10]:
+                log(f"  EXTRA in Qdrant (not in DB): {i}")
         else:
-            log(f"collection '{config.QDRANT_COLLECTION}' matches DB rows ({count})")
+            log(f"reconcile OK: Qdrant {len(point_ids)} points match DB {len(db_ids)} rows")
     except Exception as e:
-        log(f"WARNING: could not inspect collection: {e}")
+        log(f"WARNING: reconcile failed: {e}")
 
 
 async def main():
@@ -281,12 +324,12 @@ async def main():
         state_fps = {str(i): fingerprint(records[i]) for i in records}
         state = {
             "last_id": max(records) if records else 0,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
             "fingerprints": state_fps,
         }
         save_state(state)
         log(f"seeded {len(state_fps)} fingerprints (last_id={state['last_id']})")
-        verify_state(state, records)
+        reconcile(state, records)
         return
 
     new, changed, deleted = sync_delta(state, records)
@@ -297,10 +340,12 @@ async def main():
 
     if not new and not changed and not deleted:
         log(f"index current ({time.perf_counter() - start:.2f}s, models not loaded)")
+        reconcile(state, records)
         return
 
     apply_delta(records, new, changed, deleted, state)
     log(f"done in {time.perf_counter() - start:.2f}s")
+    reconcile(state, records)
 
 
 if __name__ == "__main__":

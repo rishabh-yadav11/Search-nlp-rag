@@ -14,6 +14,16 @@ PUBLIC_PORT="${PUBLIC_PORT:-80}"
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 
+# Pinned docker images. Pin to a specific tag; for full reproducibility resolve
+# and append a digest: qdrant/qdrant:v1.11.3@sha256:<digest>, redis:7-alpine@sha256:<digest>
+QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.11.3}"
+REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+
+# Optional TLS (see the `tls` stage). When TLS_DOMAIN is non-empty nginx is
+# configured with certbot-managed certs; TLS_EMAIL is the certbot registration address.
+TLS_DOMAIN="${TLS_DOMAIN:-}"
+TLS_EMAIL="${TLS_EMAIL:-}"
+
 VENV="$SCRIPT_DIR/backend/venv"
 VENV_PY="$VENV/bin/python"
 LOGS="$SCRIPT_DIR/logs"
@@ -36,12 +46,17 @@ stages (run in order):
   stop       stop both backend + frontend
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
+  tls        optional HTTPS via certbot (needs TLS_DOMAIN + TLS_EMAIL)
 
-  all        deps backend index frontend services pm2-startup cron nginx
+  all        deps backend index frontend services pm2-startup cron nginx tls
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
+  QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.11.3, redis:7-alpine)
+  TLS_DOMAIN TLS_EMAIL   enable HTTPS via certbot (tls stage); run_nginx emits an
+                         ssl config + HSTS when TLS_DOMAIN is set
+  ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
 EOF
 }
 
@@ -106,20 +121,66 @@ docker_up() {
     fi
 }
 
+check_python() {
+    local py="${1:-python3}"
+    local ver major minor
+    ver="$("$py" -c 'import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1]))' 2>/dev/null || echo "0.0")"
+    major="${ver%%.*}"; minor="${ver##*.}"
+    if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 11 ]; }; then
+        echo "ERROR: '$py' is Python $ver; this project requires Python >= 3.11 and < 3.13." >&2
+        echo "       Install python3.11 or python3.12 (e.g. 'sudo apt install python3.12') and re-run." >&2
+        exit 1
+    fi
+    if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 13 ]; }; then
+        if [ "${ALLOW_UNSUPPORTED_PY:-0}" = "1" ]; then
+            echo "WARNING: '$py' is Python $ver (outside supported 3.11-3.12); continuing because ALLOW_UNSUPPORTED_PY=1"
+        else
+            echo "WARNING: '$py' is Python $ver, newer than the supported range (3.11-3.12)." >&2
+            echo "         torch 2.x may lack wheels for it; prefer 'python3.12'." >&2
+            echo "         Continuing anyway (set ALLOW_UNSUPPORTED_PY=1 to silence this)." >&2
+        fi
+    fi
+}
+
+# Succeeds when every published host port of the container binds to 127.0.0.1
+# (a 0.0.0.0/"" bind means it is reachable from the network).
+container_binds_localhost() {
+    if docker inspect -f \
+        '{{range $k, $v := .HostConfig.PortBindings}}{{range $v}}{{if ne .HostIp "127.0.0.1"}}PUBLIC_BIND{{end}}{{end}}{{end}}' \
+        "$1" 2>/dev/null | grep -q PUBLIC_BIND; then
+        return 1
+    fi
+    return 0
+}
+
+rebind_container_ports() {
+    local name="$1" image="$2" ports="$3" volume="$4"
+    echo "container '$name' exists with non-localhost port bindings; recreating bound to 127.0.0.1..."
+    docker stop "$name" >/dev/null 2>&1 || true
+    docker rm "$name" >/dev/null 2>&1 || true
+    echo "pulling + starting '$name'..."
+    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume "$image"
+    echo "container '$name' recreated (bound to 127.0.0.1 only)"
+}
+
 ensure_docker_container() {
     local name="$1" image="$2" ports="$3" volume="$4"
     if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
-        if [ "$(docker inspect -f '{{.State.Running}}' "$name")" = "true" ]; then
-            echo "container '$name' already running"
+        if container_binds_localhost "$name"; then
+            if [ "$(docker inspect -f '{{.State.Running}}' "$name")" = "true" ]; then
+                echo "container '$name' already running (bound to 127.0.0.1)"
+                return
+            fi
+            echo "starting existing '$name' container..."
+            docker start "$name"
             return
         fi
-        echo "starting existing '$name' container..."
-        docker start "$name"
+        rebind_container_ports "$name" "$image" "$ports" "$volume"
         return
     fi
     echo "pulling + starting '$name'..."
     docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume "$image"
-    echo "container '$name' started"
+    echo "container '$name' started (bound to 127.0.0.1 only)"
 }
 
 wait_http() {
@@ -141,10 +202,11 @@ run_deps() {
 
 run_backend() {
     stage "backend"
+    check_python python3
     docker_up
-    ensure_docker_container qdrant qdrant/qdrant \
-        "$QDRANT_PORT:6333" "-v $SCRIPT_DIR/qdrant_data:/qdrant/storage"
-    ensure_docker_container redis redis:7 "$REDIS_PORT:6379" ""
+    ensure_docker_container qdrant "$QDRANT_IMAGE" \
+        "127.0.0.1:$QDRANT_PORT:6333" "-v $SCRIPT_DIR/qdrant_data:/qdrant/storage"
+    ensure_docker_container redis "$REDIS_IMAGE" "127.0.0.1:$REDIS_PORT:6379" ""
     wait_http "http://localhost:$QDRANT_PORT/healthz"
 
     if [ ! -x "$VENV_PY" ]; then
@@ -209,8 +271,6 @@ run_services() {
     ensure_pm2
     pm2 delete vccircle-backend >/dev/null 2>&1 || true
     pm2 delete vccircle-frontend >/dev/null 2>&1 || true
-    pkill -f "gunicorn.*$API_PORT" 2>/dev/null || true
-    pkill -f "next-server" 2>/dev/null || true
     sleep 2
 
     (cd backend && pm2 start "$VENV_PY" \
@@ -227,24 +287,20 @@ run_services() {
 }
 
 stop_service() {
-    local name="$1" pidfile="$2" pattern="$3"
-    local stopped=0
+    local name="$1" pidfile="$2"
     if [ -f "$pidfile" ]; then
         local pid
         pid="$(cat "$pidfile" 2>/dev/null || true)"
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
             echo "'$name' stopped (pid $pid)"
-            stopped=1
+        else
+            echo "'$name' was not running"
         fi
         rm -f "$pidfile"
+    else
+        echo "'$name' was not running"
     fi
-    if pgrep -f "$pattern" >/dev/null 2>&1; then
-        pkill -f "$pattern" 2>/dev/null || true
-        echo "'$name' stopped (matched '$pattern')"
-        stopped=1
-    fi
-    [ "$stopped" -eq 0 ] && echo "'$name' was not running"
 }
 
 run_pm2_startup() {
@@ -266,12 +322,12 @@ run_stop_backend() {
     if have pm2; then
         pm2 delete vccircle-backend >/dev/null 2>&1 || true
     fi
-    stop_service gunicorn "$PID_DIR/api.pid" "gunicorn.*$API_PORT"
+    stop_service gunicorn "$PID_DIR/api.pid"
 }
 
 run_stop_frontend() {
     stage "stop-frontend"
-    stop_service next "$PID_DIR/next.pid" "next.*start"
+    stop_service next "$PID_DIR/next.pid"
     if have pm2; then
         if pm2 delete vccircle-frontend >/dev/null 2>&1; then
             echo "'vccircle-frontend' stopped (pm2)"
@@ -305,14 +361,33 @@ run_nginx() {
         echo "ERROR: nginx not installed." >&2
         exit 1
     fi
-    sudo tee "$conf" >/dev/null <<NGINX
+    if [ -n "$TLS_DOMAIN" ]; then
+        local cert="/etc/letsencrypt/live/$TLS_DOMAIN/fullchain.pem"
+        sudo tee "$conf" >/dev/null <<NGINX
 server {
-    listen $PUBLIC_PORT;
-    server_name _;
+    listen 80;
+    server_name $TLS_DOMAIN;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen $PUBLIC_PORT ssl;
+    server_name $TLS_DOMAIN;
+
+    ssl_certificate $cert;
+    ssl_certificate_key /etc/letsencrypt/live/$TLS_DOMAIN/privkey.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     location /search { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /ask    { proxy_pass http://127.0.0.1:$API_PORT; }
     location /health { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /ask {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_read_timeout 300s;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:$NEXT_PORT;
@@ -323,11 +398,67 @@ server {
     }
 }
 NGINX
-    sudo ln -sf "$conf" "$site"
-    sudo rm -f /etc/nginx/sites-enabled/default
-    sudo nginx -t
+        sudo ln -sf "$conf" "$site"
+        sudo rm -f /etc/nginx/sites-enabled/default
+        if [ -f "$cert" ]; then
+            sudo nginx -t
+            sudo systemctl reload nginx
+            echo "nginx configured for HTTPS on port $PUBLIC_PORT ($TLS_DOMAIN)"
+        else
+            echo "nginx TLS config written for $TLS_DOMAIN; certs not present yet."
+            echo "run './setup.sh tls' to provision them via certbot."
+        fi
+    else
+        sudo tee "$conf" >/dev/null <<NGINX
+server {
+    listen $PUBLIC_PORT;
+    server_name _;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location /search { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /health { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /ask {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_read_timeout 300s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:$NEXT_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+NGINX
+        sudo ln -sf "$conf" "$site"
+        sudo rm -f /etc/nginx/sites-enabled/default
+        sudo nginx -t
+        sudo systemctl reload nginx
+        echo "nginx configured on port $PUBLIC_PORT"
+    fi
+}
+
+run_tls() {
+    stage "tls"
+    if [ -z "$TLS_DOMAIN" ]; then
+        echo "TLS_DOMAIN not set; skipping TLS provisioning (plain HTTP)."
+        return
+    fi
+    if [ -z "$TLS_EMAIL" ]; then
+        echo "ERROR: TLS_DOMAIN is set but TLS_EMAIL is empty; certbot needs it for registration." >&2
+        return 1
+    fi
+    if ! have certbot; then
+        sudo apt-get update -y -q
+        sudo apt-get install -y -q certbot python3-certbot-nginx
+    fi
+    sudo certbot --nginx -d "$TLS_DOMAIN" --non-interactive --agree-tos -m "$TLS_EMAIL"
     sudo systemctl reload nginx
-    echo "nginx configured on port $PUBLIC_PORT"
+    echo "TLS enabled for $TLS_DOMAIN (certbot + HSTS)"
 }
 
 STAGES=()
@@ -336,14 +467,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         all) ALL=1 ;;
         -h|--help) usage; exit 0 ;;
-        deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx) STAGES+=("$1") ;;
+        deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx|tls) STAGES+=("$1") ;;
         *) echo "unknown stage: $1"; usage; exit 1 ;;
     esac
     shift
 done
 
 if [ $ALL -eq 1 ]; then
-    STAGES=(deps backend index frontend services pm2-startup cron nginx)
+    STAGES=(deps backend index frontend services pm2-startup cron nginx tls)
 fi
 if [ ${#STAGES[@]} -eq 0 ]; then
     usage
@@ -363,6 +494,7 @@ for s in "${STAGES[@]}"; do
         stop) run_stop ;;
         cron) run_cron ;;
         nginx) run_nginx ;;
+        tls) run_tls ;;
     esac
 done
 

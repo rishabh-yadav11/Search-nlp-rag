@@ -88,43 +88,42 @@ feid,
         LIMIT %s
     """
 
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                f"SELECT COUNT(*) AS c FROM {config.MYSQL_TABLE} WHERE status = 1 AND feid > %s",
-                (last_id,),
-            )
-            remaining = (await cur.fetchone())["c"]
-            pbar = tqdm(total=remaining, desc="Fetching articles")
+    async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
+        await cur.execute(
+            f"SELECT COUNT(*) AS c FROM {config.MYSQL_TABLE} WHERE status = 1 AND feid > %s",
+            (last_id,),
+        )
+        remaining = (await cur.fetchone())["c"]
+        pbar = tqdm(total=remaining, desc="Fetching articles")
 
-            with open(OUTPUT_PATH, "a") as out_f:
-                while True:
-                    await cur.execute(query, (last_id, PAGE_SIZE))
-                    rows = await cur.fetchall()
-                    if not rows:
-                        break
+        with open(OUTPUT_PATH, "a") as out_f:
+            while True:
+                await cur.execute(query, (last_id, PAGE_SIZE))
+                rows = await cur.fetchall()
+                if not rows:
+                    break
 
-                    for row in rows:
-                        rec = {
-                            "id": row["feid"],
-                            "title": clean(row["title"]),
-                            "summary": clean(row["summary"]),
-                            "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
-                            "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
-                            "published_date": normalize_date(row["publish"]),
-                            "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
-                            "author_names": split_names(row["author_names"]),
-                            "industry_names": split_names(row["industry_names"]),
-                            "dealtype_names": split_names(row["dealtype_names"]),
-                        }
-                        out_f.write(json.dumps(rec, default=str) + "\n")
+                for row in rows:
+                    rec = {
+                        "id": row["feid"],
+                        "title": clean(row["title"]),
+                        "summary": clean(row["summary"]),
+                        "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
+                        "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
+                        "published_date": normalize_date(row["publish"]),
+                        "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
+                        "author_names": split_names(row["author_names"]),
+                        "industry_names": split_names(row["industry_names"]),
+                        "dealtype_names": split_names(row["dealtype_names"]),
+                    }
+                    out_f.write(json.dumps(rec, default=str) + "\n")
 
-                    out_f.flush()
-                    last_id = rows[-1]["feid"]
-                    total_written += len(rows)
-                    pbar.update(len(rows))
+                out_f.flush()
+                last_id = rows[-1]["feid"]
+                total_written += len(rows)
+                pbar.update(len(rows))
 
-            pbar.close()
+        pbar.close()
 
     pool.close()
     await pool.wait_closed()

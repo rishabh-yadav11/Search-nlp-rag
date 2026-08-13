@@ -1,0 +1,15 @@
+line-length = 120
+target-version = "py311"
+
+[lint.per-file-ignores]
+# Pragmatic baseline for this codebase:
+#   BLE001  - broad except in resilient boundary code (cache/health/indexers) is intentional
+#   ASYNC230- blocking file IO in async CLI scripts is fine (single-threaded, non-server)
+#   SIM115  - flock lock files are deliberately not context-managed
+#   DTZ011  - naive date for "current year" resolution is acceptable here
+#   FURB162 - explicit timezone normalization is clearer than relying on fromisoformat
+"app/health.py" = ["BLE001"]
+"app/redis_cache.py" = ["BLE001"]
+"scripts/*" = ["BLE001", "ASYNC230", "SIM115"]
+"app/query_intent.py" = ["DTZ011"]
+"app/main.py" = ["FURB162"]

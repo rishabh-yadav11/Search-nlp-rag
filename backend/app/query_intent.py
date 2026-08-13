@@ -4,11 +4,11 @@ from datetime import date
 _CURRENT_YEAR = date.today().year
 
 _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
-_YEAR_SPAN_RE = re.compile(r"\b(20\d{2}|19\d{2})\s*(?:-|to|through)\s*(20\d{2}|19\d{2})\b", re.I)
-_LAST_YEAR_RE = re.compile(r"\b(?:the\s+)?last\s+year\b|\bprevious\s+year\b", re.I)
-_THIS_YEAR_RE = re.compile(r"\b(?:this|current)\s+year\b", re.I)
-_FLASHBACK_RE = re.compile(r"\bflashback\s+(20\d{2}|19\d{2})\b", re.I)
-_TOP_HINT_RE = re.compile(r"\btop\s+(\d{1,2})\b|\b(best|leading|biggest|largest|top)\b", re.I)
+_YEAR_SPAN_RE = re.compile(r"\b(20\d{2}|19\d{2})\s*(?:-|to|through)\s*(20\d{2}|19\d{2})\b", re.IGNORECASE)
+_LAST_YEAR_RE = re.compile(r"\b(?:the\s+)?last\s+year\b|\bprevious\s+year\b", re.IGNORECASE)
+_THIS_YEAR_RE = re.compile(r"\b(?:this|current)\s+year\b", re.IGNORECASE)
+_FLASHBACK_RE = re.compile(r"\bflashback\s+(20\d{2}|19\d{2})\b", re.IGNORECASE)
+_TOP_HINT_RE = re.compile(r"\btop\s+(\d{1,2})\b|\b(best|leading|biggest|largest|top)\b", re.IGNORECASE)
 _DEFAULT_LIST_K = 10
 
 
@@ -35,7 +35,7 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
 def top_k_hint(query: str) -> int | None:
     """Suggested top_k from a 'top N' in the query, or a small default for a
     generic top/best intent without a number. None when no list intent."""
-    m = re.search(r"\btop\s+(\d{1,2})\b", query, re.I)
+    m = re.search(r"\btop\s+(\d{1,2})\b", query, re.IGNORECASE)
     if m:
         return int(m.group(1))
     if _TOP_HINT_RE.search(query):

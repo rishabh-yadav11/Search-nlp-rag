@@ -10,6 +10,7 @@ backend/.env
 
 # Data (fetched articles, index checkpoints, generated vocab)
 backend/data/
+backend/backups/
 qdrant_data/
 logs/
 

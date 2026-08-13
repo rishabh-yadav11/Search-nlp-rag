@@ -6,6 +6,18 @@ can resume without re-embedding everything.
 Dense encoding and upserting are pipelined across thread pool workers
 (INDEXER_WORKERS) so encode of a later batch overlaps upsert of an earlier one.
 
+Durability & backups (audit items #4, #5):
+  * Upserts are acknowledged (wait=True) and the checkpoint is advanced only
+    after a successful upsert, so a partially-written batch is re-processed
+    from the last saved checkpoint on the next run.
+  * Before the collection is deleted/recreated (incompatible schema), a
+    best-effort snapshot backup is taken via qdrant_backup.make_backup();
+    a backup failure only logs a WARNING and does not abort the build.
+  * A versioned build collection + alias switch was deliberately NOT
+    implemented: the backup-first approach above is simpler, carries no risk of
+    breaking a live collection/alias, and update_index.py keeps operating on
+    config.QDRANT_COLLECTION as-is.
+
 Usage:
     python scripts/build_index.py
 """
@@ -14,20 +26,21 @@ import os
 import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    VectorParams,
-    SparseVectorParams,
     Distance,
     Modifier,
+    PayloadSchemaType,
     PointStruct,
     SparseVector,
-    PayloadSchemaType,
+    SparseVectorParams,
+    VectorParams,
 )
-from sentence_transformers import SentenceTransformer
 from qdrant_client.models import models as qmodels
+from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +49,10 @@ from app.index_text import compose_dense_text, compose_sparse_text
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint")
+
+
+def log(msg: str):
+    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def load_checkpoint() -> int:
@@ -50,9 +67,28 @@ def save_checkpoint(line_num: int):
         f.write(str(line_num))
 
 
+def backup_collection_best_effort(client: QdrantClient):
+    """Snapshot the collection + local artifacts before a destructive change.
+
+    Best-effort: a failure only logs a WARNING and the build continues, so a
+    transient Qdrant outage cannot block a rebuild. No-op when the collection
+    does not exist (nothing to protect).
+    """
+    try:
+        from qdrant_backup import make_backup
+
+        existing = [c.name for c in client.get_collections().collections]
+        if config.QDRANT_COLLECTION not in existing:
+            return
+        make_backup(client, config.QDRANT_COLLECTION)
+    except Exception as e:
+        log(f"WARNING: best-effort backup before collection change failed: {e}")
+
+
 def ensure_collection(client: QdrantClient):
     existing = [c.name for c in client.get_collections().collections]
     if config.QDRANT_COLLECTION not in existing:
+        backup_collection_best_effort(client)
         create_collection(client)
         return
 
@@ -78,6 +114,7 @@ def ensure_collection(client: QdrantClient):
         f"(dense size={dense_size} vs {config.EMBED_DIM}, sparse modifier idf={needs_idf}). "
         f"Deleting and recreating it so indexed vectors match the current config.",
     )
+    backup_collection_best_effort(client)
     client.delete_collection(collection_name=config.QDRANT_COLLECTION)
     create_collection(client)
 
@@ -160,7 +197,14 @@ def main():
         rows = batch_frames.pop(end_line)
         dense_vecs, sparse_vecs = future.result()
         points = [to_point(row, dvec, svec) for row, dvec, svec in zip(rows, dense_vecs, sparse_vecs)]
-        client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=False)
+        try:
+            client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
+        except Exception as e:
+            log(
+                f"ERROR: upsert of batch ending line {end_line} failed; checkpoint NOT "
+                f"advanced (batch will be retried from the last saved checkpoint): {e}",
+            )
+            raise
         save_checkpoint(end_line)
         pbar.update(len(rows))
 
@@ -194,6 +238,19 @@ def main():
         executor.shutdown(wait=False)
 
     pbar.close()
+    processed = total - start_line
+    try:
+        info = client.get_collection(config.QDRANT_COLLECTION)
+        count = info.points_count or 0
+        if count < processed:
+            log(
+                f"WARNING: collection '{config.QDRANT_COLLECTION}' has {count} points "
+                f"but {processed} lines were processed",
+            )
+        else:
+            log(f"verified: {count} points in collection >= {processed} lines processed")
+    except Exception as e:
+        log(f"WARNING: could not verify points_count: {e}")
     print("Index build complete.")
 
 

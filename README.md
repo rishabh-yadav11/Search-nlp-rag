@@ -192,15 +192,42 @@ server {
     listen 80;
     server_name _;
 
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
     location /search { proxy_pass http://127.0.0.1:8001; }
-    location /ask    { proxy_pass http://127.0.0.1:8001; }
     location /health { proxy_pass http://127.0.0.1:8001; }
+    location /ask    { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
     location /       { proxy_pass http://127.0.0.1:3000; }
 }
 ```
 
 The API's CORS is wide open (`allow_origins=["*"]`) for POC convenience —
 restrict it to the real frontend origin before exposing the API directly.
+
+### Security
+
+Hardening baked into `setup.sh`:
+
+- **Services bound to localhost** — Qdrant and Redis are published as
+  `127.0.0.1:PORT:PORT` so they are only reachable from the host (nginx, the
+  API), never the internet. If containers were previously created with public
+  binds, `setup.sh backend` detects it and recreates them with the local bind
+  (Qdrant's data volume is preserved).
+- **nginx security headers** — the generated config adds `X-Content-Type-Options:
+  nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy:
+  strict-origin-when-cross-origin` on every location. CSP is left to the
+  frontend (Next.js `headers()` in `next.config`), so it is not duplicated here.
+- **Optional TLS** — set `TLS_DOMAIN` (and `TLS_EMAIL`) then run
+  `TLS_DOMAIN=your.domain TLS_EMAIL=you@example.com ./setup.sh tls` to install
+  certbot and issue certificates. With `TLS_DOMAIN` set, `setup.sh nginx` emits
+  an HTTPS config with an HTTP→HTTPS redirect, certbot-managed certs and an HSTS
+  header; without it, plain HTTP is used. Certificates renew automatically via
+  the certbot timer.
+- **Pinned images** — Qdrant/Redis run from pinned tags
+  (`QDRANT_IMAGE=qdrant/qdrant:v1.11.3`, `REDIS_IMAGE=redis:7-alpine`); override
+  them to pin an exact `@sha256:` digest for full reproducibility.
 
 ## Supported settings
 

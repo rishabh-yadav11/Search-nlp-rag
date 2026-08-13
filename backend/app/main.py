@@ -2,7 +2,7 @@ import asyncio
 import math
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import partial
 
 from fastapi import FastAPI, HTTPException, Query
@@ -12,20 +12,20 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
-    NamedVector,
-    NamedSparseVector,
-    SparseVector,
-    Prefetch,
-    FusionQuery,
-    Fusion,
-    Filter,
-    FieldCondition,
-    MatchAny,
     DatetimeRange,
+    FieldCondition,
+    Filter,
+    Fusion,
+    FusionQuery,
+    MatchAny,
+    Prefetch,
+    SparseVector,
 )
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app.config import config
+from app.health import router as health_router
+from app.llm import LLMUnavailableError, generate_answer
 from app.query_intent import extract_year_range, rewrite_year_in_review, top_k_hint
 from app.redis_cache import cache
 
@@ -54,6 +54,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(health_router)
+
 
 class SourceArticle(BaseModel):
     id: int
@@ -69,9 +71,24 @@ class SourceArticle(BaseModel):
     score: float
 
 
+class SourceSummary(BaseModel):
+    """Public DTO for search/ask results. Intentionally excludes summary and
+    body so the response never leaks article text beyond the LLM context."""
+
+    id: int
+    title: str
+    url: str
+    published_date: str | None = None
+    category: str | None = None
+    author_names: list[str] = []
+    industry_names: list[str] = []
+    dealtype_names: list[str] = []
+    score: float
+
+
 class SearchResponse(BaseModel):
     query: str
-    results: list[SourceArticle]
+    results: list[SourceSummary]
     cached: bool
     latency_ms: float
 
@@ -79,9 +96,23 @@ class SearchResponse(BaseModel):
 class AskResponse(BaseModel):
     query: str
     answer: str
-    sources: list[SourceArticle]
+    sources: list[SourceSummary]
     cached: bool
     latency_ms: float
+
+
+def to_summary(a: SourceArticle) -> SourceSummary:
+    return SourceSummary(
+        id=a.id,
+        title=a.title,
+        url=a.url,
+        published_date=a.published_date,
+        category=a.category,
+        score=a.score,
+        author_names=a.author_names,
+        industry_names=a.industry_names,
+        dealtype_names=a.dealtype_names,
+    )
 
 
 def _parse_date(s: str) -> datetime | None:
@@ -97,7 +128,7 @@ def _parse_date(s: str) -> datetime | None:
         except ValueError:
             return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -166,7 +197,7 @@ async def hybrid_search(
     # Sentence-transformers and fastembed are CPU/sync-bound: run them off the
     # event loop so the async handlers stay responsive under load.
     dense_vec = (await asyncio.to_thread(partial(state["model"].encode, query, normalize_embeddings=True))).tolist()
-    sparse_emb = list(await asyncio.to_thread(state["sparse_model"].embed, [query]))[0]
+    sparse_emb = next(await asyncio.to_thread(state["sparse_model"].embed, [query]))
     sparse_vec = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
 
     dense_prefetch = Prefetch(
@@ -223,7 +254,7 @@ def _recency_multiplier(published_date: str | None) -> float:
     dt = _parse_date(published_date)
     if dt is None:
         return 1.0
-    age_days = max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
+    age_days = max(0.0, (datetime.now(UTC) - dt).total_seconds() / 86400.0)
     return 1.0 - config.RECENCY_STRENGTH * (1.0 - math.exp(-age_days / config.RECENCY_DECAY_DAYS))
 
 
@@ -253,13 +284,23 @@ async def search(
     cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
-        return SearchResponse(query=q, results=cached_results, cached=True, latency_ms=(time.perf_counter() - start) * 1000)
+        return SearchResponse(
+            query=q,
+            results=[SourceSummary.model_validate(d) for d in cached_results],
+            cached=True,
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
     results = sort_results(await rerank(retrieval_q, candidates))[:eff_top_k]
-    await cache.set(cache_key, [r.model_dump() for r in results])
-    return SearchResponse(query=q, results=results, cached=False, latency_ms=(time.perf_counter() - start) * 1000)
+    await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
+    return SearchResponse(
+        query=q,
+        results=[to_summary(r) for r in results],
+        cached=False,
+        latency_ms=(time.perf_counter() - start) * 1000,
+    )
 
 
 ANSWER_PROMPT = """You are answering a question using ONLY the numbered articles below. \
@@ -313,8 +354,13 @@ async def ask(
     cache_key = f"ask:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached = await cache.get(cache_key)
     if cached is not None:
-        return AskResponse(query=q, answer=cached["answer"], sources=cached["sources"], cached=True,
-                            latency_ms=(time.perf_counter() - start) * 1000)
+        return AskResponse(
+            query=q,
+            answer=cached["answer"],
+            sources=[SourceSummary.model_validate(s) for s in cached["sources"]],
+            cached=True,
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
@@ -322,24 +368,20 @@ async def ask(
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
         await cache.set(cache_key, {"answer": answer, "sources": []})
-        return AskResponse(query=q, answer=answer, sources=sources, cached=False,
+        return AskResponse(query=q, answer=answer, sources=[], cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
     context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
     prompt = ANSWER_PROMPT.format(context=context, question=q)
 
-    response = await state["llm"].chat.completions.create(
-        model=config.LLM_MODEL,
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    answer = response.choices[0].message.content or ""
+    try:
+        answer = await generate_answer(state["llm"], prompt, config.LLM_MODEL)
+    except LLMUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
+        )
 
-    await cache.set(cache_key, {"answer": answer, "sources": [s.model_dump() for s in sources]})
-    return AskResponse(query=q, answer=answer, sources=sources, cached=False,
+    await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources]})
+    return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000)
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}

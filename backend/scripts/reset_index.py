@@ -5,19 +5,28 @@ Drops the Qdrant collection and deletes the local data artifacts
 (articles.jsonl, build checkpoint, incremental index state). The embedding
 model cache, venv, and .env are left untouched.
 
+Safety (audit item #5): before deleting anything, a snapshot backup is taken
+via qdrant_backup.make_backup() (Qdrant collection snapshot + copies of
+articles.jsonl/index_state.json under backend/backups/). Deletion only proceeds
+after the snapshot succeeds, unless the explicit --skip-backup flag is passed
+(dangerous). Run scripts/backup_qdrant.py to back up without resetting.
+
 Usage:
     python scripts/reset_index.py            # interactive confirmation
     python scripts/reset_index.py --yes      # skip confirmation
     python scripts/reset_index.py --keep-data  # drop collection only
+    python scripts/reset_index.py --skip-backup  # delete WITHOUT a backup (dangerous)
 """
 import os
 import socket
 import sys
-from datetime import datetime, timezone
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from qdrant_backup import log, make_backup
 from qdrant_client import QdrantClient
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,10 +42,6 @@ DATA_FILES = [
 API_PORT = int(os.getenv("API_PORT", "8001"))
 
 
-def log(msg: str):
-    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
-
-
 def api_is_live() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", API_PORT), timeout=1):
@@ -48,15 +53,24 @@ def api_is_live() -> bool:
 def main():
     keep_data = "--keep-data" in sys.argv
     assume_yes = "--yes" in sys.argv
+    skip_backup = "--skip-backup" in sys.argv
 
     targets = [f"Qdrant collection '{config.QDRANT_COLLECTION}'"]
     if not keep_data:
         targets += [os.path.relpath(p, BACKEND_DIR) for p in DATA_FILES]
 
-    print("This will permanently remove:")
+    print("=" * 70)
+    print("  WARNING: This will PERMANENTLY delete:")
     for t in targets:
-        print(f"  - {t}")
-    print(f"Backend API on port {API_PORT} must be stopped or will 500 until the index is rebuilt.")
+        print(f"    - {t}")
+    print(f"  Backend API on port {API_PORT} must be stopped or will 500 until the index is rebuilt.")
+    print("=" * 70)
+
+    if not skip_backup:
+        print("A snapshot backup of the collection and local artifacts will be taken")
+        print("under backend/backups/ BEFORE anything is deleted.")
+    else:
+        print("!!! --skip-backup set: NO backup will be taken. Data will be unrecoverable.")
 
     if not assume_yes:
         reply = input("Type 'yes' to continue: ").strip().lower()
@@ -69,6 +83,21 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=30)
     existing = [c.name for c in client.get_collections().collections]
+
+    if not skip_backup:
+        if config.QDRANT_COLLECTION in existing:
+            dest, snapshot_ok = make_backup(client, config.QDRANT_COLLECTION)
+            if not snapshot_ok:
+                log(
+                    f"ERROR: snapshot for '{config.QDRANT_COLLECTION}' could not be created; "
+                    f"aborting reset to avoid irreversible loss",
+                )
+                log("Re-run with --skip-backup to force deletion without a backup.")
+                return
+            log(f"backup before reset: {dest}")
+        else:
+            log(f"collection '{config.QDRANT_COLLECTION}' does not exist — nothing to snapshot")
+
     if config.QDRANT_COLLECTION in existing:
         client.delete_collection(collection_name=config.QDRANT_COLLECTION)
         log(f"dropped collection '{config.QDRANT_COLLECTION}'")
