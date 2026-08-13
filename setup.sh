@@ -353,8 +353,12 @@ run_cron() {
     # (wrapping with `flock -n` would conflict with the script's own lock and
     # cause every run to be skipped).
     local line="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
-    crontab -l 2>/dev/null | grep -vF "update_index.py" | crontab -
-    ( crontab -l 2>/dev/null; echo "$line" ) | crontab -
+    local tmp
+    tmp="$(mktemp)"
+    crontab -l 2>/dev/null | grep -vF "update_index.py" > "$tmp" || true
+    printf '%s\n' "$line" >> "$tmp"
+    crontab "$tmp"
+    rm -f "$tmp"
     echo "cron installed: */15 * * * * update_index.py"
 }
 
