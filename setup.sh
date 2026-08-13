@@ -347,9 +347,12 @@ run_stop() {
 
 run_cron() {
     stage "cron"
-    local lock="$SCRIPT_DIR/backend/data/update.lock"
     local log="$LOGS/update_index.log"
-    local line="*/15 * * * * flock -n $lock nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
+    # update_index.py takes its own flock(2) on data/update.lock (LOCK_EX|LOCK_NB)
+    # and skips when another run holds it, so no external flock wrapper is needed
+    # (wrapping with `flock -n` would conflict with the script's own lock and
+    # cause every run to be skipped).
+    local line="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
     crontab -l 2>/dev/null | grep -vF "update_index.py" | crontab -
     ( crontab -l 2>/dev/null; echo "$line" ) | crontab -
     echo "cron installed: */15 * * * * update_index.py"
