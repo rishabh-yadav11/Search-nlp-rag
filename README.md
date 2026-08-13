@@ -1,63 +1,106 @@
-# VCCircle Semantic Search POC
+# VCCircle Semantic Search
 
-Performance-oriented POC: full dataset (50k–200k articles), hybrid dense+sparse
-search in Qdrant, async FastAPI, cached queries, optional LLM answer synthesis
-with citations.
+A hybrid retrieval + RAG search over the VCCircle article corpus. The full
+dataset is indexed into Qdrant with dense (semantic) and sparse (BM25) vectors,
+fused with Reciprocal Rank Fusion. A FastAPI service queries it and optionally
+synthesizes cited answers with an LLM (Groq). A Next.js single-page UI ties it
+together.
 
 ```
-backend/   FastAPI app (app/), data scripts (scripts/), requirements, .env
-frontend/  Next.js app (App Router, TypeScript) — app/ + package.json
+MySQL ──fetch_data──▶ articles.jsonl ──build_index──▶ Qdrant (dense + sparse)
+   │                                                         ▲
+   └─────────update_index (incremental new/edit/delete)──────┘
+                                                              │
+Browsers ◀── nginx ───▶ Next.js app ◀──(same origin)──▶ FastAPI ──▶ Qdrant
+                           /search, /ask, /health                 Groq (for /ask)
 ```
 
-## Setup
+## Repository layout
+
+```
+backend/
+  app/                 FastAPI application (config + main)
+  scripts/
+    fetch_data.py      MySQL -> data/articles.jsonl (paginated, resumable)
+    build_index.py     articles.jsonl -> Qdrant embeddings (checkpointed)
+    update_index.py    incremental MySQL->Qdrant sync (new/edited/deleted)
+    reset_index.py     drop the index + data files, start from zero
+  requirements.txt
+  .env.example         configuration template
+frontend/              Next.js app (App Router + TypeScript)
+  app/page.tsx         search/ask UI
+  .env.local.example   API base URL template
+```
+
+## How it works
+
+- **Hybrid retrieval** — every article is embedded twice at index time:
+  `BAAI/bge-small-en-v1.5` (dense, cosine) and `Qdrant/bm25` sparse vectors
+  with IDF. At query time both are searched in a single Qdrant prefetch and
+  fused with RRF, using `"<title>. <summary>"` as the searchable text.
+- **Ask mode (RAG)** — retrieves articles above `ASK_MIN_SCORE`, packs them
+  into a numbered context, and asks Groq (`llama-3.3-70b-versatile`) for an
+  answer with inline `[n]` citations. If nothing clears the threshold it says
+  so instead of guessing.
+- **Caching** — in-process TTL cache (`cachetools`) for both `/search` and
+  `/ask`, keyed by query + top_k.
+
+## Prerequisites
+
+- Python 3.10+
+- Node.js 18.18+ (for the frontend)
+- Docker (for Qdrant)
+
+## 1. Backend setup
 
 ```bash
 cd backend
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-# Qdrant, local
-docker run -d -p 6333:6333 -v $(pwd)/qdrant_data:/qdrant/storage qdrant/qdrant
-
-cp .env.example .env   # fill in MySQL creds + GROQ_API_KEY
+cp .env.example .env        # fill in MySQL creds + GROQ_API_KEY
 ```
 
-## Build the index (run once, resumable)
+Configuration is read from `.env` (see [Supported settings](#supported-settings)
+below). Qdrant, local:
+
+```bash
+docker run -d --name qdrant -p 6333:6333 \
+  -v $(pwd)/qdrant_data:/qdrant/storage --restart unless-stopped qdrant/qdrant
+```
+
+## 2. Build the index (run once)
 
 ```bash
 cd backend
-python scripts/fetch_data.py     # MySQL -> backend/data/articles.jsonl (paginated, resumable)
-python scripts/build_index.py    # embed + upsert into Qdrant (checkpointed, resumable)
+python scripts/fetch_data.py     # MySQL -> data/articles.jsonl
+python scripts/build_index.py    # embed + upsert into Qdrant
 ```
 
-Both scripts are safe to interrupt and re-run — `fetch_data.py` resumes from
-the max `id` already written, `build_index.py` resumes from a line-number
-checkpoint file. `build_index.py` downloads the embedding models on first run:
-`BAAI/bge-small-en-v1.5` (dense, via sentence-transformers) and `Qdrant/bm25`
-(sparse, via fastembed).
+Both are safe to interrupt and re-run: `fetch_data.py` resumes from the max id
+already written, `build_index.py` resumes from a line-number checkpoint.
+Downloads the embedding models on first run (dense + sparse, cached locally).
 
-> Note: sparse vectors use Qdrant's `Modifier.IDF` schema. If you re-run
-> `build_index.py` against a collection created by an older version of this
-> project, it detects the mismatch and recreates the collection automatically
-> (you'll need to re-index).
+> Sparse vectors use Qdrant's `Modifier.IDF` schema. `build_index.py` detects and
+> recreates a collection built with a mismatched config (you'd need to re-index).
 
-## Keep the index current (incremental sync)
+## 3. Keep the index current (incremental)
 
-`scripts/update_index.py` keeps Qdrant in sync with MySQL without touching the
-running app: it fingerprints every published row, then embeds/upserts new and
-edited articles and deletes removed ones. It never recreates the collection.
+`update_index.py` keeps Qdrant in sync with the database without touching the
+running app. It fingerprints every published row and, on each run, embeds and
+upserts new or edited articles and deletes removed ones. It never recreates the
+collection and is safe to run while the API is live.
 
 ```bash
 cd backend
 python scripts/update_index.py --init   # seed once, AFTER a full build (no embedding)
-python scripts/update_index.py          # scheduled runs; cheap no-op when nothing changed
+python scripts/update_index.py          # scheduled runs
 ```
 
 State (`last_id` + per-row fingerprints) lives in `backend/data/index_state.json`
-(gitignored). A run is a no-op with zero model load if nothing changed, and
-holds a `flock` so overlapping runs skip. Safe to run while the API is up.
+(gitignored). When nothing changed a run is a near-free no-op — no model load —
+and a `flock` prevents overlapping runs.
 
-Schedule via cron (every 15 min), deprioritized with `nice`:
+Every 15 minutes via cron, deprioritized with `nice`:
 
 ```
 */15 * * * * flock -n ~/search-nlp-rag/backend/data/update.lock \
@@ -66,72 +109,112 @@ Schedule via cron (every 15 min), deprioritized with `nice`:
   >> ~/search-nlp-rag/logs/update_index.log 2>&1
 ```
 
-## Reset the index (start from zero)
+## 4. Reset the index (start from zero)
 
-`scripts/reset_index.py` drops the Qdrant collection and deletes the local data
-artifacts (`articles.jsonl`, build checkpoint, incremental state), so the next
-build starts fresh. Model caches, venv and `.env` are kept.
+`reset_index.py` drops the Qdrant collection and deletes the local data
+artifacts (`articles.jsonl`, build checkpoint, incremental state) so the next
+build starts from scratch. Embedding model caches, the venv and `.env` are kept.
 
 ```bash
 cd backend
-python scripts/reset_index.py            # interactive confirmation
-python scripts/reset_index.py --yes      # skip confirmation
-python scripts/reset_index.py --keep-data  # drop the collection only
+python scripts/reset_index.py               # interactive confirmation
+python scripts/reset_index.py --yes         # skip confirmation
+python scripts/reset_index.py --keep-data   # drop the collection only
 ```
 
-It warns if the API is still listening (port 8001); live queries 500 until the
-index is rebuilt. After wiping, rebuild with:
-`fetch_data.py` → `build_index.py` → `update_index.py --init` → (re)start API.
+It warns if the API is still listening (port 8001) — live queries 500 until the
+index is rebuilt. After wiping, rebuild with
+`fetch_data.py` → `build_index.py` → `update_index.py --init` → (re)start the API.
 
-## Run the API
+## 5. Run the API
 
 ```bash
 cd backend
 uvicorn app.main:app --reload --port 8000
 ```
 
-- `GET /search?q=...&top_k=8` — hybrid semantic search, no LLM, cached
-- `GET /ask?q=...&top_k=8` — search + cited LLM answer, cached
-- `GET /health`
+| Endpoint | Description |
+|---|---|
+| `GET /search?q=...&top_k=8` | Hybrid semantic search (no LLM), cached |
+| `GET /ask?q=...&top_k=8` | Search + cited LLM answer, cached |
+| `GET /health` | Liveness |
 
-`/ask` only retrieves articles whose dense similarity is at least
-`ASK_MIN_SCORE` (default `0.2`); if the filter removes everything it answers
-"no sufficiently relevant articles" instead of guessing.
+```bash
+curl "http://localhost:8000/search?q=fintech%20funding&top_k=3"
+curl "http://localhost:8000/ask?q=who%20is%20investing%20in%20fintech&top_k=5"
+```
 
-## Run the frontend
+For production the same app runs under gunicorn with uvicorn workers:
 
-Next.js (App Router, TypeScript), on port 3000 by default:
+```bash
+cd backend
+./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 2 \
+  --bind 0.0.0.0:8001 --timeout 120 app.main:app
+```
+
+## 6. Run the frontend
 
 ```bash
 cd frontend
 npm install
-npm run dev        # dev, http://localhost:3000
-# or
-npm run build && npm run start   # production
+npm run dev                  # http://localhost:3000
+# production:
+npm run build && npm run start
 ```
 
-Open http://localhost:3000, type a query, toggle SEARCH vs ASK, hit Run (or
-Enter). The UI calls the API same-origin by default (`location.origin`) — right
-when nginx proxies the API paths on the same port. For local dev (`next dev`
-on :3000 with the API on :8000) set `NEXT_PUBLIC_API_BASE=http://localhost:8000`
-(see `.env.local.example`); `window.API_BASE` before page load overrides too.
+The UI defaults to calling the API **same-origin** (`location.origin`), which
+is right when nginx proxies the API paths on the app's own port (the deployment
+pattern below). For local dev (`next dev` on :3000 with the API on :8000) set
+`NEXT_PUBLIC_API_BASE=http://localhost:8000` — see `.env.local.example`.
+`window.API_BASE` before page load overrides anything.
 
-The API has CORS wide open (`allow_origins=["*"]`) so the browser can call it
-from :3000 — fine for local POC use, tighten to your actual frontend origin
-before deploying anywhere shared.
+## Deployment (nginx)
 
-## Known POC shortcuts (fix before real prod)
+Port map: Qdrant `6333` (internal), API `8001` (internal), Next.js `3000`
+(internal, or a static build), nginx `8080` (public). nginx serves the app and
+proxies the API paths on the same origin so the UI works with zero CORS setup:
 
-1. **Embeddings run on CPU.** The dense (sentence-transformers) and sparse
-   (fastembed BM25) models default to CPU; both are offloaded off the event
+```nginx
+server {
+    listen 8080;
+    server_name _;
+
+    location /search { proxy_pass http://127.0.0.1:8001; }
+    location /ask    { proxy_pass http://127.0.0.1:8001; }
+    location /health { proxy_pass http://127.0.0.1:8001; }
+    location /       { proxy_pass http://127.0.0.1:3000; }
+}
+```
+
+The API's CORS is wide open (`allow_origins=["*"]`) for POC convenience —
+restrict it to the real frontend origin before exposing the API directly.
+
+## Supported settings
+
+All optional (`backend/.env`), see `.env.example` for the full list:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE/TABLE` | `localhost/3306/root//vccircle/articles` | Source DB (`vcc_frontend`, pk `feid`, `status=1`) |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint |
+| `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
+| `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-small-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
+| `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `256` / `cpu` | Indexing batch size; `cuda` for a GPU |
+| `GROQ_API_KEY` / `GROQ_BASE_URL` / `LLM_MODEL` | — | Groq-compatible endpoint for `/ask` |
+| `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
+| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | In-memory query cache |
+
+## Production notes (POC shortcuts to fix before real prod)
+
+1. **Embeddings run on CPU.** Query-time embedding is offloaded off the event
    loop in `hybrid_search`, so the API stays responsive, but latency is higher
-   than a GPU-backed embedder would give you. Set `EMBED_DEVICE=cuda` (and add
-   a GPU) for lower per-request latency.
-2. **No re-ranker.** Top-k from fusion is returned as-is; add a cross-encoder
-   pass if precision on the top few results matters.
-3. **In-memory cache (`cachetools`)** — fine for a single process; swap for
-   Redis if you run more than one API worker, since an in-process cache won't
-   be shared across workers.
+   than a GPU-backed embedder. Set `EMBED_DEVICE=cuda` for lower latency.
+2. **No re-ranker.** RRF fusion output is returned as-is; add a cross-encoder
+   pass if top-few precision matters.
+3. **In-memory cache** — fine for a single process; use Redis if you run more
+   than one API worker so the cache is shared.
 4. **No auth/rate limiting** on the API — add before exposing beyond localhost.
 5. **`published_date` payload index** assumes MySQL returns a parseable
    date/datetime string; adjust the payload schema if your column type differs.
+6. **Manual process start** in the reference deployment — gunicorn and
+   `next start` won't survive a reboot; wrap them in systemd when staging.
