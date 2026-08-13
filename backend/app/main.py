@@ -161,15 +161,13 @@ async def ask(q: str = Query(..., min_length=1), top_k: int = Query(config.TOP_K
         return AskResponse(query=q, answer=cached["answer"], sources=cached["sources"], cached=True,
                             latency_ms=(time.perf_counter() - start) * 1000)
 
-    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES), min_dense_score=config.ASK_MIN_SCORE)
-    if not candidates:
-        sources = []
+    candidates = await hybrid_search(q, max(top_k, config.RERANK_CANDIDATES))
+    sources = [s for s in sort_results(await rerank(q, candidates)) if s.score >= config.ASK_MIN_SCORE][:top_k]
+    if not sources:
         answer = "No sufficiently relevant articles were found for this query."
         await cache.set(cache_key, {"answer": answer, "sources": []})
         return AskResponse(query=q, answer=answer, sources=sources, cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000)
-
-    sources = sort_results(await rerank(q, candidates))[:top_k]
 
     context = "\n".join(f"[{i+1}] {s.title} ({s.published_date or 'n/a'})" for i, s in enumerate(sources))
     prompt = ANSWER_PROMPT.format(context=context, question=q)
