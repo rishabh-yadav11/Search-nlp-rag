@@ -3,7 +3,7 @@ import logging
 
 import openai
 
-from app import config
+from app.config import config
 
 logger = logging.getLogger("llm")
 
