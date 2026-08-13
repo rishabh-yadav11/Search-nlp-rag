@@ -212,9 +212,9 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
 | `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `6000` / `6000` | Chars sent to the embedder; body chars kept in the payload |
-| `INDEXER_WORKERS` | `8` | Threads pipelining dense encode + upsert during a build |
+| `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `16` | Cross-encoder reranker; how many RRF candidates to re-score |
-| `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `512` / `cpu` | Indexing batch size; `cuda` for a GPU |
+| `EMBED_BATCH_SIZE` / `EMBED_DEVICE` | `256` / `cpu` | Embedder batch size; `cuda` for a GPU |
 | `GROQ_API_KEY` / `GROQ_BASE_URL` / `LLM_MODEL` | — | Groq-compatible endpoint for `/ask` |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |

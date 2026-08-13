@@ -23,7 +23,7 @@ class Config:
     # Embeddings
     EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
     EMBED_DIM = 768  # matches bge-base; change if you swap models
-    EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "512"))
+    EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "256"))
     EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
 
     # Indexed text limits. compose_index_text() orders metadata (title, authors,
@@ -32,8 +32,11 @@ class Config:
     EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "6000"))  # chars sent to the embedder
     BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "6000"))    # body chars kept in the payload
 
-    # Indexer worker threads (dense encode + upsert pipelined across batches)
-    INDEXER_WORKERS = int(os.getenv("INDEXER_WORKERS", "8"))
+    # In-flight encode batches during indexing. Keep this small: CPU dense
+    # encoding of a batch near max-token length uses ~1-2GB, so depth * batch
+    # must fit in RAM (the pipeline's value is overlapping encode with upsert,
+    # not running many encodes in parallel).
+    INDEXER_WORKERS = int(os.getenv("INDEXER_WORKERS", "2"))
 
     # Sparse (BM25) embeddings — must match the model used at index time
     SPARSE_MODEL = os.getenv("SPARSE_MODEL", "Qdrant/bm25")

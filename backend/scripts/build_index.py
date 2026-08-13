@@ -157,11 +157,12 @@ def main():
         if not pending:
             return
         end_line, future = pending.popleft()
+        rows = batch_frames.pop(end_line)
         dense_vecs, sparse_vecs = future.result()
-        points = [to_point(row, dvec, svec) for row, dvec, svec in zip(batch_frames[end_line], dense_vecs, sparse_vecs)]
+        points = [to_point(row, dvec, svec) for row, dvec, svec in zip(rows, dense_vecs, sparse_vecs)]
         client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=False)
         save_checkpoint(end_line)
-        pbar.update(len(batch_frames[end_line]))
+        pbar.update(len(rows))
 
     batch_frames = {}
     executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
