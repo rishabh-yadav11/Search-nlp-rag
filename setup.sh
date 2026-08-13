@@ -29,14 +29,15 @@ stages (run in order):
   backend    venv + pip deps + .env + Qdrant/Redis docker containers
   index      build the index from MySQL (fetch -> embed -> seed incremental state)
   frontend   npm ci + production build (Next.js)
-  services   start gunicorn + next in the background
+  services   start gunicorn + next (pm2) in the background
+  pm2-startup   install systemd unit so pm2 restores the frontend on boot
   stop-backend   stop gunicorn (API) only
   stop-frontend  stop next (frontend) only
   stop       stop both backend + frontend
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
 
-  all        deps backend index frontend services cron nginx
+  all        deps backend index frontend services pm2-startup cron nginx
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
@@ -243,6 +244,20 @@ stop_service() {
     [ "$stopped" -eq 0 ] && echo "'$name' was not running"
 }
 
+run_pm2_startup() {
+    stage "pm2-startup"
+    ensure_pm2
+    if [ -d "/etc/systemd/system" ] && have systemctl; then
+        sudo env "PATH=$PATH" pm2 startup systemd -u "$USER" --hp "$HOME" >/dev/null
+        pm2 save >/dev/null
+        systemctl is-enabled "pm2-$USER" >/dev/null 2>&1 \
+            && echo "pm2 boot-start enabled (pm2-$USER)" \
+            || echo "pm2 startup completed"
+    else
+        echo "systemd not available; pm2 manual start only"
+    fi
+}
+
 run_stop_backend() {
     stage "stop-backend"
     stop_service gunicorn "$PID_DIR/api.pid" "gunicorn.*$API_PORT"
@@ -314,14 +329,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         all) ALL=1 ;;
         -h|--help) usage; exit 0 ;;
-        deps|backend|index|frontend|services|stop-backend|stop-frontend|stop|cron|nginx) STAGES+=("$1") ;;
+        deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx) STAGES+=("$1") ;;
         *) echo "unknown stage: $1"; usage; exit 1 ;;
     esac
     shift
 done
 
 if [ $ALL -eq 1 ]; then
-    STAGES=(deps backend index frontend services cron nginx)
+    STAGES=(deps backend index frontend services pm2-startup cron nginx)
 fi
 if [ ${#STAGES[@]} -eq 0 ]; then
     usage
@@ -335,6 +350,7 @@ for s in "${STAGES[@]}"; do
         index) run_index ;;
         frontend) run_frontend ;;
         services) run_services ;;
+        pm2-startup) run_pm2_startup ;;
         stop-backend) run_stop_backend ;;
         stop-frontend) run_stop_frontend ;;
         stop) run_stop ;;
