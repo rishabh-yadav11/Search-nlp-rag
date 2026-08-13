@@ -30,6 +30,9 @@ stages (run in order):
   index      build the index from MySQL (fetch -> embed -> seed incremental state)
   frontend   npm ci + production build (Next.js)
   services   start gunicorn + next in the background
+  stop-backend   stop gunicorn (API) only
+  stop-frontend  stop next (frontend) only
+  stop       stop both backend + frontend
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
 
@@ -195,6 +198,43 @@ run_services() {
     wait_http "http://localhost:$NEXT_PORT/"
 }
 
+stop_service() {
+    local name="$1" pidfile="$2" pattern="$3"
+    local stopped=0
+    if [ -f "$pidfile" ]; then
+        local pid
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            echo "'$name' stopped (pid $pid)"
+            stopped=1
+        fi
+        rm -f "$pidfile"
+    fi
+    if pgrep -f "$pattern" >/dev/null 2>&1; then
+        pkill -f "$pattern" 2>/dev/null || true
+        echo "'$name' stopped (matched '$pattern')"
+        stopped=1
+    fi
+    [ "$stopped" -eq 0 ] && echo "'$name' was not running"
+}
+
+run_stop_backend() {
+    stage "stop-backend"
+    stop_service gunicorn "$PID_DIR/api.pid" "gunicorn.*$API_PORT"
+}
+
+run_stop_frontend() {
+    stage "stop-frontend"
+    stop_service next "$PID_DIR/next.pid" "next.*start"
+}
+
+run_stop() {
+    stage "stop"
+    run_stop_backend
+    run_stop_frontend
+}
+
 run_cron() {
     stage "cron"
     local lock="$SCRIPT_DIR/backend/data/update.lock"
@@ -243,7 +283,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         all) ALL=1 ;;
         -h|--help) usage; exit 0 ;;
-        deps|backend|index|frontend|services|cron|nginx) STAGES+=("$1") ;;
+        deps|backend|index|frontend|services|stop-backend|stop-frontend|stop|cron|nginx) STAGES+=("$1") ;;
         *) echo "unknown stage: $1"; usage; exit 1 ;;
     esac
     shift
@@ -264,6 +304,9 @@ for s in "${STAGES[@]}"; do
         index) run_index ;;
         frontend) run_frontend ;;
         services) run_services ;;
+        stop-backend) run_stop_backend ;;
+        stop-frontend) run_stop_frontend ;;
+        stop) run_stop ;;
         cron) run_cron ;;
         nginx) run_nginx ;;
     esac
