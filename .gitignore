@@ -13,5 +13,9 @@ backend/data/
 qdrant_data/
 logs/
 
+# Qdrant runtime artifacts
+qdrant_config.yaml
+.qdrant-initialized
+
 # OS
 .DS_Store
