@@ -189,7 +189,8 @@ run_services() {
     pkill -f "next-server" 2>/dev/null || true
     sleep 2
     start_service gunicorn "$PID_DIR/api.pid" "$LOGS/api.log" \
-        "$VENV_PY" -m gunicorn -k uvicorn.workers.UvicornWorker \
+        "$VENV_PY" -m gunicorn --chdir "$SCRIPT_DIR/backend" \
+        -k uvicorn.workers.UvicornWorker \
         --workers "$GUNICORN_WORKERS" --bind "0.0.0.0:$API_PORT" \
         --timeout 120 -p "$PID_DIR/gunicorn.pid" app.main:app
     wait_http "http://localhost:$API_PORT/health"
