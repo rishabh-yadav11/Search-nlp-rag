@@ -57,12 +57,17 @@ def ensure_collection(client: QdrantClient):
         return
 
     info = client.get_collection(collection_name=config.QDRANT_COLLECTION)
-    sparse_cfg = info.config.sparse_vectors_config.get("sparse")
-    needs_idf = sparse_cfg is not None and sparse_cfg.modifier == Modifier.IDF
-
+    # Introspection is tolerant: some qdrant server/client combinations don't
+    # surface sparse_vectors_config/hnsw_config on the returned model. When we
+    # can't confirm the existing schema, recreate it so vectors match config.
     vectors = info.config.params.vectors
     dense_size = vectors.get("dense").size if isinstance(vectors, dict) else vectors.size
     dim_matches = dense_size == config.EMBED_DIM
+
+    sparse_cfg = getattr(info.config, "sparse_vectors_config", None)
+    if sparse_cfg is not None:
+        sparse_cfg = sparse_cfg.sparse if hasattr(sparse_cfg, "sparse") else sparse_cfg.get("sparse")
+    needs_idf = bool(sparse_cfg and sparse_cfg.modifier == Modifier.IDF)
 
     if needs_idf and dim_matches:
         print(f"Collection '{config.QDRANT_COLLECTION}' already exists, resuming upserts into it")
