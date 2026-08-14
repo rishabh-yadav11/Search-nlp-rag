@@ -19,7 +19,7 @@ from app.config import config
 
 logger = logging.getLogger("analytics")
 
-_client = None
+_redis = None
 _warned = False
 
 
@@ -29,15 +29,15 @@ def _base_url(db: int) -> str:
 
 
 def _client() -> aioredis.Redis:
-    global _client
-    if _client is None:
-        _client = aioredis.from_url(
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(
             _base_url(config.ANALYTICS_REDIS_DB),
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=2,
         )
-    return _client
+    return _redis
 
 
 def _degraded(exc: Exception) -> None:
@@ -48,10 +48,10 @@ def _degraded(exc: Exception) -> None:
 
 
 async def close() -> None:
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
+    global _redis
+    if _redis is not None:
+        await _redis.aclose()
+        _redis = None
 
 
 def _today() -> str:
