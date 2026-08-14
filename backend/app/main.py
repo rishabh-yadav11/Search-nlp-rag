@@ -194,9 +194,11 @@ def _effective_intent(
 
 
 def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
-    """Concatenate and dedupe by id, keeping the highest score for each id
-    (each group is independently RRF/reranked; the cross-encoder rerank below
-    re-scores the merged set, so we only need to de-duplicate here)."""
+    """Concatenate and dedupe by id, keeping the highest score for each id.
+
+    Used to combine the raw RRF-candidate sets from the Flashback and bare-topic
+    retrieval legs *before* a single cross-encoder rerank against the original
+    query, so scores remain comparable across legs."""
     best: dict[int, SourceArticle] = {}
     for group in groups:
         for a in group:
@@ -333,8 +335,8 @@ async def search(
         if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
             rq = expand_query(rq)
         candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-        groups.append(await rerank(rq, candidates))
-    reranked = _merge_results(*groups)
+        groups.append(candidates)
+    reranked = await rerank(q, _merge_results(*groups))
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(q, reranked)
     results = sort_results(reranked)[:eff_top_k]
@@ -417,8 +419,8 @@ async def ask(
         if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
             rq = expand_query(rq)
         candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-        groups.append(await rerank(rq, candidates))
-    reranked = _merge_results(*groups)
+        groups.append(candidates)
+    reranked = await rerank(q, _merge_results(*groups))
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(q, reranked)
     sources = [s for s in sort_results(reranked) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
