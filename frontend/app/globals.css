@@ -449,20 +449,50 @@ input[type='text']:focus-visible,
   outline-offset: 2px;
 }
 
+.filters-menu {
+  margin-bottom: 22px;
+}
+
+.filters-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: white;
+  border: 1.5px solid var(--line);
+  padding: 7px 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.filters-toggle:hover {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+.filters-toggle[aria-expanded='true'] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.filters-toggle .filter-icon {
+  display: block;
+}
+
+.filters-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .filters {
-  margin: 0 0 22px;
+  margin: 8px 0 0;
   padding: 12px 14px;
   border: 1px solid var(--line);
   background: white;
-}
-
-.filters-title {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 10px;
 }
 
 .filters-grid {

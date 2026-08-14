@@ -130,6 +130,7 @@ export default function Page() {
   const [meta, setMeta] = useState('')
   const [sortBy, setSortBy] = useState<SortBy>('relevance')
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
+  const [showFilters, setShowFilters] = useState(false)
   const [hideLow, setHideLow] = useState(false)
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
 
@@ -257,64 +258,94 @@ export default function Page() {
           ))}
         </div>
 
-        <section className="filters" aria-label="Search filters">
-          <div className="filters-title">Filters</div>
-          <div className="filters-grid">
-            <label className="filter-field">
-              <span className="filter-label">industry</span>
-              <input
-                type="text"
-                value={filters.industry}
-                onChange={(e) => updateFilter('industry', e.target.value)}
-                placeholder="e.g. fintech"
-                aria-label="Industry filter"
-              />
-            </label>
-            <label className="filter-field">
-              <span className="filter-label">dealtype</span>
-              <input
-                type="text"
-                value={filters.dealtype}
-                onChange={(e) => updateFilter('dealtype', e.target.value)}
-                placeholder="e.g. venture debt"
-                aria-label="Dealtype filter"
-              />
-            </label>
-            <label className="filter-field">
-              <span className="filter-label">author</span>
-              <input
-                type="text"
-                value={filters.author}
-                onChange={(e) => updateFilter('author', e.target.value)}
-                placeholder="e.g. Priya"
-                aria-label="Author filter"
-              />
-            </label>
-            <label className="filter-field">
-              <span className="filter-label">from_date</span>
-              <input
-                type="date"
-                value={filters.from_date}
-                onChange={(e) => updateFilter('from_date', e.target.value)}
-                aria-label="From date filter"
-              />
-            </label>
-            <label className="filter-field">
-              <span className="filter-label">to_date</span>
-              <input
-                type="date"
-                value={filters.to_date}
-                onChange={(e) => updateFilter('to_date', e.target.value)}
-                aria-label="To date filter"
-              />
-            </label>
-            {hasFilters && (
-              <button type="button" className="clear-filters" onClick={() => setFilters(EMPTY_FILTERS)}>
-                Clear filters
-              </button>
-            )}
-          </div>
-        </section>
+        <div className="filters-menu">
+          <button
+            type="button"
+            className="filters-toggle"
+            onClick={() => setShowFilters((v) => !v)}
+            aria-expanded={showFilters}
+            aria-controls="filters-panel"
+            aria-label={showFilters ? 'Hide filters' : 'Show filters'}
+          >
+            <svg
+              className="filter-icon"
+              viewBox="0 0 24 24"
+              width="16"
+              height="16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M4 6h16" />
+              <path d="M7 12h10" />
+              <path d="M10 18h4" />
+            </svg>
+            Filters{hasFilters ? ' ·' : ''}
+          </button>
+
+          {showFilters && (
+            <section id="filters-panel" className="filters" aria-label="Search filters">
+              <div className="filters-grid">
+                <label className="filter-field">
+                  <span className="filter-label">industry</span>
+                  <input
+                    type="text"
+                    value={filters.industry}
+                    onChange={(e) => updateFilter('industry', e.target.value)}
+                    placeholder="e.g. fintech"
+                    aria-label="Industry filter"
+                  />
+                </label>
+                <label className="filter-field">
+                  <span className="filter-label">dealtype</span>
+                  <input
+                    type="text"
+                    value={filters.dealtype}
+                    onChange={(e) => updateFilter('dealtype', e.target.value)}
+                    placeholder="e.g. venture debt"
+                    aria-label="Dealtype filter"
+                  />
+                </label>
+                <label className="filter-field">
+                  <span className="filter-label">author</span>
+                  <input
+                    type="text"
+                    value={filters.author}
+                    onChange={(e) => updateFilter('author', e.target.value)}
+                    placeholder="e.g. Priya"
+                    aria-label="Author filter"
+                  />
+                </label>
+                <label className="filter-field">
+                  <span className="filter-label">from_date</span>
+                  <input
+                    type="date"
+                    value={filters.from_date}
+                    onChange={(e) => updateFilter('from_date', e.target.value)}
+                    aria-label="From date filter"
+                  />
+                </label>
+                <label className="filter-field">
+                  <span className="filter-label">to_date</span>
+                  <input
+                    type="date"
+                    value={filters.to_date}
+                    onChange={(e) => updateFilter('to_date', e.target.value)}
+                    aria-label="To date filter"
+                  />
+                </label>
+                {hasFilters && (
+                  <button type="button" className="clear-filters" onClick={() => setFilters(EMPTY_FILTERS)}>
+                    Clear filters
+                  </button>
+                )}
+              </div>
+            </section>
+          )}
+        </div>
 
         <div className="results-region" aria-live="polite" aria-busy={loading}>
           <div className="meta-row">{meta}</div>
