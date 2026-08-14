@@ -229,7 +229,7 @@ export default function Page() {
       <header>
         <div className="brand">
           <span className="mark">VCC</span>
-          <h1>VCCircle New Search</h1>
+          <h1>ASK VCCircle</h1>
         </div>
       </header>
 

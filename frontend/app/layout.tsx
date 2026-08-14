@@ -4,7 +4,7 @@ import './globals.css'
 export const dynamic = 'force-dynamic'
 
 export const metadata: Metadata = {
-  title: 'VCCircle New Search',
+  title: 'ASK VCCircle',
   description: 'Hybrid retrieval · optional cited answers',
 }
 
