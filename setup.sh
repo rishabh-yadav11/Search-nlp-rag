@@ -147,13 +147,16 @@ container_binds_localhost() {
     return 0
 }
 
+# Bound docker json-file logs so they can't fill the disk (20MB x 3 files each).
+DOCKER_LOG_OPTS="--log-driver json-file --log-opt max-size=20m --log-opt max-file=3"
+
 rebind_container_ports() {
     local name="$1" image="$2" ports="$3" volume="$4"
     echo "container '$name' exists with non-localhost port bindings; recreating bound to 127.0.0.1..."
     docker stop "$name" >/dev/null 2>&1 || true
     docker rm "$name" >/dev/null 2>&1 || true
     echo "pulling + starting '$name'..."
-    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume "$image"
+    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $DOCKER_LOG_OPTS "$image"
     echo "container '$name' recreated (bound to 127.0.0.1 only)"
 }
 
@@ -173,7 +176,7 @@ ensure_docker_container() {
         return
     fi
     echo "pulling + starting '$name'..."
-    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume "$image"
+    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $DOCKER_LOG_OPTS "$image"
     echo "container '$name' started (bound to 127.0.0.1 only)"
 }
 

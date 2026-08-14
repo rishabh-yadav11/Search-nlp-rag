@@ -186,6 +186,23 @@ Every 15 minutes via cron, deprioritized with `nice` (installed by `setup.sh cro
   >> ~/search-nlp-rag/logs/update_index.log 2>&1
 ```
 
+## Log management
+
+Logs are capped so they can't fill the disk long-term:
+
+- **Docker** (Qdrant/Redis) run with `--log-driver json-file --log-opt max-size=20m
+  --log-opt max-file=3` (set by `setup.sh` via `DOCKER_LOG_OPTS`).
+- **App + PM2 logs** (`~/search-nlp-rag/logs/*.log`, `~/.pm2/logs/*.log`) are
+  rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2),
+  compressed, with `copytruncate` so open file handles keep writing. Deploy it
+  once with:
+
+  ```bash
+  sudo install -m 644 /etc/logrotate.d/vccircle  # see repo: deploy/logrotate.conf
+  ```
+
+  The config lives in the repo at `deploy/logrotate.conf` for reproducibility.
+
 ## 4. Backups and reset
 
 `backup_qdrant.py` snapshots the Qdrant collection and copies the local data
