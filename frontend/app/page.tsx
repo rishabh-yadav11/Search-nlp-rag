@@ -390,9 +390,6 @@ function ResultBlock({
               {status.note}
             </div>
           )}
-          <div className="results-count" role="status">
-            {status.results.length} results for &ldquo;<span className="query">{status.query}</span>&rdquo;
-          </div>
           <div className="sort-row">
             <label htmlFor="sort-select">Sort by</label>
             <select
@@ -415,7 +412,7 @@ function ResultBlock({
               Hide low relevance
             </label>
           </div>
-          {renderResults(filterByRelevance(sortResults(status.results, sortBy), hideLow))}
+          {renderResults(filterByRelevance(sortResults(status.results, sortBy), hideLow), status.query)}
         </div>
       )
   }
@@ -425,7 +422,19 @@ function formatDate(s: string): string {
   if (!s) return 'n/a'
   const d = new Date(s)
   if (isNaN(d.getTime())) return s
-  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+  const now = Date.now()
+  const diff = now - d.getTime()
+  const minute = 60_000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diff < minute) return 'just now'
+  if (diff < hour) return `${Math.floor(diff / minute)} minute${Math.floor(diff / minute) > 1 ? 's' : ''} ago`
+  if (diff < day) return `${Math.floor(diff / hour)} hour${Math.floor(diff / hour) > 1 ? 's' : ''} ago`
+  if (diff < 2 * day) return 'yesterday'
+  if (diff < 7 * day) return `${Math.floor(diff / day)} days ago`
+  if (diff < 30 * day) return `${Math.floor(diff / (7 * day))} week${Math.floor(diff / (7 * day)) > 1 ? 's' : ''} ago`
+  if (diff < 365 * day) return `${Math.floor(diff / (30 * day))} month${Math.floor(diff / (30 * day)) > 1 ? 's' : ''} ago`
+  return `${Math.floor(diff / (365 * day))} year${Math.floor(diff / (365 * day)) > 1 ? 's' : ''} ago`
 }
 
 function relevance(score: number): { label: string; cls: string } {
@@ -468,13 +477,25 @@ function filterByRelevance(items: Result[], hideLow: boolean): Result[] {
   return items.filter((r) => r.score >= 0.5)
 }
 
-function renderResults(items: Result[]) {
+const FACET_PLACEHOLDERS = new Set(['others', 'general', 'n/a', 'na', 'unknown', 'none', 'miscellaneous'])
+
+function cleanFacets(values: string[] | undefined): string {
+  if (!values?.length) return ''
+  return values.filter((v) => !FACET_PLACEHOLDERS.has(v.trim().toLowerCase())).join(', ')
+}
+
+function renderResults(items: Result[], query: string) {
   if (!items.length) return <div className="empty">No matches found.</div>
   return (
     <div>
-      <div className="results-heading">Results</div>
+      <div className="results-heading">
+        {items.length} results for &ldquo;<span className="query">{query}</span>&rdquo;
+      </div>
       {items.map((r, i) => {
         const rel = relevance(r.score)
+        const authors = cleanFacets(r.author_names)
+        const industries = cleanFacets(r.industry_names)
+        const dealtypes = cleanFacets(r.dealtype_names)
         return (
           <div className="result" key={r.id}>
             <div className="idx">{i + 1}</div>
@@ -491,12 +512,12 @@ function renderResults(items: Result[]) {
                 <span className={`badge ${rel.cls}`}>{rel.label}</span>
                 <span className="score">{r.score.toFixed(3)}</span>
                 <span>{formatDate(r.published_date)}</span>
-                {r.category ? <span>{r.category}</span> : null}
+                {r.category && !FACET_PLACEHOLDERS.has(r.category.trim().toLowerCase()) ? <span>{r.category}</span> : null}
               </div>
               <div className="facet-line">
-                {r.author_names?.length ? <span className="facet">✎ {r.author_names.join(', ')}</span> : null}
-                {r.industry_names?.length ? <span className="facet">◆ {r.industry_names.join(', ')}</span> : null}
-                {r.dealtype_names?.length ? <span className="facet">● {r.dealtype_names.join(', ')}</span> : null}
+                {authors ? <span className="facet">✎ {authors}</span> : null}
+                {industries ? <span className="facet">◆ {industries}</span> : null}
+                {dealtypes ? <span className="facet">● {dealtypes}</span> : null}
               </div>
             </div>
           </div>
