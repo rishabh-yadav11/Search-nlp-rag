@@ -5,28 +5,8 @@ written: users ask about "startup layoffs" while the corpus says "job cuts" and
 "downsizing", or ask "who acquired X" while the article is framed as "X
 acquisition". expand_query() detects such concepts with plain substring matching
 and appends a small, bounded set of synonym phrases so semantic retrieval also
-matches the corpus's wording. has_ambiguous_entity() flags proper-noun-ish tokens
-(known Indian VC/PE/M&A brand names) so callers can be careful when an entity name
-changes the meaning of an otherwise generic query. Stdlib only, fully offline.
+matches the corpus's wording. Stdlib only, fully offline.
 """
-
-_KNOWN_BRANDS: list[str] = [
-    "PhonePe",
-    "Paytm",
-    "Flipkart",
-    "Zomato",
-    "Swiggy",
-    "BYJU'S",
-    "Housing.com",
-    "PayU",
-    "Pine Labs",
-    "Ola Electric",
-    "Razorpay",
-    "Zepto",
-    "Nykaa",
-    "FirstCry",
-    "Blinkit",
-]
 
 CONCEPT_EXPANSIONS: dict[str, list[str]] = {
     "funding/raise/raising/raised/raises/fundraise/fundraising": [
@@ -167,21 +147,3 @@ def expand_query(q: str) -> str:
     if not appended:
         return q
     return f"{q.rstrip()} {' '.join(appended)}"
-
-
-def has_ambiguous_entity(q: str) -> list[str]:
-    """Return the known brand/company names present in ``q``, in order of appearance.
-
-    Matching is a case-insensitive substring test that ignores apostrophes and
-    internal spaces ("byju's", "ola electric", "pine labs"). Generic words never
-    match. Returns an empty list when no known brand is mentioned.
-    """
-    q_norm = q.lower().replace("'", "")
-    found: list[tuple[int, str]] = []
-    for brand in _KNOWN_BRANDS:
-        norm = brand.lower().replace("'", "")
-        pos = q_norm.find(norm)
-        if pos != -1:
-            found.append((pos, brand))
-    found.sort(key=lambda item: item[0])
-    return [brand for _, brand in found]

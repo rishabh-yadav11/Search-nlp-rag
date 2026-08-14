@@ -30,9 +30,9 @@ class Config:
     # Indexed text limits. The dense embedder gets title+facets+summary only
     # (kept short so CPU builds stay fast); the sparse/lexical embedder gets the
     # full text including body so body keywords stay searchable.
-    EMBED_DENSE_CHAR_LIMIT = int(os.getenv("EMBED_DENSE_CHAR_LIMIT", "1500"))  # chars for the dense vector
-    EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "6000"))  # chars for the sparse/lexical vector
-    BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "6000"))    # body chars kept in the payload
+    EMBED_DENSE_CHAR_LIMIT = int(os.getenv("EMBED_DENSE_CHAR_LIMIT", "1500"))
+    EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "6000"))
+    BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "6000"))
 
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch
@@ -58,8 +58,8 @@ class Config:
 
     # Search
     TOP_K = int(os.getenv("TOP_K", "8"))
-    # Minimum dense cosine similarity for /ask retrieval; filters the dense
-    # prefetch so weak results don't reach the LLM.
+    # Minimum reranked relevance score for /ask; weaker results are dropped
+    # before the LLM sees them.
     ASK_MIN_SCORE = float(os.getenv("ASK_MIN_SCORE", "0.2"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))

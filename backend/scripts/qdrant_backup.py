@@ -1,5 +1,5 @@
 """
-Shared Qdrant snapshot/backup helpers (audit item #5).
+Shared Qdrant snapshot/backup helpers.
 
 A backup is a directory under ``backend/backups/`` named
 ``<collection>-<UTC-YYYYmmdd-HHMMSS-mmmmmm>`` containing:

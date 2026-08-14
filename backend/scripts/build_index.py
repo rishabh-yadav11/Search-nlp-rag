@@ -6,7 +6,7 @@ can resume without re-embedding everything.
 Dense encoding and upserting are pipelined across thread pool workers
 (INDEXER_WORKERS) so encode of a later batch overlaps upsert of an earlier one.
 
-Durability & backups (audit items #4, #5):
+Durability & backups:
   * Upserts are acknowledged (wait=True) and the checkpoint is advanced only
     after a successful upsert, so a partially-written batch is re-processed
     from the last saved checkpoint on the next run.

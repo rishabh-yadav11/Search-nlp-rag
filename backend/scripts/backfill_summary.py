@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """One-off backfill: populate the `summary` payload field for Qdrant points
 that were indexed before summaries were stored (empty summary). Reads the same
 MySQL rows as the indexer, scrolls Qdrant for points with an empty summary,
@@ -6,26 +5,17 @@ and sets the payload in small batches with wait=True, using a fresh client per
 batch so a long-lived connection can't die mid-run. Idempotent; safe to rerun.
 """
 import asyncio
-import importlib.util
 import os
 import sys
 from datetime import UTC, datetime
 
-_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _BACKEND_DIR)
-sys.path.insert(0, _SCRIPTS_DIR)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from qdrant_client import QdrantClient  # noqa: E402
+from qdrant_client import QdrantClient
+from update_index import fetch_records
 
-from app.config import config  # noqa: E402
-
-_spec = importlib.util.spec_from_file_location(
-    "update_index", os.path.join(_SCRIPTS_DIR, "update_index.py")
-)
-update_index = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(update_index)
-fetch_records = update_index.fetch_records
+from app.config import config
 
 BATCH_SIZE = 200
 EMPTY_SUMMARY_FILTER = {"must": [{"is_empty": {"key": "summary"}}]}

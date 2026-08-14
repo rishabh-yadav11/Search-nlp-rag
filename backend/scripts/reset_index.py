@@ -5,7 +5,7 @@ Drops the Qdrant collection and deletes the local data artifacts
 (articles.jsonl, build checkpoint, incremental index state). The embedding
 model cache, venv, and .env are left untouched.
 
-Safety (audit item #5): before deleting anything, a snapshot backup is taken
+Safety: before deleting anything, a snapshot backup is taken
 via qdrant_backup.make_backup() (Qdrant collection snapshot + copies of
 articles.jsonl/index_state.json under backend/backups/). Deletion only proceeds
 after the snapshot succeeds, unless the explicit --skip-backup flag is passed

@@ -7,11 +7,11 @@ unaffected (Qdrant handles concurrent reads/writes; points are only appended
 or removed, never bulk-recreated).
 
 State lives in data/index_state.json: {last_id, updated_at, fingerprints}.
-A fingerprint is the md5 of the *indexed* row values (cleaned title, summary,
-url, published_date, category), so any edit that would change the payload or
-the embedded text is caught.
+A fingerprint is the md5 of the *indexed* row values (title, summary, url,
+published_date, category, body and the facet lists), so any edit that would
+change the payload or the embedded text is caught.
 
-Durability & reconciliation (audit items #4, #5):
+Durability & reconciliation:
   * Upserts are acknowledged (wait=True); state fingerprints/last_id are
     updated only after a successful upsert, so a failed batch is retried from
     the previous state on the next run.
@@ -37,16 +37,13 @@ from datetime import UTC, datetime
 import aiomysql
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from fetch_data import clean
 
 from app.config import config
-from app.index_text import compose_dense_text, compose_sparse_text, normalize_date, split_names
+from app.index_text import EXTERNAL_URL_SQL, compose_dense_text, compose_sparse_text, record_from_row
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 STATE_PATH = os.path.join(DATA_DIR, "index_state.json")
 LOCK_PATH = os.path.join(DATA_DIR, "update.lock")
-
-_EXT = "COALESCE(NULLIF(external_url, ''), NULLIF(canonical_url, ''))"
 
 
 def log(msg: str):
@@ -104,7 +101,7 @@ async def fetch_records() -> dict[int, dict]:
             summary,
             body,
             slug,
-            {_EXT} AS ext_url,
+            {EXTERNAL_URL_SQL} AS ext_url,
             publish,
             content_type,
             author_names,
@@ -118,18 +115,7 @@ async def fetch_records() -> dict[int, dict]:
         async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(query)
             async for row in cur:
-                rec = {
-                    "id": row["feid"],
-                    "title": clean(row["title"]),
-                    "summary": clean(row["summary"]),
-                    "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
-                    "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
-                    "published_date": normalize_date(row["publish"]),
-                    "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
-                    "author_names": split_names(row["author_names"]),
-                    "industry_names": split_names(row["industry_names"]),
-                    "dealtype_names": split_names(row["dealtype_names"]),
-                }
+                rec = record_from_row(row)
                 records[rec["id"]] = rec
     finally:
         pool.close()

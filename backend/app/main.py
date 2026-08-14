@@ -23,7 +23,7 @@ from qdrant_client.models import (
 )
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
-from app.answer_fallback import date_label, fallback_answer, search_note, weak_results
+from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
 from app.config import config
 from app.health import router as health_router
 from app.llm import LLMUnavailableError, generate_answer
@@ -33,7 +33,7 @@ from app.query_intent import (
     extract_year_range,
     month_query_topic,
     rewrite_year_in_review,
-    top_k_hint,
+    suggested_top_k,
 )
 from app.redis_cache import cache
 from app.rerank_boost import apply_entity_boost
@@ -243,7 +243,6 @@ def _retrieval_queries(q: str) -> list[str]:
 async def hybrid_search(
     query: str,
     top_k: int,
-    min_dense_score: float | None = None,
     qfilter: Filter | None = None,
 ) -> list[SourceArticle]:
     # Sentence-transformers and fastembed are CPU/sync-bound: run them off the
@@ -256,7 +255,6 @@ async def hybrid_search(
         query=dense_vec,
         using="dense",
         limit=top_k * 4,
-        score_threshold=min_dense_score if min_dense_score is not None else None,
     )
     sparse_prefetch = Prefetch(query=sparse_vec, using="sparse", limit=top_k * 4)
 
@@ -320,6 +318,27 @@ def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
     return results
 
 
+async def retrieve_and_rerank(
+    q: str,
+    top_k: int,
+    qfilter: Filter | None,
+) -> list[SourceArticle]:
+    """Run every retrieval leg, merge RRF candidates, cross-encode rerank, and
+    apply the entity-mention boost. Returns the recency-sorted articles.
+
+    Shared by /search and /ask so the two pipelines stay consistent."""
+    groups = []
+    for rq in _retrieval_queries(q):
+        if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
+            rq = expand_query(rq)
+        candidates = await hybrid_search(rq, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
+        groups.append(candidates)
+    reranked = await rerank(month_query_topic(q) or q, _merge_results(*groups))
+    if config.ENABLE_ENTITY_BOOST:
+        reranked = apply_entity_boost(month_query_topic(q) or q, reranked)
+    return sort_results(reranked)
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search(
     q: str = Query(..., min_length=1),
@@ -334,7 +353,7 @@ async def search(
     retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
     if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
         retrieval_q = expand_query(retrieval_q)
-    eff_top_k = min(max(top_k, top_k_hint(q) or 0), 50)
+    eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
     cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
@@ -344,27 +363,19 @@ async def search(
             results=summaries,
             cached=True,
             latency_ms=(time.perf_counter() - start) * 1000,
-            note=search_note([s.score for s in summaries], date_label(eff_from, eff_to)),
+            note=weak_results_note([s.score for s in summaries], date_label(eff_from, eff_to)),
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    groups = []
-    for rq in _retrieval_queries(q):
-        if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
-            rq = expand_query(rq)
-        candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-        groups.append(candidates)
-    reranked = await rerank(month_query_topic(q) or q, _merge_results(*groups))
-    if config.ENABLE_ENTITY_BOOST:
-        reranked = apply_entity_boost(month_query_topic(q) or q, reranked)
-    results = sort_results(reranked)[:eff_top_k]
+    reranked = await retrieve_and_rerank(q, eff_top_k, qfilter)
+    results = reranked[:eff_top_k]
     await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
     return SearchResponse(
         query=q,
         results=[to_summary(r) for r in results],
         cached=False,
         latency_ms=(time.perf_counter() - start) * 1000,
-        note=search_note([r.score for r in results], date_label(eff_from, eff_to)),
+        note=weak_results_note([r.score for r in results], date_label(eff_from, eff_to)),
     )
 
 
@@ -417,7 +428,7 @@ async def ask(
     retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
     if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
         retrieval_q = expand_query(retrieval_q)
-    eff_top_k = min(max(top_k, top_k_hint(q) or 0), 20)
+    eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 20)
     cache_key = f"ask:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     cached = await cache.get(cache_key)
     if cached is not None:
@@ -432,18 +443,10 @@ async def ask(
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    groups = []
-    for rq in _retrieval_queries(q):
-        if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
-            rq = expand_query(rq)
-        candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-        groups.append(candidates)
-    reranked = await rerank(month_query_topic(q) or q, _merge_results(*groups))
-    if config.ENABLE_ENTITY_BOOST:
-        reranked = apply_entity_boost(month_query_topic(q) or q, reranked)
-    sources = [s for s in sort_results(reranked) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
+    reranked = await retrieve_and_rerank(q, eff_top_k, qfilter)
+    sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
 
-    note = search_note([s.score for s in sources], date_label(eff_from, eff_to)) if config.ENABLE_WEAK_FALLBACK else None
+    note = weak_results_note([s.score for s in sources], date_label(eff_from, eff_to)) if config.ENABLE_WEAK_FALLBACK else None
 
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
@@ -451,7 +454,7 @@ async def ask(
         return AskResponse(query=q, answer=answer, sources=[], cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
-    if config.ENABLE_WEAK_FALLBACK and weak_results(q, [s.score for s in sources]):
+    if config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
         answer = fallback_answer(q, len(sources), date_label(eff_from, eff_to))
         await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
         return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,

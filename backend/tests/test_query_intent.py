@@ -6,7 +6,7 @@ from app.query_intent import (
     extract_year_range,
     month_query_topic,
     rewrite_year_in_review,
-    top_k_hint,
+    suggested_top_k,
 )
 
 
@@ -36,18 +36,18 @@ def test_extract_year_range_no_year_returns_none():
     assert extract_year_range("") is None
 
 
-def test_top_k_hint_numeric():
-    assert top_k_hint("top 5 deals") == 5
-    assert top_k_hint("show me top 20 startups") == 20
-    assert top_k_hint("best 10 companies") == 10
+def test_suggested_top_k_numeric():
+    assert suggested_top_k("top 5 deals") == 5
+    assert suggested_top_k("show me top 20 startups") == 20
+    assert suggested_top_k("best 10 companies") == 10
 
 
-def test_top_k_hint_default_and_none():
-    assert top_k_hint("top deals in fintech") == 10
-    assert top_k_hint("best fintech companies") == 10
-    assert top_k_hint("leading funds") == 10
-    assert top_k_hint("latest news") is None
-    assert top_k_hint("") is None
+def test_suggested_top_k_default_and_none():
+    assert suggested_top_k("top deals in fintech") == 10
+    assert suggested_top_k("best fintech companies") == 10
+    assert suggested_top_k("leading funds") == 10
+    assert suggested_top_k("latest news") is None
+    assert suggested_top_k("") is None
 
 
 def test_rewrite_top_deals_in_year():

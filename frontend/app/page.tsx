@@ -18,7 +18,6 @@ type Result = {
 type ResponseData = {
   query: string
   results: Result[]
-  answer?: string
   cached: boolean
   latency_ms: number
   note?: string
@@ -27,7 +26,7 @@ type ResponseData = {
 type Status =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'done'; query: string; answer?: string; results: Result[]; note?: string; hint?: string }
+  | { kind: 'done'; query: string; results: Result[]; note?: string; hint?: string }
   | { kind: 'error'; message: string }
 
 type SortBy = 'relevance' | 'date_desc' | 'date_asc' | 'score'
@@ -102,7 +101,6 @@ function sanitizeResponse(raw: unknown): ResponseData {
   return {
     query: typeof data.query === 'string' ? data.query : '',
     results,
-    answer: typeof data.answer === 'string' ? data.answer : undefined,
     cached: data.cached === true,
     latency_ms: typeof data.latency_ms === 'number' ? data.latency_ms : 0,
     note: typeof data.note === 'string' && data.note.length ? data.note : undefined,
@@ -200,7 +198,7 @@ export default function Page() {
       }
 
       const data = sanitizeResponse(await res.json())
-      setStatus({ kind: 'done', query: data.query || q, answer: data.answer, results: data.results, note: data.note })
+      setStatus({ kind: 'done', query: data.query || q, results: data.results, note: data.note })
       const cached = data.cached ? 'cached · ' : ''
       setMeta(`${cached}${data.latency_ms.toFixed(0)}ms server · ${(performance.now() - t0).toFixed(0)}ms round-trip`)
     } catch (err) {

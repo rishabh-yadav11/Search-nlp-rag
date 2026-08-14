@@ -13,11 +13,19 @@ Helpers shared by the index scripts (fetch/build/update) and the API.
   a clean, de-duplicated list (used for the payload facet fields).
 * normalize_date(): converts MySQL datetime values into RFC 3339 so Qdrant's
   DATETIME payload index, range filters and recency blending all parse them.
+* record_from_row(): builds the canonical indexed record from a MySQL row, so
+  fetch_data.py and update_index.py build identical payloads.
 """
+import html
+import json
 import re
 from datetime import UTC, datetime
 
 from app.config import config
+
+# vcc_frontend schema -> canonical record mapping. The table/pk come from config.
+# external_url wins over canonical_url for the canonical article link.
+EXTERNAL_URL_SQL = "COALESCE(NULLIF(external_url, ''), NULLIF(canonical_url, ''))"
 
 
 def split_names(value) -> list[str]:
@@ -29,7 +37,7 @@ def split_names(value) -> list[str]:
         return []
     if s.startswith("["):
         try:
-            parsed = __import__("json").loads(s)
+            parsed = json.loads(s)
             if isinstance(parsed, list):
                 return [str(x).strip() for x in parsed if str(x).strip()]
         except (ValueError, TypeError):
@@ -40,6 +48,35 @@ def split_names(value) -> list[str]:
         if p and p not in seen:
             seen.append(p)
     return seen
+
+
+def clean(text) -> str:
+    """Strip HTML tags, unescape entities, collapse whitespace."""
+    if text is None:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", str(text))
+    s = html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def record_from_row(row: dict) -> dict:
+    """Build the canonical indexed record dict from a MySQL row (DictCursor).
+
+    Fields are shared verbatim by fetch_data.py (dump to articles.jsonl),
+    update_index.py (incremental upsert) and backfill_summary.py (payload repair).
+    """
+    return {
+        "id": row["feid"],
+        "title": clean(row["title"]),
+        "summary": clean(row["summary"]),
+        "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
+        "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
+        "published_date": normalize_date(row["publish"]),
+        "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
+        "author_names": split_names(row["author_names"]),
+        "industry_names": split_names(row["industry_names"]),
+        "dealtype_names": split_names(row["dealtype_names"]),
+    }
 
 
 def normalize_date(value):

@@ -27,7 +27,7 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
     return None
 
 
-def weak_results(query: str, scores: list[float], limit: int = 3) -> bool:
+def results_are_weak(scores: list[float], limit: int = 3) -> bool:
     """True when fewer than `limit` of the top reranked scores exceed
     TOP_WEAK_THRESHOLD, i.e. retrieval is too weak to answer the query.
     An empty scores list counts as weak; if there are fewer than `limit`
@@ -57,10 +57,10 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
     )
 
 
-def search_note(scores: list[float], label: str | None = None) -> str | None:
+def weak_results_note(scores: list[float], label: str | None = None) -> str | None:
     """Short annotation for /search when results are weak, else None. With a
     date label the note is framed as a best-effort for that period."""
-    if not weak_results("", scores):
+    if not results_are_weak(scores):
         return None
     if label:
         return f"Showing the closest {label} matches — only a few articles cover this exact topic."

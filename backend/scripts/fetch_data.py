@@ -10,10 +10,8 @@ Usage:
     python scripts/fetch_data.py
 """
 import asyncio
-import html
 import json
 import os
-import re
 import sys
 
 import aiomysql
@@ -21,22 +19,10 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import config
-from app.index_text import normalize_date, split_names
+from app.index_text import EXTERNAL_URL_SQL, record_from_row
 
 OUTPUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 PAGE_SIZE = 5000
-
-# vcc_frontend schema -> articles.jsonl mapping. Table/pk come from config.
-_EXT = "COALESCE(NULLIF(external_url, ''), NULLIF(canonical_url, ''))"
-
-
-def clean(text) -> str:
-    """Strip HTML tags, unescape entities, collapse whitespace."""
-    if text is None:
-        return ""
-    s = re.sub(r"<[^>]+>", " ", str(text))
-    s = html.unescape(s)
-    return re.sub(r"\s+", " ", s).strip()
 
 
 async def fetch_all():
@@ -71,17 +57,17 @@ async def fetch_all():
     # Only published content ('article'/'interview'/'video'); the table pk is `feid`.
     query = f"""
         SELECT
-feid,
-    title,
-    summary,
-    body,
-    slug,
-    {_EXT} AS ext_url,
-    publish,
-    content_type,
-    author_names,
-    industry_names,
-    dealtype_names
+            feid,
+            title,
+            summary,
+            body,
+            slug,
+            {EXTERNAL_URL_SQL} AS ext_url,
+            publish,
+            content_type,
+            author_names,
+            industry_names,
+            dealtype_names
         FROM {config.MYSQL_TABLE}
         WHERE status = 1 AND feid > %s
         ORDER BY feid ASC
@@ -104,18 +90,7 @@ feid,
                     break
 
                 for row in rows:
-                    rec = {
-                        "id": row["feid"],
-                        "title": clean(row["title"]),
-                        "summary": clean(row["summary"]),
-                        "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
-                        "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
-                        "published_date": normalize_date(row["publish"]),
-                        "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
-                        "author_names": split_names(row["author_names"]),
-                        "industry_names": split_names(row["industry_names"]),
-                        "dealtype_names": split_names(row["dealtype_names"]),
-                    }
+                    rec = record_from_row(row)
                     out_f.write(json.dumps(rec, default=str) + "\n")
 
                 out_f.flush()

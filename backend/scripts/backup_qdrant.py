@@ -1,6 +1,5 @@
 """
-Create a Qdrant collection snapshot backup and copy local artifacts
-(audit item #5).
+Create a Qdrant collection snapshot backup and copy local artifacts.
 
 A backup directory ``backend/backups/<collection>-<timestamp>`` is created
 containing the Qdrant collection snapshot (downloaded from the server) plus
