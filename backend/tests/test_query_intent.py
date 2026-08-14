@@ -4,6 +4,7 @@ from app.query_intent import (
     extract_list_topic,
     extract_month_range,
     extract_year_range,
+    month_query_topic,
     rewrite_year_in_review,
     top_k_hint,
 )
@@ -123,6 +124,23 @@ def test_rewrite_skipped_for_month_query():
     q, changed = rewrite_year_in_review("top pharma deals of month january 2025")
     assert changed is False
     assert q == "top pharma deals of month january 2025"
+
+
+def test_month_query_topic_top_n_query():
+    assert month_query_topic("top pharma deals of month january 2025") == "pharma deals"
+    assert month_query_topic("deals in feb 2024") == "deals"
+
+
+def test_month_query_topic_plain_date_query():
+    assert month_query_topic("january 2025") is None
+    assert month_query_topic("ChrysCapital Intas Pharma deals in january 2025") == (
+        "ChrysCapital Intas Pharma deals"
+    )
+
+
+def test_month_query_topic_no_month_returns_none():
+    assert month_query_topic("top pharma deals 2025") is None
+    assert month_query_topic("venture funding") is None
 
 
 def test_extract_list_topic_strips_month_words():
