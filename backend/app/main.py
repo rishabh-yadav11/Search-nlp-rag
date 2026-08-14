@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     await cache.close()
 
 
-app = FastAPI(title="VCCircle Semantic Search POC", lifespan=lifespan)
+app = FastAPI(title="VCCircle New Search", lifespan=lifespan)
 
 # POC-only: wide open for local frontend on :3000. Restrict origins before any real deployment.
 app.add_middleware(

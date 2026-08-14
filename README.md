@@ -1,4 +1,4 @@
-# VCCircle Semantic Search
+# VCCircle New Search
 
 Hybrid retrieval + RAG search over the VCCircle article corpus. Articles are
 indexed into Qdrant with dense (semantic) and sparse (BM25) vectors fused with

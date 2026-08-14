@@ -164,7 +164,7 @@ export default function Page() {
       <header>
         <div className="brand">
           <span className="mark">VCC</span>
-          <h1>Semantic Search — POC</h1>
+          <h1>VCCircle New Search</h1>
         </div>
         <span className="tag">hybrid retrieval · optional cited answers</span>
       </header>
