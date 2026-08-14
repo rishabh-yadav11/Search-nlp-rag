@@ -329,7 +329,9 @@ async def search(
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     groups = []
-    for rq in _retrieval_queries(retrieval_q):
+    for rq in _retrieval_queries(q):
+        if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
+            rq = expand_query(rq)
         candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
         groups.append(await rerank(rq, candidates))
     reranked = _merge_results(*groups)
@@ -411,7 +413,9 @@ async def ask(
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     groups = []
-    for rq in _retrieval_queries(retrieval_q):
+    for rq in _retrieval_queries(q):
+        if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
+            rq = expand_query(rq)
         candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
         groups.append(await rerank(rq, candidates))
     reranked = _merge_results(*groups)
