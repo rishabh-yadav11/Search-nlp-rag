@@ -139,6 +139,31 @@ input[type='text']:focus-visible,
   margin-bottom: 28px;
 }
 
+.sort-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.sort-row select {
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 5px 8px;
+  border: 1.5px solid var(--line);
+  background: white;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.sort-row select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .weak-note {
   background: #fff8e6;
   border-left: 3px solid #d9a400;

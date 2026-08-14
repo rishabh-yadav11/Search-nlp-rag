@@ -29,6 +29,8 @@ type Status =
   | { kind: 'done'; answer?: string; results: Result[]; note?: string }
   | { kind: 'error'; message: string }
 
+type SortBy = 'relevance' | 'date_desc' | 'date_asc' | 'score'
+
 const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
@@ -100,6 +102,7 @@ export default function Page() {
   const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [meta, setMeta] = useState('')
+  const [sortBy, setSortBy] = useState<SortBy>('relevance')
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
 
   useEffect(() => {
@@ -198,14 +201,22 @@ export default function Page() {
         </form>
         <div className="results-region" aria-live="polite" aria-busy={loading}>
           <div className="meta-row">{meta}</div>
-          <ResultBlock status={status} />
+          <ResultBlock status={status} sortBy={sortBy} onSort={setSortBy} />
         </div>
       </main>
     </div>
   )
 }
 
-function ResultBlock({ status }: { status: Status }) {
+function ResultBlock({
+  status,
+  sortBy,
+  onSort,
+}: {
+  status: Status
+  sortBy: SortBy
+  onSort: (s: SortBy) => void
+}) {
   switch (status.kind) {
     case 'idle':
       return <div className="empty">Results will appear here.</div>
@@ -225,7 +236,20 @@ function ResultBlock({ status }: { status: Status }) {
               {status.note}
             </div>
           )}
-          {renderResults(status.results)}
+          <div className="sort-row">
+            <label htmlFor="sort-select">Sort by</label>
+            <select
+              id="sort-select"
+              value={sortBy}
+              onChange={(e) => onSort(e.target.value as SortBy)}
+            >
+              <option value="relevance">Relevance</option>
+              <option value="date_desc">Newest first</option>
+              <option value="date_asc">Oldest first</option>
+              <option value="score">Score</option>
+            </select>
+          </div>
+          {renderResults(sortResults(status.results, sortBy))}
         </div>
       )
   }
@@ -242,6 +266,35 @@ function relevance(score: number): { label: string; cls: string } {
   if (score >= 0.8) return { label: 'High', cls: 'high' }
   if (score >= 0.5) return { label: 'Medium', cls: 'medium' }
   return { label: 'Low', cls: 'low' }
+}
+
+function sortResults(items: Result[], sortBy: SortBy): Result[] {
+  const sorted = [...items]
+  switch (sortBy) {
+    case 'date_desc':
+      return sorted.sort((a, b) => {
+        const da = Date.parse(a.published_date)
+        const db = Date.parse(b.published_date)
+        if (!isNaN(da) && !isNaN(db)) return db - da
+        if (!isNaN(db)) return 1
+        if (!isNaN(da)) return -1
+        return 0
+      })
+    case 'date_asc':
+      return sorted.sort((a, b) => {
+        const da = Date.parse(a.published_date)
+        const db = Date.parse(b.published_date)
+        if (!isNaN(da) && !isNaN(db)) return da - db
+        if (!isNaN(db)) return -1
+        if (!isNaN(da)) return 1
+        return 0
+      })
+    case 'score':
+      return sorted.sort((a, b) => b.score - a.score)
+    case 'relevance':
+    default:
+      return sorted
+  }
 }
 
 function renderResults(items: Result[]) {
