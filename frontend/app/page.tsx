@@ -121,8 +121,15 @@ function isSafeUrl(url: string): boolean {
 function trackClick(query: string, position: number) {
   if (typeof navigator === 'undefined' || !query) return
   try {
-    const blob = new Blob([JSON.stringify({ query, position })], { type: 'application/json' })
-    navigator.sendBeacon(`${API_BASE}/analytics/click`, blob)
+    const payload = JSON.stringify({ query, position })
+    const sent = navigator.sendBeacon(`${API_BASE}/analytics/click`, new Blob([payload], { type: 'application/json' }))
+    if (sent) return
+    fetch(`${API_BASE}/analytics/click`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {})
   } catch {
     /* analytics is best-effort; never block navigation */
   }
