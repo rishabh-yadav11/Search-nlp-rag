@@ -248,7 +248,7 @@ function renderResults(items: Result[]) {
   if (!items.length) return <div className="empty">No matches found.</div>
   return (
     <div>
-      <div className="results-heading">Sources</div>
+      <div className="results-heading">Results</div>
       {items.map((r, i) => {
         const rel = relevance(r.score)
         return (
