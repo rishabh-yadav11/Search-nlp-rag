@@ -160,7 +160,6 @@ export default function Page() {
           <span className="mark">VCC</span>
           <h1>VCCircle New Search</h1>
         </div>
-        <span className="tag">search · cited answers</span>
       </header>
 
       <main>
