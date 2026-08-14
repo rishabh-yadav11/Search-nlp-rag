@@ -1,10 +1,6 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-
-type Mode = 'search' | 'ask'
 
 type Result = {
   id: number
@@ -30,15 +26,15 @@ type ResponseData = {
 type Status =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'done'; mode: Mode; answer?: string; results: Result[]; note?: string }
-  | { kind: 'error'; mode: Mode; message: string }
+  | { kind: 'done'; answer?: string; results: Result[]; note?: string }
+  | { kind: 'error'; message: string }
 
 const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
 
-const TIMEOUT_MS: Record<Mode, number> = { search: 30_000, ask: 60_000 }
+const TIMEOUT_MS = 30_000
 
 function friendlyMessage(status: number): string {
   switch (status) {
@@ -101,11 +97,10 @@ function isSafeUrl(url: string): boolean {
 
 export default function Page() {
   const [query, setQuery] = useState('')
-  const [mode, setMode] = useState<Mode>('search')
   const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [meta, setMeta] = useState('')
-  const submittedRef = useRef<{ mode: Mode; controller: AbortController } | null>(null)
+  const submittedRef = useRef<{ controller: AbortController } | null>(null)
 
   useEffect(() => {
     return () => submittedRef.current?.controller.abort()
@@ -117,8 +112,8 @@ export default function Page() {
 
     submittedRef.current?.controller.abort()
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort('timeout'), TIMEOUT_MS[mode])
-    const submitted = { mode, controller }
+    const timer = setTimeout(() => controller.abort('timeout'), TIMEOUT_MS)
+    const submitted = { controller }
     submittedRef.current = submitted
 
     setLoading(true)
@@ -127,28 +122,27 @@ export default function Page() {
 
     const t0 = performance.now()
     try {
-      const endpoint = mode === 'ask' ? '/ask' : '/search'
-      const res = await fetch(`${API_BASE}${endpoint}?q=${encodeURIComponent(q)}&top_k=8`, {
+      const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}&top_k=8`, {
         signal: controller.signal,
       })
 
       if (!res.ok) {
         const detail = await res.text()
         console.error(`Search API ${res.status}: ${detail}`)
-        setStatus({ kind: 'error', mode, message: friendlyMessage(res.status) })
+        setStatus({ kind: 'error', message: friendlyMessage(res.status) })
         return
       }
 
       const data = sanitizeResponse(await res.json())
-      setStatus({ kind: 'done', mode, answer: data.answer, results: data.results, note: data.note })
+      setStatus({ kind: 'done', answer: data.answer, results: data.results, note: data.note })
       const cached = data.cached ? 'cached · ' : ''
       setMeta(`${cached}${data.latency_ms.toFixed(0)}ms server · ${(performance.now() - t0).toFixed(0)}ms round-trip`)
     } catch (err) {
       if (!controller.signal.aborted) {
         console.error('Search API network error', err)
-        setStatus({ kind: 'error', mode, message: 'Something went wrong. Please try again.' })
+        setStatus({ kind: 'error', message: 'Something went wrong. Please try again.' })
       } else if (controller.signal.reason === 'timeout') {
-        setStatus({ kind: 'error', mode, message: 'Request timed out. Please try again.' })
+        setStatus({ kind: 'error', message: 'Request timed out. Please try again.' })
       }
     } finally {
       clearTimeout(timer)
@@ -166,7 +160,7 @@ export default function Page() {
           <span className="mark">VCC</span>
           <h1>VCCircle New Search</h1>
         </div>
-        <span className="tag">hybrid retrieval · optional cited answers</span>
+        <span className="tag">search · cited answers</span>
       </header>
 
       <main>
@@ -185,28 +179,22 @@ export default function Page() {
             aria-label="Search query"
             autoComplete="off"
           />
-          <div className="mode-toggle" role="group" aria-label="Search mode">
-            <button
-              type="button"
-              aria-pressed={mode === 'search'}
-              disabled={loading}
-              className={mode === 'search' ? 'active' : ''}
-              onClick={() => setMode('search')}
+          <button className="go-btn" type="submit" disabled={loading} aria-label="Search">
+            <svg
+              className="search-icon"
+              viewBox="0 0 24 24"
+              width="18"
+              height="18"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
             >
-              SEARCH
-            </button>
-            <button
-              type="button"
-              aria-pressed={mode === 'ask'}
-              disabled={loading}
-              className={mode === 'ask' ? 'active' : ''}
-              onClick={() => setMode('ask')}
-            >
-              ASK
-            </button>
-          </div>
-          <button className="go-btn" type="submit" disabled={loading}>
-            Run
+              <circle cx="11" cy="11" r="7" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
           </button>
         </form>
         <div className="results-region" aria-live="polite" aria-busy={loading}>
@@ -233,11 +221,6 @@ function ResultBlock({ status }: { status: Status }) {
     case 'done':
       return (
         <div>
-          {status.mode === 'ask' && status.answer && (
-            <div className="answer-block markdown-body">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{status.answer}</ReactMarkdown>
-            </div>
-          )}
           {status.note && (
             <div className="weak-note" role="note">
               {status.note}
@@ -249,30 +232,52 @@ function ResultBlock({ status }: { status: Status }) {
   }
 }
 
+function formatDate(s: string): string {
+  if (!s) return 'n/a'
+  const d = new Date(s)
+  if (isNaN(d.getTime())) return s
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+}
+
+function relevance(score: number): { label: string; cls: string } {
+  if (score >= 0.8) return { label: 'High', cls: 'high' }
+  if (score >= 0.5) return { label: 'Medium', cls: 'medium' }
+  return { label: 'Low', cls: 'low' }
+}
+
 function renderResults(items: Result[]) {
   if (!items.length) return <div className="empty">No matches found.</div>
   return (
     <div>
       <div className="results-heading">Sources</div>
-      {items.map((r, i) => (
-        <div className="result" key={r.id}>
-          <div className="idx">{i + 1}</div>
-          <div className="body">
-            {isSafeUrl(r.url) ? (
-              <a href={r.url} target="_blank" rel="noopener noreferrer">
-                {r.title || 'Untitled'}
-              </a>
-            ) : (
-              <span className="plain-title">{r.title || 'Untitled'}</span>
-            )}
-            <div className="info">
-              <span className="score">{r.score.toFixed(3)}</span>
-              <span>{r.published_date || 'n/a'}</span>
-              {r.category ? <span>{r.category}</span> : null}
+      {items.map((r, i) => {
+        const rel = relevance(r.score)
+        return (
+          <div className="result" key={r.id}>
+            <div className="idx">{i + 1}</div>
+            <div className="body">
+              {isSafeUrl(r.url) ? (
+                <a href={r.url} target="_blank" rel="noopener noreferrer">
+                  {r.title || 'Untitled'}
+                </a>
+              ) : (
+                <span className="plain-title">{r.title || 'Untitled'}</span>
+              )}
+              <div className="info">
+                <span className={`badge ${rel.cls}`}>{rel.label}</span>
+                <span className="score">{r.score.toFixed(3)}</span>
+                <span>{formatDate(r.published_date)}</span>
+                {r.category ? <span>{r.category}</span> : null}
+              </div>
+              <div className="facet-line">
+                {r.author_names?.length ? <span className="facet">✎ {r.author_names.join(', ')}</span> : null}
+                {r.industry_names?.length ? <span className="facet">◆ {r.industry_names.join(', ')}</span> : null}
+                {r.dealtype_names?.length ? <span className="facet">● {r.dealtype_names.join(', ')}</span> : null}
+              </div>
             </div>
           </div>
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
