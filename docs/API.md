@@ -106,6 +106,55 @@ Distinct values for filter autocomplete. Cached in Redis.
 
 ---
 
+## `POST /analytics/click`
+
+Anonymous result-click beacon sent by the frontend when a user opens a result
+(no user identifiers, no cookies). `sendBeacon` from the search page.
+
+### Body
+
+```json
+{ "query": "fintech funding", "position": 2 }
+```
+
+### Response
+
+`200` with `{"ok": true}`. Recording is best-effort; a Redis outage never
+affects search.
+
+---
+
+## `GET /analytics/summary`
+
+Aggregated search-quality and click metrics, stored in Redis DB 1
+(`ANALYTICS_REDIS_DB`). Protected by `ANALYTICS_VIEW_TOKEN` when set (send it
+as `Authorization: Bearer <token>` or `?token=<token>`); otherwise open.
+
+### Response
+
+```json
+{
+  "searches_total": 120,
+  "searches_today": 14,
+  "zero_result_rate": 4.2,
+  "weak_result_rate": 8.3,
+  "filtered_rate": 12.5,
+  "cache_hit_rate": 61.0,
+  "avg_latency_ms": 214.3,
+  "asks_total": 9,
+  "clicks_total": 33,
+  "top_queries": [["fintech funding", 22], ...],
+  "top_asks": [["who funds fintech", 3], ...],
+  "click_positions": { "1": 12, "2": 8, ... },
+  "click_top_queries": [["fintech funding", 9], ...]
+}
+```
+
+Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`).
+
+
+---
+
 ## Health endpoints
 
 | Endpoint | Purpose | Status |

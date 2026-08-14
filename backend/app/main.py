@@ -23,6 +23,9 @@ from qdrant_client.models import (
 )
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
+from app.analytics import close as close_analytics
+from app.analytics import record_ask, record_click, record_search
+from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
 from app.config import config
 from app.health import router as health_router
@@ -51,6 +54,7 @@ async def lifespan(app: FastAPI):
     yield
     await state["qdrant"].close()
     await cache.close()
+    await close_analytics()
 
 
 app = FastAPI(title="VCCircle New Search", lifespan=lifespan)
@@ -355,27 +359,34 @@ async def search(
         retrieval_q = expand_query(retrieval_q)
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
     cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
+    filtered = any((industry, dealtype, author, from_date, to_date))
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
         summaries = [SourceSummary.model_validate(d) for d in cached_results]
+        note = weak_results_note([s.score for s in summaries], date_label(eff_from, eff_to))
+        await record_search(q, len(summaries), bool(note), cached=True,
+                            latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
         return SearchResponse(
             query=q,
             results=summaries,
             cached=True,
             latency_ms=(time.perf_counter() - start) * 1000,
-            note=weak_results_note([s.score for s in summaries], date_label(eff_from, eff_to)),
+            note=note,
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     reranked = await retrieve_and_rerank(q, eff_top_k, qfilter)
     results = reranked[:eff_top_k]
+    note = weak_results_note([r.score for r in results], date_label(eff_from, eff_to))
     await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
+    await record_search(q, len(results), bool(note), cached=False,
+                        latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
     return SearchResponse(
         query=q,
         results=[to_summary(r) for r in results],
         cached=False,
         latency_ms=(time.perf_counter() - start) * 1000,
-        note=weak_results_note([r.score for r in results], date_label(eff_from, eff_to)),
+        note=note,
     )
 
 
@@ -433,6 +444,7 @@ async def ask(
     cached = await cache.get(cache_key)
     if cached is not None:
         sources = [SourceSummary.model_validate(s) for s in cached["sources"]]
+        await record_ask(q, "answered", cached=True)
         return AskResponse(
             query=q,
             answer=cached["answer"],
@@ -451,12 +463,14 @@ async def ask(
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
         await cache.set(cache_key, {"answer": answer, "sources": [], "note": note})
+        await record_ask(q, "none", cached=False)
         return AskResponse(query=q, answer=answer, sources=[], cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     if config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
         answer = fallback_answer(q, len(sources), date_label(eff_from, eff_to))
         await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
+        await record_ask(q, "fallback", cached=False)
         return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
@@ -466,12 +480,14 @@ async def ask(
     try:
         answer = await generate_answer(state["llm"], prompt, config.LLM_MODEL)
     except LLMUnavailableError:
+        await record_ask(q, "error", cached=False)
         raise HTTPException(
             status_code=503,
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
 
     await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
+    await record_ask(q, "answered", cached=False)
     return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
@@ -516,3 +532,26 @@ async def facets():
     }
     await cache.set(FACETS_CACHE_KEY, result)
     return result
+
+
+class ClickEvent(BaseModel):
+    query: str = ""
+    position: int = 0
+
+
+@app.post("/analytics/click")
+async def analytics_click(event: ClickEvent):
+    """Anonymous result-click beacon from the frontend (no identifiers)."""
+    await record_click(event.query, event.position)
+    return {"ok": True}
+
+
+@app.get("/analytics/summary")
+async def get_analytics_summary(authorization: str | None = None, token: str | None = None):
+    """Aggregated search/click metrics. Protected by ANALYTICS_VIEW_TOKEN when
+    set (Bearer token or ?token=); otherwise open (POC default)."""
+    if config.ANALYTICS_VIEW_TOKEN:
+        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
+        if supplied != config.ANALYTICS_VIEW_TOKEN:
+            raise HTTPException(status_code=401, detail="invalid analytics token")
+    return await analytics_data()

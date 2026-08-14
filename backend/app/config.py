@@ -76,5 +76,11 @@ class Config:
     ENABLE_ENTITY_BOOST = os.getenv("ENABLE_ENTITY_BOOST", "true").lower() in ("1", "true", "yes")
     ENABLE_WEAK_FALLBACK = os.getenv("ENABLE_WEAK_FALLBACK", "true").lower() in ("1", "true", "yes")
 
+    # Analytics
+    # Aggregates live in Redis DB 1 (the query cache uses DB 0 and is flushed
+    # during deploys). When a view token is set, /analytics/summary requires it.
+    ANALYTICS_REDIS_DB = int(os.getenv("ANALYTICS_REDIS_DB", "1"))
+    ANALYTICS_VIEW_TOKEN = os.getenv("ANALYTICS_VIEW_TOKEN", "")
+
 
 config = Config()

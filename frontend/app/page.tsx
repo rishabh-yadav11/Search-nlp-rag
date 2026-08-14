@@ -118,6 +118,16 @@ function isSafeUrl(url: string): boolean {
   }
 }
 
+function trackClick(query: string, position: number) {
+  if (typeof navigator === 'undefined' || !query) return
+  try {
+    const blob = new Blob([JSON.stringify({ query, position })], { type: 'application/json' })
+    navigator.sendBeacon(`${API_BASE}/analytics/click`, blob)
+  } catch {
+    /* analytics is best-effort; never block navigation */
+  }
+}
+
 export default function Page() {
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(false)
@@ -535,7 +545,12 @@ function renderResults(items: Result[], query: string) {
             <div className="idx">{i + 1}</div>
             <div className="body">
               {isSafeUrl(r.url) ? (
-                <a href={r.url} target="_blank" rel="noopener noreferrer">
+                <a
+                  href={r.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={() => trackClick(query, i + 1)}
+                >
                   {r.title || 'Untitled'}
                 </a>
               ) : (
