@@ -46,25 +46,41 @@ def top_k_hint(query: str) -> int | None:
 def rewrite_year_in_review(query: str) -> tuple[str, bool]:
     """For 'top/best <topic> in <year>' style queries, rewrite to surface the
     year-in-review ('Flashback <year>') articles. Returns (query, changed)."""
-    yr = None
+    topic = extract_list_topic(query)
+    yr = _year_of(query)
+    if yr is None or topic is None:
+        return query, False
+    new_q = f"Flashback {yr} {topic}".strip()
+    return new_q, new_q != query
+
+
+def _year_of(query: str) -> int | None:
+    """The year referenced by the query (explicit, span, last/this year, or an
+    explicit 'Flashback <year>' prefix), else None."""
     m = _FLASHBACK_RE.search(query)
     if m:
-        yr = int(m.group(1))
-    else:
-        rng = extract_year_range(query)
-        if rng is not None:
-            yr = int(rng[0][:4])
-    if yr is None:
-        return query, False
-    if _TOP_HINT_RE.search(query) is None:
-        return query, False
+        return int(m.group(1))
+    rng = extract_year_range(query)
+    if rng is not None:
+        return int(rng[0][:4])
+    return None
 
-    stripped = _YEAR_RE.sub(" ", query)
+
+def extract_list_topic(query: str) -> str | None:
+    """The bare topic of a top-N query with year/time words removed, e.g.
+    'top 3 unicorns created in 2025' -> 'unicorns created'. None when the
+    query is not a top/best/list intent."""
+    if _TOP_HINT_RE.search(query) is None:
+        return None
+    stripped = _YEAR_SPAN_RE.sub(" ", query)
+    stripped = _YEAR_RE.sub(" ", stripped)
     stripped = _LAST_YEAR_RE.sub(" ", stripped)
     stripped = _THIS_YEAR_RE.sub(" ", stripped)
     stripped = _TOP_HINT_RE.sub(" ", stripped)
     stripped = _FLASHBACK_RE.sub(" ", stripped)
-    stripped = re.sub(r"\bof\b|\bin\b|\bfor\b|\byear\b|\byears\b|\bflashback\b", " ", stripped)
-    topic = " ".join(stripped.split()).strip()
-    new_q = f"Flashback {yr} {topic}".strip()
-    return new_q, new_q != query
+    stripped = re.sub(
+        r"\bof\b|\bin\b|\bfor\b|\bto\b|\byear\b|\byears\b|\bflashback\b", " ", stripped, flags=re.IGNORECASE
+    )
+    stripped = re.sub(r"[\s-]+", " ", stripped).strip()
+    topic = stripped.strip()
+    return topic or None

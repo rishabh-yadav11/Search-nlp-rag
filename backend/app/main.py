@@ -28,7 +28,7 @@ from app.config import config
 from app.health import router as health_router
 from app.llm import LLMUnavailableError, generate_answer
 from app.query_expand import expand_query
-from app.query_intent import extract_year_range, rewrite_year_in_review, top_k_hint
+from app.query_intent import extract_list_topic, extract_year_range, rewrite_year_in_review, top_k_hint
 from app.redis_cache import cache
 from app.rerank_boost import apply_entity_boost
 
@@ -193,6 +193,33 @@ def _effective_intent(
     return retrieval_q, from_date, to_date
 
 
+def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
+    """Concatenate and dedupe by id, keeping the highest score for each id
+    (each group is independently RRF/reranked; the cross-encoder rerank below
+    re-scores the merged set, so we only need to de-duplicate here)."""
+    best: dict[int, SourceArticle] = {}
+    for group in groups:
+        for a in group:
+            prev = best.get(a.id)
+            if prev is None or a.score > prev.score:
+                best[a.id] = a
+    return list(best.values())
+
+
+def _retrieval_queries(q: str) -> list[str]:
+    """Queries to run for a user query. For year-in-review intents this is the
+    Flashback-rewritten query PLUS the bare topic (year-filtered) so niche
+    topics that have no dedicated Flashback article still surface their specific
+    articles (e.g. 'venture debt providers', 'unicorns created'). Otherwise a
+    single query."""
+    flashback, changed = rewrite_year_in_review(q)
+    if not changed:
+        return [q]
+    topic = extract_list_topic(q) or q
+    # Dedupe identical entries (e.g. query that's already 'Flashback Y topic').
+    return list(dict.fromkeys([flashback, topic]))
+
+
 async def hybrid_search(
     query: str,
     top_k: int,
@@ -301,8 +328,11 @@ async def search(
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-    reranked = await rerank(retrieval_q, candidates)
+    groups = []
+    for rq in _retrieval_queries(retrieval_q):
+        candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
+        groups.append(await rerank(rq, candidates))
+    reranked = _merge_results(*groups)
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(q, reranked)
     results = sort_results(reranked)[:eff_top_k]
@@ -380,8 +410,11 @@ async def ask(
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    candidates = await hybrid_search(retrieval_q, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-    reranked = await rerank(retrieval_q, candidates)
+    groups = []
+    for rq in _retrieval_queries(retrieval_q):
+        candidates = await hybrid_search(rq, max(eff_top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
+        groups.append(await rerank(rq, candidates))
+    reranked = _merge_results(*groups)
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(q, reranked)
     sources = [s for s in sort_results(reranked) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]

@@ -151,3 +151,44 @@ def test_rerank_single_result_short_circuit(monkeypatch):
     out = asyncio.run(main.rerank("q", [one]))
     assert fake.calls == 0
     assert out == [one]
+
+
+def test_merge_results_dedupes_keeping_highest_score():
+    from app.main import _merge_results
+
+    a1 = _article(1, 0.5, title="x")
+    a2 = _article(1, 0.9, title="x")
+    b = _article(2, 0.7, title="y")
+    merged = _merge_results([a1, b], [a2])
+    assert [x.id for x in merged] == [1, 2]
+    assert abs(merged[0].score - 0.9) < 1e-9
+
+
+def test_merge_results_empty_and_disjoint():
+    from app.main import _merge_results
+
+    a = _article(1, 0.4)
+    c = _article(3, 0.6)
+    assert _merge_results() == []
+    assert [x.id for x in _merge_results([a], [c])] == [1, 3]
+
+
+def test_retrieval_queries_dual_for_year_top_intent():
+    from app.main import _retrieval_queries
+
+    qs = _retrieval_queries("top 3 unicorns created in 2025")
+    assert qs == ["Flashback 2025 unicorns created", "unicorns created"]
+
+
+def test_retrieval_queries_single_for_non_year_top():
+    from app.main import _retrieval_queries
+
+    assert _retrieval_queries("fintech funding") == ["fintech funding"]
+
+
+def test_retrieval_queries_no_dup_when_topic_equals_rewrite():
+    from app.main import _retrieval_queries
+
+    # A query that's already a bare 'top <topic>' with no year: no rewrite -> single
+    qs = _retrieval_queries("top deals")
+    assert qs == ["top deals"]

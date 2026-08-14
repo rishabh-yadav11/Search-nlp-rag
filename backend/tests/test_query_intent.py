@@ -1,5 +1,11 @@
 
-from app.query_intent import extract_year_range, rewrite_year_in_review, top_k_hint
+
+from app.query_intent import (
+    extract_list_topic,
+    extract_year_range,
+    rewrite_year_in_review,
+    top_k_hint,
+)
 
 
 def test_extract_year_range_explicit_year():
@@ -64,3 +70,31 @@ def test_rewrite_unchanged_without_year():
     q, changed = rewrite_year_in_review("top deals")
     assert changed is False
     assert q == "top deals"
+
+
+def test_extract_list_topic_basic():
+    assert extract_list_topic("top 3 unicorns created in 2025") == "unicorns created"
+    assert extract_list_topic("top 10 fintech deals in 2025") == "fintech deals"
+    assert extract_list_topic("biggest PE funds raised last year") == "PE funds raised"
+
+
+def test_extract_list_topic_no_intent():
+    assert extract_list_topic("funding deals in 2025") is None
+    assert extract_list_topic("top deals") == "deals"
+
+
+def test_extract_list_topic_year_span_removed():
+    assert extract_list_topic("best M&A deals in 2023-2025") == "M&A deals"
+
+
+def test_rewrite_niche_topic_flashback_kept_but_topic_extractable():
+    """The Flashback rewrite still fires, but the bare topic is recoverable for
+    the second (direct) retrieval leg used to surface niche articles."""
+    new_q, changed = rewrite_year_in_review("top venture debt providers in 2024")
+    assert changed is True
+    assert new_q == "Flashback 2024 venture debt providers"
+    assert extract_list_topic("top venture debt providers in 2024") == "venture debt providers"
+
+
+def test_extract_list_topic_ignores_explicit_flashback_prefix():
+    assert extract_list_topic("Flashback 2025 biggest deals") == "deals"
