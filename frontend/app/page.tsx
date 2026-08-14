@@ -35,7 +35,6 @@ type SortBy = 'relevance' | 'date_desc' | 'date_asc' | 'score'
 type Filters = {
   industry: string
   dealtype: string
-  author: string
   from_date: string
   to_date: string
 }
@@ -43,7 +42,6 @@ type Filters = {
 const EMPTY_FILTERS: Filters = {
   industry: '',
   dealtype: '',
-  author: '',
   from_date: '',
   to_date: '',
 }
@@ -303,16 +301,6 @@ export default function Page() {
                     onChange={(e) => updateFilter('dealtype', e.target.value)}
                     placeholder="e.g. venture debt"
                     aria-label="Dealtype filter"
-                  />
-                </label>
-                <label className="filter-field">
-                  <span className="filter-label">author</span>
-                  <input
-                    type="text"
-                    value={filters.author}
-                    onChange={(e) => updateFilter('author', e.target.value)}
-                    placeholder="e.g. Priya"
-                    aria-label="Author filter"
                   />
                 </label>
                 <label className="filter-field">
