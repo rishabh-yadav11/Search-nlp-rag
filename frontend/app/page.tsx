@@ -49,10 +49,9 @@ const EMPTY_FILTERS: Filters = {
 }
 
 const SUGGESTIONS = [
-  'top 10 fintech deals in 2025',
-  'Ola Electric IPO price band',
-  'top venture debt providers in 2024',
-  "who invested in BYJU'S funding round",
+  'top 10 fintech deals 2025',
+  'Ola Electric IPO',
+  'top venture debt providers 2024',
 ]
 
 const API_BASE =
@@ -248,20 +247,9 @@ export default function Page() {
               <line x1="21" y1="21" x2="16.65" y2="16.65" />
             </svg>
           </button>
-        </form>
-
-        <div className="suggestions" role="group" aria-label="Search suggestions">
-          {SUGGESTIONS.map((s) => (
-            <button key={s} type="button" className="chip" onClick={() => handleSuggestion(s)} aria-label={`Search for ${s}`}>
-              {s}
-            </button>
-          ))}
-        </div>
-
-        <div className="filters-menu">
           <button
             type="button"
-            className="filters-toggle"
+            className={`filter-toggle ${showFilters ? 'active' : ''}`}
             onClick={() => setShowFilters((v) => !v)}
             aria-expanded={showFilters}
             aria-controls="filters-panel"
@@ -270,8 +258,8 @@ export default function Page() {
             <svg
               className="filter-icon"
               viewBox="0 0 24 24"
-              width="16"
-              height="16"
+              width="18"
+              height="18"
               fill="none"
               stroke="currentColor"
               strokeWidth="2"
@@ -283,12 +271,20 @@ export default function Page() {
               <path d="M7 12h10" />
               <path d="M10 18h4" />
             </svg>
-            Filters{hasFilters ? ' ·' : ''}
           </button>
+        </form>
 
-          {showFilters && (
-            <section id="filters-panel" className="filters" aria-label="Search filters">
-              <div className="filters-grid">
+        <div className="suggestions" role="group" aria-label="Search suggestions">
+          {SUGGESTIONS.map((s) => (
+            <button key={s} type="button" className="chip" onClick={() => handleSuggestion(s)} aria-label={`Search for ${s}`}>
+              {s}
+            </button>
+          ))}
+        </div>
+
+        {showFilters && (
+          <section id="filters-panel" className="filters" aria-label="Search filters">
+            <div className="filters-grid">
                 <label className="filter-field">
                   <span className="filter-label">industry</span>
                   <input
@@ -345,7 +341,6 @@ export default function Page() {
               </div>
             </section>
           )}
-        </div>
 
         <div className="results-region" aria-live="polite" aria-busy={loading}>
           <div className="meta-row">{meta}</div>
