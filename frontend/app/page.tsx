@@ -129,10 +129,31 @@ export default function Page() {
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
   const [showFilters, setShowFilters] = useState(false)
   const [hideLow, setHideLow] = useState(false)
+  const [facetOptions, setFacetOptions] = useState<{ industry: string[]; dealtype: string[] }>({
+    industry: [],
+    dealtype: [],
+  })
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
 
   useEffect(() => {
     return () => submittedRef.current?.controller.abort()
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API_BASE}/facets`, { signal: AbortSignal.timeout(10_000) })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return
+        setFacetOptions({
+          industry: Array.isArray(data.industry) ? data.industry : [],
+          dealtype: Array.isArray(data.dealtype) ? data.dealtype : [],
+        })
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const hasFilters = Object.values(filters).some((v) => v.trim() !== '')
@@ -287,22 +308,34 @@ export default function Page() {
                   <span className="filter-label">industry</span>
                   <input
                     type="text"
+                    list="industry-options"
                     value={filters.industry}
                     onChange={(e) => updateFilter('industry', e.target.value)}
                     placeholder="e.g. fintech"
                     aria-label="Industry filter"
                   />
                 </label>
+                <datalist id="industry-options">
+                  {facetOptions.industry.map((v) => (
+                    <option key={v} value={v} />
+                  ))}
+                </datalist>
                 <label className="filter-field">
                   <span className="filter-label">dealtype</span>
                   <input
                     type="text"
+                    list="dealtype-options"
                     value={filters.dealtype}
                     onChange={(e) => updateFilter('dealtype', e.target.value)}
                     placeholder="e.g. venture debt"
                     aria-label="Dealtype filter"
                   />
                 </label>
+                <datalist id="dealtype-options">
+                  {facetOptions.dealtype.map((v) => (
+                    <option key={v} value={v} />
+                  ))}
+                </datalist>
                 <label className="filter-field">
                   <span className="filter-label">from_date</span>
                   <input

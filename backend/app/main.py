@@ -455,3 +455,45 @@ async def ask(
     await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
     return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, note=note)
+
+
+FACETS_CACHE_KEY = "facets:v1"
+FACETS_LIMIT = 200
+
+
+@app.get("/facets")
+async def facets():
+    """Distinct industry_names and dealtype_names values across the collection,
+    used for filter autocomplete. Cached in Redis (small controlled vocab)."""
+    cached = await cache.get(FACETS_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    industries: set[str] = set()
+    dealtypes: set[str] = set()
+    offset = None
+    while True:
+        points, offset = await state["qdrant"].scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            limit=2000,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            pl = p.payload or {}
+            for v in pl.get("industry_names") or []:
+                if isinstance(v, str) and v.strip():
+                    industries.add(v.strip())
+            for v in pl.get("dealtype_names") or []:
+                if isinstance(v, str) and v.strip():
+                    dealtypes.add(v.strip())
+        if offset is None or not points:
+            break
+
+    result = {
+        "industry": sorted(industries)[:FACETS_LIMIT],
+        "dealtype": sorted(dealtypes)[:FACETS_LIMIT],
+    }
+    await cache.set(FACETS_CACHE_KEY, result)
+    return result
