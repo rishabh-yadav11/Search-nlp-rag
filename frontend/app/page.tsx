@@ -225,17 +225,21 @@ export default function Page() {
   }
 
   return (
-    <div>
-      <header>
-        <div className="brand">
-          <span className="mark">VCC</span>
-          <h1>ASK VCCircle</h1>
+    <div className="app">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="brand">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img className="logo" src="/vccircle-wordmark.svg" alt="VCCircle" width={130} height={35} />
+            <span className="ask">ASK</span>
+          </div>
         </div>
       </header>
 
       <main>
         <form
-          className="search-row"
+          id="search"
+          className="search-hero search-row"
           onSubmit={(e) => {
             e.preventDefault()
             run()
@@ -368,6 +372,17 @@ export default function Page() {
           <ResultBlock status={status} sortBy={sortBy} onSort={setSortBy} hideLow={hideLow} onHideLow={setHideLow} />
         </div>
       </main>
+
+      <footer className="site-footer">
+        <div className="footer-inner">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img className="footer-logo" src="/vccircle-wordmark.svg" alt="VCCircle" width={120} height={32} />
+          <span className="footer-note">
+            ASK VCCircle &middot; AI-assisted search over VCCircle&rsquo;s archives
+          </span>
+          <span className="footer-copy">&copy; 2026 VCCircle</span>
+        </div>
+      </footer>
     </div>
   )
 }
