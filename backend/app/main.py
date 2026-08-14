@@ -23,7 +23,7 @@ from qdrant_client.models import (
 )
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
-from app.answer_fallback import fallback_answer, search_note, weak_results
+from app.answer_fallback import date_label, fallback_answer, search_note, weak_results
 from app.config import config
 from app.health import router as health_router
 from app.llm import LLMUnavailableError, generate_answer
@@ -328,7 +328,7 @@ async def search(
             results=summaries,
             cached=True,
             latency_ms=(time.perf_counter() - start) * 1000,
-            note=search_note([s.score for s in summaries]),
+            note=search_note([s.score for s in summaries], date_label(eff_from, eff_to)),
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
@@ -348,7 +348,7 @@ async def search(
         results=[to_summary(r) for r in results],
         cached=False,
         latency_ms=(time.perf_counter() - start) * 1000,
-        note=search_note([r.score for r in results]),
+        note=search_note([r.score for r in results], date_label(eff_from, eff_to)),
     )
 
 
@@ -427,7 +427,7 @@ async def ask(
         reranked = apply_entity_boost(q, reranked)
     sources = [s for s in sort_results(reranked) if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
 
-    note = search_note([s.score for s in sources]) if config.ENABLE_WEAK_FALLBACK else None
+    note = search_note([s.score for s in sources], date_label(eff_from, eff_to)) if config.ENABLE_WEAK_FALLBACK else None
 
     if not sources:
         answer = "No sufficiently relevant articles were found for this query."
@@ -436,7 +436,7 @@ async def ask(
                             latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     if config.ENABLE_WEAK_FALLBACK and weak_results(q, [s.score for s in sources]):
-        answer = fallback_answer(q, len(sources))
+        answer = fallback_answer(q, len(sources), date_label(eff_from, eff_to))
         await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
         return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
                             latency_ms=(time.perf_counter() - start) * 1000, note=note)
