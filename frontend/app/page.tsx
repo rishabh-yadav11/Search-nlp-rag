@@ -12,6 +12,7 @@ type Result = {
   author_names?: string[]
   industry_names?: string[]
   dealtype_names?: string[]
+  summary?: string
 }
 
 type ResponseData = {
@@ -26,10 +27,33 @@ type ResponseData = {
 type Status =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'done'; answer?: string; results: Result[]; note?: string }
+  | { kind: 'done'; query: string; answer?: string; results: Result[]; note?: string; hint?: string }
   | { kind: 'error'; message: string }
 
 type SortBy = 'relevance' | 'date_desc' | 'date_asc' | 'score'
+
+type Filters = {
+  industry: string
+  dealtype: string
+  author: string
+  from_date: string
+  to_date: string
+}
+
+const EMPTY_FILTERS: Filters = {
+  industry: '',
+  dealtype: '',
+  author: '',
+  from_date: '',
+  to_date: '',
+}
+
+const SUGGESTIONS = [
+  'top 10 fintech deals in 2025',
+  'Ola Electric IPO price band',
+  'top venture debt providers in 2024',
+  "who invested in BYJU'S funding round",
+]
 
 const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
@@ -63,6 +87,7 @@ function sanitizeResponse(raw: unknown): ResponseData {
 
   const results: Result[] = rawResults.map((item, i) => {
     const r = (typeof item === 'object' && item !== null ? item : {}) as Record<string, unknown>
+    const summary = typeof r.summary === 'string' ? r.summary.trim() : ''
     return {
       id: typeof r.id === 'number' ? r.id : i,
       title: typeof r.title === 'string' ? r.title : '',
@@ -73,6 +98,7 @@ function sanitizeResponse(raw: unknown): ResponseData {
       author_names: sanitizeStrings(r.author_names),
       industry_names: sanitizeStrings(r.industry_names),
       dealtype_names: sanitizeStrings(r.dealtype_names),
+      summary: summary || undefined,
     }
   })
 
@@ -103,15 +129,28 @@ export default function Page() {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [meta, setMeta] = useState('')
   const [sortBy, setSortBy] = useState<SortBy>('relevance')
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
+  const [hideLow, setHideLow] = useState(false)
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
 
   useEffect(() => {
     return () => submittedRef.current?.controller.abort()
   }, [])
 
-  async function run() {
-    const q = query.trim()
-    if (!q || loading) return
+  const hasFilters = Object.values(filters).some((v) => v.trim() !== '')
+
+  function updateFilter(key: keyof Filters, value: string) {
+    setFilters((f) => ({ ...f, [key]: value }))
+  }
+
+  async function run(qOverride?: string) {
+    const q = (qOverride ?? query).trim()
+    if (loading) return
+    if (!q) {
+      setMeta('')
+      setStatus({ kind: 'done', query: '', results: [], hint: 'Please enter a query to search.' })
+      return
+    }
 
     submittedRef.current?.controller.abort()
     const controller = new AbortController()
@@ -123,9 +162,14 @@ export default function Page() {
     setMeta('')
     setStatus({ kind: 'loading' })
 
+    const params = new URLSearchParams({ q, top_k: '8' })
+    for (const [key, value] of Object.entries(filters)) {
+      if (value && value.trim()) params.set(key, value.trim())
+    }
+
     const t0 = performance.now()
     try {
-      const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}&top_k=8`, {
+      const res = await fetch(`${API_BASE}/search?${params.toString()}`, {
         signal: controller.signal,
       })
 
@@ -137,7 +181,7 @@ export default function Page() {
       }
 
       const data = sanitizeResponse(await res.json())
-      setStatus({ kind: 'done', answer: data.answer, results: data.results, note: data.note })
+      setStatus({ kind: 'done', query: data.query || q, answer: data.answer, results: data.results, note: data.note })
       const cached = data.cached ? 'cached · ' : ''
       setMeta(`${cached}${data.latency_ms.toFixed(0)}ms server · ${(performance.now() - t0).toFixed(0)}ms round-trip`)
     } catch (err) {
@@ -154,6 +198,11 @@ export default function Page() {
         setLoading(false)
       }
     }
+  }
+
+  function handleSuggestion(s: string) {
+    setQuery(s)
+    run(s)
   }
 
   return (
@@ -199,9 +248,77 @@ export default function Page() {
             </svg>
           </button>
         </form>
+
+        <div className="suggestions" role="group" aria-label="Search suggestions">
+          {SUGGESTIONS.map((s) => (
+            <button key={s} type="button" className="chip" onClick={() => handleSuggestion(s)} aria-label={`Search for ${s}`}>
+              {s}
+            </button>
+          ))}
+        </div>
+
+        <section className="filters" aria-label="Search filters">
+          <div className="filters-title">Filters</div>
+          <div className="filters-grid">
+            <label className="filter-field">
+              <span className="filter-label">industry</span>
+              <input
+                type="text"
+                value={filters.industry}
+                onChange={(e) => updateFilter('industry', e.target.value)}
+                placeholder="e.g. fintech"
+                aria-label="Industry filter"
+              />
+            </label>
+            <label className="filter-field">
+              <span className="filter-label">dealtype</span>
+              <input
+                type="text"
+                value={filters.dealtype}
+                onChange={(e) => updateFilter('dealtype', e.target.value)}
+                placeholder="e.g. venture debt"
+                aria-label="Dealtype filter"
+              />
+            </label>
+            <label className="filter-field">
+              <span className="filter-label">author</span>
+              <input
+                type="text"
+                value={filters.author}
+                onChange={(e) => updateFilter('author', e.target.value)}
+                placeholder="e.g. Priya"
+                aria-label="Author filter"
+              />
+            </label>
+            <label className="filter-field">
+              <span className="filter-label">from_date</span>
+              <input
+                type="date"
+                value={filters.from_date}
+                onChange={(e) => updateFilter('from_date', e.target.value)}
+                aria-label="From date filter"
+              />
+            </label>
+            <label className="filter-field">
+              <span className="filter-label">to_date</span>
+              <input
+                type="date"
+                value={filters.to_date}
+                onChange={(e) => updateFilter('to_date', e.target.value)}
+                aria-label="To date filter"
+              />
+            </label>
+            {hasFilters && (
+              <button type="button" className="clear-filters" onClick={() => setFilters(EMPTY_FILTERS)}>
+                Clear filters
+              </button>
+            )}
+          </div>
+        </section>
+
         <div className="results-region" aria-live="polite" aria-busy={loading}>
           <div className="meta-row">{meta}</div>
-          <ResultBlock status={status} sortBy={sortBy} onSort={setSortBy} />
+          <ResultBlock status={status} sortBy={sortBy} onSort={setSortBy} hideLow={hideLow} onHideLow={setHideLow} />
         </div>
       </main>
     </div>
@@ -212,10 +329,14 @@ function ResultBlock({
   status,
   sortBy,
   onSort,
+  hideLow,
+  onHideLow,
 }: {
   status: Status
   sortBy: SortBy
   onSort: (s: SortBy) => void
+  hideLow: boolean
+  onHideLow: (v: boolean) => void
 }) {
   switch (status.kind) {
     case 'idle':
@@ -229,6 +350,13 @@ function ResultBlock({
         </div>
       )
     case 'done':
+      if (status.hint) {
+        return (
+          <div className="hint" role="status">
+            {status.hint}
+          </div>
+        )
+      }
       return (
         <div>
           {status.note && (
@@ -236,6 +364,9 @@ function ResultBlock({
               {status.note}
             </div>
           )}
+          <div className="results-count" role="status">
+            {status.results.length} results for &ldquo;<span className="query">{status.query}</span>&rdquo;
+          </div>
           <div className="sort-row">
             <label htmlFor="sort-select">Sort by</label>
             <select
@@ -248,8 +379,17 @@ function ResultBlock({
               <option value="date_asc">Oldest first</option>
               <option value="score">Score</option>
             </select>
+            <label className="hide-low" htmlFor="hide-low-input">
+              <input
+                id="hide-low-input"
+                type="checkbox"
+                checked={hideLow}
+                onChange={(e) => onHideLow(e.target.checked)}
+              />
+              Hide low relevance
+            </label>
           </div>
-          {renderResults(sortResults(status.results, sortBy))}
+          {renderResults(filterByRelevance(sortResults(status.results, sortBy), hideLow))}
         </div>
       )
   }
@@ -297,6 +437,11 @@ function sortResults(items: Result[], sortBy: SortBy): Result[] {
   }
 }
 
+function filterByRelevance(items: Result[], hideLow: boolean): Result[] {
+  if (!hideLow) return items
+  return items.filter((r) => r.score >= 0.5)
+}
+
 function renderResults(items: Result[]) {
   if (!items.length) return <div className="empty">No matches found.</div>
   return (
@@ -315,6 +460,7 @@ function renderResults(items: Result[]) {
               ) : (
                 <span className="plain-title">{r.title || 'Untitled'}</span>
               )}
+              {r.summary ? <p className="excerpt">{r.summary}</p> : null}
               <div className="info">
                 <span className={`badge ${rel.cls}`}>{rel.label}</span>
                 <span className="score">{r.score.toFixed(3)}</span>

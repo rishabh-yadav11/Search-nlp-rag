@@ -1,7 +1,7 @@
 """Validate the slim SourceSummary public DTO (parallel task).
 
-The DTO must carry only the fields needed by the frontend and must never leak
-the article `body` or the internal `summary`/`body` text in API responses.
+The DTO must carry only the fields needed by the frontend plus a short `summary`
+excerpt for editors, and must never leak the full article `body` in API responses.
 """
 
 from app.main import SourceArticle, SourceSummary
@@ -23,7 +23,7 @@ def _sample_article() -> SourceArticle:
     )
 
 
-def test_source_summary_excludes_body_and_summary():
+def test_source_summary_includes_summary_but_never_body():
     article = _sample_article()
     summary = SourceSummary(
         id=article.id,
@@ -31,13 +31,13 @@ def test_source_summary_excludes_body_and_summary():
         url=article.url,
         published_date=article.published_date,
         category=article.category,
+        summary=article.summary,
         score=article.score,
     )
     dumped = summary.model_dump()
-    for field in ("id", "title", "url", "published_date", "category", "score"):
+    for field in ("id", "title", "url", "published_date", "category", "score", "summary"):
         assert field in dumped
     assert "body" not in dumped
-    assert "summary" not in dumped
 
 
 def test_source_summary_dump_contains_only_public_fields():
@@ -62,11 +62,13 @@ def test_source_summary_dump_contains_only_public_fields():
         "published_date",
         "category",
         "score",
+        "summary",
         "author_names",
         "industry_names",
         "dealtype_names",
     }
     assert set(summary.model_dump()) == public_fields
+    assert summary.summary == ""
 
 
 def test_source_summary_serializable_from_article():
@@ -75,4 +77,5 @@ def test_source_summary_serializable_from_article():
     assert summary.id == article.id
     assert summary.title == article.title
     assert summary.score == article.score
+    assert summary.summary == article.summary
     assert summary.model_dump_json()

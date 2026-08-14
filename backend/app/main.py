@@ -75,14 +75,15 @@ class SourceArticle(BaseModel):
 
 
 class SourceSummary(BaseModel):
-    """Public DTO for search/ask results. Intentionally excludes summary and
-    body so the response never leaks article text beyond the LLM context."""
+    """Public DTO for search/ask results. Exposes a short `summary` excerpt for
+    editors; the full article `body` is never included in the response."""
 
     id: int
     title: str
     url: str
     published_date: str | None = None
     category: str | None = None
+    summary: str = ""
     author_names: list[str] = []
     industry_names: list[str] = []
     dealtype_names: list[str] = []
@@ -113,6 +114,7 @@ def to_summary(a: SourceArticle) -> SourceSummary:
         url=a.url,
         published_date=a.published_date,
         category=a.category,
+        summary=a.summary,
         score=a.score,
         author_names=a.author_names,
         industry_names=a.industry_names,
