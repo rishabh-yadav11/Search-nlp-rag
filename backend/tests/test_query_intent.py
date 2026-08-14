@@ -2,6 +2,7 @@
 
 from app.query_intent import (
     extract_list_topic,
+    extract_month_range,
     extract_year_range,
     rewrite_year_in_review,
     top_k_hint,
@@ -98,3 +99,32 @@ def test_rewrite_niche_topic_flashback_kept_but_topic_extractable():
 
 def test_extract_list_topic_ignores_explicit_flashback_prefix():
     assert extract_list_topic("Flashback 2025 biggest deals") == "deals"
+
+
+def test_extract_month_range_full_and_abbrev():
+    assert extract_month_range("january 2025") == ("2025-01-01", "2025-01-31")
+    assert extract_month_range("deals in feb 2024") == ("2024-02-01", "2024-02-29")
+    assert extract_month_range("no month here 2025") is None
+
+
+def test_extract_month_range_defaults_to_current_year():
+    rng = extract_month_range("top deals in march")
+    assert rng is not None
+    assert rng[0].startswith("2026-03-")
+    assert rng[1].startswith("2026-03-")
+
+
+def test_extract_year_range_month_takes_precedence():
+    assert extract_year_range("top pharma deals of month january 2025") == ("2025-01-01", "2025-01-31")
+    assert extract_year_range("deals in feb 2024") == ("2024-02-01", "2024-02-29")
+
+
+def test_rewrite_skipped_for_month_query():
+    q, changed = rewrite_year_in_review("top pharma deals of month january 2025")
+    assert changed is False
+    assert q == "top pharma deals of month january 2025"
+
+
+def test_extract_list_topic_strips_month_words():
+    assert extract_list_topic("top pharma deals of month january 2025") == "pharma deals"
+    assert extract_list_topic("top deals in feb 2024") == "deals"
