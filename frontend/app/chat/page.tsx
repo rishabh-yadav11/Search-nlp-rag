@@ -38,15 +38,33 @@ const API_BASE =
 
 const USER_KEY = 'vccircle_chat_user_id'
 
+function makeUuid(): string {
+  // crypto.randomUUID requires a secure context (HTTPS). The site is served
+  // over plain HTTP, so fall back to a Math.random-based UUID v4.
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+  } catch {
+    /* fall through to manual generation */
+  }
+  const rnd = (n: number) => Math.floor(Math.random() * n).toString(16)
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
 function getUserId(): string {
   try {
     const existing = window.localStorage.getItem(USER_KEY)
     if (existing) return existing
-    const id = crypto.randomUUID()
+    const id = makeUuid()
     window.localStorage.setItem(USER_KEY, id)
     return id
   } catch {
-    return `anon-${Date.now()}`
+    return `anon-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
   }
 }
 
