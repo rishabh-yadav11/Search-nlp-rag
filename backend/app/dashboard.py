@@ -39,7 +39,6 @@ DASHBOARD_HTML = """<!doctype html>
   }
   header.topbar .brand { display: flex; align-items: center; gap: 10px; color: #fff; font-weight: 700; }
   header.topbar .brand .dot { color: var(--orange); }
-  header.topbar .sub { color: rgba(255,255,255,.65); font-size: 12px; font-weight: 500; letter-spacing: .04em; }
   .wrap { max-width: 1120px; margin: 0 auto; padding: 28px 24px 64px; }
   .updated { color: var(--meta); font-size: 12px; margin-bottom: 16px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }
@@ -73,7 +72,6 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
   <header class="topbar">
     <div class="brand">VCCircle <span class="dot">·</span> ASK — Analytics</div>
-    <div class="sub">Search quality · self-hosted · no cookies</div>
   </header>
   <div class="wrap">
     <div class="updated" id="updated">loading…</div>
