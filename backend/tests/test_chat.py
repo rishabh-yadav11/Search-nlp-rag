@@ -250,3 +250,73 @@ def test_smalltalk_short_circuits_rag(monkeypatch):
     assert sources == []
     assert note is None
     assert (pt, ct, cost) == (0, 0, 0.0)
+
+
+def test_api_stream_smalltalk_short_circuits(tmp_path):
+    """SSE stream for small talk emits a single done event with a canned reply."""
+    from app import main
+
+    client, store = _make_client(tmp_path)
+    try:
+        h = {"X-User-Id": USER_A}
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(*args, **kwargs):
+            raise AssertionError("retrieval should not run for small talk")
+
+        monkeypatch_global = pytest.MonkeyPatch()
+        monkeypatch_global.setattr(main, "retrieve_and_rerank", boom)
+
+        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "good morning"}) as r:
+            assert r.status_code == 200
+            assert r.headers["content-type"].startswith("text/event-stream")
+            body = "".join(r.iter_text())
+        monkeypatch_global.undo()
+
+        assert "event: start" in body
+        assert "event: done" in body
+        assert "Hello!" in body
+        assert "event: error" not in body
+
+        # Assistant message persisted.
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert len(detail["messages"]) == 2
+        assert detail["messages"][1]["role"] == "assistant"
+    finally:
+        _run(store.close())
+
+
+def test_api_stream_full_turn(tmp_path, monkeypatch):
+    """SSE stream with a real LLM path emits deltas + a done event with usage."""
+    client, store = _make_client(tmp_path)
+    try:
+        h = {"X-User-Id": USER_A}
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return "prompt", "prompt-text", [{"id": 1, "title": "Src"}], None, None, None, None
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            for piece in ["Hello ", "world", "!"]:
+                yield piece
+            if usage_holder is not None:
+                usage_holder.append(type("U", (), {"prompt_tokens": 50, "completion_tokens": 10})())
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "Who invested in fintech?"}) as r:
+            assert r.status_code == 200
+            body = "".join(r.iter_text())
+
+        assert body.count("event: delta") == 3
+        assert "Hello world!" in body
+        assert "event: done" in body
+        assert "prompt_tokens" in body
+
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert detail["messages"][1]["content"] == "Hello world!"
+        assert detail["messages"][1]["prompt_tokens"] == 50
+        assert detail["messages"][1]["completion_tokens"] == 10
+    finally:
+        _run(store.close())

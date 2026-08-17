@@ -1197,6 +1197,17 @@ input[type='text']:focus-visible,
   margin-bottom: 10px;
 }
 
+.chat-note {
+  background: #fff7ea;
+  border-left: 3px solid var(--orange-from);
+  color: #6b4a00;
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+
 @media (max-width: 720px) {
   .chat-app {
     flex-direction: column;

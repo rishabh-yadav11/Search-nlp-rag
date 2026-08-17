@@ -186,6 +186,8 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [streaming, setStreaming] = useState(false)
+  const [note, setNote] = useState('')
   const [error, setError] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -228,6 +230,7 @@ export default function ChatPage() {
     setMessages([])
     setInput('')
     setError('')
+    setNote('')
   }, [])
 
   const send = useCallback(async () => {
@@ -254,19 +257,79 @@ export default function ChatPage() {
     setSending(true)
 
     try {
-      const data = await api(`/api/chat/sessions/${sessionId}/messages`, {
+      const userId = getUserId()
+      const res = await fetch(`/api/chat/sessions/${sessionId}/messages/stream`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(userId ? { 'X-User-Id': userId } : {}) },
         body: JSON.stringify({ content: question }),
       })
-      const userMsg = data.user as Message
-      const assistantMsg = data.assistant as Message
-      setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), userMsg, assistantMsg])
-      await loadSessions()
+      if (!res.ok) throw new Error(`Request failed (${res.status})`)
+      if (!res.body) throw new Error('Streaming not supported')
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let streamingMsg: Message | null = null
+      let doneMsg: Message | null = null
+      let note = ''
+      let streamError = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const events = buffer.split('\n\n')
+        buffer = events.pop() ?? ''
+        for (const evt of events) {
+          const lines = evt.split('\n')
+          let type = ''
+          let data = ''
+          for (const line of lines) {
+            if (line.startsWith('event:')) type = line.slice(6).trim()
+            else if (line.startsWith('data:')) data += line.slice(5).trim()
+          }
+          if (!type || !data) continue
+          try {
+            const payload = JSON.parse(data)
+            if (type === 'start') {
+              const userMsg = payload.user as Message
+              setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), userMsg])
+            } else if (type === 'delta') {
+              const text = payload.text as string
+              setStreaming(true)
+              const prev: Message = streamingMsg ?? { id: -Date.now() + 1, role: 'assistant', content: '', created_at: Date.now() / 1000 }
+              streamingMsg = { ...prev, content: prev.content + text }
+              setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), streamingMsg!])
+            } else if (type === 'done') {
+              doneMsg = payload.message as Message
+              note = payload.note ?? ''
+              streamingMsg = null
+            } else if (type === 'error') {
+              streamError = payload.error ?? 'Something went wrong.'
+            }
+          } catch {
+            /* skip malformed event */
+          }
+        }
+      }
+
+      if (streamError) throw new Error(streamError)
+      if (doneMsg) {
+        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id && x.id !== doneMsg!.id), doneMsg!])
+        if (note) setNote(note)
+        await loadSessions()
+      } else if (streamingMsg) {
+        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), streamingMsg!])
+        await loadSessions()
+      } else {
+        throw new Error('No response received.')
+      }
     } catch (err) {
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setSending(false)
+      setStreaming(false)
     }
   }, [activeId, input, loadSessions, sending])
 
@@ -357,7 +420,7 @@ export default function ChatPage() {
               </div>
             ))
           )}
-          {sending ? (
+          {sending && !streaming ? (
             <div className="chat-msg chat-assistant">
               <div className="chat-msg-bubble">
                 <div className="chat-typing">
@@ -371,6 +434,11 @@ export default function ChatPage() {
         </div>
 
         <div className="chat-composer">
+          {note ? (
+            <div className="chat-note">
+              {note}
+            </div>
+          ) : null}
           {error ? (
             <div className="chat-error" role="alert">
               {error}

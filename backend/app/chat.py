@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.config import config
-from app.llm import LLMUnavailableError, generate_answer, stream_answer
+from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
 
 logger = logging.getLogger("chat")
 
@@ -564,6 +564,90 @@ async def send_message(
         first_user = question[:60] or "New chat"
         await s.rename_session(session_id, user_id, first_user)
     return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
+
+
+def _sse(event: str, data: dict) -> str:
+    import json
+
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+@router.post("/sessions/{session_id}/messages/stream")
+async def send_message_stream(
+    session_id: str,
+    body: MessageIn,
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+):
+    """SSE-streamed chat turn: retrieves, then streams the LLM answer token by
+    token. Events: 'start', 'delta' (content chunk), 'done' (with full message,
+    sources, usage, cost, latency), or 'error'. The assistant message is saved
+    once streaming completes."""
+    user_id = _user_id(x_user_id)
+    s = _require_store()
+    question = (body.content or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="empty message")
+    if len(question) > MAX_CONTENT_LEN:
+        raise HTTPException(status_code=400, detail=f"message too long (max {MAX_CONTENT_LEN} chars)")
+
+    user_msg = await s.append_message(session_id, user_id, "user", question)
+    history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+
+    async def event_stream():
+        start = time.perf_counter()
+        try:
+            yield _sse("start", {"user": user_msg.model_dump()})
+            kind, a, sources, note, pt, ct, cost = await _prepare_turn(question, history)
+            if kind == "done":
+                latency_ms = (time.perf_counter() - start) * 1000
+                assistant_msg = await s.append_message(
+                    session_id, user_id, "assistant", a, sources,
+                    prompt_tokens=pt, completion_tokens=ct, cost=cost, latency_ms=latency_ms,
+                )
+                yield _sse("done", {"message": assistant_msg.model_dump(), "note": note, "latency_ms": latency_ms})
+                return
+
+            prompt = a
+            usage_holder: list = []
+            chunks: list[str] = []
+            async for piece in stream_answer(state_llm(), prompt, config.LLM_MODEL, usage_holder):
+                chunks.append(piece)
+                yield _sse("delta", {"text": piece})
+
+            usage = usage_holder[0] if usage_holder else None
+            latency_ms = (time.perf_counter() - start) * 1000
+            answer = "".join(chunks)
+            result = LLMResult(
+                content=answer,
+                prompt_tokens=usage.prompt_tokens if usage else 0,
+                completion_tokens=usage.completion_tokens if usage else 0,
+            )
+            assistant_msg = await s.append_message(
+                session_id, user_id, "assistant", answer, sources,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                cost=result.cost(),
+                latency_ms=latency_ms,
+            )
+            session = await s.get_session(session_id, user_id)
+            if session is not None and session.title.strip() in ("", "New chat"):
+                first_user = question[:60] or "New chat"
+                await s.rename_session(session_id, user_id, first_user)
+            yield _sse(
+                "done",
+                {
+                    "message": assistant_msg.model_dump(),
+                    "note": note,
+                    "latency_ms": latency_ms,
+                },
+            )
+        except LLMUnavailableError:
+            yield _sse("error", {"error": "LLM temporarily unavailable"})
+        except Exception:
+            logger.exception("chat stream turn failed")
+            yield _sse("error", {"error": "Something went wrong"})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 async def retention_loop() -> None:
