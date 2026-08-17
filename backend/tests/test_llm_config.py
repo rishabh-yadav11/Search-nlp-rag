@@ -16,6 +16,13 @@ def test_llm_reads_config_instance_attributes():
     assert llm.config.LLM_RETRY_BACKOFF > 0
 
 
+def test_gemini_config_present():
+    assert hasattr(config_instance, "GEMINI_API_KEY")
+    assert hasattr(config_instance, "GEMINI_BASE_URL")
+    assert config_instance.GEMINI_BASE_URL.startswith("https://")
+    assert config_instance.LLM_MODEL  # non-empty default model
+
+
 def test_llm_result_cost_in_inr(monkeypatch):
     # 1M input @ $0.59 + 1M output @ $0.79 = $1.38; * 95.60 INR/USD = 131.928
     monkeypatch.setattr(config_instance, "LLM_PRICE_INPUT_PER_1M", 0.59)

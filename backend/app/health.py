@@ -37,8 +37,8 @@ def _models_ok(state) -> bool:
     return all(state.get(key) is not None for key in ("model", "sparse_model", "reranker"))
 
 
-def _groq_ok() -> bool:
-    return bool(config.GROQ_API_KEY)
+def _llm_ok() -> bool:
+    return bool(config.GEMINI_API_KEY)
 
 
 async def _redis_status() -> tuple[bool, str]:
@@ -63,7 +63,7 @@ async def _readiness_report(state) -> tuple[bool, dict]:
     qdrant_ok = await _qdrant_ok(state)
     models_ok = _models_ok(state)
     redis_ok, cache_mode = await _redis_status()
-    groq_ok = _groq_ok()
+    llm_ok = _llm_ok()
     ready = qdrant_ok and models_ok
     report = {
         "ready": ready,
@@ -71,7 +71,7 @@ async def _readiness_report(state) -> tuple[bool, dict]:
             "qdrant": {"ok": qdrant_ok},
             "models": {"ok": models_ok},
             "redis": {"ok": redis_ok, "cache": cache_mode},
-            "groq": {"ok": groq_ok},
+            "llm": {"ok": llm_ok},
         },
     }
     return ready, report

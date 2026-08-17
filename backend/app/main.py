@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
     state["sparse_model"] = SparseTextEmbedding(config.SPARSE_MODEL)
     state["reranker"] = CrossEncoder(config.RERANK_MODEL, device="cpu")
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
-    state["llm"] = AsyncOpenAI(api_key=config.GROQ_API_KEY, base_url=config.GROQ_BASE_URL) if config.GROQ_API_KEY else None
+    state["llm"] = AsyncOpenAI(api_key=config.GEMINI_API_KEY, base_url=config.GEMINI_BASE_URL) if config.GEMINI_API_KEY else None
 
     chat_store = chat_module.ChatStore(config.CHAT_DB_PATH)
     await chat_store.connect()
@@ -128,6 +128,9 @@ class AskResponse(BaseModel):
     cached: bool
     latency_ms: float
     note: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
 
 
 def to_summary(a: SourceArticle) -> SourceSummary:
@@ -446,7 +449,7 @@ async def ask(
     to_date: str | None = Query(None),
 ):
     if state["llm"] is None:
-        raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured")
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
 
     start = time.perf_counter()
     retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
@@ -465,6 +468,9 @@ async def ask(
             cached=True,
             latency_ms=(time.perf_counter() - start) * 1000,
             note=cached.get("note"),
+            prompt_tokens=int(cached.get("prompt_tokens", 0)),
+            completion_tokens=int(cached.get("completion_tokens", 0)),
+            cost=float(cached.get("cost", 0.0)),
         )
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
@@ -500,10 +506,27 @@ async def ask(
         )
 
     answer = llm_result.content
-    await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
+    usage_payload = {
+        "answer": answer,
+        "sources": [to_summary(s).model_dump() for s in sources],
+        "note": note,
+        "prompt_tokens": llm_result.prompt_tokens,
+        "completion_tokens": llm_result.completion_tokens,
+        "cost": llm_result.cost(),
+    }
+    await cache.set(cache_key, usage_payload)
     await record_ask(q, "answered", cached=False)
-    return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
-                        latency_ms=(time.perf_counter() - start) * 1000, note=note)
+    return AskResponse(
+        query=q,
+        answer=answer,
+        sources=[to_summary(s) for s in sources],
+        cached=False,
+        latency_ms=(time.perf_counter() - start) * 1000,
+        note=note,
+        prompt_tokens=llm_result.prompt_tokens,
+        completion_tokens=llm_result.completion_tokens,
+        cost=llm_result.cost(),
+    )
 
 
 FACETS_CACHE_KEY = "facets:v1"
