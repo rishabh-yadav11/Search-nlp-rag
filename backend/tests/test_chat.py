@@ -165,7 +165,7 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
         async def fake_turn(question, history):
             assert question == "Who invested in fintech?"
             assert [m.role for m in history] == ["user"]  # prior turn context included
-            return "A fintech investor is [1].", [{"id": 1, "title": "Fintech funding"}], None
+            return "A fintech investor is [1].", [{"id": 1, "title": "Fintech funding"}], None, 120, 45, 0.0012
 
         monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
 
@@ -175,11 +175,45 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
         assert body["user"]["content"] == "Who invested in fintech?"
         assert body["assistant"]["content"] == "A fintech investor is [1]."
         assert body["assistant"]["sources"][0]["title"] == "Fintech funding"
+        assert body["assistant"]["prompt_tokens"] == 120
+        assert body["assistant"]["completion_tokens"] == 45
+        assert body["assistant"]["cost"] == 0.0012
 
         assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["title"] == "Who invested in fintech?"
 
         detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
         assert len(detail["messages"]) == 2
+        assert detail["messages"][1]["prompt_tokens"] == 120
+        assert detail["messages"][1]["cost"] == 0.0012
+    finally:
+        _run(store.close())
+
+
+def test_api_usage_stats(tmp_path, monkeypatch):
+    client, store = _make_client(tmp_path)
+    try:
+        h = {"X-User-Id": USER_A}
+        assert client.get("/api/chat/usage", headers=h).json() == {
+            "sessions": 0, "messages": 0, "total_tokens": 0, "total_cost": 0.0
+        }
+
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_turn(question, history):
+            return "answer", [], None, 100, 50, 0.0005
+
+        monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
+        client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "query one"})
+        client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "query two"})
+
+        usage = client.get("/api/chat/usage", headers=h).json()
+        assert usage["sessions"] == 1
+        assert usage["messages"] == 4  # 2 user + 2 assistant
+        assert usage["total_tokens"] == 300  # 2 * (100 + 50)
+        assert abs(usage["total_cost"] - 0.001) < 1e-9
+
+        # Other users see their own usage only.
+        assert client.get("/api/chat/usage", headers={"X-User-Id": USER_B}).json()["total_tokens"] == 0
     finally:
         _run(store.close())
 
@@ -211,7 +245,8 @@ def test_smalltalk_short_circuits_rag(monkeypatch):
         raise AssertionError("retrieval should not run for small talk")
 
     monkeypatch.setattr(main, "retrieve_and_rerank", boom)
-    answer, sources, note = _run(chat_module._run_turn("good morning", []))
+    answer, sources, note, pt, ct, cost = _run(chat_module._run_turn("good morning", []))
     assert answer.startswith("Hello!")
     assert sources == []
     assert note is None
+    assert (pt, ct, cost) == (0, 0, 0.0)

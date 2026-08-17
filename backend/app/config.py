@@ -55,6 +55,10 @@ class Config:
     LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
     LLM_RETRY_BACKOFF = float(os.getenv("LLM_RETRY_BACKOFF", "1.0"))
+    # Pricing in USD per 1M tokens, used by LLMResult.cost() for cost tracking.
+    # Defaults match Groq's llama-3.3-70b-versatile rates.
+    LLM_PRICE_INPUT_PER_1M = float(os.getenv("LLM_PRICE_INPUT_PER_1M", "0.59"))
+    LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "0.79"))
 
     # Search
     TOP_K = int(os.getenv("TOP_K", "8"))

@@ -957,6 +957,13 @@ input[type='text']:focus-visible,
   padding-top: 8px;
 }
 
+.chat-usage {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 6px;
+}
+
 .chat-sources-toggle {
   border: none;
   background: transparent;

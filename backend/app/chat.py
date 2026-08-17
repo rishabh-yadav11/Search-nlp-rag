@@ -50,10 +50,20 @@ class MessageOut(BaseModel):
     content: str
     sources: list[dict] = []
     created_at: float
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
 
 
 class SessionDetailOut(SessionOut):
     messages: list[MessageOut] = []
+
+
+class SessionStatsOut(BaseModel):
+    sessions: int = 0
+    messages: int = 0
+    total_tokens: int = 0
+    total_cost: float = 0.0
 
 
 class MessageIn(BaseModel):
@@ -111,7 +121,10 @@ class ChatStore:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 sources TEXT NOT NULL DEFAULT '[]',
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                cost REAL NOT NULL DEFAULT 0
             )
             """
         )
@@ -121,6 +134,13 @@ class ChatStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)"
         )
+        # Migration for existing databases created before token/cost tracking.
+        cols = await self._db.execute_fetchall("PRAGMA table_info(messages)")
+        col_names = {row["name"] for row in cols}
+        if "prompt_tokens" not in col_names:
+            await self._db.execute("ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+            await self._db.execute("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
+            await self._db.execute("ALTER TABLE messages ADD COLUMN cost REAL NOT NULL DEFAULT 0")
         await self._db.commit()
 
     async def close(self) -> None:
@@ -185,38 +205,47 @@ class ChatStore:
             raise HTTPException(status_code=404, detail="conversation not found")
         rows = await self._db.execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at FROM messages
-            WHERE session_id = ? ORDER BY created_at ASC, id ASC
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost
+            FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC
             """,
             (session_id,),
         )
-        return [
-            MessageOut(
-                id=r["id"],
-                role=r["role"],
-                content=r["content"],
-                sources=json_loads(r["sources"]),
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
+        return [_row_to_message(r) for r in rows]
 
     async def append_message(
-        self, session_id: str, user_id: str, role: str, content: str, sources: list[dict] | None = None
+        self,
+        session_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        sources: list[dict] | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost: float = 0.0,
     ) -> MessageOut:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
         ts = _now()
         cur = await self._db.execute(
-            "INSERT INTO messages (session_id, role, content, sources, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, role, content, json_dumps(sources or []), ts),
+            "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost),
         )
         await self._db.execute(
             "UPDATE sessions SET updated_at = ?, title = COALESCE(NULLIF(title, ''), 'New chat') WHERE id = ?",
             (ts, session_id),
         )
         await self._db.commit()
-        return MessageOut(id=cur.lastrowid, role=role, content=content, sources=sources or [], created_at=ts)
+        return MessageOut(
+            id=cur.lastrowid,
+            role=role,
+            content=content,
+            sources=sources or [],
+            created_at=ts,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost=cost,
+        )
 
     async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
         session = await self.get_session(session_id, user_id)
@@ -244,22 +273,13 @@ class ChatStore:
         first), used as conversation context for the LLM prompt."""
         rows = await self._db.execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at FROM messages
-            WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost
+            FROM messages WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
             """,
             (session_id, max_turns * 2),
         )
         rows.reverse()
-        return [
-            MessageOut(
-                id=r["id"],
-                role=r["role"],
-                content=r["content"],
-                sources=json_loads(r["sources"]),
-                created_at=r["created_at"],
-            )
-            for r in rows
-        ]
+        return [_row_to_message(r) for r in rows]
 
     async def purge_expired(self) -> int:
         """Delete conversations idle for CHAT_RETENTION_DAYS or longer."""
@@ -270,6 +290,28 @@ class ChatStore:
             await self._db.execute("DELETE FROM sessions WHERE id = ?", (r["id"],))
         await self._db.commit()
         return len(stale)
+
+    async def stats(self, user_id: str) -> SessionStatsOut:
+        """Aggregate token/cost usage across the user's conversations."""
+        sessions_row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?", (user_id,)
+        )
+        msgs_row = await self._fetchone(
+            """
+            SELECT COUNT(*) AS n,
+                   COALESCE(SUM(prompt_tokens), 0) AS pt,
+                   COALESCE(SUM(completion_tokens), 0) AS ct,
+                   COALESCE(SUM(cost), 0) AS cost
+            FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE user_id = ?)
+            """,
+            (user_id,),
+        )
+        return SessionStatsOut(
+            sessions=int(sessions_row["n"]) if sessions_row else 0,
+            messages=int(msgs_row["n"]) if msgs_row else 0,
+            total_tokens=int((msgs_row["pt"] if msgs_row else 0) + (msgs_row["ct"] if msgs_row else 0)),
+            total_cost=float(msgs_row["cost"] if msgs_row else 0.0),
+        )
 
 
 def json_dumps(v) -> str:
@@ -285,6 +327,19 @@ def json_loads(s: str) -> list[dict]:
         return json.loads(s or "[]")
     except (ValueError, TypeError):
         return []
+
+
+def _row_to_message(r) -> MessageOut:
+    return MessageOut(
+        id=r["id"],
+        role=r["role"],
+        content=r["content"],
+        sources=json_loads(r["sources"]),
+        created_at=r["created_at"],
+        prompt_tokens=int(r["prompt_tokens"] or 0),
+        completion_tokens=int(r["completion_tokens"] or 0),
+        cost=float(r["cost"] or 0.0),
+    )
 
 
 _SMALLTALK_PATTERNS: dict[str, str] = {
@@ -313,14 +368,15 @@ def _smalltalk_reply(question: str, history: list[MessageOut]) -> str | None:
     return None
 
 
-async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list[dict], str | None]:
+async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list[dict], str | None, int, int, float]:
     """Retrieve, build a conversation-aware prompt, and call the LLM.
 
-    Returns (answer, sources, note). Mirrors /ask's pipeline; imported lazily to
-    avoid a circular import with app.main."""
+    Returns (answer, sources, note, prompt_tokens, completion_tokens, cost).
+    Mirrors /ask's pipeline; imported lazily to avoid a circular import with
+    app.main."""
     smalltalk = _smalltalk_reply(question, history)
     if smalltalk is not None:
-        return smalltalk, [], None
+        return smalltalk, [], None, 0, 0, 0.0
 
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
     from app.main import _effective_intent, retrieve_and_rerank, source_context, to_summary
@@ -336,17 +392,31 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
     )
 
     if not sources:
-        return "No sufficiently relevant articles were found for this query.", [], note
+        return "No sufficiently relevant articles were found for this query.", [], note, 0, 0, 0.0
 
     if config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
-        return fallback_answer(question, len(sources), date_label(eff_from, eff_to)), [to_summary(s).model_dump() for s in sources], note
+        return (
+            fallback_answer(question, len(sources), date_label(eff_from, eff_to)),
+            [to_summary(s).model_dump() for s in sources],
+            note,
+            0,
+            0,
+            0.0,
+        )
 
     context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
     history_text = "\n".join(f"{m.role}: {m.content}" for m in history if m.role in ("user", "assistant"))
     prompt = CHAT_PROMPT.format(history=history_text or "(none)", context=context, question=question)
 
-    answer = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
-    return answer, [to_summary(s).model_dump() for s in sources], note
+    result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
+    return (
+        result.content,
+        [to_summary(s).model_dump() for s in sources],
+        note,
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cost(),
+    )
 
 
 def state_llm():
@@ -414,6 +484,13 @@ async def delete_session(session_id: str, x_user_id: str | None = Header(default
     return {"ok": True}
 
 
+@router.get("/usage", response_model=SessionStatsOut)
+async def get_usage(x_user_id: str | None = Header(default=None, alias="X-User-Id")):
+    """Aggregate token usage and cost across the user's conversations."""
+    user_id = _user_id(x_user_id)
+    return await _require_store().stats(user_id)
+
+
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
 async def send_message(
     session_id: str,
@@ -432,14 +509,23 @@ async def send_message(
     history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
 
     try:
-        answer, sources, note = await _run_turn(question, history)
+        answer, sources, note, prompt_tokens, completion_tokens, cost = await _run_turn(question, history)
     except LLMUnavailableError:
         raise HTTPException(
             status_code=503,
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
 
-    assistant_msg = await s.append_message(session_id, user_id, "assistant", answer, sources)
+    assistant_msg = await s.append_message(
+        session_id,
+        user_id,
+        "assistant",
+        answer,
+        sources,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost=cost,
+    )
     session = await s.get_session(session_id, user_id)
     if session is not None and session.title.strip() in ("", "New chat"):
         first_user = question[:60] or "New chat"

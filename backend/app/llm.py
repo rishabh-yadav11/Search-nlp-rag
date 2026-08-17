@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 
 import openai
 
@@ -15,6 +16,26 @@ class LLMUnavailableError(Exception):
         super().__init__(message)
 
 
+@dataclass
+class LLMResult:
+    """LLM answer plus reported token usage (for cost tracking)."""
+
+    content: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def cost(self) -> float:
+        """Estimated cost of this call in USD, from config pricing per 1M tokens."""
+        return (
+            self.prompt_tokens / 1_000_000 * config.LLM_PRICE_INPUT_PER_1M
+            + self.completion_tokens / 1_000_000 * config.LLM_PRICE_OUTPUT_PER_1M
+        )
+
+
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
@@ -23,12 +44,13 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
-async def generate_answer(llm_client, prompt: str, model: str) -> str:
+async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
     """Call the LLM with a timeout and retries on transient errors.
 
     Retries exponential backoff (LLM_RETRY_BACKOFF * 2^attempt) up to
     LLM_MAX_RETRIES. Raises LLMUnavailableError (wrapping the last error)
     after retries are exhausted, so callers never surface raw SDK errors.
+    Returns an LLMResult with the answer text and token usage.
     """
     last_error = None
     for attempt in range(config.LLM_MAX_RETRIES + 1):
@@ -39,7 +61,12 @@ async def generate_answer(llm_client, prompt: str, model: str) -> str:
                 messages=[{"role": "user", "content": prompt}],
                 timeout=config.LLM_TIMEOUT_SECONDS,
             )
-            return response.choices[0].message.content or ""
+            usage = response.usage
+            return LLMResult(
+                content=response.choices[0].message.content or "",
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            )
         except Exception as exc:
             last_error = exc
             if not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:

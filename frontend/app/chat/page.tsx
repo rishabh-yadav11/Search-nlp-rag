@@ -21,6 +21,9 @@ type Message = {
   content: string
   sources?: Source[]
   created_at: number
+  prompt_tokens?: number
+  completion_tokens?: number
+  cost?: number
 }
 
 type Session = {
@@ -88,30 +91,52 @@ function relativeTime(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-function SourceList({ sources }: { sources: Source[] }) {
+function formatCost(cost: number): string {
+  if (cost <= 0) return ''
+  if (cost < 0.01) return `$${(cost * 1000).toFixed(3)}m`
+  return `$${cost.toFixed(4)}`
+}
+
+function UsageLine({ msg }: { msg: Message }) {
+  const tokens = (msg.prompt_tokens ?? 0) + (msg.completion_tokens ?? 0)
+  const cost = msg.cost ?? 0
+  if (!tokens) return null
+  return (
+    <div className="chat-usage">
+      {tokens.toLocaleString()} tokens · {formatCost(cost)}
+    </div>
+  )
+}
+
+function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
   const [open, setOpen] = useState(false)
-  if (!sources.length) return null
+  if (!sources.length && !((msg.prompt_tokens ?? 0) + (msg.completion_tokens ?? 0))) return null
   return (
     <div className="chat-sources">
-      <button type="button" className="chat-sources-toggle" onClick={() => setOpen((o) => !o)}>
-        {open ? 'Hide' : 'Show'} sources ({sources.length})
-      </button>
-      {open && (
-        <ol className="chat-sources-list">
-          {sources.map((s) => (
-            <li key={s.id}>
-              {/^https?:\/\//.test(s.url) ? (
-                <a href={s.url} target="_blank" rel="noopener noreferrer">
-                  {s.title || `Source ${s.id}`}
-                </a>
-              ) : (
-                <span>{s.title || `Source ${s.id}`}</span>
-              )}
-              {s.published_date ? <span className="chat-sources-date">{s.published_date.slice(0, 10)}</span> : null}
-            </li>
-          ))}
-        </ol>
-      )}
+      <UsageLine msg={msg} />
+      {sources.length ? (
+        <>
+          <button type="button" className="chat-sources-toggle" onClick={() => setOpen((o) => !o)}>
+            {open ? 'Hide' : 'Show'} sources ({sources.length})
+          </button>
+          {open && (
+            <ol className="chat-sources-list">
+              {sources.map((s) => (
+                <li key={s.id}>
+                  {/^https?:\/\//.test(s.url) ? (
+                    <a href={s.url} target="_blank" rel="noopener noreferrer">
+                      {s.title || `Source ${s.id}`}
+                    </a>
+                  ) : (
+                    <span>{s.title || `Source ${s.id}`}</span>
+                  )}
+                  {s.published_date ? <span className="chat-sources-date">{s.published_date.slice(0, 10)}</span> : null}
+                </li>
+              ))}
+            </ol>
+          )}
+        </>
+      ) : null}
     </div>
   )
 }
@@ -279,7 +304,7 @@ export default function ChatPage() {
                   ) : (
                     <div className="chat-msg-answer">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
-                      <SourceList sources={m.sources ?? []} />
+                      <SourceList sources={m.sources ?? []} msg={m} />
                     </div>
                   )}
                 </div>

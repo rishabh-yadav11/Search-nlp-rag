@@ -491,7 +491,7 @@ async def ask(
     prompt = ANSWER_PROMPT.format(context=context, question=q)
 
     try:
-        answer = await generate_answer(state["llm"], prompt, config.LLM_MODEL)
+        llm_result = await generate_answer(state["llm"], prompt, config.LLM_MODEL)
     except LLMUnavailableError:
         await record_ask(q, "error", cached=False)
         raise HTTPException(
@@ -499,6 +499,7 @@ async def ask(
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
 
+    answer = llm_result.content
     await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
     await record_ask(q, "answered", cached=False)
     return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
