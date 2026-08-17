@@ -246,12 +246,20 @@ export default function Page() {
         <div className="topbar-inner">
           <div className="brand">
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img className="logo" src="/vccircle-wordmark.svg" alt="VCCircle" width={130} height={35} />
-            <span className="ask">ASK</span>
+            <img className="logo" src="/vccircle-wordmark.svg" alt="VCCircle" width={154} height={40} />
           </div>
-          <Link href="/chat" className="chat-nav-link">
-            Chat
-          </Link>
+          <nav className="topbar-nav" aria-label="Primary">
+            <Link href="/" className="topbar-nav-link active">
+              Search
+            </Link>
+            <Link href="/chat" className="topbar-nav-link">
+              Chat
+            </Link>
+            <a href="/analytics/dashboard" className="topbar-nav-link">
+              Analytics
+            </a>
+          </nav>
+          <span className="topbar-cta">ASK VCCircle</span>
         </div>
       </header>
 
