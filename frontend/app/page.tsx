@@ -80,7 +80,7 @@ function sanitizeStrings(value: unknown): string[] | undefined {
 
 function sanitizeResponse(raw: unknown): ResponseData {
   const data = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>
-  const rawResults = Array.isArray(data.results) ? data.results : Array.isArray(data.sources) ? data.sources : []
+  const rawResults = Array.isArray(data.results) ? data.results : []
 
   const results: Result[] = rawResults.map((item, i) => {
     const r = (typeof item === 'object' && item !== null ? item : {}) as Record<string, unknown>

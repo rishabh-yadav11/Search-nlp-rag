@@ -65,8 +65,8 @@ class Config:
 
     # Search
     TOP_K = int(os.getenv("TOP_K", "8"))
-    # Minimum reranked relevance score for /ask; weaker results are dropped
-    # before the LLM sees them.
+    # Minimum reranked relevance score for chat sources; weaker results are
+    # dropped before the LLM sees them.
     ASK_MIN_SCORE = float(os.getenv("ASK_MIN_SCORE", "0.2"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))

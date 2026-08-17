@@ -44,7 +44,7 @@ const API_BASE =
 
 const USER_KEY = 'vccircle_chat_user_id'
 
-const CITATION_RE = /\[\d+\]/g
+const CITATION_RE = /\[\d+\]/
 
 function remarkCitations() {
   return (tree: any) => {

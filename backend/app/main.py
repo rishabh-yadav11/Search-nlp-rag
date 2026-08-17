@@ -97,7 +97,7 @@ class SourceArticle(BaseModel):
 
 
 class SourceSummary(BaseModel):
-    """Public DTO for search/ask results. Exposes a short `summary` excerpt for
+    """Public DTO for search/chat results. Exposes a short `summary` excerpt for
     editors; the full article `body` is never included in the response."""
 
     id: int
@@ -333,7 +333,7 @@ async def retrieve_and_rerank(
     """Run every retrieval leg, merge RRF candidates, cross-encode rerank, and
     apply the entity-mention boost. Returns the recency-sorted articles.
 
-    Shared by /search and /ask so the two pipelines stay consistent."""
+    Shared by /search and /chat so the two pipelines stay consistent."""
     groups = []
     for rq in _retrieval_queries(q):
         if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
@@ -369,13 +369,8 @@ async def search(
         note = weak_results_note([s.score for s in summaries], date_label(eff_from, eff_to))
         await record_search(q, len(summaries), bool(note), cached=True,
                             latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
-        return SearchResponse(
-            query=q,
-            results=summaries,
-            cached=True,
-            latency_ms=(time.perf_counter() - start) * 1000,
-            note=note,
-        )
+        return SearchResponse(query=q, results=summaries, cached=True,
+                              latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     reranked = await retrieve_and_rerank(q, eff_top_k, qfilter)
@@ -384,13 +379,8 @@ async def search(
     await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
     await record_search(q, len(results), bool(note), cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
-    return SearchResponse(
-        query=q,
-        results=[to_summary(r) for r in results],
-        cached=False,
-        latency_ms=(time.perf_counter() - start) * 1000,
-        note=note,
-    )
+    return SearchResponse(query=q, results=[to_summary(r) for r in results], cached=False,
+                          latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
 
 def source_context(s: SourceArticle, idx: int) -> str:
@@ -458,6 +448,13 @@ class ClickEvent(BaseModel):
     position: int = 0
 
 
+def _check_analytics_token(authorization: str | None, token: str | None) -> None:
+    if config.ANALYTICS_VIEW_TOKEN:
+        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
+        if supplied != config.ANALYTICS_VIEW_TOKEN:
+            raise HTTPException(status_code=401, detail="invalid analytics token")
+
+
 @app.post("/analytics/click")
 async def analytics_click(event: ClickEvent):
     """Anonymous result-click beacon from the frontend (no identifiers)."""
@@ -469,10 +466,7 @@ async def analytics_click(event: ClickEvent):
 async def get_analytics_summary(authorization: str | None = None, token: str | None = None):
     """Aggregated search/click metrics. Protected by ANALYTICS_VIEW_TOKEN when
     set (Bearer token or ?token=); otherwise open (POC default)."""
-    if config.ANALYTICS_VIEW_TOKEN:
-        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
-        if supplied != config.ANALYTICS_VIEW_TOKEN:
-            raise HTTPException(status_code=401, detail="invalid analytics token")
+    _check_analytics_token(authorization, token)
     return await analytics_data()
 
 
@@ -480,10 +474,7 @@ async def get_analytics_summary(authorization: str | None = None, token: str | N
 async def get_analytics_chat(authorization: str | None = None, token: str | None = None):
     """Cross-user chat usage (sessions, messages, tokens, cost). Same token gate
     as /analytics/summary; reads the SQLite chat store."""
-    if config.ANALYTICS_VIEW_TOKEN:
-        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
-        if supplied != config.ANALYTICS_VIEW_TOKEN:
-            raise HTTPException(status_code=401, detail="invalid analytics token")
+    _check_analytics_token(authorization, token)
     return await chat_module._require_store().global_stats()
 
 
@@ -491,8 +482,5 @@ async def get_analytics_chat(authorization: str | None = None, token: str | None
 async def get_analytics_dashboard(authorization: str | None = None, token: str | None = None):
     """Human-readable analytics dashboard (self-contained HTML, no external
     assets). Same token gate as /analytics/summary; fetches summary on load."""
-    if config.ANALYTICS_VIEW_TOKEN:
-        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
-        if supplied != config.ANALYTICS_VIEW_TOKEN:
-            raise HTTPException(status_code=401, detail="invalid analytics token")
+    _check_analytics_token(authorization, token)
     return HTMLResponse(dashboard_html())

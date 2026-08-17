@@ -33,12 +33,16 @@ backend/
     dashboard.py       self-contained HTML analytics dashboard
     config.py          env-driven settings
     query_intent.py    year/top-N intent parsing + Flashback rewriting
+    query_expand.py    deterministic synonym query expansion
+    rerank_boost.py    entity-mention score boost on reranked results
+    answer_fallback.py weak-result notes + honest chat fallback replies
     index_text.py      shared text composition + date normalization
     redis_cache.py     Redis-backed cache with in-process fallback
   scripts/
     fetch_data.py      MySQL -> data/articles.jsonl (paginated, resumable)
     build_index.py     articles.jsonl -> Qdrant embeddings (checkpointed)
     update_index.py    incremental MySQL->Qdrant sync (new/edit/delete)
+    backfill_summary.py  one-off summary payload backfill
     backup_qdrant.py   Qdrant snapshot + local artifact backups (retention)
     qdrant_backup.py   shared backup helpers
     reset_index.py     drop the index + data files (backup-gated)

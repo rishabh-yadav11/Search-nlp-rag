@@ -37,7 +37,7 @@ def results_are_weak(scores: list[float], limit: int = 3) -> bool:
 
 
 def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
-    """Honest fallback for /ask: never fabricates facts, mentions the query.
+    """Honest fallback for chat: never fabricates facts, mentions the query.
     With a date label, frames the result as a best-effort for that period."""
     if label:
         return (

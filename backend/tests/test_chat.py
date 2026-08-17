@@ -230,13 +230,13 @@ def test_api_send_message_rejects_empty(tmp_path):
 
 def test_smalltalk_returns_canned_reply():
     for greeting in ["hi", "hello", "hey", "good morning", "Good Afternoon!", "namaste", "how are you?", "thanks", "thank you", "bye", "who are you?"]:
-        reply = _smalltalk_reply(greeting, [])
+        reply = _smalltalk_reply(greeting)
         assert reply is not None, greeting
         assert "ASK VCCircle" in reply or "archive" in reply
 
 def test_smalltalk_ignores_real_queries():
     for q in ["who invested in Ola Electric?", "top 10 fintech deals 2025", "Ola Electric IPO", "what is the latest funding news", "how many deals did Sequoia do last year?"]:
-        assert _smalltalk_reply(q, []) is None, q
+        assert _smalltalk_reply(q) is None, q
 
 def test_smalltalk_short_circuits_rag(monkeypatch):
     from app import main
@@ -294,7 +294,12 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
         async def fake_prepare(question, history):
-            return "prompt", "prompt-text", [{"id": 1, "title": "Src"}], None, None, None, None
+            return chat_module.PreparedTurn(
+                answer="prompt-text",
+                sources=[{"id": 1, "title": "Src"}],
+                note=None,
+                needs_llm=True,
+            )
 
         async def fake_stream(client, prompt, model, usage_holder=None):
             for piece in ["Hello ", "world", "!"]:

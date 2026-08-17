@@ -1,20 +1,21 @@
-"""Per-user chat conversations stored in SQLite on the host.
+"""Per-user chat conversations stored in SQLite.
 
-Conversations survive restarts (unlike Redis-without-AOF) and are purged after
-CHAT_RETENTION_DAYS of inactivity. Users are identified by an anonymous
-X-User-Id header set by the frontend (device UUID); this is NOT authentication.
+Conversations survive restarts and are purged after CHAT_RETENTION_DAYS of
+inactivity. Users are identified by an anonymous X-User-Id header (device UUID);
+this is not authentication.
 
-Turn flow (POST /api/chat/sessions/{id}/messages) reuses the same retrieval,
-rerank, fallback and LLM pipeline as /ask, but builds a conversation-aware
-prompt so the model can follow up on prior turns in the session.
+The turn pipeline reuses the shared retrieval/rerank/fallback pipeline and
+builds a conversation-aware prompt so the model can follow up on prior turns.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -389,14 +390,10 @@ class ChatStore:
 
 
 def json_dumps(v) -> str:
-    import json
-
     return json.dumps(v, separators=(",", ":"))
 
 
 def json_loads(s: str) -> list[dict]:
-    import json
-
     try:
         return json.loads(s or "[]")
     except (ValueError, TypeError):
@@ -431,7 +428,7 @@ _SMALLTALK_PATTERNS: dict[str, str] = {
 }
 
 
-def _smalltalk_reply(question: str, history: list[MessageOut]) -> str | None:
+def _smalltalk_reply(question: str) -> str | None:
     """Return a canned friendly reply for greetings/thanks/small talk, or None
     when the message looks like a real query for the archive."""
     q = question.strip().lower()
@@ -443,19 +440,28 @@ def _smalltalk_reply(question: str, history: list[MessageOut]) -> str | None:
     return None
 
 
-async def _prepare_turn(question: str, history: list[MessageOut]):
-    """Retrieve and build the LLM prompt for a turn.
+@dataclass
+class PreparedTurn:
+    """Outcome of retrieval + prompt building for one turn.
 
-    Returns a tuple. The first element is either:
-      - ("done", answer, sources, note, 0, 0, 0.0) when the turn is fully
-        answered without the LLM (small talk, no sources, weak results), or
-      - ("prompt", prompt, sources, note, None, None, None) when the LLM is
-        needed; the caller streams/calls the LLM and fills the last three
-        fields with (prompt_tokens, completion_tokens, cost).
+    Either carries a ready-made `answer` (small talk, no sources, or weak
+    results) with zero token usage, or a `prompt` for the LLM plus the sources
+    to cite. `needs_llm` distinguishes the two.
     """
-    smalltalk = _smalltalk_reply(question, history)
+
+    answer: str
+    sources: list[dict]
+    note: str | None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost: float = 0.0
+    needs_llm: bool = False
+
+
+async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTurn:
+    smalltalk = _smalltalk_reply(question)
     if smalltalk is not None:
-        return "done", smalltalk, [], None, 0, 0, 0.0
+        return PreparedTurn(answer=smalltalk, sources=[], note=None)
 
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
     from app.main import _effective_intent, retrieve_and_rerank, source_context, to_summary
@@ -471,40 +477,41 @@ async def _prepare_turn(question: str, history: list[MessageOut]):
     )
 
     if not sources:
-        return "done", "No sufficiently relevant articles were found for this query.", [], note, 0, 0, 0.0
+        return PreparedTurn(answer="No sufficiently relevant articles were found for this query.", sources=[], note=note)
 
     if config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
-        return (
-            "done",
-            fallback_answer(question, len(sources), date_label(eff_from, eff_to)),
-            [to_summary(s).model_dump() for s in sources],
-            note,
-            0,
-            0,
-            0.0,
+        return PreparedTurn(
+            answer=fallback_answer(question, len(sources), date_label(eff_from, eff_to)),
+            sources=[to_summary(s).model_dump() for s in sources],
+            note=note,
         )
 
     context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
     history_text = "\n".join(f"{m.role}: {m.content}" for m in history if m.role in ("user", "assistant"))
     prompt = CHAT_PROMPT.format(history=history_text or "(none)", context=context, question=question)
-    return "prompt", prompt, [to_summary(s).model_dump() for s in sources], note, None, None, None
+    return PreparedTurn(
+        answer=prompt,
+        sources=[to_summary(s).model_dump() for s in sources],
+        note=note,
+        needs_llm=True,
+    )
 
 
 async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list[dict], str | None, int, int, float]:
     """Retrieve, build a conversation-aware prompt, and call the LLM.
 
     Returns (answer, sources, note, prompt_tokens, completion_tokens, cost).
-    Mirrors /ask's pipeline; imported lazily to avoid a circular import with
-    app.main."""
-    kind, a, sources, note, pt, ct, cost = await _prepare_turn(question, history)
-    if kind == "done":
-        return a, sources, note, pt, ct, cost
+    Uses the shared retrieval pipeline from app.main; imported lazily to avoid a
+    circular import with app.main."""
+    turn = await _prepare_turn(question, history)
+    if not turn.needs_llm:
+        return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
-    result = await generate_answer(state_llm(), a, config.LLM_MODEL)
+    result = await generate_answer(state_llm(), turn.answer, config.LLM_MODEL)
     return (
         result.content,
-        sources,
-        note,
+        turn.sources,
+        turn.note,
         result.prompt_tokens,
         result.completion_tokens,
         result.cost(),
@@ -538,6 +545,27 @@ def _require_store() -> ChatStore:
     if store is None:
         raise HTTPException(status_code=503, detail="chat store not initialized")
     return store
+
+
+def _validate_question(body: MessageIn) -> str:
+    question = (body.content or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="empty message")
+    if len(question) > MAX_CONTENT_LEN:
+        raise HTTPException(status_code=400, detail=f"message too long (max {MAX_CONTENT_LEN} chars)")
+    return question
+
+
+async def _start_turn(s: ChatStore, session_id: str, user_id: str, question: str) -> tuple[MessageOut, list[MessageOut]]:
+    user_msg = await s.append_message(session_id, user_id, "user", question)
+    history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+    return user_msg, history
+
+
+async def _auto_title(s: ChatStore, session_id: str, user_id: str, question: str) -> None:
+    session = await s.get_session(session_id, user_id)
+    if session is not None and session.title.strip() in ("", "New chat"):
+        await s.rename_session(session_id, user_id, question[:60] or "New chat")
 
 
 @router.post("/sessions", response_model=SessionOut)
@@ -591,14 +619,9 @@ async def send_message(
 ):
     user_id = _user_id(x_user_id)
     s = _require_store()
-    question = (body.content or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="empty message")
-    if len(question) > MAX_CONTENT_LEN:
-        raise HTTPException(status_code=400, detail=f"message too long (max {MAX_CONTENT_LEN} chars)")
+    question = _validate_question(body)
 
-    user_msg = await s.append_message(session_id, user_id, "user", question)
-    history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+    user_msg, history = await _start_turn(s, session_id, user_id, question)
     start = time.perf_counter()
 
     try:
@@ -622,16 +645,11 @@ async def send_message(
         cost=cost,
         latency_ms=latency_ms,
     )
-    session = await s.get_session(session_id, user_id)
-    if session is not None and session.title.strip() in ("", "New chat"):
-        first_user = question[:60] or "New chat"
-        await s.rename_session(session_id, user_id, first_user)
+    await _auto_title(s, session_id, user_id, question)
     return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
 
 
 def _sse(event: str, data: dict) -> str:
-    import json
-
     return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
@@ -647,33 +665,29 @@ async def send_message_stream(
     once streaming completes."""
     user_id = _user_id(x_user_id)
     s = _require_store()
-    question = (body.content or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="empty message")
-    if len(question) > MAX_CONTENT_LEN:
-        raise HTTPException(status_code=400, detail=f"message too long (max {MAX_CONTENT_LEN} chars)")
+    question = _validate_question(body)
 
-    user_msg = await s.append_message(session_id, user_id, "user", question)
-    history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+    user_msg, history = await _start_turn(s, session_id, user_id, question)
 
     async def event_stream():
         start = time.perf_counter()
         try:
             yield _sse("start", {"user": user_msg.model_dump()})
-            kind, a, sources, note, pt, ct, cost = await _prepare_turn(question, history)
-            if kind == "done":
+            turn = await _prepare_turn(question, history)
+            if not turn.needs_llm:
                 latency_ms = (time.perf_counter() - start) * 1000
                 assistant_msg = await s.append_message(
-                    session_id, user_id, "assistant", a, sources,
-                    prompt_tokens=pt, completion_tokens=ct, cost=cost, latency_ms=latency_ms,
+                    session_id, user_id, "assistant", turn.answer, turn.sources,
+                    prompt_tokens=turn.prompt_tokens, completion_tokens=turn.completion_tokens,
+                    cost=turn.cost, latency_ms=latency_ms,
                 )
-                yield _sse("done", {"message": assistant_msg.model_dump(), "note": note, "latency_ms": latency_ms})
+                await _auto_title(s, session_id, user_id, question)
+                yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
                 return
 
-            prompt = a
             usage_holder: list = []
             chunks: list[str] = []
-            async for piece in stream_answer(state_llm(), prompt, config.LLM_MODEL, usage_holder):
+            async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
                 chunks.append(piece)
                 yield _sse("delta", {"text": piece})
 
@@ -686,21 +700,18 @@ async def send_message_stream(
                 completion_tokens=usage.completion_tokens if usage else 0,
             )
             assistant_msg = await s.append_message(
-                session_id, user_id, "assistant", answer, sources,
+                session_id, user_id, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
                 cost=result.cost(),
                 latency_ms=latency_ms,
             )
-            session = await s.get_session(session_id, user_id)
-            if session is not None and session.title.strip() in ("", "New chat"):
-                first_user = question[:60] or "New chat"
-                await s.rename_session(session_id, user_id, first_user)
+            await _auto_title(s, session_id, user_id, question)
             yield _sse(
                 "done",
                 {
                     "message": assistant_msg.model_dump(),
-                    "note": note,
+                    "note": turn.note,
                     "latency_ms": latency_ms,
                 },
             )

@@ -18,7 +18,6 @@ from update_index import fetch_records
 from app.config import config
 
 BATCH_SIZE = 200
-EMPTY_SUMMARY_FILTER = {"must": [{"is_empty": {"key": "summary"}}]}
 
 
 def log(msg: str):
