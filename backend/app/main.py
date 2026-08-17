@@ -393,6 +393,24 @@ async def search(
     )
 
 
+def source_context(s: SourceArticle, idx: int) -> str:
+    """Packs an article's metadata + summary + a body excerpt into a numbered
+    context block for the chat LLM prompt."""
+    meta = s.published_date or "n/a"
+    if s.author_names:
+        meta += f" | Authors: {', '.join(s.author_names)}"
+    if s.industry_names:
+        meta += f" | Industry: {', '.join(s.industry_names)}"
+    if s.dealtype_names:
+        meta += f" | Dealtype: {', '.join(s.dealtype_names)}"
+    parts = [f"[{idx}] {s.title} ({meta})"]
+    if s.summary:
+        parts.append(s.summary)
+    if s.body:
+        parts.append(s.body[:1500])
+    return "\n".join(parts)
+
+
 FACETS_CACHE_KEY = "facets:v1"
 FACETS_LIMIT = 200
 

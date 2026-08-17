@@ -378,3 +378,12 @@ def test_analytics_chat_endpoint(tmp_path):
     finally:
         chat_module.store = None
         _run(store.close())
+
+
+def test_chat_imports_shared_retrieval_helpers():
+    """The names chat lazily imports from app.main must stay available after
+    endpoint removals (regression: /ask removal dropped source_context)."""
+    from app import main
+
+    for name in ("_effective_intent", "retrieve_and_rerank", "source_context", "to_summary"):
+        assert hasattr(main, name), f"app.main.{name} missing (needed by chat._prepare_turn)"
