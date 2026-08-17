@@ -93,8 +93,9 @@ function relativeTime(ts: number): string {
 
 function formatCost(cost: number): string {
   if (cost <= 0) return ''
-  if (cost < 0.01) return `$${(cost * 1000).toFixed(3)}m`
-  return `$${cost.toFixed(4)}`
+  if (cost >= 1) return `$${cost.toFixed(2)}`
+  if (cost >= 0.01) return `$${cost.toFixed(4)}`
+  return `$${cost.toFixed(6)}`
 }
 
 function UsageLine({ msg }: { msg: Message }) {
