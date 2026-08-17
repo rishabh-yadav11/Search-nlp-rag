@@ -327,6 +327,10 @@ export default function ChatPage() {
 
       <section className="chat-main">
         <header className="chat-main-head">
+          <Link href="/" className="chat-main-brand">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/vccircle-wordmark.svg" alt="VCCircle" width={110} height={30} />
+          </Link>
           <span className="chat-main-title">ASK VCCircle</span>
           {activeId ? <span className="chat-main-sub">Conversation</span> : null}
         </header>

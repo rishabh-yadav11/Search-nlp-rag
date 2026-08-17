@@ -83,3 +83,61 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
             )
             await asyncio.sleep(delay)
     raise LLMUnavailableError() from last_error
+
+
+async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list | None = None):
+    """Yield answer text chunks as they arrive from the LLM.
+
+    Same retry policy as generate_answer, but only retries when the stream
+    fails before yielding any content (a mid-stream failure would otherwise
+    duplicate already-sent text). Each item yielded is a string chunk; the
+    caller reassembles the full answer. When usage_holder is provided (a
+    single-element list), it is filled with the final LLMResult after the
+    stream completes. Raises LLMUnavailableError after retries are exhausted.
+    """
+    last_error = None
+    for attempt in range(config.LLM_MAX_RETRIES + 1):
+        started = False
+        try:
+            stream = await llm_client.chat.completions.create(
+                model=model,
+                max_tokens=1200,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=config.LLM_TIMEOUT_SECONDS,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            usage = None
+            async for chunk in stream:
+                if chunk.usage is not None:
+                    usage = chunk.usage
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                piece = (delta.content or "") if delta else ""
+                if piece:
+                    started = True
+                    yield piece
+            if usage_holder is not None:
+                usage_holder.append(
+                    LLMResult(
+                        content="",
+                        prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+                        completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+                    )
+                )
+            return
+        except Exception as exc:
+            last_error = exc
+            if started or not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
+                raise LLMUnavailableError() from exc
+            delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            logger.warning(
+                "LLM stream failed on attempt %d/%d (%s); retrying in %.1fs",
+                attempt + 1,
+                config.LLM_MAX_RETRIES + 1,
+                type(exc).__name__,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise LLMUnavailableError() from last_error
