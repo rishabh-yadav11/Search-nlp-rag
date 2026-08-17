@@ -11,3 +11,4 @@ openai==1.68.2
 python-dotenv==1.0.1
 cachetools==5.5.0
 tqdm==4.66.5
+aiosqlite==0.20.0

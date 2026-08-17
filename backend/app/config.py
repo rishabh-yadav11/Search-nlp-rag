@@ -76,6 +76,14 @@ class Config:
     ENABLE_ENTITY_BOOST = os.getenv("ENABLE_ENTITY_BOOST", "true").lower() in ("1", "true", "yes")
     ENABLE_WEAK_FALLBACK = os.getenv("ENABLE_WEAK_FALLBACK", "true").lower() in ("1", "true", "yes")
 
+    # Chat history (SQLite on the host; survives restarts, unlike Redis without AOF)
+    # Relative CHAT_DB_PATH resolves against the backend working dir (where
+    # gunicorn runs). Retention purges conversations idle for CHAT_RETENTION_DAYS.
+    CHAT_DB_PATH = os.getenv("CHAT_DB_PATH", "data/chat.db")
+    CHAT_RETENTION_DAYS = int(os.getenv("CHAT_RETENTION_DAYS", "180"))
+    CHAT_MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "10"))
+    CHAT_PURGE_INTERVAL_SECONDS = int(os.getenv("CHAT_PURGE_INTERVAL_SECONDS", "86400"))
+
     # Analytics
     # Aggregates live in Redis DB 1 (the query cache uses DB 0 and is flushed
     # during deploys). When a view token is set, /analytics/summary requires it.

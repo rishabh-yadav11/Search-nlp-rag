@@ -24,6 +24,7 @@ from qdrant_client.models import (
 )
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
+from app import chat as chat_module
 from app.analytics import close as close_analytics
 from app.analytics import record_ask, record_click, record_search
 from app.analytics import summary as analytics_data
@@ -53,7 +54,16 @@ async def lifespan(app: FastAPI):
     state["reranker"] = CrossEncoder(config.RERANK_MODEL, device="cpu")
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
     state["llm"] = AsyncOpenAI(api_key=config.GROQ_API_KEY, base_url=config.GROQ_BASE_URL) if config.GROQ_API_KEY else None
+
+    chat_store = chat_module.ChatStore(config.CHAT_DB_PATH)
+    await chat_store.connect()
+    chat_module.store = chat_store
+    state["chat_retention"] = asyncio.create_task(chat_module.retention_loop())
+
     yield
+    state["chat_retention"].cancel()
+    await asyncio.gather(state["chat_retention"], return_exceptions=True)
+    await chat_store.close()
     await state["qdrant"].close()
     await cache.close()
     await close_analytics()
@@ -65,11 +75,12 @@ app = FastAPI(title="VCCircle New Search", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 app.include_router(health_router)
+app.include_router(chat_module.router)
 
 
 class SourceArticle(BaseModel):

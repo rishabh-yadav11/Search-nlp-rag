@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import Link from 'next/link'
 
 type Result = {
   id: number
@@ -248,6 +249,9 @@ export default function Page() {
             <img className="logo" src="/vccircle-wordmark.svg" alt="VCCircle" width={130} height={35} />
             <span className="ask">ASK</span>
           </div>
+          <Link href="/chat" className="chat-nav-link">
+            Chat
+          </Link>
         </div>
       </header>
 
