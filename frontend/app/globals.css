@@ -951,6 +951,15 @@ input[type='text']:focus-visible,
   margin: 3px 0;
 }
 
+.chat-msg-answer sup.cite {
+  font-size: 0.7em;
+  font-weight: 600;
+  vertical-align: super;
+  line-height: 0;
+  color: var(--blue-deep);
+  margin: 0 1px;
+}
+
 .chat-sources {
   margin-top: 10px;
   border-top: 1px solid rgba(0, 0, 0, 0.08);

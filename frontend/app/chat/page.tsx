@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import ReactMarkdown from 'react-markdown'
+import rehypeRaw from 'rehype-raw'
 import remarkGfm from 'remark-gfm'
 
 type Source = {
@@ -42,6 +43,32 @@ const API_BASE =
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
 
 const USER_KEY = 'vccircle_chat_user_id'
+
+const CITATION_RE = /\[\d+\]/g
+
+function remarkCitations() {
+  return (tree: any) => {
+    walk(tree, (node, parent, index) => {
+      if (node.type !== 'text' || !CITATION_RE.test(node.value)) return
+      const segments = node.value.split(/(\[\d+\])/g)
+      if (segments.length <= 1) return
+      const nodes = segments
+        .filter((s: string) => s !== '')
+        .map((s: string) => (/^\[\d+\]$/.test(s) ? { type: 'html', value: `<sup class="cite">${s}</sup>` } : { type: 'text', value: s }))
+      parent.children.splice(index, 1, ...nodes)
+    })
+  }
+}
+
+function walk(node: any, fn: (node: any, parent: any, index: number) => void) {
+  if (!node || typeof node !== 'object' || !Array.isArray(node.children)) return
+  for (let i = 0; i < node.children.length; i++) {
+    const child = node.children[i]
+    fn(child, node, i)
+    if (child.type === 'text') continue
+    walk(child, fn)
+  }
+}
 
 function makeUuid(): string {
   // crypto.randomUUID requires a secure context (HTTPS). The site is served
@@ -318,7 +345,7 @@ export default function ChatPage() {
                     <div className="chat-msg-plain">{m.content}</div>
                   ) : (
                     <div className="chat-msg-answer">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkCitations]} rehypePlugins={[rehypeRaw]}>{m.content}</ReactMarkdown>
                       <SourceList sources={m.sources ?? []} msg={m} />
                     </div>
                   )}
