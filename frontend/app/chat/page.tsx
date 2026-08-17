@@ -32,6 +32,7 @@ type Session = {
   created_at: number
   updated_at: number
   last_preview?: string
+  total_cost?: number
 }
 
 const API_BASE =
@@ -93,9 +94,9 @@ function relativeTime(ts: number): string {
 
 function formatCost(cost: number): string {
   if (cost <= 0) return ''
-  if (cost >= 1) return `$${cost.toFixed(2)}`
-  if (cost >= 0.01) return `$${cost.toFixed(4)}`
-  return `$${cost.toFixed(6)}`
+  if (cost >= 1) return `₹${cost.toFixed(2)}`
+  if (cost >= 0.01) return `₹${cost.toFixed(4)}`
+  return `₹${cost.toFixed(6)}`
 }
 
 function UsageLine({ msg }: { msg: Message }) {
@@ -262,7 +263,10 @@ export default function ChatPage() {
               <div className="chat-session-title" title={s.title}>
                 {s.title || 'New chat'}
               </div>
-              <div className="chat-session-meta">{relativeTime(s.updated_at)}</div>
+              <div className="chat-session-meta">
+                {relativeTime(s.updated_at)}
+                {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
+              </div>
               <button
                 type="button"
                 className="chat-session-del"

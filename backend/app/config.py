@@ -59,6 +59,8 @@ class Config:
     # Defaults match Groq's llama-3.3-70b-versatile rates.
     LLM_PRICE_INPUT_PER_1M = float(os.getenv("LLM_PRICE_INPUT_PER_1M", "0.59"))
     LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "0.79"))
+    # Conversion for displaying cost in Indian Rupees (INR). Approx market rate.
+    INR_PER_USD = float(os.getenv("INR_PER_USD", "95.60"))
 
     # Search
     TOP_K = int(os.getenv("TOP_K", "8"))

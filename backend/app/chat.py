@@ -42,6 +42,7 @@ class SessionOut(BaseModel):
     created_at: float
     updated_at: float
     last_preview: str = ""
+    total_cost: float = 0.0
 
 
 class MessageOut(BaseModel):
@@ -163,7 +164,8 @@ class ChatStore:
             """
             SELECT s.id, s.title, s.created_at, s.updated_at,
                    (SELECT m.content FROM messages m
-                     WHERE m.session_id = s.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last
+                     WHERE m.session_id = s.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last,
+                   (SELECT COALESCE(SUM(m.cost), 0) FROM messages m WHERE m.session_id = s.id) AS total_cost
             FROM sessions s
             WHERE s.user_id = ?
             ORDER BY s.updated_at DESC
@@ -181,6 +183,7 @@ class ChatStore:
                     created_at=r["created_at"],
                     updated_at=r["updated_at"],
                     last_preview=last[:PREVIEW_LEN],
+                    total_cost=float(r["total_cost"] or 0.0),
                 )
             )
         return out

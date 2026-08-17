@@ -29,11 +29,13 @@ class LLMResult:
         return self.prompt_tokens + self.completion_tokens
 
     def cost(self) -> float:
-        """Estimated cost of this call in USD, from config pricing per 1M tokens."""
-        return (
+        """Estimated cost of this call in INR, from config pricing per 1M tokens
+        (USD) converted at INR_PER_USD."""
+        usd = (
             self.prompt_tokens / 1_000_000 * config.LLM_PRICE_INPUT_PER_1M
             + self.completion_tokens / 1_000_000 * config.LLM_PRICE_OUTPUT_PER_1M
         )
+        return usd * config.INR_PER_USD
 
 
 def _is_retryable(exc: Exception) -> bool:
