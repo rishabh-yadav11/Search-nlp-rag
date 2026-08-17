@@ -24,6 +24,7 @@ type Message = {
   prompt_tokens?: number
   completion_tokens?: number
   cost?: number
+  latency_ms?: number
 }
 
 type Session = {
@@ -99,13 +100,22 @@ function formatCost(cost: number): string {
   return `₹${cost.toFixed(6)}`
 }
 
+function formatTime(ms: number): string {
+  if (ms <= 0) return ''
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  return `${(ms / 1000).toFixed(1)}s`
+}
+
 function UsageLine({ msg }: { msg: Message }) {
   const tokens = (msg.prompt_tokens ?? 0) + (msg.completion_tokens ?? 0)
   const cost = msg.cost ?? 0
-  if (!tokens) return null
+  const latency = msg.latency_ms ?? 0
+  if (!tokens && !latency) return null
   return (
     <div className="chat-usage">
-      {tokens.toLocaleString()} tokens · {formatCost(cost)}
+      {latency ? <span className="chat-usage-time">⏱ {formatTime(latency)}</span> : null}
+      <span>{tokens.toLocaleString()} tokens</span>
+      {cost > 0 ? <span className="chat-usage-cost">{formatCost(cost)}</span> : null}
     </div>
   )
 }

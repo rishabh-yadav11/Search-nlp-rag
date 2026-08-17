@@ -54,6 +54,7 @@ class MessageOut(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost: float = 0.0
+    latency_ms: float = 0.0
 
 
 class SessionDetailOut(SessionOut):
@@ -75,6 +76,7 @@ class TurnOut(BaseModel):
     user: MessageOut
     assistant: MessageOut
     note: str | None = None
+    latency_ms: float = 0.0
 
 
 def _now() -> float:
@@ -125,7 +127,8 @@ class ChatStore:
                 created_at REAL NOT NULL,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
-                cost REAL NOT NULL DEFAULT 0
+                cost REAL NOT NULL DEFAULT 0,
+                latency_ms REAL NOT NULL DEFAULT 0
             )
             """
         )
@@ -142,6 +145,8 @@ class ChatStore:
             await self._db.execute("ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
             await self._db.execute("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
             await self._db.execute("ALTER TABLE messages ADD COLUMN cost REAL NOT NULL DEFAULT 0")
+        if "latency_ms" not in col_names:
+            await self._db.execute("ALTER TABLE messages ADD COLUMN latency_ms REAL NOT NULL DEFAULT 0")
         await self._db.commit()
 
     async def close(self) -> None:
@@ -208,7 +213,7 @@ class ChatStore:
             raise HTTPException(status_code=404, detail="conversation not found")
         rows = await self._db.execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms
             FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC
             """,
             (session_id,),
@@ -225,14 +230,15 @@ class ChatStore:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         cost: float = 0.0,
+        latency_ms: float = 0.0,
     ) -> MessageOut:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
         ts = _now()
         cur = await self._db.execute(
-            "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost),
+            "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms),
         )
         await self._db.execute(
             "UPDATE sessions SET updated_at = ?, title = COALESCE(NULLIF(title, ''), 'New chat') WHERE id = ?",
@@ -248,6 +254,7 @@ class ChatStore:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost=cost,
+            latency_ms=latency_ms,
         )
 
     async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
@@ -276,7 +283,7 @@ class ChatStore:
         first), used as conversation context for the LLM prompt."""
         rows = await self._db.execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms
             FROM messages WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
             """,
             (session_id, max_turns * 2),
@@ -342,6 +349,7 @@ def _row_to_message(r) -> MessageOut:
         prompt_tokens=int(r["prompt_tokens"] or 0),
         completion_tokens=int(r["completion_tokens"] or 0),
         cost=float(r["cost"] or 0.0),
+        latency_ms=float(r["latency_ms"] or 0.0),
     )
 
 
@@ -510,6 +518,7 @@ async def send_message(
 
     user_msg = await s.append_message(session_id, user_id, "user", question)
     history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+    start = time.perf_counter()
 
     try:
         answer, sources, note, prompt_tokens, completion_tokens, cost = await _run_turn(question, history)
@@ -518,6 +527,8 @@ async def send_message(
             status_code=503,
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
+
+    latency_ms = (time.perf_counter() - start) * 1000
 
     assistant_msg = await s.append_message(
         session_id,
@@ -528,12 +539,13 @@ async def send_message(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         cost=cost,
+        latency_ms=latency_ms,
     )
     session = await s.get_session(session_id, user_id)
     if session is not None and session.title.strip() in ("", "New chat"):
         first_user = question[:60] or "New chat"
         await s.rename_session(session_id, user_id, first_user)
-    return TurnOut(user=user_msg, assistant=assistant_msg, note=note)
+    return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
 
 
 async def retention_loop() -> None:
