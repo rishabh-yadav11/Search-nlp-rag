@@ -7,6 +7,7 @@ from functools import partial
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastembed import SparseTextEmbedding
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -28,6 +29,7 @@ from app.analytics import record_ask, record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
 from app.config import config
+from app.dashboard import dashboard_html
 from app.health import router as health_router
 from app.llm import LLMUnavailableError, generate_answer
 from app.query_expand import expand_query
@@ -555,3 +557,14 @@ async def get_analytics_summary(authorization: str | None = None, token: str | N
         if supplied != config.ANALYTICS_VIEW_TOKEN:
             raise HTTPException(status_code=401, detail="invalid analytics token")
     return await analytics_data()
+
+
+@app.get("/analytics/dashboard")
+async def get_analytics_dashboard(authorization: str | None = None, token: str | None = None):
+    """Human-readable analytics dashboard (self-contained HTML, no external
+    assets). Same token gate as /analytics/summary; fetches summary on load."""
+    if config.ANALYTICS_VIEW_TOKEN:
+        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
+        if supplied != config.ANALYTICS_VIEW_TOKEN:
+            raise HTTPException(status_code=401, detail="invalid analytics token")
+    return HTMLResponse(dashboard_html())

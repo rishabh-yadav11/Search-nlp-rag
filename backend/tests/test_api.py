@@ -192,3 +192,13 @@ def test_retrieval_queries_no_dup_when_topic_equals_rewrite():
     # A query that's already a bare 'top <topic>' with no year: no rewrite -> single
     qs = _retrieval_queries("top deals")
     assert qs == ["top deals"]
+
+
+def test_analytics_dashboard_route_registered():
+    from app.dashboard import DASHBOARD_HTML
+
+    paths = {r.path for r in main.app.routes}
+    assert "/analytics/dashboard" in paths
+    assert "/analytics/summary" in paths
+    assert "Top queries" in DASHBOARD_HTML
+    assert "Zero-result rate" in DASHBOARD_HTML
