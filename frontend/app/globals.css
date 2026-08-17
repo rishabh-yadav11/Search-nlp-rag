@@ -713,6 +713,19 @@ input[type='text']:focus-visible,
 
 /* ---- Chat UI (ChatGPT-style) ---- */
 
+.chat-thread::-webkit-scrollbar,
+.chat-session-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.chat-thread,
+.chat-session-list {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
 .chat-app {
   display: flex;
   height: 100vh;
