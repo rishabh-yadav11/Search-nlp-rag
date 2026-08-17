@@ -51,15 +51,15 @@ class Config:
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-    LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
     # Per-call timeout and retry policy for the LLM (see app/llm.py).
     LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
     LLM_RETRY_BACKOFF = float(os.getenv("LLM_RETRY_BACKOFF", "1.0"))
     # Pricing in USD per 1M tokens, used by LLMResult.cost() for cost tracking.
-    # Defaults approximate Google Gemini 2.5 Flash rates.
-    LLM_PRICE_INPUT_PER_1M = float(os.getenv("LLM_PRICE_INPUT_PER_1M", "0.30"))
-    LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "2.50"))
+    # Defaults approximate Google Gemini 3.1 Flash Lite rates.
+    LLM_PRICE_INPUT_PER_1M = float(os.getenv("LLM_PRICE_INPUT_PER_1M", "0.25"))
+    LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "1.50"))
     # Conversion for displaying cost in Indian Rupees (INR). Approx market rate.
     INR_PER_USD = float(os.getenv("INR_PER_USD", "95.60"))
 
