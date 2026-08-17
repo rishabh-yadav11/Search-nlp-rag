@@ -30,6 +30,7 @@ from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
 from app.config import config
+from app.cost_budget import close as close_cost_budget
 from app.dashboard import dashboard_html
 from app.health import router as health_router
 from app.query_expand import expand_query
@@ -66,14 +67,14 @@ async def lifespan(app: FastAPI):
     await state["qdrant"].close()
     await cache.close()
     await close_analytics()
+    await close_cost_budget()
 
 
 app = FastAPI(title="VCCircle New Search", lifespan=lifespan)
 
-# POC-only: wide open for local frontend on :3000. Restrict origins before any real deployment.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -405,6 +406,24 @@ FACETS_CACHE_KEY = "facets:v1"
 FACETS_LIMIT = 200
 
 
+async def _facet_values(key: str) -> list[str]:
+    """Distinct payload values for ``key`` via Qdrant's vector-free facet API.
+
+    Runs a single indexed query server-side instead of scrolling the whole
+    collection in Python. Returns values sorted alphabetically, capped at
+    FACETS_LIMIT.
+    """
+    raw = await state["qdrant"].http.collections_api.api_client.request(
+        type_=dict,
+        method="POST",
+        url="/collections/{collection_name}/facet",
+        path_params={"collection_name": config.QDRANT_COLLECTION},
+        json={"key": key, "limit": FACETS_LIMIT},
+    )
+    hits = ((raw or {}).get("result") or {}).get("hits") or []
+    return sorted(h["value"] for h in hits if isinstance(h.get("value"), str))
+
+
 @app.get("/facets")
 async def facets():
     """Distinct industry_names and dealtype_names values across the collection,
@@ -413,31 +432,9 @@ async def facets():
     if cached is not None:
         return cached
 
-    industries: set[str] = set()
-    dealtypes: set[str] = set()
-    offset = None
-    while True:
-        points, offset = await state["qdrant"].scroll(
-            collection_name=config.QDRANT_COLLECTION,
-            limit=2000,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        for p in points:
-            pl = p.payload or {}
-            for v in pl.get("industry_names") or []:
-                if isinstance(v, str) and v.strip():
-                    industries.add(v.strip())
-            for v in pl.get("dealtype_names") or []:
-                if isinstance(v, str) and v.strip():
-                    dealtypes.add(v.strip())
-        if offset is None or not points:
-            break
-
     result = {
-        "industry": sorted(industries)[:FACETS_LIMIT],
-        "dealtype": sorted(dealtypes)[:FACETS_LIMIT],
+        "industry": await _facet_values("industry_names"),
+        "dealtype": await _facet_values("dealtype_names"),
     }
     await cache.set(FACETS_CACHE_KEY, result)
     return result

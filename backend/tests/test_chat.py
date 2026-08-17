@@ -327,6 +327,33 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
         _run(store.close())
 
 
+def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
+    """SSE stream fails closed with an error event when the daily budget is hit."""
+    client, store = _make_client(tmp_path)
+    try:
+        h = {"X-User-Id": USER_A}
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="prompt-text", sources=[{"id": 1}], note=None, needs_llm=True)
+
+        async def boom(*args, **kwargs):
+            raise chat_module.BudgetExceeded()
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "assert_within_budget", boom)
+
+        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "question"}) as r:
+            assert r.status_code == 200
+            body = "".join(r.iter_text())
+
+        assert "event: error" in body
+        assert "Daily AI budget reached" in body
+        assert "event: done" not in body
+    finally:
+        _run(store.close())
+
+
 def test_global_stats_aggregates(tmp_path):
     """global_stats returns cross-user counts, tokens, cost and top tables."""
     store = _store(tmp_path)

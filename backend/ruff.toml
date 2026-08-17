@@ -11,6 +11,7 @@ target-version = "py311"
 "app/health.py" = ["BLE001"]
 "app/redis_cache.py" = ["BLE001"]
 "app/analytics.py" = ["BLE001"]
+"app/cost_budget.py" = ["BLE001"]
 "scripts/*" = ["BLE001", "ASYNC230", "SIM115"]
 "app/query_intent.py" = ["DTZ011"]
 "app/main.py" = ["FURB162"]

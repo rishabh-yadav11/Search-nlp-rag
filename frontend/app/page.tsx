@@ -259,7 +259,9 @@ export default function Page() {
               Analytics
             </a>
           </nav>
-          <span className="topbar-cta">ASK VCCircle</span>
+          <Link href="/chat" className="topbar-cta" aria-label="Open chat assistant">
+            ASK VCCircle
+          </Link>
         </div>
       </header>
 

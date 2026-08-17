@@ -1,4 +1,5 @@
 import os
+from typing import ClassVar
 
 from dotenv import load_dotenv
 
@@ -43,9 +44,11 @@ class Config:
     # Sparse (BM25) embeddings — must match the model used at index time
     SPARSE_MODEL = os.getenv("SPARSE_MODEL", "Qdrant/bm25")
 
-    # Reranker (cross-encoder) applied to RRF candidates before the top_k is kept
+    # Reranker (cross-encoder) applied to RRF candidates before the top_k is kept.
+    # Fewer candidates = faster CPU rerank; 12 keeps top-8 quality vs 16 while
+    # trimming latency (measured 8/8 overlap on representative queries).
     RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "16"))
+    RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "12"))
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
@@ -62,6 +65,9 @@ class Config:
     LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "1.50"))
     # Conversion for displaying cost in Indian Rupees (INR). Approx market rate.
     INR_PER_USD = float(os.getenv("INR_PER_USD", "95.60"))
+    # Daily LLM spend cap in USD; 0 disables it. Chat fails closed (no LLM calls)
+    # once today's cumulative spend reaches this value (see app/cost_budget.py).
+    LLM_DAILY_BUDGET_USD = float(os.getenv("LLM_DAILY_BUDGET_USD", "0"))
 
     # Search
     TOP_K = int(os.getenv("TOP_K", "8"))
@@ -96,6 +102,15 @@ class Config:
     # during deploys). When a view token is set, /analytics/summary requires it.
     ANALYTICS_REDIS_DB = int(os.getenv("ANALYTICS_REDIS_DB", "1"))
     ANALYTICS_VIEW_TOKEN = os.getenv("ANALYTICS_VIEW_TOKEN", "")
+
+    # CORS: comma-separated allowed origins. Production serves the API and the
+    # frontend same-origin through nginx, so this only matters for cross-origin
+    # dev clients (e.g. the Next.js dev server on :3000 hitting :8000).
+    CORS_ORIGINS: ClassVar[list[str]] = [
+        o.strip()
+        for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
+        if o.strip()
+    ]
 
 
 config = Config()

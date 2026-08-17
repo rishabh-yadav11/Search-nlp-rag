@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.config import config
+from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
 
 logger = logging.getLogger("chat")
@@ -502,12 +503,15 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
 
     Returns (answer, sources, note, prompt_tokens, completion_tokens, cost).
     Uses the shared retrieval pipeline from app.main; imported lazily to avoid a
-    circular import with app.main."""
+    circular import with app.main. Raises BudgetExceeded when the daily LLM
+    spend cap is already exhausted."""
     turn = await _prepare_turn(question, history)
     if not turn.needs_llm:
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
+    await assert_within_budget()
     result = await generate_answer(state_llm(), turn.answer, config.LLM_MODEL)
+    await record_cost(result.cost())
     return (
         result.content,
         turn.sources,
@@ -626,6 +630,11 @@ async def send_message(
 
     try:
         answer, sources, note, prompt_tokens, completion_tokens, cost = await _run_turn(question, history)
+    except BudgetExceeded:
+        raise HTTPException(
+            status_code=429,
+            detail={"error": "Daily AI budget reached", "detail": "The daily chat budget is exhausted; please try again tomorrow."},
+        )
     except LLMUnavailableError:
         raise HTTPException(
             status_code=503,
@@ -685,6 +694,7 @@ async def send_message_stream(
                 yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
                 return
 
+            await assert_within_budget()
             usage_holder: list = []
             chunks: list[str] = []
             async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
@@ -699,6 +709,7 @@ async def send_message_stream(
                 prompt_tokens=usage.prompt_tokens if usage else 0,
                 completion_tokens=usage.completion_tokens if usage else 0,
             )
+            await record_cost(result.cost())
             assistant_msg = await s.append_message(
                 session_id, user_id, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,
@@ -717,6 +728,8 @@ async def send_message_stream(
             )
         except LLMUnavailableError:
             yield _sse("error", {"error": "LLM temporarily unavailable"})
+        except BudgetExceeded:
+            yield _sse("error", {"error": "Daily AI budget reached"})
         except Exception:
             logger.exception("chat stream turn failed")
             yield _sse("error", {"error": "Something went wrong"})

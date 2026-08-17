@@ -122,6 +122,11 @@ header.topbar {
   border-radius: 3px;
   white-space: nowrap;
   padding: 0 14px;
+  text-decoration: none;
+}
+
+.topbar-cta:hover {
+  filter: brightness(1.08);
 }
 
 .chat-nav-link:hover {
