@@ -55,7 +55,8 @@ DASHBOARD_HTML = """<!doctype html>
   .card .value.ok { color: var(--blue); }
   .card .value.warn { color: var(--orange); }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 760px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
   .panel { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
   .panel h2 { font-size: 15px; margin-bottom: 12px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -83,7 +84,11 @@ DASHBOARD_HTML = """<!doctype html>
         <div id="top-queries"><div class="empty">loading…</div></div>
       </div>
       <div class="panel">
-        <h2>Clicks &amp; ask</h2>
+        <h2>Top asks</h2>
+        <div id="top-asks"><div class="empty">loading…</div></div>
+      </div>
+      <div class="panel">
+        <h2>Clicks</h2>
         <div id="clicks"><div class="empty">loading…</div></div>
       </div>
     </div>
@@ -112,6 +117,7 @@ DASHBOARD_HTML = """<!doctype html>
         'Updated ' + new Date().toLocaleTimeString() + ' · counters since the analytics DB was last cleared';
       renderCards(d);
       renderTopQueries(d);
+      renderTopAsks(d);
       renderClicks(d);
     } catch (e) {
       document.getElementById('error').textContent = 'Analytics unavailable: ' + e.message;
@@ -209,6 +215,8 @@ DASHBOARD_HTML = """<!doctype html>
   }
 
   function renderTopQueries(d) { document.getElementById('top-queries').innerHTML = topTable(d.top_queries); }
+
+  function renderTopAsks(d) { document.getElementById('top-asks').innerHTML = topTable(d.top_asks); }
 
   function renderClicks(d) {
     var pos = d.click_positions || {};
