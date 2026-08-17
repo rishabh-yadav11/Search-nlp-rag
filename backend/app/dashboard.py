@@ -198,6 +198,7 @@ DASHBOARD_HTML = """<!doctype html>
       card('Cache hit', pct(d.cache_hit_rate), 'of searches served from cache') +
       card('Filtered', pct(d.filtered_rate), 'searches with facet/date filters') +
       card('Asks', fmt(d.asks_total), 'LLM answer requests') +
+      card('Ask cost', inr(d.ask_cost), 'LLM spend on /ask', d.ask_cost > 0 ? 'warn' : '') +
       card('Clicks', fmt(d.clicks_total), 'results opened by users', d.clicks_total > 0 ? 'ok' : '');
     document.getElementById('cards').innerHTML = html;
   }

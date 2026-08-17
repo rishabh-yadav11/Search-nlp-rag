@@ -460,7 +460,7 @@ async def ask(
     cached = await cache.get(cache_key)
     if cached is not None:
         sources = [SourceSummary.model_validate(s) for s in cached["sources"]]
-        await record_ask(q, "answered", cached=True)
+        await record_ask(q, "answered", cached=True, cost=float(cached.get("cost", 0.0)))
         return AskResponse(
             query=q,
             answer=cached["answer"],
@@ -515,7 +515,7 @@ async def ask(
         "cost": llm_result.cost(),
     }
     await cache.set(cache_key, usage_payload)
-    await record_ask(q, "answered", cached=False)
+    await record_ask(q, "answered", cached=False, cost=llm_result.cost())
     return AskResponse(
         query=q,
         answer=answer,

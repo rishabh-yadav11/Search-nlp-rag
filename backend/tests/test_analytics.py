@@ -23,10 +23,16 @@ class _FakeRedis:
         self.last_pipe.append(("zincrby", key, amount, member))
         return self
 
+    def incrbyfloat(self, key, amount):
+        self.last_pipe.append(("incrbyfloat", key, amount))
+        return self
+
     async def execute(self):
         for cmd in self.last_pipe:
             if cmd[0] in ("incr", "zincrby"):
                 self.store[cmd[1]] = self.store.get(cmd[1], 0) + cmd[2]
+            elif cmd[0] == "incrbyfloat":
+                self.store[cmd[1]] = self.store.get(cmd[1], 0.0) + cmd[2]
         self.last_pipe = []
         return []
 
@@ -83,11 +89,14 @@ def test_record_click_and_ask(monkeypatch):
 
     _run(analytics.record_click("fintech funding", 2))
     _run(analytics.record_ask("who funds fintech", "answered", cached=False))
+    _run(analytics.record_ask("who funds healthtech", "answered", cached=True, cost=0.12))
 
     assert fake.store["analytics:click:total"] == 1
     assert fake.store["analytics:click:pos:2"] == 1
-    assert fake.store["analytics:ask:total"] == 1
-    assert fake.store["analytics:ask:outcome:answered"] == 1
+    assert fake.store["analytics:ask:total"] == 2
+    assert fake.store["analytics:ask:outcome:answered"] == 2
+    assert fake.store["analytics:ask:cost"] == 0.12
+    assert fake.store["analytics:ask:cached"] == 1
 
 
 def test_summary_reads_aggregates(monkeypatch):
@@ -103,6 +112,7 @@ def test_summary_reads_aggregates(monkeypatch):
             "analytics:search:latency:count": 10,
             "analytics:search:cached": 6,
             "analytics:ask:total": 5,
+            "analytics:ask:cost": "1.75",
             "analytics:click:total": 7,
         }
     )
@@ -118,6 +128,7 @@ def test_summary_reads_aggregates(monkeypatch):
     assert s["cache_hit_rate"] == 60.0
     assert s["avg_latency_ms"] == 200.0
     assert s["asks_total"] == 5
+    assert s["ask_cost"] == 1.75
     assert s["clicks_total"] == 7
 
 
