@@ -26,13 +26,12 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app import chat as chat_module
 from app.analytics import close as close_analytics
-from app.analytics import record_ask, record_click, record_search
+from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
-from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
+from app.answer_fallback import date_label, weak_results_note
 from app.config import config
 from app.dashboard import dashboard_html
 from app.health import router as health_router
-from app.llm import LLMUnavailableError, generate_answer
 from app.query_expand import expand_query
 from app.query_intent import (
     extract_list_topic,
@@ -119,18 +118,6 @@ class SearchResponse(BaseModel):
     cached: bool
     latency_ms: float
     note: str | None = None
-
-
-class AskResponse(BaseModel):
-    query: str
-    answer: str
-    sources: list[SourceSummary]
-    cached: bool
-    latency_ms: float
-    note: str | None = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cost: float = 0.0
 
 
 def to_summary(a: SourceArticle) -> SourceSummary:
@@ -403,129 +390,6 @@ async def search(
         cached=False,
         latency_ms=(time.perf_counter() - start) * 1000,
         note=note,
-    )
-
-
-ANSWER_PROMPT = """You are answering a question using ONLY the numbered articles below. \
-Cite the article number(s) for every factual claim, like [1] or [2][3]. \
-If the question asks for a list or ranking (e.g. "top N deals", "top articles", "which companies/funds"), \
-extract and enumerate every matching item that appears in the articles, with citations. \
-Do not refuse because the list is long; list as many as the articles mention, and say how many \
-were found if fewer than the requested number. \
-If the articles genuinely contain no information relevant to the question, say so plainly instead of guessing.
-
-Articles:
-{context}
-
-Question: {question}
-
-Answer (with inline [n] citations):"""
-
-
-def source_context(s: SourceArticle, idx: int) -> str:
-    meta = s.published_date or "n/a"
-    if s.author_names:
-        meta += f" | Authors: {', '.join(s.author_names)}"
-    if s.industry_names:
-        meta += f" | Industry: {', '.join(s.industry_names)}"
-    if s.dealtype_names:
-        meta += f" | Dealtype: {', '.join(s.dealtype_names)}"
-    parts = [f"[{idx}] {s.title} ({meta})"]
-    if s.summary:
-        parts.append(s.summary)
-    if s.body:
-        parts.append(s.body[:1500])
-    return "\n".join(parts)
-
-
-@app.get("/ask", response_model=AskResponse)
-async def ask(
-    q: str = Query(..., min_length=1),
-    top_k: int = Query(config.TOP_K, ge=1, le=20),
-    industry: str | None = Query(None),
-    dealtype: str | None = Query(None),
-    author: str | None = Query(None),
-    from_date: str | None = Query(None),
-    to_date: str | None = Query(None),
-):
-    if state["llm"] is None:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured")
-
-    start = time.perf_counter()
-    retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
-    if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
-        retrieval_q = expand_query(retrieval_q)
-    eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 20)
-    cache_key = f"ask:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
-    cached = await cache.get(cache_key)
-    if cached is not None:
-        sources = [SourceSummary.model_validate(s) for s in cached["sources"]]
-        await record_ask(q, "answered", cached=True, cost=float(cached.get("cost", 0.0)))
-        return AskResponse(
-            query=q,
-            answer=cached["answer"],
-            sources=sources,
-            cached=True,
-            latency_ms=(time.perf_counter() - start) * 1000,
-            note=cached.get("note"),
-            prompt_tokens=int(cached.get("prompt_tokens", 0)),
-            completion_tokens=int(cached.get("completion_tokens", 0)),
-            cost=float(cached.get("cost", 0.0)),
-        )
-
-    qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    reranked = await retrieve_and_rerank(q, eff_top_k, qfilter)
-    sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][:eff_top_k]
-
-    note = weak_results_note([s.score for s in sources], date_label(eff_from, eff_to)) if config.ENABLE_WEAK_FALLBACK else None
-
-    if not sources:
-        answer = "No sufficiently relevant articles were found for this query."
-        await cache.set(cache_key, {"answer": answer, "sources": [], "note": note})
-        await record_ask(q, "none", cached=False)
-        return AskResponse(query=q, answer=answer, sources=[], cached=False,
-                            latency_ms=(time.perf_counter() - start) * 1000, note=note)
-
-    if config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
-        answer = fallback_answer(q, len(sources), date_label(eff_from, eff_to))
-        await cache.set(cache_key, {"answer": answer, "sources": [to_summary(s).model_dump() for s in sources], "note": note})
-        await record_ask(q, "fallback", cached=False)
-        return AskResponse(query=q, answer=answer, sources=[to_summary(s) for s in sources], cached=False,
-                            latency_ms=(time.perf_counter() - start) * 1000, note=note)
-
-    context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
-    prompt = ANSWER_PROMPT.format(context=context, question=q)
-
-    try:
-        llm_result = await generate_answer(state["llm"], prompt, config.LLM_MODEL)
-    except LLMUnavailableError:
-        await record_ask(q, "error", cached=False)
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
-        )
-
-    answer = llm_result.content
-    usage_payload = {
-        "answer": answer,
-        "sources": [to_summary(s).model_dump() for s in sources],
-        "note": note,
-        "prompt_tokens": llm_result.prompt_tokens,
-        "completion_tokens": llm_result.completion_tokens,
-        "cost": llm_result.cost(),
-    }
-    await cache.set(cache_key, usage_payload)
-    await record_ask(q, "answered", cached=False, cost=llm_result.cost())
-    return AskResponse(
-        query=q,
-        answer=answer,
-        sources=[to_summary(s) for s in sources],
-        cached=False,
-        latency_ms=(time.perf_counter() - start) * 1000,
-        note=note,
-        prompt_tokens=llm_result.prompt_tokens,
-        completion_tokens=llm_result.completion_tokens,
-        cost=llm_result.cost(),
     )
 
 

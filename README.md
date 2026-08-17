@@ -14,10 +14,10 @@ MySQL ──fetch_data──▶ articles.jsonl ──build_index──▶ Qdrant
    └─────────update_index (incremental new/edit/delete)──────┘
                                                                │
 Browsers ◀── nginx ───▶ Next.js app ◀──(same origin)──▶ FastAPI ──▶ Qdrant
-                         /search, /ask, /chat, /facets,         │
-                         /health, /live, /ready               Gemini (for /ask, /chat)
-                                                               Redis (cache + analytics)
-                                                               SQLite (chat conversations)
+                         /search, /chat, /facets,          │
+                         /health, /live, /ready            Gemini (for chat)
+                                                           Redis (cache + analytics)
+                                                           SQLite (chat conversations)
 ```
 
 ## Repository layout
@@ -25,7 +25,7 @@ Browsers ◀── nginx ───▶ Next.js app ◀──(same origin)──�
 ```
 backend/
   app/
-    main.py            FastAPI app: /search, /ask (RAG), /health, /analytics
+    main.py            FastAPI app: /search, /chat, /health, /analytics
     health.py          /live, /ready, /readyz dependency checks
     llm.py             LLM call with timeout, retries, backoff, token-cost calc
     chat.py            per-user chat store (SQLite) + /api/chat router
@@ -47,7 +47,7 @@ backend/
   requirements-dev.txt lint/test tooling
   .env.example         configuration template
 frontend/              Next.js app (App Router + TypeScript)
-  app/page.tsx         search/ask UI (timeouts, validation, a11y)
+  app/page.tsx         search UI (timeouts, validation, a11y)
   app/chat/page.tsx    ChatGPT-style chat UI (SSE streaming)
   app/globals.css
   middleware.ts        CSP nonce header
@@ -66,7 +66,7 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
   dealtype + summary` (metadata first, no body, short and fast to encode on
   CPU); the **sparse (BM25)** vector is the same plus the full `body`, so
   keyword matches inside article bodies stay searchable at lexical cost.
-- **Faceted filtering** — `/search` and `/ask` accept optional `industry`,
+- **Faceted filtering** — `/search` accepts optional `industry`,
   `dealtype`, `author` and `from_date`/`to_date` params, applied as a Qdrant
   filter to both prefetches. Any value can be comma-separated for multi-select.
   Cache keys include the filters so distinct queries don't collide.
@@ -81,22 +81,16 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
 - **Result ordering** — recency-tempered relevance first: blended score desc
   (`score * (1 - RECENCY_STRENGTH * (1 - exp(-age_days / RECENCY_DECAY_DAYS)))`),
   then `published_date` desc as tie-break (missing dates last).
-- **Ask mode (RAG)** — retrieves articles above `ASK_MIN_SCORE`, packs them
-  (title, date, authors/industry/dealtype, summary and a body excerpt) into a
-  numbered context, and asks Google Gemini (`gemini-3.1-flash-lite`, configurable)
-  for an answer with inline `[n]` citations. If nothing clears the threshold it
-  says so instead of guessing. Token usage and cost (input/output price per 1M,
-  converted to INR) are returned with the response.
 - **Chat (conversations)** — a ChatGPT-style UI at `/chat`. Each device gets an
   anonymous `X-User-Id` (a localStorage UUID) and conversations are stored per
   user in SQLite (`backend/data/chat.db`, WAL mode) so they survive restarts,
   shared across gunicorn workers. Turns reuse the same retrieval/rerank/fallback
-  pipeline as `/ask` but build a conversation-aware prompt; the answer is
+  pipeline as search but build a conversation-aware prompt; the answer is
   streamed token-by-token over SSE (`POST .../messages/stream`) and the assistant
   message, sources, tokens, cost and latency are persisted. Conversations idle
   for `CHAT_RETENTION_DAYS` (180) are purged daily. See `docs/API.md`.
 - **Caching** — Redis-backed JSON cache shared across workers (falls back to
-  an in-process cache if Redis is down) for both `/search` and `/ask`, keyed
+  an in-process cache if Redis is down) for `/search`, keyed
   by effective query + top_k + facets.
 
 ### Health endpoints
@@ -256,7 +250,6 @@ cd backend
 | Endpoint | Description |
 |---|---|
 | `GET /search?q=...&top_k=8` | Hybrid semantic search (no LLM), cached |
-| `GET /ask?q=...&top_k=8` | Search + cited LLM answer, cached |
 | `GET /facets` | Distinct industry/dealtype values for filter autocomplete |
 | `POST /api/chat/sessions` | Create a chat conversation |
 | `POST /api/chat/sessions/{id}/messages/stream` | SSE-streamed chat turn |
@@ -268,7 +261,6 @@ cd backend
 ```bash
 curl "http://localhost:8001/search?q=fintech%20funding&top_k=3"
 curl "http://localhost:8001/search?q=funding&industry=Finance,TMT&from_date=2024-01-01"
-curl "http://localhost:8001/ask?q=who%20is%20investing%20in%20fintech&top_k=5"
 ```
 
 Responses use a slim `SourceSummary` DTO (`id`, `title`, `url`,
@@ -277,7 +269,7 @@ text is used only internally for the LLM context and is never sent to clients.
 
 LLM calls are bounded: `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES` and
 `LLM_RETRY_BACKOFF` control the timeout and exponential backoff; when the model
-is unreachable, `/ask` and chat turns return a clean `503` instead of a raw
+is unreachable, chat turns return a clean `503` instead of a raw
 `500`. Chat conversations require the `X-User-Id` header (min 8 chars); see
 `docs/API.md` for the full chat API.
 
@@ -324,7 +316,6 @@ server {
     location /health    { proxy_pass http://127.0.0.1:8001; }
     location /live      { proxy_pass http://127.0.0.1:8001; }
     location /ready     { proxy_pass http://127.0.0.1:8001; }
-    location /ask       { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
     location /api       { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
     location /analytics { proxy_pass http://127.0.0.1:8001; }
     location /          { proxy_pass http://127.0.0.1:3000; }
@@ -377,10 +368,10 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `EMBED_DEVICE` | `cpu` | `cuda` for a GPU |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `16` | Cross-encoder reranker; how many RRF candidates to re-score |
-| `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `LLM_MODEL` (`GEMINI_MODEL`) | — | Google Gemini (OpenAI-compatible endpoint) for `/ask` and chat |
+| `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `LLM_MODEL` (`GEMINI_MODEL`) | — | Google Gemini (OpenAI-compatible endpoint) for chat |
 | `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` / `INR_PER_USD` | `0.25` / `1.50` / `95.60` | USD per 1M input/output tokens (for cost display); USD→INR rate |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
-| `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
+| `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; chat retrieval threshold |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |
 | `CHAT_DB_PATH` / `CHAT_RETENTION_DAYS` / `CHAT_MAX_HISTORY_TURNS` | `data/chat.db` / `180` / `10` | SQLite chat store; idle-purge window; context turns kept per conversation |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |

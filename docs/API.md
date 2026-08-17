@@ -3,9 +3,9 @@
 Base URL: `https://<host>/` (also reachable directly at `http://<host>:8001` on the
 host itself; the public entrypoint is nginx on port 80).
 
-Most endpoints return JSON. Search/ask/analytics are `GET`; chat is JSON or
+Most endpoints return JSON. Search and analytics are `GET`; chat is JSON or
 Server-Sent-Events (SSE). There is currently **no authentication or rate
-limiting** on search/ask — the chat API uses an anonymous `X-User-Id` header
+limiting** on search — the chat API uses an anonymous `X-User-Id` header
 (device UUID) for per-user isolation only, which is not authentication.
 
 ---
@@ -60,41 +60,6 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 `note` is a human-readable hint when results are only weakly related to the query
 (otherwise `null`). `score` is the cross-encoder reranked relevance in `0..1`
 (entity-boosted results can exceed `1.0`). `published_date` may be `null`.
-
----
-
-## `GET /ask`
-
-Search + LLM-synthesized answer with inline `[n]` citations. Calls Google Gemini
-(`gemini-3.1-flash-lite` by default). **Costs LLM credits per uncached request.**
-
-### Query parameters
-
-Same as `/search`, except `top_k` range is `1..20`.
-
-### Response
-
-```json
-{
-  "query": "who is investing in Indian fintech?",
-  "answer": "Several VCs are active in Indian fintech, including Accel [1] and Peak XV [2]...",
-  "sources": [ { "id": ..., "title": ..., "url": ..., "published_date": ..., "category": ..., "summary": ..., "score": ... } ],
-  "cached": false,
-  "latency_ms": 8120.0,
-  "prompt_tokens": 2065,
-  "completion_tokens": 323,
-  "cost": 0.095672,
-  "note": null
-}
-```
-
-Notes:
-- Answers cite article numbers `[n]` that map to `sources`.
-- `prompt_tokens`, `completion_tokens` and `cost` (INR, at `INR_PER_USD`)
-  describe the LLM call; they are 0 when the answer came from cache or fallback.
-- If no result clears the relevance threshold, `/ask` returns an honest
-  "couldn't find strong matches" message instead of fabricating.
-- LLM failures return `503` after bounded retries with backoff.
 
 ---
 
@@ -255,10 +220,8 @@ as `Authorization: Bearer <token>` or `?token=<token>`); otherwise open.
   "filtered_rate": 12.5,
   "cache_hit_rate": 61.0,
   "avg_latency_ms": 214.3,
-  "asks_total": 9,
   "clicks_total": 33,
   "top_queries": [["fintech funding", 22], ...],
-  "top_asks": [["who funds fintech", 3], ...],
   "click_positions": { "1": 12, "2": 8, ... },
   "click_top_queries": [["fintech funding", 9], ...]
 }
@@ -344,9 +307,6 @@ curl "https://<host>/search?q=funding&industry=Fintech,Healthtech&from_date=2024
 # Year-in-review / top-N (auto Flashback handling)
 curl "https://<host>/search?q=top%2010%20fintech%20deals%20in%202025&top_k=10"
 
-# Ask with citations (LLM)
-curl "https://<host>/ask?q=who%20is%20investing%20in%20fintech&top_k=5"
-
 # Facet values for filter autocomplete
 curl "https://<host>/facets"
 
@@ -376,7 +336,7 @@ curl -N -X POST "https://<host>/api/chat/sessions/<id>/messages/stream" \
   claim any user id.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
-- **Caching**: `/search` and `/ask` responses are cached (TTL 120s) keyed by effective
+- **Caching**: `/search` responses are cached (TTL 120s) keyed by effective
   query + filters. `cached: true` indicates a cache hit. Chat turns are not cached.
 - **Retention**: conversations idle for 180 days are purged daily.
 - Interactive OpenAPI docs are served by FastAPI at `/docs` on the internal API port.

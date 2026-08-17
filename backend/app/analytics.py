@@ -86,22 +86,6 @@ async def record_search(
         _degraded(exc)
 
 
-async def record_ask(query: str, outcome: str, cached: bool, cost: float = 0.0) -> None:
-    """Count one /ask event. ``outcome`` is one of answered/fallback/none/error."""
-    try:
-        p = _client().pipeline()
-        p.incr("analytics:ask:total")
-        p.incr(f"analytics:ask:day:{_today()}")
-        p.incr(f"analytics:ask:outcome:{outcome}")
-        p.incr("analytics:ask:cached" if cached else "analytics:ask:uncached")
-        p.zincrby("analytics:top_asks", 1, query)
-        if cost:
-            p.incrbyfloat("analytics:ask:cost", cost)
-        await p.execute()
-    except Exception as exc:
-        _degraded(exc)
-
-
 async def record_click(query: str, position: int) -> None:
     """Count one result click from the frontend beacon. Never raises."""
     try:
@@ -145,7 +129,6 @@ async def summary() -> dict:
             "analytics:search:filtered",
             "analytics:search:latency:sum",
             "analytics:search:latency:count",
-            "analytics:ask:total",
             "analytics:click:total",
         ]
         vals = await c.mget(keys)
@@ -157,14 +140,11 @@ async def summary() -> dict:
             filtered,
             lat_sum,
             lat_count,
-            ask_total,
             click_total,
         ) = vals
         cached = await c.get("analytics:search:cached")
-        ask_cost = await c.get("analytics:ask:cost")
 
         top_queries = await c.zrevrange("analytics:top_queries", 0, 19, withscores=True)
-        top_asks = await c.zrevrange("analytics:top_asks", 0, 9, withscores=True)
         click_positions = await c.zrevrange("analytics:click_top_queries", 0, 9, withscores=True)
 
         pos_keys = [f"analytics:click:pos:{i}" for i in range(1, 11)]
@@ -179,11 +159,8 @@ async def summary() -> dict:
             "filtered_rate": _pct(_i(filtered), total),
             "cache_hit_rate": _pct(_i(cached), total),
             "avg_latency_ms": round(_f(lat_sum) / _i(lat_count), 1) if _i(lat_count) else 0.0,
-            "asks_total": _i(ask_total),
-            "ask_cost": _f(ask_cost),
             "clicks_total": _i(click_total),
             "top_queries": [[q, _i(s)] for q, s in top_queries],
-            "top_asks": [[q, _i(s)] for q, s in top_asks],
             "click_positions": {str(i): _i(v) for i, v in zip(range(1, 11), pos_vals)},
             "click_top_queries": [[q, _i(s)] for q, s in click_positions],
         }

@@ -380,10 +380,6 @@ server {
     location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
     location /facets { proxy_pass http://127.0.0.1:$API_PORT; }
     location /analytics { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /ask {
-        proxy_pass http://127.0.0.1:$API_PORT;
-        proxy_read_timeout 300s;
-    }
 
     location / {
         proxy_pass http://127.0.0.1:$NEXT_PORT;
