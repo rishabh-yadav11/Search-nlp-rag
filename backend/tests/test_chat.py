@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app import chat as chat_module
-from app.chat import ChatStore
+from app.chat import ChatStore, _smalltalk_reply
 
 USER_A = "user-a-device-id-0001"
 USER_B = "user-b-device-id-0002"
@@ -192,3 +192,26 @@ def test_api_send_message_rejects_empty(tmp_path):
         assert client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "   "}).status_code == 400
     finally:
         _run(store.close())
+
+
+def test_smalltalk_returns_canned_reply():
+    for greeting in ["hi", "hello", "hey", "good morning", "Good Afternoon!", "namaste", "how are you?", "thanks", "thank you", "bye", "who are you?"]:
+        reply = _smalltalk_reply(greeting, [])
+        assert reply is not None, greeting
+        assert "ASK VCCircle" in reply or "archive" in reply
+
+def test_smalltalk_ignores_real_queries():
+    for q in ["who invested in Ola Electric?", "top 10 fintech deals 2025", "Ola Electric IPO", "what is the latest funding news", "how many deals did Sequoia do last year?"]:
+        assert _smalltalk_reply(q, []) is None, q
+
+def test_smalltalk_short_circuits_rag(monkeypatch):
+    from app import main
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("retrieval should not run for small talk")
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", boom)
+    answer, sources, note = _run(chat_module._run_turn("good morning", []))
+    assert answer.startswith("Hello!")
+    assert sources == []
+    assert note is None

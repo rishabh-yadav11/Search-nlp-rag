@@ -12,6 +12,7 @@ prompt so the model can follow up on prior turns in the session.
 import asyncio
 import logging
 import os
+import re
 import time
 import uuid
 
@@ -286,11 +287,41 @@ def json_loads(s: str) -> list[dict]:
         return []
 
 
+_SMALLTALK_PATTERNS: dict[str, str] = {
+    r"^(hi|hii+|hey|hello|yo|hola|howdy|namaste|good (morning|afternoon|evening))\b": (
+        "Hello! I'm ASK VCCircle. Ask me about VCCircle's business news archive — "
+        "deals, funding, IPOs, M&A, companies, or a specific sector."
+    ),
+    r"^(thanks|thank you|ty|thx|thank u|cheers)\b": "You're welcome! Ask me anything about VCCircle's news archive anytime.",
+    r"^(goodbye|bye|see you|gtg|cya)\b": "Goodbye! Come back anytime to search VCCircle's archive.",
+    r"\bhow are you\b": "I'm doing great, thanks for asking! What would you like to know about VCCircle's news archive?",
+    r"\bwho are you\b": "I'm ASK VCCircle, an AI assistant that searches VCCircle's business news archive. Ask me about deals, funding, IPOs, companies, or sectors.",
+    r"\bwhat can you do\b|how (do|can) you work|what are you": "I search VCCircle's archive for relevant articles and summarize answers with citations. Try asking, e.g., \"top 10 fintech deals 2025\" or \"who invested in Ola Electric?\".",
+    r"\b(can|are) you help( me)?\b": "Of course! Ask me anything about VCCircle's business news archive — deals, funding, IPOs, companies, or sectors.",
+}
+
+
+def _smalltalk_reply(question: str, history: list[MessageOut]) -> str | None:
+    """Return a canned friendly reply for greetings/thanks/small talk, or None
+    when the message looks like a real query for the archive."""
+    q = question.strip().lower()
+    if not q or len(q.split()) > 12:
+        return None
+    for pattern, reply in _SMALLTALK_PATTERNS.items():
+        if re.search(pattern, q):
+            return reply
+    return None
+
+
 async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list[dict], str | None]:
     """Retrieve, build a conversation-aware prompt, and call the LLM.
 
     Returns (answer, sources, note). Mirrors /ask's pipeline; imported lazily to
     avoid a circular import with app.main."""
+    smalltalk = _smalltalk_reply(question, history)
+    if smalltalk is not None:
+        return smalltalk, [], None
+
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
     from app.main import _effective_intent, retrieve_and_rerank, source_context, to_summary
 
