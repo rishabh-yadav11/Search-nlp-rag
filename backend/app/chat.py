@@ -15,6 +15,7 @@ import os
 import re
 import time
 import uuid
+from datetime import UTC, datetime
 
 import aiosqlite
 from fastapi import APIRouter, Header, HTTPException
@@ -198,6 +199,9 @@ class ChatStore:
         rows = await self._db.execute_fetchall(query, params)
         return rows[0] if rows else None
 
+    async def _fetchall(self, query: str, params: tuple = ()):
+        return await self._db.execute_fetchall(query, params)
+
     async def get_session(self, session_id: str, user_id: str) -> SessionOut | None:
         row = await self._fetchone(
             "SELECT id, title, created_at, updated_at FROM sessions WHERE id = ? AND user_id = ?",
@@ -323,6 +327,65 @@ class ChatStore:
             total_tokens=int((msgs_row["pt"] if msgs_row else 0) + (msgs_row["ct"] if msgs_row else 0)),
             total_cost=float(msgs_row["cost"] if msgs_row else 0.0),
         )
+
+    async def global_stats(self) -> dict:
+        """Cross-user analytics across the whole chat DB (privacy-safe: no
+        message contents, only counts/aggregates). Never raises."""
+        try:
+            sessions_row = await self._fetchone(
+                "SELECT COUNT(*) AS n FROM sessions"
+            )
+            users_row = await self._fetchone("SELECT COUNT(DISTINCT user_id) AS n FROM sessions")
+            msgs_row = await self._fetchone(
+                """
+                SELECT COUNT(*) AS n,
+                       COALESCE(SUM(CASE WHEN role='assistant' THEN prompt_tokens END), 0) AS pt,
+                       COALESCE(SUM(CASE WHEN role='assistant' THEN completion_tokens END), 0) AS ct,
+                       COALESCE(SUM(cost), 0) AS cost,
+                       COALESCE(AVG(CASE WHEN role='assistant' AND latency_ms > 0 THEN latency_ms END), 0) AS latency
+                FROM messages
+                """
+            )
+            top_cost = await self._fetchall(
+                """
+                SELECT s.title, s.updated_at,
+                       COUNT(m.id) AS messages,
+                       COALESCE(SUM(m.cost), 0) AS cost
+                FROM sessions s JOIN messages m ON m.session_id = s.id
+                GROUP BY s.id ORDER BY cost DESC LIMIT 10
+                """
+            )
+            top_messages = await self._fetchall(
+                """
+                SELECT s.title, s.updated_at,
+                       COUNT(m.id) AS messages,
+                       COALESCE(SUM(m.prompt_tokens + m.completion_tokens), 0) AS tokens
+                FROM sessions s JOIN messages m ON m.session_id = s.id
+                GROUP BY s.id ORDER BY tokens DESC LIMIT 10
+                """
+            )
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            day_rows = await self._fetchall(
+                """
+                SELECT date(created_at, 'unixepoch') AS d, COUNT(*) AS n
+                FROM sessions GROUP BY d ORDER BY d DESC LIMIT 14
+                """
+            )
+            return {
+                "sessions": int(sessions_row["n"]) if sessions_row else 0,
+                "users": int(users_row["n"]) if users_row else 0,
+                "messages": int(msgs_row["n"]) if msgs_row else 0,
+                "total_tokens": int((msgs_row["pt"] if msgs_row else 0) + (msgs_row["ct"] if msgs_row else 0)),
+                "total_cost": float(msgs_row["cost"] if msgs_row else 0.0),
+                "avg_latency_ms": round(float(msgs_row["latency"] if msgs_row else 0.0), 1),
+                "top_by_cost": [[r["title"], int(r["messages"]), round(float(r["cost"]), 4), r["updated_at"]] for r in top_cost],
+                "top_by_tokens": [[r["title"], int(r["messages"]), int(r["tokens"]), r["updated_at"]] for r in top_messages],
+                "sessions_today": sum(int(r["n"]) for r in day_rows if r["d"] == today),
+                "daily_sessions": [[r["d"], int(r["n"])] for r in day_rows],
+            }
+        except Exception:
+            logger.exception("chat global_stats failed")
+            return {"error": "chat analytics unavailable"}
 
 
 def json_dumps(v) -> str:

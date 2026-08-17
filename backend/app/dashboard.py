@@ -73,7 +73,7 @@ DASHBOARD_HTML = """<!doctype html>
   <header class="topbar">
     <div class="brand">VCCircle <span class="dot">·</span> ASK — Analytics</div>
   </header>
-  <div class="wrap">
+    <div class="wrap">
     <div class="updated" id="updated">loading…</div>
     <div id="error" class="err" style="display:none"></div>
     <div class="cards" id="cards"></div>
@@ -85,6 +85,18 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="panel">
         <h2>Clicks &amp; ask</h2>
         <div id="clicks"><div class="empty">loading…</div></div>
+      </div>
+    </div>
+    <h2 style="margin-top:32px; color:var(--ink)">Chat usage</h2>
+    <div class="cards" id="chat-cards"></div>
+    <div class="grid2">
+      <div class="panel">
+        <h2>Conversations by cost</h2>
+        <div id="chat-cost"><div class="empty">loading…</div></div>
+      </div>
+      <div class="panel">
+        <h2>Conversations by tokens</h2>
+        <div id="chat-tokens"><div class="empty">loading…</div></div>
       </div>
     </div>
   </div>
@@ -105,6 +117,60 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('error').textContent = 'Analytics unavailable: ' + e.message;
       document.getElementById('error').style.display = 'block';
     }
+    loadChat();
+  }
+
+  async function loadChat() {
+    try {
+      var res = await fetch('/analytics/chat', { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) throw new Error('chat returned HTTP ' + res.status);
+      var d = await res.json();
+      if (d && d.error) throw new Error(d.error);
+      renderChatCards(d);
+      renderChatTables(d);
+    } catch (e) {
+      document.getElementById('chat-cards').innerHTML =
+        '<div class="err">Chat analytics unavailable: ' + e.message + '</div>';
+    }
+  }
+
+  function inr(v) {
+    return v == null ? '₹0' : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  }
+
+  function renderChatCards(d) {
+    var html =
+      card('Chat users', fmt(d.users), 'distinct devices') +
+      card('Conversations', fmt(d.sessions), 'today: ' + fmt(d.sessions_today), d.sessions > 0 ? 'ok' : '') +
+      card('Messages', fmt(d.messages), 'user + assistant') +
+      card('Total tokens', fmt(d.total_tokens), 'prompt + completion') +
+      card('Total cost', inr(d.total_cost), 'across all conversations', d.total_cost > 0 ? 'warn' : '') +
+      card('Avg latency', d.avg_latency_ms + ' <small>ms</small>', 'per assistant reply');
+    document.getElementById('chat-cards').innerHTML = html;
+  }
+
+  function chatTable(rows, cols) {
+    if (!rows || !rows.length) return '<div class="empty">No chat activity yet.</div>';
+    var head = '<tr>' + cols.map(function (c) { return '<th>' + c[1] + '</th>'; }).join('') + '</tr>';
+    var body = rows.map(function (r) {
+      return '<tr>' + r.map(function (cell, i) {
+        if (cols[i][2] === 'num') return '<td class="num">' + fmt(cell) + '</td>';
+        if (cols[i][2] === 'cost') return '<td class="num">' + inr(cell) + '</td>';
+        if (cols[i][2] === 'date') {
+          var d = new Date(cell * 1000);
+          return '<td>' + (isNaN(d) ? (cell || '') : d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) + '</td>';
+        }
+        return '<td>' + (cell == null ? '' : String(cell)) + '</td>';
+      }).join('') + '</tr>';
+    }).join('');
+    return '<table>' + head + body + '</table>';
+  }
+
+  function renderChatTables(d) {
+    var costCols = [['title', 'Conversation'], ['messages', 'Msgs', 'num'], ['cost', 'Cost', 'cost'], ['updated_at', 'Updated', 'date']];
+    var tokCols = [['title', 'Conversation'], ['messages', 'Msgs', 'num'], ['tokens', 'Tokens', 'num'], ['updated_at', 'Updated', 'date']];
+    document.getElementById('chat-cost').innerHTML = chatTable(d.top_by_cost, costCols);
+    document.getElementById('chat-tokens').innerHTML = chatTable(d.top_by_tokens, tokCols);
   }
 
   function fmt(n) { return (n == null || isNaN(n)) ? '0' : Number(n).toLocaleString(); }

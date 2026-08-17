@@ -594,6 +594,17 @@ async def get_analytics_summary(authorization: str | None = None, token: str | N
     return await analytics_data()
 
 
+@app.get("/analytics/chat")
+async def get_analytics_chat(authorization: str | None = None, token: str | None = None):
+    """Cross-user chat usage (sessions, messages, tokens, cost). Same token gate
+    as /analytics/summary; reads the SQLite chat store."""
+    if config.ANALYTICS_VIEW_TOKEN:
+        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
+        if supplied != config.ANALYTICS_VIEW_TOKEN:
+            raise HTTPException(status_code=401, detail="invalid analytics token")
+    return await chat_module._require_store().global_stats()
+
+
 @app.get("/analytics/dashboard")
 async def get_analytics_dashboard(authorization: str | None = None, token: str | None = None):
     """Human-readable analytics dashboard (self-contained HTML, no external

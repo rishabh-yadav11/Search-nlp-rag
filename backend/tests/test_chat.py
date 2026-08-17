@@ -320,3 +320,61 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
         assert detail["messages"][1]["completion_tokens"] == 10
     finally:
         _run(store.close())
+
+
+def test_global_stats_aggregates(tmp_path):
+    """global_stats returns cross-user counts, tokens, cost and top tables."""
+    store = _store(tmp_path)
+    try:
+        for user, q, a, pt, ct, cost in [
+            (USER_A, "q1", "a1", 100, 20, 0.01),
+            (USER_A, "q2", "a2", 200, 30, 0.02),
+            (USER_B, "q3", "a3", 300, 40, 0.03),
+        ]:
+            sid = _run(store.create_session(user, "Conversation")).id
+            _run(store.append_message(sid, user, "user", q))
+            _run(store.append_message(
+                sid, user, "assistant", a,
+                prompt_tokens=pt, completion_tokens=ct, cost=cost, latency_ms=250.0,
+            ))
+
+        g = _run(store.global_stats())
+        assert g["sessions"] == 3
+        assert g["users"] == 2
+        assert g["messages"] == 6
+        assert g["total_tokens"] == 690
+        assert g["total_cost"] == pytest.approx(0.06)
+        assert g["avg_latency_ms"] == pytest.approx(250.0)
+        assert len(g["top_by_cost"]) == 3
+        assert g["top_by_cost"][0][2] == pytest.approx(0.03)
+        assert len(g["top_by_tokens"]) == 3
+        assert g["top_by_tokens"][0][2] == 340
+        assert g["daily_sessions"][0][1] == 3
+    finally:
+        _run(store.close())
+
+
+def test_analytics_chat_endpoint(tmp_path):
+    """/analytics/chat returns global chat stats through the app."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+
+    store = _store(tmp_path)
+    chat_module.store = store
+    client = TestClient(main.app)
+    try:
+        h = {"X-User-Id": USER_A}
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "hello"})
+
+        res = client.get("/analytics/chat")
+        assert res.status_code == 200
+        d = res.json()
+        assert d["sessions"] >= 1
+        assert d["messages"] >= 2
+        assert d["users"] == 1
+        assert "total_tokens" in d and "total_cost" in d
+    finally:
+        chat_module.store = None
+        _run(store.close())
