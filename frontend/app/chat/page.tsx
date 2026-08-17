@@ -187,6 +187,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [streaming, setStreaming] = useState(false)
+  const [streamingContent, setStreamingContent] = useState('')
   const [note, setNote] = useState('')
   const [error, setError] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -269,7 +270,7 @@ export default function ChatPage() {
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-      let streamingMsg: Message | null = null
+      let accumulated = ''
       let doneMsg: Message | null = null
       let note = ''
       let streamError = ''
@@ -297,13 +298,11 @@ export default function ChatPage() {
             } else if (type === 'delta') {
               const text = payload.text as string
               setStreaming(true)
-              const prev: Message = streamingMsg ?? { id: -Date.now() + 1, role: 'assistant', content: '', created_at: Date.now() / 1000 }
-              streamingMsg = { ...prev, content: prev.content + text }
-              setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), streamingMsg!])
+              accumulated += text
+              setStreamingContent(accumulated)
             } else if (type === 'done') {
               doneMsg = payload.message as Message
               note = payload.note ?? ''
-              streamingMsg = null
             } else if (type === 'error') {
               streamError = payload.error ?? 'Something went wrong.'
             }
@@ -315,17 +314,20 @@ export default function ChatPage() {
 
       if (streamError) throw new Error(streamError)
       if (doneMsg) {
-        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id && x.id !== doneMsg!.id), doneMsg!])
+        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
+        setStreamingContent('')
         if (note) setNote(note)
         await loadSessions()
-      } else if (streamingMsg) {
-        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), streamingMsg!])
+      } else if (accumulated) {
+        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), { id: -Date.now() + 1, role: 'assistant', content: accumulated, created_at: Date.now() / 1000 }])
+        setStreamingContent('')
         await loadSessions()
       } else {
         throw new Error('No response received.')
       }
     } catch (err) {
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
+      setStreamingContent('')
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setSending(false)
@@ -427,6 +429,14 @@ export default function ChatPage() {
                   <span />
                   <span />
                   <span />
+                </div>
+              </div>
+            </div>
+          ) : streamingContent ? (
+            <div className="chat-msg chat-assistant">
+              <div className="chat-msg-bubble">
+                <div className="chat-msg-answer">
+                  <ReactMarkdown remarkPlugins={[remarkGfm, remarkCitations]} rehypePlugins={[rehypeRaw]}>{streamingContent}</ReactMarkdown>
                 </div>
               </div>
             </div>
