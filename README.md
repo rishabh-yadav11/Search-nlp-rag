@@ -1,10 +1,12 @@
 # VCCircle New Search
 
-Hybrid retrieval + RAG search over the VCCircle article corpus. Articles are
-indexed into Qdrant with dense (semantic) and sparse (BM25) vectors fused with
-Reciprocal Rank Fusion (RRF). A FastAPI service queries the index and optionally
-synthesizes cited answers with an LLM (Groq). A Next.js single-page UI ties it
-together.
+Hybrid retrieval + RAG search over the VCCircle article corpus, with a
+ChatGPT-style chat assistant. Articles are indexed into Qdrant with dense
+(semantic) and sparse (BM25) vectors fused with Reciprocal Rank Fusion (RRF). A
+FastAPI service queries the index, synthesizes cited answers with an LLM (Google
+Gemini via an OpenAI-compatible endpoint), and stores per-user chat
+conversations in SQLite. A Next.js UI ties it together with a search page and a
+`/chat` page.
 
 ```
 MySQL ──fetch_data──▶ articles.jsonl ──build_index──▶ Qdrant (dense + sparse)
@@ -12,9 +14,10 @@ MySQL ──fetch_data──▶ articles.jsonl ──build_index──▶ Qdrant
    └─────────update_index (incremental new/edit/delete)──────┘
                                                                │
 Browsers ◀── nginx ───▶ Next.js app ◀──(same origin)──▶ FastAPI ──▶ Qdrant
-                         /search, /ask, /health,               │
-                         /live, /ready                       Groq (for /ask)
-                                                              Redis (cache)
+                         /search, /ask, /chat, /facets,         │
+                         /health, /live, /ready               Gemini (for /ask, /chat)
+                                                               Redis (cache + analytics)
+                                                               SQLite (chat conversations)
 ```
 
 ## Repository layout
@@ -22,9 +25,12 @@ Browsers ◀── nginx ───▶ Next.js app ◀──(same origin)──�
 ```
 backend/
   app/
-    main.py            FastAPI app: /search, /ask (RAG), /health
+    main.py            FastAPI app: /search, /ask (RAG), /health, /analytics
     health.py          /live, /ready, /readyz dependency checks
-    llm.py             LLM call with timeout, retries, backoff
+    llm.py             LLM call with timeout, retries, backoff, token-cost calc
+    chat.py            per-user chat store (SQLite) + /api/chat router
+    analytics.py       Redis-backed search/click analytics aggregates
+    dashboard.py       self-contained HTML analytics dashboard
     config.py          env-driven settings
     query_intent.py    year/top-N intent parsing + Flashback rewriting
     index_text.py      shared text composition + date normalization
@@ -42,7 +48,9 @@ backend/
   .env.example         configuration template
 frontend/              Next.js app (App Router + TypeScript)
   app/page.tsx         search/ask UI (timeouts, validation, a11y)
+  app/chat/page.tsx    ChatGPT-style chat UI (SSE streaming)
   app/globals.css
+  middleware.ts        CSP nonce header
   next.config.ts       security headers (CSP, nosniff, etc.)
   eslint.config.mjs    flat config for eslint 9
 setup.sh               one-command deploy (deps, services, index, nginx, cron)
@@ -75,9 +83,18 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
   then `published_date` desc as tie-break (missing dates last).
 - **Ask mode (RAG)** — retrieves articles above `ASK_MIN_SCORE`, packs them
   (title, date, authors/industry/dealtype, summary and a body excerpt) into a
-  numbered context, and asks Groq (`llama-3.3-70b-versatile`) for an answer
-  with inline `[n]` citations. If nothing clears the threshold it says so
-  instead of guessing.
+  numbered context, and asks Google Gemini (`gemini-3.1-flash-lite`, configurable)
+  for an answer with inline `[n]` citations. If nothing clears the threshold it
+  says so instead of guessing. Token usage and cost (input/output price per 1M,
+  converted to INR) are returned with the response.
+- **Chat (conversations)** — a ChatGPT-style UI at `/chat`. Each device gets an
+  anonymous `X-User-Id` (a localStorage UUID) and conversations are stored per
+  user in SQLite (`backend/data/chat.db`, WAL mode) so they survive restarts,
+  shared across gunicorn workers. Turns reuse the same retrieval/rerank/fallback
+  pipeline as `/ask` but build a conversation-aware prompt; the answer is
+  streamed token-by-token over SSE (`POST .../messages/stream`) and the assistant
+  message, sources, tokens, cost and latency are persisted. Conversations idle
+  for `CHAT_RETENTION_DAYS` (180) are purged daily. See `docs/API.md`.
 - **Caching** — Redis-backed JSON cache shared across workers (falls back to
   an in-process cache if Redis is down) for both `/search` and `/ask`, keyed
   by effective query + top_k + facets.
@@ -92,8 +109,8 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
 | `/readyz` | Readiness, bare status code | same as `/ready` |
 
 `/ready` checks the Qdrant collection, model/reranker loading, and reports Redis
-and Groq status non-fatally (Redis failures degrade to the in-process cache, so
-they don't flip readiness).
+and LLM (Gemini) status non-fatally (Redis failures degrade to the in-process
+cache, so they don't flip readiness).
 
 ## Prerequisites
 
@@ -130,7 +147,7 @@ If you'd rather run pieces manually, keep reading.
 cd backend
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # fill in MySQL creds + GROQ_API_KEY
+cp .env.example .env        # fill in MySQL creds + GEMINI_API_KEY
 ```
 
 Qdrant and Redis, local (mirrors what `setup.sh backend` does):
@@ -240,9 +257,13 @@ cd backend
 |---|---|
 | `GET /search?q=...&top_k=8` | Hybrid semantic search (no LLM), cached |
 | `GET /ask?q=...&top_k=8` | Search + cited LLM answer, cached |
+| `GET /facets` | Distinct industry/dealtype values for filter autocomplete |
+| `POST /api/chat/sessions` | Create a chat conversation |
+| `POST /api/chat/sessions/{id}/messages/stream` | SSE-streamed chat turn |
 | `GET /health` | Liveness |
 | `GET /ready` | Readiness (503 when Qdrant/models unavailable) |
 | `GET /live`, `GET /readyz` | Liveness / bare readiness |
+| `GET /analytics/dashboard` | Self-contained HTML analytics dashboard (incl. chat usage) |
 
 ```bash
 curl "http://localhost:8001/search?q=fintech%20funding&top_k=3"
@@ -256,7 +277,9 @@ text is used only internally for the LLM context and is never sent to clients.
 
 LLM calls are bounded: `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES` and
 `LLM_RETRY_BACKOFF` control the timeout and exponential backoff; when the model
-is unreachable, `/ask` returns a clean `503` instead of a raw `500`.
+is unreachable, `/ask` and chat turns return a clean `503` instead of a raw
+`500`. Chat conversations require the `X-User-Id` header (min 8 chars); see
+`docs/API.md` for the full chat API.
 
 ## 6. Run the frontend
 
@@ -296,12 +319,15 @@ server {
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-    location /search { proxy_pass http://127.0.0.1:8001; }
-    location /health { proxy_pass http://127.0.0.1:8001; }
-    location /live   { proxy_pass http://127.0.0.1:8001; }
-    location /ready  { proxy_pass http://127.0.0.1:8001; }
-    location /ask    { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
-    location /       { proxy_pass http://127.0.0.1:3000; }
+    location /search    { proxy_pass http://127.0.0.1:8001; }
+    location /facets    { proxy_pass http://127.0.0.1:8001; }
+    location /health    { proxy_pass http://127.0.0.1:8001; }
+    location /live      { proxy_pass http://127.0.0.1:8001; }
+    location /ready     { proxy_pass http://127.0.0.1:8001; }
+    location /ask       { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
+    location /api       { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
+    location /analytics { proxy_pass http://127.0.0.1:8001; }
+    location /          { proxy_pass http://127.0.0.1:3000; }
 }
 ```
 
@@ -324,8 +350,8 @@ Hardening baked into `setup.sh`:
   Also restrict the cloud security group (e.g. AWS) to ports 22/80.
 - **nginx security headers** — `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY` and `Referrer-Policy: strict-origin-when-cross-origin`
-  on every location. CSP is set by the frontend (`next.config` headers), so it
-  is not duplicated at nginx. Plain HTTP only.
+  on every location. CSP is set by the frontend (`middleware.ts`, per-request
+  nonce), so it is not duplicated at nginx. Plain HTTP only.
 - **Pinned images** — Qdrant/Redis run from pinned, digest-resolvable tags
   (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`,
   `REDIS_IMAGE=redis:7-alpine`). When overriding Qdrant, keep it >= the version
@@ -351,13 +377,15 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `EMBED_DEVICE` | `cpu` | `cuda` for a GPU |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `16` | Cross-encoder reranker; how many RRF candidates to re-score |
-| `GROQ_API_KEY` / `GROQ_BASE_URL` / `LLM_MODEL` | — | Groq-compatible endpoint for `/ask` |
+| `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `LLM_MODEL` (`GEMINI_MODEL`) | — | Google Gemini (OpenAI-compatible endpoint) for `/ask` and chat |
+| `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` / `INR_PER_USD` | `0.25` / `1.50` / `95.60` | USD per 1M input/output tokens (for cost display); USD→INR rate |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; `/ask` retrieval threshold |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |
+| `CHAT_DB_PATH` / `CHAT_RETENTION_DAYS` / `CHAT_MAX_HISTORY_TURNS` | `data/chat.db` / `180` / `10` | SQLite chat store; idle-purge window; context turns kept per conversation |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
-| `ANALYTICS_REDIS_DB` / `ANALYTICS_VIEW_TOKEN` | `1` / `` | Analytics aggregates live in Redis DB N (cache is DB 0); when set, `/analytics/summary` requires this bearer token |
+| `ANALYTICS_REDIS_DB` / `ANALYTICS_VIEW_TOKEN` | `1` / `` | Analytics aggregates live in Redis DB N (cache is DB 0); when set, `/analytics/*` require this bearer token |
 
 ## Testing and CI
 
@@ -371,8 +399,10 @@ python -m ruff check app scripts tests
 ```
 
 Coverage: query-intent/date parsing, facet filter construction, effective
-intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, index
-fingerprinting/delta/reconciliation, cache TTL and degraded fallback.
+intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, chat store
+(CRUD, ownership isolation, retention, token/cost stats) and SSE streaming
+(small-talk short-circuit + full-turn deltas), index fingerprinting/delta/
+reconciliation, cache TTL and degraded fallback.
 
 `.github/workflows/ci.yml` runs three gates on push/PR to `main`:
 

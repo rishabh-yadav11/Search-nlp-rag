@@ -3,8 +3,10 @@
 Base URL: `https://<host>/` (also reachable directly at `http://<host>:8001` on the
 host itself; the public entrypoint is nginx on port 80).
 
-All endpoints are `GET` and return JSON. There is currently **no authentication or
-rate limiting** — the API is publicly reachable via nginx.
+Most endpoints return JSON. Search/ask/analytics are `GET`; chat is JSON or
+Server-Sent-Events (SSE). There is currently **no authentication or rate
+limiting** on search/ask — the chat API uses an anonymous `X-User-Id` header
+(device UUID) for per-user isolation only, which is not authentication.
 
 ---
 
@@ -63,8 +65,8 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 
 ## `GET /ask`
 
-Search + LLM-synthesized answer with inline `[n]` citations. Calls Groq
-(`llama-3.3-70b-versatile`). **Costs LLM credits per uncached request.**
+Search + LLM-synthesized answer with inline `[n]` citations. Calls Google Gemini
+(`gemini-3.1-flash-lite` by default). **Costs LLM credits per uncached request.**
 
 ### Query parameters
 
@@ -79,15 +81,127 @@ Same as `/search`, except `top_k` range is `1..20`.
   "sources": [ { "id": ..., "title": ..., "url": ..., "published_date": ..., "category": ..., "summary": ..., "score": ... } ],
   "cached": false,
   "latency_ms": 8120.0,
+  "prompt_tokens": 2065,
+  "completion_tokens": 323,
+  "cost": 0.095672,
   "note": null
 }
 ```
 
 Notes:
 - Answers cite article numbers `[n]` that map to `sources`.
+- `prompt_tokens`, `completion_tokens` and `cost` (INR, at `INR_PER_USD`)
+  describe the LLM call; they are 0 when the answer came from cache or fallback.
 - If no result clears the relevance threshold, `/ask` returns an honest
   "couldn't find strong matches" message instead of fabricating.
 - LLM failures return `503` after bounded retries with backoff.
+
+---
+
+## Chat API (per-user conversations)
+
+Conversations are stored per device in SQLite and survive restarts; they are
+purged after `CHAT_RETENTION_DAYS` (180) of inactivity. **Every chat request
+must send `X-User-Id: <device-uuid>`** (min 8 chars). The frontend persists a
+UUID in localStorage and sends it automatically; this identifies a device, it is
+not authentication.
+
+### Identity & session shape
+
+`Session` (list/create/get/rename):
+
+```json
+{
+  "id": "f0e1d2c3...",
+  "title": "Who invested in Ola Electric?",
+  "created_at": 1786950000.0,
+  "updated_at": 1786953600.0,
+  "last_preview": "first 140 chars of the last message",
+  "total_cost": 0.3017
+}
+```
+
+`Message`:
+
+```json
+{
+  "id": 42,
+  "role": "assistant",
+  "content": "Ola Electric raised... [1]",
+  "sources": [ { "id": 53671, "title": "...", "url": "https://www.vccircle.com/...", "published_date": "2023-01-04T12:17:39+00:00", "category": "Others", "score": 0.91 } ],
+  "created_at": 1786953600.0,
+  "prompt_tokens": 2065,
+  "completion_tokens": 323,
+  "cost": 0.1369,
+  "latency_ms": 1800.0
+}
+```
+
+### Endpoints
+
+| Method & path | Purpose |
+|---|---|
+| `POST /api/chat/sessions` | Create a conversation → `Session` |
+| `GET /api/chat/sessions` | List the user's conversations (newest first, up to 100) → `Session[]` |
+| `GET /api/chat/sessions/{id}` | Fetch a conversation + full message list → `Session` with `messages: Message[]` (404 if not owned) |
+| `PATCH /api/chat/sessions/{id}` | Rename; body `{ "content": "new title" }` → `Session` |
+| `DELETE /api/chat/sessions/{id}` | Delete the conversation (cascades messages) → `{"ok": true}` |
+| `GET /api/chat/usage` | Per-user aggregates → `{"sessions", "messages", "total_tokens", "total_cost"}` |
+| `POST /api/chat/sessions/{id}/messages` | One-shot turn (non-streaming) → `TurnOut` (below) |
+| `POST /api/chat/sessions/{id}/messages/stream` | SSE-streamed turn → see below |
+
+### `POST /api/chat/sessions/{id}/messages`
+
+Body: `{ "content": "who invested in Ola Electric?" }` (max 8000 chars).
+
+Response (`TurnOut`):
+
+```json
+{
+  "user": { "id": 41, "role": "user", "content": "who invested in Ola Electric?", "sources": [], "created_at": ..., "prompt_tokens": 0, "completion_tokens": 0, "cost": 0, "latency_ms": 0 },
+  "assistant": { "id": 42, "role": "assistant", "content": "...", "sources": [...], "prompt_tokens": ..., "completion_tokens": ..., "cost": ..., "latency_ms": ... },
+  "note": null,
+  "latency_ms": 1800.0
+}
+```
+
+Both the user message and the assistant reply (with sources, tokens, cost and
+latency) are persisted. Greetings/small talk are answered without an LLM call;
+turns with only weak results get an honest fallback reply (zero tokens/cost).
+
+### `POST /api/chat/sessions/{id}/messages/stream` (SSE)
+
+Same body/headers as the one-shot endpoint. Returns `text/event-stream` with
+named events:
+
+| Event | Payload | Meaning |
+|---|---|---|
+| `start` | `{ "user": Message }` | User message persisted |
+| `delta` | `{ "text": "..." }` | One streamed content chunk of the answer |
+| `done` | `{ "message": Message, "note": string\|null, "latency_ms": number }` | Answer finished; `message` is persisted (sources/usage/cost filled in) |
+| `error` | `{ "error": "..." }` | Turn failed (e.g. LLM unreachable); nothing persisted |
+
+Example consumption:
+
+```bash
+curl -N -X POST http://localhost:8001/api/chat/sessions/abc/messages/stream \
+  -H "X-User-Id: my-device-id-0001" -H "Content-Type: application/json" \
+  -d '{"content":"who invested in Ola Electric?"}'
+```
+
+```text
+event: start
+data: {"user":{...}}
+
+event: delta
+data: {"text":"Ola Electric raised"}
+
+event: delta
+data: {"text":" a Series E round"}
+
+event: done
+data: {"message":{...,"prompt_tokens":2065,"completion_tokens":323,"cost":0.1369,...},"note":null,"latency_ms":1800.0}
+```
 
 ---
 
@@ -152,6 +266,42 @@ as `Authorization: Bearer <token>` or `?token=<token>`); otherwise open.
 
 Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`).
 
+---
+
+## `GET /analytics/chat`
+
+Cross-user chat usage, read from the SQLite chat store. Same token gate as
+`/analytics/summary`.
+
+### Response
+
+```json
+{
+  "sessions": 21,
+  "users": 12,
+  "messages": 55,
+  "total_tokens": 61397,
+  "total_cost": 2.1901243,
+  "avg_latency_ms": 1797.1,
+  "top_by_cost": [ ["Who invested in Ola Electric?", 4, 0.3017, 1786954406.95], ... ],
+  "top_by_tokens": [ ["top deals of 2025", 6, 8432, 1786956978.24], ... ],
+  "sessions_today": 3,
+  "daily_sessions": [ ["2026-08-17", 3], ... ]
+}
+```
+
+No message contents are exposed — only counts, totals and per-conversation
+aggregates (privacy-safe).
+
+---
+
+## `GET /analytics/dashboard`
+
+Self-contained HTML analytics dashboard (no external assets): KPI cards for
+search quality + chat usage, top-query tables, clicks-by-position and
+conversations-by-cost/tokens tables. It fetches `/analytics/summary` and
+`/analytics/chat` on load and refreshes every 30s. Same token gate as
+`/analytics/summary`.
 
 ---
 
@@ -173,7 +323,7 @@ Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`)
     "qdrant": { "ok": true },
     "models": { "ok": true },
     "redis": { "ok": true, "cache": "redis" },
-    "groq": { "ok": true }
+    "llm": { "ok": true }
   }
 }
 ```
@@ -199,6 +349,21 @@ curl "https://<host>/ask?q=who%20is%20investing%20in%20fintech&top_k=5"
 
 # Facet values for filter autocomplete
 curl "https://<host>/facets"
+
+# Create a chat conversation (device UUID in X-User-Id)
+curl -X POST "https://<host>/api/chat/sessions" \
+  -H "X-User-Id: my-device-id-0001"
+
+# List conversations
+curl "https://<host>/api/chat/sessions" -H "X-User-Id: my-device-id-0001"
+
+# Per-user token/cost usage
+curl "https://<host>/api/chat/usage" -H "X-User-Id: my-device-id-0001"
+
+# Stream a chat turn (SSE)
+curl -N -X POST "https://<host>/api/chat/sessions/<id>/messages/stream" \
+  -H "X-User-Id: my-device-id-0001" -H "Content-Type: application/json" \
+  -d '{"content":"who invested in Ola Electric?"}'
 ```
 
 ---
@@ -207,8 +372,11 @@ curl "https://<host>/facets"
 
 - **Public exposure**: no auth / rate limiting yet. Restrict via nginx (basic auth /
   API key), an AWS security-group allowlist, or a rate limiter before broad use.
+  Chat's `X-User-Id` isolates devices but is not authentication — anyone can
+  claim any user id.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
 - **Caching**: `/search` and `/ask` responses are cached (TTL 120s) keyed by effective
-  query + filters. `cached: true` indicates a cache hit.
+  query + filters. `cached: true` indicates a cache hit. Chat turns are not cached.
+- **Retention**: conversations idle for 180 days are purged daily.
 - Interactive OpenAPI docs are served by FastAPI at `/docs` on the internal API port.
