@@ -412,6 +412,39 @@ def test_analytics_chat_endpoint(tmp_path):
         _run(store.close())
 
 
+def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
+    """Chat must apply the auto date filter derived by _effective_intent,
+    matching /search (regression: chat passed qfilter=None)."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: ("q", "2024-01-01", "2024-12-31"))
+
+    captured = {}
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        captured["qfilter"] = qfilter
+        return [SourceArticle(id=1, title="t", url="u", published_date="2024-03-01",
+                              summary="s", body="b", score=0.9)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("Top startup funding deals of 2024", []))
+    assert turn.needs_llm
+    qf = captured["qfilter"]
+    assert qf is not None
+    keys = {c.key for c in qf.must}
+    assert "published_date" in keys
+    assert len(turn.sources) == 1
+
+
 def test_chat_imports_shared_retrieval_helpers():
     """The names chat lazily imports from app.main must stay available after
     endpoint removals (regression: /ask removal dropped source_context)."""
