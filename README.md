@@ -390,7 +390,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `LLM_DAILY_BUDGET_USD` | `0` (disabled) | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value (see `app/cost_budget.py`) |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; chat retrieval threshold |
-| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |
+| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | Query cache TTL; size of the in-process fallback cache |
 | `CHAT_DB_PATH` / `CHAT_RETENTION_DAYS` / `CHAT_MAX_HISTORY_TURNS` | `data/chat.db` / `180` / `10` | SQLite chat store; idle-purge window; context turns kept per conversation |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
@@ -420,6 +420,21 @@ reconciliation, cache TTL and degraded fallback.
 1. **backend** — pytest + ruff on Python 3.11
 2. **frontend** — eslint, `tsc --noEmit`, production build on Node 22
 3. **security** — `pip-audit`, `npm audit --audit-level=high`, gitleaks secret scan
+
+## Eval scripts (repeatable quality checks)
+
+Run on a box with the backend serving on localhost:8001 and MySQL/Qdrant
+reachable from `backend/.env` (venv python, from `backend/`):
+
+- `./venv/bin/python scripts/deep_body_eval.py` — whole-body indexing and
+  body-grounded chat: (1) coverage of terms that live only in the deep body
+  (>6000 chars) inside the stored sparse vectors, (2) title+deep-word search
+  top-8 hits, (3) a chat query answered purely from an article body whose
+  summary is empty. Deterministic seed.
+- `./venv/bin/python scripts/chat_quality_test.py` — golden-set chat eval
+  (event-year date suppression, plain-year date filters, weak-fallback niche,
+  normal and entity queries) verifying key terms and expected source years.
+  Makes real (billed) LLM calls.
 
 ## Production notes (POC shortcuts to fix before real prod)
 
