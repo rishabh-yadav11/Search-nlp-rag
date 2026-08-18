@@ -9,15 +9,20 @@ query makes a real LLM call (billed against the daily budget), so this is not
 free. Creates and deletes a fresh chat session per query.
 
 Each query carries an expected outcome: a category, optional key terms that
-must appear in the answer, and an optional expected publication year for the
-plain-year date-filter cases. Prints a compact result table and flags queries
-with issues. Extend QUERIES as new failure modes are found.
+must appear in the answer, an optional expected publication year for the
+plain-year date-filter cases, and an optional `dataviz` flag asserting the
+answer carries a valid ```dataviz JSON block (mirroring app.chat.parse_dataviz).
+Prints a compact result table and flags queries with issues. Extend QUERIES as
+new failure modes are found.
 """
 import json
+import re
 import urllib.request
 
 BASE = "http://localhost:8001/api/chat"
 UID = "qualityeval-7"
+
+_DATAVIZ_RE = re.compile(r"```dataviz\s*\n(.*?)\n```", re.DOTALL)
 
 QUERIES = [
     {
@@ -82,7 +87,83 @@ QUERIES = [
         "q": "How did the 2008 global financial crisis change the way the Reserve Bank of India communicates?",
         "terms": ["2008", "communicat"],
     },
+    {
+        "id": 12,
+        "category": "dataviz: ranked list with values",
+        "q": "List the top 5 biggest funding rounds in India in 2025 with their values",
+        "terms": [],
+        "dataviz": True,
+    },
+    {
+        "id": 13,
+        "category": "dataviz: count + yearly (line)",
+        "q": "How many venture capital deals happened in India in 2024?",
+        "terms": ["2024"],
+        "dataviz": True,
+    },
+    {
+        "id": 14,
+        "category": "dataviz: sector breakdown (pie)",
+        "q": "What are the biggest deals by sector in India in 2025?",
+        "terms": [],
+        "dataviz": True,
+    },
+    {
+        "id": 15,
+        "category": "dataviz: count across years",
+        "q": "How many funding rounds has Ola raised over the years, and in which years?",
+        "terms": ["ola"],
+        "dataviz": True,
+    },
 ]
+
+
+def _to_float(v: object) -> float | None:
+    """Coerce a dataviz cell to float (plain numbers or digit strings)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_dataviz(text: str) -> dict | None:
+    """Return the assistant's dataviz JSON block, or None when absent/invalid.
+
+    Mirrors backend app.chat.parse_dataviz so the eval asserts the same
+    contract the frontend renderer relies on."""
+    m = _DATAVIZ_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    columns = d.get("columns")
+    rows = d.get("rows")
+    if not isinstance(columns, list) or not columns or not all(isinstance(c, str) for c in columns):
+        return None
+    if not isinstance(rows, list) or not rows or not all(isinstance(r, list) for r in rows):
+        return None
+    if any(len(r) != len(columns) for r in rows):
+        return None
+    vc = d.get("value_column")
+    if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
+        vc = None
+        for j in range(len(columns)):
+            if all(_to_float(r[j]) is not None for r in rows):
+                vc = j
+                break
+    if vc is None or any(_to_float(r[vc]) is None for r in rows):
+        return None
+    return {"columns": columns, "rows": rows, "value_column": vc, "format": d.get("format")}
 
 
 def _req(url: str, payload: dict | None = None, method: str | None = None,
@@ -112,6 +193,8 @@ def run(q: dict) -> dict:
     year_ok = True
     if q.get("year"):
         year_ok = years == {str(q["year"])}
+    dv = _parse_dataviz(a["content"]) if q.get("dataviz") else None
+    dv_ok = not q.get("dataviz") or dv is not None
     return {
         "id": q["id"],
         "category": q["category"],
@@ -121,6 +204,8 @@ def run(q: dict) -> dict:
                 a["sources"][0]["title"][:55]) if a["sources"] else None,
         "years": sorted(years),
         "year_ok": year_ok,
+        "dv_ok": dv_ok,
+        "dv": dv,
         "answer_len": len(a["content"]),
         "tokens": a["prompt_tokens"],
         "cost": round(a["cost"], 3),
@@ -132,16 +217,23 @@ def run(q: dict) -> dict:
 
 def main() -> None:
     results = [run(q) for q in QUERIES]
-    print(f"{'id':>3} {'llm':>4} {'src':>4} {'yr_ok':>6} {'toks':>7} {'INR':>6} {'lat':>6}  category")
+    print(f"{'id':>3} {'llm':>4} {'src':>4} {'yr_ok':>6} {'dv':>4} {'toks':>7} {'INR':>6} {'lat':>6}  category")
     for r in results:
         print(f"{r['id']:>3} {r['llm']!s:>4} {r['n_src']:>4} {r['year_ok']!s:>6} "
-              f"{r['tokens']:>7} {r['cost']:>6} {r['latency']:>6}  {r['category']}")
+              f"{'ok' if r['dv_ok'] else 'MISS':>4} {r['tokens']:>7} {r['cost']:>6} "
+              f"{r['latency']:>6}  {r['category']}")
         print(f"     top source: {r['top']}")
         print(f"     source years: {r['years']} | note: {r['note']}")
         if r["missing_terms"]:
             print(f"     MISSING TERMS: {r['missing_terms']}")
+        if r["dv"]:
+            dv = r["dv"]
+            print(f"     dataviz: cols={dv['columns']} rows={len(dv['rows'])} "
+                  f"vc={dv['value_column']} format={dv['format']!r}")
+            for row in dv["rows"][:4]:
+                print(f"       {row}")
         print()
-    fails = [r["id"] for r in results if not r["llm"] or r["missing_terms"] or not r["year_ok"]]
+    fails = [r["id"] for r in results if not r["llm"] or r["missing_terms"] or not r["year_ok"] or not r["dv_ok"]]
     print("QUERIES WITH ISSUES:", fails if fails else "none")
 
 

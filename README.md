@@ -439,8 +439,10 @@ reachable from `backend/.env` (venv python, from `backend/`):
   summary is empty. Deterministic seed.
 - `./venv/bin/python scripts/chat_quality_test.py` — golden-set chat eval
   (event-year date suppression, plain-year date filters, weak-fallback niche,
-  normal and entity queries) verifying key terms and expected source years.
-  Makes real (billed) LLM calls.
+  normal and entity queries) verifying key terms, expected source years, and —
+  for the dataviz-intent queries — that the answer carries a valid
+  ```` ```dataviz ```` JSON block (same contract `app.chat.parse_dataviz`
+  enforces). Makes real (billed) LLM calls.
 
 ## Production notes (POC shortcuts to fix before real prod)
 

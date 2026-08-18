@@ -168,6 +168,39 @@ event: done
 data: {"message":{...,"prompt_tokens":2065,"completion_tokens":323,"cost":0.1369,...},"note":null,"latency_ms":1800.0}
 ```
 
+### Dataviz data block (in `Message.content`)
+
+For ranked-list / numeric-comparison / breakdown questions, the assistant's
+`content` (in both the one-shot `TurnOut` and the SSE `done` message) ends with
+**one** fenced JSON block tagged `dataviz` that the UI renders as a
+Table/Bar/Line/Pie/Pictogram chart:
+
+```markdown
+Prose answer with inline citations [1][2].
+
+```dataviz
+{"title": "Top 2025 deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto raise", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B", "kind": "bar"}
+```
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `title` | string (optional) | Chart heading |
+| `columns` | `string[]` | Column headers; first column is the item label |
+| `rows` | `(string\|number)[][]` | One array per row, aligned with `columns` (max 10 rows) |
+| `value_column` | int | Index of the numeric column the chart plots |
+| `format` | string (optional) | Unit for display: `"$B"`, `"$M"`, `"₹ Cr"`, `"%"`, or `""` |
+| `kind` | string (optional) | Chart hint: `"bar"`, `"line"`, or `"pie"` (frontend default view) |
+
+Notes:
+- Emission is non-deterministic; the backend re-calls the LLM once with a
+  nudge when a dataviz-intent question returns without a block.
+- Malformed blocks (invalid JSON, ragged rows, non-numeric value column) are
+  stripped by `_sanitize_dataviz` before storage, so `content` never exposes
+  unparseable JSON to clients.
+- Consumers should treat the block as optional and never fail to render the
+  prose when it is absent.
+
 ---
 
 ## `GET /facets`
