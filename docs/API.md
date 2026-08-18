@@ -39,6 +39,72 @@ unknown email or wrong password (no account enumeration). A disabled account
 
 ---
 
+## Integration guide (for the external consumer)
+
+### 1. Auth flow
+
+1. **Sign up** (`POST /api/auth/signup`) or **log in** (`POST /api/auth/login`).
+   Both return `{ "token": "<opaque bearer token>", "user": {...} }`.
+2. Send the token on every protected request:
+   `Authorization: Bearer <token>`.
+3. Tokens expire after `AUTH_TOKEN_TTL_DAYS` (7). When a call returns `401`,
+   re-authenticate with `POST /api/auth/login` to mint a fresh token — do not
+   try to refresh an expired token. `POST /api/auth/logout` revokes the current
+   token server-side (treat the client copy as dead after that).
+4. Store tokens server-side only if your client needs to act on behalf of users;
+   otherwise log in per user session. Never store raw passwords or tokens in
+   browser-side JavaScript that ships to visitors.
+
+### 2. Protection matrix
+
+| Access | Endpoints |
+|---|---|
+| **Public** (no token) | `GET /search`, `GET /facets`, `POST /analytics/click`, `POST /api/auth/signup`, `POST /api/auth/login`, health (`/health`, `/live`, `/ready`, `/readyz`) |
+| **Any authenticated user** (`user` role, default) | `POST/GET/PATCH/DELETE /api/chat/...`, `POST /api/auth/logout`, `POST /api/auth/change-password` |
+| **Admin only** | `GET /analytics/summary`, `GET /analytics/chat`, all `GET/PATCH/DELETE /api/auth/users...` |
+
+Chat conversations are scoped to the account that created them — a token can
+never see or modify another account's conversations. `403` means the token is
+valid but the role is not allowed; `401` means missing/expired/revoked token.
+
+### 3. Rate limits (per IP, Redis)
+
+- Signup: `AUTH_SIGNUP_RATE_PER_MIN` (5) — exceed → `429`.
+- Login: `AUTH_LOGIN_RATE_PER_MIN` (10) — exceed → `429`.
+- `/search` and chat are not IP-rate-limited (chat is bounded by the global LLM
+  daily budget instead).
+
+### 4. Consuming the chat SSE stream
+
+`POST /api/chat/sessions/{id}/messages/stream` returns Server-Sent Events.
+Read the body as a stream, split on blank lines, and parse `data:` lines as
+JSON per `event:` line:
+
+| event | payload |
+|---|---|
+| `start` | `{ "user": Message }` |
+| `delta` | `{ "text": "..." }` — append to the answer |
+| `done` | `{ "message": Message, "note": string\|null, "latency_ms": number }` — final, persisted message (sources, usage, cost) |
+| `error` | `{ "error": "..." }` — nothing persisted |
+
+If the stream drops mid-turn, the turn was not saved; re-send to retry.
+Ranked-list / numeric / breakdown answers may end with a fenced
+```` ```dataviz ```` JSON block (see the Dataviz section) — render it as a
+chart or strip the fence before showing raw markdown.
+
+### 5. Errors & conventions
+
+- Errors are uniform JSON: `{"detail": "<message>"}` (FastAPI default).
+- Status codes: `401` auth required/expired, `403` role forbidden, `404` session
+  not found, `409` duplicate email, `422` input validation, `429` rate limit or
+  daily LLM budget reached, `503` LLM/model unavailable.
+- All `GET /search` responses carry `cached`, `latency_ms`, and `note` fields.
+- The internal eval scripts authenticate with an `X-Service-Token` header that
+  acts as an admin. That bypass is for machine-to-machine use only — never
+  expose it in a browser client.
+
+---
+
 ## `GET /search`
 
 Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involved.
