@@ -522,12 +522,16 @@ _DATAVIZ_INTENT_RE = re.compile(
 )
 
 _DATAVIZ_NUDGE = (
-    "\n\nYour previous answer did not include the required JSON data block. This question asks for a "
-    "ranked list or numeric comparison, so re-answer the SAME question and END your answer with exactly "
-    "one fenced code block tagged dataviz containing JSON of the shape "
-    '{"title": "…", "columns": ["…", "…"], "rows": [["…", 1.0], …], "value_column": <int>, "format": "$B|$M|₹ Cr|%|"}'
-    ". Rows are the ranked items (max 10); every value cell is a plain number stated in the articles, "
-    "never invented; keep [n] citations only in the prose."
+    "\n\nYour previous answer did not include a VALID JSON data block. This question asks for a ranked "
+    "list or numeric comparison, so re-answer the SAME question and END your answer with exactly one "
+    "fenced code block tagged dataviz containing ONLY valid JSON, like this:\n\n"
+    "```dataviz\n"
+    '{"title": "Top deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}\n'
+    "```\n\n"
+    "Rules: valid JSON only (double-quoted keys, no trailing commas, no markdown bullet lists); rows are "
+    "the ranked items (max 10); value_column is the integer index of the numeric column and every cell in "
+    "that column is a plain number actually stated in the articles; never invent numbers; keep [n] "
+    "citations only in the prose."
 )
 
 
