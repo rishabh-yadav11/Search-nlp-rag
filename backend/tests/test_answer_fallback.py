@@ -25,9 +25,14 @@ def test_results_are_weak_empty_list():
     assert results_are_weak([]) is True
 
 
-def test_results_are_weak_fewer_than_limit_results():
-    assert results_are_weak([0.5, 0.9]) is True
-    assert results_are_weak([0.5]) is True
+def test_results_are_weak_few_strong_matches_not_weak():
+    """A topic with only 1-2 strong matches must not be suppressed: the corpus
+    may simply have few articles on it (regression: niche queries were refused
+    even when retrieval found a solid match)."""
+    assert results_are_weak([0.5, 0.9]) is False
+    assert results_are_weak([0.761, 0.457]) is False
+    assert results_are_weak([0.5]) is False
+    assert results_are_weak([0.5, 0.2]) is True  # one strong + one weak is still weak
 
 
 def test_results_are_weak_custom_limit():

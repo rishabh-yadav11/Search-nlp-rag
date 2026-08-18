@@ -57,6 +57,39 @@ _MONTH_YEAR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A year that names a historical event is a topic reference, not a
+# publication-date filter: 'the 2008 crisis' should surface retrospectives
+# written later, so the auto date filter is suppressed for such phrases.
+_EVENT_NOUNS = (
+    "crisis", "crash", "bubble", "meltdown", "recession", "slowdown", "downturn",
+    "pandemic", "epidemic", "outbreak", "war", "invasion", "battle", "conflict",
+    "election", "referendum", "demonetisation", "demonetization", "reforms",
+    "reform", "census", "olympics", "earthquake", "tsunami", "cyclone",
+    "floods", "flood", "hurricane", "massacre", "riots", "protest", "scandal",
+    "coup", "default", "bankruptcy", "bailout", "goldrush", "partition",
+    "independence",
+)
+_EVENT_NOUN_ALT = "|".join(sorted(_EVENT_NOUNS, key=len, reverse=True))
+# '2008 (financial) crisis', 'the 2008 global financial crisis'
+_EVENT_YEAR_RE = re.compile(
+    rf"\b((?:19|20)\d{{2}})\s+(?:\w+\s+){{0,2}}({_EVENT_NOUN_ALT})s?\b", re.IGNORECASE
+)
+# 'financial crisis of 2008', 'the crisis in 2008'
+_REV_EVENT_YEAR_RE = re.compile(
+    rf"\b(?:\w+\s+){{0,2}}({_EVENT_NOUN_ALT})s?\s+(?:of|in)\s+((?:19|20)\d{{2}})\b", re.IGNORECASE
+)
+
+
+def _year_is_event_reference(query: str, year: int) -> bool:
+    """True when ``year`` appears in the query inside a historical-event phrase
+    (e.g. '2008 crisis' or 'financial crisis of 2008'), meaning it is a topic
+    reference rather than a publication-date filter."""
+    for pattern, year_group in ((_EVENT_YEAR_RE, 1), (_REV_EVENT_YEAR_RE, 2)):
+        for m in pattern.finditer(query):
+            if int(m.group(year_group)) == year:
+                return True
+    return False
+
 
 def extract_month_range(query: str) -> tuple[str, str] | None:
     """Return (from_date, to_date) ISO strings for a specific month in the query,
@@ -76,7 +109,11 @@ def extract_month_range(query: str) -> tuple[str, str] | None:
 def extract_year_range(query: str) -> tuple[str, str] | None:
     """Return (from_date, to_date) ISO strings for a time window mentioned in the
     query: a specific month ('january 2025' -> month range), a year span, an
-    explicit year, or 'last year'/'this year'. Month takes precedence."""
+    explicit year, or 'last year'/'this year'. Month takes precedence.
+
+    An explicit year that names a historical event ('2008 crisis', 'financial
+    crisis of 2008') is NOT treated as a publication-date filter: such queries
+    want retrospectives written later, not only articles published that year."""
     q = query.lower()
     month_range = extract_month_range(q)
     if month_range is not None:
@@ -92,8 +129,11 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
         return (f"{y}-01-01", f"{y}-12-31")
     m = _YEAR_RE.search(q)
     if m:
-        y = int(m.group(1))
-        return (f"{y}-01-01", f"{y}-12-31")
+        for ym in _YEAR_RE.finditer(q):
+            year = int(ym.group(1))
+            if not _year_is_event_reference(q, year):
+                return (f"{year}-01-01", f"{year}-12-31")
+        return None
     return None
 
 

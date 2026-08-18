@@ -30,10 +30,15 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
 def results_are_weak(scores: list[float], limit: int = 3) -> bool:
     """True when fewer than `limit` of the top reranked scores exceed
     TOP_WEAK_THRESHOLD, i.e. retrieval is too weak to answer the query.
-    An empty scores list counts as weak; if there are fewer than `limit`
-    results total, only what exists is evaluated."""
+
+    ``limit`` is capped at the number of available scores (min 1): a topic with
+    only 1-2 strong matches in the corpus is NOT treated as weak — refusing to
+    answer then would suppress every narrow/niche question. An empty scores
+    list still counts as weak."""
+    if not scores:
+        return True
     strong = sum(1 for s in scores if s > TOP_WEAK_THRESHOLD)
-    return strong < limit
+    return strong < min(limit, len(scores))
 
 
 def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:

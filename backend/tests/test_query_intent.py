@@ -36,6 +36,26 @@ def test_extract_year_range_no_year_returns_none():
     assert extract_year_range("") is None
 
 
+def test_extract_year_range_event_year_not_a_date_filter():
+    """A year naming a historical event is a topic reference, not a
+    publication-date filter: 'the 2008 crisis' must find retrospectives written
+    later instead of being restricted to 2008 articles."""
+    assert extract_year_range("lessons from the 2008 crisis") is None
+    assert extract_year_range("the 2008 financial crisis") is None
+    assert extract_year_range("financial crisis of 2008") is None
+    assert extract_year_range("what caused the 2016 demonetisation") is None
+    assert extract_year_range("how did companies fare in the 2020 pandemic") is None
+
+
+def test_extract_year_range_event_year_ignored_when_other_year_mentioned():
+    assert extract_year_range("funding 2024 during the 2008 crisis") == ("2024-01-01", "2024-12-31")
+
+
+def test_extract_year_range_plain_year_still_filters():
+    assert extract_year_range("2024 funding") == ("2024-01-01", "2024-12-31")
+    assert extract_year_range("top deals of 2025") == ("2025-01-01", "2025-12-31")
+
+
 def test_suggested_top_k_numeric():
     assert suggested_top_k("top 5 deals") == 5
     assert suggested_top_k("show me top 20 startups") == 20
