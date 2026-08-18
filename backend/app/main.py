@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 import time
 from contextlib import asynccontextmanager
@@ -364,7 +365,7 @@ def _filter_token(qfilter: Filter | None) -> str:
     """Deterministic cache key fragment for a Qdrant filter."""
     if qfilter is None:
         return ""
-    return qfilter.model_dump_json(sort_keys=True)
+    return json.dumps(qfilter.model_dump(), sort_keys=True, default=str)
 
 
 async def _attach_bodies(articles: list[SourceArticle]) -> None:

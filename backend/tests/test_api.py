@@ -207,6 +207,18 @@ class _FakeCache:
         self.store[key] = value
 
 
+def test_filter_token_deterministic_and_json_serializable():
+    """The retrieve-cache key from a Qdrant filter must be a stable string
+    (regression: model_dump_json(sort_keys=...) is unsupported in pydantic)."""
+    f = Filter(must=[FieldCondition(key="industry_names", match=MatchAny(any=["Fintech"]))])
+    assert main._filter_token(None) == ""
+    t1 = main._filter_token(f)
+    t2 = main._filter_token(f)
+    assert t1 == t2
+    assert isinstance(t1, str)
+    assert "Fintech" in t1
+
+
 def test_retrieve_and_rerank_caches_without_body(monkeypatch):
     """The retrieve cache round-trips SourceArticles but never stores bodies;
     a chat request re-fetches them from Qdrant after a cache hit."""
