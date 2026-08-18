@@ -7,6 +7,10 @@ qdrant-client==1.11.3
 fastembed==0.8.0
 sentence-transformers==3.1.1
 torch==2.13.0
+transformers==4.57.6
+onnxruntime==1.28.0
+# Optional (falls back to torch rerank when missing): ONNX cross-encoder path.
+optimum>=1.20.0
 openai==1.68.2
 python-dotenv==1.0.1
 cachetools==5.5.0

@@ -46,6 +46,12 @@ const USER_KEY = 'vccircle_chat_user_id'
 
 const CITATION_RE = /\[\d+\]/
 
+// Re-rendering the accumulated markdown on every SSE token is O(n^2): each
+// token re-parses the entire answer so far. Throttle streaming renders to at
+// most this many ms apart; the final chunk is always flushed when the stream
+// ends.
+const STREAM_RENDER_MS = 50
+
 function remarkCitations() {
   return (tree: any) => {
     walk(tree, (node, parent, index) => {
@@ -274,6 +280,7 @@ export default function ChatPage() {
       let doneMsg: Message | null = null
       let note = ''
       let streamError = ''
+      let lastRender = 0
 
       while (true) {
         const { done, value } = await reader.read()
@@ -299,7 +306,11 @@ export default function ChatPage() {
               const text = payload.text as string
               setStreaming(true)
               accumulated += text
-              setStreamingContent(accumulated)
+              const now = Date.now()
+              if (now - lastRender >= STREAM_RENDER_MS) {
+                lastRender = now
+                setStreamingContent(accumulated)
+              }
             } else if (type === 'done') {
               doneMsg = payload.message as Message
               note = payload.note ?? ''
@@ -311,6 +322,10 @@ export default function ChatPage() {
           }
         }
       }
+
+      // Flush the final text so the last chunk renders even if it arrived
+      // inside the throttle window.
+      if (accumulated) setStreamingContent(accumulated)
 
       if (streamError) throw new Error(streamError)
       if (doneMsg) {

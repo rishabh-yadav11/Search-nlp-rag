@@ -468,7 +468,7 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     from app.main import _effective_intent, retrieve_and_rerank, source_context, to_summary
 
     retrieval_q, eff_from, eff_to = _effective_intent(question, None, None)
-    reranked = await retrieve_and_rerank(retrieval_q, config.TOP_K, None)
+    reranked = await retrieve_and_rerank(retrieval_q, config.TOP_K, None, need_body=True)
     sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][: config.TOP_K]
 
     note = (

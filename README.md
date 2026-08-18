@@ -95,7 +95,10 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
   for `CHAT_RETENTION_DAYS` (180) are purged daily. See `docs/API.md`.
 - **Caching** — Redis-backed JSON cache shared across workers (falls back to
   an in-process cache if Redis is down) for `/search`, keyed
-  by effective query + top_k + facets.
+  by effective query + top_k + facets. The retrieval/rerank step
+  (`retrieve_and_rerank`) is cached on the same key space (query + filter +
+  top_k), so repeated searches AND every chat turn that re-asks the same
+  question skip embedding + rerank entirely.
 
 ### Health endpoints
 
@@ -418,10 +421,14 @@ reconciliation, cache TTL and degraded fallback.
 
 ## Production notes (POC shortcuts to fix before real prod)
 
-1. **Embeddings and the reranker run on CPU.** Query-time embedding and
-   cross-encoder re-scoring are offloaded off the event loop, so the API stays
-   responsive, but latency is higher than a GPU-backed embedder. Set
-   `EMBED_DEVICE=cuda` for lower latency.
+1. **Embeddings and the reranker run on CPU.** Query-time embedding uses
+   fastembed's ONNX (INT8) variant of the bge model (≈3-5x faster than torch on
+   CPU, same 768-dim normalized vectors, so the existing index stays valid) and
+   the cross-encoder runs via ONNX/optimum (≈2-3x faster) when `optimum` is
+   installed, with a torch fallback. Inference is serialized per worker and
+   `TORCH_THREADS` (default 2) caps torch/onnxruntime threads so 4 gunicorn
+   workers don't oversubscribe the CPU. Latency is still higher than a
+   GPU-backed embedder; set `EMBED_DEVICE=cuda` for lower latency.
 2. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
    down it silently degrades to a per-worker in-process cache (which no longer
    benefits the other workers until Redis returns).

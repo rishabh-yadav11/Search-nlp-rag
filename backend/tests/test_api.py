@@ -194,6 +194,65 @@ def test_retrieval_queries_no_dup_when_topic_equals_rewrite():
     assert qs == ["top deals"]
 
 
+class _FakeCache:
+    """Minimal in-memory stand-in for the HybridCache used by retrieve_and_rerank."""
+
+    def __init__(self):
+        self.store: dict = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value):
+        self.store[key] = value
+
+
+def test_retrieve_and_rerank_caches_without_body(monkeypatch):
+    """The retrieve cache round-trips SourceArticles but never stores bodies;
+    a chat request re-fetches them from Qdrant after a cache hit."""
+    from app.main import SourceArticle
+
+    fake_cache = _FakeCache()
+    monkeypatch.setattr(main, "cache", fake_cache)
+
+    def make_article(id_: int, score: float) -> SourceArticle:
+        return SourceArticle(id=id_, title="t", url="u", summary="s", body="", score=score)
+
+    async def fake_leg(rq, top_k, qfilter):
+        return [make_article(1, 0.9), make_article(2, 0.7)]
+
+    async def fake_rerank(q, results):
+        results.sort(key=lambda a: a.score, reverse=True)
+        return results
+
+    async def fake_bodies(articles):
+        for a in articles:
+            a.body = "full body"
+
+    monkeypatch.setattr(main, "_retrieval_queries", lambda q: [q])
+    monkeypatch.setattr(main, "_retrieval_leg", fake_leg)
+    monkeypatch.setattr(main, "rerank", fake_rerank)
+    monkeypatch.setattr(main, "sort_results", lambda r: r)
+    monkeypatch.setattr(main, "apply_entity_boost", lambda q, r: r)
+    monkeypatch.setattr(main, "_attach_bodies", fake_bodies)
+    monkeypatch.setattr(main.config, "ENABLE_ENTITY_BOOST", True)
+
+    out1 = asyncio.run(main.retrieve_and_rerank("q", 8, None, need_body=True))
+    assert out1[0].body == "full body"
+    (_, cached), = list(fake_cache.store.items())
+    assert "body" not in cached[0]
+    assert cached[0]["id"] == 1
+
+    async def refetch_bodies(articles):
+        for a in articles:
+            a.body = "refetched"
+
+    monkeypatch.setattr(main, "_attach_bodies", refetch_bodies)
+    out2 = asyncio.run(main.retrieve_and_rerank("q", 8, None, need_body=True))
+    assert out2[0].body == "refetched"
+    assert len(fake_cache.store) == 1  # still a single cache entry
+
+
 def test_analytics_dashboard_route_registered():
     from app.dashboard import DASHBOARD_HTML
 

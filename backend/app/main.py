@@ -3,7 +3,6 @@ import math
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from functools import partial
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,16 +21,19 @@ from qdrant_client.models import (
     Prefetch,
     SparseVector,
 )
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app import chat as chat_module
 from app.analytics import close as close_analytics
 from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
+
+# Import config FIRST so the OMP/MKL thread caps in app.config are set before
+# any inference library (torch/onnxruntime) is imported below.
 from app.config import config
 from app.cost_budget import close as close_cost_budget
 from app.dashboard import dashboard_html
+from app.encoders import DenseEncoder
 from app.health import router as health_router
 from app.query_expand import expand_query
 from app.query_intent import (
@@ -43,15 +45,21 @@ from app.query_intent import (
 )
 from app.redis_cache import cache
 from app.rerank_boost import apply_entity_boost
+from app.reranker import Reranker
 
 state = {}
+
+# Serializes CPU-bound inference (dense encode, sparse embed, rerank) per
+# worker so concurrent requests don't contend for the CPU and thrash torch /
+# onnxruntime thread pools. Async I/O (Qdrant/Redis) is unaffected.
+inference_lock = asyncio.Lock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    state["model"] = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
+    state["model"] = DenseEncoder(config.EMBED_MODEL, config.EMBED_DEVICE, config.TORCH_THREADS)
     state["sparse_model"] = SparseTextEmbedding(config.SPARSE_MODEL)
-    state["reranker"] = CrossEncoder(config.RERANK_MODEL, device="cpu")
+    state["reranker"] = Reranker(config.RERANK_MODEL, backend=config.RERANK_BACKEND)
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
     state["llm"] = AsyncOpenAI(api_key=config.GEMINI_API_KEY, base_url=config.GEMINI_BASE_URL) if config.GEMINI_API_KEY else None
 
@@ -248,15 +256,40 @@ def _retrieval_queries(q: str) -> list[str]:
     return [q]
 
 
+# Payload fields needed for ranking/display. The article `body` is intentionally
+# excluded: it is large (~6KB/article) and only used for chat context, where it
+# is fetched separately for the final sources (_attach_bodies).
+_PAYLOAD_FIELDS = [
+    "title",
+    "url",
+    "published_date",
+    "category",
+    "summary",
+    "author_names",
+    "industry_names",
+    "dealtype_names",
+]
+
+
+def _embed_sparse(model, text: str):
+    """Sparse-embed one query, consuming fastembed's lazy generator inside the
+    worker thread (a bare ``next()`` outside would run inference on the event
+    loop and stall every other request)."""
+    return next(iter(model.embed([text])))
+
+
 async def hybrid_search(
     query: str,
     top_k: int,
     qfilter: Filter | None = None,
+    with_body: bool = False,
 ) -> list[SourceArticle]:
-    # Sentence-transformers and fastembed are CPU/sync-bound: run them off the
-    # event loop so the async handlers stay responsive under load.
-    dense_vec = (await asyncio.to_thread(partial(state["model"].encode, query, normalize_embeddings=True))).tolist()
-    sparse_emb = next(await asyncio.to_thread(state["sparse_model"].embed, [query]))
+    # Dense/sparse encoders are CPU/sync-bound: run them off the event loop so
+    # the async handlers stay responsive under load, and serialize them so
+    # concurrent requests don't thrash the inference thread pools.
+    async with inference_lock:
+        dense_vec = (await asyncio.to_thread(state["model"].encode, query)).tolist()
+        sparse_emb = await asyncio.to_thread(_embed_sparse, state["sparse_model"], query)
     sparse_vec = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
 
     dense_prefetch = Prefetch(
@@ -272,7 +305,7 @@ async def hybrid_search(
         query=FusionQuery(fusion=Fusion.RRF),
         query_filter=qfilter,
         limit=top_k,
-        with_payload=True,
+        with_payload=True if with_body else _PAYLOAD_FIELDS,
     )
 
     return [
@@ -300,7 +333,8 @@ async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle
     if len(results) <= 1:
         return results
     pairs = [(query, f"{a.title}. {a.summary or ''}".strip()) for a in results]
-    logits = await asyncio.to_thread(state["reranker"].predict, pairs)
+    async with inference_lock:
+        logits = await asyncio.to_thread(state["reranker"].predict, pairs)
     for a, s in zip(results, logits):
         a.score = float(1 / (1 + math.exp(-s)))
     results.sort(key=lambda a: a.score, reverse=True)
@@ -326,25 +360,77 @@ def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
     return results
 
 
+def _filter_token(qfilter: Filter | None) -> str:
+    """Deterministic cache key fragment for a Qdrant filter."""
+    if qfilter is None:
+        return ""
+    return qfilter.model_dump_json(sort_keys=True)
+
+
+async def _attach_bodies(articles: list[SourceArticle]) -> None:
+    """Fetch the article `body` payloads for a set of articles in one Qdrant
+    call. hybrid_search deliberately omits bodies to keep candidate fetches
+    small; chat needs bodies for the LLM context, so they are pulled only for
+    the final reranked set."""
+    ids = [a.id for a in articles]
+    if not ids:
+        return
+    resp = await state["qdrant"].retrieve(
+        collection_name=config.QDRANT_COLLECTION,
+        ids=ids,
+        with_payload=["body"],
+    )
+    bodies = {p.id: (p.payload or {}).get("body", "") for p in resp}
+    for a in articles:
+        a.body = bodies.get(a.id, "")
+
+
+async def _retrieval_leg(
+    rq: str,
+    top_k: int,
+    qfilter: Filter | None,
+) -> list[SourceArticle]:
+    if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
+        rq = expand_query(rq)
+    return await hybrid_search(rq, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
+
+
 async def retrieve_and_rerank(
     q: str,
     top_k: int,
     qfilter: Filter | None,
+    need_body: bool = False,
 ) -> list[SourceArticle]:
     """Run every retrieval leg, merge RRF candidates, cross-encode rerank, and
     apply the entity-mention boost. Returns the recency-sorted articles.
 
-    Shared by /search and /chat so the two pipelines stay consistent."""
-    groups = []
-    for rq in _retrieval_queries(q):
-        if config.ENABLE_QUERY_EXPANSION and "flashback" not in rq.lower():
-            rq = expand_query(rq)
-        candidates = await hybrid_search(rq, max(top_k, config.RERANK_CANDIDATES), qfilter=qfilter)
-        groups.append(candidates)
+    Shared by /search and /chat so the two pipelines stay consistent. The
+    reranked article set is cached in Redis (same TTL as /search) because it is
+    deterministic for a (query, filter) pair; chat follows-up re-run the same
+    retrieval on every turn, and this cache makes those turns skip embedding +
+    rerank entirely. Bodies are not cached (they are large); when ``need_body``
+    is set they are fetched from Qdrant for the returned set.
+    """
+    cache_key = f"retrieve:{q}:{top_k}:{_filter_token(qfilter)}"
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        articles = [SourceArticle.model_validate(d) for d in cached]
+        if need_body and articles:
+            await _attach_bodies(articles)
+        return articles
+
+    queries = _retrieval_queries(q)
+    groups = await asyncio.gather(*(_retrieval_leg(rq, top_k, qfilter) for rq in queries))
     reranked = await rerank(month_query_topic(q) or q, _merge_results(*groups))
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(month_query_topic(q) or q, reranked)
-    return sort_results(reranked)
+    reranked = sort_results(reranked)
+    if need_body:
+        await _attach_bodies(reranked)
+    # Bodies are deliberately excluded from the cache entry: they are large and
+    # chat re-fetches them from Qdrant on a cache hit (_attach_bodies).
+    await cache.set(cache_key, [a.model_dump(exclude={"body"}) for a in reranked])
+    return reranked
 
 
 @app.get("/search", response_model=SearchResponse)

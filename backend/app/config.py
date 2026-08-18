@@ -5,6 +5,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Cap the number of CPU threads torch/onnxruntime use per process BEFORE any
+# inference library is imported. With GUNICORN_WORKERS processes sharing the
+# box, leaving the default (all cores) oversubscribes the CPU and hurts
+# latency under concurrent load. 2 threads per worker is the tuned default.
+_TORCH_THREADS = int(os.getenv("TORCH_THREADS", "2"))
+os.environ.setdefault("OMP_NUM_THREADS", str(_TORCH_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_TORCH_THREADS))
+
 
 class Config:
     # MySQL
@@ -27,6 +35,9 @@ class Config:
     EMBED_DIM = 768  # matches bge-base; change if you swap models
     EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "256"))
     EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
+    # CPU threads each worker's inference libs may use (torch + onnxruntime).
+    # Kept small so GUNICORN_WORKERS processes don't oversubscribe the box.
+    TORCH_THREADS = _TORCH_THREADS
 
     # Indexed text limits. The dense embedder gets title+facets+summary only
     # (kept short so CPU builds stay fast); the sparse/lexical embedder gets the
@@ -49,6 +60,14 @@ class Config:
     # trimming latency (measured 8/8 overlap on representative queries).
     RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
     RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "12"))
+    # Reranker execution backend: 'onnx' (optimum/onnxruntime, ~2-3x faster on
+    # CPU, exported once at startup) or 'torch' (sentence-transformers). Falls
+    # back to 'torch' automatically when optimum is not installed.
+    RERANK_BACKEND = os.getenv("RERANK_BACKEND", "onnx")
+    # Local dir where the ONNX cross-encoder is exported on first use and
+    # reloaded on later startups (relative paths resolve against the backend
+    # working dir, where gunicorn runs).
+    RERANK_ONNX_DIR = os.getenv("RERANK_ONNX_DIR", "data/reranker_onnx")
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
@@ -74,7 +93,7 @@ class Config:
     # Minimum reranked relevance score for chat sources; weaker results are
     # dropped before the LLM sees them.
     ASK_MIN_SCORE = float(os.getenv("ASK_MIN_SCORE", "0.2"))
-    CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
+    CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
 
     # Recency-tempered ranking: scores are multiplied by
