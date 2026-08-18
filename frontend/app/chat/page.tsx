@@ -5,6 +5,7 @@ import Link from 'next/link'
 import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
 import remarkGfm from 'remark-gfm'
+import DataViz, { splitContent } from './DataViz'
 
 type Source = {
   id: number
@@ -183,6 +184,23 @@ function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
         </>
       ) : null}
     </div>
+  )
+}
+
+function AnswerBody({ content }: { content: string }) {
+  const parts = splitContent(content)
+  return (
+    <>
+      {parts.map((part, i) =>
+        part.type === 'viz' ? (
+          <DataViz key={`viz-${i}`} block={part.block} />
+        ) : (
+          <ReactMarkdown key={`md-${i}`} remarkPlugins={[remarkGfm, remarkCitations]} rehypePlugins={[rehypeRaw]}>
+            {part.md}
+          </ReactMarkdown>
+        ),
+      )}
+    </>
   )
 }
 
@@ -429,7 +447,7 @@ export default function ChatPage() {
                     <div className="chat-msg-plain">{m.content}</div>
                   ) : (
                     <div className="chat-msg-answer">
-                      <ReactMarkdown remarkPlugins={[remarkGfm, remarkCitations]} rehypePlugins={[rehypeRaw]}>{m.content}</ReactMarkdown>
+                      <AnswerBody content={m.content} />
                       <SourceList sources={m.sources ?? []} msg={m} />
                     </div>
                   )}
@@ -451,7 +469,7 @@ export default function ChatPage() {
             <div className="chat-msg chat-assistant">
               <div className="chat-msg-bubble">
                 <div className="chat-msg-answer">
-                  <ReactMarkdown remarkPlugins={[remarkGfm, remarkCitations]} rehypePlugins={[rehypeRaw]}>{streamingContent}</ReactMarkdown>
+                  <AnswerBody content={streamingContent} />
                 </div>
               </div>
             </div>

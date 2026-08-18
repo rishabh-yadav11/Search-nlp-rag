@@ -441,6 +441,78 @@ def _smalltalk_reply(question: str) -> str | None:
     return None
 
 
+_DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _as_float(v: object) -> float | None:
+    """Coerce a cell to float (ints, floats, or digit strings), else None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def _first_numeric_column(rows: list[list[object]]) -> int | None:
+    if not rows or not rows[0]:
+        return None
+    for j in range(len(rows[0])):
+        if all(_as_float(r[j]) is not None for r in rows):
+            return j
+    return None
+
+
+def parse_dataviz(text: str) -> dict | None:
+    """Extract and validate the assistant's ``dataviz`` JSON data block.
+
+    Returns the parsed block dict, or None when absent or malformed. The block
+    powers the frontend table/bar/pie renderer; the prose answer always stands
+    alone, so an invalid block is simply dropped instead of breaking chat."""
+    m = _DATAVIZ_FENCE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    columns = data.get("columns")
+    rows = data.get("rows")
+    if not isinstance(columns, list) or not columns or not all(isinstance(c, str) for c in columns):
+        return None
+    if not isinstance(rows, list) or not rows or not all(isinstance(r, list) for r in rows):
+        return None
+    if any(len(r) != len(columns) for r in rows):
+        return None
+    vc = data.get("value_column")
+    if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
+        vc = _first_numeric_column(rows)
+    if vc is None or any(_as_float(r[vc]) is None for r in rows):
+        return None
+    data["value_column"] = vc
+    return data
+
+
+def _sanitize_dataviz(text: str) -> str:
+    """Return ``text`` with any malformed ``dataviz`` fence removed.
+
+    Valid blocks pass through untouched (the frontend renders them); malformed
+    JSON is stripped so users never see raw, unparseable blocks."""
+    if not text or "```dataviz" not in text:
+        return text
+
+    def _keep(match: re.Match) -> str:
+        return match.group(0) if parse_dataviz(match.group(0)) is not None else ""
+
+    return _DATAVIZ_FENCE_RE.sub(_keep, text)
+
+
 @dataclass
 class PreparedTurn:
     """Outcome of retrieval + prompt building for one turn.
@@ -523,7 +595,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
     result = await generate_answer(state_llm(), turn.answer, config.LLM_MODEL)
     await record_cost(result.cost())
     return (
-        result.content,
+        _sanitize_dataviz(result.content),
         turn.sources,
         turn.note,
         result.prompt_tokens,
@@ -543,6 +615,18 @@ business news archive using ONLY the numbered articles below. Cite the article n
 factual claim, like [1] or [2][3]. If the user asks a follow-up question, use the conversation history \
 for context but only make claims supported by the articles. If the articles contain no relevant \
 information, say so plainly instead of guessing.
+
+If the question asks for a ranked list or a numeric comparison, append ONE JSON data block at the very \
+end of your answer, in a fenced code block tagged dataviz, like this:
+
+```dataviz
+{{"title": "Top 2025 deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto raise", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}}
+```
+
+Data block rules: rows are the ranked items; every value cell is a plain number in the unit declared by \
+"format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
+articles, never invented ones; keep [n] citations only in the prose, never inside the data block; omit \
+the block entirely when the answer contains no ranked list or numeric comparison.
 
 Conversation so far:
 {history}
@@ -713,7 +797,7 @@ async def send_message_stream(
 
             usage = usage_holder[0] if usage_holder else None
             latency_ms = (time.perf_counter() - start) * 1000
-            answer = "".join(chunks)
+            answer = _sanitize_dataviz("".join(chunks))
             result = LLMResult(
                 content=answer,
                 prompt_tokens=usage.prompt_tokens if usage else 0,

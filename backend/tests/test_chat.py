@@ -452,3 +452,54 @@ def test_chat_imports_shared_retrieval_helpers():
 
     for name in ("_effective_intent", "retrieve_and_rerank", "body_rescue", "source_context", "to_summary"):
         assert hasattr(main, name), f"app.main.{name} missing (needed by chat._prepare_turn)"
+
+
+def test_parse_dataviz_valid_block():
+    text = (
+        "Top deals:\n\n```dataviz\n"
+        '{"title": "Top 2025 deals", "columns": ["Deal", "Value ($B)"], '
+        '"rows": [["Zepto raise", 1.0], ["Shriram stake", 4.4]], "value_column": 1, "format": "$B"}\n'
+        "```\n"
+    )
+    data = chat_module.parse_dataviz(text)
+    assert data is not None
+    assert data["title"] == "Top 2025 deals"
+    assert data["value_column"] == 1
+    assert len(data["rows"]) == 2
+
+
+def test_parse_dataviz_missing_returns_none():
+    assert chat_module.parse_dataviz("Just some prose [1].") is None
+    assert chat_module.parse_dataviz("") is None
+
+
+def test_parse_dataviz_malformed_json_returns_none():
+    assert chat_module.parse_dataviz("```dataviz\n{not json}\n```") is None
+
+
+def test_parse_dataviz_invalid_shape_returns_none():
+    # inconsistent row widths
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A","B"], "rows": [["x", 1], ["y"]]}\n```') is None
+    # value column is not numeric
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A","B"], "rows": [["x", "y"], ["z", "w"]]}\n```') is None
+
+
+def test_parse_dataviz_infers_numeric_column():
+    data = chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Deal", "Value"], "rows": [["Zepto", 1.0], ["MUFG", 4.4]]}\n```'
+    )
+    assert data is not None
+    assert data["value_column"] == 1
+
+
+def test_sanitize_dataviz_keeps_valid_strips_malformed():
+    valid = "Prose [1].\n\n```dataviz\n{\"columns\": [\"Deal\", \"Value\"], \"rows\": [[\"Zepto\", 1.0]]}\n```"
+    assert chat_module._sanitize_dataviz(valid) == valid
+
+    bad = "Prose [1].\n\n```dataviz\n{not json}\n```"
+    out = chat_module._sanitize_dataviz(bad)
+    assert "```dataviz" not in out
+    assert "Prose [1]" in out
+
+    plain = "Just prose with a ```dataviz``` mention."
+    assert chat_module._sanitize_dataviz(plain) == plain
