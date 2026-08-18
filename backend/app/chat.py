@@ -513,6 +513,37 @@ def _sanitize_dataviz(text: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_keep, text)
 
 
+_DATAVIZ_INTENT_RE = re.compile(
+    r"(top\s+\d+|biggest|largest|highest|most|best|leading|ranked|ranking|list|"
+    r"compare|comparison|breakdown|how many|how much|count|total|average|"
+    r"yearly|annual|monthly|by year|by month|per year|share of|percentage|"
+    r"growth|trend|increase|decrease|per cent|percent)",
+    re.IGNORECASE,
+)
+
+_DATAVIZ_NUDGE = (
+    "\n\nYour previous answer did not include the required JSON data block. This question asks for a "
+    "ranked list or numeric comparison, so re-answer the SAME question and END your answer with exactly "
+    "one fenced code block tagged dataviz containing JSON of the shape "
+    '{"title": "…", "columns": ["…", "…"], "rows": [["…", 1.0], …], "value_column": <int>, "format": "$B|$M|₹ Cr|%|"}'
+    ". Rows are the ranked items (max 10); every value cell is a plain number stated in the articles, "
+    "never invented; keep [n] citations only in the prose."
+)
+
+
+async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
+    """Call the LLM once, nudging it to include a dataviz data block when the
+    question calls for a ranked list or numeric comparison and the model
+    skipped the block. One extra call at most; token usage is summed."""
+    result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
+    if parse_dataviz(result.content) is None and _DATAVIZ_INTENT_RE.search(question):
+        nudge = await generate_answer(state_llm(), prompt + _DATAVIZ_NUDGE, config.LLM_MODEL)
+        result.content = nudge.content
+        result.prompt_tokens += nudge.prompt_tokens
+        result.completion_tokens += nudge.completion_tokens
+    return result
+
+
 @dataclass
 class PreparedTurn:
     """Outcome of retrieval + prompt building for one turn.
@@ -592,7 +623,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
     await assert_within_budget()
-    result = await generate_answer(state_llm(), turn.answer, config.LLM_MODEL)
+    result = await _answer_with_dataviz(question, turn.answer)
     await record_cost(result.cost())
     return (
         _sanitize_dataviz(result.content),
@@ -616,15 +647,21 @@ factual claim, like [1] or [2][3]. If the user asks a follow-up question, use th
 for context but only make claims supported by the articles. If the articles contain no relevant \
 information, say so plainly instead of guessing.
 
-If the question asks for a ranked list or a numeric comparison, append ONE JSON data block at the very \
-end of your answer, in a fenced code block tagged dataviz, like this:
+If the question asks for a ranked list (e.g. "top deals", "biggest rounds", "most active investors"), \
+a numeric comparison, a yearly/monthly breakdown, or a count ("how many", "total", "share of"), you MUST \
+end your answer with ONE JSON data block in a fenced code block tagged dataviz, like this:
 
 ```dataviz
 {{"title": "Top 2025 deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto raise", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}}
 ```
 
-Data block rules: rows are the ranked items; every value cell is a plain number in the unit declared by \
-"format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
+For a share breakdown, put a percentage column and set "format" to "%" (e.g. columns ["Segment", "Share (%)"], \
+value_column 1, format "%"). For a year-over-year trend, put the year in the first column (e.g. columns \
+["Year", "Deals"], rows [["2021", 120], ["2022", 145]], value_column 1). Optionally include "kind" — \
+"bar", "line", or "pie" — as a hint for the best chart ("line" for time trends, "pie" for share breakdowns).
+
+Data block rules: rows are the ranked items (max 10 rows); every value cell is a plain number in the unit \
+declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
 articles, never invented ones; keep [n] citations only in the prose, never inside the data block; omit \
 the block entirely when the answer contains no ranked list or numeric comparison.
 
@@ -797,11 +834,21 @@ async def send_message_stream(
 
             usage = usage_holder[0] if usage_holder else None
             latency_ms = (time.perf_counter() - start) * 1000
-            answer = _sanitize_dataviz("".join(chunks))
+            answer = "".join(chunks)
+            prompt_tokens = usage.prompt_tokens if usage else 0
+            completion_tokens = usage.completion_tokens if usage else 0
+            if parse_dataviz(answer) is None and _DATAVIZ_INTENT_RE.search(question):
+                # The answer streamed without a chart; ask once more so
+                # ranked/numeric questions reliably carry a dataviz block.
+                nudge = await generate_answer(state_llm(), turn.answer + _DATAVIZ_NUDGE, config.LLM_MODEL)
+                answer = nudge.content
+                prompt_tokens += nudge.prompt_tokens
+                completion_tokens += nudge.completion_tokens
+            answer = _sanitize_dataviz(answer)
             result = LLMResult(
                 content=answer,
-                prompt_tokens=usage.prompt_tokens if usage else 0,
-                completion_tokens=usage.completion_tokens if usage else 0,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
             await record_cost(result.cost())
             assistant_msg = await s.append_message(

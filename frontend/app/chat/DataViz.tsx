@@ -8,11 +8,13 @@ export type DataVizBlock = {
   rows: (string | number)[][]
   value_column: number
   format?: string
+  kind?: 'bar' | 'line' | 'pie'
 }
 
 type ContentPart = { type: 'md'; md: string } | { type: 'viz'; block: DataVizBlock }
 
 const FENCE_SRC = '```dataviz\\s*\\n([\\s\\S]*?)\\n```'
+const KINDS = ['bar', 'line', 'pie'] as const
 
 function toNum(v: unknown): number | null {
   if (typeof v === 'boolean') return null
@@ -50,12 +52,14 @@ export function parseDataViz(text: string): DataVizBlock | null {
         ? vcRaw
         : firstNumericColumn(rowArr)
     if (vc == null || rowArr.some((r) => toNum(r[vc]) == null)) return null
+    const kind = (d as { kind?: unknown }).kind
     return {
       title: typeof (d as { title?: unknown }).title === 'string' ? (d as { title: string }).title : undefined,
       columns: columns as string[],
       rows: rowArr,
       value_column: vc as number,
       format: typeof (d as { format?: unknown }).format === 'string' ? (d as { format: string }).format : undefined,
+      kind: typeof kind === 'string' && (KINDS as readonly string[]).includes(kind) ? (kind as DataVizBlock['kind']) : undefined,
     }
   } catch {
     return null
@@ -137,9 +141,11 @@ function BarChart({ block }: { block: DataVizBlock }) {
           const bh = Math.max(2, (v / maxVal) * plotH)
           const x = 30 + i * slot
           const y = plotBottom - bh
-          const label = String(rows[i][0] ?? '').length > 14 ? `${String(rows[i][0] ?? '').slice(0, 13)}…` : String(rows[i][0] ?? '')
+          const full = String(rows[i][0] ?? '')
+          const label = full.length > 14 ? `${full.slice(0, 13)}…` : full
           return (
             <g key={i}>
+              <title>{full}</title>
               <rect x={x} y={y} width={barW} height={bh} rx={3} fill={COLORS[i % COLORS.length]} />
               <text x={x + barW / 2} y={y - 5} textAnchor="middle" className="chat-viz-bar-val">
                 {formatValue(v, format)}
@@ -151,12 +157,60 @@ function BarChart({ block }: { block: DataVizBlock }) {
                 transform={`rotate(${rotate ? -24 : 0} ${x + barW / 2} ${height - 14})`}
                 className="chat-viz-bar-label"
               >
-                <title>{String(rows[i][0] ?? '')}</title>
                 {label}
               </text>
             </g>
           )
         })}
+      </svg>
+    </div>
+  )
+}
+
+function LineChart({ block }: { block: DataVizBlock }) {
+  const { rows, columns, value_column: vc, format } = block
+  const values = rows.map((r) => toNum(r[vc]) ?? 0)
+  const maxVal = Math.max(1, ...values)
+  const n = rows.length
+  const width = Math.max(340, n * 80 + 60)
+  const height = 240
+  const padL = 40
+  const padR = 20
+  const padT = 18
+  const padB = 40
+  const plotW = width - padL - padR
+  const plotH = height - padT - padB
+  const xs = rows.map((_, i) => padL + (i * plotW) / Math.max(1, n - 1))
+  const ys = values.map((v) => padT + plotH - (v / maxVal) * plotH)
+  const pts = rows.map((_, i) => `${xs[i]},${ys[i]}`).join(' ')
+  const step = Math.max(1, Math.ceil(n / 8))
+
+  return (
+    <div className="chat-viz-chart">
+      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={block.title || 'line chart'}>
+        <polyline
+          points={pts}
+          fill="none"
+          stroke={COLORS[0]}
+          strokeWidth={2.5}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+        {values.map((v, i) => (
+          <g key={i}>
+            <circle cx={xs[i]} cy={ys[i]} r={4} fill={COLORS[0]} stroke="#fff" strokeWidth={1.5} />
+            <text x={xs[i]} y={ys[i] - 8} textAnchor="middle" className="chat-viz-bar-val">
+              {formatValue(v, format)}
+            </text>
+          </g>
+        ))}
+        {rows.map((r, i) =>
+          i % step === 0 || i === n - 1 ? (
+            <text key={i} x={xs[i]} y={height - padB + 16} textAnchor="middle" className="chat-viz-bar-label">
+              {String(r[0])}
+            </text>
+          ) : null,
+        )}
       </svg>
     </div>
   )
@@ -224,11 +278,51 @@ function PieChart({ block }: { block: DataVizBlock }) {
   )
 }
 
+function PictogramChart({ block }: { block: DataVizBlock }) {
+  const { rows, columns, value_column: vc, format } = block
+  const values = rows.map((r) => toNum(r[vc]) ?? 0)
+  const maxVal = Math.max(1, ...values)
+  const scale = maxVal > 40 ? Math.ceil(maxVal / 40) : 1
+
+  return (
+    <div className="chat-viz-picto">
+      {rows.map((row, i) => {
+        const v = toNum(row[vc]) ?? 0
+        const icons = Math.round(v / scale)
+        return (
+          <div className="chat-viz-picto-row" key={i}>
+            <span className="chat-viz-picto-label">{String(row[0])}</span>
+            <span className="chat-viz-picto-icons">
+              {Array.from({ length: Math.max(0, icons) }).map((_, j) => (
+                <span key={j} className="chat-viz-picto-icon" style={{ background: COLORS[i % COLORS.length] }} />
+              ))}
+            </span>
+            <span className="chat-viz-picto-val">
+              {formatValue(v, format)}
+              {scale > 1 ? ` (${scale} per icon)` : ''}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function DataViz({ block }: { block: DataVizBlock }) {
-  const [view, setView] = useState<'table' | 'bar' | 'pie'>('table')
+  const [view, setView] = useState<'table' | 'bar' | 'pie' | 'line' | 'picto'>(
+    block.kind ?? 'table',
+  )
   const [raw, setRaw] = useState(false)
   const numbers = useMemo(
-    () => (block.rows.every((r) => toNum(r[block.value_column]) != null) ? true : false),
+    () => block.rows.every((r) => toNum(r[block.value_column]) != null),
+    [block],
+  )
+  const pictoOk = useMemo(
+    () =>
+      block.rows.every((r) => {
+        const v = toNum(r[block.value_column])
+        return v != null && Number.isInteger(v) && v >= 0
+      }),
     [block],
   )
 
@@ -245,9 +339,17 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
               <button type="button" className={view === 'bar' ? 'active' : ''} onClick={() => setView('bar')}>
                 Bar
               </button>
+              <button type="button" className={view === 'line' ? 'active' : ''} onClick={() => setView('line')}>
+                Line
+              </button>
               <button type="button" className={view === 'pie' ? 'active' : ''} onClick={() => setView('pie')}>
                 Pie
               </button>
+              {pictoOk && (
+                <button type="button" className={view === 'picto' ? 'active' : ''} onClick={() => setView('picto')}>
+                  Pictogram
+                </button>
+              )}
             </>
           )}
         </div>
@@ -283,7 +385,9 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
         </div>
       )}
       {view === 'bar' && numbers && <BarChart block={block} />}
+      {view === 'line' && numbers && <LineChart block={block} />}
       {view === 'pie' && numbers && <PieChart block={block} />}
+      {view === 'picto' && pictoOk && <PictogramChart block={block} />}
 
       {raw && <pre className="chat-viz-raw">{JSON.stringify(block, null, 2)}</pre>}
     </div>

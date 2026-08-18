@@ -503,3 +503,71 @@ def test_sanitize_dataviz_keeps_valid_strips_malformed():
 
     plain = "Just prose with a ```dataviz``` mention."
     assert chat_module._sanitize_dataviz(plain) == plain
+
+
+def test_dataviz_intent_regex():
+    assert chat_module._DATAVIZ_INTENT_RE.search("top 5 deals in 2025")
+    assert chat_module._DATAVIZ_INTENT_RE.search("biggest funding rounds")
+    assert chat_module._DATAVIZ_INTENT_RE.search("how many IPOs this year")
+    assert chat_module._DATAVIZ_INTENT_RE.search("yearly breakdown of deals")
+    assert chat_module._DATAVIZ_INTENT_RE.search("market share of fintech")
+    assert not chat_module._DATAVIZ_INTENT_RE.search("2008 crisis")
+    assert not chat_module._DATAVIZ_INTENT_RE.search("who invested in Ola Electric?")
+
+
+def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
+        return chat_module.LLMResult(
+            content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]]}\n```',
+            prompt_tokens=20,
+            completion_tokens=8,
+        )
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
+    assert len(calls) == 2
+    assert chat_module._DATAVIZ_NUDGE in calls[1]
+    assert result.prompt_tokens == 30
+    assert result.completion_tokens == 13
+    assert "dataviz" in result.content
+
+
+def test_answer_with_dataviz_single_call_when_block_present(monkeypatch):
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        return chat_module.LLMResult(
+            content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]]}\n```',
+            prompt_tokens=10,
+            completion_tokens=5,
+        )
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
+    assert len(calls) == 1
+    assert result.prompt_tokens == 10
+
+
+def test_answer_with_dataviz_no_retry_for_non_numeric_question(monkeypatch):
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        return chat_module.LLMResult(content="Plain answer [1].", prompt_tokens=10, completion_tokens=5)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("who invested in Ola Electric?", "PROMPT"))
+    assert len(calls) == 1
+    assert result.content == "Plain answer [1]."
