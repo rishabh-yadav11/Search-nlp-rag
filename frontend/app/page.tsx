@@ -2,6 +2,14 @@
 
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
+import {
+  AuthUser,
+  authHeaders,
+  clearMeCache,
+  getMe,
+  getToken,
+  redirectToLogin,
+} from './lib/auth'
 
 type Result = {
   id: number
@@ -150,6 +158,31 @@ export default function Page() {
     dealtype: [],
   })
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
+  const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
+
+  useEffect(() => {
+    if (!getToken()) {
+      setMe(null)
+      return
+    }
+    let cancelled = false
+    getMe()
+      .then((u) => {
+        if (!cancelled) setMe(u)
+      })
+      .catch(() => {
+        if (!cancelled) setMe(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  function logout() {
+    fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
+    clearMeCache()
+    redirectToLogin()
+  }
 
   useEffect(() => {
     return () => submittedRef.current?.controller.abort()
@@ -255,13 +288,31 @@ export default function Page() {
             <Link href="/chat" className="topbar-nav-link">
               Chat
             </Link>
-            <a href="/analytics/dashboard" className="topbar-nav-link">
-              Analytics
-            </a>
+            {me?.role === 'admin' ? (
+              <a href="/analytics/dashboard" className="topbar-nav-link">
+                Analytics
+              </a>
+            ) : null}
           </nav>
-          <Link href="/chat" className="topbar-cta" aria-label="Open chat assistant">
-            ASK VCCircle
-          </Link>
+          <div className="topbar-right">
+            <Link href="/chat" className="topbar-cta" aria-label="Open chat assistant">
+              ASK VCCircle
+            </Link>
+            {me === undefined ? null : me ? (
+              <span className="topbar-user">
+                <span className="topbar-user-email" title={me.email}>
+                  {me.name || me.email}
+                </span>
+                <button type="button" className="topbar-logout" onClick={logout}>
+                  Log out
+                </button>
+              </span>
+            ) : (
+              <Link href="/login" className="topbar-signin">
+                Sign in
+              </Link>
+            )}
+          </div>
         </div>
       </header>
 

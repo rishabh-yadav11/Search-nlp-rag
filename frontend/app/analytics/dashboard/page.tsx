@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
-import { API_BASE, authHeaders, getToken, redirectToLogin } from '../../lib/auth'
+import { API_BASE, authHeaders, getMe, getToken, redirectToLogin } from '../../lib/auth'
 
 interface Summary {
   searches_total: number
@@ -116,18 +116,28 @@ export default function AnalyticsDashboardPage() {
   const [chat, setChat] = useState<ChatStats | null>(null)
   const [updated, setUpdated] = useState('loading…')
   const [error, setError] = useState('')
+  const [forbidden, setForbidden] = useState(false)
 
   async function load() {
     if (!getToken()) {
-      redirectToLogin()
+      redirectToLogin('/analytics/dashboard')
       return
     }
     try {
+      const me = await getMe()
+      if (!me) {
+        redirectToLogin('/analytics/dashboard')
+        return
+      }
+      if (me.role !== 'admin') {
+        setForbidden(true)
+        return
+      }
       const [sRes, cRes] = await Promise.all([
         fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders() }),
         fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders() }),
       ])
-      if (sRes.status === 401 || cRes.status === 401) redirectToLogin()
+      if (sRes.status === 401 || cRes.status === 401) redirectToLogin('/analytics/dashboard')
       if (!sRes.ok) throw new Error(`summary returned HTTP ${sRes.status}`)
       if (!cRes.ok) throw new Error(`chat returned HTTP ${cRes.status}`)
       setSummary((await sRes.json()) as Summary)
@@ -170,6 +180,12 @@ export default function AnalyticsDashboardPage() {
       </header>
       <div className="dash-main">
         <div className="dash-updated">{updated}</div>
+        {forbidden ? (
+          <div className="dash-error">
+            You don&apos;t have access to analytics.
+            <div className="dash-error-hint">This dashboard is for administrators only.</div>
+          </div>
+        ) : null}
         {error ? (
           <div className="dash-error">
             {error}
