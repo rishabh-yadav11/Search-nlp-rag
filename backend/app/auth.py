@@ -14,11 +14,13 @@ Machine clients (eval scripts) may bypass via the AUTH_SERVICE_TOKEN header,
 which acts as an admin user. All inputs are validated server-side.
 """
 
+import asyncio
 import hashlib
 import logging
 import os
 import re
 import secrets
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -162,6 +164,11 @@ def _now() -> float:
     return time.time()
 
 
+class DuplicateEmailError(Exception):
+    """Raised when an INSERT hits the users.email UNIQUE constraint (e.g. two
+    gunicorn workers bootstrapping the same admin concurrently)."""
+
+
 class AuthStore:
     """SQLite-backed user + token store (WAL mode, same concurrency discipline
     as the chat store). Token values are never stored plaintext."""
@@ -240,12 +247,23 @@ class AuthStore:
             is_active=True,
             created_at=_now(),
         )
-        await self._db.execute(
-            "INSERT INTO users (id, email, password_hash, name, role, is_active, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user.id, user.email, user.password_hash, user.name, user.role, 1, user.created_at),
-        )
-        await self._db.commit()
+        try:
+            await self._db.execute(
+                "INSERT INTO users (id, email, password_hash, name, role, is_active, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user.id, user.email, user.password_hash, user.name, user.role, 1, user.created_at),
+            )
+            await self._db.commit()
+        except sqlite3.IntegrityError:
+            # Duplicate email under concurrency (e.g. concurrent worker
+            # bootstrap). Roll back so the failed statement never leaves this
+            # connection holding an open write transaction (which would poison
+            # the whole DB with "database is locked").
+            await self._db.rollback()
+            raise DuplicateEmailError(email) from None
+        except Exception:
+            await self._db.rollback()
+            raise
         return user
 
     async def get_user_by_email(self, email: str) -> StoredUser | None:
@@ -294,11 +312,15 @@ class AuthStore:
         raw = secrets.token_urlsafe(32)
         created = _now()
         expires = created + ttl_days * 86400
-        await self._db.execute(
-            "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (hash_token(raw), user_id, created, expires),
-        )
-        await self._db.commit()
+        try:
+            await self._db.execute(
+                "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (hash_token(raw), user_id, created, expires),
+            )
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
         return raw
 
     async def user_for_token(self, raw_token: str) -> StoredUser | None:
@@ -443,7 +465,11 @@ async def signup(body: SignupIn, request: Request):
     s = _require_auth_store()
     if await s.get_user_by_email(email) is not None:
         raise HTTPException(status_code=409, detail="an account with this email already exists")
-    user = await s.create_user(email, password, name, role=config.AUTH_DEFAULT_ROLE)
+    try:
+        user = await s.create_user(email, password, name, role=config.AUTH_DEFAULT_ROLE)
+    except DuplicateEmailError:
+        # lost the concurrent-creation race; report it as a plain duplicate
+        raise HTTPException(status_code=409, detail="an account with this email already exists") from None
     token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
     return AuthOut(token=token, user=UserOut.from_user(user))
 
@@ -573,13 +599,26 @@ async def revoke_user_tokens(
 
 async def bootstrap_admin() -> None:
     """Seed the bootstrap admin from config (once, at startup). Never overwrites
-    an existing account's password."""
+    an existing account's password. Safe under concurrent worker startups: the
+    duplicate / write-lock races are handled instead of failing startup (which
+    would restart-loop the worker)."""
     email = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
     password = config.AUTH_ADMIN_PASSWORD or ""
     if not email or not password:
         return
     s = _require_auth_store()
-    if await s.get_user_by_email(email) is not None:
-        return
-    await s.create_user(email, password, "Administrator", role="admin")
-    logger.info("bootstrapped admin account %s", email)
+    for attempt in range(5):
+        if await s.get_user_by_email(email) is not None:
+            return
+        try:
+            await s.create_user(email, password, "Administrator", role="admin")
+            logger.info("bootstrapped admin account %s", email)
+            return
+        except DuplicateEmailError:
+            logger.info("bootstrap admin %s already exists (concurrent worker)", email)
+            return
+        except sqlite3.OperationalError:
+            if attempt == 4:
+                logger.error("bootstrap admin %s could not be created (write lock)", email)
+                return
+            await asyncio.sleep(1)

@@ -1,12 +1,13 @@
 import asyncio
 import re
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from app import auth
-from app.auth import AuthStore, bootstrap_admin
+from app.auth import AuthStore, DuplicateEmailError, StoredUser, bootstrap_admin
 
 
 def _headers(*pairs) -> dict:
@@ -386,6 +387,89 @@ def test_change_password_invalidates_other_tokens(tmp_path):
     finally:
         auth.store = None
         asyncio.run(s.close())
+
+
+def test_concurrent_create_duplicate_race_no_poison(tmp_path):
+    """The loser of a create_user race must roll back so its connection is not
+    left holding an open write transaction (which would lock the whole DB)."""
+    async def main():
+        store = AuthStore(str(tmp_path / "auth.db"))
+        await store.connect()
+        auth.store = store
+        try:
+            results = await asyncio.gather(
+                store.create_user("race@x.co", "secret12", "A", "user"),
+                store.create_user("race@x.co", "secret12", "B", "user"),
+                return_exceptions=True,
+            )
+            ok = [r for r in results if isinstance(r, StoredUser)]
+            dup = [r for r in results if isinstance(r, DuplicateEmailError)]
+            assert len(ok) == 1 and len(dup) == 1
+            # the failed insert must not have poisoned the connection
+            u = await store.create_user("after@x.co", "secret12", "C", "user")
+            token = await store.issue_token(u.id, 7)
+            assert (await store.user_for_token(token)).id == u.id
+        finally:
+            await store.close()
+            auth.store = None
+
+    asyncio.run(main())
+
+
+def test_signup_duplicate_race_returns_409(tmp_path):
+    import threading
+
+    client, s = _auth_app(tmp_path)
+    try:
+        barrier = threading.Barrier(2)
+        statuses = []
+
+        def do_signup():
+            barrier.wait()
+            statuses.append(client.post("/api/auth/signup", json={"email": "same@x.co", "password": "secret12"}).status_code)
+
+        t1 = threading.Thread(target=do_signup)
+        t2 = threading.Thread(target=do_signup)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert sorted(statuses) == [200, 409]
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_bootstrap_admin_survives_duplicate_and_lock_races(tmp_path, monkeypatch):
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "adminpass1")
+
+    async def main():
+        store = AuthStore(str(tmp_path / "auth.db"))
+        await store.connect()
+        auth.store = store
+        try:
+            # another worker already created it -> DuplicateEmailError path is safe
+            original = store.create_user
+
+            async def racy_create(email, password, name, role):
+                await original(email, password, name, role)
+                raise DuplicateEmailError(email)
+
+            monkeypatch.setattr(store, "create_user", racy_create)
+            await auth.bootstrap_admin()  # must not raise
+
+            # lock contention -> retries then gives up gracefully instead of failing
+            async def locked_create(email, password, name, role):
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(store, "create_user", locked_create)
+            await auth.bootstrap_admin()  # must not raise
+        finally:
+            await store.close()
+            auth.store = None
+
+    asyncio.run(main())
 
 
 def test_admin_user_management_rbac(tmp_path):
