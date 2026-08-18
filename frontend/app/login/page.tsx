@@ -1,20 +1,22 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { API_BASE, getToken, setToken } from '../lib/auth'
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter()
+  const params = useSearchParams()
+  const next = params.get('next') || '/chat'
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    if (getToken()) router.replace('/chat')
-  }, [router])
+    if (getToken()) router.replace(next)
+  }, [router, next])
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -38,7 +40,7 @@ export default function LoginPage() {
       }
       const data = (await res.json()) as { token: string }
       setToken(data.token)
-      router.replace('/chat')
+      router.replace(next)
     } catch {
       setError('Could not reach the server. Please try again.')
     } finally {
@@ -85,5 +87,13 @@ export default function LoginPage() {
         </p>
       </form>
     </div>
+  )
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
   )
 }

@@ -1,12 +1,14 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { API_BASE, getToken, setToken } from '../lib/auth'
 
-export default function SignupPage() {
+function SignupForm() {
   const router = useRouter()
+  const params = useSearchParams()
+  const next = params.get('next') || '/chat'
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -14,8 +16,8 @@ export default function SignupPage() {
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    if (getToken()) router.replace('/chat')
-  }, [router])
+    if (getToken()) router.replace(next)
+  }, [router, next])
 
   function validate(): string {
     if (!email.trim() || !password) return 'Email and password are required.'
@@ -48,7 +50,7 @@ export default function SignupPage() {
       }
       const data = (await res.json()) as { token: string }
       setToken(data.token)
-      router.replace('/chat')
+      router.replace(next)
     } catch {
       setError('Could not reach the server. Please try again.')
     } finally {
@@ -93,5 +95,13 @@ export default function SignupPage() {
         </p>
       </form>
     </div>
+  )
+}
+
+export default function SignupPage() {
+  return (
+    <Suspense fallback={null}>
+      <SignupForm />
+    </Suspense>
   )
 }

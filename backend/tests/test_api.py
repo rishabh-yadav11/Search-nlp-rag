@@ -277,14 +277,13 @@ def test_source_context_includes_whole_body():
     assert "x" * 3000 in out
 
 
-def test_analytics_dashboard_route_registered():
-    from app.dashboard import DASHBOARD_HTML
-
+def test_analytics_dashboard_is_frontend_owned():
+    """The dashboard UI is a Next.js page now (frontend/app/analytics/dashboard);
+    the backend only serves the JSON data endpoints, both admin-gated."""
     paths = {r.path for r in main.app.routes}
-    assert "/analytics/dashboard" in paths
+    assert "/analytics/dashboard" not in paths
     assert "/analytics/summary" in paths
-    assert "Top queries" in DASHBOARD_HTML
-    assert "Zero-result rate" in DASHBOARD_HTML
+    assert "/analytics/chat" in paths
 
 
 def test_best_body_window_finds_query_token_dense_region():

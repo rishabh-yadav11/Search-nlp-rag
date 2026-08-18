@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from fastembed import SparseTextEmbedding
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -24,6 +23,8 @@ from qdrant_client.models import (
     SparseVector,
 )
 
+# Import config FIRST so the OMP/MKL thread caps in app.config are set before
+# any inference library (torch/onnxruntime) is imported below.
 from app import auth as auth_module
 from app import chat as chat_module
 from app.analytics import close as close_analytics
@@ -31,12 +32,8 @@ from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
 from app.auth import require_auth, require_permission
-
-# Import config FIRST so the OMP/MKL thread caps in app.config are set before
-# any inference library (torch/onnxruntime) is imported below.
 from app.config import config
 from app.cost_budget import close as close_cost_budget
-from app.dashboard import dashboard_html
 from app.encoders import DenseEncoder
 from app.health import router as health_router
 from app.query_expand import expand_query
@@ -639,13 +636,3 @@ async def get_analytics_chat(
 ):
     """Cross-user chat usage (sessions, messages, tokens, cost). Admin-only."""
     return await chat_module._require_store().global_stats()
-
-
-@app.get("/analytics/dashboard")
-async def get_analytics_dashboard(
-    _auth: None = Depends(require_auth),
-    _perm: None = Depends(require_permission("analytics:read")),
-):
-    """Human-readable analytics dashboard (self-contained HTML, no external
-    assets). Admin-only; fetches summary on load."""
-    return HTMLResponse(dashboard_html())

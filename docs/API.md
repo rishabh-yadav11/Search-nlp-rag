@@ -271,8 +271,8 @@ affects search.
 ## `GET /analytics/summary`
 
 Aggregated search-quality and click metrics, stored in Redis DB 1
-(`ANALYTICS_REDIS_DB`). Protected by `ANALYTICS_VIEW_TOKEN` when set (send it
-as `Authorization: Bearer <token>` or `?token=<token>`); otherwise open.
+(`ANALYTICS_REDIS_DB`). Admin-only: requires a bearer token for an account with
+the `analytics:read` permission (`Authorization: Bearer <token>`).
 
 ### Response
 
@@ -298,8 +298,8 @@ Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`)
 
 ## `GET /analytics/chat`
 
-Cross-user chat usage, read from the SQLite chat store. Same token gate as
-`/analytics/summary`.
+Cross-user chat usage, read from the SQLite chat store. Admin-only
+(`analytics:read`), same gate as `/analytics/summary`.
 
 ### Response
 
@@ -323,13 +323,13 @@ aggregates (privacy-safe).
 
 ---
 
-## `GET /analytics/dashboard`
+## `GET /analytics/dashboard` (frontend page)
 
-Self-contained HTML analytics dashboard (no external assets): KPI cards for
-search quality + chat usage, top-query tables, clicks-by-position and
-conversations-by-cost/tokens tables. It fetches `/analytics/summary` and
-`/analytics/chat` on load and refreshes every 30s. Same token gate as
-`/analytics/summary`.
+The dashboard UI is a Next.js page at `/analytics/dashboard` (proxied by nginx
+to the frontend; not part of this API). It renders KPI cards for search quality
++ chat usage, top-query tables, clicks-by-position and
+conversations-by-cost/tokens tables by calling the two admin-gated JSON
+endpoints below with the bearer token, and refreshes every 30s.
 
 ---
 

@@ -38,8 +38,12 @@ export function authHeaders(init?: RequestInit): Headers {
   return headers
 }
 
-/** Redirect to the login page (used when the backend rejects an expired token). */
-export function redirectToLogin(): void {
+/** Redirect to the login page (used when the backend rejects an expired token).
+ *  `next` (a path) is preserved so the user is sent back after signing in. */
+export function redirectToLogin(next?: string): void {
   clearToken()
-  if (typeof window !== 'undefined') window.location.replace('/login')
+  if (typeof window !== 'undefined') {
+    const target = next && next.startsWith('/') ? `/login?next=${encodeURIComponent(next)}` : '/login'
+    window.location.replace(target)
+  }
 }
