@@ -394,6 +394,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `CHAT_DB_PATH` / `CHAT_RETENTION_DAYS` / `CHAT_MAX_HISTORY_TURNS` | `data/chat.db` / `180` / `10` | SQLite chat store; idle-purge window; context turns kept per conversation |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
+| `ENABLE_BODY_RESCUE` / `BODY_RESCUE_THRESHOLD` | `true` / `0.3` | Chat-only rescue: when the top reranked score is weak, re-score candidates against the body region with the most lexical query-token overlap and keep `max(baseline, body)` so deep-body matches (e.g. retrospectives) can pass `ASK_MIN_SCORE`; one extra cross-encoder pass per candidate, only on weak results |
 | `ANALYTICS_REDIS_DB` / `ANALYTICS_VIEW_TOKEN` | `1` / `` | Analytics aggregates live in Redis DB N (cache is DB 0); when set, `/analytics/*` require this bearer token |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated allowed origins for CORS (production is same-origin through nginx) |
 

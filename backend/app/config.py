@@ -113,6 +113,17 @@ class Config:
     ENABLE_ENTITY_BOOST = os.getenv("ENABLE_ENTITY_BOOST", "true").lower() in ("1", "true", "yes")
     ENABLE_WEAK_FALLBACK = os.getenv("ENABLE_WEAK_FALLBACK", "true").lower() in ("1", "true", "yes")
 
+    # Chat-only "body rescue": when the top reranked score is below
+    # BODY_RESCUE_THRESHOLD, re-score the candidates against the body region
+    # with the most lexical query-token overlap and keep max(baseline, body).
+    # Lets deep-body matches (e.g. historical retrospectives whose relevant
+    # facts live mid-article) pass the chat relevance gate; costs one extra
+    # cross-encoder pass per candidate and only runs on weak-top results.
+    ENABLE_BODY_RESCUE = os.getenv("ENABLE_BODY_RESCUE", "true").lower() in ("1", "true", "yes")
+    BODY_RESCUE_THRESHOLD = float(os.getenv("BODY_RESCUE_THRESHOLD", "0.3"))
+    BODY_RESCUE_WINDOW = int(os.getenv("BODY_RESCUE_WINDOW", "1500"))
+    BODY_RESCUE_STEP = int(os.getenv("BODY_RESCUE_STEP", "500"))
+
     # Chat history (SQLite on the host; survives restarts, unlike Redis without AOF)
     # Relative CHAT_DB_PATH resolves against the backend working dir (where
     # gunicorn runs). Retention purges conversations idle for CHAT_RETENTION_DAYS.

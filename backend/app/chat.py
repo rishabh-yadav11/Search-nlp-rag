@@ -465,10 +465,12 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         return PreparedTurn(answer=smalltalk, sources=[], note=None)
 
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
-    from app.main import _effective_intent, retrieve_and_rerank, source_context, to_summary
+    from app.main import _effective_intent, body_rescue, retrieve_and_rerank, source_context, to_summary
 
     retrieval_q, eff_from, eff_to = _effective_intent(question, None, None)
     reranked = await retrieve_and_rerank(retrieval_q, config.TOP_K, None, need_body=True)
+    if config.ENABLE_BODY_RESCUE:
+        reranked = await body_rescue(retrieval_q, reranked)
     sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][: config.TOP_K]
 
     note = (

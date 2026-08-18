@@ -285,3 +285,49 @@ def test_analytics_dashboard_route_registered():
     assert "/analytics/summary" in paths
     assert "Top queries" in DASHBOARD_HTML
     assert "Zero-result rate" in DASHBOARD_HTML
+
+
+def test_best_body_window_finds_query_token_dense_region():
+    from app.main import _best_body_window, _query_content_tokens
+
+    body = ("intro filler " * 200) + ("2008 crisis central banks lessons Subbarao " * 30) + ("tail filler " * 100)
+    tokens = _query_content_tokens("lessons RBI governor Subbarao central banks learned 2008 crisis")
+    assert "2008" in tokens and "crisis" in tokens and "subbarao" in tokens
+    win = _best_body_window(body, tokens, 1500, 500)
+    low = win.lower()
+    assert "2008" in low and "subbarao" in low
+    assert low.find("2008") < 1500  # picked the dense region, not the filler intro
+
+
+def test_body_rescue_lifts_deep_body_match_and_reorders(monkeypatch):
+    """A weak title+summary score is rescued when the body region matches the
+    query; the score becomes max(baseline, body-window score)."""
+    from app.main import body_rescue
+
+    def make(id_: int, body: str) -> SourceArticle:
+        a = SourceArticle(id=id_, title="t", url=f"https://example.com/{id_}",
+                          summary="s", body=body, score=0.1)
+        return a
+
+    matching = make(1, "filler words here " * 100 + "2008 crisis central banks lessons learned " * 40)
+    unrelated = make(2, "completely unrelated filler content about weather and markets " * 200)
+    fake = _FakeReranker([5.0, -2.0])
+    monkeypatch.setitem(main.state, "reranker", fake)
+
+    out = asyncio.run(body_rescue("lessons RBI governor Subbarao central banks learned 2008 crisis", [matching, unrelated]))
+    assert fake.calls == 1
+    assert [a.id for a in out] == [1, 2]
+    assert abs(out[0].score - 1.0 / (1.0 + math.exp(-5.0))) < 1e-9
+    assert abs(out[1].score - max(0.1, 1.0 / (1.0 + math.exp(2.0)))) < 1e-9
+
+
+def test_body_rescue_skips_when_top_score_strong(monkeypatch):
+    from app.main import body_rescue
+
+    a = _article(1, 0.8)
+    a.body = "has body"
+    fake = _FakeReranker([9.0])
+    monkeypatch.setitem(main.state, "reranker", fake)
+    out = asyncio.run(body_rescue("some query", [a]))
+    assert fake.calls == 0
+    assert out[0].id == 1

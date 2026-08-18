@@ -417,5 +417,5 @@ def test_chat_imports_shared_retrieval_helpers():
     endpoint removals (regression: /ask removal dropped source_context)."""
     from app import main
 
-    for name in ("_effective_intent", "retrieve_and_rerank", "source_context", "to_summary"):
+    for name in ("_effective_intent", "retrieve_and_rerank", "body_rescue", "source_context", "to_summary"):
         assert hasattr(main, name), f"app.main.{name} missing (needed by chat._prepare_turn)"

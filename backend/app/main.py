@@ -1,6 +1,7 @@
 import asyncio
 import json
 import math
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -340,6 +341,79 @@ async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle
         a.score = float(1 / (1 + math.exp(-s)))
     results.sort(key=lambda a: a.score, reverse=True)
     return results
+
+
+_STOPWORDS = frozenset(
+    (
+        "a", "an", "and", "are", "as", "at", "be", "been", "being", "but",
+        "by", "can", "could", "did", "do", "does", "for", "from", "had",
+        "has", "have", "how", "in", "into", "is", "it", "its", "may",
+        "might", "must", "no", "not", "of", "on", "or", "over", "said",
+        "say", "says", "should", "so", "than", "that", "the", "their",
+        "them", "then", "there", "these", "they", "this", "those", "to",
+        "under", "was", "we", "were", "what", "when", "where", "which",
+        "who", "whose", "why", "will", "with", "would", "you", "your",
+    )
+)
+
+
+def _query_content_tokens(query: str) -> set[str]:
+    """Lowercased alphanumeric query tokens minus stopwords/single chars,
+    used for cheap lexical localization of the best-matching body region."""
+    return {w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOPWORDS and len(w) > 1}
+
+
+def _best_body_window(body: str, tokens: set[str], win: int, step: int) -> str:
+    """The body region with the most distinct query tokens, cheaply located by
+    sliding a window over the lowercased body. Returns the window with the
+    original casing (falls back to the tail region on ties)."""
+    if not tokens or len(body) <= win:
+        return body
+    low = body.lower()
+    best_score, best_start = -1, 0
+    for start in range(0, len(body) - win + 1, step):
+        score = sum(1 for t in tokens if t in low[start:start + win])
+        if score > best_score:
+            best_score, best_start = score, start
+    tail = low[-win:]
+    if sum(1 for t in tokens if t in tail) > best_score:
+        return body[-win:]
+    return body[best_start:best_start + win]
+
+
+async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceArticle]:
+    """Chat-only rerank rescue for deep-body matches, in place.
+
+    When the top reranked score is weak (below BODY_RESCUE_THRESHOLD) the
+    title+summary cross-encoder scores are unreliable: relevant content may
+    live mid-article (e.g. historical retrospectives). Re-score each candidate
+    against the body region with the most lexical query overlap and keep
+    max(baseline, body), so such matches can pass the chat relevance gate.
+    Costs one extra cross-encoder pass per candidate and only runs on weak
+    results, so normal queries are unaffected."""
+    if not articles:
+        return articles
+    if max((a.score for a in articles), default=0.0) >= config.BODY_RESCUE_THRESHOLD:
+        return articles
+    tokens = _query_content_tokens(query)
+    if not tokens:
+        return articles
+    pairs: list[tuple[str, str]] = []
+    indices: list[int] = []
+    for i, a in enumerate(articles):
+        if not a.body:
+            continue
+        win = _best_body_window(a.body, tokens, config.BODY_RESCUE_WINDOW, config.BODY_RESCUE_STEP)
+        pairs.append((query, f"{a.title}. {a.summary or ''}. {win}".strip()))
+        indices.append(i)
+    if not pairs:
+        return articles
+    async with inference_lock:
+        logits = await asyncio.to_thread(state["reranker"].predict, pairs)
+    for i, logit in zip(indices, logits):
+        articles[i].score = max(articles[i].score, float(1 / (1 + math.exp(-logit))))
+    articles.sort(key=lambda a: a.score, reverse=True)
+    return articles
 
 
 def _recency_multiplier(published_date: str | None) -> float:
