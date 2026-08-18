@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, SparseVector
+from qdrant_client.models import PointVectors, SparseVector
 from update_index import fetch_records
 
 from app.config import config
@@ -91,7 +91,7 @@ def main():
             sparse_texts = [compose_sparse_text(records[i]) for i in batch]
             svecs = list(sparse_model.embed(sparse_texts))
             vector_points = [
-                PointStruct(
+                PointVectors(
                     id=i,
                     vector={
                         "sparse": SparseVector(
