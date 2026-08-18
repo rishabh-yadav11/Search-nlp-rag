@@ -138,6 +138,31 @@ class Config:
     ANALYTICS_REDIS_DB = int(os.getenv("ANALYTICS_REDIS_DB", "1"))
     ANALYTICS_VIEW_TOKEN = os.getenv("ANALYTICS_VIEW_TOKEN", "")
 
+    # Auth (token + RBAC). Users sign up openly; a role-based access-control
+    # layer maps roles to permissions (see app/auth.py). Tokens are opaque,
+    # hashed (SHA-256) in storage, expire after AUTH_TOKEN_TTL_DAYS, and can be
+    # revoked individually.
+    AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
+    AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "7"))
+    # Default role granted to new accounts (public signups land in 'user').
+    AUTH_DEFAULT_ROLE = os.getenv("AUTH_DEFAULT_ROLE", "user")
+    # Optional machine-to-machine bypass: any request carrying this exact value
+    # in X-Service-Token acts as an admin user. Leave empty to disable. Used by
+    # the internal eval scripts; never expose it to browsers.
+    AUTH_SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
+    # Bootstrap admin: created once at startup (role=admin) if no account with
+    # this email exists. An existing account is never overwritten.
+    AUTH_ADMIN_EMAIL = os.getenv("AUTH_ADMIN_EMAIL", "")
+    AUTH_ADMIN_PASSWORD = os.getenv("AUTH_ADMIN_PASSWORD", "")
+    # Input-validation limits for the auth endpoints.
+    AUTH_PASSWORD_MIN_LEN = int(os.getenv("AUTH_PASSWORD_MIN_LEN", "8"))
+    AUTH_MAX_EMAIL_LEN = int(os.getenv("AUTH_MAX_EMAIL_LEN", "254"))
+    AUTH_MAX_NAME_LEN = int(os.getenv("AUTH_MAX_NAME_LEN", "60"))
+    # Redis-backed per-IP rate limits on the public auth endpoints (0 disables).
+    AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
+    AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
+    AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+
     # CORS: comma-separated allowed origins. Production serves the API and the
     # frontend same-origin through nginx, so this only matters for cross-origin
     # dev clients (e.g. the Next.js dev server on :3000 hitting :8000).

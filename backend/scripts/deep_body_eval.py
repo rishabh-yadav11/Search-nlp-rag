@@ -42,6 +42,9 @@ from app.index_text import clean
 
 DEEP_CUTOFF = 6000
 SEED = 42
+# Machine-to-machine bypass for the internal eval scripts; must match the
+# backend's AUTH_SERVICE_TOKEN in backend/.env.
+SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
 DEEP_FACTS = ("makemytrip", "flight", "bizgain", "webmobi")
 
 
@@ -172,7 +175,9 @@ def main() -> None:
         in_deep = fact in b11283[DEEP_CUTOFF:].lower()
         print(f"  fact {fact!r}: head/summary={in_head} deep-only={in_deep and not in_head}")
 
-    headers = {"Content-Type": "application/json", "X-User-Id": "deepeval-run1"}
+    headers = {"Content-Type": "application/json"}
+    if SERVICE_TOKEN:
+        headers["X-Service-Token"] = SERVICE_TOKEN
     base = "http://localhost:8001/api/chat"
     sid = _http_json(base + "/sessions", {"title": "deepeval"}, headers=headers)["id"]
     try:

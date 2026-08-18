@@ -16,11 +16,14 @@ Prints a compact result table and flags queries with issues. Extend QUERIES as
 new failure modes are found.
 """
 import json
+import os
 import re
 import urllib.request
 
 BASE = "http://localhost:8001/api/chat"
-UID = "qualityeval-7"
+# Machine-to-machine bypass for the internal eval scripts; must match the
+# backend's AUTH_SERVICE_TOKEN in backend/.env.
+SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
 
 _DATAVIZ_RE = re.compile(r"```dataviz\s*\n(.*?)\n```", re.DOTALL)
 
@@ -169,9 +172,12 @@ def _parse_dataviz(text: str) -> dict | None:
 def _req(url: str, payload: dict | None = None, method: str | None = None,
          timeout: int = 180) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if SERVICE_TOKEN:
+        headers["X-Service-Token"] = SERVICE_TOKEN
     req = urllib.request.Request(
         url, data=data, method=method or ("POST" if payload is not None else "GET"),
-        headers={"Content-Type": "application/json", "X-User-Id": UID})
+        headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 

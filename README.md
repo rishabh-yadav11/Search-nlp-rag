@@ -85,9 +85,11 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
 - **Result ordering** — recency-tempered relevance first: blended score desc
   (`score * (1 - RECENCY_STRENGTH * (1 - exp(-age_days / RECENCY_DECAY_DAYS)))`),
   then `published_date` desc as tie-break (missing dates last).
-- **Chat (conversations)** — a ChatGPT-style UI at `/chat`. Each device gets an
-  anonymous `X-User-Id` (a localStorage UUID) and conversations are stored per
-  user in SQLite (`backend/data/chat.db`, WAL mode) so they survive restarts,
+- **Chat (conversations)** — a ChatGPT-style UI at `/chat`. Users sign up/log in
+  (token + RBAC: public signup grants `user` = chat; the `admin` role adds
+  analytics + user management; the bootstrap admin comes from
+  `AUTH_ADMIN_EMAIL`/`AUTH_ADMIN_PASSWORD`). Conversations are stored per
+  account in SQLite (`backend/data/chat.db`, WAL mode) so they survive restarts,
   shared across gunicorn workers. Turns reuse the same retrieval/rerank/fallback
   pipeline as search but build a conversation-aware prompt; the answer is
   streamed token-by-token over SSE (`POST .../messages/stream`) and the assistant
@@ -282,8 +284,8 @@ text is used only internally for the LLM context and is never sent to clients.
 LLM calls are bounded: `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES` and
 `LLM_RETRY_BACKOFF` control the timeout and exponential backoff; when the model
 is unreachable, chat turns return a clean `503` instead of a raw
-`500`. Chat conversations require the `X-User-Id` header (min 8 chars); see
-`docs/API.md` for the full chat API.
+`500`. Chat requires a valid bearer token (`Authorization: Bearer <token>` from
+`/api/auth/login` or `/api/auth/signup`); see `docs/API.md` for the full chat API.
 
 Spend is capped per day via `LLM_DAILY_BUDGET_USD` (0 = disabled): once today's
 cumulative LLM cost reaches the cap, chat fails closed (refuses further LLM

@@ -1,8 +1,9 @@
 """Per-user chat conversations stored in SQLite.
 
 Conversations survive restarts and are purged after CHAT_RETENTION_DAYS of
-inactivity. Users are identified by an anonymous X-User-Id header (device UUID);
-this is not authentication.
+inactivity. The caller must be authenticated (Bearer token, validated by the
+auth dependency at the router level); conversations are scoped to the
+authenticated account's user id.
 
 The turn pipeline reuses the shared retrieval/rerank/fallback pipeline and
 builds a conversation-aware prompt so the model can follow up on prior turns.
@@ -19,20 +20,23 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import aiosqlite
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from app.auth import require_auth, require_permission
 from app.config import config
 from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
 
 logger = logging.getLogger("chat")
 
-router = APIRouter(prefix="/api/chat", tags=["chat"])
+router = APIRouter(
+    prefix="/api/chat",
+    tags=["chat"],
+    dependencies=[Depends(require_auth), Depends(require_permission("chat:use"))],
+)
 
-MIN_USER_ID_LEN = 8
-MAX_USER_ID_LEN = 128
 MAX_CONTENT_LEN = 8000
 PREVIEW_LEN = 140
 
@@ -85,12 +89,6 @@ class TurnOut(BaseModel):
 
 def _now() -> float:
     return time.time()
-
-
-def _user_id(x_user_id: str | None) -> str:
-    if not x_user_id or len(x_user_id) < MIN_USER_ID_LEN:
-        raise HTTPException(status_code=400, detail="X-User-Id header required (min 8 chars)")
-    return x_user_id[:MAX_USER_ID_LEN]
 
 
 class ChatStore:
@@ -708,20 +706,20 @@ async def _auto_title(s: ChatStore, session_id: str, user_id: str, question: str
 
 
 @router.post("/sessions", response_model=SessionOut)
-async def create_session(x_user_id: str | None = Header(default=None, alias="X-User-Id")):
-    user_id = _user_id(x_user_id)
+async def create_session(request: Request):
+    user_id = request.state.user_id
     return await _require_store().create_session(user_id)
 
 
 @router.get("/sessions", response_model=list[SessionOut])
-async def list_sessions(x_user_id: str | None = Header(default=None, alias="X-User-Id")):
-    user_id = _user_id(x_user_id)
+async def list_sessions(request: Request):
+    user_id = request.state.user_id
     return await _require_store().list_sessions(user_id)
 
 
 @router.get("/sessions/{session_id}", response_model=SessionDetailOut)
-async def get_session(session_id: str, x_user_id: str | None = Header(default=None, alias="X-User-Id")):
-    user_id = _user_id(x_user_id)
+async def get_session(session_id: str, request: Request):
+    user_id = request.state.user_id
     s = _require_store()
     session = await s.get_session(session_id, user_id)
     if session is None:
@@ -731,32 +729,28 @@ async def get_session(session_id: str, x_user_id: str | None = Header(default=No
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionOut)
-async def rename_session(session_id: str, body: MessageIn, x_user_id: str | None = Header(default=None, alias="X-User-Id")):
-    user_id = _user_id(x_user_id)
+async def rename_session(session_id: str, body: MessageIn, request: Request):
+    user_id = request.state.user_id
     return await _require_store().rename_session(session_id, user_id, body.content)
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_session(session_id: str, x_user_id: str | None = Header(default=None, alias="X-User-Id")):
-    user_id = _user_id(x_user_id)
+async def delete_session(session_id: str, request: Request):
+    user_id = request.state.user_id
     await _require_store().delete_session(session_id, user_id)
     return {"ok": True}
 
 
 @router.get("/usage", response_model=SessionStatsOut)
-async def get_usage(x_user_id: str | None = Header(default=None, alias="X-User-Id")):
+async def get_usage(request: Request):
     """Aggregate token usage and cost across the user's conversations."""
-    user_id = _user_id(x_user_id)
+    user_id = request.state.user_id
     return await _require_store().stats(user_id)
 
 
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
-async def send_message(
-    session_id: str,
-    body: MessageIn,
-    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
-):
-    user_id = _user_id(x_user_id)
+async def send_message(session_id: str, body: MessageIn, request: Request):
+    user_id = request.state.user_id
     s = _require_store()
     question = _validate_question(body)
 
@@ -798,16 +792,12 @@ def _sse(event: str, data: dict) -> str:
 
 
 @router.post("/sessions/{session_id}/messages/stream")
-async def send_message_stream(
-    session_id: str,
-    body: MessageIn,
-    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
-):
+async def send_message_stream(session_id: str, body: MessageIn, request: Request):
     """SSE-streamed chat turn: retrieves, then streams the LLM answer token by
     token. Events: 'start', 'delta' (content chunk), 'done' (with full message,
     sources, usage, cost, latency), or 'error'. The assistant message is saved
     once streaming completes."""
-    user_id = _user_id(x_user_id)
+    user_id = request.state.user_id
     s = _require_store()
     question = _validate_question(body)
 

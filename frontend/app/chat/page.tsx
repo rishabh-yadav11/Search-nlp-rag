@@ -6,6 +6,7 @@ import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
 import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
+import { API_BASE, authHeaders, getToken, redirectToLogin } from '../lib/auth'
 
 type Source = {
   id: number
@@ -37,13 +38,6 @@ type Session = {
   last_preview?: string
   total_cost?: number
 }
-
-const API_BASE =
-  (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
-  process.env.NEXT_PUBLIC_API_BASE ||
-  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
-
-const USER_KEY = 'vccircle_chat_user_id'
 
 const CITATION_RE = /\[\d+\]/
 
@@ -77,41 +71,10 @@ function walk(node: any, fn: (node: any, parent: any, index: number) => void) {
   }
 }
 
-function makeUuid(): string {
-  // crypto.randomUUID requires a secure context (HTTPS). The site is served
-  // over plain HTTP, so fall back to a Math.random-based UUID v4.
-  try {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      return crypto.randomUUID()
-    }
-  } catch {
-    /* fall through to manual generation */
-  }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = Math.floor(Math.random() * 16)
-    const v = c === 'x' ? r : (r & 0x3) | 0x8
-    return v.toString(16)
-  })
-}
-
-function getUserId(): string {
-  try {
-    const existing = window.localStorage.getItem(USER_KEY)
-    if (existing) return existing
-    const id = makeUuid()
-    window.localStorage.setItem(USER_KEY, id)
-    return id
-  } catch {
-    return `anon-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-  }
-}
-
 async function api(path: string, init?: RequestInit) {
-  const headers = new Headers(init?.headers)
-  headers.set('X-User-Id', getUserId())
-  if (init?.body) headers.set('Content-Type', 'application/json')
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers })
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers: authHeaders(init) })
   if (!res.ok) {
+    if (res.status === 401) redirectToLogin()
     const detail = await res.text()
     throw new Error(detail || `Request failed (${res.status})`)
   }
@@ -227,6 +190,10 @@ export default function ChatPage() {
   }, [])
 
   useEffect(() => {
+    if (!getToken()) redirectToLogin()
+  }, [])
+
+  useEffect(() => {
     loadSessions()
   }, [loadSessions])
 
@@ -282,12 +249,12 @@ export default function ChatPage() {
     setSending(true)
 
     try {
-      const userId = getUserId()
-      const res = await fetch(`/api/chat/sessions/${sessionId}/messages/stream`, {
+      const res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(userId ? { 'X-User-Id': userId } : {}) },
+        headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
         body: JSON.stringify({ content: question }),
       })
+      if (res.status === 401) redirectToLogin()
       if (!res.ok) throw new Error(`Request failed (${res.status})`)
       if (!res.body) throw new Error('Streaming not supported')
 
@@ -420,6 +387,16 @@ export default function ChatPage() {
           <Link href="/" className="chat-back-link">
             ← Back to search
           </Link>
+          <button
+            type="button"
+            className="chat-logout"
+            onClick={() => {
+              fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
+              redirectToLogin()
+            }}
+          >
+            Log out
+          </button>
         </div>
       </aside>
 

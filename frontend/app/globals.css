@@ -883,6 +883,113 @@ input[type='text']:focus-visible,
   text-decoration: underline;
 }
 
+.chat-logout {
+  display: block;
+  margin-top: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 13px;
+  color: #c00;
+  cursor: pointer;
+}
+
+.chat-logout:hover {
+  text-decoration: underline;
+}
+
+/* Auth pages (login/signup) */
+.auth-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg, #fff);
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 360px;
+  padding: 28px;
+  border: 1px solid var(--line, #e3e3e8);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+}
+
+.auth-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.auth-sub {
+  margin: 4px 0 20px;
+  color: #666;
+  font-size: 13px;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #333;
+}
+
+.auth-field input {
+  padding: 10px 12px;
+  border: 1px solid var(--line, #e3e3e8);
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.auth-error {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #fdecec;
+  color: #c00;
+  font-size: 13px;
+}
+
+.auth-btn {
+  width: 100%;
+  margin-top: 4px;
+  padding: 11px;
+  border: none;
+  border-radius: 8px;
+  background: var(--blue-deep, #004d9e);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.auth-alt {
+  margin: 14px 0 0;
+  text-align: center;
+  font-size: 13px;
+  color: #666;
+}
+
+.auth-alt a {
+  color: var(--blue-deep, #004d9e);
+  text-decoration: none;
+}
+
+.auth-alt a:hover {
+  text-decoration: underline;
+}
+
 .chat-main {
   flex: 1;
   display: flex;

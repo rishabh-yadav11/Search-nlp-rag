@@ -18,3 +18,4 @@ python-dotenv==1.0.1
 cachetools==5.5.0
 tqdm==4.66.5
 aiosqlite==0.20.0
+bcrypt==4.2.1

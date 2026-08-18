@@ -8,11 +8,15 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from app import auth as auth_module
 from app import chat as chat_module
+from app.auth import AuthStore
 from app.chat import ChatStore, _smalltalk_reply
 
 USER_A = "user-a-device-id-0001"
 USER_B = "user-b-device-id-0002"
+EMAIL_A = "user-a@example.com"
+EMAIL_B = "user-b@example.com"
 
 
 def _run(coro):
@@ -23,6 +27,23 @@ def _store(tmp_path):
     s = ChatStore(str(tmp_path / "chat.db"))
     _run(s.connect())
     return s
+
+
+def _auth_store(tmp_path):
+    s = AuthStore(str(tmp_path / "auth.db"))
+    _run(s.connect())
+    return s
+
+
+def _auth_headers(auth_store, email=EMAIL_A, role="user"):
+    """Create/upgrade the account and return a valid Bearer header for it."""
+    user = _run(auth_store.get_user_by_email(email))
+    if user is None:
+        user = _run(auth_store.create_user(email, "secret1", email.split("@")[0], role))
+    elif user.role != role:
+        _run(auth_store.update_user(user.id, None, role, None))
+    token = _run(auth_store.issue_token(user.id, 7))
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_create_and_list_sessions(tmp_path):
@@ -107,39 +128,47 @@ def test_purge_expired(tmp_path):
 
 
 def _make_client(tmp_path):
-    store = _store(tmp_path)
+    chat_store = _store(tmp_path)
+    auth_store = _auth_store(tmp_path)
     app = FastAPI()
     app.include_router(chat_module.router)
-    chat_module.store = store
+    chat_module.store = chat_store
+    auth_module.store = auth_store
     client = TestClient(app)
-    return client, store
+    return client, chat_store, auth_store
 
 
-def test_api_requires_user_header(tmp_path):
-    client, store = _make_client(tmp_path)
+def test_api_requires_auth(tmp_path):
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        assert client.post("/api/chat/sessions").status_code == 400
-        assert client.post("/api/chat/sessions", headers={"X-User-Id": "short"}).status_code == 400
+        assert client.post("/api/chat/sessions").status_code == 401
+        assert client.get("/api/chat/sessions").status_code == 401
+        # A device-id header (X-User-Id) no longer bypasses auth.
+        assert client.post("/api/chat/sessions", headers={"X-User-Id": USER_A}).status_code == 401
+        assert client.post("/api/chat/sessions", headers={"Authorization": "Bearer garbage"}).status_code == 401
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_create_and_list(tmp_path):
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
         created = client.post("/api/chat/sessions", headers=h).json()
         assert created["id"]
         listed = client.get("/api/chat/sessions", headers=h).json()
         assert [s["id"] for s in listed] == [created["id"]]
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_get_rename_delete_flow(tmp_path):
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
+        h_b = _auth_headers(auth_store, email=EMAIL_B)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
         detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
@@ -148,18 +177,20 @@ def test_api_get_rename_delete_flow(tmp_path):
         renamed = client.patch(f"/api/chat/sessions/{sid}", headers=h, json={"content": "Renamed"}).json()
         assert renamed["title"] == "Renamed"
 
-        assert client.get(f"/api/chat/sessions/{sid}", headers={"X-User-Id": USER_B}).status_code == 404
+        # Other accounts cannot read this conversation.
+        assert client.get(f"/api/chat/sessions/{sid}", headers=h_b).status_code == 404
 
         assert client.delete(f"/api/chat/sessions/{sid}", headers=h).status_code == 200
         assert client.get(f"/api/chat/sessions/{sid}", headers=h).status_code == 404
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_send_message_runs_turn(tmp_path, monkeypatch):
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
         async def fake_turn(question, history):
@@ -186,13 +217,15 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
         assert detail["messages"][1]["prompt_tokens"] == 120
         assert detail["messages"][1]["cost"] == 0.0012
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_usage_stats(tmp_path, monkeypatch):
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
+        h_b = _auth_headers(auth_store, email=EMAIL_B)
         assert client.get("/api/chat/usage", headers=h).json() == {
             "sessions": 0, "messages": 0, "total_tokens": 0, "total_cost": 0.0
         }
@@ -213,19 +246,21 @@ def test_api_usage_stats(tmp_path, monkeypatch):
         assert abs(usage["total_cost"] - 0.001) < 1e-9
 
         # Other users see their own usage only.
-        assert client.get("/api/chat/usage", headers={"X-User-Id": USER_B}).json()["total_tokens"] == 0
+        assert client.get("/api/chat/usage", headers=h_b).json()["total_tokens"] == 0
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_send_message_rejects_empty(tmp_path):
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
         assert client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "   "}).status_code == 400
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_smalltalk_returns_canned_reply():
@@ -256,9 +291,9 @@ def test_api_stream_smalltalk_short_circuits(tmp_path):
     """SSE stream for small talk emits a single done event with a canned reply."""
     from app import main
 
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
         async def boom(*args, **kwargs):
@@ -283,14 +318,15 @@ def test_api_stream_smalltalk_short_circuits(tmp_path):
         assert len(detail["messages"]) == 2
         assert detail["messages"][1]["role"] == "assistant"
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_stream_full_turn(tmp_path, monkeypatch):
     """SSE stream with a real LLM path emits deltas + a done event with usage."""
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
         async def fake_prepare(question, history):
@@ -324,14 +360,15 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
         assert detail["messages"][1]["prompt_tokens"] == 50
         assert detail["messages"][1]["completion_tokens"] == 10
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
     """SSE stream fails closed with an error event when the daily budget is hit."""
-    client, store = _make_client(tmp_path)
+    client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = {"X-User-Id": USER_A}
+        h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
         async def fake_prepare(question, history):
@@ -351,7 +388,8 @@ def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
         assert "Daily AI budget reached" in body
         assert "event: done" not in body
     finally:
-        _run(store.close())
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_global_stats_aggregates(tmp_path):
@@ -387,20 +425,28 @@ def test_global_stats_aggregates(tmp_path):
 
 
 def test_analytics_chat_endpoint(tmp_path):
-    """/analytics/chat returns global chat stats through the app."""
+    """/analytics/chat returns global chat stats through the app (admin-only)."""
     from fastapi.testclient import TestClient
 
     from app import main
 
-    store = _store(tmp_path)
-    chat_module.store = store
+    chat_store = _store(tmp_path)
+    auth_store = _auth_store(tmp_path)
+    chat_module.store = chat_store
+    auth_module.store = auth_store
     client = TestClient(main.app)
     try:
-        h = {"X-User-Id": USER_A}
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
-        client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "hello"})
+        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
+        client.post(f"/api/chat/sessions/{sid}/messages", headers=admin_h, json={"content": "hello"})
 
-        res = client.get("/analytics/chat")
+        # Regular users are denied analytics.
+        user_h = _auth_headers(auth_store, email=EMAIL_A)
+        assert client.get("/analytics/chat", headers=user_h).status_code == 403
+        # Unauthenticated requests are rejected.
+        assert client.get("/analytics/chat").status_code == 401
+
+        res = client.get("/analytics/chat", headers=admin_h)
         assert res.status_code == 200
         d = res.json()
         assert d["sessions"] >= 1
@@ -409,7 +455,9 @@ def test_analytics_chat_endpoint(tmp_path):
         assert "total_tokens" in d and "total_cost" in d
     finally:
         chat_module.store = None
-        _run(store.close())
+        auth_module.store = None
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):

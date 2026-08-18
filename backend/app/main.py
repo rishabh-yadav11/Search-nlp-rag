@@ -6,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastembed import SparseTextEmbedding
@@ -24,11 +24,13 @@ from qdrant_client.models import (
     SparseVector,
 )
 
+from app import auth as auth_module
 from app import chat as chat_module
 from app.analytics import close as close_analytics
 from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
+from app.auth import require_auth, require_permission
 
 # Import config FIRST so the OMP/MKL thread caps in app.config are set before
 # any inference library (torch/onnxruntime) is imported below.
@@ -70,10 +72,16 @@ async def lifespan(app: FastAPI):
     chat_module.store = chat_store
     state["chat_retention"] = asyncio.create_task(chat_module.retention_loop())
 
+    auth_store = auth_module.AuthStore(config.AUTH_DB_PATH)
+    await auth_store.connect()
+    auth_module.store = auth_store
+    await auth_module.bootstrap_admin()
+
     yield
     state["chat_retention"].cancel()
     await asyncio.gather(state["chat_retention"], return_exceptions=True)
     await chat_store.close()
+    await auth_store.close()
     await state["qdrant"].close()
     await cache.close()
     await close_analytics()
@@ -90,6 +98,7 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(auth_module.router)
 app.include_router(chat_module.router)
 
 
@@ -606,39 +615,37 @@ class ClickEvent(BaseModel):
     position: int = 0
 
 
-def _check_analytics_token(authorization: str | None, token: str | None) -> None:
-    if config.ANALYTICS_VIEW_TOKEN:
-        supplied = token or (authorization.removeprefix("Bearer ").strip() if authorization else None)
-        if supplied != config.ANALYTICS_VIEW_TOKEN:
-            raise HTTPException(status_code=401, detail="invalid analytics token")
-
-
 @app.post("/analytics/click")
 async def analytics_click(event: ClickEvent):
-    """Anonymous result-click beacon from the frontend (no identifiers)."""
+    """Anonymous result-click beacon from the public search page (no data
+    returned, so it stays open to keep collecting interaction analytics)."""
     await record_click(event.query, event.position)
     return {"ok": True}
 
 
 @app.get("/analytics/summary")
-async def get_analytics_summary(authorization: str | None = None, token: str | None = None):
-    """Aggregated search/click metrics. Protected by ANALYTICS_VIEW_TOKEN when
-    set (Bearer token or ?token=); otherwise open (POC default)."""
-    _check_analytics_token(authorization, token)
+async def get_analytics_summary(
+    _auth: None = Depends(require_auth),
+    _perm: None = Depends(require_permission("analytics:read")),
+):
+    """Aggregated search/click metrics. Admin-only (analytics:read)."""
     return await analytics_data()
 
 
 @app.get("/analytics/chat")
-async def get_analytics_chat(authorization: str | None = None, token: str | None = None):
-    """Cross-user chat usage (sessions, messages, tokens, cost). Same token gate
-    as /analytics/summary; reads the SQLite chat store."""
-    _check_analytics_token(authorization, token)
+async def get_analytics_chat(
+    _auth: None = Depends(require_auth),
+    _perm: None = Depends(require_permission("analytics:read")),
+):
+    """Cross-user chat usage (sessions, messages, tokens, cost). Admin-only."""
     return await chat_module._require_store().global_stats()
 
 
 @app.get("/analytics/dashboard")
-async def get_analytics_dashboard(authorization: str | None = None, token: str | None = None):
+async def get_analytics_dashboard(
+    _auth: None = Depends(require_auth),
+    _perm: None = Depends(require_permission("analytics:read")),
+):
     """Human-readable analytics dashboard (self-contained HTML, no external
-    assets). Same token gate as /analytics/summary; fetches summary on load."""
-    _check_analytics_token(authorization, token)
+    assets). Admin-only; fetches summary on load."""
     return HTMLResponse(dashboard_html())

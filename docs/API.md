@@ -4,9 +4,38 @@ Base URL: `https://<host>/` (also reachable directly at `http://<host>:8001` on 
 host itself; the public entrypoint is nginx on port 80).
 
 Most endpoints return JSON. Search and analytics are `GET`; chat is JSON or
-Server-Sent-Events (SSE). There is currently **no authentication or rate
-limiting** on search — the chat API uses an anonymous `X-User-Id` header
-(device UUID) for per-user isolation only, which is not authentication.
+Server-Sent-Events (SSE).
+
+**Authentication:** chat, analytics and user-management endpoints require a
+bearer token issued by `POST /api/auth/signup` or `POST /api/auth/login`
+(`Authorization: Bearer <token>`). Tokens are opaque, expire after
+`AUTH_TOKEN_TTL_DAYS` (7) and can be revoked (`POST /api/auth/logout`). Access
+is role-based: `user` (public-signup default) may use chat; `admin` also has
+analytics read + user management. `/search`, `/facets`, `/analytics/click` and
+the auth endpoints are public. Signup/login are rate-limited per IP (Redis);
+all inputs are validated server-side. Internal machine clients may bypass via
+`X-Service-Token` (config `AUTH_SERVICE_TOKEN`).
+
+### Auth endpoints
+
+| Method & path | Access | Purpose |
+|---|---|---|
+| `POST /api/auth/signup` | public | Create account → `{token, user}` |
+| `POST /api/auth/login` | public | Exchange email+password → `{token, user}` |
+| `GET /api/auth/me` | auth | Current user profile |
+| `POST /api/auth/logout` | auth | Revoke current token |
+| `POST /api/auth/change-password` | auth | Change password; revokes other tokens → `{token, user}` |
+| `GET /api/auth/users` | `admin` | List users |
+| `GET /api/auth/users/{id}` | `admin` | User detail |
+| `PATCH /api/auth/users/{id}` | `admin` | Update name/role/is_active |
+| `DELETE /api/auth/users/{id}` | `admin` | Delete user + revoke tokens |
+| `POST /api/auth/users/{id}/tokens/revoke` | `admin` | Revoke all of a user's tokens |
+
+Signup validation: `email` (format, ≤254, lowercased, unique → 409),
+`password` (8–128 chars, must contain a letter and a digit), `name` (optional,
+≤60, no control characters). Login returns an identical generic `401` for
+unknown email or wrong password (no account enumeration). A disabled account
+(`is_active=false`) is rejected everywhere.
 
 ---
 
@@ -65,11 +94,11 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 
 ## Chat API (per-user conversations)
 
-Conversations are stored per device in SQLite and survive restarts; they are
-purged after `CHAT_RETENTION_DAYS` (180) of inactivity. **Every chat request
-must send `X-User-Id: <device-uuid>`** (min 8 chars). The frontend persists a
-UUID in localStorage and sends it automatically; this identifies a device, it is
-not authentication.
+Conversations are stored per authenticated account in SQLite and survive
+restarts; they are purged after `CHAT_RETENTION_DAYS` (180) of inactivity.
+**Every chat request must send `Authorization: Bearer <token>`** (or the
+`X-Service-Token` machine bypass). Conversations are scoped to the account, so
+other users can never see or modify them.
 
 ### Identity & session shape
 
@@ -149,8 +178,11 @@ named events:
 Example consumption:
 
 ```bash
+TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"secret12"}' | jq -r .token)
 curl -N -X POST http://localhost:8001/api/chat/sessions/abc/messages/stream \
-  -H "X-User-Id: my-device-id-0001" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"content":"who invested in Ola Electric?"}'
 ```
 
@@ -343,19 +375,26 @@ curl "https://<host>/search?q=top%2010%20fintech%20deals%20in%202025&top_k=10"
 # Facet values for filter autocomplete
 curl "https://<host>/facets"
 
-# Create a chat conversation (device UUID in X-User-Id)
-curl -X POST "https://<host>/api/chat/sessions" \
-  -H "X-User-Id: my-device-id-0001"
+# Sign up (public; rate-limited per IP)
+curl -X POST "https://<host>/api/auth/signup" -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"secret12","name":"You"}'
+
+# Log in and capture a bearer token
+TOKEN=$(curl -s -X POST "https://<host>/api/auth/login" -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"secret12"}' | jq -r .token)
+
+# Create a chat conversation
+curl -X POST "https://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
 
 # List conversations
-curl "https://<host>/api/chat/sessions" -H "X-User-Id: my-device-id-0001"
+curl "https://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
 
 # Per-user token/cost usage
-curl "https://<host>/api/chat/usage" -H "X-User-Id: my-device-id-0001"
+curl "https://<host>/api/chat/usage" -H "Authorization: Bearer $TOKEN"
 
 # Stream a chat turn (SSE)
 curl -N -X POST "https://<host>/api/chat/sessions/<id>/messages/stream" \
-  -H "X-User-Id: my-device-id-0001" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"content":"who invested in Ola Electric?"}'
 ```
 
@@ -363,10 +402,10 @@ curl -N -X POST "https://<host>/api/chat/sessions/<id>/messages/stream" \
 
 ## Notes & limitations
 
-- **Public exposure**: no auth / rate limiting yet. Restrict via nginx (basic auth /
-  API key), an AWS security-group allowlist, or a rate limiter before broad use.
-  Chat's `X-User-Id` isolates devices but is not authentication — anyone can
-  claim any user id.
+- **Auth**: bearer tokens (7-day expiry, revocable) gate chat, analytics and
+  user management; `/search`, `/facets`, `/analytics/click` and the auth
+  endpoints are public. Signup/login are rate-limited per IP via Redis; set
+  `AUTH_SERVICE_TOKEN` to let internal scripts bypass as an admin user.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
 - **Caching**: `/search` responses are cached (TTL 120s) keyed by effective
