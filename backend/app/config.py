@@ -134,9 +134,8 @@ class Config:
 
     # Analytics
     # Aggregates live in Redis DB 1 (the query cache uses DB 0 and is flushed
-    # during deploys). When a view token is set, /analytics/summary requires it.
+    # during deploys). Read endpoints are gated by the auth layer (admin role).
     ANALYTICS_REDIS_DB = int(os.getenv("ANALYTICS_REDIS_DB", "1"))
-    ANALYTICS_VIEW_TOKEN = os.getenv("ANALYTICS_VIEW_TOKEN", "")
 
     # Auth (token + RBAC). Users sign up openly; a role-based access-control
     # layer maps roles to permissions (see app/auth.py). Tokens are opaque,

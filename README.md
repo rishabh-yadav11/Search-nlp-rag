@@ -270,7 +270,7 @@ cd backend
 | `GET /health` | Liveness |
 | `GET /ready` | Readiness (503 when Qdrant/models unavailable) |
 | `GET /live`, `GET /readyz` | Liveness / bare readiness |
-| `GET /analytics/dashboard` | Self-contained HTML analytics dashboard (incl. chat usage) |
+| `GET /analytics/dashboard` | Analytics dashboard — a Next.js frontend page (admin-only), fed by the gated `/analytics/summary` + `/analytics/chat` APIs |
 
 ```bash
 curl "http://localhost:8001/search?q=fintech%20funding&top_k=3"
@@ -403,7 +403,12 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
 | `ENABLE_BODY_RESCUE` / `BODY_RESCUE_THRESHOLD` | `true` / `0.3` | Chat-only rescue: when the top reranked score is weak, re-score candidates against the body region with the most lexical query-token overlap and keep `max(baseline, body)` so deep-body matches (e.g. retrospectives) can pass `ASK_MIN_SCORE`; one extra cross-encoder pass per candidate, only on weak results |
-| `ANALYTICS_REDIS_DB` / `ANALYTICS_VIEW_TOKEN` | `1` / `` | Analytics aggregates live in Redis DB N (cache is DB 0); when set, `/analytics/*` require this bearer token |
+| `ANALYTICS_REDIS_DB` | `1` | Analytics aggregates live in Redis DB N (cache is DB 0) |
+| `AUTH_DB_PATH` / `AUTH_TOKEN_TTL_DAYS` / `AUTH_DEFAULT_ROLE` | `data/auth.db` / `7` / `user` | SQLite auth store; bearer-token expiry; role granted to new public signups |
+| `AUTH_SERVICE_TOKEN` | `` (disabled) | Machine-to-machine bypass: a request with this exact `X-Service-Token` header acts as an admin (used by the eval scripts); leave empty to disable |
+| `AUTH_ADMIN_EMAIL` / `AUTH_ADMIN_PASSWORD` | `` | Bootstrap admin, created once at startup if absent (never overwrites an existing account) |
+| `AUTH_PASSWORD_MIN_LEN` / `AUTH_MAX_EMAIL_LEN` / `AUTH_MAX_NAME_LEN` | `8` / `254` / `60` | Server-side input-validation limits for the auth endpoints |
+| `AUTH_SIGNUP_RATE_PER_MIN` / `AUTH_LOGIN_RATE_PER_MIN` / `AUTH_RATE_WINDOW_SECONDS` | `5` / `10` / `60` | Redis-backed per-IP rate limits on public auth endpoints (0 disables) |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated allowed origins for CORS (production is same-origin through nginx) |
 
 ## Testing and CI
@@ -432,7 +437,9 @@ reconciliation, cache TTL and degraded fallback.
 ## Eval scripts (repeatable quality checks)
 
 Run on a box with the backend serving on localhost:8001 and MySQL/Qdrant
-reachable from `backend/.env` (venv python, from `backend/`):
+reachable from `backend/.env` (venv python, from `backend/`). The scripts
+authenticate with `AUTH_SERVICE_TOKEN` from `backend/.env` (auto-loaded), so no
+manual token setup is needed:
 
 - `./venv/bin/python scripts/deep_body_eval.py` — whole-body indexing and
   body-grounded chat: (1) coverage of terms that live only in the deep body
@@ -459,8 +466,11 @@ reachable from `backend/.env` (venv python, from `backend/`):
 2. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
    down it silently degrades to a per-worker in-process cache (which no longer
    benefits the other workers until Redis returns).
-3. **No auth/rate limiting** on the API — add before exposing beyond
-   nginx/localhost.
+3. **Auth is self-enforced by the backend** (bearer tokens + RBAC; public
+   signup/login is rate-limited per IP via Redis) but the frontend is a
+   temporary UI — the API is the contract for the external project. Review
+   role assignment (`AUTH_DEFAULT_ROLE`), the admin bootstrap password, and the
+   service-token bypass before broad exposure.
 4. **`published_date` payload index** assumes MySQL returns a parseable
    date/datetime string; adjust the payload schema if your column type differs.
 5. **Backups are host-local** — schedule off-server transfer of

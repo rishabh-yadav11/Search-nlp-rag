@@ -20,6 +20,11 @@ import os
 import re
 import urllib.request
 
+from dotenv import load_dotenv
+
+# Load backend/.env (run from backend/) so AUTH_SERVICE_TOKEN is picked up.
+load_dotenv()
+
 BASE = "http://localhost:8001/api/chat"
 # Machine-to-machine bypass for the internal eval scripts; must match the
 # backend's AUTH_SERVICE_TOKEN in backend/.env.
