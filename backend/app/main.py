@@ -472,8 +472,8 @@ async def search(
 
 
 def source_context(s: SourceArticle, idx: int) -> str:
-    """Packs an article's metadata + summary + a body excerpt into a numbered
-    context block for the chat LLM prompt."""
+    """Packs an article's metadata + summary + body into a numbered
+    context block for the chat LLM prompt (body capped by CHAT_BODY_CHAR_LIMIT)."""
     meta = s.published_date or "n/a"
     if s.author_names:
         meta += f" | Authors: {', '.join(s.author_names)}"
@@ -485,7 +485,7 @@ def source_context(s: SourceArticle, idx: int) -> str:
     if s.summary:
         parts.append(s.summary)
     if s.body:
-        parts.append(s.body[:1500])
+        parts.append(s.body[: config.CHAT_BODY_CHAR_LIMIT])
     return "\n".join(parts)
 
 

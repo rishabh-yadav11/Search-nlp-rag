@@ -380,7 +380,8 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
-| `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `6000` / `6000` | Chars for the dense vector; sparse/lexical vector; body chars kept in the payload |
+| `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `30000` / `30000` | Chars for the dense vector; sparse/lexical vector input; body chars kept in the Qdrant payload |
+| `CHAT_BODY_CHAR_LIMIT` | `30000` | Body chars per source fed to the chat LLM (whole stored body by default; lower to cut prompt tokens/cost) |
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `EMBED_DEVICE` | `cpu` | `cuda` for a GPU |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `12` | Cross-encoder reranker; how many RRF candidates to re-score (12 keeps top-8 quality vs 16, faster on CPU) |

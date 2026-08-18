@@ -41,10 +41,15 @@ class Config:
 
     # Indexed text limits. The dense embedder gets title+facets+summary only
     # (kept short so CPU builds stay fast); the sparse/lexical embedder gets the
-    # full text including body so body keywords stay searchable.
+    # full text including body so body keywords stay searchable. Body-related
+    # caps default to 30000 chars, which covers every article currently in the
+    # corpus (max clean body ~14K) with headroom for growth.
     EMBED_DENSE_CHAR_LIMIT = int(os.getenv("EMBED_DENSE_CHAR_LIMIT", "1500"))
-    EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "6000"))
-    BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "6000"))
+    EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "30000"))
+    BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "30000"))
+    # Per-source body excerpt sent to the chat LLM (the whole stored body when
+    # this matches BODY_CHAR_LIMIT; lower it to cut prompt tokens/cost).
+    CHAT_BODY_CHAR_LIMIT = int(os.getenv("CHAT_BODY_CHAR_LIMIT", "30000"))
 
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch

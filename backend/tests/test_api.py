@@ -265,6 +265,18 @@ def test_retrieve_and_rerank_caches_without_body(monkeypatch):
     assert len(fake_cache.store) == 1  # still a single cache entry
 
 
+def test_source_context_includes_whole_body():
+    """Chat prompt context must carry the full article body, not a fixed excerpt."""
+    from app.main import SourceArticle, source_context
+
+    body = "x" * 4000
+    a = SourceArticle(id=1, title="t", url="u", published_date="2024-01-01",
+                      summary="s", body=body, score=0.9)
+    out = source_context(a, 1)
+    assert body in out
+    assert "x" * 3000 in out
+
+
 def test_analytics_dashboard_route_registered():
     from app.dashboard import DASHBOARD_HTML
 
