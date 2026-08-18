@@ -49,6 +49,17 @@ def test_record_cost_redis_down_never_raises(monkeypatch):
     _run(cost_budget.record_cost(0.5))  # must not raise
 
 
+def test_record_cost_converts_inr_to_usd(monkeypatch):
+    """Regression: the day counter is compared against LLM_DAILY_BUDGET_USD, so
+    INR cost from LLMResult.cost() must be converted to USD before incrementing."""
+    calls = []
+    monkeypatch.setattr(cost_budget, "_client", lambda: _fake_client(calls))
+    monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 95.6)
+    _run(cost_budget.record_cost(95.6))
+    assert len(calls) == 1
+    assert abs(calls[0][1] - 1.0) < 1e-9  # ₹95.6 -> $1.0
+
+
 def _run(coro):
     import asyncio
 

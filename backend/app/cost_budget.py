@@ -76,11 +76,13 @@ async def assert_within_budget() -> None:
         raise BudgetExceeded()
 
 
-async def record_cost(cost: float) -> None:
-    """Add ``cost`` (USD) to today's running total. Best-effort, never raises."""
-    if cost <= 0:
+async def record_cost(cost_inr: float) -> None:
+    """Add ``cost_inr`` (INR, as reported by LLMResult.cost()) to today's
+    running total, converted to USD so the counter is comparable to
+    LLM_DAILY_BUDGET_USD. Best-effort, never raises."""
+    if cost_inr <= 0:
         return
     try:
-        await _client().incrbyfloat(_day_key(), cost)
+        await _client().incrbyfloat(_day_key(), cost_inr / (config.INR_PER_USD or 1.0))
     except Exception as exc:
         logger.warning("cost budget Redis unavailable (%s); spend not recorded", exc)
