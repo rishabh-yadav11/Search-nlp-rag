@@ -96,13 +96,15 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
   message, sources, tokens, cost and latency are persisted. Conversations idle
   for `CHAT_RETENTION_DAYS` (180) are purged daily. See `docs/API.md`.
   Answers carry a ` ```dataviz ` JSON block (`{title?, columns, rows,
-  value_column, format?, kind?}`) that the UI renders as Table/Bar/Line/Pie/
-  Pictogram charts (hand-rolled SVG, no chart deps) — but ONLY when the user
+  value_column, format?, kind?, view?}`) that the UI renders as Table/Bar/Line/
+  Pie/Pictogram charts (hand-rolled SVG, no chart deps) — but ONLY when the user
   explicitly asks for a chart/graph/plot/table (e.g. "show me a chart"), so
-  ranked/numeric questions answer in plain prose by default. Emission is
-  non-deterministic, so the backend re-prompts once with a nudge when an
-  explicit chart request comes back without a block, and malformed fences are
-  stripped before storage so raw JSON never reaches users.
+  ranked/numeric questions answer in plain prose by default. When the user asks
+  for a specific view (table, bar/graph, line, pie, or pictogram), the block's
+  `view` is pinned to it and the UI renders ONLY that view (no view toggles).
+  Emission is non-deterministic, so the backend re-prompts once with a nudge
+  when an explicit chart request comes back without a block, and malformed
+  fences are stripped before storage so raw JSON never reaches users.
 - **Caching** — Redis-backed JSON cache shared across workers (falls back to
   an in-process cache if Redis is down) for `/search`, keyed
   by effective query + top_k + facets. The retrieval/rerank step
