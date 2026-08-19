@@ -540,6 +540,35 @@ def test_parse_dataviz_infers_numeric_column():
     assert data["value_column"] == 1
 
 
+def test_parse_dataviz_allows_missing_values():
+    """A top-N table may include rows whose value isn't stated ("" or None) as
+    long as at least one row has a number and no non-empty cell is non-numeric."""
+    data = chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Proceeds (₹ Cr)"], '
+        '"rows": [["Wakefit", ""], ["Groww", 1200], ["Meesho", ""]], "value_column": 1}\n```'
+    )
+    assert data is not None
+    assert data["value_column"] == 1
+
+    data = chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Proceeds (₹ Cr)"], '
+        '"rows": [["Wakefit", null], ["Groww", 1200]], "value_column": 1}\n```'
+    )
+    assert data is not None
+    assert len(data["rows"]) == 2
+
+    # A present but non-numeric cell still invalidates the block.
+    assert chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Value"], '
+        '"rows": [["Wakefit", "n/a"], ["Groww", 1200]], "value_column": 1}\n```'
+    ) is None
+    # A value column with no numeric cell at all is invalid.
+    assert chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Value"], '
+        '"rows": [["Wakefit", ""], ["Groww", ""]], "value_column": 1}\n```'
+    ) is None
+
+
 def test_sanitize_dataviz_keeps_valid_strips_malformed():
     valid = "Prose [1].\n\n```dataviz\n{\"columns\": [\"Deal\", \"Value\"], \"rows\": [[\"Zepto\", 1.0]]}\n```"
     assert chat_module._sanitize_dataviz(valid) == valid
@@ -676,6 +705,13 @@ def test_chat_prompt_instructs_constructing_top_n_lists():
     (regression: 'top 10 ipo deals in 2025' was refused despite relevant data)."""
     assert "build the ranked list from the specific items the articles actually name" in chat_module.CHAT_PROMPT
     assert "Do NOT refuse a top-N list just because the articles lack a pre-made ranking" in chat_module.CHAT_PROMPT
+    # IPO questions must yield companies that went public, not M&A/stake deals,
+    # and a list item with no stated value must still be included.
+    assert "the list items are the COMPANIES that went public or filed for an IPO" in chat_module.CHAT_PROMPT
+    assert "Do not substitute M&A or PE-VC deals when the question asks for IPOs" in chat_module.CHAT_PROMPT
+    assert "still include it in the list and write \"value not stated\"" in chat_module.CHAT_PROMPT
+    # The dataviz table may hold rows whose value cell is an empty string.
+    assert "can use an empty string \"\" for that cell" in chat_module.CHAT_PROMPT
 
 
 def test_requested_view_detection():

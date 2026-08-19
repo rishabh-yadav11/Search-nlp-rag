@@ -161,6 +161,17 @@ def _to_float(v: object) -> float | None:
     return None
 
 
+def _missing_cell(v: object) -> bool:
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+
+def _valid_value_column(rows: list[list[object]], j: int) -> bool:
+    """A value column holds a number in every non-missing cell and at least one
+    number overall (empty cells are allowed for 'value not stated' rows)."""
+    present = [r[j] for r in rows if not _missing_cell(r[j])]
+    return bool(present) and all(_to_float(v) is not None for v in present)
+
+
 def _parse_dataviz(text: str) -> dict | None:
     """Return the assistant's dataviz JSON block, or None when absent/invalid.
 
@@ -187,10 +198,10 @@ def _parse_dataviz(text: str) -> dict | None:
     if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
         vc = None
         for j in range(len(columns)):
-            if all(_to_float(r[j]) is not None for r in rows):
+            if _valid_value_column(rows, j):
                 vc = j
                 break
-    if vc is None or any(_to_float(r[vc]) is None for r in rows):
+    if vc is None or not _valid_value_column(rows, vc):
         return None
     return {"columns": columns, "rows": rows, "value_column": vc, "format": d.get("format"),
             "kind": d.get("kind"), "view": d.get("view")}

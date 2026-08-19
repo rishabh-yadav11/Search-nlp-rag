@@ -457,11 +457,24 @@ def _as_float(v: object) -> float | None:
     return None
 
 
+def _missing_cell(v: object) -> bool:
+    """True when a dataviz value cell explicitly marks a missing value ("" or
+    None), so a top-N table can include items whose value isn't stated."""
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+
+def _valid_value_column(rows: list[list[object]], j: int) -> bool:
+    """A value column must hold a number in every non-missing cell and at least
+    one number overall (empty cells are allowed, e.g. 'value not stated')."""
+    present = [r[j] for r in rows if not _missing_cell(r[j])]
+    return bool(present) and all(_as_float(v) is not None for v in present)
+
+
 def _first_numeric_column(rows: list[list[object]]) -> int | None:
     if not rows or not rows[0]:
         return None
     for j in range(len(rows[0])):
-        if all(_as_float(r[j]) is not None for r in rows):
+        if _valid_value_column(rows, j):
             return j
     return None
 
@@ -492,7 +505,7 @@ def parse_dataviz(text: str) -> dict | None:
     vc = data.get("value_column")
     if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
         vc = _first_numeric_column(rows)
-    if vc is None or any(_as_float(r[vc]) is None for r in rows):
+    if vc is None or not _valid_value_column(rows, vc):
         return None
     data["value_column"] = vc
     return data
@@ -760,6 +773,13 @@ items as the articles support, up to the requested N. If the articles support fe
 those and note that you found fewer than N. Do NOT refuse a top-N list just because the articles lack a \
 pre-made ranking; extract and rank the items yourself. Never invent an item that no article names.
 
+For questions about IPOs or public listings (e.g. "top ipo deals", "top IPOs of 2025", "make a table of \
+top 10 IPOs"), the list items are the COMPANIES that went public or filed for an IPO — not private \
+funding rounds, stake sales, or mergers & acquisitions. Do not substitute M&A or PE-VC deals when the \
+question asks for IPOs. When an item lacks a stated value (e.g. an IPO with no disclosed proceeds), still \
+include it in the list and write "value not stated" for it instead of dropping it or refusing; a list \
+with some missing values is better than a short list or a refusal.
+
 ONLY when the user explicitly asks for a chart, graph, plot, diagram, or a table/visual view (e.g. "show \
 me a chart", "bar chart", "graph the deals", "as a table"), end your answer with ONE JSON data block in a \
 fenced code block tagged dataviz, like this:
@@ -776,9 +796,11 @@ value_column 1, format "%"). For a year-over-year trend, put the year in the fir
 {dataviz_view_instruction}
 
 Data block rules: rows are the ranked items (max {dataviz_max_rows} rows); every value cell is a plain number in the unit \
-declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
-articles, never invented ones; keep [n] citations only in the prose, never inside the data block. Do NOT \
-include the block unless the user explicitly asked for a chart, graph, plot, diagram, or table/visual view.
+declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); a row whose value is not stated in the articles can \
+use an empty string "" for that cell (the UI shows it as "—"); only include numbers that are actually \
+stated in the articles, never invented ones; keep [n] citations only in the prose, never inside the data \
+block. Do NOT include the block unless the user explicitly asked for a chart, graph, plot, diagram, or \
+table/visual view.
 
 Conversation so far:
 {history}
