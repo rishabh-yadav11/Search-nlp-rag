@@ -5,6 +5,7 @@ from app.query_intent import (
     extract_month_range,
     extract_year_range,
     month_query_topic,
+    range_query_topic,
     rewrite_year_in_review,
     suggested_top_k,
 )
@@ -166,3 +167,71 @@ def test_month_query_topic_no_month_returns_none():
 def test_extract_list_topic_strips_month_words():
     assert extract_list_topic("top pharma deals of month january 2025") == "pharma deals"
     assert extract_list_topic("top deals in feb 2024") == "deals"
+
+
+def test_extract_year_range_short_span():
+    assert extract_year_range("top 15 deals in 2024-25") == ("2024-01-01", "2025-12-31")
+    assert extract_year_range("deals 1999-00") == ("1999-01-01", "2000-12-31")
+
+
+def test_extract_year_range_month_span():
+    assert extract_year_range("deals in jan-march") == ("2026-01-01", "2026-03-31")
+    assert extract_year_range("x in jan-march 2025") == ("2025-01-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in jan to march 2025") == ("2025-01-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in january 2025 to march 2025") == ("2025-01-01", "2025-03-31")
+    assert extract_year_range("deals between january and march 2025") == ("2025-01-01", "2025-03-31")
+
+
+def test_extract_year_range_month_span_crosses_year():
+    assert extract_year_range("deals from may to march") == ("2026-05-01", "2027-03-31")
+
+
+def test_extract_month_range_month_span():
+    assert extract_month_range("deals in jan-march") == ("2026-01-01", "2026-03-31")
+    assert extract_month_range("january to march 2025") == ("2025-01-01", "2025-03-31")
+
+
+def test_extract_year_range_quarter():
+    assert extract_year_range("deals in Q1 2025") == ("2025-01-01", "2025-03-31")
+    assert extract_year_range("deals in Q2-2024") == ("2024-04-01", "2024-06-30")
+    assert extract_year_range("deals in Q3 2024") == ("2024-07-01", "2024-09-30")
+    assert extract_year_range("deals in q4") == ("2026-10-01", "2026-12-31")
+    assert extract_year_range("deals in first quarter of 2025") == ("2025-01-01", "2025-03-31")
+
+
+def test_extract_year_range_fiscal_year():
+    assert extract_year_range("top 15 deals in FY25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in FY 2024-25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in fy24-25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("deals in fiscal year 2025") == ("2024-04-01", "2025-03-31")
+
+
+def test_rewrite_not_fired_for_range_queries():
+    """Range/fiscal/quarter queries must not collapse into a single annual
+    Flashback roundup — they want the span's own data."""
+    for q in (
+        "top 15 deals in 2024-25",
+        "top 15 deals in jan to march 2025",
+        "top 15 deals in Q1 2025",
+        "top 15 deals in FY25",
+    ):
+        new_q, changed = rewrite_year_in_review(q)
+        assert changed is False
+        assert new_q == q
+
+
+def test_extract_list_topic_strips_new_range_words():
+    assert extract_list_topic("top 15 deals in 2024-25") == "deals"
+    assert extract_list_topic("top 15 deals in Q1 2025") == "deals"
+    assert extract_list_topic("top 15 deals in FY25") == "deals"
+    assert extract_list_topic("top 15 deals in jan to march 2025") == "deals"
+
+
+def test_range_query_topic():
+    assert range_query_topic("top 15 deals in 2024-25") == "deals"
+    assert range_query_topic("deals in jan-march") == "deals"
+    assert range_query_topic("top 15 deals in Q1 2025") == "deals"
+    assert range_query_topic("top 15 deals in FY25") == "deals"
+    assert range_query_topic("funding deals 2024-25") == "funding deals"
+    assert range_query_topic("top deals in 2025") is None
+    assert range_query_topic("venture funding") is None
