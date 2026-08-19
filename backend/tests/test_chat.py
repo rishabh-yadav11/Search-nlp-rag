@@ -605,6 +605,26 @@ def test_sanitize_dataviz_keeps_valid_strips_malformed():
     assert chat_module._sanitize_dataviz(plain) == plain
 
 
+def test_finalize_answer_only_keeps_charts_on_explicit_request():
+    """Charts must never appear unless the user explicitly asked for one
+    (guards non-deterministic model emission of dataviz blocks)."""
+    with_block = (
+        "Prose [1].\n\n```dataviz\n"
+        '{"columns": ["Company", "Value"], "rows": [["Wakefit", 1.0]], "value_column": 1}\n'
+        "```"
+    )
+    # No chart ask -> the block is stripped, prose kept.
+    out = chat_module._finalize_answer(with_block, "top 10 ipo deals in 2025")
+    assert "dataviz" not in out
+    assert "Prose [1]" in out
+    # Explicit table ask -> block kept (and pinned).
+    out = chat_module._finalize_answer(with_block, "make a table of top 10 ipo deals")
+    assert "dataviz" in out
+    assert chat_module.parse_dataviz(out)["view"] == "table"
+    # Plain prose, no ask -> untouched.
+    assert chat_module._finalize_answer("Just prose [1].", "top deals") == "Just prose [1]."
+
+
 def test_chart_intent_regex():
     """Only an explicit chart/graph/plot/table request counts as chart intent;
     ranked/numeric questions without a visual ask must stay plain prose."""

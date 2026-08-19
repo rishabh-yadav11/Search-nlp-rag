@@ -542,6 +542,21 @@ def _sanitize_dataviz(text: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_keep, text)
 
 
+def _finalize_answer(text: str, question: str) -> str:
+    """Clean the raw LLM answer for storage/display.
+
+    Charts are ONLY shown on an explicit request: if the user did not ask for a
+    chart/graph/plot/table, any dataviz block the model emitted anyway is
+    removed (guarding against non-deterministic emission). When a chart IS
+    requested, the block is pinned to the requested view and malformed fences
+    are stripped."""
+    if _CHART_INTENT_RE.search(question):
+        return _sanitize_dataviz(_apply_requested_view(text, question))
+    if not text or "```dataviz" not in text:
+        return text
+    return _DATAVIZ_FENCE_RE.sub("", text).rstrip()
+
+
 def _effective_chat_k(question: str) -> int:
     """How many sources chat should retrieve/cite for a question.
 
@@ -777,7 +792,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
     result = await _answer_with_dataviz(question, turn.answer)
     await record_cost(result.cost())
     return (
-        _sanitize_dataviz(_apply_requested_view(result.content, question)),
+        _finalize_answer(result.content, question),
         turn.sources,
         turn.note,
         result.prompt_tokens,
@@ -1025,7 +1040,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer = nudge.content
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
-            answer = _sanitize_dataviz(_apply_requested_view(answer, question))
+            answer = _finalize_answer(answer, question)
             result = LLMResult(
                 content=answer,
                 prompt_tokens=prompt_tokens,
