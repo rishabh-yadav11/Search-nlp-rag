@@ -493,6 +493,95 @@ def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
     assert len(turn.sources) == 1
 
 
+def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
+    """A vague follow-up ('make this into a table') has no standalone topic:
+    retrieval must inherit the previous turn's query + date filter + top-N,
+    otherwise the embedding on the bare follow-up finds nothing and the turn
+    short-circuits to 'no relevant articles' before the LLM sees the history."""
+    from app import main
+    from app.main import SourceArticle
+    from app.chat import MessageOut
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+
+    intents = {
+        "top ipo in 2025": ("Flashback 2025 IPO", "2025-01-01", "2025-12-31"),
+        "make this into a table": ("make this into a table", None, None),
+    }
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: intents[q])
+
+    captured = {}
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        captured["rq"] = rq
+        captured["top_k"] = top_k
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-06-01",
+                              summary="s", body="b", score=0.9)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    def msg(i, role, content):
+        return MessageOut(id=i, role=role, content=content, sources=[], created_at=float(i),
+                          prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=0.0)
+
+    history = [
+        msg(1, "user", "top ipo in 2025"),
+        msg(2, "assistant", "Here are the IPOs."),
+        msg(3, "user", "make this into a table"),
+    ]
+    turn = _run(chat_module._prepare_turn("make this into a table", history))
+    assert turn.needs_llm
+    assert captured["rq"] == "Flashback 2025 IPO"
+    assert captured["top_k"] == 10  # previous turn's 'top ...' list size
+    assert "make this into a table" in turn.answer  # current question in prompt
+    assert "top ipo in 2025" in turn.answer  # history included for the LLM
+
+
+def test_prepare_turn_real_question_does_not_inherit_previous_retrieval(monkeypatch):
+    """A standalone question (even one that asks for a table) must use its own
+    retrieval topic, not the previous turn's."""
+    from app import main
+    from app.main import SourceArticle
+    from app.chat import MessageOut
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+
+    captured = {}
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        captured["rq"] = rq
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-06-01",
+                              summary="s", body="b", score=0.9)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    def msg(i, role, content):
+        return MessageOut(id=i, role=role, content=content, sources=[], created_at=float(i),
+                          prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=0.0)
+
+    history = [
+        msg(1, "user", "top ipo in 2025"),
+        msg(2, "assistant", "Here are the IPOs."),
+        msg(3, "user", "make a table of top 15 deals in 2024-25"),
+    ]
+    turn = _run(chat_module._prepare_turn("make a table of top 15 deals in 2024-25", history))
+    assert turn.needs_llm
+    assert captured["rq"] == "make a table of top 15 deals in 2024-25"
+
+
 def test_chat_imports_shared_retrieval_helpers():
     """The names chat lazily imports from app.main must stay available after
     endpoint removals (regression: /ask removal dropped source_context)."""
