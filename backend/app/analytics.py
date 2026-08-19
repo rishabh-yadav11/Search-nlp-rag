@@ -114,7 +114,10 @@ async def click_signals(query: str) -> dict | None:
         raw = await c.zrevrange(key, 0, 50, withscores=True)
         if not raw:
             return None
-        total = await c.zcard(key)
+        # "total clicks" is the sum of per-article click counts, not the number
+        # of distinct articles (zcard) — repeated clicks on one article still
+        # count as query volume.
+        total = sum(int(count) for _article, count in raw)
         if total < config.CLICK_BOOST_MIN_CLICKS:
             return None
         return {
