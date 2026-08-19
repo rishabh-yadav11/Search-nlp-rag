@@ -101,7 +101,11 @@ class QueryFixer:
             logger.info("query_fix: no vocabulary; disabled")
             return
         sym = SymSpell(max_dictionary_edit_distance=self.max_edit, prefix_length=7)
-        sym.create_dictionary(entries)
+        # create_dictionary_entry() propagates real frequencies (unlike
+        # create_dictionary(dict), which counts each key once) so curated
+        # entities and high-frequency corpus words win SymSpell suggestions.
+        for term, count in entries.items():
+            sym.create_dictionary_entry(term, count)
         self._sym = sym
         self._known = set(entries)
         logger.info("query_fix: ready (%d terms, max_edit=%d)", len(entries), self.max_edit)
