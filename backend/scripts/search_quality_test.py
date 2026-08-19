@@ -133,6 +133,37 @@ GOLDEN = [
         "q": "How did demonetisation in 2016 impact fintech startups in India?",
         "expected": [32090, 27619],
     },
+    # --- typo scenarios (correction should recover the same relevant ids) ---
+    {
+        "id": 18,
+        "category": "typo: brand (Ola -> Olla)",
+        "q": "How did Olla Cabs raise funding from SoftBank?",
+        "expected": [29052, 31716],
+    },
+    {
+        "id": 19,
+        "category": "typo: brand (SoftBank -> Sotbank)",
+        "q": "How did Ola Cabs raise funding from Sotbank?",
+        "expected": [29052, 31716],
+    },
+    {
+        "id": 20,
+        "category": "typo: brand (PhonePe -> PonePe)",
+        "q": "PonePe funding round valuation",
+        "expected": [54121, 53858, 45379],
+    },
+    {
+        "id": 21,
+        "category": "typo: generic (funding -> fundnig)",
+        "q": "Venture debt providers in India fundnig",
+        "expected": [37122, 39839, 26029],
+    },
+    {
+        "id": 22,
+        "category": "typo: generic (Property -> Propery)",
+        "q": "Ask Property Fund exits Shriram Propery project",
+        "expected": [67884],
+    },
 ]
 
 

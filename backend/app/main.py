@@ -37,6 +37,7 @@ from app.cost_budget import close as close_cost_budget
 from app.encoders import DenseEncoder
 from app.health import router as health_router
 from app.query_expand import expand_query
+from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
     extract_list_topic,
     extract_year_range,
@@ -73,6 +74,14 @@ async def lifespan(app: FastAPI):
     await auth_store.connect()
     auth_module.store = auth_store
     await auth_module.bootstrap_admin()
+
+    init_fixer(
+        config.ENABLE_QUERY_FIX,
+        config.QUERY_FIX_VOCAB_PATH,
+        max_edit=config.QUERY_FIX_MAX_EDIT,
+        min_count=config.QUERY_FIX_MIN_COUNT,
+        min_token_len=config.QUERY_FIX_MIN_TOKEN_LEN,
+    )
 
     yield
     state["chat_retention"].cancel()
@@ -295,13 +304,27 @@ async def hybrid_search(
     # Dense/sparse encoders are CPU/sync-bound: run them off the event loop so
     # the async handlers stay responsive under load, and serialize them so
     # concurrent requests don't thrash the inference thread pools.
-    async with inference_lock:
-        dense_vec = (await asyncio.to_thread(state["model"].encode, query)).tolist()
-        sparse_emb = await asyncio.to_thread(_embed_sparse, state["sparse_model"], query)
-    sparse_vec = SparseVector(indices=sparse_emb.indices.tolist(), values=sparse_emb.values.tolist())
+    #
+    # The (dense, sparse) pair for a query string is deterministic and
+    # independent of the qfilter, so it is cached in Redis keyed by the
+    # embedding models (a model change invalidates it). Repeated queries with
+    # different facet/date filters skip encoding entirely.
+    vec_key = f"vec:{config.EMBED_MODEL}|{config.SPARSE_MODEL}:{query}"
+    vec = await cache.get(vec_key)
+    if vec is None:
+        async with inference_lock:
+            dense_vec = (await asyncio.to_thread(state["model"].encode, query)).tolist()
+            sparse_emb = await asyncio.to_thread(_embed_sparse, state["sparse_model"], query)
+        vec = {
+            "dense": dense_vec,
+            "si": sparse_emb.indices.tolist(),
+            "sv": sparse_emb.values.tolist(),
+        }
+        await cache.set(vec_key, vec, ttl=config.VECTOR_CACHE_TTL_SECONDS)
+    sparse_vec = SparseVector(indices=vec["si"], values=vec["sv"])
 
     dense_prefetch = Prefetch(
-        query=dense_vec,
+        query=vec["dense"],
         using="dense",
         limit=top_k * 4,
     )
@@ -492,6 +515,7 @@ async def retrieve_and_rerank(
     rerank entirely. Bodies are not cached (they are large); when ``need_body``
     is set they are fetched from Qdrant for the returned set.
     """
+    q = fix_query(q)[0]  # typo-corrected query flows to cache key, legs, boost
     cache_key = f"retrieve:{q}:{top_k}:{_filter_token(qfilter)}"
     cached = await cache.get(cache_key)
     if cached is not None:
@@ -525,7 +549,8 @@ async def search(
     to_date: str | None = Query(None),
 ):
     start = time.perf_counter()
-    retrieval_q, eff_from, eff_to = _effective_intent(q, from_date, to_date)
+    q_fixed, _ = fix_query(q)
+    retrieval_q, eff_from, eff_to = _effective_intent(q_fixed, from_date, to_date)
     if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
         retrieval_q = expand_query(retrieval_q)
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
@@ -541,7 +566,7 @@ async def search(
                               latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    reranked = await retrieve_and_rerank(q, eff_top_k, qfilter)
+    reranked = await retrieve_and_rerank(q_fixed, eff_top_k, qfilter)
     results = reranked[:eff_top_k]
     note = weak_results_note([r.score for r in results], date_label(eff_from, eff_to))
     await cache.set(cache_key, [to_summary(r).model_dump() for r in results])

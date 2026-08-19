@@ -45,9 +45,9 @@ class HybridCache:
             self._degraded(exc)
         return self._mem.get(key)
 
-    async def set(self, key: str, value) -> None:
+    async def set(self, key: str, value, ttl: int | None = None) -> None:
         try:
-            await self._client().set(key, json.dumps(value), ex=self._ttl)
+            await self._client().set(key, json.dumps(value), ex=self._ttl if ttl is None else ttl)
             return
         except Exception as exc:
             self._degraded(exc)
