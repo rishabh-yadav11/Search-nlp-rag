@@ -97,10 +97,11 @@ QUERIES = [
     },
     {
         "id": 12,
-        "category": "dataviz: ranked list with values (explicit chart ask)",
+        "category": "dataviz: ranked list with values (explicit bar chart ask)",
         "q": "Show me a bar chart of the top 5 biggest funding rounds in India in 2025 with their values",
         "terms": [],
         "dataviz": True,
+        "view": "bar",
     },
     {
         "id": 13,
@@ -109,6 +110,7 @@ QUERIES = [
         "terms": ["2024"],
         "year": 2024,
         "dataviz": True,
+        "view": "line",
     },
     {
         "id": 14,
@@ -116,6 +118,7 @@ QUERIES = [
         "q": "Show me a pie chart of the biggest deals by sector in India in 2025",
         "terms": [],
         "dataviz": True,
+        "view": "pie",
     },
     {
         "id": 15,
@@ -131,6 +134,15 @@ QUERIES = [
         "terms": [],
         "year": 2025,
         "no_dataviz": True,
+    },
+    {
+        "id": 17,
+        "category": "dataviz: explicit table request",
+        "q": "Show me a table of the top 10 ipo deals in 2025",
+        "terms": [],
+        "year": 2025,
+        "dataviz": True,
+        "view": "table",
     },
 ]
 
@@ -180,7 +192,8 @@ def _parse_dataviz(text: str) -> dict | None:
                 break
     if vc is None or any(_to_float(r[vc]) is None for r in rows):
         return None
-    return {"columns": columns, "rows": rows, "value_column": vc, "format": d.get("format")}
+    return {"columns": columns, "rows": rows, "value_column": vc, "format": d.get("format"),
+            "kind": d.get("kind"), "view": d.get("view")}
 
 
 def _req(url: str, payload: dict | None = None, method: str | None = None,
@@ -217,6 +230,8 @@ def run(q: dict) -> dict:
     dv_ok = True
     if q.get("dataviz"):
         dv_ok = dv is not None
+        if q.get("view") and dv is not None:
+            dv_ok = dv.get("view") == q["view"]
     elif q.get("no_dataviz"):
         dv_ok = dv is None
     return {
