@@ -28,8 +28,15 @@ function toNum(v: unknown): number | null {
   return null
 }
 
+const MISSING_VALUE_TOKENS = new Set([
+  '', 'value not stated', 'not stated', 'n/a', 'na', 'n/d', 'nil', 'none',
+  'unknown', 'tbd', 'to be decided', 'to be determined', '—', '-', '--',
+])
+
 function isMissing(v: unknown): boolean {
-  return v == null || (typeof v === 'string' && v.trim() === '')
+  if (v == null) return true
+  if (typeof v === 'string') return MISSING_VALUE_TOKENS.has(v.trim().toLowerCase())
+  return false
 }
 
 // A value column must hold a number in every non-missing cell and at least one
