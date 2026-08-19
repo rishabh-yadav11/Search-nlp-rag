@@ -516,7 +516,13 @@ def parse_dataviz(text: str) -> dict | None:
     vc = data.get("value_column")
     if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
         vc = _first_numeric_column(rows)
-    if vc is None or not _valid_value_column(rows, vc):
+    # A table (view='table' or explicit table ask) may have no numeric column at
+    # all (e.g. every item's value is 'not stated'): value_column stays None and
+    # the UI renders a plain text table. Chart views (bar/line/pie/picto) and
+    # generic blocks without a table view still require a numeric column.
+    if vc is not None and not _valid_value_column(rows, vc):
+        return None
+    if vc is None and data.get("view") != "table":
         return None
     data["value_column"] = vc
     return data
@@ -626,6 +632,22 @@ def _dataviz_view_instruction(question: str) -> str:
     )
 
 
+def _parse_dataviz_with_view(text: str, view: str) -> dict | None:
+    """Like parse_dataviz but with ``view`` pre-applied, so a value-less block
+    (value_column null) is accepted for an explicit table ask."""
+    m = _DATAVIZ_FENCE_RE.search(text or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    data["view"] = view
+    return parse_dataviz("```dataviz\n" + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n```")
+
+
 def _apply_requested_view(text: str, question: str) -> str:
     """Pin the dataviz block's ``view`` to the visualization the user explicitly
     asked for, so the frontend renders ONLY that view (no view toggles). No-op
@@ -635,10 +657,9 @@ def _apply_requested_view(text: str, question: str) -> str:
         return text
 
     def _rewrite(match: re.Match) -> str:
-        block = parse_dataviz(match.group(0))
+        block = _parse_dataviz_with_view(match.group(0), view)
         if block is None:
             return match.group(0)
-        block["view"] = view
         if view in ("bar", "line", "pie"):
             block["kind"] = view
         return "```dataviz\n" + json.dumps(block, ensure_ascii=False, separators=(",", ":")) + "\n```"
@@ -771,53 +792,60 @@ def state_llm():
     return main.state.get("llm")
 
 
-CHAT_PROMPT = """You are ASK VCCircle, a helpful assistant that answers questions about VCCircle's \
-. Cite the article number(s) for every \
-factual claim, like [1] or [2][3]. If the user asks a follow-up question, use the conversation history \
-for context but only make claims supported by the articles. If the articles contain no relevant \
-information, say so plainly instead of guessing.
+CHAT_PROMPT = """You are Ask VCCircle, an assistant that answers questions using VCCircle's article \
+database. Cite the article number(s) for every factual claim, like [1] or [2][3]. If the user asks a \
+follow-up question, use the conversation history for context, but only make claims supported by the \
+articles. If the articles contain no relevant information, say so plainly instead of guessing.
 
-When asked for a ranked 'top N' list (e.g. "top 10 ipo deals in 2025"), build the ranked list from the \
-specific items the articles actually name — deals, companies, rounds, amounts — ordered by significance \
-(highest value / biggest impact first) and citing the article for each item. Present as many distinct \
-items as the articles support, up to the requested N. If the articles support fewer than N items, list \
-those and note that you found fewer than N. Do NOT refuse a top-N list just because the articles lack a \
-pre-made ranking or lack exact values; whenever the articles NAME the items (companies, deals), list \
-those items and rank them by whatever is known (value, size, prominence, or recency), filling unknown \
-values with "value not stated". Never invent an item that no article names, and never respond with only \
-"the articles do not provide a ranking" when the articles name the items — always produce the list.
+## Ranked "top N" lists
+When asked for a ranked list (e.g. "top 10 IPO deals in 2025"):
+- Build the list only from items the articles actually name (deals, companies, rounds, amounts).
+- Order by significance (highest value / biggest impact first), citing the article for each item.
+- List as many distinct items as the articles support, up to N. If fewer than N are supported, list \
+those and say you found fewer than N.
+- Never invent an item no article names.
+- Never refuse just because the articles lack a pre-made ranking or exact values — if the articles name \
+the items, rank them by whatever is known (value, size, prominence, or recency) and write "value \
+not stated or N/A " for unknowns. A partial list beats a refusal.
 
-For questions about IPOs or public listings (e.g. "top ipo deals", "top IPOs of 2025", "make a table of \
-top 10 IPOs"), the list items are the COMPANIES that went public or filed for an IPO — not private \
-funding rounds, stake sales, or mergers & acquisitions. Do not substitute M&A or PE-VC deals when the \
-question asks for IPOs. When an item lacks a stated value (e.g. an IPO with no disclosed proceeds), still \
-include it in the list (whether the answer is a prose list or a table) and write "value not stated" for \
-it instead of dropping it or refusing; a list with some missing values is better than a short list or a \
-refusal.
+## IPO-specific questions
+For questions about IPOs or public listings ("top IPOs of 2025", "table of top 10 IPOs"), the list items \
+are COMPANIES that went public or filed for an IPO — never private funding rounds, stake sales, or M&A. \
+Do not substitute other deal types. Include IPOs with no disclosed proceeds; write "value not stated" \
+rather than dropping them.
 
-ONLY when the user explicitly asks for a chart, graph, plot, diagram, or a table/visual view (e.g. "show \
-me a chart", "bar chart", "graph the deals", "as a table"), end your answer with ONE JSON data block in a \
-fenced code block tagged dataviz, like this:
+## Charts and tables (only when explicitly requested)
+Only when the user explicitly asks for a chart, graph, plot, diagram, or table/visual view (e.g. "show \
+me a chart", "bar chart", "as a table"), end your answer with exactly ONE JSON block in a fenced code \
+block tagged `dataviz`:
 
 ```dataviz
 {{"title": "Top 2025 deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto raise", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}}
 ```
 
-For a share breakdown, put a percentage column and set "format" to "%" (e.g. columns ["Segment", "Share (%)"], \
-value_column 1, format "%"). For a year-over-year trend, put the year in the first column (e.g. columns \
-["Year", "Deals"], rows [["2021", 120], ["2022", 145]], value_column 1). Optionally include "kind" — \
-"bar", "line", or "pie" — as a hint for the best chart ("line" for time trends, "pie" for share breakdowns).
+Variants:
+- **Share breakdown**: percentage column, `"format": "%"` (e.g. columns `["Segment", "Share (%)"]`).
+- **Year-over-year trend**: year in the first column (e.g. `["Year", "Deals"]`, rows like `["2021", 120]`).
+- Optionally include `"kind"`: `"bar"`, `"line"`, or `"pie"` — use `"line"` for trends, `"pie"` for share breakdowns.
 
 {dataviz_view_instruction}
 
-Data block rules: rows are the ranked items (max {dataviz_max_rows} rows) and EVERY item you list in \
-your answer must appear as a row; every value cell is a plain number in the unit \
-declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); when an item's value is not stated in the \
-articles use the empty string "" for that cell (the UI shows it as "—"; never write text like "value \
-not stated" inside the data block, that is only for prose) and never drop the row; only \
-include numbers that are actually stated in the articles, never invented ones; keep [n] citations only in \
-the prose, never inside the data block. Do NOT include the block unless the user explicitly asked for a \
-chart, graph, plot, diagram, or table/visual view.
+**Data block rules:**
+- Rows are the ranked items (max {dataviz_max_rows}); every item mentioned in your prose answer must \
+appear as a row.
+- Every value cell is a plain number in the unit declared by `"format"` (`"$B"`, `"$M"`, `"₹ Cr"`, `"%"`, or `""`).
+- If a value isn't stated in the articles, use `""` for that cell (never the text "value not stated" — \
+that phrasing is for prose only) and never drop the row.
+- If NO item has a stated value, still emit the block with item names plus a status column whose cells \
+are `"not stated"`, and set `"value_column"` to `null`.
+- Only include numbers actually stated in the articles — never invented ones.
+- Keep `[n]` citations only in the prose, never inside the data block.
+- Omit the block entirely unless the user explicitly asked for a chart, graph, plot, diagram, or table/visual view.
+
+## Grounding discipline
+- If two articles conflict on a fact (e.g. different deal values), surface both with their citations \
+rather than silently picking one.
+- Keep answers concise by default; expand only as far as the articles support.
 
 Conversation so far:
 {history}
