@@ -605,6 +605,27 @@ def test_sanitize_dataviz_keeps_valid_strips_malformed():
     assert chat_module._sanitize_dataviz(plain) == plain
 
 
+def test_parse_dataviz_rejects_all_empty_label_cells():
+    """A table whose label column is blank on every row (e.g. the model emitted
+    only values and no deal/company names) is useless and must be treated as
+    malformed so the nudge retry rebuilds it."""
+    empty_labels = (
+        '```dataviz\n{"columns": ["Deal", "Value ($B)"], '
+        '"rows": [["", 8.5], ["", 4.3], ["", 0.35]], "value_column": 1, "format": "$B"}\n```'
+    )
+    assert chat_module.parse_dataviz(empty_labels) is None
+    out = chat_module._sanitize_dataviz("Prose [1].\n\n" + empty_labels)
+    assert "```dataviz" not in out
+    assert "Prose [1]" in out
+
+    # A block with names present (even if a few rows are blank) stays valid.
+    partly = (
+        '```dataviz\n{"columns": ["Deal", "Value ($B)"], '
+        '"rows": [["Reliance", 8.5], ["", 4.3], ["Zepto", 0.35]], "value_column": 1}\n```'
+    )
+    assert chat_module.parse_dataviz(partly) is not None
+
+
 def test_finalize_answer_only_keeps_charts_on_explicit_request():
     """Charts must never appear unless the user explicitly asked for one
     (guards non-deterministic model emission of dataviz blocks)."""
