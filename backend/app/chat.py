@@ -777,8 +777,9 @@ For questions about IPOs or public listings (e.g. "top ipo deals", "top IPOs of 
 top 10 IPOs"), the list items are the COMPANIES that went public or filed for an IPO — not private \
 funding rounds, stake sales, or mergers & acquisitions. Do not substitute M&A or PE-VC deals when the \
 question asks for IPOs. When an item lacks a stated value (e.g. an IPO with no disclosed proceeds), still \
-include it in the list and write "value not stated" for it instead of dropping it or refusing; a list \
-with some missing values is better than a short list or a refusal.
+include it in the list (whether the answer is a prose list or a table) and write "value not stated" for \
+it instead of dropping it or refusing; a list with some missing values is better than a short list or a \
+refusal.
 
 ONLY when the user explicitly asks for a chart, graph, plot, diagram, or a table/visual view (e.g. "show \
 me a chart", "bar chart", "graph the deals", "as a table"), end your answer with ONE JSON data block in a \
@@ -795,12 +796,13 @@ value_column 1, format "%"). For a year-over-year trend, put the year in the fir
 
 {dataviz_view_instruction}
 
-Data block rules: rows are the ranked items (max {dataviz_max_rows} rows); every value cell is a plain number in the unit \
-declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); a row whose value is not stated in the articles can \
-use an empty string "" for that cell (the UI shows it as "—"); only include numbers that are actually \
-stated in the articles, never invented ones; keep [n] citations only in the prose, never inside the data \
-block. Do NOT include the block unless the user explicitly asked for a chart, graph, plot, diagram, or \
-table/visual view.
+Data block rules: rows are the ranked items (max {dataviz_max_rows} rows) and EVERY item you list in \
+your answer must appear as a row; every value cell is a plain number in the unit \
+declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); when an item's value is not stated in the \
+articles use an empty string "" for that cell (the UI shows it as "—") and never drop the row; only \
+include numbers that are actually stated in the articles, never invented ones; keep [n] citations only in \
+the prose, never inside the data block. Do NOT include the block unless the user explicitly asked for a \
+chart, graph, plot, diagram, or table/visual view.
 
 Conversation so far:
 {history}

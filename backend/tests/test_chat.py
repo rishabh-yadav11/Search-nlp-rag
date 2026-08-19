@@ -709,9 +709,10 @@ def test_chat_prompt_instructs_constructing_top_n_lists():
     # and a list item with no stated value must still be included.
     assert "the list items are the COMPANIES that went public or filed for an IPO" in chat_module.CHAT_PROMPT
     assert "Do not substitute M&A or PE-VC deals when the question asks for IPOs" in chat_module.CHAT_PROMPT
-    assert "still include it in the list and write \"value not stated\"" in chat_module.CHAT_PROMPT
-    # The dataviz table may hold rows whose value cell is an empty string.
-    assert "can use an empty string \"\" for that cell" in chat_module.CHAT_PROMPT
+    assert "write \"value not stated\"" in chat_module.CHAT_PROMPT
+    # The dataviz table must include every listed item; missing values use "".
+    assert "EVERY item you list in your answer must appear as a row" in chat_module.CHAT_PROMPT
+    assert "never drop the row" in chat_module.CHAT_PROMPT
 
 
 def test_requested_view_detection():
