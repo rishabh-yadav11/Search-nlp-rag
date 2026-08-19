@@ -154,8 +154,8 @@ GOLDEN = [
     },
     {
         "id": 21,
-        "category": "typo: generic (funding -> fundnig)",
-        "q": "Venture debt providers in India fundnig",
+        "category": "typo: generic (providers -> provders)",
+        "q": "Venture debt provders in India",
         "expected": [37122, 39839, 26029],
     },
     {
