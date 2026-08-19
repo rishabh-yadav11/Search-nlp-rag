@@ -670,6 +670,14 @@ def test_dataviz_nudge_row_cap_scales():
     assert f"max {chat_module.config.TOP_K} rows" in chat_module._dataviz_nudge("who invested in Ola Electric?")
 
 
+def test_chat_prompt_instructs_constructing_top_n_lists():
+    """A 'top N' request must be answered by extracting and ranking the named
+    items from the articles, not refused because no pre-made ranking exists
+    (regression: 'top 10 ipo deals in 2025' was refused despite relevant data)."""
+    assert "build the ranked list from the specific items the articles actually name" in chat_module.CHAT_PROMPT
+    assert "Do NOT refuse a top-N list just because the articles lack a pre-made ranking" in chat_module.CHAT_PROMPT
+
+
 def test_requested_view_detection():
     assert chat_module._requested_view("show me a table of top deals") == "table"
     assert chat_module._requested_view("give me a bar chart") == "bar"
