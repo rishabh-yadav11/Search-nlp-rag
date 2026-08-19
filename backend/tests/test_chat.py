@@ -570,11 +570,26 @@ def test_parse_dataviz_allows_missing_values():
         '```dataviz\n{"columns": ["Company", "Value"], '
         '"rows": [["Wakefit", "abc"], ["Groww", 1200]], "value_column": 1}\n```'
     ) is None
-    # A value column with no numeric cell at all is invalid.
+    # A value column with no numeric cell at all is invalid for a chart block...
     assert chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Value"], '
         '"rows": [["Wakefit", ""], ["Groww", "value not stated"]], "value_column": 1}\n```'
     ) is None
+    # ...but a table block with no numeric column (value_column null) is valid
+    # for a plain text table (e.g. every item's value is 'not stated').
+    data = chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Status"], '
+        '"rows": [["Wakefit", "not stated"], ["Groww", "not stated"]], "value_column": null, "view": "table"}\n```'
+    )
+    assert data is not None
+    assert data["value_column"] is None
+    # When a numeric column exists, a missing value_column still auto-detects it.
+    data = chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Value"], '
+        '"rows": [["Wakefit", ""], ["Groww", 1200]]}\n```'
+    )
+    assert data is not None
+    assert data["value_column"] == 1
 
 
 def test_sanitize_dataviz_keeps_valid_strips_malformed():
@@ -711,17 +726,18 @@ def test_chat_prompt_instructs_constructing_top_n_lists():
     """A 'top N' request must be answered by extracting and ranking the named
     items from the articles, not refused because no pre-made ranking exists
     (regression: 'top 10 ipo deals in 2025' was refused despite relevant data)."""
-    assert "build the ranked list from the specific items the articles actually name" in chat_module.CHAT_PROMPT
-    assert "Do NOT refuse a top-N list just because the articles lack a pre-made ranking" in chat_module.CHAT_PROMPT
-    assert "never respond with only \"the articles do not provide a ranking\"" in chat_module.CHAT_PROMPT
+    assert "Build the list only from items the articles actually name" in chat_module.CHAT_PROMPT
+    assert "Never refuse just because the articles lack a pre-made ranking or exact values" in chat_module.CHAT_PROMPT
+    assert "A partial list beats a refusal" in chat_module.CHAT_PROMPT
     # IPO questions must yield companies that went public, not M&A/stake deals,
     # and a list item with no stated value must still be included.
-    assert "the list items are the COMPANIES that went public or filed for an IPO" in chat_module.CHAT_PROMPT
-    assert "Do not substitute M&A or PE-VC deals when the question asks for IPOs" in chat_module.CHAT_PROMPT
+    assert "are COMPANIES that went public or filed for an IPO" in chat_module.CHAT_PROMPT
+    assert "never private funding rounds, stake sales, or M&A" in chat_module.CHAT_PROMPT
     assert "write \"value not stated\"" in chat_module.CHAT_PROMPT
     # The dataviz table must include every listed item; missing values use "".
-    assert "EVERY item you list in your answer must appear as a row" in chat_module.CHAT_PROMPT
+    assert "every item mentioned in your prose answer must appear as a row" in chat_module.CHAT_PROMPT
     assert "never drop the row" in chat_module.CHAT_PROMPT
+    assert "set `\"value_column\"` to `null`" in chat_module.CHAT_PROMPT
 
 
 def test_requested_view_detection():
@@ -759,6 +775,20 @@ def test_apply_requested_view_pins_block_view():
     out = chat_module._apply_requested_view(text, "show me a table of deals")
     block = chat_module.parse_dataviz(out)
     assert block["view"] == "table"
+
+    # A value-less table block (every item's value 'not stated') is accepted for
+    # an explicit table ask and rendered as a plain text table (value_column null).
+    text2 = (
+        "Top IPOs [1].\n\n```dataviz\n"
+        '{"columns": ["Company", "Status"], "rows": [["Wakefit", "not stated"], ["Groww", "not stated"]]}\n'
+        "```"
+    )
+    out = chat_module._apply_requested_view(text2, "make a table of top 10 ipos")
+    block = chat_module.parse_dataviz(out)
+    assert block is not None
+    assert block["view"] == "table"
+    assert block["value_column"] is None
+    assert "not stated" in out
 
     # Generic chart ask leaves the block untouched.
     assert chat_module._apply_requested_view(text, "show me a chart of deals") == text
@@ -799,7 +829,7 @@ def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
     turn = _run(chat_module._prepare_turn("top 10 ipo deals in 2025", []))
     assert captured["top_k"] == 10
     assert len(turn.sources) == 10
-    assert "max 10 rows" in turn.answer  # dataviz cap matches the requested N
+    assert "max 10" in turn.answer  # dataviz cap matches the requested N
 
     monkeypatch.setattr(main, "retrieve_and_rerank", make_fake(chat_module.config.TOP_K))
     turn = _run(chat_module._prepare_turn("who invested in Ola Electric?", []))

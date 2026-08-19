@@ -6,7 +6,7 @@ export type DataVizBlock = {
   title?: string
   columns: string[]
   rows: (string | number)[][]
-  value_column: number
+  value_column: number | null
   format?: string
   kind?: 'bar' | 'line' | 'pie'
   view?: 'table' | 'bar' | 'line' | 'pie' | 'picto'
@@ -71,7 +71,7 @@ export function parseDataViz(text: string): DataVizBlock | null {
       typeof vcRaw === 'number' && Number.isInteger(vcRaw) && vcRaw >= 0 && vcRaw < columns.length
         ? vcRaw
         : firstNumericColumn(rowArr)
-    if (vc == null || !validValueColumn(rowArr, vc)) return null
+    if (vc != null && !validValueColumn(rowArr, vc)) return null
     const kind = (d as { kind?: unknown }).kind
     const view = (d as { view?: unknown }).view
     return {
@@ -144,7 +144,8 @@ const COLORS = ['#1a5fb4', '#26a269', '#e66100', '#c01c28', '#613583', '#2a7bde'
 
 function BarChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
-  const values = rows.map((r) => toNum(r[vc]) ?? 0)
+  const v = vc ?? 0
+  const values = rows.map((r) => toNum(r[v]) ?? 0)
   const maxVal = Math.max(1, ...values)
   const n = rows.length
   const slot = 64
@@ -191,7 +192,8 @@ function BarChart({ block }: { block: DataVizBlock }) {
 
 function LineChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
-  const values = rows.map((r) => toNum(r[vc]) ?? 0)
+  const v = vc ?? 0
+  const values = rows.map((r) => toNum(r[v]) ?? 0)
   const maxVal = Math.max(1, ...values)
   const n = rows.length
   const width = Math.max(340, n * 80 + 60)
@@ -240,7 +242,8 @@ function LineChart({ block }: { block: DataVizBlock }) {
 
 function PieChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
-  const values = rows.map((r) => toNum(r[vc]) ?? 0)
+  const v = vc ?? 0
+  const values = rows.map((r) => toNum(r[v]) ?? 0)
   const total = values.reduce((a, b) => a + b, 0)
   const cx = 110
   const cy = 110
@@ -291,7 +294,7 @@ function PieChart({ block }: { block: DataVizBlock }) {
             <span className="chat-viz-swatch" style={{ background: COLORS[i % COLORS.length] }} />
             <span className="chat-viz-legend-label">{String(row[0])}</span>
             <span className="chat-viz-legend-val">
-              {formatValue(toNum(row[vc]) ?? 0, format)} · {total ? Math.round((toNum(row[vc])! / total) * 1000) / 10 : 0}%
+              {formatValue(toNum(row[v]) ?? 0, format)} · {total ? Math.round((toNum(row[v])! / total) * 1000) / 10 : 0}%
             </span>
           </li>
         ))}
@@ -302,15 +305,16 @@ function PieChart({ block }: { block: DataVizBlock }) {
 
 function PictogramChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
-  const values = rows.map((r) => toNum(r[vc]) ?? 0)
+  const v = vc ?? 0
+  const values = rows.map((r) => toNum(r[v]) ?? 0)
   const maxVal = Math.max(1, ...values)
   const scale = maxVal > 40 ? Math.ceil(maxVal / 40) : 1
 
   return (
     <div className="chat-viz-picto">
       {rows.map((row, i) => {
-        const v = toNum(row[vc]) ?? 0
-        const icons = Math.round(v / scale)
+        const val = toNum(row[v]) ?? 0
+        const icons = Math.round(val / scale)
         return (
           <div className="chat-viz-picto-row" key={i}>
             <span className="chat-viz-picto-label">{String(row[0])}</span>
@@ -320,7 +324,7 @@ function PictogramChart({ block }: { block: DataVizBlock }) {
               ))}
             </span>
             <span className="chat-viz-picto-val">
-              {formatValue(v, format)}
+              {formatValue(val, format)}
               {scale > 1 ? ` (${scale} per icon)` : ''}
             </span>
           </div>
@@ -371,17 +375,19 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
 export default function DataViz({ block }: { block: DataVizBlock }) {
   const [view, setView] = useState<NonNullable<DataVizBlock['view']>>(block.kind ?? 'table')
   const [raw, setRaw] = useState(false)
+  const vc = block.value_column
   const numbers = useMemo(
-    () => block.rows.every((r) => toNum(r[block.value_column]) != null),
-    [block],
+    () => vc != null && block.rows.every((r) => toNum(r[vc]) != null),
+    [block, vc],
   )
   const pictoOk = useMemo(
     () =>
+      vc != null &&
       block.rows.every((r) => {
-        const v = toNum(r[block.value_column])
+        const v = toNum(r[vc])
         return v != null && Number.isInteger(v) && v >= 0
       }),
-    [block],
+    [block, vc],
   )
   // When the user explicitly asked for one view (block.view set by the backend),
   // render ONLY that view; otherwise keep the interactive view toggles.
