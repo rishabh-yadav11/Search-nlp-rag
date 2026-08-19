@@ -128,6 +128,14 @@ class Config:
     QUERY_FIX_MIN_COUNT = int(os.getenv("QUERY_FIX_MIN_COUNT", "5"))
     QUERY_FIX_MIN_TOKEN_LEN = int(os.getenv("QUERY_FIX_MIN_TOKEN_LEN", "3"))
 
+    # Result diversity (app/diversity.py): greedy MMR over the reranked set to
+    # avoid near-duplicate headlines filling the top-k. LAMBDA near 1 favours
+    # pure relevance; lower trades relevance for headline diversity. Applied in
+    # /search before the final top-k slice.
+    ENABLE_DIVERSITY = os.getenv("ENABLE_DIVERSITY", "true").lower() in ("1", "true", "yes")
+    DIVERSITY_LAMBDA = float(os.getenv("DIVERSITY_LAMBDA", "0.7"))
+    DIVERSITY_SIM_THRESHOLD = float(os.getenv("DIVERSITY_SIM_THRESHOLD", "0.4"))
+
     # Chat-only "body rescue": when the top reranked score is below
     # BODY_RESCUE_THRESHOLD, re-score the candidates against the body region
     # with the most lexical query-token overlap and keep max(baseline, body).

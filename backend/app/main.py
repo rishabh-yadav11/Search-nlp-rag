@@ -34,6 +34,7 @@ from app.answer_fallback import date_label, weak_results_note
 from app.auth import require_auth, require_permission
 from app.config import config
 from app.cost_budget import close as close_cost_budget
+from app.diversity import diversify
 from app.encoders import DenseEncoder
 from app.health import router as health_router
 from app.query_expand import expand_query
@@ -567,6 +568,9 @@ async def search(
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     reranked = await retrieve_and_rerank(q_fixed, eff_top_k, qfilter)
+    if config.ENABLE_DIVERSITY:
+        reranked = diversify(reranked, eff_top_k, lam=config.DIVERSITY_LAMBDA,
+                             sim_thresh=config.DIVERSITY_SIM_THRESHOLD)
     results = reranked[:eff_top_k]
     note = weak_results_note([r.score for r in results], date_label(eff_from, eff_to))
     await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
