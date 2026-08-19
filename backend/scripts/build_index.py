@@ -85,12 +85,20 @@ def backup_collection_best_effort(client: QdrantClient):
         log(f"WARNING: best-effort backup before collection change failed: {e}")
 
 
-def ensure_collection(client: QdrantClient):
+def ensure_collection(client: QdrantClient) -> bool:
+    """Ensure the collection matches the current schema.
+
+    Returns True if the collection was (re)created empty this run. When that
+    happens the caller MUST reset the embed checkpoint to 0: the previous
+    checkpoint refers to rows embedded into a collection that no longer exists,
+    and resuming from it would silently skip the earlier rows in the new one
+    (a regression that once left feids 1-7171 permanently absent).
+    """
     existing = [c.name for c in client.get_collections().collections]
     if config.QDRANT_COLLECTION not in existing:
         backup_collection_best_effort(client)
         create_collection(client)
-        return
+        return True
 
     info = client.get_collection(collection_name=config.QDRANT_COLLECTION)
     # Introspection is tolerant: some qdrant server/client combinations don't
@@ -107,7 +115,7 @@ def ensure_collection(client: QdrantClient):
 
     if needs_idf and dim_matches:
         print(f"Collection '{config.QDRANT_COLLECTION}' already exists, resuming upserts into it")
-        return
+        return False
 
     print(
         f"Collection '{config.QDRANT_COLLECTION}' exists but is incompatible "
@@ -117,6 +125,7 @@ def ensure_collection(client: QdrantClient):
     backup_collection_best_effort(client)
     client.delete_collection(collection_name=config.QDRANT_COLLECTION)
     create_collection(client)
+    return True
 
 
 def create_collection(client: QdrantClient):
@@ -166,7 +175,15 @@ def main():
     sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
-    ensure_collection(client)
+    recreated = ensure_collection(client)
+
+    if recreated:
+        save_checkpoint(0)
+        print(
+            "Collection was (re)created empty this run — embed checkpoint reset to 0 so "
+            "the ENTIRE dataset is re-indexed (the old checkpoint referred to a "
+            "collection that no longer exists).",
+        )
 
     start_line = load_checkpoint()
 
@@ -239,17 +256,27 @@ def main():
         executor.shutdown(wait=False)
 
     pbar.close()
-    processed = total - start_line
     try:
         info = client.get_collection(config.QDRANT_COLLECTION)
         count = info.points_count or 0
-        if count < processed:
+        # Compare against the FULL dataset size, not the number of lines processed
+        # this run. A resume-from-checkpoint shortfall (e.g. rows skipped because
+        # the collection was recreated after a stale checkpoint) would otherwise
+        # pass verification even though the index is incomplete.
+        if count < total:
+            log(
+                f"ERROR: collection '{config.QDRANT_COLLECTION}' has {count} points "
+                f"but the dataset has {total} articles ({total - count} missing). "
+                f"The index is INCOMPLETE — investigate before going live.",
+            )
+        elif count > total:
             log(
                 f"WARNING: collection '{config.QDRANT_COLLECTION}' has {count} points "
-                f"but {processed} lines were processed",
+                f"which EXCEEDS the {total}-row dataset (possible stale points from a "
+                f"previous schema). Consider a clean rebuild.",
             )
         else:
-            log(f"verified: {count} points in collection >= {processed} lines processed")
+            log(f"verified: {count} points in collection == {total} dataset articles")
     except Exception as e:
         log(f"WARNING: could not verify points_count: {e}")
     print("Index build complete.")

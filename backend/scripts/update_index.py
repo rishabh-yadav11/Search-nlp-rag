@@ -240,12 +240,13 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
         executor.shutdown(wait=False)
 
 
-def reconcile(state: dict, records: dict[int, dict]):
+def reconcile(state: dict, records: dict[int, dict]) -> bool:
     """Compare the full Qdrant point-id set to the DB row id set.
 
     Scrolls the whole collection in batches of 500 with payloads and vectors
     disabled (bounded, fast). Logs a WARNING listing the count mismatch plus
-    sample missing/extra IDs. Never raises.
+    sample missing/extra IDs. Returns True when in sync, False on any mismatch.
+    Never raises.
     """
     from qdrant_client import QdrantClient
 
@@ -277,10 +278,12 @@ def reconcile(state: dict, records: dict[int, dict]):
                 log(f"  MISSING in Qdrant: {i}")
             for i in sorted(extra)[:10]:
                 log(f"  EXTRA in Qdrant (not in DB): {i}")
-        else:
-            log(f"reconcile OK: Qdrant {len(point_ids)} points match DB {len(db_ids)} rows")
+            return False
+        log(f"reconcile OK: Qdrant {len(point_ids)} points match DB {len(db_ids)} rows")
+        return True
     except Exception as e:
         log(f"WARNING: reconcile failed: {e}")
+        return False
 
 
 async def main():
@@ -316,8 +319,7 @@ async def main():
         }
         save_state(state)
         log(f"seeded {len(state_fps)} fingerprints (last_id={state['last_id']})")
-        reconcile(state, records)
-        return
+        return 0 if reconcile(state, records) else 1
 
     new, changed, deleted = sync_delta(state, records)
     log(
@@ -327,13 +329,12 @@ async def main():
 
     if not new and not changed and not deleted:
         log(f"index current ({time.perf_counter() - start:.2f}s, models not loaded)")
-        reconcile(state, records)
-        return
+        return 0 if reconcile(state, records) else 1
 
     apply_delta(records, new, changed, deleted, state)
     log(f"done in {time.perf_counter() - start:.2f}s")
-    reconcile(state, records)
+    return 0 if reconcile(state, records) else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

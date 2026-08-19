@@ -373,9 +373,8 @@ Hardening baked into `setup.sh`:
   rate limits. LLM spend is bounded by `LLM_DAILY_BUDGET_USD` (see
   `app/cost_budget.py`).
 - **Health monitoring** — `deploy/healthcheck.sh` probes `/health` (run from
-  cron every few minutes), restarts `vccircle-backend` when unhealthy, and posts
-  an alert to `HEALTHCHECK_WEBHOOK_URL` if a restart doesn't recover the app.
-  Logs to `logs/healthcheck.log`.
+  cron every few minutes), restarts `vccircle-backend` when unhealthy, and logs
+  if a restart doesn't recover the app. Logs to `logs/healthcheck.log`.
 
 ## Supported settings
 
