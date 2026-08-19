@@ -1,0 +1,72 @@
+"""Simple concurrent load test for /search.
+
+Measures throughput and latency under concurrency against a running backend.
+Two modes:
+
+  cold  - N DISTINCT queries so every request hits the full pipeline
+          (encode + rerank + Qdrant); stresses inference/CPU.
+  hot   - every request uses the SAME query (cache hits); stresses I/O.
+
+Run from anywhere (the backend must be up):
+
+    python3 scripts/load_test.py --base http://localhost:8001 \
+        --concurrency 32 --total 64 --mode cold --workers 8
+
+Prints total time, requests/sec, and p50/p95/p99 latency (ms).
+"""
+import argparse
+import concurrent.futures as cf
+import statistics
+import time
+import urllib.parse
+import urllib.request
+
+
+# Cold queries: distinct but meaningful so each triggers a full retrieval pass.
+def cold_query(i: int) -> str:
+    topics = [
+        "venture debt providers", "fintech funding round", "AI startups raising capital",
+        "electric vehicle charging companies", "edtech deals 2023", "crypto exchange funding",
+        "healthcare private equity India", "manufacturing series B", "saas companies growth",
+        "unicorn creation 2025",
+    ]
+    return f"{topics[i % len(topics)]} {i // len(topics) + 1}"
+
+
+def hit(url: str, q: str, hot: bool) -> float:
+    query = "top startup funding deals of 2024" if hot else cold_query(int(q) if q.isdigit() else 0)
+    u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(u, timeout=120) as r:
+        r.read()
+    return (time.perf_counter() - t0) * 1000
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", default="http://localhost:8001")
+    ap.add_argument("--concurrency", type=int, default=16)
+    ap.add_argument("--total", type=int, default=48)
+    ap.add_argument("--mode", choices=["cold", "hot"], default="cold")
+    ap.add_argument("--workers", type=int, default=None, help="label only")
+    args = ap.parse_args()
+
+    tasks = [str(i % 10000) for i in range(args.total)]
+    latencies: list[float] = []
+    t0 = time.perf_counter()
+    with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futs = [ex.submit(hit, args.base, t, args.mode == "hot") for t in tasks]
+        for f in cf.as_completed(futs):
+            latencies.append(f.result())
+    total_s = time.perf_counter() - t0
+
+    latencies.sort()
+    p = lambda q: statistics.quantiles(latencies, n=100)[q - 1]
+    label = f"workers={args.workers or '?'}"
+    print(f"[{args.mode:>4}] {label}  total={args.total} conc={args.concurrency} "
+          f"time={total_s:.2f}s  rps={args.total / total_s:.1f}  "
+          f"p50={p(50):.0f}ms p95={p(95):.0f}ms p99={p(99):.0f}ms")
+
+
+if __name__ == "__main__":
+    main()
