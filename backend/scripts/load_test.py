@@ -23,19 +23,21 @@ import urllib.request
 
 
 # Cold queries: each request gets a UNIQUE query so every one triggers a full
-# retrieval pass (distinct queries can't hit the search/retrieve cache).
-def cold_query(i: int) -> str:
+# retrieval pass (distinct queries can't hit the search/retrieve cache). A
+# per-run offset makes queries differ across invocations so the per-worker
+# in-process TTLCache (not cleared by redis FLUSHDB) can't serve them.
+def cold_query(i: int, run_id: int) -> str:
     topics = [
         "venture debt providers", "fintech funding round", "AI startups raising capital",
         "electric vehicle charging companies", "edtech deals 2023", "crypto exchange funding",
         "healthcare private equity India", "manufacturing series B", "saas companies growth",
         "unicorn creation 2025",
     ]
-    return f"{topics[i % len(topics)]} {i}"
+    return f"{topics[i % len(topics)]} {run_id}-{i}"
 
 
-def hit(url: str, q: str, hot: bool) -> float:
-    query = "top startup funding deals of 2024" if hot else cold_query(int(q))
+def hit(url: str, q: str, hot: bool, run_id: int) -> float:
+    query = "top startup funding deals of 2024" if hot else cold_query(int(q), run_id)
     u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)
     t0 = time.perf_counter()
     with urllib.request.urlopen(u, timeout=120) as r:
@@ -50,13 +52,14 @@ def main() -> None:
     ap.add_argument("--total", type=int, default=48)
     ap.add_argument("--mode", choices=["cold", "hot"], default="cold")
     ap.add_argument("--workers", type=int, default=None, help="label only")
+    ap.add_argument("--run-id", type=int, default=0, help="cold-query namespace per run")
     args = ap.parse_args()
 
     tasks = [str(i % 10000) for i in range(args.total)]
     latencies: list[float] = []
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-        futs = [ex.submit(hit, args.base, t, args.mode == "hot") for t in tasks]
+        futs = [ex.submit(hit, args.base, t, args.mode == "hot", args.run_id) for t in tasks]
         for f in cf.as_completed(futs):
             latencies.append(f.result())
     total_s = time.perf_counter() - t0
