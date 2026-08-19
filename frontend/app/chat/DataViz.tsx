@@ -149,20 +149,26 @@ function BarChart({ block }: { block: DataVizBlock }) {
   const maxVal = Math.max(1, ...values)
   const n = rows.length
   const slot = 64
-  const width = Math.max(320, n * slot + 60)
-  const height = 240
-  const plotTop = 18
-  const plotBottom = height - 66
+  const padL = 56
+  const width = Math.max(360, n * slot + padL + 20)
+  const height = 244
+  const plotTop = 16
+  const plotBottom = height - 62
   const plotH = plotBottom - plotTop
   const barW = Math.min(44, slot - 16)
-  const rotate = n > 4
+  // Rotate labels only when there are enough bars that horizontal ones would
+  // collide; the shallow angle + centered anchor keeps every name inside the
+  // viewBox even at the plot edges.
+  const rotate = n > 6
+  const labelY = height - 34
+  const angle = rotate ? -20 : 0
 
   return (
     <div className="chat-viz-chart">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={block.title || 'bar chart'}>
-        {values.map((v, i) => {
-          const bh = Math.max(2, (v / maxVal) * plotH)
-          const x = 30 + i * slot
+        {values.map((val, i) => {
+          const bh = Math.max(2, (val / maxVal) * plotH)
+          const x = padL + i * slot
           const y = plotBottom - bh
           const full = String(rows[i][0] ?? '')
           const label = full.length > 14 ? `${full.slice(0, 13)}…` : full
@@ -171,13 +177,13 @@ function BarChart({ block }: { block: DataVizBlock }) {
               <title>{full}</title>
               <rect x={x} y={y} width={barW} height={bh} rx={3} fill={COLORS[i % COLORS.length]} />
               <text x={x + barW / 2} y={y - 5} textAnchor="middle" className="chat-viz-bar-val">
-                {formatValue(v, format)}
+                {formatValue(val, format)}
               </text>
               <text
                 x={x + barW / 2}
-                y={height - 14}
-                textAnchor="end"
-                transform={`rotate(${rotate ? -24 : 0} ${x + barW / 2} ${height - 14})`}
+                y={labelY}
+                textAnchor="middle"
+                transform={`rotate(${angle} ${x + barW / 2} ${labelY})`}
                 className="chat-viz-bar-label"
               >
                 {label}
