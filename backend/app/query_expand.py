@@ -101,6 +101,101 @@ CONCEPT_EXPANSIONS: dict[str, list[str]] = {
         "series b",
         "series c",
     ],
+    "crypto/cryptocurrency/cryptocurrencies": [
+        "crypto",
+        "bitcoin",
+        "blockchain",
+        "web3",
+        "token",
+        "digital asset",
+    ],
+    "web3": [
+        "web3",
+        "blockchain",
+        "crypto",
+        "decentralized",
+    ],
+    "spac/special purpose acquisition company": [
+        "special purpose acquisition company",
+        "blank check company",
+        "de-spac",
+        "merger to go public",
+    ],
+    "d2c/direct to consumer/direct-to-consumer": [
+        "direct-to-consumer",
+        "d2c brand",
+        "consumer brand",
+    ],
+    "manufacturing/manufacturers": [
+        "factory",
+        "industrial",
+        "production",
+        "plant",
+    ],
+    "electric vehicle/ev/evs": [
+        "electric vehicle",
+        "ev",
+        "battery",
+        "charging",
+    ],
+    "ai/artificial intelligence/ml/machine learning": [
+        "artificial intelligence",
+        "machine learning",
+        "generative ai",
+        "deep learning",
+    ],
+    "overseas/abroad/international/global": [
+        "international",
+        "global",
+        "overseas",
+        "cross-border",
+    ],
+    "merger/merge": [
+        "merger",
+        "acquisition",
+        "combine",
+    ],
+    "gaming/games": [
+        "gaming",
+        "esports",
+        "game studio",
+    ],
+    "insurtech/insurance": [
+        "insurtech",
+        "insurance tech",
+    ],
+    "healthtech/health tech/healthcare tech": [
+        "healthtech",
+        "healthcare",
+        "digital health",
+    ],
+    "saas/software as a service": [
+        "software as a service",
+        "cloud software",
+    ],
+    "series a/series b/series c/seed funding": [
+        "series a",
+        "series b",
+        "series c",
+        "seed round",
+        "early stage",
+    ],
+    "profitability/profitable": [
+        "profitability",
+        "profit",
+        "ebitda",
+    ],
+    "valuation/valuations": [
+        "valuation",
+        "worth",
+        "enterprise value",
+    ],
+    "exit/exits": [
+        "exit",
+        "ipo",
+        "acquisition exit",
+        "secondary",
+    ],
 }
 
 _MAX_EXTRA_TOKENS = 6
