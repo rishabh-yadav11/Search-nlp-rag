@@ -756,6 +756,58 @@ async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     return result
 
 
+# Refusal signatures a model can emit instead of the requested ranked list —
+# 'cannot be generated', 'unable to provide', 'do not contain specific amounts'.
+_RANKING_REFUSAL_RE = re.compile(
+    r"\b(?:cannot|can'?t|unable|couldn'?t|won'?t)\s+(?:be\s+)?"
+    r"(?:generated|provided|ranked|determined|constructed|compiled|created|listed)\b"
+    r"|\b(?:cannot|can'?t|unable\s+to)\s+(?:generate|provide|rank|determine|construct|compile)\b"
+    r"|\b(?:do|does)\s+not\s+(?:contain|include|have|provide)\s+(?:specific\s+)?"
+    r"(?:offering\s+)?(?:amounts?|values?|figures?|data|proceeds)\b"
+    r"|\bno\s+(?:specific\s+)?(?:offering\s+)?(?:amounts?|values?|figures?|data|proceeds)"
+    r"\s+(?:available|stated|provided|exist)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_ranking_refusal(text: str) -> bool:
+    """True when an answer refuses to produce a ranked list because values are
+    missing instead of ranking the named items (value not stated)."""
+    return bool(text and _RANKING_REFUSAL_RE.search(text))
+
+
+def _is_ranking_question(question: str) -> bool:
+    """True for a ranked/numeric list question (a 'top N' or top/best/leading/
+    biggest/largest intent), for which a refusal must trigger a nudge retry."""
+    return suggested_top_k(question) is not None
+
+
+_RANKING_NUDGE = (
+    "\n\nYour previous answer refused to provide a ranked list because exact values were missing. "
+    "Re-answer the SAME question and ALWAYS produce the ranked list. Use only items the articles name; "
+    "order them by whatever is known (value, size, prominence, or recency); and write \"value not "
+    "stated\" for every item whose amount is not in the articles. Never claim the list cannot be "
+    "generated or ranked — a ranked list with \"value not stated\" entries is always better than a refusal."
+)
+
+
+async def _answer_ranked(question: str, prompt: str) -> LLMResult:
+    """Call the LLM for a chat answer, applying the dataviz nudge (when a chart
+    was asked) and the ranking-refusal nudge (when a ranked list came back as a
+    refusal). At most one extra call for each; a failed retry keeps the first
+    answer instead of erroring the turn."""
+    result = await _answer_with_dataviz(question, prompt)
+    if _is_ranking_question(question) and _is_ranking_refusal(result.content):
+        try:
+            nudge = await generate_answer(state_llm(), prompt + _RANKING_NUDGE, config.LLM_MODEL)
+        except LLMUnavailableError:
+            return result
+        result.content = nudge.content
+        result.prompt_tokens += nudge.prompt_tokens
+        result.completion_tokens += nudge.completion_tokens
+    return result
+
+
 @dataclass
 class PreparedTurn:
     """Outcome of retrieval + prompt building for one turn.
@@ -863,7 +915,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
     await assert_within_budget()
-    result = await _answer_with_dataviz(question, turn.answer)
+    result = await _answer_ranked(question, turn.answer)
     await record_cost(result.cost())
     return (
         _finalize_answer(result.content, question),
@@ -887,21 +939,25 @@ follow-up question, use the conversation history for context, but only make clai
 articles. If the articles contain no relevant information, say so plainly instead of guessing.
 
 ## Ranked "top N" lists
-When asked for a ranked list (e.g. "top 10 IPO deals in 2025"):
+When asked for a ranked list (e.g. "top 10 IPO deals in 2025", "top 15 deals", "biggest funding rounds"):
 - Build the list only from items the articles actually name (deals, companies, rounds, amounts).
-- Order by significance (highest value / biggest impact first), citing the article for each item.
 - List as many distinct items as the articles support, up to N. If fewer than N are supported, list \
 those and say you found fewer than N.
+- Order by significance (highest value / biggest impact first), citing the article for each item.
 - Never invent an item no article names.
-- Never refuse just because the articles lack a pre-made ranking or exact values — if the articles name \
-the items, rank them by whatever is known (value, size, prominence, or recency) and write "value \
-not stated or N/A " for unknowns. A partial list beats a refusal.
+- **Never refuse, and never say a ranked list "cannot be generated"**, just because the articles lack \
+exact values or a pre-made ranking. If the articles name the items but don't state amounts, rank them \
+by whatever is known — prominence, size, or recency — and write "value not stated" for each unknown \
+value. A ranked list of the named items (even with every value "not stated") always beats a refusal.
+- This applies to EVERY ranked/numeric list question, not just IPOs: funding rounds, deals, M&A, \
+stake sales, companies, funds raised, hires — all of them.
 
 ## IPO-specific questions
 For questions about IPOs or public listings ("top IPOs of 2025", "table of top 10 IPOs"), the list items \
 are COMPANIES that went public or filed for an IPO — never private funding rounds, stake sales, or M&A. \
 Do not substitute other deal types. Include IPOs with no disclosed proceeds; write "value not stated" \
-rather than dropping them.
+rather than dropping them, and never refuse the ranked list for want of proceeds data — rank the named \
+IPO companies by prominence/recency and mark each missing value "not stated".
 
 ## Charts and tables (only when explicitly requested)
 Only when the user explicitly asks for a chart, graph, plot, diagram, or table/visual view (e.g. "show \
@@ -1110,6 +1166,18 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # user already saw it stream in.
                 try:
                     nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
+                except LLMUnavailableError:
+                    nudge = None
+                if nudge is not None:
+                    answer = nudge.content
+                    prompt_tokens += nudge.prompt_tokens
+                    completion_tokens += nudge.completion_tokens
+            if _is_ranking_question(question) and _is_ranking_refusal(answer):
+                # A ranked/numeric list question streamed back as a refusal
+                # ("cannot be generated", "no specific amounts"). Ask once more
+                # to rank the named items with "value not stated" for unknowns.
+                try:
+                    nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
                 except LLMUnavailableError:
                     nudge = None
                 if nudge is not None:
