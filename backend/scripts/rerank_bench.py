@@ -109,12 +109,18 @@ def quantize_onnx(fp32_dir: str, tag: str):
     from optimum.onnxruntime.configuration import AutoQuantizationConfig
 
     out = os.path.join(BENCH_DIR, tag)
-    if os.path.isfile(os.path.join(out, "model.onnx")):
-        return out
-    os.makedirs(out, exist_ok=True)
-    quantizer = ORTQuantizer.from_pretrained(fp32_dir, file_name="model.onnx")
-    dqconfig = AutoQuantizationConfig.avx512(is_static=False)
-    quantizer.quantize(save_dir=out, quantization_config=dqconfig)
+    if not os.path.isfile(os.path.join(out, "model.onnx")):
+        os.makedirs(out, exist_ok=True)
+        quantizer = ORTQuantizer.from_pretrained(fp32_dir, file_name="model.onnx")
+        dqconfig = AutoQuantizationConfig.avx512(is_static=False)
+        quantizer.quantize(save_dir=out, quantization_config=dqconfig)
+        # ORTQuantizer writes model_quantized.onnx; normalize the filename so
+        # the same loader works for fp32 and int8 exports.
+        src = os.path.join(out, "model_quantized.onnx")
+        if os.path.isfile(src):
+            os.replace(src, os.path.join(out, "model.onnx"))
+    if not os.path.isfile(os.path.join(out, "model.onnx")):
+        raise FileNotFoundError("int8 quantization produced no model.onnx")
     for f in ("config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.txt"):
         src = os.path.join(fp32_dir, f)
         if os.path.isfile(src) and not os.path.exists(os.path.join(out, f)):
