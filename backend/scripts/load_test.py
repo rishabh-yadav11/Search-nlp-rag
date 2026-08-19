@@ -22,7 +22,8 @@ import urllib.parse
 import urllib.request
 
 
-# Cold queries: distinct but meaningful so each triggers a full retrieval pass.
+# Cold queries: each request gets a UNIQUE query so every one triggers a full
+# retrieval pass (distinct queries can't hit the search/retrieve cache).
 def cold_query(i: int) -> str:
     topics = [
         "venture debt providers", "fintech funding round", "AI startups raising capital",
@@ -30,11 +31,11 @@ def cold_query(i: int) -> str:
         "healthcare private equity India", "manufacturing series B", "saas companies growth",
         "unicorn creation 2025",
     ]
-    return f"{topics[i % len(topics)]} {i // len(topics) + 1}"
+    return f"{topics[i % len(topics)]} {i}"
 
 
 def hit(url: str, q: str, hot: bool) -> float:
-    query = "top startup funding deals of 2024" if hot else cold_query(int(q) if q.isdigit() else 0)
+    query = "top startup funding deals of 2024" if hot else cold_query(int(q))
     u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)
     t0 = time.perf_counter()
     with urllib.request.urlopen(u, timeout=120) as r:
