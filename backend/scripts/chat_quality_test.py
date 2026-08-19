@@ -162,7 +162,14 @@ def _to_float(v: object) -> float | None:
 
 
 def _missing_cell(v: object) -> bool:
-    return v is None or (isinstance(v, str) and v.strip() == "")
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() in (
+            "", "value not stated", "not stated", "n/a", "na", "n/d", "nil", "none",
+            "unknown", "tbd", "to be decided", "to be determined", "—", "-", "--",
+        )
+    return False
 
 
 def _valid_value_column(rows: list[list[object]], j: int) -> bool:

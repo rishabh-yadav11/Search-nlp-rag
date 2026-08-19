@@ -457,10 +457,21 @@ def _as_float(v: object) -> float | None:
     return None
 
 
+_MISSING_VALUE_TOKENS = frozenset((
+    "", "value not stated", "not stated", "n/a", "na", "n/d", "nil", "none",
+    "unknown", "tbd", "to be decided", "to be determined", "—", "-", "--",
+))
+
+
 def _missing_cell(v: object) -> bool:
-    """True when a dataviz value cell explicitly marks a missing value ("" or
-    None), so a top-N table can include items whose value isn't stated."""
-    return v is None or (isinstance(v, str) and v.strip() == "")
+    """True when a dataviz value cell marks a missing value (null, empty string,
+    or a common 'not stated' token), so a top-N table can include items whose
+    value isn't stated."""
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() in _MISSING_VALUE_TOKENS
+    return False
 
 
 def _valid_value_column(rows: list[list[object]], j: int) -> bool:
@@ -799,7 +810,8 @@ value_column 1, format "%"). For a year-over-year trend, put the year in the fir
 Data block rules: rows are the ranked items (max {dataviz_max_rows} rows) and EVERY item you list in \
 your answer must appear as a row; every value cell is a plain number in the unit \
 declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); when an item's value is not stated in the \
-articles use an empty string "" for that cell (the UI shows it as "—") and never drop the row; only \
+articles use the empty string "" for that cell (the UI shows it as "—"; never write text like "value \
+not stated" inside the data block, that is only for prose) and never drop the row; only \
 include numbers that are actually stated in the articles, never invented ones; keep [n] citations only in \
 the prose, never inside the data block. Do NOT include the block unless the user explicitly asked for a \
 chart, graph, plot, diagram, or table/visual view.
