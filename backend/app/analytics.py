@@ -86,16 +86,44 @@ async def record_search(
         _degraded(exc)
 
 
-async def record_click(query: str, position: int) -> None:
-    """Count one result click from the frontend beacon. Never raises."""
+async def record_click(query: str, position: int, article_id: int | None = None) -> None:
+    """Count one result click from the frontend beacon. Never raises.
+
+    Also tallies per-query per-article clicks (keyed ``analytics:query_click:{q}``
+    as a sorted set of {article_id: count}) so the click-boost layer can learn
+    which results users actually open for a query.
+    """
     try:
         p = _client().pipeline()
         p.incr("analytics:click:total")
         p.incr(f"analytics:click:pos:{position}")
         p.zincrby("analytics:click_top_queries", 1, query)
+        if article_id is not None:
+            p.zincrby(f"analytics:query_click:{query}", 1, str(article_id))
         await p.execute()
     except Exception as exc:
         _degraded(exc)
+
+
+async def click_signals(query: str) -> dict | None:
+    """Per-query click signal for the click-boost layer, or None when the query
+    has too little click volume to act on. Returns ``{"total": int, "by_id": {id: count}}``."""
+    try:
+        c = _client()
+        key = f"analytics:query_click:{query}"
+        raw = await c.zrevrange(key, 0, 50, withscores=True)
+        if not raw:
+            return None
+        total = await c.zcard(key)
+        if total < config.CLICK_BOOST_MIN_CLICKS:
+            return None
+        return {
+            "total": total,
+            "by_id": {int(article_id): int(count) for article_id, count in raw if count >= 1},
+        }
+    except Exception as exc:
+        _degraded(exc)
+        return None
 
 
 def _i(value) -> int:

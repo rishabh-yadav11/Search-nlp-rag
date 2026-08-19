@@ -136,6 +136,17 @@ class Config:
     DIVERSITY_LAMBDA = float(os.getenv("DIVERSITY_LAMBDA", "0.7"))
     DIVERSITY_SIM_THRESHOLD = float(os.getenv("DIVERSITY_SIM_THRESHOLD", "0.4"))
 
+    # Click-driven learning (app/click_boost.py): per-query per-article click
+    # aggregates (analytics Redis) boost results users actually open. Inert until
+    # a query accumulates >= CLICK_BOOST_MIN_CLICKS clicks and an article holds
+    # >= CLICK_BOOST_MIN_ARTICLE_CLICKS clicks (>= CLICK_BOOST_MIN_SHARE of the
+    # query's total), so it never fires on sparse/noisy traffic.
+    ENABLE_CLICK_BOOST = os.getenv("ENABLE_CLICK_BOOST", "true").lower() in ("1", "true", "yes")
+    CLICK_BOOST_MIN_CLICKS = int(os.getenv("CLICK_BOOST_MIN_CLICKS", "5"))
+    CLICK_BOOST_MIN_ARTICLE_CLICKS = int(os.getenv("CLICK_BOOST_MIN_ARTICLE_CLICKS", "3"))
+    CLICK_BOOST_MIN_SHARE = float(os.getenv("CLICK_BOOST_MIN_SHARE", "0.3"))
+    CLICK_BOOST_MULT = float(os.getenv("CLICK_BOOST_MULT", "1.3"))
+
     # Chat-only "body rescue": when the top reranked score is below
     # BODY_RESCUE_THRESHOLD, re-score the candidates against the body region
     # with the most lexical query-token overlap and keep max(baseline, body).

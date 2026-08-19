@@ -127,10 +127,10 @@ function isSafeUrl(url: string): boolean {
   }
 }
 
-function trackClick(query: string, position: number) {
+function trackClick(query: string, position: number, id?: number) {
   if (typeof navigator === 'undefined' || !query) return
   try {
-    const payload = JSON.stringify({ query, position })
+    const payload = JSON.stringify({ query, position, id })
     const sent = navigator.sendBeacon(`${API_BASE}/analytics/click`, new Blob([payload], { type: 'application/json' }))
     if (sent) return
     fetch(`${API_BASE}/analytics/click`, {
@@ -621,7 +621,7 @@ function renderResults(items: Result[], query: string) {
                   href={r.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  onClick={() => trackClick(query, i + 1)}
+                  onClick={() => trackClick(query, i + 1, r.id)}
                 >
                   {r.title || 'Untitled'}
                 </a>
