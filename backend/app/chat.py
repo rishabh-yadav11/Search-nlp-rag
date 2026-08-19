@@ -28,6 +28,7 @@ from app.auth import require_auth, require_permission
 from app.config import config
 from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
+from app.query_intent import suggested_top_k
 
 logger = logging.getLogger("chat")
 
@@ -511,6 +512,15 @@ def _sanitize_dataviz(text: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_keep, text)
 
 
+def _effective_chat_k(question: str) -> int:
+    """How many sources chat should retrieve/cite for a question.
+
+    Mirrors /search: a 'top N' request (or a bare top/best list) scales the
+    source count up, floored at TOP_K and capped at CHAT_MAX_SOURCES so the LLM
+    context stays bounded."""
+    return min(max(config.TOP_K, suggested_top_k(question) or 0), config.CHAT_MAX_SOURCES)
+
+
 _DATAVIZ_INTENT_RE = re.compile(
     r"(top\s+\d+|biggest|largest|highest|most|best|leading|ranked|ranking|list|"
     r"compare|comparison|breakdown|how many|how much|count|total|average|"
@@ -518,6 +528,9 @@ _DATAVIZ_INTENT_RE = re.compile(
     r"growth|trend|increase|decrease|per cent|percent)",
     re.IGNORECASE,
 )
+
+# Replaced by _dataviz_nudge() so the retry's row cap matches the requested N.
+_DATAVIZ_MAX_ROWS_TOKEN = "{MAX_ROWS}"
 
 _DATAVIZ_NUDGE = (
     "\n\nYour previous answer did not include a VALID JSON data block. This question asks for a ranked "
@@ -527,19 +540,29 @@ _DATAVIZ_NUDGE = (
     '{"title": "Top deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}\n'
     "```\n\n"
     "Rules: valid JSON only (double-quoted keys, no trailing commas, no markdown bullet lists); rows are "
-    "the ranked items (max 10); value_column is the integer index of the numeric column and every cell in "
-    "that column is a plain number actually stated in the articles; never invent numbers; keep [n] "
-    "citations only in the prose."
+    f"the ranked items (max {_DATAVIZ_MAX_ROWS_TOKEN} rows); value_column is the integer index of the "
+    "numeric column and every cell in that column is a plain number actually stated in the articles; "
+    "never invent numbers; keep [n] citations only in the prose."
 )
+
+
+def _dataviz_nudge(question: str) -> str:
+    """The dataviz retry instruction with the row cap set to the question's
+    effective source count, so a 'top 10' table can actually hold 10 rows."""
+    return _DATAVIZ_NUDGE.replace(_DATAVIZ_MAX_ROWS_TOKEN, str(_effective_chat_k(question)))
 
 
 async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     """Call the LLM once, nudging it to include a dataviz data block when the
     question calls for a ranked list or numeric comparison and the model
-    skipped the block. One extra call at most; token usage is summed."""
+    skipped the block. One extra call at most; token usage is summed. A failed
+    nudge retry keeps the first answer instead of erroring the turn."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
     if parse_dataviz(result.content) is None and _DATAVIZ_INTENT_RE.search(question):
-        nudge = await generate_answer(state_llm(), prompt + _DATAVIZ_NUDGE, config.LLM_MODEL)
+        try:
+            nudge = await generate_answer(state_llm(), prompt + _dataviz_nudge(question), config.LLM_MODEL)
+        except LLMUnavailableError:
+            return result
         result.content = nudge.content
         result.prompt_tokens += nudge.prompt_tokens
         result.completion_tokens += nudge.completion_tokens
@@ -581,10 +604,11 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
 
     retrieval_q, eff_from, eff_to = _effective_intent(question, None, None)
     qfilter = build_facet_filter(None, None, None, eff_from, eff_to)
-    reranked = await retrieve_and_rerank(retrieval_q, config.TOP_K, qfilter, need_body=True)
+    k = _effective_chat_k(question)
+    reranked = await retrieve_and_rerank(retrieval_q, k, qfilter, need_body=True)
     if config.ENABLE_BODY_RESCUE:
         reranked = await body_rescue(retrieval_q, reranked)
-    sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][: config.TOP_K]
+    sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][: k]
 
     note = (
         weak_results_note([s.score for s in sources], date_label(eff_from, eff_to))
@@ -602,9 +626,18 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
             note=note,
         )
 
-    context = "\n\n".join(source_context(s, i + 1) for i, s in enumerate(sources))
+    # As the source count grows (a 'top N' request), trim each source's body
+    # excerpt so the total stays within the budget: more articles to rank at the
+    # same token cost, without blowing the LLM context window.
+    body_limit = min(config.CHAT_BODY_CHAR_LIMIT, config.CHAT_TOTAL_BODY_CHARS // max(1, len(sources)))
+    context = "\n\n".join(source_context(s, i + 1, body_limit=body_limit) for i, s in enumerate(sources))
     history_text = "\n".join(f"{m.role}: {m.content}" for m in history if m.role in ("user", "assistant"))
-    prompt = CHAT_PROMPT.format(history=history_text or "(none)", context=context, question=question)
+    prompt = CHAT_PROMPT.format(
+        history=history_text or "(none)",
+        context=context,
+        question=question,
+        dataviz_max_rows=k,
+    )
     return PreparedTurn(
         answer=prompt,
         sources=[to_summary(s).model_dump() for s in sources],
@@ -662,7 +695,7 @@ value_column 1, format "%"). For a year-over-year trend, put the year in the fir
 ["Year", "Deals"], rows [["2021", 120], ["2022", 145]], value_column 1). Optionally include "kind" — \
 "bar", "line", or "pie" — as a hint for the best chart ("line" for time trends, "pie" for share breakdowns).
 
-Data block rules: rows are the ranked items (max 10 rows); every value cell is a plain number in the unit \
+Data block rules: rows are the ranked items (max {dataviz_max_rows} rows); every value cell is a plain number in the unit \
 declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
 articles, never invented ones; keep [n] citations only in the prose, never inside the data block; omit \
 the block entirely when the answer contains no ranked list or numeric comparison.
@@ -833,11 +866,17 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             completion_tokens = usage.completion_tokens if usage else 0
             if parse_dataviz(answer) is None and _DATAVIZ_INTENT_RE.search(question):
                 # The answer streamed without a chart; ask once more so
-                # ranked/numeric questions reliably carry a dataviz block.
-                nudge = await generate_answer(state_llm(), turn.answer + _DATAVIZ_NUDGE, config.LLM_MODEL)
-                answer = nudge.content
-                prompt_tokens += nudge.prompt_tokens
-                completion_tokens += nudge.completion_tokens
+                # ranked/numeric questions reliably carry a dataviz block. A
+                # failed retry keeps the streamed answer instead of erroring
+                # the whole turn after the user already saw it stream in.
+                try:
+                    nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
+                except LLMUnavailableError:
+                    nudge = None
+                if nudge is not None:
+                    answer = nudge.content
+                    prompt_tokens += nudge.prompt_tokens
+                    completion_tokens += nudge.completion_tokens
             answer = _sanitize_dataviz(answer)
             result = LLMResult(
                 content=answer,

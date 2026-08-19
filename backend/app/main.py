@@ -583,9 +583,11 @@ async def search(
                           latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
 
-def source_context(s: SourceArticle, idx: int) -> str:
+def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) -> str:
     """Packs an article's metadata + summary + body into a numbered
-    context block for the chat LLM prompt (body capped by CHAT_BODY_CHAR_LIMIT)."""
+    context block for the chat LLM prompt. The body excerpt is capped by
+    CHAT_BODY_CHAR_LIMIT, or by ``body_limit`` when the caller budgets a fixed
+    total across a larger source set (chat scales its source count to 'top N')."""
     meta = s.published_date or "n/a"
     if s.author_names:
         meta += f" | Authors: {', '.join(s.author_names)}"
@@ -597,7 +599,7 @@ def source_context(s: SourceArticle, idx: int) -> str:
     if s.summary:
         parts.append(s.summary)
     if s.body:
-        parts.append(s.body[: config.CHAT_BODY_CHAR_LIMIT])
+        parts.append(s.body[: min(body_limit or config.CHAT_BODY_CHAR_LIMIT, len(s.body))])
     return "\n".join(parts)
 
 

@@ -50,6 +50,12 @@ class Config:
     # Per-source body excerpt sent to the chat LLM (the whole stored body when
     # this matches BODY_CHAR_LIMIT; lower it to cut prompt tokens/cost).
     CHAT_BODY_CHAR_LIMIT = int(os.getenv("CHAT_BODY_CHAR_LIMIT", "50000"))
+    # Chat dynamically scales the source count to the query's requested 'top N'
+    # (capped here so the LLM context stays bounded) and trims each source's
+    # body excerpt to fit the total budget below, so asking for more deals never
+    # balloons the prompt size. 400000 matches today's 8 sources x 50K bodies.
+    CHAT_MAX_SOURCES = int(os.getenv("CHAT_MAX_SOURCES", "20"))
+    CHAT_TOTAL_BODY_CHARS = int(os.getenv("CHAT_TOTAL_BODY_CHARS", "400000"))
 
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch

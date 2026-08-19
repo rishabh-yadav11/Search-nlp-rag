@@ -581,7 +581,7 @@ def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
 
     result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
     assert len(calls) == 2
-    assert chat_module._DATAVIZ_NUDGE in calls[1]
+    assert chat_module._dataviz_nudge("top 5 deals") in calls[1]
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 13
     assert "dataviz" in result.content
@@ -619,3 +619,109 @@ def test_answer_with_dataviz_no_retry_for_non_numeric_question(monkeypatch):
     result = _run(chat_module._answer_with_dataviz("who invested in Ola Electric?", "PROMPT"))
     assert len(calls) == 1
     assert result.content == "Plain answer [1]."
+
+
+def test_effective_chat_k_dynamic():
+    """The chat source count scales to the requested 'top N' (floored at TOP_K,
+    capped at CHAT_MAX_SOURCES) instead of always being TOP_K."""
+    assert chat_module._effective_chat_k("top 10 ipo deals in 2025") == 10
+    assert chat_module._effective_chat_k("top ipo deals in 2025") == 10  # bare top -> list default
+    assert chat_module._effective_chat_k("who invested in Ola Electric?") == chat_module.config.TOP_K
+    assert chat_module._effective_chat_k("top 50 ipo deals") == chat_module.config.CHAT_MAX_SOURCES
+
+
+def test_dataviz_nudge_row_cap_scales():
+    assert "max 10 rows" in chat_module._dataviz_nudge("top 10 ipo deals in 2025")
+    assert f"max {chat_module.config.TOP_K} rows" in chat_module._dataviz_nudge("who invested in Ola Electric?")
+
+
+def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
+    """Chat must retrieve as many sources as the question asks for ('top 10 ...'
+    -> top_k=10) and budget the body excerpts so the prompt stays bounded
+    (regression: chat always retrieved TOP_K)."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+
+    captured = {}
+
+    def make_fake(n):
+        async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+            captured["top_k"] = top_k
+            return [
+                SourceArticle(id=i, title=f"t{i}", url=f"u{i}", published_date="2025-03-01",
+                              summary="s", body="b" * 4000, score=0.9)
+                for i in range(n)
+            ]
+        return fake_retrieve
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+    monkeypatch.setattr(main, "retrieve_and_rerank", make_fake(10))
+
+    turn = _run(chat_module._prepare_turn("top 10 ipo deals in 2025", []))
+    assert captured["top_k"] == 10
+    assert len(turn.sources) == 10
+    assert "max 10 rows" in turn.answer  # dataviz cap matches the requested N
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", make_fake(chat_module.config.TOP_K))
+    turn = _run(chat_module._prepare_turn("who invested in Ola Electric?", []))
+    assert captured["top_k"] == chat_module.config.TOP_K
+    assert len(turn.sources) == chat_module.config.TOP_K
+
+
+def test_prepare_turn_budgets_body_excerpts_across_sources(monkeypatch):
+    """With more sources than body-budget / CHAT_BODY_CHAR_LIMIT, each source's
+    body excerpt is trimmed so the total prompt stays bounded."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [
+            SourceArticle(id=i, title=f"t{i}", url=f"u{i}", published_date="2025-03-01",
+                          summary="s", body="x" * 50000, score=0.9)  # 50K body each
+            for i in range(20)
+        ]
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    turn = _run(chat_module._prepare_turn("top 20 ipo deals in 2025", []))
+    # 20 sources x 20K excerpt = 400K, the total body budget.
+    assert turn.answer.count("x" * 20000) >= 20
+    assert "x" * 20001 not in turn.answer  # no source exceeds its share
+
+
+def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
+    """A failed dataviz nudge retry must keep the first answer instead of
+    erroring the turn."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
+        raise chat_module.LLMUnavailableError()
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
+    assert len(calls) == 2
+    assert result.content == "No chart here [1]."
+    assert result.prompt_tokens == 10
+    assert result.completion_tokens == 5
