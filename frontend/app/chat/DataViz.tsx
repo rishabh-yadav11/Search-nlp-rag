@@ -380,7 +380,6 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
 
 export default function DataViz({ block }: { block: DataVizBlock }) {
   const [view, setView] = useState<NonNullable<DataVizBlock['view']>>(block.kind ?? 'table')
-  const [raw, setRaw] = useState(false)
   const vc = block.value_column
   const numbers = useMemo(
     () => vc != null && block.rows.every((r) => toNum(r[vc]) != null),
@@ -408,8 +407,8 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
   return (
     <div className="chat-viz">
       {block.title ? <div className="chat-viz-title">{block.title}</div> : null}
-      <div className="chat-viz-tools">
-        {!locked && (
+      {!locked && (
+        <div className="chat-viz-tools">
           <div className="chat-viz-toggle" role="group" aria-label="View">
             <button type="button" className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}>
               Table
@@ -433,15 +432,10 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
               </>
             )}
           </div>
-        )}
-        <button type="button" className="chat-viz-raw-btn" onClick={() => setRaw((r) => !r)}>
-          {raw ? 'Hide raw data' : 'Raw data'}
-        </button>
-      </div>
+        </div>
+      )}
 
       <RenderView block={block} view={effective} />
-
-      {raw && <pre className="chat-viz-raw">{JSON.stringify(block, null, 2)}</pre>}
     </div>
   )
 }

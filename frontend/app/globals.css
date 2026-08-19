@@ -1409,8 +1409,7 @@ input[type='text']:focus-visible,
   gap: 4px;
 }
 
-.chat-viz-toggle button,
-.chat-viz-raw-btn {
+.chat-viz-toggle button {
   border: 1px solid rgba(0, 0, 0, 0.12);
   background: #f7f7f8;
   color: #333;
@@ -1424,10 +1423,6 @@ input[type='text']:focus-visible,
   background: var(--blue-deep);
   border-color: var(--blue-deep);
   color: #fff;
-}
-
-.chat-viz-raw-btn {
-  font-size: 11px;
 }
 
 .chat-viz-table-wrap {
@@ -1531,16 +1526,6 @@ input[type='text']:focus-visible,
   font-size: 12px;
   padding: 20px;
   text-align: center;
-}
-
-.chat-viz-raw {
-  margin-top: 10px;
-  background: #f6f6f7;
-  border-radius: 6px;
-  padding: 10px;
-  font-size: 11px;
-  overflow-x: auto;
-  color: #444;
 }
 
 .chat-viz-picto {
