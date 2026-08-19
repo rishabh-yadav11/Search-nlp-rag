@@ -119,6 +119,38 @@ _REV_EVENT_YEAR_RE = re.compile(
     rf"\b(?:\w+\s+){{0,2}}({_EVENT_NOUN_ALT})s?\s+(?:of|in)\s+((?:19|20)\d{{2}})\b", re.IGNORECASE
 )
 
+# Chart/table request filler: 'make a table of', 'show me a bar chart of',
+# 'create a pie chart for', 'top deals as a table'. These words describe the
+# requested OUTPUT format, not the topic, so they must be stripped from the
+# retrieval/rerank query or the embedding match is diluted ('make a table of
+# top 15 deals' would otherwise retrieve on 'make a table' instead of 'deals').
+_CHART_VERB = r"(?:show|draw|make|create|give|build|plot|display|present)"
+_CHART_TYPE = r"(?:bar|line|pie|column|area|pictogram|pictograph)?\s*"
+_CHART_NOUN = r"(?:chart|graph|plot|diagram|table|pictogram|pictograph)"
+_CHART_LEAD_RE = re.compile(
+    rf"\b(?:{_CHART_VERB})\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?"
+    rf"{_CHART_TYPE}{_CHART_NOUN}\b(?:\s+(?:of|for|on|about|regarding)\b)?",
+    re.IGNORECASE,
+)
+_CHART_TRAIL_RE = re.compile(
+    rf"\b(?:as|in|into|using)\s+(?:a\s+|an\s+|the\s+)?"
+    rf"{_CHART_TYPE}{_CHART_NOUN}\b(?:\s+form\b)?",
+    re.IGNORECASE,
+)
+
+
+def _is_chart_request(text: str) -> bool:
+    """True when the query contains a chart/table request phrase, so its filler
+    words can be stripped from the retrieval topic."""
+    return bool(_CHART_LEAD_RE.search(text) or _CHART_TRAIL_RE.search(text))
+
+
+def _strip_chart_filler(text: str) -> str:
+    """Remove chart/table request filler words, leaving the bare topic text."""
+    s = _CHART_LEAD_RE.sub(" ", text)
+    s = _CHART_TRAIL_RE.sub(" ", s)
+    return s
+
 
 def _year_is_event_reference(query: str, year: int) -> bool:
     """True when ``year`` appears in the query inside a historical-event phrase
@@ -283,7 +315,11 @@ def suggested_top_k(query: str) -> int | None:
 def _strip_time_tokens(text: str) -> str:
     """Remove fiscal/quarter/month/year/time filler tokens from a query, leaving
     the bare topical text. Time-word regexes are applied longest-first so a
-    compound token ('FY 2024-25', 'jan to march') is removed before its parts."""
+    compound token ('FY 2024-25', 'jan to march') is removed before its parts.
+    Chart/table request filler ('make a table of') is stripped first when the
+    query is a chart request, so the output-format words never reach retrieval."""
+    if _is_chart_request(text):
+        text = _strip_chart_filler(text)
     s = _FY_RE.sub(" ", text)
     s = _QUARTER_WORD_RE.sub(" ", s)
     s = _Q_RE.sub(" ", s)
