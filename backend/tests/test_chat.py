@@ -557,15 +557,23 @@ def test_parse_dataviz_allows_missing_values():
     assert data is not None
     assert len(data["rows"]) == 2
 
-    # A present but non-numeric cell still invalidates the block.
+    # A common 'not stated' token is treated as missing, like "".
+    data = chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Company", "Value"], '
+        '"rows": [["Wakefit", "value not stated"], ["Groww", 1200]], "value_column": 1}\n```'
+    )
+    assert data is not None
+    assert data["rows"][0][1] == "value not stated"
+
+    # A genuinely non-numeric cell still invalidates the block.
     assert chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Value"], '
-        '"rows": [["Wakefit", "n/a"], ["Groww", 1200]], "value_column": 1}\n```'
+        '"rows": [["Wakefit", "abc"], ["Groww", 1200]], "value_column": 1}\n```'
     ) is None
     # A value column with no numeric cell at all is invalid.
     assert chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Value"], '
-        '"rows": [["Wakefit", ""], ["Groww", ""]], "value_column": 1}\n```'
+        '"rows": [["Wakefit", ""], ["Groww", "value not stated"]], "value_column": 1}\n```'
     ) is None
 
 
