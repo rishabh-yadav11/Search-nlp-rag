@@ -713,6 +713,7 @@ def test_chat_prompt_instructs_constructing_top_n_lists():
     (regression: 'top 10 ipo deals in 2025' was refused despite relevant data)."""
     assert "build the ranked list from the specific items the articles actually name" in chat_module.CHAT_PROMPT
     assert "Do NOT refuse a top-N list just because the articles lack a pre-made ranking" in chat_module.CHAT_PROMPT
+    assert "never respond with only \"the articles do not provide a ranking\"" in chat_module.CHAT_PROMPT
     # IPO questions must yield companies that went public, not M&A/stake deals,
     # and a list item with no stated value must still be included.
     assert "the list items are the COMPANIES that went public or filed for an IPO" in chat_module.CHAT_PROMPT
