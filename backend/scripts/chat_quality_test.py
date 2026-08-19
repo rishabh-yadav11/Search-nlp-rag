@@ -208,7 +208,9 @@ def _parse_dataviz(text: str) -> dict | None:
             if _valid_value_column(rows, j):
                 vc = j
                 break
-    if vc is None or not _valid_value_column(rows, vc):
+    if vc is not None and not _valid_value_column(rows, vc):
+        return None
+    if vc is None and d.get("view") != "table":
         return None
     return {"columns": columns, "rows": rows, "value_column": vc, "format": d.get("format"),
             "kind": d.get("kind"), "view": d.get("view")}
