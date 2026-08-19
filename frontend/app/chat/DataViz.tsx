@@ -9,12 +9,14 @@ export type DataVizBlock = {
   value_column: number
   format?: string
   kind?: 'bar' | 'line' | 'pie'
+  view?: 'table' | 'bar' | 'line' | 'pie' | 'picto'
 }
 
 type ContentPart = { type: 'md'; md: string } | { type: 'viz'; block: DataVizBlock }
 
 const FENCE_SRC = '```dataviz\\s*\\n([\\s\\S]*?)\\n```'
 const KINDS = ['bar', 'line', 'pie'] as const
+const VIEWS = ['table', 'bar', 'line', 'pie', 'picto'] as const
 
 function toNum(v: unknown): number | null {
   if (typeof v === 'boolean') return null
@@ -53,6 +55,7 @@ export function parseDataViz(text: string): DataVizBlock | null {
         : firstNumericColumn(rowArr)
     if (vc == null || rowArr.some((r) => toNum(r[vc]) == null)) return null
     const kind = (d as { kind?: unknown }).kind
+    const view = (d as { view?: unknown }).view
     return {
       title: typeof (d as { title?: unknown }).title === 'string' ? (d as { title: string }).title : undefined,
       columns: columns as string[],
@@ -60,6 +63,7 @@ export function parseDataViz(text: string): DataVizBlock | null {
       value_column: vc as number,
       format: typeof (d as { format?: unknown }).format === 'string' ? (d as { format: string }).format : undefined,
       kind: typeof kind === 'string' && (KINDS as readonly string[]).includes(kind) ? (kind as DataVizBlock['kind']) : undefined,
+      view: typeof view === 'string' && (VIEWS as readonly string[]).includes(view) ? (view as DataVizBlock['view']) : undefined,
     }
   } catch {
     return null
@@ -308,57 +312,18 @@ function PictogramChart({ block }: { block: DataVizBlock }) {
   )
 }
 
-export default function DataViz({ block }: { block: DataVizBlock }) {
-  const [view, setView] = useState<'table' | 'bar' | 'pie' | 'line' | 'picto'>(
-    block.kind ?? 'table',
-  )
-  const [raw, setRaw] = useState(false)
-  const numbers = useMemo(
-    () => block.rows.every((r) => toNum(r[block.value_column]) != null),
-    [block],
-  )
-  const pictoOk = useMemo(
-    () =>
-      block.rows.every((r) => {
-        const v = toNum(r[block.value_column])
-        return v != null && Number.isInteger(v) && v >= 0
-      }),
-    [block],
-  )
-
-  return (
-    <div className="chat-viz">
-      {block.title ? <div className="chat-viz-title">{block.title}</div> : null}
-      <div className="chat-viz-tools">
-        <div className="chat-viz-toggle" role="group" aria-label="View">
-          <button type="button" className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}>
-            Table
-          </button>
-          {numbers && (
-            <>
-              <button type="button" className={view === 'bar' ? 'active' : ''} onClick={() => setView('bar')}>
-                Bar
-              </button>
-              <button type="button" className={view === 'line' ? 'active' : ''} onClick={() => setView('line')}>
-                Line
-              </button>
-              <button type="button" className={view === 'pie' ? 'active' : ''} onClick={() => setView('pie')}>
-                Pie
-              </button>
-              {pictoOk && (
-                <button type="button" className={view === 'picto' ? 'active' : ''} onClick={() => setView('picto')}>
-                  Pictogram
-                </button>
-              )}
-            </>
-          )}
-        </div>
-        <button type="button" className="chat-viz-raw-btn" onClick={() => setRaw((r) => !r)}>
-          {raw ? 'Hide raw data' : 'Raw data'}
-        </button>
-      </div>
-
-      {view === 'table' && (
+function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<DataVizBlock['view']> }) {
+  switch (view) {
+    case 'bar':
+      return <BarChart block={block} />
+    case 'line':
+      return <LineChart block={block} />
+    case 'pie':
+      return <PieChart block={block} />
+    case 'picto':
+      return <PictogramChart block={block} />
+    default:
+      return (
         <div className="chat-viz-table-wrap">
           <table className="chat-viz-table">
             <thead>
@@ -383,11 +348,70 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
             </tbody>
           </table>
         </div>
-      )}
-      {view === 'bar' && numbers && <BarChart block={block} />}
-      {view === 'line' && numbers && <LineChart block={block} />}
-      {view === 'pie' && numbers && <PieChart block={block} />}
-      {view === 'picto' && pictoOk && <PictogramChart block={block} />}
+      )
+  }
+}
+
+export default function DataViz({ block }: { block: DataVizBlock }) {
+  const [view, setView] = useState<NonNullable<DataVizBlock['view']>>(block.kind ?? 'table')
+  const [raw, setRaw] = useState(false)
+  const numbers = useMemo(
+    () => block.rows.every((r) => toNum(r[block.value_column]) != null),
+    [block],
+  )
+  const pictoOk = useMemo(
+    () =>
+      block.rows.every((r) => {
+        const v = toNum(r[block.value_column])
+        return v != null && Number.isInteger(v) && v >= 0
+      }),
+    [block],
+  )
+  // When the user explicitly asked for one view (block.view set by the backend),
+  // render ONLY that view; otherwise keep the interactive view toggles.
+  const locked = block.view
+  const effective: NonNullable<DataVizBlock['view']> = useMemo(() => {
+    const target = locked ?? view
+    if (target === 'picto' && !pictoOk) return 'table'
+    if ((target === 'bar' || target === 'line' || target === 'pie') && !numbers) return 'table'
+    return target
+  }, [locked, view, numbers, pictoOk])
+
+  return (
+    <div className="chat-viz">
+      {block.title ? <div className="chat-viz-title">{block.title}</div> : null}
+      <div className="chat-viz-tools">
+        {!locked && (
+          <div className="chat-viz-toggle" role="group" aria-label="View">
+            <button type="button" className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}>
+              Table
+            </button>
+            {numbers && (
+              <>
+                <button type="button" className={view === 'bar' ? 'active' : ''} onClick={() => setView('bar')}>
+                  Bar
+                </button>
+                <button type="button" className={view === 'line' ? 'active' : ''} onClick={() => setView('line')}>
+                  Line
+                </button>
+                <button type="button" className={view === 'pie' ? 'active' : ''} onClick={() => setView('pie')}>
+                  Pie
+                </button>
+                {pictoOk && (
+                  <button type="button" className={view === 'picto' ? 'active' : ''} onClick={() => setView('picto')}>
+                    Pictogram
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        )}
+        <button type="button" className="chat-viz-raw-btn" onClick={() => setRaw((r) => !r)}>
+          {raw ? 'Hide raw data' : 'Raw data'}
+        </button>
+      </div>
+
+      <RenderView block={block} view={effective} />
 
       {raw && <pre className="chat-viz-raw">{JSON.stringify(block, null, 2)}</pre>}
     </div>

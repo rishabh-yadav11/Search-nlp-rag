@@ -291,10 +291,13 @@ Prose answer with inline citations [1][2].
 | `value_column` | int | Index of the numeric column the chart plots |
 | `format` | string (optional) | Unit for display: `"$B"`, `"$M"`, `"₹ Cr"`, `"%"`, or `""` |
 | `kind` | string (optional) | Chart hint: `"bar"`, `"line"`, or `"pie"` (frontend default view) |
+| `view` | string (optional) | Pinned view the user explicitly asked for: `"table"`, `"bar"`, `"line"`, `"pie"`, or `"picto"`. When present the UI renders ONLY that view (no toggles); `"bar"`/`"line"`/`"pie"` also set `kind` |
 
 Notes:
 - Emission is non-deterministic; the backend re-calls the LLM once with a
-  nudge when an explicit chart request returns without a block.
+  nudge when an explicit chart request returns without a block. When the user
+  asks for a specific view (e.g. "show me a pie chart", "as a table"), the
+  backend pins the block's `view` to it so clients render exactly that view.
 - Malformed blocks (invalid JSON, ragged rows, non-numeric value column) are
   stripped by `_sanitize_dataviz` before storage, so `content` never exposes
   unparseable JSON to clients.
