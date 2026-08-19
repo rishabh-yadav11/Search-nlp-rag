@@ -97,31 +97,40 @@ QUERIES = [
     },
     {
         "id": 12,
-        "category": "dataviz: ranked list with values",
-        "q": "List the top 5 biggest funding rounds in India in 2025 with their values",
+        "category": "dataviz: ranked list with values (explicit chart ask)",
+        "q": "Show me a bar chart of the top 5 biggest funding rounds in India in 2025 with their values",
         "terms": [],
         "dataviz": True,
     },
     {
         "id": 13,
-        "category": "dataviz: count + yearly (line)",
-        "q": "How many venture capital deals happened in India in 2024?",
+        "category": "dataviz: count + yearly (line, explicit chart ask)",
+        "q": "Show me a line chart of how many venture capital deals happened in India in 2024",
         "terms": ["2024"],
+        "year": 2024,
         "dataviz": True,
     },
     {
         "id": 14,
-        "category": "dataviz: sector breakdown (pie)",
-        "q": "What are the biggest deals by sector in India in 2025?",
+        "category": "dataviz: sector breakdown (pie, explicit chart ask)",
+        "q": "Show me a pie chart of the biggest deals by sector in India in 2025",
         "terms": [],
         "dataviz": True,
     },
     {
         "id": 15,
-        "category": "dataviz: count across years",
-        "q": "How many funding rounds has Ola raised over the years, and in which years?",
+        "category": "dataviz: count across years (explicit chart ask)",
+        "q": "Show me a chart of how many funding rounds Ola has raised over the years and in which years",
         "terms": ["ola"],
         "dataviz": True,
+    },
+    {
+        "id": 16,
+        "category": "no dataviz: ranked question without a visual ask",
+        "q": "top 10 ipo deals in 2025",
+        "terms": [],
+        "year": 2025,
+        "no_dataviz": True,
     },
 ]
 
@@ -204,8 +213,12 @@ def run(q: dict) -> dict:
     year_ok = True
     if q.get("year"):
         year_ok = years == {str(q["year"])}
-    dv = _parse_dataviz(a["content"]) if q.get("dataviz") else None
-    dv_ok = not q.get("dataviz") or dv is not None
+    dv = _parse_dataviz(a["content"]) if (q.get("dataviz") or q.get("no_dataviz")) else None
+    dv_ok = True
+    if q.get("dataviz"):
+        dv_ok = dv is not None
+    elif q.get("no_dataviz"):
+        dv_ok = dv is None
     return {
         "id": q["id"],
         "category": q["category"],

@@ -268,10 +268,12 @@ data: {"message":{...,"prompt_tokens":2065,"completion_tokens":323,"cost":0.1369
 
 ### Dataviz data block (in `Message.content`)
 
-For ranked-list / numeric-comparison / breakdown questions, the assistant's
-`content` (in both the one-shot `TurnOut` and the SSE `done` message) ends with
-**one** fenced JSON block tagged `dataviz` that the UI renders as a
-Table/Bar/Line/Pie/Pictogram chart:
+When the user explicitly asks for a chart, graph, plot, diagram, or a
+table/visual view, the assistant's `content` (in both the one-shot `TurnOut`
+and the SSE `done` message) ends with **one** fenced JSON block tagged `dataviz`
+that the UI renders as a Table/Bar/Line/Pie/Pictogram chart. Ranked-list /
+numeric-comparison / breakdown questions that do NOT mention a visual view
+answer in plain prose with no block:
 
 ```markdown
 Prose answer with inline citations [1][2].
@@ -285,14 +287,14 @@ Prose answer with inline citations [1][2].
 |---|---|---|
 | `title` | string (optional) | Chart heading |
 | `columns` | `string[]` | Column headers; first column is the item label |
-| `rows` | `(string\|number)[][]` | One array per row, aligned with `columns` (max 10 rows) |
+| `rows` | `(string\|number)[][]` | One array per row, aligned with `columns` (up to the requested count, capped at `CHAT_MAX_SOURCES`) |
 | `value_column` | int | Index of the numeric column the chart plots |
 | `format` | string (optional) | Unit for display: `"$B"`, `"$M"`, `"₹ Cr"`, `"%"`, or `""` |
 | `kind` | string (optional) | Chart hint: `"bar"`, `"line"`, or `"pie"` (frontend default view) |
 
 Notes:
 - Emission is non-deterministic; the backend re-calls the LLM once with a
-  nudge when a dataviz-intent question returns without a block.
+  nudge when an explicit chart request returns without a block.
 - Malformed blocks (invalid JSON, ragged rows, non-numeric value column) are
   stripped by `_sanitize_dataviz` before storage, so `content` never exposes
   unparseable JSON to clients.

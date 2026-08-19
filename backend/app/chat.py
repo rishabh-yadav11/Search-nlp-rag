@@ -521,11 +521,15 @@ def _effective_chat_k(question: str) -> int:
     return min(max(config.TOP_K, suggested_top_k(question) or 0), config.CHAT_MAX_SOURCES)
 
 
-_DATAVIZ_INTENT_RE = re.compile(
-    r"(top\s+\d+|biggest|largest|highest|most|best|leading|ranked|ranking|list|"
-    r"compare|comparison|breakdown|how many|how much|count|total|average|"
-    r"yearly|annual|monthly|by year|by month|per year|share of|percentage|"
-    r"growth|trend|increase|decrease|per cent|percent)",
+# Matches only an EXPLICIT request for a chart/graph/plot/visualization/table,
+# so ranked-list and numeric-comparison questions that do NOT mention a visual
+# view get plain prose instead of an automatic chart (see CHAT_PROMPT).
+_CHART_INTENT_RE = re.compile(
+    r"\b(charts?|graphs?|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
+    r"|(?:show|draw|make|create|give|build|plot)\s+(?:me\s+)?(?:a\s+|the\s+)?"
+    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|table)\b"
+    r"|\b(?:as|in|into)\s+a\s+(?:chart|graph|plot|table)\b"
+    r"|\b(?:chart|graph|plot)\s+(?:it|this|these|them|that|out)\b",
     re.IGNORECASE,
 )
 
@@ -533,8 +537,8 @@ _DATAVIZ_INTENT_RE = re.compile(
 _DATAVIZ_MAX_ROWS_TOKEN = "{MAX_ROWS}"
 
 _DATAVIZ_NUDGE = (
-    "\n\nYour previous answer did not include a VALID JSON data block. This question asks for a ranked "
-    "list or numeric comparison, so re-answer the SAME question and END your answer with exactly one "
+    "\n\nYour previous answer did not include a VALID JSON data block. You were asked to show a chart, "
+    "graph, plot, or table, so re-answer the SAME question and END your answer with exactly one "
     "fenced code block tagged dataviz containing ONLY valid JSON, like this:\n\n"
     "```dataviz\n"
     '{"title": "Top deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}\n'
@@ -548,17 +552,17 @@ _DATAVIZ_NUDGE = (
 
 def _dataviz_nudge(question: str) -> str:
     """The dataviz retry instruction with the row cap set to the question's
-    effective source count, so a 'top 10' table can actually hold 10 rows."""
+    effective source count, so a 'top 10' chart can actually hold 10 rows."""
     return _DATAVIZ_NUDGE.replace(_DATAVIZ_MAX_ROWS_TOKEN, str(_effective_chat_k(question)))
 
 
 async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     """Call the LLM once, nudging it to include a dataviz data block when the
-    question calls for a ranked list or numeric comparison and the model
-    skipped the block. One extra call at most; token usage is summed. A failed
-    nudge retry keeps the first answer instead of erroring the turn."""
+    question explicitly asks for a chart/graph/plot/table and the model skipped
+    the block. One extra call at most; token usage is summed. A failed nudge
+    retry keeps the first answer instead of erroring the turn."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
-    if parse_dataviz(result.content) is None and _DATAVIZ_INTENT_RE.search(question):
+    if parse_dataviz(result.content) is None and _CHART_INTENT_RE.search(question):
         try:
             nudge = await generate_answer(state_llm(), prompt + _dataviz_nudge(question), config.LLM_MODEL)
         except LLMUnavailableError:
@@ -682,9 +686,9 @@ factual claim, like [1] or [2][3]. If the user asks a follow-up question, use th
 for context but only make claims supported by the articles. If the articles contain no relevant \
 information, say so plainly instead of guessing.
 
-If the question asks for a ranked list (e.g. "top deals", "biggest rounds", "most active investors"), \
-a numeric comparison, a yearly/monthly breakdown, or a count ("how many", "total", "share of"), you MUST \
-end your answer with ONE JSON data block in a fenced code block tagged dataviz, like this:
+ONLY when the user explicitly asks for a chart, graph, plot, diagram, or a table/visual view (e.g. "show \
+me a chart", "bar chart", "graph the deals", "as a table"), end your answer with ONE JSON data block in a \
+fenced code block tagged dataviz, like this:
 
 ```dataviz
 {{"title": "Top 2025 deals", "columns": ["Deal", "Value ($B)"], "rows": [["Zepto raise", 1.0], ["Shriram Finance stake", 4.4]], "value_column": 1, "format": "$B"}}
@@ -697,8 +701,8 @@ value_column 1, format "%"). For a year-over-year trend, put the year in the fir
 
 Data block rules: rows are the ranked items (max {dataviz_max_rows} rows); every value cell is a plain number in the unit \
 declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
-articles, never invented ones; keep [n] citations only in the prose, never inside the data block; omit \
-the block entirely when the answer contains no ranked list or numeric comparison.
+articles, never invented ones; keep [n] citations only in the prose, never inside the data block. Do NOT \
+include the block unless the user explicitly asked for a chart, graph, plot, diagram, or table/visual view.
 
 Conversation so far:
 {history}
@@ -864,11 +868,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
-            if parse_dataviz(answer) is None and _DATAVIZ_INTENT_RE.search(question):
-                # The answer streamed without a chart; ask once more so
-                # ranked/numeric questions reliably carry a dataviz block. A
-                # failed retry keeps the streamed answer instead of erroring
-                # the whole turn after the user already saw it stream in.
+            if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
+                # The user explicitly asked for a chart/graph/plot/table but the
+                # answer streamed without one; ask once more so visual requests
+                # reliably carry a dataviz block. A failed retry keeps the
+                # streamed answer instead of erroring the whole turn after the
+                # user already saw it stream in.
                 try:
                     nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
                 except LLMUnavailableError:
