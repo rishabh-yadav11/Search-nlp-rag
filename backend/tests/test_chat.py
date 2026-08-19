@@ -670,6 +670,48 @@ def test_dataviz_nudge_row_cap_scales():
     assert f"max {chat_module.config.TOP_K} rows" in chat_module._dataviz_nudge("who invested in Ola Electric?")
 
 
+def test_requested_view_detection():
+    assert chat_module._requested_view("show me a table of top deals") == "table"
+    assert chat_module._requested_view("give me a bar chart") == "bar"
+    assert chat_module._requested_view("graph the top deals") == "bar"
+    assert chat_module._requested_view("show me a line chart of funding") == "line"
+    assert chat_module._requested_view("pie chart of sectors") == "pie"
+    assert chat_module._requested_view("make a pictogram of deals") == "picto"
+    # Generic chart ask, no specific view.
+    assert chat_module._requested_view("show me a chart of top deals") is None
+    # Not a chart request at all.
+    assert chat_module._requested_view("who invested in Ola Electric?") is None
+
+
+def test_dataviz_view_instruction():
+    assert "pie" in chat_module._dataviz_view_instruction("show me a pie chart of sectors")
+    assert chat_module._dataviz_view_instruction("show me a chart of deals") == ""
+    assert chat_module._dataviz_view_instruction("top 10 ipo deals in 2025") == ""
+
+
+def test_apply_requested_view_pins_block_view():
+    text = (
+        "Here they are [1].\n\n```dataviz\n"
+        '{"columns": ["Deal", "Value ($B)"], "rows": [["Zepto", 1.0], ["MUFG", 4.4]], "value_column": 1}\n'
+        "```"
+    )
+    out = chat_module._apply_requested_view(text, "show me a pie chart of deals")
+    block = chat_module.parse_dataviz(out)
+    assert block["view"] == "pie"
+    assert block["kind"] == "pie"
+    assert "```dataviz" in out
+
+    # A table ask pins view to table and leaves the table rendered as-is.
+    out = chat_module._apply_requested_view(text, "show me a table of deals")
+    block = chat_module.parse_dataviz(out)
+    assert block["view"] == "table"
+
+    # Generic chart ask leaves the block untouched.
+    assert chat_module._apply_requested_view(text, "show me a chart of deals") == text
+    # No block -> untouched.
+    assert chat_module._apply_requested_view("Just prose [1].", "show me a pie chart") == "Just prose [1]."
+
+
 def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
     """Chat must retrieve as many sources as the question asks for ('top 10 ...'
     -> top_k=10) and budget the body excerpts so the prompt stays bounded

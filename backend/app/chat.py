@@ -553,7 +553,73 @@ _DATAVIZ_NUDGE = (
 def _dataviz_nudge(question: str) -> str:
     """The dataviz retry instruction with the row cap set to the question's
     effective source count, so a 'top 10' chart can actually hold 10 rows."""
-    return _DATAVIZ_NUDGE.replace(_DATAVIZ_MAX_ROWS_TOKEN, str(_effective_chat_k(question)))
+    nudge = _DATAVIZ_NUDGE.replace(_DATAVIZ_MAX_ROWS_TOKEN, str(_effective_chat_k(question)))
+    view = _requested_view(question)
+    if view is not None:
+        nudge += f" The user explicitly asked for a {view} view — emit that exact type of data block."
+    return nudge
+
+
+# Canonical dataviz views exposed by the frontend (DataViz.tsx), in match
+# priority (most specific first; 'graph' is the generic bar fallback).
+_VIEW_TERMS: list[tuple[str, str]] = [
+    ("pictogram", "picto"),
+    ("pictograph", "picto"),
+    ("line", "line"),
+    ("pie", "pie"),
+    ("donut", "pie"),
+    ("bar", "bar"),
+    ("column", "bar"),
+    ("histogram", "bar"),
+    ("table", "table"),
+    ("tabular", "table"),
+    ("graph", "bar"),
+]
+
+
+def _requested_view(question: str) -> str | None:
+    """The canonical dataviz view the user explicitly asked for
+    (table/bar/line/pie/picto), or None for a generic chart request."""
+    if _CHART_INTENT_RE.search(question) is None:
+        return None
+    q = question.lower()
+    for term, view in _VIEW_TERMS:
+        if re.search(rf"\b{term}\b", q):
+            return view
+    return None
+
+
+def _dataviz_view_instruction(question: str) -> str:
+    """Prompt sentence pinning the data block to the explicitly requested view,
+    or '' when the user only asked for a generic chart."""
+    view = _requested_view(question)
+    if view is None:
+        return ""
+    return (
+        f"The user explicitly asked for a {view} view. Structure the data block for that exact view: "
+        f"bar/line/pie need a numeric value column, pictogram values must be non-negative integers, and "
+        f'a table can hold any columns. Set "kind" to "{view}" when it is bar, line, or pie.'
+    )
+
+
+def _apply_requested_view(text: str, question: str) -> str:
+    """Pin the dataviz block's ``view`` to the visualization the user explicitly
+    asked for, so the frontend renders ONLY that view (no view toggles). No-op
+    for generic chart asks or answers without a valid block."""
+    view = _requested_view(question)
+    if view is None or not text or "```dataviz" not in text:
+        return text
+
+    def _rewrite(match: re.Match) -> str:
+        block = parse_dataviz(match.group(0))
+        if block is None:
+            return match.group(0)
+        block["view"] = view
+        if view in ("bar", "line", "pie"):
+            block["kind"] = view
+        return "```dataviz\n" + json.dumps(block, ensure_ascii=False, separators=(",", ":")) + "\n```"
+
+    return _DATAVIZ_FENCE_RE.sub(_rewrite, text)
 
 
 async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
@@ -641,6 +707,7 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         context=context,
         question=question,
         dataviz_max_rows=k,
+        dataviz_view_instruction=_dataviz_view_instruction(question),
     )
     return PreparedTurn(
         answer=prompt,
@@ -665,7 +732,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
     result = await _answer_with_dataviz(question, turn.answer)
     await record_cost(result.cost())
     return (
-        _sanitize_dataviz(result.content),
+        _sanitize_dataviz(_apply_requested_view(result.content, question)),
         turn.sources,
         turn.note,
         result.prompt_tokens,
@@ -698,6 +765,8 @@ For a share breakdown, put a percentage column and set "format" to "%" (e.g. col
 value_column 1, format "%"). For a year-over-year trend, put the year in the first column (e.g. columns \
 ["Year", "Deals"], rows [["2021", 120], ["2022", 145]], value_column 1). Optionally include "kind" — \
 "bar", "line", or "pie" — as a hint for the best chart ("line" for time trends, "pie" for share breakdowns).
+
+{dataviz_view_instruction}
 
 Data block rules: rows are the ranked items (max {dataviz_max_rows} rows); every value cell is a plain number in the unit \
 declared by "format" ("$B", "$M", "₹ Cr", "%", or ""); only include numbers that are actually stated in the \
@@ -882,7 +951,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer = nudge.content
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
-            answer = _sanitize_dataviz(answer)
+            answer = _sanitize_dataviz(_apply_requested_view(answer, question))
             result = LLMResult(
                 content=answer,
                 prompt_tokens=prompt_tokens,
