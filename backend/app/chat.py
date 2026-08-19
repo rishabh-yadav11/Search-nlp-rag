@@ -782,7 +782,10 @@ specific items the articles actually name — deals, companies, rounds, amounts 
 (highest value / biggest impact first) and citing the article for each item. Present as many distinct \
 items as the articles support, up to the requested N. If the articles support fewer than N items, list \
 those and note that you found fewer than N. Do NOT refuse a top-N list just because the articles lack a \
-pre-made ranking; extract and rank the items yourself. Never invent an item that no article names.
+pre-made ranking or lack exact values; whenever the articles NAME the items (companies, deals), list \
+those items and rank them by whatever is known (value, size, prominence, or recency), filling unknown \
+values with "value not stated". Never invent an item that no article names, and never respond with only \
+"the articles do not provide a ranking" when the articles name the items — always produce the list.
 
 For questions about IPOs or public listings (e.g. "top ipo deals", "top IPOs of 2025", "make a table of \
 top 10 IPOs"), the list items are the COMPANIES that went public or filed for an IPO — not private \
