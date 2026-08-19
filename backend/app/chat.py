@@ -28,7 +28,7 @@ from app.auth import require_auth, require_permission
 from app.config import config
 from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
-from app.query_intent import suggested_top_k
+from app.query_intent import extract_year_range, suggested_top_k
 
 logger = logging.getLogger("chat")
 
@@ -440,6 +440,48 @@ def _smalltalk_reply(question: str) -> str | None:
     return None
 
 
+# Words that carry no retrieval topic on their own: pronouns, chart/table
+# request verbs, output-format nouns, and bare follow-up fillers. A question
+# made only of these (e.g. 'make this into a table', 'plot it', 'more') is a
+# vague follow-up: it must inherit the previous turn's topic + date filter to
+# retrieve anything meaningful.
+_VAGUE_WORDS = frozenset((
+    "a", "an", "the", "this", "that", "it", "them", "these", "those", "they",
+    "there", "above", "below", "same", "such", "one", "some", "like", "as",
+    "into", "in", "on", "for", "of", "and", "or", "with", "to", "please",
+    "now", "again", "also", "then", "next", "about", "further", "more",
+    "elaborate", "explain", "detail", "details", "why", "what", "how",
+    "make", "create", "show", "draw", "give", "build", "plot", "display",
+    "present", "convert", "format", "chart", "table", "graph", "pie", "bar",
+    "line", "column", "area", "pictogram", "pictograph", "diagram", "visual",
+    "visualize", "visualise", "visualization", "visualisation",
+))
+
+
+def _is_vague_followup(question: str) -> bool:
+    """True when ``question`` has no standalone retrieval topic — a pure
+    format/pronoun follow-up like 'make this into a table' or 'plot it' that
+    must inherit the previous turn's topic+date filter to retrieve anything."""
+    from app.query_intent import _strip_noise_words, range_query_topic
+
+    topic = range_query_topic(question) or _strip_noise_words(question) or ""
+    words = set(re.findall(r"[a-z]+", topic.lower()))
+    meaningful = {w for w in words if w not in _VAGUE_WORDS and len(w) > 1}
+    return not meaningful
+
+
+def _previous_user_question(history: list[MessageOut]) -> str | None:
+    """The user's question from the turn before the current one, or None. The
+    history's last message is the just-appended current question."""
+    seen_current = False
+    for m in reversed(history):
+        if m.role == "user":
+            if seen_current:
+                return m.content
+            seen_current = True
+    return None
+
+
 _DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n```", re.DOTALL)
 
 
@@ -748,8 +790,25 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     )
 
     retrieval_q, eff_from, eff_to = _effective_intent(question, None, None)
-    qfilter = build_facet_filter(None, None, None, eff_from, eff_to)
     k = _effective_chat_k(question)
+    prev_question = _previous_user_question(history)
+    if prev_question and _is_vague_followup(question):
+        # A vague follow-up ('make this into a table', 'plot it', 'more') has no
+        # standalone topic to retrieve on — 'make this into a table' as an
+        # embedding query finds nothing and short-circuits the turn. Inherit the
+        # previous turn's retrieval query and date filter (and top-N size) so the
+        # same sources are re-presented, while the LLM still gets full history.
+        prev_q, prev_from, prev_to = _effective_intent(prev_question, None, None)
+        rng = extract_year_range(question)
+        if rng:
+            from app.query_intent import extract_list_topic, range_query_topic
+
+            retrieval_q = range_query_topic(prev_question) or extract_list_topic(prev_question) or prev_q
+            eff_from, eff_to = rng[0], rng[1]
+        else:
+            retrieval_q, eff_from, eff_to = prev_q, prev_from, prev_to
+        k = _effective_chat_k(prev_question)
+    qfilter = build_facet_filter(None, None, None, eff_from, eff_to)
     reranked = await retrieve_and_rerank(retrieval_q, k, qfilter, need_body=True)
     if config.ENABLE_BODY_RESCUE:
         reranked = await body_rescue(retrieval_q, reranked)
