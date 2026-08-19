@@ -553,14 +553,32 @@ def test_sanitize_dataviz_keeps_valid_strips_malformed():
     assert chat_module._sanitize_dataviz(plain) == plain
 
 
-def test_dataviz_intent_regex():
-    assert chat_module._DATAVIZ_INTENT_RE.search("top 5 deals in 2025")
-    assert chat_module._DATAVIZ_INTENT_RE.search("biggest funding rounds")
-    assert chat_module._DATAVIZ_INTENT_RE.search("how many IPOs this year")
-    assert chat_module._DATAVIZ_INTENT_RE.search("yearly breakdown of deals")
-    assert chat_module._DATAVIZ_INTENT_RE.search("market share of fintech")
-    assert not chat_module._DATAVIZ_INTENT_RE.search("2008 crisis")
-    assert not chat_module._DATAVIZ_INTENT_RE.search("who invested in Ola Electric?")
+def test_chart_intent_regex():
+    """Only an explicit chart/graph/plot/table request counts as chart intent;
+    ranked/numeric questions without a visual ask must stay plain prose."""
+    for q in [
+        "show me a chart of top deals",
+        "show me a bar chart",
+        "plot the deals as a graph",
+        "make a pie chart of the sectors",
+        "give me a line graph of funding by year",
+        "as a table",
+        "graph it",
+        "visualize the top 10 ipo deals",
+    ]:
+        assert chat_module._CHART_INTENT_RE.search(q), q
+    for q in [
+        "top 5 deals in 2025",
+        "top 10 ipo deals in 2025",
+        "biggest funding rounds",
+        "how many IPOs this year",
+        "yearly breakdown of deals",
+        "market share of fintech",
+        "2008 crisis",
+        "who invested in Ola Electric?",
+        "a plot of land in Gurgaon",
+    ]:
+        assert not chat_module._CHART_INTENT_RE.search(q), q
 
 
 def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
@@ -579,9 +597,9 @@ def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
     assert len(calls) == 2
-    assert chat_module._dataviz_nudge("top 5 deals") in calls[1]
+    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") in calls[1]
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 13
     assert "dataviz" in result.content
@@ -601,7 +619,7 @@ def test_answer_with_dataviz_single_call_when_block_present(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
     assert len(calls) == 1
     assert result.prompt_tokens == 10
 
@@ -619,6 +637,23 @@ def test_answer_with_dataviz_no_retry_for_non_numeric_question(monkeypatch):
     result = _run(chat_module._answer_with_dataviz("who invested in Ola Electric?", "PROMPT"))
     assert len(calls) == 1
     assert result.content == "Plain answer [1]."
+
+
+def test_answer_with_dataviz_no_retry_for_ranked_question_without_chart_ask(monkeypatch):
+    """A ranked-list question that does NOT ask for a visual must not nudge a
+    dataviz block into the answer (regression: top-N used to auto-chart)."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        return chat_module.LLMResult(content="Top deal is Zepto [1].", prompt_tokens=10, completion_tokens=5)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("top 10 ipo deals in 2025", "PROMPT"))
+    assert len(calls) == 1
+    assert "dataviz" not in result.content
 
 
 def test_effective_chat_k_dynamic():
@@ -720,7 +755,7 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_with_dataviz("top 5 deals", "PROMPT"))
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
     assert len(calls) == 2
     assert result.content == "No chart here [1]."
     assert result.prompt_tokens == 10
