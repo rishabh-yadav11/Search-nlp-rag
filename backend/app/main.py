@@ -43,7 +43,7 @@ from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
     extract_list_topic,
     extract_year_range,
-    month_query_topic,
+    range_query_topic,
     rewrite_year_in_review,
     suggested_top_k,
 )
@@ -230,15 +230,16 @@ def _effective_intent(
 
     Month-scoped queries (e.g. 'top pharma deals of month january 2025') use the
     bare topic as the retrieval query (the date filter scopes the month), so the
-    noisy 'top/of/month/year' words don't dilute the embedding match."""
+    noisy 'top/of/month/year' words don't dilute the embedding match. The same
+    applies to quarter, fiscal-year, and year-span queries."""
     retrieval_q, _ = rewrite_year_in_review(q)
     if from_date or to_date:
         return retrieval_q, from_date, to_date
     rng = extract_year_range(q)
     if rng:
-        month_topic = month_query_topic(q)
-        if month_topic:
-            retrieval_q = month_topic
+        cleaned = range_query_topic(q)
+        if cleaned:
+            retrieval_q = cleaned
         return retrieval_q, rng[0], rng[1]
     return retrieval_q, from_date, to_date
 
@@ -269,9 +270,9 @@ def _retrieval_queries(q: str) -> list[str]:
     if changed:
         topic = extract_list_topic(q) or q
         return list(dict.fromkeys([flashback, topic]))
-    month_topic = month_query_topic(q)
-    if month_topic:
-        return [month_topic]
+    scoped = range_query_topic(q)
+    if scoped:
+        return [scoped]
     return [q]
 
 
@@ -528,9 +529,9 @@ async def retrieve_and_rerank(
 
     queries = _retrieval_queries(q)
     groups = await asyncio.gather(*(_retrieval_leg(rq, top_k, qfilter) for rq in queries))
-    reranked = await rerank(month_query_topic(q) or q, _merge_results(*groups))
+    reranked = await rerank(range_query_topic(q) or q, _merge_results(*groups))
     if config.ENABLE_ENTITY_BOOST:
-        reranked = apply_entity_boost(month_query_topic(q) or q, reranked)
+        reranked = apply_entity_boost(range_query_topic(q) or q, reranked)
     reranked = sort_results(reranked)
     if need_body:
         await _attach_bodies(reranked)

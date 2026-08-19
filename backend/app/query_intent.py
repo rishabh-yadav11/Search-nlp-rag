@@ -5,7 +5,15 @@ from datetime import date
 _CURRENT_YEAR = date.today().year
 
 _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
-_YEAR_SPAN_RE = re.compile(r"\b(20\d{2}|19\d{2})\s*(?:-|to|through)\s*(20\d{2}|19\d{2})\b", re.IGNORECASE)
+# Full year span: '2024 to 2025', '2023-2025', '2023 through 2025'.
+_YEAR_SPAN_RE = re.compile(
+    r"\b(20\d{2}|19\d{2})\s*(?:-|to|through|and)\s*(20\d{2}|19\d{2})\b", re.IGNORECASE
+)
+# Short year span: '2024-25' -> years 2024 and 2025 (same century). The trailing
+# \b on the 2-digit year keeps it from matching inside a 4-digit year.
+_YEAR_SPAN_SHORT_RE = re.compile(
+    r"\b(20\d{2}|19\d{2})\s*(?:-|to|through)\s*(\d{2})\b", re.IGNORECASE
+)
 _LAST_YEAR_RE = re.compile(r"\b(?:the\s+)?last\s+year\b|\bprevious\s+year\b", re.IGNORECASE)
 _THIS_YEAR_RE = re.compile(r"\b(?:this|current)\s+year\b", re.IGNORECASE)
 _FLASHBACK_RE = re.compile(r"\bflashback\s+(20\d{2}|19\d{2})\b", re.IGNORECASE)
@@ -44,16 +52,48 @@ _MONTHS = {
     "nov": 11,
     "dec": 12,
 }
-_MONTH_RE = re.compile(
-    r"\b(january|february|march|april|may|june|july|august|september|october|"
-    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b",
+_MONTH_ALT = (
+    r"january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+)
+_MONTH_RE = re.compile(rf"\b({_MONTH_ALT})\b", re.IGNORECASE)
+# A span of months: 'jan-march', 'january to march 2025', 'january 2025 to march
+# 2025', 'between january and march'. Each month may carry its own year.
+_MONTH_SPAN_RE = re.compile(
+    rf"\b({_MONTH_ALT})\b(?:\s+(?:of\s+)?((?:19|20)\d{{2}}))?\s*(?:-|to|through|and)\s*"
+    rf"\b({_MONTH_ALT})\b(?:\s+(?:of\s+)?((?:19|20)\d{{2}}))?",
     re.IGNORECASE,
 )
 # month(+optional year) with optional filler words: "january 2025", "of month january 2025", "in jan"
 _MONTH_YEAR_RE = re.compile(
-    r"\b(january|february|march|april|may|june|july|august|september|october|"
-    r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)"
-    r"\b[^.\d]*(?:\b(20\d{2}|19\d{2})\b)?",
+    rf"\b({_MONTH_ALT})\b[^.\d]*(?:\b(20\d{{2}}|19\d{{2}})\b)?",
+    re.IGNORECASE,
+)
+
+# Quarter references: 'Q1 2025', 'Q1-2025', "Q1'25", 'first quarter of 2025'.
+_QUARTER_MONTHS = {1: (1, 3), 2: (4, 6), 3: (7, 9), 4: (10, 12)}
+_QUARTER_WORD_ORDER = {
+    "first": 1, "1st": 1,
+    "second": 2, "2nd": 2,
+    "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4,
+}
+_Q_RE = re.compile(r"\bq([1-4])\b", re.IGNORECASE)
+_Q_YEAR_RE = re.compile(
+    r"\bq([1-4])\s*(?:of\s*)?(?:-|/|')?\s*((?:19|20)\d{2}|\d{2})\b", re.IGNORECASE
+)
+_QUARTER_WORD_RE = re.compile(
+    r"\b(first|1st|second|2nd|third|3rd|fourth|4th)\s+quarter\b(?:\s+of\s+((?:19|20)\d{2}))?",
+    re.IGNORECASE,
+)
+
+# Fiscal-year references: 'FY25', 'FY 25', "FY'25", 'FY2024-25', 'FY 2024 to 2025',
+# 'fiscal year 2025'. An Indian FY ending in year N spans Apr (N-1) to Mar N.
+_FY_RE = re.compile(
+    r"\bfy\s*((?:19|20)?\d{2})\s*(?:-|to|through)\s*((?:19|20)?\d{2})\b"
+    r"|\bfy\s*'?((?:19|20)?\d{2})\b"
+    r"|\bfiscal\s+year\s*((?:19|20)?\d{2})\b"
+    r"|\bfiscal\s+((?:19|20)?\d{2})\b",
     re.IGNORECASE,
 )
 
@@ -91,11 +131,26 @@ def _year_is_event_reference(query: str, year: int) -> bool:
     return False
 
 
+def _full_year(y: int, near: int) -> int:
+    """Expand a 2-digit year to 4 digits near ``near`` (e.g. '25' near 2024 ->
+    2025), handling century rollover ('99' near 2024 -> 1999)."""
+    if y >= 100:
+        return y
+    full = (near // 100) * 100 + y
+    if full < near - 50:
+        full += 100
+    return full
+
+
 def extract_month_range(query: str) -> tuple[str, str] | None:
-    """Return (from_date, to_date) ISO strings for a specific month in the query,
-    e.g. 'january 2025' -> ('2025-01-01', '2025-01-31'). Year defaults to the
-    current year when not given. None when no month is mentioned."""
+    """Return (from_date, to_date) ISO strings for a month or span of months in
+    the query, e.g. 'january 2025' -> ('2025-01-01', '2025-01-31') and
+    'january to march 2025' -> ('2025-01-01', '2025-03-31'). Year defaults to
+    the current year when not given. None when no month is mentioned."""
     q = query.lower()
+    span = _extract_month_span(q)
+    if span is not None:
+        return span
     m = _MONTH_RE.search(q)
     if not m:
         return None
@@ -106,10 +161,74 @@ def extract_month_range(query: str) -> tuple[str, str] | None:
     return (f"{year}-{month:02d}-01", f"{year}-{month:02d}-{last_day:02d}")
 
 
+def _extract_month_span(query: str) -> tuple[str, str] | None:
+    """A span of months as (from_date, to_date), or None. Handles 'jan-march',
+    'january to march 2025', 'january 2025 to march 2025', and 'january and
+    february'. A reverse span (e.g. 'may to march') crosses a year boundary."""
+    m = _MONTH_SPAN_RE.search(query)
+    if not m:
+        return None
+    m1, y1, m2, y2 = _MONTHS[m.group(1)], m.group(2), _MONTHS[m.group(3)], m.group(4)
+    year = int(y2 or y1) if (y2 or y1) else _CURRENT_YEAR
+    if m1 <= m2:
+        end_year = year
+    else:
+        end_year = year + 1
+    end_last = calendar.monthrange(end_year, m2)[1]
+    return (f"{year}-{m1:02d}-01", f"{end_year}-{m2:02d}-{end_last:02d}")
+
+
+def _quarter_range(query: str) -> tuple[str, str] | None:
+    """(from_date, to_date) for a quarter reference ('Q1 2025', 'first quarter
+    of 2025'), or None. Year defaults to the current year when not given."""
+    q = query.lower()
+    m = _Q_YEAR_RE.search(q)
+    if m:
+        qn, year = int(m.group(1)), _full_year(int(m.group(2)), _CURRENT_YEAR)
+    else:
+        m = _Q_RE.search(q)
+        if m:
+            qn, year = int(m.group(1)), _CURRENT_YEAR
+        else:
+            m = _QUARTER_WORD_RE.search(q)
+            if not m:
+                return None
+            qn = _QUARTER_WORD_ORDER[m.group(1).lower()]
+            year = int(m.group(2)) if m.group(2) else _CURRENT_YEAR
+    sm, em = _QUARTER_MONTHS[qn]
+    return (f"{year}-{sm:02d}-01", f"{year}-{em:02d}-{calendar.monthrange(year, em)[1]:02d}")
+
+
+def _fiscal_range(query: str) -> tuple[str, str] | None:
+    """(from_date, to_date) for a fiscal-year reference ('FY25', 'FY 2024-25',
+    'fiscal year 2025'), or None. FY ending in year N spans Apr (N-1) to Mar N."""
+    q = query.lower()
+    m = re.search(
+        r"\bfy\s*((?:19|20)?\d{2})\s*(?:-|to|through)\s*((?:19|20)?\d{2})\b", q
+    )
+    if m:
+        start = _full_year(int(m.group(1)), _CURRENT_YEAR)
+        end = _full_year(int(m.group(2)), start)
+        if end < start:
+            end += 100
+        return (f"{end - 1}-04-01", f"{end}-03-31")
+    m = re.search(r"\bfy\s*'?((?:19|20)?\d{2})\b", q)
+    if m:
+        end = _full_year(int(m.group(1)), _CURRENT_YEAR)
+        return (f"{end - 1}-04-01", f"{end}-03-31")
+    m = re.search(r"\bfiscal(?:\s+year)?\s*((?:19|20)?\d{2})\b", q)
+    if m:
+        end = _full_year(int(m.group(1)), _CURRENT_YEAR)
+        return (f"{end - 1}-04-01", f"{end}-03-31")
+    return None
+
+
 def extract_year_range(query: str) -> tuple[str, str] | None:
     """Return (from_date, to_date) ISO strings for a time window mentioned in the
-    query: a specific month ('january 2025' -> month range), a year span, an
-    explicit year, or 'last year'/'this year'. Month takes precedence.
+    query: a specific month or month span ('january 2025', 'jan-march'), a fiscal
+    year ('FY25'), a quarter ('Q1 2025'), a year span ('2024-25', '2023 to
+    2025'), an explicit year, or 'last year'/'this year'. Month spans take
+    precedence, then fiscal, then quarter, then year span.
 
     An explicit year that names a historical event ('2008 crisis', 'financial
     crisis of 2008') is NOT treated as a publication-date filter: such queries
@@ -118,9 +237,22 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
     month_range = extract_month_range(q)
     if month_range is not None:
         return month_range
+    fy = _fiscal_range(q)
+    if fy is not None:
+        return fy
+    quarter = _quarter_range(q)
+    if quarter is not None:
+        return quarter
     m = _YEAR_SPAN_RE.search(q)
     if m:
         return (f"{m.group(1)}-01-01", f"{m.group(2)}-12-31")
+    m = _YEAR_SPAN_SHORT_RE.search(q)
+    if m:
+        start = int(m.group(1))
+        end = _full_year(int(m.group(2)), start)
+        if end < start:
+            end += 100
+        return (f"{start}-01-01", f"{end}-12-31")
     if _LAST_YEAR_RE.search(q):
         y = _CURRENT_YEAR - 1
         return (f"{y}-01-01", f"{y}-12-31")
@@ -148,13 +280,34 @@ def suggested_top_k(query: str) -> int | None:
     return None
 
 
+def _strip_time_tokens(text: str) -> str:
+    """Remove fiscal/quarter/month/year/time filler tokens from a query, leaving
+    the bare topical text. Time-word regexes are applied longest-first so a
+    compound token ('FY 2024-25', 'jan to march') is removed before its parts."""
+    s = _FY_RE.sub(" ", text)
+    s = _QUARTER_WORD_RE.sub(" ", s)
+    s = _Q_RE.sub(" ", s)
+    s = re.sub(r"'(\d{2})\b", " ", s)
+    s = _MONTH_SPAN_RE.sub(" ", s)
+    s = _YEAR_SPAN_SHORT_RE.sub(" ", s)
+    s = _YEAR_SPAN_RE.sub(" ", s)
+    s = _MONTH_RE.sub(" ", s)
+    s = _LAST_YEAR_RE.sub(" ", s)
+    s = _THIS_YEAR_RE.sub(" ", s)
+    s = _YEAR_RE.sub(" ", s)
+    s = _FLASHBACK_RE.sub(" ", s)
+    s = _NOISE_WORDS_RE.sub(" ", s)
+    return s
+
+
 def rewrite_year_in_review(query: str) -> tuple[str, bool]:
     """For 'top/best <topic> in <year>' style queries, rewrite to surface the
     year-in-review ('Flashback <year>') articles. Returns (query, changed).
 
     Queries that mention a specific MONTH are NOT rewritten: Flashback articles
     are annual roundups, so a month-scoped query should match the month's actual
-    articles instead."""
+    articles instead. Range/fiscal/quarter queries are not rewritten either —
+    they want the span's own data, not a single annual roundup."""
     if extract_month_range(query) is not None:
         return query, False
     topic = extract_list_topic(query)
@@ -166,14 +319,39 @@ def rewrite_year_in_review(query: str) -> tuple[str, bool]:
 
 
 def _referenced_year(query: str) -> int | None:
-    """The year referenced by the query (explicit, span, last/this year, or an
-    explicit 'Flashback <year>' prefix), else None."""
+    """The year referenced by the query (explicit, last/this year, or an
+    explicit 'Flashback <year>' prefix), else None. Range, fiscal-year, and
+    quarter queries return None: they span more than a single calendar year (or
+    a sub-year period) and must not collapse into one annual roundup."""
     m = _FLASHBACK_RE.search(query)
     if m:
         return int(m.group(1))
+    if _YEAR_SPAN_RE.search(query) or _YEAR_SPAN_SHORT_RE.search(query):
+        return None
+    if _fiscal_range(query) is not None or _quarter_range(query) is not None:
+        return None
     rng = extract_year_range(query)
     if rng is not None:
-        return int(rng[0][:4])
+        start, end = int(rng[0][:4]), int(rng[1][:4])
+        if start == end:
+            return start
+    return None
+
+
+def range_query_topic(query: str) -> str | None:
+    """Cleaned retrieval/rerank query for a query scoped by an auto date range
+    that is NOT a plain single year — a month, month span, quarter, fiscal year,
+    or year span — e.g. 'top 15 deals in Q1 2025' -> 'deals'. The date filter
+    already scopes the period, so dropping the 'top/quarter/fiscal/of/month/year'
+    words lets the embeddings and cross-encoder focus on the actual topic. None
+    for plain single-year queries (they keep their Flashback rewrite) or for
+    queries with no auto date range."""
+    if extract_month_range(query) is not None:
+        return extract_list_topic(query) or _strip_noise_words(query)
+    if _quarter_range(query) is not None or _fiscal_range(query) is not None:
+        return extract_list_topic(query) or _strip_noise_words(query)
+    if _YEAR_SPAN_RE.search(query) or _YEAR_SPAN_SHORT_RE.search(query):
+        return extract_list_topic(query) or _strip_noise_words(query)
     return None
 
 
@@ -185,10 +363,7 @@ def month_query_topic(query: str) -> str | None:
     doesn't mention a specific month."""
     if extract_month_range(query) is None:
         return None
-    topic = extract_list_topic(query)
-    if topic:
-        return topic
-    return _strip_noise_words(query)
+    return range_query_topic(query)
 
 
 def extract_list_topic(query: str) -> str | None:
@@ -197,24 +372,15 @@ def extract_list_topic(query: str) -> str | None:
     query is not a top/best/list intent."""
     if _TOP_HINT_RE.search(query) is None and _TOP_N_RE.search(query) is None:
         return None
-    stripped = _YEAR_SPAN_RE.sub(" ", query)
-    stripped = _YEAR_RE.sub(" ", stripped)
-    stripped = _LAST_YEAR_RE.sub(" ", stripped)
-    stripped = _THIS_YEAR_RE.sub(" ", stripped)
+    stripped = _strip_time_tokens(query)
     stripped = _TOP_N_RE.sub(" ", stripped)
     stripped = _TOP_HINT_RE.sub(" ", stripped)
-    stripped = _FLASHBACK_RE.sub(" ", stripped)
-    stripped = _MONTH_RE.sub(" ", stripped)
-    stripped = _NOISE_WORDS_RE.sub(" ", stripped)
     topic = re.sub(r"[\s-]+", " ", stripped).strip()
     return topic or None
 
 
 def _strip_noise_words(query: str) -> str | None:
     """Remove month/year/time filler words, leaving the bare query text."""
-    q = _MONTH_RE.sub(" ", query)
-    q = _YEAR_SPAN_RE.sub(" ", q)
-    q = _YEAR_RE.sub(" ", q)
-    q = _NOISE_WORDS_RE.sub(" ", q)
+    q = _strip_time_tokens(query)
     q = re.sub(r"[\s-]+", " ", q).strip()
     return q or None
