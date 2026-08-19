@@ -235,3 +235,27 @@ def test_range_query_topic():
     assert range_query_topic("funding deals 2024-25") == "funding deals"
     assert range_query_topic("top deals in 2025") is None
     assert range_query_topic("venture funding") is None
+
+
+def test_chart_request_filler_stripped_from_topic():
+    """Chart/table request words ('make a table of') describe the output format,
+    not the topic: they must not leak into the retrieval query or embedding
+    match is diluted and retrieval can fail ('make a table deals')."""
+    for q, expected in (
+        ("make a table of top 15 deals in 2024-25", "deals"),
+        ("show me a bar chart of top 15 deals in 2024-25", "deals"),
+        ("create a pie chart for top deals in Q1 2025", "deals"),
+        ("top 15 deals in 2024-25 as a table", "deals"),
+        ("give me a graph of deals in jan-march", "deals"),
+        ("draw a line chart of top 10 funding rounds in FY25", "funding rounds"),
+        ("make a table of top pharma deals of month january 2025", "pharma deals"),
+    ):
+        assert range_query_topic(q) == expected
+    assert extract_list_topic("make a table of top 15 deals in 2024-25") == "deals"
+    assert extract_list_topic("draw a line chart of top 10 funding rounds in FY25") == "funding rounds"
+
+
+def test_chart_filler_not_stripped_from_real_topic_words():
+    """'table' as a real topic word (not part of a chart request) must survive."""
+    assert extract_list_topic("top table manufacturing deals in 2025") == "table manufacturing deals"
+    assert range_query_topic("top table games funding") is None
