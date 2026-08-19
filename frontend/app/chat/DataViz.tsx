@@ -28,10 +28,21 @@ function toNum(v: unknown): number | null {
   return null
 }
 
+function isMissing(v: unknown): boolean {
+  return v == null || (typeof v === 'string' && v.trim() === '')
+}
+
+// A value column must hold a number in every non-missing cell and at least one
+// number overall (empty cells are allowed, e.g. 'value not stated').
+function validValueColumn(rows: (string | number)[][], j: number): boolean {
+  const present = rows.map((r) => r[j]).filter((v) => !isMissing(v))
+  return present.length > 0 && present.every((v) => toNum(v) != null)
+}
+
 function firstNumericColumn(rows: (string | number)[][]): number | null {
   if (!rows.length || !rows[0].length) return null
   for (let j = 0; j < rows[0].length; j++) {
-    if (rows.every((r) => toNum(r[j]) != null)) return j
+    if (validValueColumn(rows, j)) return j
   }
   return null
 }
@@ -53,7 +64,7 @@ export function parseDataViz(text: string): DataVizBlock | null {
       typeof vcRaw === 'number' && Number.isInteger(vcRaw) && vcRaw >= 0 && vcRaw < columns.length
         ? vcRaw
         : firstNumericColumn(rowArr)
-    if (vc == null || rowArr.some((r) => toNum(r[vc]) == null)) return null
+    if (vc == null || !validValueColumn(rowArr, vc)) return null
     const kind = (d as { kind?: unknown }).kind
     const view = (d as { view?: unknown }).view
     return {
@@ -338,9 +349,7 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
                 <tr key={i}>
                   {row.map((cell, j) => (
                     <td key={j}>
-                      {j === block.value_column && toNum(cell) != null
-                        ? formatValue(toNum(cell)!, block.format)
-                        : String(cell)}
+                      {j === block.value_column && (isMissing(cell) ? '—' : toNum(cell) != null ? formatValue(toNum(cell)!, block.format) : String(cell))}
                     </td>
                   ))}
                 </tr>
