@@ -490,12 +490,24 @@ def _first_numeric_column(rows: list[list[object]]) -> int | None:
     return None
 
 
+def _has_label_content(rows: list[list[object]], columns: list[str], value_column: int | None) -> bool:
+    """A dataviz block is only useful if at least one non-value column carries
+    identifying text. A 'top deals' table whose Deal cells are all empty shows
+    only numbers and is treated as malformed so the nudge retry rebuilds it."""
+    label_cols = [j for j in range(len(columns)) if j != value_column]
+    if not label_cols:
+        return True
+    return any(not _missing_cell(r[j]) for j in label_cols for r in rows)
+
+
 def parse_dataviz(text: str) -> dict | None:
     """Extract and validate the assistant's ``dataviz`` JSON data block.
 
     Returns the parsed block dict, or None when absent or malformed. The block
     powers the frontend table/bar/pie renderer; the prose answer always stands
-    alone, so an invalid block is simply dropped instead of breaking chat."""
+    alone, so an invalid block is simply dropped instead of breaking chat. A
+    block whose label cells are all empty (e.g. every Deal name blank) is
+    malformed too: it conveys no information to the user."""
     m = _DATAVIZ_FENCE_RE.search(text or "")
     if not m:
         return None
@@ -523,6 +535,8 @@ def parse_dataviz(text: str) -> dict | None:
     if vc is not None and not _valid_value_column(rows, vc):
         return None
     if vc is None and data.get("view") != "table":
+        return None
+    if not _has_label_content(rows, columns, vc):
         return None
     data["value_column"] = vc
     return data
@@ -591,6 +605,7 @@ _DATAVIZ_NUDGE = (
     "Rules: valid JSON only (double-quoted keys, no trailing commas, no markdown bullet lists); rows are "
     f"the ranked items (max {_DATAVIZ_MAX_ROWS_TOKEN} rows); value_column is the integer index of the "
     "numeric column and every cell in that column is a plain number actually stated in the articles; "
+    "the first (label) column must contain every item's name — never leave it empty; "
     "never invent numbers; keep [n] citations only in the prose."
 )
 
@@ -848,6 +863,8 @@ Variants:
 **Data block rules:**
 - Rows are the ranked items (max {dataviz_max_rows}); every item mentioned in your prose answer must \
 appear as a row.
+- The first (label) column must contain each item's name (deal, company, round, year, segment) — \
+never leave a label cell empty; a row of bare numbers is useless to the user.
 - Every value cell is a plain number in the unit declared by `"format"` (`"$B"`, `"$M"`, `"₹ Cr"`, `"%"`, or `""`).
 - If a value isn't stated in the articles, use `""` for that cell (never the text "value not stated" — \
 that phrasing is for prose only) and never drop the row.
