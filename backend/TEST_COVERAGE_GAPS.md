@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (89% overall, 324 passed). This is a checklist
+Measured with `pytest --cov=app` (89% overall, 330 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -177,13 +177,20 @@ degraded path).
 
 ---
 
-## app/cost_budget.py — 92%
+## app/cost_budget.py — 100% (covered by tests/test_cost_budget.py)
 
-- [ ] **`close` resets `_redis`** (lines 48-50).
-- [ ] `spend_today` Redis failure → 0.0 (line 61-63), `record_cost` failure
-      (lines 87-88), `assert_within_budget` over-cap (line 75-76) are the
-      branches to probe — partly covered; confirm the **ERROR PATH — Redis
-      down** degrade is asserted (fail-open on read, skip record on write).
+- [x] **`close` resets `_redis`** (lines 48-50): `aclose` called, global set to
+      `None`; `close` no-op when no client.
+- [x] **`spend_today` Redis failure → 0.0** (lines 61-63): fail-open on read,
+      warn once, return `0.0`. **ERROR PATH — Redis down.**
+- [x] **`spend_today` counter read** (line 60): non-empty counter parsed to
+      float; `get` → None → `0.0`.
+- [x] **`record_cost` failure** (lines 87-88): skip recording, warn once, no
+      raise. **ERROR PATH — Redis down.**
+- [x] **`assert_within_budget` over-cap** (lines 75-76): confirmed spend ≥ cap
+      → `BudgetExceeded`; under-cap allowed; Redis-down never blocks.
+- [x] **`_client` lazy init + `_base_url`** (lines 29-43): `from_url` once,
+      DB index swapped to `ANALYTICS_REDIS_DB`, connection reused.
 
 ---
 
@@ -304,8 +311,8 @@ degraded path).
 
 1. **app/main.py `hybrid_search` / `_attach_bodies` / `search` / `facets`** —
    Qdrant down and Redis down surfaces as 500s.
-2. **app/analytics.py + app/cost_budget.py** — Redis down degrade paths
-   (warn-once, in-memory fallback, fail-open budget).
+2. **app/analytics.py** — Redis down degrade paths (warn-once, in-memory
+   fallback, fail-open budget).
 3. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
 4. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
@@ -316,5 +323,6 @@ degraded path).
 (was 15%) is now 100% via `tests/test_diversity.py`, `app/query_fix.py`
 (was 30%) is now 100% via `tests/test_query_fix.py`, `app/click_boost.py`
 (was 15%) is now 100% via `tests/test_click_boost.py`, `app/health.py`
-(was 37%) is now 100% via `tests/test_health.py`, and `app/redis_cache.py`
-(was 85%) is now 100% via `tests/test_cache.py`.
+(was 37%) is now 100% via `tests/test_health.py`, `app/redis_cache.py`
+(was 85%) is now 100% via `tests/test_cache.py`, and `app/cost_budget.py`
+(was 92%) is now 100% via `tests/test_cost_budget.py`.
