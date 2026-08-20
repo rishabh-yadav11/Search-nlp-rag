@@ -54,6 +54,16 @@ function firstNumericColumn(rows: (string | number)[][]): number | null {
   return null
 }
 
+// A data block is only useful if at least one non-value column carries
+// identifying text. A table whose label cells are all empty shows only numbers
+// and is treated as malformed (mirrors backend app.chat._has_label_content), so
+// the streamed view drops it instead of rendering a column of blank names.
+function hasLabelContent(rows: (string | number)[][], columns: string[], valueColumn: number | null): boolean {
+  const labelCols = columns.map((_, j) => j).filter((j) => j !== valueColumn)
+  if (!labelCols.length) return true
+  return labelCols.some((j) => rows.some((r) => !isMissing(r[j])))
+}
+
 export function parseDataViz(text: string): DataVizBlock | null {
   const m = new RegExp(FENCE_SRC).exec(text)
   if (!m) return null
@@ -72,6 +82,7 @@ export function parseDataViz(text: string): DataVizBlock | null {
         ? vcRaw
         : firstNumericColumn(rowArr)
     if (vc != null && !validValueColumn(rowArr, vc)) return null
+    if (!hasLabelContent(rowArr, columns, vc)) return null
     const kind = (d as { kind?: unknown }).kind
     const view = (d as { view?: unknown }).view
     return {

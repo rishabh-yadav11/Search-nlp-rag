@@ -978,6 +978,8 @@ Variants:
 **Data block rules:**
 - Rows are the ranked items (max {dataviz_max_rows}); every item mentioned in your prose answer must \
 appear as a row.
+- Do NOT render the same data as a markdown table in the prose — the data block IS the table. Keep \
+the prose as a short summary with citations.
 - The first (label) column must contain each item's name (deal, company, round, year, segment) — \
 never leave a label cell empty; a row of bare numbers is useless to the user.
 - Every value cell is a plain number in the unit declared by `"format"` (`"$B"`, `"$M"`, `"₹ Cr"`, `"%"`, or `""`).
