@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (89% overall, 330 passed). This is a checklist
+Measured with `pytest --cov=app` (90% overall, 347 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -194,16 +194,23 @@ degraded path).
 
 ---
 
-## app/analytics.py — 74%
+## app/analytics.py — 100% (covered by tests/test_analytics.py)
 
-- [ ] **`_client` first-call init** (lines 33-40).
-- [ ] **`_degraded` warn-once** (lines 43-47) + `close` (lines 52-54).
-- [ ] **`record_click` with `article_id`** (line 102) — the click-boost key.
-- [ ] **`click_signals`** (lines 111-129): no raw → None; below
-      `CLICK_BOOST_MIN_CLICKS` → None; success dict build. **ERROR PATH —
+- [x] **`_client` first-call init** (lines 33-40): `from_url` once, DB index
+      swapped to `ANALYTICS_REDIS_DB`, connection reused.
+- [x] **`_degraded` warn-once** (lines 43-47): only the first failure logs.
+- [x] **`close`** (lines 52-54): `aclose` called, global reset to `None`;
+      no-op when no client.
+- [x] **`record_click` with `article_id`** (line 102): per-query per-article
+      `analytics:query_click:{q}` sorted-set tally (repeated clicks stack);
+      without `article_id` the key is never created.
+- [x] **`click_signals`** (lines 111-129): no raw → None; below
+      `CLICK_BOOST_MIN_CLICKS` → None; success dict build (zero-count members
+      filtered, `total` = sum of per-article counts). **ERROR PATH —
       Redis down → degraded → None.**
-- [ ] **`_i`/`_f` malformed value branches** (lines 135-136, 142-143).
-      **ERROR PATH — malformed Redis counters.**
+- [x] **`_i`/`_f` malformed value branches** (lines 135-136, 142-143):
+      non-numeric / un-parseable values → `0` / `0.0`. **ERROR PATH —
+      malformed Redis counters.**
 
 ---
 
@@ -311,10 +318,8 @@ degraded path).
 
 1. **app/main.py `hybrid_search` / `_attach_bodies` / `search` / `facets`** —
    Qdrant down and Redis down surfaces as 500s.
-2. **app/analytics.py** — Redis down degrade paths (warn-once, in-memory
-   fallback, fail-open budget).
-3. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
-4. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
+2. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
+3. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
@@ -324,5 +329,6 @@ degraded path).
 (was 30%) is now 100% via `tests/test_query_fix.py`, `app/click_boost.py`
 (was 15%) is now 100% via `tests/test_click_boost.py`, `app/health.py`
 (was 37%) is now 100% via `tests/test_health.py`, `app/redis_cache.py`
-(was 85%) is now 100% via `tests/test_cache.py`, and `app/cost_budget.py`
-(was 92%) is now 100% via `tests/test_cost_budget.py`.
+(was 85%) is now 100% via `tests/test_cache.py`, `app/cost_budget.py`
+(was 92%) is now 100% via `tests/test_cost_budget.py`, and `app/analytics.py`
+(was 74%) is now 100% via `tests/test_analytics.py`.
