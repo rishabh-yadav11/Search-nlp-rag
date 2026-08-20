@@ -24,3 +24,4 @@ qdrant_config.yaml
 # Runtime
 .pid/
 AGENTS.md
+backend/.coverage
