@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (88% overall, 318 passed). This is a checklist
+Measured with `pytest --cov=app` (89% overall, 324 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -157,12 +157,23 @@ coroutine.
 
 ---
 
-## app/redis_cache.py — 85%
+## app/redis_cache.py — 100% (covered by tests/test_cache.py)
 
-- [ ] **`get` Redis hit + JSON decode** (lines 42-43).
-- [ ] **`get`/`set` degraded fallback to in-memory** (lines 42-45, 51-54).
+Redis faked in-process (`_RecordingRedis` happy path, `_FakeRedis` for the
+degraded path).
+
+- [x] **`get` Redis hit + JSON decode** (lines 42-43): a stored JSON string is
+      `json.loads`-ed back into a dict; a Redis miss (`get` → None) falls
+      through to the in-memory cache.
+- [x] **`get`/`set` degraded fallback to in-memory** (lines 42-45, 51-54):
+      Redis raising → warn-once → reads/writes the in-process `TTLCache`.
       **ERROR PATH — Redis down → silent in-process fallback.**
-- [ ] **`close` with active client** (lines 57-58).
+- [x] **`_client` lazy init + reuse** (lines 27-32): `from_url` called once,
+      kwargs (`decode_responses`, timeouts) asserted, cached for later calls.
+- [x] **`set` success writes JSON + TTL** (lines 50-51): default ttl vs per-call
+      override.
+- [x] **`close` with active client** (lines 57-58) and **`close` no-op when no
+      client** (line 57 guard).
 
 ---
 
@@ -293,8 +304,8 @@ coroutine.
 
 1. **app/main.py `hybrid_search` / `_attach_bodies` / `search` / `facets`** —
    Qdrant down and Redis down surfaces as 500s.
-2. **app/redis_cache.py + app/analytics.py + app/cost_budget.py** — Redis down
-   degrade paths (warn-once, in-memory fallback, fail-open budget).
+2. **app/analytics.py + app/cost_budget.py** — Redis down degrade paths
+   (warn-once, in-memory fallback, fail-open budget).
 3. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
 4. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
@@ -304,5 +315,6 @@ coroutine.
 (was 25%) is now 100% via `tests/test_encoders.py`, `app/diversity.py`
 (was 15%) is now 100% via `tests/test_diversity.py`, `app/query_fix.py`
 (was 30%) is now 100% via `tests/test_query_fix.py`, `app/click_boost.py`
-(was 15%) is now 100% via `tests/test_click_boost.py`, and `app/health.py`
-(was 37%) is now 100% via `tests/test_health.py`.
+(was 15%) is now 100% via `tests/test_click_boost.py`, `app/health.py`
+(was 37%) is now 100% via `tests/test_health.py`, and `app/redis_cache.py`
+(was 85%) is now 100% via `tests/test_cache.py`.
