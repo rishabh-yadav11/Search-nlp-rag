@@ -1,3 +1,4 @@
+from app import query_expand
 from app.query_expand import expand_query
 
 
@@ -44,3 +45,14 @@ def test_expand_is_bounded_to_six_extra_tokens():
         original_tokens = len(q.split())
         expanded = expand_query(q)
         assert len(expanded.split()) - original_tokens <= 6
+
+
+def test_ai_concept_expands_to_multi_token_terms_by_default():
+    expanded = expand_query("ai")
+    assert "artificial intelligence" in expanded
+    assert "machine learning" in expanded
+
+
+def test_expand_returns_query_unchanged_when_no_term_fits_token_budget(monkeypatch):
+    monkeypatch.setattr(query_expand, "_MAX_EXTRA_TOKENS", 1)
+    assert expand_query("ai") == "ai"
