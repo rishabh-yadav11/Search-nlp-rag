@@ -2,6 +2,7 @@
 retention purging, and the message-turn flow (retrieval + LLM stubbed)."""
 
 import asyncio
+import sqlite3
 import time
 
 import pytest
@@ -123,6 +124,110 @@ def test_purge_expired(tmp_path):
         _run(store._db.commit())
         assert _run(store.purge_expired()) == 1
         assert _run(store.get_session(a.id, USER_A)) is None
+    finally:
+        _run(store.close())
+
+
+def _legacy_db(path, messages_schema):
+    """Create a pre-token-tracking SQLite DB (the schema chat.py must migrate)."""
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE sessions ("
+        " id TEXT PRIMARY KEY, user_id TEXT NOT NULL,"
+        " title TEXT NOT NULL DEFAULT 'New chat',"
+        " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+    )
+    conn.execute(messages_schema)
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES ('s1', 'u1', 'Legacy', 0, 0)"
+    )
+    conn.execute("INSERT INTO messages (session_id, role, content, created_at) VALUES ('s1', 'user', 'hello', 0)")
+    conn.commit()
+    conn.close()
+
+
+def test_connect_migrates_legacy_messages_schema(tmp_path):
+    """A DB created before token/cost tracking gets the missing columns added by
+    connect() (ERROR PATH — legacy/malformed SQLite schema)."""
+    db_path = tmp_path / "chat.db"
+    _legacy_db(
+        db_path,
+        "CREATE TABLE messages ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        " role TEXT NOT NULL, content TEXT NOT NULL,"
+        " sources TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL)",
+    )
+    store = ChatStore(str(db_path))
+    _run(store.connect())
+    try:
+        cols = _run(store._db.execute_fetchall("PRAGMA table_info(messages)"))
+        names = {c["name"] for c in cols}
+        for name in ("prompt_tokens", "completion_tokens", "cost", "latency_ms"):
+            assert name in names
+        rows = _run(store._db.execute_fetchall("SELECT * FROM messages"))
+        assert rows[0]["prompt_tokens"] == 0  # migrated columns default to 0
+        assert rows[0]["latency_ms"] == 0
+    finally:
+        _run(store.close())
+
+
+def test_connect_adds_missing_latency_ms_only(tmp_path):
+    """connect() also adds latency_ms on its own when only that column is
+    missing from an otherwise current schema."""
+    db_path = tmp_path / "chat.db"
+    _legacy_db(
+        db_path,
+        "CREATE TABLE messages ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        " role TEXT NOT NULL, content TEXT NOT NULL,"
+        " sources TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL,"
+        " prompt_tokens INTEGER NOT NULL DEFAULT 0,"
+        " completion_tokens INTEGER NOT NULL DEFAULT 0,"
+        " cost REAL NOT NULL DEFAULT 0)",
+    )
+    store = ChatStore(str(db_path))
+    _run(store.connect())
+    try:
+        cols = _run(store._db.execute_fetchall("PRAGMA table_info(messages)"))
+        assert "latency_ms" in {c["name"] for c in cols}
+    finally:
+        _run(store.close())
+
+
+def test_close_is_idempotent(tmp_path):
+    store = _store(tmp_path)
+    _run(store.close())
+    assert store._db is None
+    _run(store.close())  # already closed -> no-op
+    assert store._db is None
+
+
+def test_rename_delete_missing_session_404(tmp_path):
+    store = _store(tmp_path)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            _run(store.rename_session("missing", USER_A, "title"))
+        assert exc.value.status_code == 404
+        with pytest.raises(HTTPException) as exc:
+            _run(store.delete_session("missing", USER_A))
+        assert exc.value.status_code == 404
+    finally:
+        _run(store.close())
+
+
+def test_global_stats_never_raises_on_error(tmp_path, monkeypatch):
+    """global_stats degrades to an error payload instead of raising when the
+    underlying query fails (ERROR PATH — DB/query failure)."""
+    store = _store(tmp_path)
+    try:
+        async def boom(*args, **kwargs):
+            raise RuntimeError("db gone")
+
+        monkeypatch.setattr(store, "_fetchone", boom)
+        monkeypatch.setattr(store, "_fetchall", boom)
+        assert _run(store.global_stats()) == {"error": "chat analytics unavailable"}
     finally:
         _run(store.close())
 
@@ -1017,3 +1122,683 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
     assert result.content == "No chart here [1]."
     assert result.prompt_tokens == 10
     assert result.completion_tokens == 5
+
+
+def test_json_loads_malformed_returns_empty():
+    assert chat_module.json_loads("{not json") == []
+    assert chat_module.json_loads(None) == []
+    assert chat_module.json_loads("") == []
+    assert chat_module.json_loads('[]') == []
+    assert chat_module.json_loads(123) == []  # TypeError branch
+
+
+def test_row_to_message_coerces_legacy_fields():
+    """_row_to_message must tolerate malformed/legacy rows: bad sources JSON and
+    NULL/string token/cost fields fall back to 0 defaults (ERROR PATH — malformed
+    stored rows)."""
+    row = {
+        "id": 1,
+        "role": "user",
+        "content": "hello",
+        "sources": "{bad json",
+        "created_at": 123.0,
+        "prompt_tokens": None,
+        "completion_tokens": "12",
+        "cost": None,
+        "latency_ms": "0.5",
+    }
+    msg = chat_module._row_to_message(row)
+    assert msg.sources == []
+    assert msg.prompt_tokens == 0
+    assert msg.completion_tokens == 12
+    assert msg.cost == 0.0
+    assert msg.latency_ms == 0.5
+
+
+def test_smalltalk_reply_empty_and_long_fallthrough():
+    """Line 436: empty queries and >12-word messages are NOT small talk."""
+    assert chat_module._smalltalk_reply("") is None
+    assert chat_module._smalltalk_reply("   ") is None
+    assert chat_module._smalltalk_reply("hi " * 13) is None  # 13 words > 12
+    assert chat_module._smalltalk_reply("who invested in Ola Electric and also in Zepto and also in Meesho?") is None
+
+
+def test_dataviz_helpers_edge_branches():
+    assert chat_module._as_float("abc") is None  # non-numeric string
+    assert chat_module._as_float(True) is None  # bool is not a number
+    assert chat_module._as_float("1,200") == 1200.0
+    assert chat_module._as_float(None) is None
+
+    assert chat_module._missing_cell(None) is True
+    assert chat_module._missing_cell("N/A") is True
+    assert chat_module._missing_cell("  value not stated ") is True
+    assert chat_module._missing_cell("—") is True
+    assert chat_module._missing_cell(0) is False
+    assert chat_module._missing_cell("present") is False
+
+    # _valid_value_column: no present cell at all -> False; numeric cells -> True.
+    assert chat_module._valid_value_column([["x", ""], ["y", "not stated"]], 1) is False
+    assert chat_module._valid_value_column([["x", 1.0]], 1) is True
+    assert chat_module._valid_value_column([["x", "abc"]], 1) is False
+
+    # _has_label_content: no label columns -> True; all-empty labels -> False.
+    assert chat_module._has_label_content([["x"]], ["A"], 0) is True
+    assert chat_module._has_label_content([["", 1.0], ["", 2.0]], ["A", "B"], 1) is False
+    assert chat_module._has_label_content([["x", 1.0], ["", 2.0]], ["A", "B"], 1) is True
+
+    # _first_numeric_column: empty rows / empty first row short-circuit to None.
+    assert chat_module._first_numeric_column([]) is None
+    assert chat_module._first_numeric_column([[]]) is None
+    assert chat_module._first_numeric_column([["x", 3.0]]) == 1
+
+
+def test_parse_dataviz_rejection_paths():
+    # line 561: data is not a dict
+    assert chat_module.parse_dataviz("```dataviz\n[1, 2, 3]\n```") is None
+    assert chat_module.parse_dataviz("```dataviz\n\"just a string\"\n```") is None
+    # line 565: columns not a non-empty list of strings
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A", 1], "rows": [["x", 1.0]]}\n```') is None
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": [], "rows": []}\n```') is None
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": "A", "rows": [["x"]]}\n```') is None
+    # line 567: rows not a non-empty list of lists
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A"], "rows": [1]}\n```') is None
+    assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A"], "rows": []}\n```') is None
+
+
+def test_sanitize_dataviz_empty_and_no_fence():
+    assert chat_module._sanitize_dataviz("") == ""
+    assert chat_module._sanitize_dataviz("plain prose [1].") == "plain prose [1]."
+
+
+def test_dataviz_nudge_pins_requested_view():
+    nudge = chat_module._dataviz_nudge("show me a pie chart of top deals")
+    assert "pie" in nudge
+    assert "exact type of data block" in nudge
+    generic = chat_module._dataviz_nudge("show me a chart of top deals")
+    assert "exact type of data block" not in generic
+
+
+def test_parse_dataviz_with_view_invalid():
+    # line 712: no fence
+    assert chat_module._parse_dataviz_with_view("no block here", "table") is None
+    # lines 715-716: invalid JSON
+    assert chat_module._parse_dataviz_with_view("```dataviz\n{not json}\n```", "table") is None
+    # line 718: data not a dict
+    assert chat_module._parse_dataviz_with_view("```dataviz\n[1, 2]\n```", "table") is None
+    # dict data gets the view applied
+    out = chat_module._parse_dataviz_with_view(
+        '```dataviz\n{"columns": ["A"], "rows": [["x"]]}\n```', "table"
+    )
+    assert out is not None
+    assert out["view"] == "table"
+
+
+def test_apply_requested_view_keeps_malformed_block():
+    """Line 734: a block that fails to re-parse is left verbatim (never dropped)."""
+    text = "Prose.\n\n```dataviz\n{not json}\n```"
+    assert chat_module._apply_requested_view(text, "show me a pie chart") == text
+
+
+def test_is_ranking_refusal():
+    assert chat_module._is_ranking_refusal("A ranked list cannot be generated because values are missing.")
+    assert chat_module._is_ranking_refusal(
+        "I cannot provide a ranked list as the articles do not contain specific amounts."
+    )
+    assert chat_module._is_ranking_refusal("The data do not include specific amounts, so no ranking exists.")
+    assert chat_module._is_ranking_refusal("") is False
+    assert not chat_module._is_ranking_refusal("Here are the top deals: Zepto $1B [1].")
+
+
+def test_answer_ranked_nudges_after_refusal(monkeypatch):
+    """A ranked-list answer that refuses must be re-asked once with the ranking
+    nudge (lines 799-808)."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(
+                content="I cannot generate a ranked list [1].", prompt_tokens=10, completion_tokens=5
+            )
+        return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT"))
+    assert len(calls) == 2
+    assert chat_module._RANKING_NUDGE in calls[1]
+    assert result.content == "Top deal: Zepto [1]."
+    assert result.prompt_tokens == 30
+    assert result.completion_tokens == 13
+
+
+def test_answer_ranked_keeps_first_answer_when_nudge_fails(monkeypatch):
+    """A failed ranking-nudge retry must keep the first answer (LLMUnavailableError
+    guard at lines 803-804)."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(
+                content="I cannot generate a ranked list.", prompt_tokens=10, completion_tokens=5
+            )
+        raise chat_module.LLMUnavailableError()
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT"))
+    assert len(calls) == 2
+    assert result.content == "I cannot generate a ranked list."
+    assert result.prompt_tokens == 10
+
+
+def test_answer_ranked_single_call_when_not_refusal(monkeypatch):
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        return chat_module.LLMResult(content="Top deal is Zepto [1].", prompt_tokens=10, completion_tokens=5)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT"))
+    assert len(calls) == 1
+    assert result.content == "Top deal is Zepto [1]."
+
+
+def test_prepare_turn_vague_followup_with_year_range(monkeypatch):
+    """A vague follow-up that adds a year window ('for 2024') keeps the previous
+    turn's topic but pins the new date range (lines 856-859)."""
+    from app import main
+    from app.chat import MessageOut
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    intents = {
+        "top ipo deals": ("top ipo deals", None, None),
+        "make this into a table for 2024": ("make this into a table for 2024", None, None),
+    }
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: intents[q])
+
+    captured = {}
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        captured["rq"] = rq
+        captured["top_k"] = top_k
+        captured["qfilter"] = qfilter
+        return [SourceArticle(id=1, title="t", url="u", published_date="2024-05-01",
+                              summary="s", body="b", score=0.9)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    def msg(i, role, content):
+        return MessageOut(id=i, role=role, content=content, sources=[], created_at=float(i),
+                          prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=0.0)
+
+    history = [
+        msg(1, "user", "top ipo deals"),
+        msg(2, "assistant", "Here are the IPOs."),
+        msg(3, "user", "make this into a table for 2024"),
+    ]
+    turn = _run(chat_module._prepare_turn("make this into a table for 2024", history))
+    assert turn.needs_llm
+    assert captured["rq"] == "ipo deals"  # inherited previous topic
+    assert captured["top_k"] == 10  # previous turn's list size
+    keys = {c.key for c in captured["qfilter"].must}
+    assert "published_date" in keys  # 2024 range applied
+
+
+def test_prepare_turn_calls_body_rescue_when_enabled(monkeypatch):
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", True)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+
+    rescued = []
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-01-01",
+                              summary="s", body="", score=0.9)]
+
+    async def fake_rescue(q, articles):
+        rescued.append(q)
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("who invested in Ola Electric?", []))
+    assert turn.needs_llm
+    assert rescued == ["who invested in Ola Electric?"]
+
+
+def test_prepare_turn_no_sources_short_circuit(monkeypatch):
+    """line 876: sources below ASK_MIN_SCORE yield a plain 'no articles' answer
+    instead of an LLM call."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-01-01",
+                              summary="s", body="b", score=0.01)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("niche topic nobody wrote about", []))
+    assert not turn.needs_llm
+    assert "No sufficiently relevant articles" in turn.answer
+    assert turn.sources == []
+    assert turn.cost == 0.0
+
+
+def test_prepare_turn_weak_fallback(monkeypatch):
+    """line 879: weak-but-nonempty sources produce the honest fallback answer
+    with a note, no LLM call."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-01-01",
+                              summary="s", body="b", score=0.2)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("niche topic", []))
+    assert not turn.needs_llm
+    assert "closest" in turn.answer
+    assert len(turn.sources) == 1
+    assert turn.note is not None
+
+
+def test_run_turn_records_cost_and_finalizes(monkeypatch):
+    """Lines 917-920: _run_turn checks the budget, calls the LLM, records cost,
+    and finalizes the answer (strips unrequested dataviz blocks)."""
+    calls = {}
+
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note="note", needs_llm=True)
+
+    async def fake_budget():
+        calls["budget"] = True
+
+    async def fake_answer_ranked(question, prompt):
+        calls["prompt"] = prompt
+        return chat_module.LLMResult(
+            content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
+            prompt_tokens=10,
+            completion_tokens=5,
+        )
+
+    async def fake_record_cost(cost):
+        calls["cost"] = cost
+
+    monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+    monkeypatch.setattr(chat_module, "assert_within_budget", fake_budget)
+    monkeypatch.setattr(chat_module, "_answer_ranked", fake_answer_ranked)
+    monkeypatch.setattr(chat_module, "record_cost", fake_record_cost)
+
+    answer, sources, note, pt, ct, _cost = _run(chat_module._run_turn("top 10 ipo deals in 2025", []))
+    assert calls["budget"] is True
+    assert calls["prompt"] == "PROMPT"
+    expected_cost = chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5).cost()
+    assert calls["cost"] == pytest.approx(expected_cost)
+    # No chart intent -> dataviz block stripped by _finalize_answer.
+    assert "dataviz" not in answer
+    assert "Prose [1]" in answer
+    assert sources == [{"id": 1}]
+    assert note == "note"
+    assert (pt, ct) == (10, 5)
+
+
+def test_api_require_store_uninitialized_503(tmp_path):
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        chat_module.store = None
+        h = _auth_headers(auth_store)
+        assert client.get("/api/chat/sessions", headers=h).status_code == 503
+        assert client.post("/api/chat/sessions", headers=h).status_code == 503
+    finally:
+        chat_module.store = chat_store
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_send_message_too_long_400(tmp_path):
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        long_msg = "x" * (chat_module.MAX_CONTENT_LEN + 1)
+        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": long_msg})
+        assert r.status_code == 400
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_send_message_budget_exceeded_429(tmp_path, monkeypatch):
+    """send_message fails closed with 429 when the daily LLM budget is hit
+    (ERROR PATH — daily budget)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(question, history):
+            raise chat_module.BudgetExceeded()
+
+        monkeypatch.setattr(chat_module, "_run_turn", boom)
+        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        assert r.status_code == 429
+        assert "Daily AI budget reached" in r.text
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_send_message_llm_unavailable_503(tmp_path, monkeypatch):
+    """send_message returns 503 when the LLM cannot be reached after retries
+    (ERROR PATH — LLM retry exhaustion)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(question, history):
+            raise chat_module.LLMUnavailableError()
+
+        monkeypatch.setattr(chat_module, "_run_turn", boom)
+        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        assert r.status_code == 503
+        assert "LLM temporarily unavailable" in r.text
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def _stream_body(client, headers, sid, content):
+    url = f"/api/chat/sessions/{sid}/messages/stream"
+    with client.stream("POST", url, headers=headers, json={"content": content}) as r:
+        assert r.status_code == 200
+        return "".join(r.iter_text())
+
+
+def _fake_prepare_llm():
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="prompt-text", sources=[], note=None, needs_llm=True)
+
+    return fake_prepare
+
+
+def test_api_stream_dataviz_nudge_replaces_answer(tmp_path, monkeypatch):
+    """Streaming: an explicit chart ask without a block re-asks once and swaps in
+    the nudge answer, summing token usage (lines 1173-1176)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "no block here [1]."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
+
+        async def fake_generate(client, prompt, model):
+            return chat_module.LLMResult(
+                content='Prose.\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
+                prompt_tokens=20,
+                completion_tokens=8,
+            )
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+        monkeypatch.setattr(chat_module, "assert_within_budget", noop)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "show me a chart of top deals")
+        assert "dataviz" in body
+        assert '"prompt_tokens":30' in body  # 10 streamed + 20 nudge
+        assert '"completion_tokens":13' in body
+        assert "event: done" in body
+        assert "event: error" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
+    """Streaming: a failed dataviz nudge retry keeps the streamed answer instead
+    of erroring the turn (lines 1171-1172)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "streamed answer without a block [1]."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
+
+        async def boom(*args, **kwargs):
+            raise chat_module.LLMUnavailableError()
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", boom)
+        monkeypatch.setattr(chat_module, "assert_within_budget", noop)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "show me a chart of top deals")
+        assert "streamed answer without a block [1]." in body
+        assert '"prompt_tokens":10' in body  # unchanged
+        assert "event: done" in body
+        assert "event: error" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_ranking_nudge_replaces_answer(tmp_path, monkeypatch):
+    """Streaming: a ranked-list refusal is re-asked once with the ranking nudge
+    (lines 1185-1188)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "I cannot generate a ranked list because amounts are missing."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
+
+        async def fake_generate(client, prompt, model):
+            return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+        monkeypatch.setattr(chat_module, "assert_within_budget", noop)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
+        assert "Top deal: Zepto [1]." in body
+        assert '"prompt_tokens":30' in body
+        assert "event: done" in body
+        assert "event: error" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_ranking_nudge_failure_keeps_answer(tmp_path, monkeypatch):
+    """Streaming: a failed ranking-nudge retry keeps the streamed refusal
+    (lines 1183-1184)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "I cannot generate a ranked list because amounts are missing."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
+
+        async def boom(*args, **kwargs):
+            raise chat_module.LLMUnavailableError()
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", boom)
+        monkeypatch.setattr(chat_module, "assert_within_budget", noop)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
+        assert "I cannot generate a ranked list because amounts are missing." in body
+        assert '"prompt_tokens":10' in body
+        assert "event: done" in body
+        assert "event: error" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_llm_unavailable_sse(tmp_path, monkeypatch):
+    """Streaming: an LLMUnavailableError mid-stream yields an error SSE event
+    (line 1213) instead of a done event (ERROR PATH — LLM retry exhaustion)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(*args, **kwargs):
+            raise chat_module.LLMUnavailableError()
+            yield  # pragma: no cover - makes boom an async generator
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", boom)
+        monkeypatch.setattr(chat_module, "assert_within_budget", noop)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "who invested in Ola Electric?")
+        assert "event: error" in body
+        assert "LLM temporarily unavailable" in body
+        assert "event: done" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_generic_error_sse(tmp_path, monkeypatch):
+    """Streaming: an unexpected exception yields a generic error SSE event
+    (lines 1216-1218), never a 500 to the client."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("boom")
+            yield  # pragma: no cover - makes boom an async generator
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", boom)
+        monkeypatch.setattr(chat_module, "assert_within_budget", noop)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "who invested in Ola Electric?")
+        assert "event: error" in body
+        assert "Something went wrong" in body
+        assert "event: done" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_retention_loop_purges_and_swallows_errors(monkeypatch, tmp_path):
+    """retention_loop purges expired conversations on each tick and swallows
+    per-tick errors (lines 1225-1233)."""
+    store = _store(tmp_path)
+    chat_module.store = store
+    try:
+        a = _run(store.create_session(USER_A))
+        _run(store._db.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (time.time() - 200 * 86400, a.id)))
+        _run(store._db.commit())
+
+        orig_purge = store.purge_expired
+        attempts = []
+        sleeps = []
+
+        async def flaky_purge():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("db locked")
+            return await orig_purge()
+
+        def fake_sleep(delay):
+            async def _sleep(d):
+                sleeps.append(d)
+                if len(sleeps) >= 2:
+                    raise asyncio.CancelledError()
+            return _sleep(delay)
+
+        monkeypatch.setattr(store, "purge_expired", flaky_purge)
+        monkeypatch.setattr(chat_module.asyncio, "sleep", fake_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(chat_module.retention_loop())
+        assert len(attempts) == 2  # first raised, second succeeded
+        assert sleeps == [chat_module.config.CHAT_PURGE_INTERVAL_SECONDS] * 2
+        assert _run(store.get_session(a.id, USER_A)) is None  # purged on 2nd tick
+    finally:
+        chat_module.store = None
+        _run(store.close())
