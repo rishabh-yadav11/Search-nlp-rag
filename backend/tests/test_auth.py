@@ -501,3 +501,192 @@ def test_admin_user_management_rbac(tmp_path):
     finally:
         auth.store = None
         asyncio.run(s.close())
+
+
+def test_verify_password_malformed_hash_returns_false():
+    """A malformed stored password hash raises ValueError inside bcrypt, which
+    verify_password must swallow as a plain False (ERROR PATH — malformed stored
+    password hash)."""
+    assert auth.verify_password("secret12", "not-a-bcrypt-hash") is False
+    assert auth.verify_password("secret12", "") is False
+
+
+def test_create_user_generic_error_rolls_back_and_raises(store, monkeypatch):
+    """A non-integrity INSERT failure must roll back so the connection never
+    holds an open write transaction, then re-raise (ERROR PATH — SQLite write
+    failure)."""
+    calls = {"rollback": 0}
+    orig_execute = store._db.execute
+
+    async def fake_execute(query, params=()):
+        if query.startswith("INSERT INTO users"):
+            raise RuntimeError("disk full")
+        return await orig_execute(query, params)
+
+    async def fake_rollback():
+        calls["rollback"] += 1
+
+    monkeypatch.setattr(store._db, "execute", fake_execute)
+    monkeypatch.setattr(store._db, "rollback", fake_rollback)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(store.create_user("x@b.co", "secret12", "X", "user"))
+    assert calls["rollback"] == 1
+
+
+def test_update_user_no_op_and_name_update(store, monkeypatch):
+    """update_user with no fields issues no SQL; a name update persists (lines
+    284-285, 293)."""
+    user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
+    execs = []
+    orig_execute = store._db.execute
+
+    async def fake_execute(query, params=()):
+        execs.append(query)
+        return await orig_execute(query, params)
+
+    monkeypatch.setattr(store._db, "execute", fake_execute)
+    asyncio.run(store.update_user(user.id, None, None, None))
+    assert execs == []  # empty update is a true no-op
+
+    asyncio.run(store.update_user(user.id, "New Name", None, None))
+    assert len(execs) == 1 and execs[0].startswith("UPDATE users SET name = ?")
+    assert asyncio.run(store.get_user(user.id)).name == "New Name"
+
+
+def test_delete_user_removes_tokens_and_user(store):
+    """delete_user removes the user and cascades its tokens (lines 299-301)."""
+    user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
+    token = asyncio.run(store.issue_token(user.id, 7))
+    assert asyncio.run(store.user_for_token(token)) is not None
+    asyncio.run(store.delete_user(user.id))
+    assert asyncio.run(store.get_user(user.id)) is None
+    assert asyncio.run(store.user_for_token(token)) is None
+
+
+def test_issue_token_error_rolls_back_and_raises(store, monkeypatch):
+    """A token INSERT failure must roll back before re-raising (ERROR PATH —
+    SQLite write failure)."""
+    calls = {"rollback": 0}
+    orig_execute = store._db.execute
+
+    async def fake_execute(query, params=()):
+        if query.startswith("INSERT INTO auth_tokens"):
+            raise RuntimeError("db gone")
+        return await orig_execute(query, params)
+
+    async def fake_rollback():
+        calls["rollback"] += 1
+
+    monkeypatch.setattr(store._db, "execute", fake_execute)
+    monkeypatch.setattr(store._db, "rollback", fake_rollback)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(store.issue_token("u1", 7))
+    assert calls["rollback"] == 1
+
+
+def test_require_auth_store_uninitialized_503(monkeypatch):
+    monkeypatch.setattr(auth, "store", None)
+    with pytest.raises(HTTPException) as e:
+        auth._require_auth_store()
+    assert e.value.status_code == 503
+
+
+def test_client_ip_x_forwarded_for_and_fallback():
+    """_client_ip trusts the first X-Forwarded-For hop (nginx) and falls back to
+    the socket peer, then 'unknown'."""
+    req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
+    assert auth._client_ip(req) == "203.0.113.9"
+    req = _req({"x-forwarded-for": " 203.0.113.9 "})
+    assert auth._client_ip(req) == "203.0.113.9"
+    # socket peer fallback
+    req = _req({})
+    req.client = SimpleNamespace(host="1.2.3.4")
+    assert auth._client_ip(req) == "1.2.3.4"
+    # no peer at all -> "unknown"
+    assert auth._client_ip(_req({})) == "unknown"
+
+
+def _promote_to_admin(client, s, email):
+    uid = asyncio.run(s.get_user_by_email(email)).id
+    asyncio.run(s.update_user(uid, None, "admin", None))
+    return uid
+
+
+def test_get_user_endpoint(tmp_path):
+    """GET /api/auth/users/{id} returns the requested user (line 548)."""
+    client, s = _auth_app(tmp_path)
+    try:
+        token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12"}).json()["token"]
+        uid = _promote_to_admin(client, s, "boss@x.co")
+        ah = {"Authorization": f"Bearer {token}"}
+        r = client.get(f"/api/auth/users/{uid}", headers=ah)
+        assert r.status_code == 200
+        assert r.json()["email"] == "boss@x.co"
+        assert r.json()["role"] == "admin"
+        assert client.get("/api/auth/users/nope", headers=ah).status_code == 404
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_patch_user_last_admin_guard_endpoint(tmp_path):
+    """PATCH cannot demote or deactivate the last active admin (line 566) —
+    ERROR PATH — self-lockout protection."""
+    client, s = _auth_app(tmp_path)
+    try:
+        token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12"}).json()["token"]
+        uid = _promote_to_admin(client, s, "boss@x.co")
+        ah = {"Authorization": f"Bearer {token}"}
+        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"role": "user"}).status_code == 400
+        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"is_active": False}).status_code == 400
+        # once a second admin exists the guard releases
+        asyncio.run(s.create_user("other@x.co", "secret12", "O", "admin"))
+        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"role": "user"}).status_code == 200
+        assert asyncio.run(s.get_user(uid)).role == "user"
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_delete_user_last_admin_guard_endpoint(tmp_path):
+    """DELETE cannot remove the last active admin (lines 580-585) — ERROR PATH —
+    self-lockout protection."""
+    client, s = _auth_app(tmp_path)
+    try:
+        token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12"}).json()["token"]
+        uid = _promote_to_admin(client, s, "boss@x.co")
+        ah = {"Authorization": f"Bearer {token}"}
+        assert client.delete(f"/api/auth/users/{uid}", headers=ah).status_code == 400
+        # a second admin releases the guard
+        asyncio.run(s.create_user("other@x.co", "secret12", "O", "admin"))
+        assert client.delete(f"/api/auth/users/{uid}", headers=ah).status_code == 200
+        assert asyncio.run(s.get_user(uid)) is None
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_bootstrap_admin_gives_up_after_write_lock_retries(store, monkeypatch):
+    """bootstrap_admin retries 5 times on a write lock, sleeping between attempts,
+    then gives up gracefully instead of failing startup (lines 620-624)."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "adminpass1")
+    monkeypatch.setattr(auth, "store", store)
+
+    calls = {"create": 0, "sleep": []}
+
+    async def locked_create(email, password, name, role):
+        calls["create"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    async def fake_sleep(seconds):
+        calls["sleep"].append(seconds)
+
+    monkeypatch.setattr(store, "create_user", locked_create)
+    monkeypatch.setattr(auth.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(auth.bootstrap_admin())  # must not raise
+    assert calls["create"] == 5  # 5 attempts before giving up
+    assert calls["sleep"] == [1, 1, 1, 1]  # slept between attempts 0-3

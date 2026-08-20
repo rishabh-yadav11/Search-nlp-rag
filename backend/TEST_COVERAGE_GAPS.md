@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (98% overall, 428 passed). This is a checklist
+Measured with `pytest --cov=app` (99% overall, 439 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -329,24 +329,36 @@ degraded path).
 
 ---
 
-## app/auth.py — 91%
+## app/auth.py — 100% (covered by tests/test_auth.py)
 
-- [ ] **`verify_password` `ValueError` branch** (lines 155-156). **ERROR PATH —
-      malformed stored password hash.**
-- [ ] **`create_user` non-unique rollback** (lines 264-266). **ERROR PATH —
-      SQLite write-lock / constraint failure.**
-- [ ] **`update_user` empty no-op** (line 293) and **`delete_user`** (lines
-      299-301).
-- [ ] **`issue_token` error rollback** (lines 321-323). **ERROR PATH — SQLite
-      write failure.**
-- [ ] **`_require_auth_store` uninitialized → 503** (line 350).
-- [ ] **`_client_ip` X-Forwarded-For branch** (line 372).
-- [ ] **`get_user` endpoint** (line 548).
-- [ ] **`patch_user` last-admin guard** (lines 565-566) and **`delete_user`
-      last-admin guard** (lines 582-585). **ERROR PATH — self-lockout
-      protection.**
-- [ ] **`bootstrap_admin` write-lock retry loop** (lines 620-624). **ERROR
-      PATH — concurrent worker bootstrap.**
+- [x] **`verify_password` `ValueError` branch** (lines 155-156): a malformed
+      stored hash (bad salt / empty string) is swallowed as a plain `False`.
+      **ERROR PATH — malformed stored password hash.**
+- [x] **`create_user` non-unique rollback** (lines 264-266): a non-integrity
+      INSERT failure rolls back the connection before re-raising, so it never
+      holds an open write transaction. **ERROR PATH — SQLite write failure.**
+      (The `IntegrityError`/duplicate path is covered by
+      `test_concurrent_create_duplicate_race_no_poison`.)
+- [x] **`update_user` empty no-op** (line 293): no fields → no SQL issued; the
+      name/role/is_active branches persist each field (lines 284-291).
+- [x] **`delete_user`** (lines 299-301): user removed and tokens cascade.
+- [x] **`issue_token` error rollback** (lines 321-323): an INSERT failure rolls
+      back before re-raising. **ERROR PATH — SQLite write failure.**
+- [x] **`_require_auth_store` uninitialized → 503** (line 350).
+- [x] **`_client_ip` X-Forwarded-For branch** (line 372): first hop wins;
+      socket-peer fallback; `"unknown"` when no peer.
+- [x] **`get_user` endpoint** (line 548): successful fetch of a user by id plus
+      the 404 path.
+- [x] **`patch_user` last-admin guard** (line 566): demoting or deactivating the
+      last active admin → 400; the guard releases once a second admin exists.
+      **ERROR PATH — self-lockout protection.**
+- [x] **`delete_user` last-admin guard** (lines 580-585): deleting the last
+      active admin → 400; allowed once a second admin exists. **ERROR PATH —
+      self-lockout protection.**
+- [x] **`bootstrap_admin` write-lock retry loop** (lines 620-624): a persistent
+      write lock is retried 5 times with a 1s sleep between attempts, then
+      gives up gracefully instead of failing startup. **ERROR PATH — concurrent
+      worker bootstrap.**
 
 ---
 
@@ -366,10 +378,10 @@ degraded path).
 
 ## Priority order (error paths first)
 
-1. **app/auth.py SQLite layer** — malformed stored password hashes,
-   write-lock/constraint rollbacks, and last-admin lockout guards.
-2. **app/index_text.py + app/query_intent.py + app/query_expand.py edge
-   branches** — malformed index rows and month/year-range edge cases.
+1. **app/index_text.py + app/query_intent.py + app/query_expand.py edge
+   branches** — malformed index rows and month/year-range edge cases (the only
+   modules below 100%: index_text 88%, llm 97% dead-code raises, query_expand
+   97%, query_intent 99%).
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
 (was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
@@ -382,6 +394,9 @@ degraded path).
 (was 92%) is now 100% via `tests/test_cost_budget.py`, `app/analytics.py`
 (was 74%) is now 100% via `tests/test_analytics.py`, `app/main.py`
 (was 72%) is now 100% via `tests/test_main_pipeline.py` +
-`tests/test_main_http.py`, and `app/chat.py` (was 84%) is now 100% via
+`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 100% via
 `tests/test_chat.py` (schema migration, error SSEs, budget/LLM HTTP paths,
-dataviz edge branches, nudge retries, and retention loop).
+dataviz edge branches, nudge retries, and retention loop), and `app/auth.py`
+(was 91%) is now 100% via `tests/test_auth.py` (malformed-hash handling,
+SQLite rollback paths, last-admin lockout guards, `_client_ip`, and the
+bootstrap write-lock retry loop).
