@@ -9,7 +9,6 @@ import sys
 import types
 
 import numpy as np
-import pytest
 
 from app.config import config
 from app.reranker import Reranker

@@ -75,7 +75,7 @@ def test_qdrant_ok_times_out(monkeypatch):
         try:
             await coro
         finally:
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
 
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
     client = type("C", (), {"collection_exists": _async(True)})()
@@ -171,7 +171,7 @@ def test_redis_status_ping_times_out_degraded(monkeypatch):
 
     class FakeRedis:
         async def ping(self):
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
 
     monkeypatch.setattr(health.aioredis, "from_url", lambda url, **kw: FakeRedis())
     assert _run(health._redis_status()) == (True, "degraded")
