@@ -64,6 +64,23 @@ def test_suggested_top_k_numeric():
     assert suggested_top_k("best 10 companies") == 10
 
 
+def test_suggested_top_k_word_numbers():
+    assert suggested_top_k("top ten deals") == 10
+    assert suggested_top_k("show me top twenty startups") == 20
+    assert suggested_top_k("best ten companies") == 10
+    assert suggested_top_k("biggest five funding rounds") == 5
+    assert suggested_top_k("top twenty five deals") == 25
+    assert suggested_top_k("largest ten deals in 2025") == 10
+    assert suggested_top_k("top fortyfive deals") == 45
+    assert suggested_top_k("top twentyone startups") == 21
+
+
+def test_extract_list_topic_word_numbers():
+    assert extract_list_topic("top ten fintech deals") == "fintech deals"
+    assert extract_list_topic("best ten companies") == "companies"
+    assert extract_list_topic("top twenty five deals in 2024") == "deals"
+
+
 def test_suggested_top_k_default_and_none():
     assert suggested_top_k("top deals in fintech") == 10
     assert suggested_top_k("best fintech companies") == 10
