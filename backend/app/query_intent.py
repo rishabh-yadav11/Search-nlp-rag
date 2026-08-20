@@ -345,6 +345,18 @@ def _top_n_to_int(phrase: str) -> int | None:
     return total
 
 
+def normalize_word_numbers(query: str) -> str:
+    """Rewrite word-form counts after a list hint to digits so the retrieval
+    query matches the numeric form exactly: 'top ten ipo' -> 'top 10 ipo'.
+    Without this the literal word 'ten' pollutes the embedding/rerank match
+    (it can match titles like 'Ten Sports'), while the digit form does not."""
+    def _replace(m: re.Match) -> str:
+        n = _top_n_to_int(m.group(2))
+        return f"{m.group(1)} {n}" if n is not None else m.group(0)
+
+    return _TOP_N_RE.sub(_replace, query)
+
+
 def suggested_top_k(query: str) -> int | None:
     """Suggested top_k from a 'top N' in the query (digit or word form, e.g.
     'top ten'), or a small default for a generic top/best intent without a
