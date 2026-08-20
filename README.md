@@ -29,7 +29,6 @@ I built this as a hybrid retrieval + RAG search system over the VCCircle article
 - [Security](#security)
 - [Supported Settings](#supported-settings)
 - [Testing and CI](#testing-and-ci)
-- [Production Notes](#production-notes-poc-shortcuts-i-still-need-to-fix)
 
 ## Architecture
 

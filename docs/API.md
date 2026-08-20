@@ -37,6 +37,11 @@ Signup validation: `email` (format, ≤254, lowercased, unique → 409),
 unknown email or wrong password (no account enumeration). A disabled account
 (`is_active=false`) is rejected everywhere.
 
+Admin endpoints are gated by granular permissions: `analytics:read`
+(`/analytics/*`), `users:read` (`GET /api/auth/users...`), and `users:manage`
+(`PATCH/DELETE /api/auth/users...` and token revocation). The default `admin`
+role carries all three.
+
 ---
 
 ## Integration guide (for the external consumer)
@@ -124,8 +129,10 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 **Query intent handling** (automatic):
 - Relative/absolute years are parsed into a date filter ("last year" = previous calendar year, "2025" = that year).
 - `top N <topic> in <year>` queries are rewritten to surface year-review ("Flashback <year>") articles **and** the bare topic is searched too; candidates are merged and reranked once.
+- `top N <topic>` queries also raise the effective result count up to `N` (bounded by 50), so the response can actually return `N` results even when the `top_k` param is smaller.
 - Query expansion maps user vocabulary to corpus terms (e.g. "layoffs" → "job cuts", "fundraise", etc.).
 - Entity-mention boosting raises results that name the query's company.
+- Results are additionally recency-tempered, de-duplicated by greedy MMR, and (once a query accumulates enough clicks) boosted toward articles users actually open.
 
 ### Response
 
@@ -228,6 +235,10 @@ Response (`TurnOut`):
 Both the user message and the assistant reply (with sources, tokens, cost and
 latency) are persisted. Greetings/small talk are answered without an LLM call;
 turns with only weak results get an honest fallback reply (zero tokens/cost).
+When the top-ranked sources score weakly, the backend re-scores them against
+the most relevant region of their article bodies ("body rescue"), so facts that
+live mid-article (e.g. historical retrospectives) can still pass the relevance
+gate and be cited.
 
 ### `POST /api/chat/sessions/{id}/messages/stream` (SSE)
 
@@ -298,6 +309,9 @@ Notes:
   nudge when an explicit chart request returns without a block. When the user
   asks for a specific view (e.g. "show me a pie chart", "as a table"), the
   backend pins the block's `view` to it so clients render exactly that view.
+- Ranked/numeric questions that come back as a refusal ("cannot be generated",
+  "no specific amounts") are re-asked once with a nudge to rank the named items
+  and state "value not stated" for unknowns.
 - Malformed blocks (invalid JSON, ragged rows, non-numeric value column) are
   stripped by `_sanitize_dataviz` before storage, so `content` never exposes
   unparseable JSON to clients.
@@ -329,8 +343,14 @@ Anonymous result-click beacon sent by the frontend when a user opens a result
 ### Body
 
 ```json
-{ "query": "fintech funding", "position": 2 }
+{ "query": "fintech funding", "position": 2, "id": 12345 }
 ```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `query` | string | The query string the user searched |
+| `position` | int | 1-based position of the clicked result |
+| `id` | int (optional) | The clicked article's id, used by click-driven learning |
 
 ### Response
 
@@ -479,7 +499,6 @@ curl -N -X POST "https://<host>/api/chat/sessions/<id>/messages/stream" \
   `AUTH_SERVICE_TOKEN` to let internal scripts bypass as an admin user.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
-- **Caching**: `/search` responses are cached (TTL 120s) keyed by effective
-  query + filters. `cached: true` indicates a cache hit. Chat turns are not cached.
+- **Caching**: `/search` responses are cached (TTL `CACHE_TTL_SECONDS`, default 300s) keyed by effective query + filters. `cached: true` indicates a cache hit. Chat turns are not cached. When Redis is unreachable, the cache degrades to an in-process store so the API keeps working.
 - **Retention**: conversations idle for 180 days are purged daily.
 - Interactive OpenAPI docs are served by FastAPI at `/docs` on the internal API port.
