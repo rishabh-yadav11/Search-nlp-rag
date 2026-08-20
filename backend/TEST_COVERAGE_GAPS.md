@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (81% overall, 250 passed). This is a checklist
+Measured with `pytest --cov=app` (82% overall, 255 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -67,13 +67,18 @@ sentence_transformers imports and a tmp ONNX cache dir.
 
 ---
 
-## app/encoders.py — 25%
+## app/encoders.py — 100% (covered by tests/test_encoders.py)
 
-- [ ] **fastembed init success** (lines 24-28): `_model` set, ONNX path used.
-- [ ] **fastembed load failure → torch fallback** (lines 29-35).
+All startup/encode branches exercised with faked fastembed /
+sentence_transformers imports (no model download or real inference).
+
+- [x] **fastembed init success** (lines 24-28): `_model` set, ONNX path used;
+      `cuda=False` on cpu vs `cuda=True` on a non-cpu device.
+- [x] **fastembed load failure → torch fallback** (lines 29-35).
       **ERROR PATH — model unavailable at startup.**
-- [ ] **`encode` both branches** (lines 39-41): torch fallback vs fastembed
-      generator path.
+- [x] **`encode` both branches** (lines 39-41): torch fallback
+      (`normalize_embeddings=True` asserted) vs fastembed generator path
+      (`batch_size=1`).
 
 ---
 
@@ -270,9 +275,10 @@ sentence_transformers imports and a tmp ONNX cache dir.
 3. **app/redis_cache.py + app/analytics.py + app/cost_budget.py** — Redis down
    degrade paths (warn-once, in-memory fallback, fail-open budget).
 4. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
-5. **app/encoders.py / app/query_fix.py** — startup model-load failure fallbacks.
+5. **app/query_fix.py** — startup model-load failure fallbacks.
 6. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
 
-`app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, and `app/reranker.py`
-(was 17%) is now 100% via `tests/test_reranker.py`.
+`app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
+(was 17%) is now 100% via `tests/test_reranker.py`, and `app/encoders.py`
+(was 25%) is now 100% via `tests/test_encoders.py`.
