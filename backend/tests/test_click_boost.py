@@ -50,7 +50,6 @@ def test_disabled_short_circuit_skips_signals(monkeypatch):
 
     async def _f(q):
         called.append(q)
-        return None
 
     monkeypatch.setattr(click_boost, "click_signals", _f)
     results = [_res(1, 0.5)]
@@ -67,7 +66,6 @@ def test_empty_results_short_circuit_skips_signals(monkeypatch):
 
     async def _f(q):
         called.append(q)
-        return None
 
     monkeypatch.setattr(click_boost, "click_signals", _f)
 

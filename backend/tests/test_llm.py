@@ -8,7 +8,6 @@ import httpx
 import openai
 import pytest
 
-from app import llm
 from app.config import config
 from app.llm import LLMResult, LLMUnavailableError, _is_retryable, generate_answer, stream_answer
 
