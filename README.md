@@ -27,13 +27,18 @@ backend/
   app/
     main.py            FastAPI app: /search, /chat, /health, /analytics
     health.py          /live, /ready, /readyz dependency checks
+    encoders.py        fastembed/ONNX dense encoder with torch fallback
+    reranker.py        ONNX cross-encoder reranker with torch fallback
     llm.py             LLM call with timeout, retries, backoff, token-cost calc
+    cost_budget.py     daily LLM spend cap (fails closed once budget hit)
     chat.py            per-user chat store (SQLite) + /api/chat router
     analytics.py       Redis-backed search/click analytics aggregates
-    dashboard.py       self-contained HTML analytics dashboard
     config.py          env-driven settings
     query_intent.py    year/top-N intent parsing + Flashback rewriting
     query_expand.py    deterministic synonym query expansion
+    query_fix.py       SymSpell query typo correction
+    diversity.py       MMR title-diversity reordering of results
+    click_boost.py     click-signal score boost on results
     rerank_boost.py    entity-mention score boost on reranked results
     answer_fallback.py weak-result notes + honest chat fallback replies
     index_text.py      shared text composition + date normalization
@@ -41,23 +46,35 @@ backend/
   scripts/
     fetch_data.py      MySQL -> data/articles.jsonl (paginated, resumable)
     build_index.py     articles.jsonl -> Qdrant embeddings (checkpointed)
+    build_query_vocab.py  corpus token vocab for query_fix (gzip JSON)
     update_index.py    incremental MySQL->Qdrant sync (new/edit/delete)
-    backfill_summary.py  one-off summary payload backfill
+    backfill_summary.py / backfill_body.py / backfill_missing.py  payload backfills
     backup_qdrant.py   Qdrant snapshot + local artifact backups (retention)
     qdrant_backup.py   shared backup helpers
     reset_index.py     drop the index + data files (backup-gated)
+    search_quality_test.py / chat_quality_test.py  golden-set search/chat evals
+    deep_body_eval.py  whole-body indexing + body-grounded chat eval
+    rerank_bench.py    reranker latency/quality benchmark (onnx vs torch)
+    load_test.py       query load/throughput harness
   tests/               pytest suite (offline, mocked deps)
+  TEST_COVERAGE_GAPS.md  coverage-gap checklist (86% overall, 285 passed)
   requirements.txt
   requirements-dev.txt lint/test tooling
   .env.example         configuration template
 frontend/              Next.js app (App Router + TypeScript)
   app/page.tsx         search UI (timeouts, validation, a11y)
   app/chat/page.tsx    ChatGPT-style chat UI (SSE streaming)
+  app/chat/DataViz.tsx hand-rolled SVG charts (table/bar/line/pie/pictogram)
+  app/analytics/dashboard/page.tsx  admin analytics dashboard
+  app/login/ app/signup/  auth pages (token + RBAC)
+  app/lib/auth.ts      client-side session/token helpers
   app/globals.css
   middleware.ts        CSP nonce header
   next.config.ts       security headers (CSP, nosniff, etc.)
   eslint.config.mjs    flat config for eslint 9
 setup.sh               one-command deploy (deps, services, index, nginx, cron)
+deploy/                healthcheck.sh (cron health probe) + logrotate.conf
+docs/API.md            chat + auth API contract
 .github/workflows/ci.yml   backend + frontend + security gates
 ```
 
@@ -85,6 +102,25 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
 - **Result ordering** — recency-tempered relevance first: blended score desc
   (`score * (1 - RECENCY_STRENGTH * (1 - exp(-age_days / RECENCY_DECAY_DAYS)))`),
   then `published_date` desc as tie-break (missing dates last).
+- **Query typo correction** — `query_fix.py` runs SymSpell dictionary correction
+  over a corpus-derived token vocab (built by `scripts/build_query_vocab.py`)
+  plus a curated entity list (companies, VCs, people), right before embedding.
+  Short tokens are capped at one edit, corrections are spliced back preserving
+  punctuation, and uncorrected tokens fall through to the hybrid layer which
+  absorbs mild typos. When the vocab artifact is missing the fixer is a silent
+  no-op, so startup never depends on the one-time artifact.
+- **Result diversity** — `diversity.py` reorders search results with greedy MMR
+  over title-word Jaccard similarity, so a deal covered by several
+  near-identical headlines doesn't crowd out other stories in the top-n. `lam`
+  near 1 keeps relevance dominant; `sim_thresh` is a floor below which a pair's
+  similarity contributes no diversity penalty.
+- **Click boost** — `click_boost.py` lifts results that have earned real click
+  share from the analytics Redis store (gated on minimum clicks/share), and
+  re-sorts the final list. Redis down degrades to a pass-through.
+- **ONNX fast paths** — query-time dense embedding uses fastembed's ONNX (INT8)
+  variant of the bge model and the cross-encoder reranker runs via optimum
+  ONNX; both keep the same vector directions as torch so the existing index
+  stays valid, and both fall back to torch if the model can't load at startup.
 - **Chat (conversations)** — a ChatGPT-style UI at `/chat`. Users sign up/log in
   (token + RBAC: public signup grants `user` = chat; the `admin` role adds
   analytics + user management; the bootstrap admin comes from
@@ -393,15 +429,23 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
 | `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `50000` / `50000` | Chars for the dense vector; sparse/lexical vector input; body chars kept in the Qdrant payload |
 | `CHAT_BODY_CHAR_LIMIT` | `50000` | Body chars per source fed to the chat LLM (whole stored body by default; lower to cut prompt tokens/cost) |
+| `CHAT_MAX_SOURCES` / `CHAT_TOTAL_BODY_CHARS` | `20` / `400000` | Chat context budget: max sources per turn and total body chars across all sources |
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `EMBED_DEVICE` | `cpu` | `cuda` for a GPU |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `12` | Cross-encoder reranker; how many RRF candidates to re-score (12 keeps top-8 quality vs 16, faster on CPU) |
+| `RERANK_BACKEND` / `RERANK_ONNX_DIR` | `onnx` / `data/reranker_onnx` | Reranker backend (`onnx` via optimum, `torch` fallback); ONNX export cache dir |
+| `TORCH_THREADS` | `2` | Caps torch/onnxruntime threads per worker (also sets OMP/MKL) |
+| `ENABLE_QUERY_FIX` / `QUERY_FIX_VOCAB_PATH` | `true` / `data/query_vocab.json.gz` | SymSpell query typo correction (see `app/query_fix.py`); vocab built by `scripts/build_query_vocab.py` |
+| `QUERY_FIX_MAX_EDIT` / `QUERY_FIX_MIN_COUNT` / `QUERY_FIX_MIN_TOKEN_LEN` | `2` / `5` / `3` | Max edit distance (short tokens capped at 1); minimum suggestion frequency; minimum token length to consider |
+| `ENABLE_DIVERSITY` / `DIVERSITY_LAMBDA` / `DIVERSITY_SIM_THRESHOLD` | `true` / `0.7` / `0.4` | MMR title-diversity reordering of search results (see `app/diversity.py`) |
+| `ENABLE_CLICK_BOOST` / `CLICK_BOOST_MIN_CLICKS` / `CLICK_BOOST_MIN_ARTICLE_CLICKS` / `CLICK_BOOST_MIN_SHARE` / `CLICK_BOOST_MULT` | `true` / `5` / `3` / `0.3` / `1.3` | Click-signal score boost on search results (see `app/click_boost.py`) |
 | `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `LLM_MODEL` (`GEMINI_MODEL`) | — | Google Gemini (OpenAI-compatible endpoint) for chat |
 | `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` / `INR_PER_USD` | `0.25` / `1.50` / `95.60` | USD per 1M input/output tokens (for cost display); USD→INR rate |
 | `LLM_DAILY_BUDGET_USD` | `0` (disabled) | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value (see `app/cost_budget.py`) |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; chat retrieval threshold |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | Query cache TTL; size of the in-process fallback cache |
+| `VECTOR_CACHE_TTL_SECONDS` | `86400` | TTL for the query-time vector cache (query → embedding) |
 | `CHAT_DB_PATH` / `CHAT_RETENTION_DAYS` / `CHAT_MAX_HISTORY_TURNS` | `data/chat.db` / `180` / `10` | SQLite chat store; idle-purge window; context turns kept per conversation |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
@@ -416,20 +460,29 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 
 ## Testing and CI
 
-Backend tests (pytest, fully offline — mocked Qdrant/Redis/MySQL/LLM):
+Backend tests (pytest, fully offline — mocked Qdrant/Redis/MySQL/LLM;
+**285 tests, 86% overall coverage**):
 
 ```bash
 cd backend
 pip install -r requirements-dev.txt
 python -m pytest tests -q
+python -m pytest tests --cov=app --cov-report=term-missing   # coverage report
 python -m ruff check app scripts tests
 ```
 
 Coverage: query-intent/date parsing, facet filter construction, effective
 intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, chat store
 (CRUD, ownership isolation, retention, token/cost stats) and SSE streaming
-(small-talk short-circuit + full-turn deltas), index fingerprinting/delta/
-reconciliation, cache TTL and degraded fallback.
+(small-talk short-circuit + full-turn deltas, dataviz emission + sanitization),
+index fingerprinting/delta/reconciliation, cache TTL and degraded fallback, and
+the startup model-load fallbacks. The LLM retry/timeout engine
+(`app/llm.py`), the ONNX reranker (`app/reranker.py`), the dense encoder
+(`app/encoders.py`), MMR diversity (`app/diversity.py`) and the query fixer
+(`app/query_fix.py`) are each covered to **100%** (imports faked, no real model
+downloads or inference). `TEST_COVERAGE_GAPS.md` is a live checklist of the
+remaining uncovered branches, prioritised error-paths-first (Qdrant/Redis down,
+malformed stored rows, LLM budget/retry exhaustion).
 
 `.github/workflows/ci.yml` runs three gates on push/PR to `main`:
 
@@ -455,26 +508,11 @@ manual token setup is needed:
   for the dataviz-intent queries — that the answer carries a valid
   ```` ```dataviz ```` JSON block (same contract `app.chat.parse_dataviz`
   enforces). Makes real (billed) LLM calls.
+- `./venv/bin/python scripts/search_quality_test.py [top_k]` — golden-set
+  search eval over the live API (default `top_k=8`), checking that the right
+  articles surface for normal, entity, date-filtered and niche queries.
+- `./venv/bin/python scripts/rerank_bench.py` — reranker latency/quality
+  benchmark (ONNX vs torch backends) over representative queries.
+- `./venv/bin/python scripts/load_test.py` — concurrency/throughput harness
+  against the live API (workers, duration and query file configurable).
 
-## Production notes (POC shortcuts to fix before real prod)
-
-1. **Embeddings and the reranker run on CPU.** Query-time embedding uses
-   fastembed's ONNX (INT8) variant of the bge model (≈3-5x faster than torch on
-   CPU, same 768-dim normalized vectors, so the existing index stays valid) and
-   the cross-encoder runs via ONNX/optimum (≈2-3x faster) when `optimum` is
-   installed, with a torch fallback. Inference is serialized per worker and
-   `TORCH_THREADS` (default 2) caps torch/onnxruntime threads so 4 gunicorn
-   workers don't oversubscribe the CPU. Latency is still higher than a
-   GPU-backed embedder; set `EMBED_DEVICE=cuda` for lower latency.
-2. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
-   down it silently degrades to a per-worker in-process cache (which no longer
-   benefits the other workers until Redis returns).
-3. **Auth is self-enforced by the backend** (bearer tokens + RBAC; public
-   signup/login is rate-limited per IP via Redis) but the frontend is a
-   temporary UI — the API is the contract for the external project. Review
-   role assignment (`AUTH_DEFAULT_ROLE`), the admin bootstrap password, and the
-   service-token bypass before broad exposure.
-4. **`published_date` payload index** assumes MySQL returns a parseable
-   date/datetime string; adjust the payload schema if your column type differs.
-5. **Backups are host-local** — schedule off-server transfer of
-   `backend/backups/` and `backend/data/articles.jsonl` for disaster recovery.
