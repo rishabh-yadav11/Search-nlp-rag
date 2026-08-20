@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (90% overall, 347 passed). This is a checklist
+Measured with `pytest --cov=app` (94% overall, 394 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -214,31 +214,52 @@ degraded path).
 
 ---
 
-## app/main.py — 72%
+## app/main.py — 100% (covered by tests/test_main_pipeline.py + test_main_http.py)
 
-- [ ] **`lifespan` startup + teardown** (lines 64-96): model/qdrant/llm init,
-      chat+auth store connect, `init_fixer`, `retention_loop` cancel, cache /
-      analytics / cost-budget close. **ERROR PATH — any startup dependency
-      failing.**
-- [ ] **`_effective_intent` month-scoped branch** (line 242): `range_query_topic`
-      non-empty rewrite.
-- [ ] **`_retrieval_queries` year-in-review two-leg branch** (lines 270-272).
-- [ ] **`_embed_sparse`** (line 298) — run inside `asyncio.to_thread`.
-- [ ] **`hybrid_search` vector-cache miss → encode + Qdrant query** (lines
-      315-345) including the `inference_lock` serialization.
-- [ ] **`body_rescue`** (lines 427-447): empty articles; score above threshold;
-      no content tokens; articles without bodies; rerank + max().  **ERROR
-      PATH — reranker unavailable.**
-- [ ] **`_attach_bodies`** (lines 482-492): empty ids; Qdrant retrieve; payload
-      shape handling. **ERROR PATH — Qdrant down / malformed payload.**
-- [ ] **`_retrieval_leg` query expansion** (lines 500-502).
-- [ ] **`search` endpoint full path** (lines 554-584): cache hit vs miss;
-      `record_search` calls; click-boost and diversity wiring (lines 573-577).
-      **ERROR PATH — Qdrant/Redis down surfacing as 500s here.**
-- [ ] **`source_context` author/industry/dealtype branches** (lines 593-598).
-- [ ] **`_facet_values`** (lines 618-626) and **`facets` cache hit/miss** (lines
-      633-642). **ERROR PATH — Qdrant facet API down.**
-- [ ] **`analytics_click`** (line 656) and **`get_analytics_summary`** (line 666).
+- [x] **`lifespan` startup + teardown** (lines 64-96): model/qdrant/llm init,
+      chat+auth store connect + wiring, `init_fixer` args, retention task
+      cancel + gather, and cache/analytics/cost-budget closes all asserted.
+      **ERROR PATH — `ChatStore.connect` raising propagates out of startup.**
+- [x] **`_effective_intent` month-scoped branch** (line 242): a month query
+      rewrites to the bare topic ("top pharma deals of month january 2025" →
+      ("pharma deals", 2025-01-01, 2025-01-31)); user-dates-win and
+      no-intent passthrough regression-covered.
+- [x] **`_retrieval_queries` year-in-review two-leg branch** (lines 270-272):
+      Flashback rewrite + bare-topic second leg; month-scoped single-leg
+      (line 275); plain; flashback==topic dedup.
+- [x] **`_embed_sparse`** (line 298) — returns the first lazy-generator element
+      (runs inside `asyncio.to_thread`; the thread-hop is exercised by
+      `hybrid_search`).
+- [x] **`hybrid_search`** (lines 315-345): vector-cache miss → encode + sparse
+      embed + `cache.set`; cache hit skips encoding; `inference_lock`
+      acquired exactly once on miss; RRF prefetch shape (`dense`/`sparse`,
+      limit=4×top_k), `FusionQuery(RRF)`, `with_payload` default vs `True`;
+      payload→SourceArticle mapping.
+- [x] **`body_rescue`** (lines 427-447): empty articles; score ≥ threshold
+      short-circuit; stopword-only query; empty bodies; rerank + `max()`
+      rescoring + re-sort. **ERROR PATH — reranker predict raising
+      propagates.**
+- [x] **`_attach_bodies`** (lines 482-492): empty ids skip retrieve; single
+      Qdrant retrieve for all ids; missing/`None` payload → empty body.
+      **ERROR PATH — retrieve raising propagates.**
+- [x] **`_retrieval_leg` query expansion** (lines 500-502): expanded query
+      flows to `hybrid_search` with `max(top_k, RERANK_CANDIDATES)`; skipped
+      for flashback queries and when `ENABLE_QUERY_EXPANSION` is off.
+- [x] **`search` endpoint full path** (lines 554-584): cache hit (validated
+      `SourceSummary` models, `record_search` cached=True) vs miss (facet
+      filter → `retrieve_and_rerank` → click-boost + diversity wiring,
+      `cache.set`, `record_search` cached=False); boost/diversity disabled
+      variant; built qfilter passed through. **ERROR PATH — Qdrant/Redis down
+      → 500 via TestClient** (`raise_server_exceptions=False`).
+- [x] **`source_context` author/industry/dealtype branches** (lines 593-598):
+      all facets → `Authors:`/`Industry:`/`Dealtype:` suffixes; none → bare
+      `n/a`; body truncated to `body_limit`; no-summary.
+- [x] **`_facet_values`** (lines 618-626) and **`facets` cache hit/miss**
+      (lines 633-642): sorted string-only values; empty/None results; cache
+      hit skips the Qdrant call. **ERROR PATH — facet API raising → 500.**
+- [x] **`analytics_click`** (line 656) and **`get_analytics_summary`**
+      (line 666): click beacon forwards query/position/id; summary returns
+      `analytics_data()`.
 
 ---
 
@@ -316,10 +337,8 @@ degraded path).
 
 ## Priority order (error paths first)
 
-1. **app/main.py `hybrid_search` / `_attach_bodies` / `search` / `facets`** —
-   Qdrant down and Redis down surfaces as 500s.
-2. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
-3. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
+1. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
+2. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
@@ -330,5 +349,7 @@ degraded path).
 (was 15%) is now 100% via `tests/test_click_boost.py`, `app/health.py`
 (was 37%) is now 100% via `tests/test_health.py`, `app/redis_cache.py`
 (was 85%) is now 100% via `tests/test_cache.py`, `app/cost_budget.py`
-(was 92%) is now 100% via `tests/test_cost_budget.py`, and `app/analytics.py`
-(was 74%) is now 100% via `tests/test_analytics.py`.
+(was 92%) is now 100% via `tests/test_cost_budget.py`, `app/analytics.py`
+(was 74%) is now 100% via `tests/test_analytics.py`, and `app/main.py`
+(was 72%) is now 100% via `tests/test_main_pipeline.py` +
+`tests/test_main_http.py`.
