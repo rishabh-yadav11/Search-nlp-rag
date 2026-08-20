@@ -43,6 +43,7 @@ from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
     extract_list_topic,
     extract_year_range,
+    normalize_word_numbers,
     range_query_topic,
     rewrite_year_in_review,
     suggested_top_k,
@@ -232,6 +233,7 @@ def _effective_intent(
     bare topic as the retrieval query (the date filter scopes the month), so the
     noisy 'top/of/month/year' words don't dilute the embedding match. The same
     applies to quarter, fiscal-year, and year-span queries."""
+    q = normalize_word_numbers(q)
     retrieval_q, _ = rewrite_year_in_review(q)
     if from_date or to_date:
         return retrieval_q, from_date, to_date

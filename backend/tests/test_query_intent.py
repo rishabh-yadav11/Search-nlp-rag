@@ -6,6 +6,7 @@ from app.query_intent import (
     extract_month_range,
     extract_year_range,
     month_query_topic,
+    normalize_word_numbers,
     range_query_topic,
     rewrite_year_in_review,
     suggested_top_k,
@@ -79,6 +80,16 @@ def test_extract_list_topic_word_numbers():
     assert extract_list_topic("top ten fintech deals") == "fintech deals"
     assert extract_list_topic("best ten companies") == "companies"
     assert extract_list_topic("top twenty five deals in 2024") == "deals"
+
+
+def test_normalize_word_numbers():
+    assert normalize_word_numbers("top ten ipo") == "top 10 ipo"
+    assert normalize_word_numbers("top ten deals") == "top 10 deals"
+    assert normalize_word_numbers("best ten companies") == "best 10 companies"
+    assert normalize_word_numbers("top twenty five deals") == "top 25 deals"
+    assert normalize_word_numbers("top 10 ipo") == "top 10 ipo"
+    assert normalize_word_numbers("top tenfold growth") == "top tenfold growth"
+    assert normalize_word_numbers("latest deals") == "latest deals"
 
 
 def test_suggested_top_k_default_and_none():
