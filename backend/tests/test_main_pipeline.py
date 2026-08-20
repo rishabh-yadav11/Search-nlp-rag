@@ -174,6 +174,17 @@ def test_effective_intent_no_intent_passthrough():
     assert (rq, fd, td) == ("latest deals", None, None)
 
 
+def test_effective_intent_normalizes_word_numbers():
+    """'top ten ipo' must retrieve exactly like 'top 10 ipo': the literal word
+    'ten' would otherwise dilute the embedding/rerank match against titles like
+    'Ten Sports'."""
+    assert main._effective_intent("top ten ipo", None, None) == ("top 10 ipo", None, None)
+    assert main._effective_intent("top ten deals", None, None) == ("top 10 deals", None, None)
+    assert main._effective_intent("top ten ipo", "2024-01-01", "2024-12-31") == (
+        "top 10 ipo", "2024-01-01", "2024-12-31",
+    )
+
+
 # --- _retrieval_queries ---
 
 
