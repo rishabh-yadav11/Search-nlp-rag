@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (86% overall, 285 passed). This is a checklist
+Measured with `pytest --cov=app` (87% overall, 294 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -120,14 +120,19 @@ symspellpy faked in sys.modules; vocab artifacts written to tmp paths.
 
 ---
 
-## app/click_boost.py — 15%
+## app/click_boost.py — 100% (covered by tests/test_click_boost.py)
 
-- [ ] **disabled / empty results short-circuit** (line 17).
-- [ ] **no click signals** (lines 20-21).
-- [ ] **boost loop** (lines 24-30): `CLICK_BOOST_MIN_ARTICLE_CLICKS` +
-      `CLICK_BOOST_MIN_SHARE` gating; score multiply.
-- [ ] **re-sort after change** (lines 31-32). **ERROR PATH — Redis down**
-      (`click_signals` degraded returns None → pass-through).
+- [x] **disabled / empty results short-circuit** (line 17): both skip the
+      `click_signals` call entirely.
+- [x] **no click signals** (lines 20-21): pass-through, no mutation, no re-sort.
+- [x] **boost loop** (lines 24-30): `CLICK_BOOST_MIN_ARTICLE_CLICKS` +
+      `CLICK_BOOST_MIN_SHARE` gating (below-either → untouched), the
+      `max(1, int(total * share))` floor, missing-`id` results (default 0
+      clicks), score multiply by `CLICK_BOOST_MULT`.
+- [x] **re-sort after change** (lines 31-32): boosted list sorted score-desc;
+      no-change case keeps original order (`changed` stays False).
+      **ERROR PATH — Redis down** (`click_signals` degraded → `None` →
+      pass-through).
 
 ---
 
@@ -292,5 +297,6 @@ symspellpy faked in sys.modules; vocab artifacts written to tmp paths.
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
 (was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
 (was 25%) is now 100% via `tests/test_encoders.py`, `app/diversity.py`
-(was 15%) is now 100% via `tests/test_diversity.py`, and `app/query_fix.py`
-(was 30%) is now 100% via `tests/test_query_fix.py`.
+(was 15%) is now 100% via `tests/test_diversity.py`, `app/query_fix.py`
+(was 30%) is now 100% via `tests/test_query_fix.py`, and `app/click_boost.py`
+(was 15%) is now 100% via `tests/test_click_boost.py`.
