@@ -5,14 +5,15 @@ aiomysql==0.3.0
 redis==5.2.1
 qdrant-client==1.11.3
 fastembed==0.8.0
-sentence-transformers==3.1.1
+sentence-transformers==5.3.0
 torch==2.13.0
-transformers==4.57.6
+transformers==5.5.4
 onnxruntime==1.28.0
-# Optional (falls back to torch rerank when missing): ONNX cross-encoder path.
-# The [onnxruntime] extra is required — base optimum does not ship
-# `optimum.onnxruntime`.
-optimum[onnxruntime]>=1.20.0
+# ONNX cross-encoder (optimum[onnxruntime]) is intentionally NOT installed:
+# optimum-onnx pins transformers<4.58, which conflicts with the pinned
+# transformers 5.5.4 (required to fix CVE-2026-4372 / CVE-2026-5241 /
+# CVE-2026-1839). The reranker falls back to the torch CrossEncoder
+# automatically (app/reranker.py).
 openai==1.68.2
 python-dotenv==1.2.2
 cachetools==5.5.0
