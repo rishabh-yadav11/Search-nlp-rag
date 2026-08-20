@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (87% overall, 294 passed). This is a checklist
+Measured with `pytest --cov=app` (88% overall, 318 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -136,17 +136,24 @@ symspellpy faked in sys.modules; vocab artifacts written to tmp paths.
 
 ---
 
-## app/health.py — 37%
+## app/health.py — 100% (covered by tests/test_health.py)
 
-- [ ] **`/health`, `/live`** (lines 16, 21).
-- [ ] **`_qdrant_ok` client absent** (lines 27-28) and **Qdrant call failing /
-      timing out** (lines 32-33). **ERROR PATH — Qdrant down.**
-- [ ] **`_models_ok`** (line 37).
-- [ ] **`_llm_ok`** (line 41).
-- [ ] **`_redis_status`** (lines 49-59): no REDIS_URL → memory; ping ok → redis;
-      ping fail → degraded. **ERROR PATH — Redis down.**
-- [ ] **`_readiness_report` + `/ready`/`/readyz`** (lines 62-93): ready vs not
-      ready → 200 vs 503.
+Redis `from_url`/`ping` mocked (no live Redis), the module-global
+`_redis_client` reset between tests, and Qdrant faked with a `collection_exists`
+coroutine.
+
+- [x] **`/health`, `/live`** (lines 16, 21).
+- [x] **`_qdrant_ok` client absent** (lines 27-28) and **Qdrant call failing /
+      timing out** (lines 32-33) — `RuntimeError` and `asyncio.wait_for`
+      raising `TimeoutError` both → False. **ERROR PATH — Qdrant down.**
+- [x] **`_models_ok`** (line 37): all present → True; any key missing → False.
+- [x] **`_llm_ok`** (line 41): key set vs empty.
+- [x] **`_redis_status`** (lines 49-59): no REDIS_URL → `(True, "memory")`;
+      ping ok → `(True, "redis")` (plus client reuse, single `from_url`);
+      ping fail / timeout → `(True, "degraded")`. **ERROR PATH — Redis down.**
+- [x] **`_readiness_report` + `/ready`/`/readyz`** (lines 62-93): report shape
+      asserted with mocked + real checks wired together; ready → 200,
+      not-ready → 503 on both endpoints.
 
 ---
 
@@ -286,17 +293,16 @@ symspellpy faked in sys.modules; vocab artifacts written to tmp paths.
 
 1. **app/main.py `hybrid_search` / `_attach_bodies` / `search` / `facets`** —
    Qdrant down and Redis down surfaces as 500s.
-2. **app/health.py** — the readiness probes that detect Qdrant/Redis/LLM
-   outages.
-3. **app/redis_cache.py + app/analytics.py + app/cost_budget.py** — Redis down
+2. **app/redis_cache.py + app/analytics.py + app/cost_budget.py** — Redis down
    degrade paths (warn-once, in-memory fallback, fail-open budget).
-4. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
-5. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
+3. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
+4. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
 (was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
 (was 25%) is now 100% via `tests/test_encoders.py`, `app/diversity.py`
 (was 15%) is now 100% via `tests/test_diversity.py`, `app/query_fix.py`
-(was 30%) is now 100% via `tests/test_query_fix.py`, and `app/click_boost.py`
-(was 15%) is now 100% via `tests/test_click_boost.py`.
+(was 30%) is now 100% via `tests/test_query_fix.py`, `app/click_boost.py`
+(was 15%) is now 100% via `tests/test_click_boost.py`, and `app/health.py`
+(was 37%) is now 100% via `tests/test_health.py`.
