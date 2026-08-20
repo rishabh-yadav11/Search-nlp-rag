@@ -27,13 +27,18 @@ backend/
   app/
     main.py            FastAPI app: /search, /chat, /health, /analytics
     health.py          /live, /ready, /readyz dependency checks
+    encoders.py        fastembed/ONNX dense encoder with torch fallback
+    reranker.py        ONNX cross-encoder reranker with torch fallback
     llm.py             LLM call with timeout, retries, backoff, token-cost calc
+    cost_budget.py     daily LLM spend cap (fails closed once budget hit)
     chat.py            per-user chat store (SQLite) + /api/chat router
     analytics.py       Redis-backed search/click analytics aggregates
-    dashboard.py       self-contained HTML analytics dashboard
     config.py          env-driven settings
     query_intent.py    year/top-N intent parsing + Flashback rewriting
     query_expand.py    deterministic synonym query expansion
+    query_fix.py       SymSpell query typo correction
+    diversity.py       MMR title-diversity reordering of results
+    click_boost.py     click-signal score boost on results
     rerank_boost.py    entity-mention score boost on reranked results
     answer_fallback.py weak-result notes + honest chat fallback replies
     index_text.py      shared text composition + date normalization
@@ -41,23 +46,35 @@ backend/
   scripts/
     fetch_data.py      MySQL -> data/articles.jsonl (paginated, resumable)
     build_index.py     articles.jsonl -> Qdrant embeddings (checkpointed)
+    build_query_vocab.py  corpus token vocab for query_fix (gzip JSON)
     update_index.py    incremental MySQL->Qdrant sync (new/edit/delete)
-    backfill_summary.py  one-off summary payload backfill
+    backfill_summary.py / backfill_body.py / backfill_missing.py  payload backfills
     backup_qdrant.py   Qdrant snapshot + local artifact backups (retention)
     qdrant_backup.py   shared backup helpers
     reset_index.py     drop the index + data files (backup-gated)
+    search_quality_test.py / chat_quality_test.py  golden-set search/chat evals
+    deep_body_eval.py  whole-body indexing + body-grounded chat eval
+    rerank_bench.py    reranker latency/quality benchmark (onnx vs torch)
+    load_test.py       query load/throughput harness
   tests/               pytest suite (offline, mocked deps)
+  TEST_COVERAGE_GAPS.md  coverage-gap checklist (86% overall, 285 passed)
   requirements.txt
   requirements-dev.txt lint/test tooling
   .env.example         configuration template
 frontend/              Next.js app (App Router + TypeScript)
   app/page.tsx         search UI (timeouts, validation, a11y)
   app/chat/page.tsx    ChatGPT-style chat UI (SSE streaming)
+  app/chat/DataViz.tsx hand-rolled SVG charts (table/bar/line/pie/pictogram)
+  app/analytics/dashboard/page.tsx  admin analytics dashboard
+  app/login/ app/signup/  auth pages (token + RBAC)
+  app/lib/auth.ts      client-side session/token helpers
   app/globals.css
   middleware.ts        CSP nonce header
   next.config.ts       security headers (CSP, nosniff, etc.)
   eslint.config.mjs    flat config for eslint 9
 setup.sh               one-command deploy (deps, services, index, nginx, cron)
+deploy/                healthcheck.sh (cron health probe) + logrotate.conf
+docs/API.md            chat + auth API contract
 .github/workflows/ci.yml   backend + frontend + security gates
 ```
 
@@ -456,25 +473,3 @@ manual token setup is needed:
   ```` ```dataviz ```` JSON block (same contract `app.chat.parse_dataviz`
   enforces). Makes real (billed) LLM calls.
 
-## Production notes (POC shortcuts to fix before real prod)
-
-1. **Embeddings and the reranker run on CPU.** Query-time embedding uses
-   fastembed's ONNX (INT8) variant of the bge model (≈3-5x faster than torch on
-   CPU, same 768-dim normalized vectors, so the existing index stays valid) and
-   the cross-encoder runs via ONNX/optimum (≈2-3x faster) when `optimum` is
-   installed, with a torch fallback. Inference is serialized per worker and
-   `TORCH_THREADS` (default 2) caps torch/onnxruntime threads so 4 gunicorn
-   workers don't oversubscribe the CPU. Latency is still higher than a
-   GPU-backed embedder; set `EMBED_DEVICE=cuda` for lower latency.
-2. **Cache is Redis-backed** and shared across gunicorn workers; if Redis is
-   down it silently degrades to a per-worker in-process cache (which no longer
-   benefits the other workers until Redis returns).
-3. **Auth is self-enforced by the backend** (bearer tokens + RBAC; public
-   signup/login is rate-limited per IP via Redis) but the frontend is a
-   temporary UI — the API is the contract for the external project. Review
-   role assignment (`AUTH_DEFAULT_ROLE`), the admin bootstrap password, and the
-   service-token bypass before broad exposure.
-4. **`published_date` payload index** assumes MySQL returns a parseable
-   date/datetime string; adjust the payload schema if your column type differs.
-5. **Backups are host-local** — schedule off-server transfer of
-   `backend/backups/` and `backend/data/articles.jsonl` for disaster recovery.
