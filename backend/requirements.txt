@@ -19,5 +19,4 @@ cachetools==5.5.0
 tqdm==4.66.5
 aiosqlite==0.20.0
 bcrypt==4.2.1
-# Query-string typo correction (app/query_fix.py) — pure Python, no build deps.
 symspellpy==6.10.0
