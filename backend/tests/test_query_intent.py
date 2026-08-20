@@ -1,6 +1,7 @@
 
 
 from app.query_intent import (
+    _referenced_year,
     extract_list_topic,
     extract_month_range,
     extract_year_range,
@@ -174,6 +175,10 @@ def test_extract_year_range_short_span():
     assert extract_year_range("deals 1999-00") == ("1999-01-01", "2000-12-31")
 
 
+def test_extract_year_range_short_span_rollover():
+    assert extract_year_range("deals 2024-23") == ("2024-01-01", "2123-12-31")
+
+
 def test_extract_year_range_month_span():
     assert extract_year_range("deals in jan-march") == ("2026-01-01", "2026-03-31")
     assert extract_year_range("x in jan-march 2025") == ("2025-01-01", "2025-03-31")
@@ -204,6 +209,15 @@ def test_extract_year_range_fiscal_year():
     assert extract_year_range("top 15 deals in FY 2024-25") == ("2024-04-01", "2025-03-31")
     assert extract_year_range("top 15 deals in fy24-25") == ("2024-04-01", "2025-03-31")
     assert extract_year_range("deals in fiscal year 2025") == ("2024-04-01", "2025-03-31")
+
+
+def test_extract_year_range_fiscal_span_rollover():
+    assert extract_year_range("deals in fy 2025-24") == ("2123-04-01", "2124-03-31")
+
+
+def test_referenced_year_explicit_flashback_prefix():
+    assert _referenced_year("flashback 2025 ipos") == 2025
+    assert _referenced_year("what happened in flashback 2020") == 2020
 
 
 def test_rewrite_not_fired_for_range_queries():
