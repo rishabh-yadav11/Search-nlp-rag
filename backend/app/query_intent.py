@@ -17,7 +17,37 @@ _YEAR_SPAN_SHORT_RE = re.compile(
 _LAST_YEAR_RE = re.compile(r"\b(?:the\s+)?last\s+year\b|\bprevious\s+year\b", re.IGNORECASE)
 _THIS_YEAR_RE = re.compile(r"\b(?:this|current)\s+year\b", re.IGNORECASE)
 _FLASHBACK_RE = re.compile(r"\bflashback\s+(20\d{2}|19\d{2})\b", re.IGNORECASE)
-_TOP_N_RE = re.compile(r"\btop\s+(\d{1,2})\b", re.IGNORECASE)
+# Word-form counts for 'top ten deals' (mirrors the digit form). Built
+# longest-first so 'fourteen' matches before 'four'.
+_UNITS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9,
+}
+_TEENS = {
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_NUMBER_WORDS = dict(_UNITS, **_TEENS, **_TENS)
+# Concatenated tens+unit compounds ('fortyfive', 'twentyone') plus the plain
+# tens ('forty') for standalone use.
+for _tens_word, tens_val in _TENS.items():
+    _NUMBER_WORDS[_tens_word] = tens_val
+    for _unit_word, unit_val in _UNITS.items():
+        _NUMBER_WORDS[f"{_tens_word}{_unit_word}"] = tens_val + unit_val
+_NUMBER_WORDS["hundred"] = 100
+_NUM_WORD_ALT = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+_WORD_SEP = r"(?:\s+|-|\s+-\s+)"
+# 'top 10' or 'top ten', 'top twenty five', 'top twenty-five', 'best ten'.
+# Any list-hint word (top/best/leading/biggest/largest) may precede the count.
+_TOP_HINT_ALT = r"top|best|leading|biggest|largest"
+_TOP_N_RE = re.compile(
+    rf"\b({_TOP_HINT_ALT})\s+((?:\d{{1,2}})|(?:(?:{_NUM_WORD_ALT})(?:{_WORD_SEP}(?:{_NUM_WORD_ALT}))*))\b",
+    re.IGNORECASE,
+)
 _TOP_HINT_RE = re.compile(r"\b(best|leading|biggest|largest|top)\b", re.IGNORECASE)
 _DEFAULT_LIST_K = 10
 # Filler/time words dropped when extracting a bare topic from a query
@@ -301,12 +331,29 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
     return None
 
 
+def _top_n_to_int(phrase: str) -> int | None:
+    """Convert a 'top N' count phrase ('10', 'ten', 'twenty five') to an int,
+    or None when the phrase is not a recognizable count."""
+    if phrase.isdigit():
+        return int(phrase)
+    total = 0
+    for token in re.split(r"[\s-]+", phrase.strip()):
+        value = _NUMBER_WORDS.get(token)
+        if value is None:
+            return None
+        total = (total or 1) * value if value == 100 else total + value
+    return total
+
+
 def suggested_top_k(query: str) -> int | None:
-    """Suggested top_k from a 'top N' in the query, or a small default for a
-    generic top/best intent without a number. None when no list intent."""
+    """Suggested top_k from a 'top N' in the query (digit or word form, e.g.
+    'top ten'), or a small default for a generic top/best intent without a
+    number. None when no list intent."""
     m = _TOP_N_RE.search(query)
     if m:
-        return int(m.group(1))
+        n = _top_n_to_int(m.group(2))
+        if n is not None:
+            return n
     if _TOP_HINT_RE.search(query):
         return _DEFAULT_LIST_K
     return None
