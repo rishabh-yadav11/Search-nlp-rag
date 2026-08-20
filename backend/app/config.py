@@ -71,10 +71,11 @@ class Config:
     # trimming latency (measured 8/8 overlap on representative queries).
     RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
     RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "12"))
-    # Reranker execution backend: 'onnx' (optimum/onnxruntime, ~2-3x faster on
-    # CPU, exported once at startup) or 'torch' (sentence-transformers). Falls
-    # back to 'torch' automatically when optimum is not installed.
-    RERANK_BACKEND = os.getenv("RERANK_BACKEND", "onnx")
+    # Reranker execution backend: 'torch' (sentence-transformers CrossEncoder)
+    # is the default. The ONNX backend ('onnx', via optimum/onnxruntime) is no
+    # longer installable: optimum-onnx requires transformers<4.58, which
+    # conflicts with the pinned transformers 5.x (CVE-fix) version.
+    RERANK_BACKEND = os.getenv("RERANK_BACKEND", "torch")
     # Local dir where the ONNX cross-encoder is exported on first use and
     # reloaded on later startups (relative paths resolve against the backend
     # working dir, where gunicorn runs).
