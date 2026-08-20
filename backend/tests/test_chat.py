@@ -604,8 +604,8 @@ def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
     otherwise the embedding on the bare follow-up finds nothing and the turn
     short-circuits to 'no relevant articles' before the LLM sees the history."""
     from app import main
-    from app.main import SourceArticle
     from app.chat import MessageOut
+    from app.main import SourceArticle
 
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
@@ -652,8 +652,8 @@ def test_prepare_turn_real_question_does_not_inherit_previous_retrieval(monkeypa
     """A standalone question (even one that asks for a table) must use its own
     retrieval topic, not the previous turn's."""
     from app import main
-    from app.main import SourceArticle
     from app.chat import MessageOut
+    from app.main import SourceArticle
 
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)

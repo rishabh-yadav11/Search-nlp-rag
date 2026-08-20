@@ -37,8 +37,7 @@ def _make_text_embedding(vectors=None, raise_on_init=False):
 
         def embed(self, texts, batch_size=1):
             calls["embed"].append((texts, batch_size))
-            for vec in vectors or []:
-                yield vec
+            yield from vectors or []
 
     return _FakeTextEmbedding, calls
 

@@ -12,8 +12,6 @@ import logging
 import sys
 import types
 
-import pytest
-
 import app.query_fix as query_fix_module
 from app.query_fix import QueryFixer, _normalize_entity
 
