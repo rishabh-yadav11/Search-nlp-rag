@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (83% overall, 266 passed). This is a checklist
+Measured with `pytest --cov=app` (86% overall, 285 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -95,20 +95,28 @@ sentence_transformers imports (no model download or real inference).
 
 ---
 
-## app/query_fix.py — 30%
+## app/query_fix.py — 100% (covered by tests/test_query_fix.py)
 
-- [ ] **`QueryFixer._build` with vocab** (lines 93-111): SymSpell built, curated
-      entities get `_CURATED_COUNT`.
-- [ ] **`_build` empty vocab → disabled** (lines 100-102).
-- [ ] **`_load_vocab` file absent** (line 82) and **corrupt gzip/JSON → {}**
-      (lines 88-90). **ERROR PATH — malformed vocab artifact.**
-- [ ] **`_allowed_distance`** (line 115): short token → max edit 1.
-- [ ] **`fix` full pipeline** (lines 117-147): no-op when disabled (`_sym is
-      None`, line 119); no-suggestion passthrough (line 130); suggestion equal
-      to input (line 132); `sug.count < min_count` rejection (line 134);
-      capitalization restore (lines 137-138); fix list building.
-- [ ] **`init_fixer` disabled branch** (lines 162-164) and **`fix_query`
-      no-op when fixer None** (line 171).
+symspellpy faked in sys.modules; vocab artifacts written to tmp paths.
+
+- [x] **`QueryFixer._build` with vocab** (lines 93-111): SymSpell built
+      (`max_dictionary_edit_distance`, `prefix_length=7`), curated entities get
+      `_CURATED_COUNT` via `create_dictionary_entry` even when already in the
+      vocab.
+- [x] **`_build` empty vocab → disabled** (lines 100-102): reached via a direct
+      `_build` call with an empty entity list (`__init__` always injects the
+      curated entity list, so this is unreachable through the constructor).
+- [x] **`_load_vocab` file absent** (line 82) and **corrupt gzip/JSON → {}**
+      (lines 88-90), plus the non-conforming-row filter (line 87).
+      **ERROR PATH — malformed vocab artifact.**
+- [x] **`_allowed_distance`** (line 115): short token → max edit 1.
+- [x] **`fix` full pipeline** (lines 117-147): no-op when disabled (`_sym is
+      None`, line 119) and on empty text; known/short/digit passthrough (line
+      126); no-suggestion passthrough (line 130); suggestion equal to input
+      and zero-distance (line 132); `sug.count < min_count` rejection (line
+      134); capitalization restore (lines 137-138); fix list building.
+- [x] **`init_fixer` disabled branch** (lines 162-164), **`init_fixer` enabled
+      build** (line 165), and **`fix_query` no-op when fixer None** (line 171).
 
 ---
 
@@ -278,11 +286,11 @@ sentence_transformers imports (no model download or real inference).
 3. **app/redis_cache.py + app/analytics.py + app/cost_budget.py** — Redis down
    degrade paths (warn-once, in-memory fallback, fail-open budget).
 4. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
-5. **app/query_fix.py** — startup model-load failure fallbacks.
-6. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
+5. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
    and write-lock/concurrency paths.
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
 (was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
-(was 25%) is now 100% via `tests/test_encoders.py`, and `app/diversity.py`
-(was 15%) is now 100% via `tests/test_diversity.py`.
+(was 25%) is now 100% via `tests/test_encoders.py`, `app/diversity.py`
+(was 15%) is now 100% via `tests/test_diversity.py`, and `app/query_fix.py`
+(was 30%) is now 100% via `tests/test_query_fix.py`.
