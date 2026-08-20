@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (82% overall, 255 passed). This is a checklist
+Measured with `pytest --cov=app` (83% overall, 266 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -82,13 +82,16 @@ sentence_transformers imports (no model download or real inference).
 
 ---
 
-## app/diversity.py — 15%
+## app/diversity.py — 100% (covered by tests/test_diversity.py)
 
-- [ ] **`diversify` short-circuit** (line 34): `len(results) <= n`.
-- [ ] **`diversify` MMR loop** (lines 38-59): greedy selection, `_jaccard`
-      similarity, `sim_thresh` floor, `lam` weighting.
-- [ ] **`_tokens` empty/None title** (line 17).
-- [ ] **`_jaccard` empty-set branch** (lines 21-22).
+- [x] **`diversify` short-circuit** (line 34): `len(results) <= n`, including
+      truncation under `n`.
+- [x] **`diversify` MMR loop** (lines 38-59): greedy selection; `_jaccard`
+      similarity with the `sim_thresh` floor (above vs below floor);
+      `lam` weighting (`lam=1.0` pure relevance vs `lam=0.0` pure diversity);
+      `max_sim` over multiple chosen indices; `>` keeps first on ties.
+- [x] **`_tokens` empty/None title** (line 17).
+- [x] **`_jaccard` empty-set branch** (lines 21-22).
 
 ---
 
@@ -280,5 +283,6 @@ sentence_transformers imports (no model download or real inference).
    and write-lock/concurrency paths.
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
-(was 17%) is now 100% via `tests/test_reranker.py`, and `app/encoders.py`
-(was 25%) is now 100% via `tests/test_encoders.py`.
+(was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
+(was 25%) is now 100% via `tests/test_encoders.py`, and `app/diversity.py`
+(was 15%) is now 100% via `tests/test_diversity.py`.
