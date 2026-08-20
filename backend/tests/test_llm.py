@@ -319,3 +319,19 @@ def test_stream_answer_zero_usage_when_usage_absent():
     assert isinstance(holder[0], LLMResult)
     assert holder[0].prompt_tokens == 0
     assert holder[0].completion_tokens == 0
+
+
+def test_generate_answer_raises_without_calling_client_when_no_attempts(monkeypatch):
+    monkeypatch.setattr(config, "LLM_MAX_RETRIES", -1)
+    client = _FakeClient(_FakeCompletions([]))
+    with pytest.raises(LLMUnavailableError):
+        _run(generate_answer(client, "P", "m"))
+    assert client.chat.completions.calls == 0
+
+
+def test_stream_answer_raises_without_calling_client_when_no_attempts(monkeypatch):
+    monkeypatch.setattr(config, "LLM_MAX_RETRIES", -1)
+    client = _FakeClient(_FakeCompletions([]))
+    with pytest.raises(LLMUnavailableError):
+        _run(_collect(stream_answer(client, "P", "m")))
+    assert client.chat.completions.calls == 0
