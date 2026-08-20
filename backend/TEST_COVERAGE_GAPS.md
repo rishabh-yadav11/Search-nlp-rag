@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (94% overall, 394 passed). This is a checklist
+Measured with `pytest --cov=app` (98% overall, 428 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -263,40 +263,69 @@ degraded path).
 
 ---
 
-## app/chat.py — 84%
+## app/chat.py — 100% (covered by tests/test_chat.py)
 
-- [ ] **`ChatStore.connect` schema migration** (lines 147-152): legacy DBs
-      missing `prompt_tokens`/`latency_ms` columns. **ERROR PATH — malformed /
-      legacy SQLite schema.**
-- [ ] **`ChatStore.close`** (lines 155-158).
-- [ ] **`rename_session` when session missing** (line 269, 282).
-- [ ] **`json_loads` malformed JSON** (lines 399-400). **ERROR PATH — malformed
-      stored rows.**
-- [ ] **`_row_to_message`** (lines 403-414) — malformed/legacy row field
-      coercion (`or 0` fallbacks).
-- [ ] **`_smalltalk_reply` non-smalltalk fallthrough** (line 436) and empty
-      query.
-- [ ] **dataviz helpers edge branches**: `_as_float` non-numeric string (line
-      491); `_missing_cell` token set (line 499); `_valid_value_column` (line
-      528); `_has_label_content` (line 541); `parse_dataviz` rejection paths
-      (lines 561, 565, 567); `_sanitize_dataviz` malformed fence (line 593).
-- [ ] **`_dataviz_nudge` view pinning** (line 661).
-- [ ] **`_parse_dataviz_with_view` non-dict/invalid** (lines 712, 715-716, 718).
-- [ ] **`_apply_requested_view` rewrite** (line 734).
-- [ ] **`_is_ranking_refusal`** (line 776).
-- [ ] **`_answer_ranked` ranking-nudge retry** (lines 799-808) and the
-      `LLMUnavailableError` guard.
-- [ ] **`_prepare_turn` follow-up inheritance** (lines 856-859, 866, 876, 879):
-      vague-follow-up with year range; `body_rescue` branch; no-sources; weak
-      fallback. **ERROR PATH — LLM/Qdrant/Redis down during retrieval.**
-- [ ] **`_run_turn` cost recording + finalize** (lines 917-920).
-- [ ] **`send_message` `BudgetExceeded` → 429** (lines 1091-1095) and
+- [x] **`ChatStore.connect` schema migration** (lines 147-152): legacy DBs
+      missing `prompt_tokens`/`completion_tokens`/`cost` and separately missing
+      `latency_ms` get the columns added with `0` defaults. **ERROR PATH —
+      malformed / legacy SQLite schema.**
+- [x] **`ChatStore.close`** (lines 155-158): close an open store and the
+      idempotent close-when-already-closed no-op.
+- [x] **`rename_session` / `delete_session` when session missing** (lines 269,
+      282) → 404.
+- [x] **`global_stats` exception handler** (lines 387-389): a failing query
+      degrades to `{"error": "chat analytics unavailable"}`, never raises.
+- [x] **`json_loads` malformed JSON** (lines 399-400): bad JSON, `None`, and
+      non-string input all → `[]`. **ERROR PATH — malformed stored rows.**
+- [x] **`_row_to_message`** (lines 403-414): malformed/legacy row field
+      coercion — bad sources JSON and `NULL`/string token/cost fields fall back
+      to `0` defaults.
+- [x] **`_smalltalk_reply` non-smalltalk fallthrough** (line 436): empty /
+      blank queries and >12-word messages are not small talk.
+- [x] **dataviz helpers edge branches**: `_as_float` non-numeric string, bool,
+      and `None` (line 491); `_missing_cell` token set incl. "not stated"/"—"
+      (line 499); `_valid_value_column` all-missing vs numeric vs non-numeric
+      (line 523); `_first_numeric_column` empty rows / empty first row
+      (line 528); `_has_label_content` no-label-cols vs all-empty labels
+      (line 541); `parse_dataviz` rejection paths — non-dict data, non-string
+      columns, non-list rows (lines 561, 565, 567); `_sanitize_dataviz` empty
+      text and no-fence passthrough (line 593).
+- [x] **`_dataviz_nudge` view pinning** (line 661): a named view appends the
+      "exact type of data block" instruction; a generic chart ask does not.
+- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 712, 715-716, 718):
+      no fence, invalid JSON, and non-dict data → `None`; dict data gets the
+      view applied.
+- [x] **`_apply_requested_view` rewrite** (line 734): a block that fails to
+      re-parse is left verbatim.
+- [x] **`_is_ranking_refusal`** (line 776): refusal signatures ("cannot be
+      generated", "do not contain specific amounts") → True; empty text and
+      genuine ranked answers → False.
+- [x] **`_answer_ranked` ranking-nudge retry** (lines 799-808): a refusal is
+      re-asked once with `_RANKING_NUDGE` and tokens summed; the
+      `LLMUnavailableError` guard keeps the first answer; non-refusals make a
+      single call.
+- [x] **`_prepare_turn` follow-up inheritance** (lines 856-859, 866, 876, 879):
+      vague-follow-up with a year range keeps the previous topic and pins the
+      new dates; `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources
+      short-circuit; weak fallback answer + note. **ERROR PATH — LLM/Qdrant/
+      Redis down during retrieval.**
+- [x] **`_run_turn` cost recording + finalize** (lines 917-920): budget check →
+      `_answer_ranked` → `record_cost(result.cost())` → finalized answer
+      (unrequested dataviz blocks stripped).
+- [x] **`send_message` `BudgetExceeded` → 429** (lines 1091-1095) and
       **`LLMUnavailableError` → 503** (lines 1096-1100). **ERROR PATH — LLM
       retry exhaustion / daily budget.**
-- [ ] **`send_message_stream` nudge retry failure branches** (lines 1169-1176,
-      1181-1188) and the **`error` SSE handlers** (lines 1213, 1216-1218).
-      **ERROR PATH — LLMUnavailableError / BudgetExceeded mid-stream.**
-- [ ] **`retention_loop`** (lines 1225-1233): purge + exception swallow.
+- [x] **`_require_store` uninitialized → 503** (line 1012) and **`_validate_question`
+      too-long → 400** (line 1021).
+- [x] **`send_message_stream` nudge retry branches** (lines 1169-1176,
+      1181-1188): a dataviz/ranking nudge that succeeds swaps the answer and
+      sums tokens; a failed nudge (`LLMUnavailableError`) keeps the streamed
+      answer. **`error` SSE handlers** (lines 1213, 1216-1218): mid-stream
+      `LLMUnavailableError` → "LLM temporarily unavailable" event; unexpected
+      exceptions → "Something went wrong" event, never a 500. **ERROR PATH —
+      LLMUnavailableError / BudgetExceeded mid-stream.**
+- [x] **`retention_loop`** (lines 1225-1233): a failing purge is swallowed and
+      the loop keeps ticking; the next tick purges expired conversations.
 
 ---
 
@@ -337,9 +366,10 @@ degraded path).
 
 ## Priority order (error paths first)
 
-1. **app/chat.py stream error SSEs + BudgetExceeded/LLMUnavailable HTTP paths.**
-2. **app/chat.py + app/auth.py SQLite layers** — malformed/legacy row handling
-   and write-lock/concurrency paths.
+1. **app/auth.py SQLite layer** — malformed stored password hashes,
+   write-lock/constraint rollbacks, and last-admin lockout guards.
+2. **app/index_text.py + app/query_intent.py + app/query_expand.py edge
+   branches** — malformed index rows and month/year-range edge cases.
 
 `app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
 (was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
@@ -350,6 +380,8 @@ degraded path).
 (was 37%) is now 100% via `tests/test_health.py`, `app/redis_cache.py`
 (was 85%) is now 100% via `tests/test_cache.py`, `app/cost_budget.py`
 (was 92%) is now 100% via `tests/test_cost_budget.py`, `app/analytics.py`
-(was 74%) is now 100% via `tests/test_analytics.py`, and `app/main.py`
+(was 74%) is now 100% via `tests/test_analytics.py`, `app/main.py`
 (was 72%) is now 100% via `tests/test_main_pipeline.py` +
-`tests/test_main_http.py`.
+`tests/test_main_http.py`, and `app/chat.py` (was 84%) is now 100% via
+`tests/test_chat.py` (schema migration, error SSEs, budget/LLM HTTP paths,
+dataviz edge branches, nudge retries, and retention loop).
