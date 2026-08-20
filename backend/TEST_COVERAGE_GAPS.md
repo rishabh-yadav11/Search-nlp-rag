@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (99% overall, 439 passed). This is a checklist
+Measured with `pytest --cov=app` (100% overall, 449 passed). This is a checklist
 of functions and branches that have **no test coverage**, grouped by module.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
@@ -12,7 +12,7 @@ Line numbers refer to the current `backend/app/*.py`.
 
 ---
 
-## app/llm.py — 97% (covered by tests/test_llm.py)
+## app/llm.py — 100% (covered by tests/test_llm.py)
 
 Retry/timeout engine fully exercised: happy path, backoff retry, exhaustion,
 non-retryable immediate failure, `_is_retryable` classification, and the stream
@@ -41,9 +41,9 @@ variants (retry-before-first-chunk, no mid-stream retry, usage capture).
       `LLMUnavailableError` immediately, never retries mid-stream (dedup
       guarantee).
 - [x] **`stream_answer` `usage_holder=None`** (lines 121-128): no usage recorded.
-- [ ] **Dead-code raises** (lines 85, 143): post-loop `raise LLMUnavailableError`
-      — unreachable while the loop always raises at `attempt >= LLM_MAX_RETRIES`;
-      not worth covering unless the loop structure changes.
+- [x] **Post-loop raises** (lines 85, 143): with `LLM_MAX_RETRIES=-1` the retry
+      loop never runs and `raise LLMUnavailableError` fires without ever calling
+      the client (both `generate_answer` and `stream_answer`).
 
 ---
 
@@ -362,28 +362,63 @@ degraded path).
 
 ---
 
+## app/query_expand.py — 100% (covered by tests/test_query_expand.py)
+
+- [x] **concept expansion** (lines 175-215): layoffs/job-cut, acquisition, funding,
+      IPO, and edtech queries append synonym terms.
+- [x] **no-concept passthrough** (line 243): `expand_query` returns the query
+      unchanged when no concept matches.
+- [x] **token budget bound** (lines 234-243): expansions are capped at
+      `_MAX_EXTRA_TOKENS`; when every candidate term exceeds the remaining budget
+      the query is returned unchanged (`monkeypatch`ed `_MAX_EXTRA_TOKENS=1`).
+
+---
+
+## app/query_intent.py — 100% (covered by tests/test_query_intent.py)
+
+- [x] **year-span rollover** (line 286): a short span whose 2-digit end year is
+      below the start (`2024-23`) rolls forward 100 years — the inverse of the
+      century-rollover case already covered (`1999-00` → 2000).
+- [x] **fiscal-span rollover** (line 245): a backward `FY 2025-24` span applies
+      the same `end += 100` normalization in `_fiscal_range`.
+- [x] **`_referenced_year` Flashback prefix** (line 364): an explicit
+      `flashback <year>` prefix resolves to that year (both via the direct
+      helper and through `rewrite_year_in_review`).
+
+---
+
+## app/index_text.py — 100% (covered by tests/test_index_text.py)
+
+- [x] **`split_names` whitespace-only** (line 37): a value of only spaces
+      returns `[]`.
+- [x] **`split_names` malformed JSON** (lines 43-44): a string starting with
+      `[` that fails `json.loads` falls through to the delimiter split instead
+      of raising. **ERROR PATH — malformed index rows.**
+- [x] **`normalize_date`** (lines 85, 87, 91, 94-95): `None` → `None`; a
+      `datetime` instance kept verbatim then tz-normalized; blank string →
+      `None`; a non-parseable string is returned as-is instead of raising.
+      **ERROR PATH — malformed index rows.**
+
+---
+
 ## Remaining small gaps
 
-- [ ] **app/query_expand.py:243** — expansion fallthrough branch (97% covered).
-- [ ] **app/query_intent.py:245, 286, 364** — month/year-range edge cases
-      (99% covered).
-- [ ] **app/index_text.py:37, 43-44, 85, 87, 91, 94-95** — `split_names`
-      fallback, `clean` edge cases, `normalize_date` malformed values.
-      **ERROR PATH — malformed index rows.**
-- [ ] **app/answer_fallback.py** — 100% covered.
-- [ ] **app/config.py** — 100% covered.
-- [ ] **app/rerank_boost.py** — 100% covered.
+None — every `app/*.py` module is at 100% coverage (2174 statements, 0 missed).
 
 ---
 
 ## Priority order (error paths first)
 
-1. **app/index_text.py + app/query_intent.py + app/query_expand.py edge
-   branches** — malformed index rows and month/year-range edge cases (the only
-   modules below 100%: index_text 88%, llm 97% dead-code raises, query_expand
-   97%, query_intent 99%).
+All error paths across the codebase are now covered: malformed index rows
+(index_text), month/year/quarter/fiscal range edges (query_intent),
+query-expansion token budgets (query_expand), the LLM retry/dead-code raises
+(llm.py), SQLite write failures and malformed stored rows (auth + chat),
+Redis/Qdrant down (health, redis_cache, cost_budget, analytics, click_boost),
+model-load fallbacks (reranker, encoders), and the query-fix / diversity
+utility branches.
 
-`app/llm.py` (was 32%) is now 97% via `tests/test_llm.py`, `app/reranker.py`
+`app/llm.py` (was 32%) is now 100% via `tests/test_llm.py` (retry/backoff/
+exhaustion/dead-code raises), `app/reranker.py`
 (was 17%) is now 100% via `tests/test_reranker.py`, `app/encoders.py`
 (was 25%) is now 100% via `tests/test_encoders.py`, `app/diversity.py`
 (was 15%) is now 100% via `tests/test_diversity.py`, `app/query_fix.py`
@@ -396,7 +431,10 @@ degraded path).
 (was 72%) is now 100% via `tests/test_main_pipeline.py` +
 `tests/test_main_http.py`, `app/chat.py` (was 84%) is now 100% via
 `tests/test_chat.py` (schema migration, error SSEs, budget/LLM HTTP paths,
-dataviz edge branches, nudge retries, and retention loop), and `app/auth.py`
+dataviz edge branches, nudge retries, and retention loop), `app/auth.py`
 (was 91%) is now 100% via `tests/test_auth.py` (malformed-hash handling,
 SQLite rollback paths, last-admin lockout guards, `_client_ip`, and the
-bootstrap write-lock retry loop).
+bootstrap write-lock retry loop), and the last three gaps —
+`app/query_expand.py` (was 97%), `app/query_intent.py` (was 99%), and
+`app/index_text.py` (was 88%) — are now 100% via `tests/test_query_expand.py`,
+`tests/test_query_intent.py`, and `tests/test_index_text.py`.

@@ -1,6 +1,15 @@
 """Shared record/text helpers used by the fetch/build/update index scripts."""
 
-from app.index_text import clean, compose_dense_text, compose_sparse_text, record_from_row, split_names
+from datetime import UTC, datetime
+
+from app.index_text import (
+    clean,
+    compose_dense_text,
+    compose_sparse_text,
+    normalize_date,
+    record_from_row,
+    split_names,
+)
 
 
 def _row(**overrides) -> dict:
@@ -32,6 +41,21 @@ def test_split_names_dedupes_and_handles_json_lists():
     assert split_names("TMT, Technology") == ["TMT", "Technology"]
     assert split_names("") == []
     assert split_names(None) == []
+
+
+def test_split_names_whitespace_only_and_malformed_json():
+    assert split_names("   ") == []
+    assert split_names("[not json") == ["[not json"]
+
+
+def test_normalize_date_edge_values():
+    assert normalize_date(None) is None
+    assert normalize_date("   ") is None
+    assert normalize_date("not-a-date") == "not-a-date"
+
+
+def test_normalize_date_datetime_instance():
+    assert normalize_date(datetime(2025, 1, 15, 12, 30, tzinfo=UTC)) == "2025-01-15T12:30:00+00:00"
 
 
 def test_record_from_row_builds_canonical_payload():
