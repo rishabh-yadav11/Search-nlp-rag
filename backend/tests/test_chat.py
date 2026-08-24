@@ -1441,6 +1441,45 @@ def test_prepare_turn_weak_fallback(monkeypatch):
     assert turn.note is not None
 
 
+def test_prepare_turn_faceted_low_score_surfaces(monkeypatch):
+    """A query that resolves a category facet (e.g. 'funding news in jun 2025')
+    must surface its on-topic matches even when the cross-encoder scores them
+    below ASK_MIN_SCORE: the facet filter is the relevance signal, so the gate is
+    dropped and the matches are presented normally (no weak disclaimer)."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
+    # dealtype resolved -> faceted path
+    monkeypatch.setattr(
+        main, "_effective_intent",
+        lambda q, f, t: (q, "2025-06-01", "2025-06-30", "Venture Capital", None),
+    )
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [
+            SourceArticle(id=1, title="t", url="u", published_date="2025-06-10",
+                          summary="s", body="b", score=0.03),
+            SourceArticle(id=2, title="t2", url="u2", published_date="2025-06-12",
+                          summary="s", body="b", score=0.02),
+        ]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("funding news in jun 2025", []))
+    assert turn.needs_llm  # normal answer, not the weak/empty short-circuit
+    assert len(turn.sources) == 2
+    assert "No sufficiently relevant" not in turn.answer
+    assert "closest" not in turn.answer
+    assert turn.note is None
+
+
 def test_run_turn_records_cost_and_finalizes(monkeypatch):
     """Lines 917-920: _run_turn checks the budget, calls the LLM, records cost,
     and finalizes the answer (strips unrequested dataviz blocks)."""
