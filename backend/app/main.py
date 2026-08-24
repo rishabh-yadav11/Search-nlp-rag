@@ -721,7 +721,10 @@ async def search(
                               latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    reranked = await retrieve_and_rerank(q_fixed, eff_top_k, qfilter)
+    # Rerank on the cleaned retrieval query (noise like 'news'/'jun' stripped),
+    # matching chat which already passes the cleaned query — otherwise the raw
+    # phrase dilutes the cross-encoder and weak scores slip through the gate.
+    reranked = await retrieve_and_rerank(retrieval_q, eff_top_k, qfilter)
     if config.ENABLE_CLICK_BOOST:
         reranked = await apply_click_boost(q_fixed, reranked)
     if config.ENABLE_DIVERSITY:
