@@ -105,6 +105,12 @@ class Config:
     # Minimum reranked relevance score for chat sources; weaker results are
     # dropped before the LLM sees them.
     ASK_MIN_SCORE = float(os.getenv("ASK_MIN_SCORE", "0.2"))
+    # When the query itself resolves a category facet (dealtype/industry), that
+    # facet filter IS the relevance signal, so the cross-encoder score only ranks
+    # within an already on-topic set. Drop the gate to 0 so month/year-scoped
+    # category queries (e.g. 'funding news in jun 2025') surface their matches
+    # instead of being rejected as "weakly related".
+    ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
     # TTL for cached query (dense+sparse) vectors, keyed by the embedding model
