@@ -79,7 +79,7 @@ def test_search_cache_hit_returns_cached_summaries(monkeypatch):
 
     monkeypatch.setattr(main, "cache", _FakeCache(get_result=cached))
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
-    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
     monkeypatch.setattr(main, "weak_results_note", lambda scores, label: "weak note")
     monkeypatch.setattr(main, "record_search", fake_record_search)
@@ -121,7 +121,7 @@ def test_search_cache_miss_runs_full_pipeline(monkeypatch):
 
     monkeypatch.setattr(main, "cache", cache)
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
-    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
     monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
     monkeypatch.setattr(main, "apply_click_boost", fake_boost)
@@ -166,7 +166,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch):
 
     monkeypatch.setattr(main, "cache", _FakeCache())
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
-    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
     monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
     monkeypatch.setattr(main, "apply_click_boost", fake_boost)
