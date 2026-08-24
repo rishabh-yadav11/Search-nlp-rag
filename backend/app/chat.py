@@ -866,18 +866,26 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     reranked = await retrieve_and_rerank(retrieval_q, k, qfilter, need_body=True)
     if config.ENABLE_BODY_RESCUE:
         reranked = await body_rescue(retrieval_q, reranked)
-    sources = [s for s in reranked if s.score >= config.ASK_MIN_SCORE][: k]
+    # A category facet resolved from the query (dealtype/industry) already scopes
+    # results to the requested topic, so the cross-encoder score only ranks within
+    # an on-topic set — don't reject those matches as "weakly related".
+    faceted = bool(dealtype or industry)
+    gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
+    sources = [s for s in reranked if s.score >= gate][: k]
 
-    note = (
-        weak_results_note([s.score for s in sources], date_label(eff_from, eff_to))
-        if config.ENABLE_WEAK_FALLBACK
-        else None
-    )
+    if not faceted:
+        note = (
+            weak_results_note([s.score for s in sources], date_label(eff_from, eff_to))
+            if config.ENABLE_WEAK_FALLBACK
+            else None
+        )
+    else:
+        note = None
 
     if not sources:
         return PreparedTurn(answer="No sufficiently relevant articles were found for this query.", sources=[], note=note)
 
-    if config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
+    if not faceted and config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
         return PreparedTurn(
             answer=fallback_answer(question, len(sources), date_label(eff_from, eff_to)),
             sources=[to_summary(s).model_dump() for s in sources],
