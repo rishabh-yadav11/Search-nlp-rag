@@ -173,7 +173,8 @@ def test_effective_intent_user_dates_win():
 
 def test_effective_intent_no_intent_passthrough():
     rq, fd, td, dt, ind = main._effective_intent("latest deals", None, None)
-    assert (rq, fd, td) == ("latest deals", None, None)
+    # Generic noise ('latest') is stripped so the embedding focuses on 'deals'.
+    assert (rq, fd, td) == ("deals", None, None)
     assert dt is None and ind is None
 
 

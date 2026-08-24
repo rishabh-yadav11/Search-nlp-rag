@@ -64,9 +64,11 @@ logger = logging.getLogger(__name__)
 
 # Live facet vocabularies loaded once at startup from Qdrant (normalized
 # lowercased value -> original-cased value). Category extraction only ever emits
-# a value present in these maps, so a natural-language query like 'ipo news'
-# maps to the real 'IPO' facet instead of guessing a label that would match
-# nothing (an unknown filter value returns zero results and breaks the query).
+# a value present in these maps, so a natural-language query like 'funding news'
+# maps to the real 'Venture Capital' facet instead of guessing a label that would
+# match nothing (an unknown filter value returns zero results and breaks the
+# query). The actual labels (e.g. 'Venture Capital', 'M&A', 'Finance') come from
+# the live index, not from hard-coded assumptions.
 _DEALTYPE_FACETS: dict[str, str] = {}
 _INDUSTRY_FACETS: dict[str, str] = {}
 
@@ -74,26 +76,24 @@ _INDUSTRY_FACETS: dict[str, str] = {}
 # vocabulary. Whole-word matched against the query; the keyword is then looked up
 # (exact, then substring) in the facet map. Resolution only succeeds when a real
 # facet value exists, so an unknown corpus degrades to no filter (current
-# behavior) rather than emitting a bogus value.
+# behavior) rather than emitting a bogus value. Synonyms are mapped to the REAL
+# dealtype labels the corpus uses (funding rounds -> 'Venture Capital', not a
+# mythical 'Funding' facet).
 _DEALTYPE_ALIASES: dict[str, str] = {
-    # IPO / public listing
-    "ipo": "ipo",
-    "ipos": "ipo",
-    "initial public offering": "ipo",
-    "public listing": "ipo",
-    "public offering": "ipo",
-    "listed": "ipo",
-    "listing": "ipo",
-    "listings": "ipo",
-    # Funding / capital raise
-    "funding": "funding",
-    "fundraise": "funding",
-    "fund raise": "funding",
-    "seed": "funding",
-    "raised": "funding",
-    "raising": "funding",
-    "capital": "funding",
-    "round": "funding",
+    # Venture capital / funding rounds
+    "funding": "venture capital",
+    "fundraise": "venture capital",
+    "fund raise": "venture capital",
+    "seed": "venture capital",
+    "raised": "venture capital",
+    "raising": "venture capital",
+    "capital": "venture capital",
+    "venture": "venture capital",
+    "vc": "venture capital",
+    "startup funding": "venture capital",
+    # Private equity
+    "private equity": "private equity",
+    "pe": "private equity",
     # M&A / consolidation
     "m&a": "m&a",
     "merger": "m&a",
@@ -104,43 +104,61 @@ _DEALTYPE_ALIASES: dict[str, str] = {
     "acquired": "m&a",
     "buyout": "m&a",
     "takeover": "m&a",
-    # Other deal types (verified against live facets at runtime)
-    "venture debt": "venture debt",
-    "stake sale": "stake sale",
-    "stake": "stake sale",
-    "secondary": "secondary",
-    "series a": "series a",
-    "series b": "series b",
-    "series c": "series c",
+    # Other real deal-type labels
+    "credit": "credit",
+    "investment banking": "investment banking",
+    "markets": "markets",
 }
 
 _INDUSTRY_ALIASES: dict[str, str] = {
-    "saas": "saas",
-    "ecommerce": "e-commerce",
-    "e-commerce": "e-commerce",
-    "e commerce": "e-commerce",
-    "healthcare": "healthtech",
-    "health care": "healthtech",
-    "health-tech": "healthtech",
+    "fintech": "finance",
+    "financial technology": "finance",
+    "healthtech": "healthcare",
+    "edtech": "education",
+    "ecommerce": "retail",
+    "e-commerce": "retail",
+    "e commerce": "retail",
+    "saas": "technology",
+    "software": "technology",
+    "cleantech": "cleantech",
+    "media": "media & entertainment",
+    "telecom": "telecom",
+    "real estate": "real estate",
+    "manufacturing": "manufacturing",
+    "consumer": "consumer",
+    "retail": "retail",
+    "technology": "technology",
+    "healthcare": "healthcare",
+    "education": "education",
+    "finance": "finance",
 }
+
+# Generic query-noise words that carry no retrieval signal and dilute the
+# embedding/rerank match (e.g. 'funding news' should retrieve on 'funding').
+# Stripped from the retrieval query so the semantic match focuses on the topic;
+# the category facet filter (when one resolves) still scopes the result set.
+_QUERY_NOISE_WORDS = frozenset(
+    ("news", "latest", "recent", "updates", "articles", "stories", "coverage", "today", "now", "current")
+)
+
+
+def _strip_query_noise(query: str) -> str:
+    """Drop generic noise words from a retrieval query, collapsing whitespace.
+    Returns the original string unchanged if stripping would leave it empty."""
+    q = re.sub(r"\b(?:" + "|".join(re.escape(w) for w in _QUERY_NOISE_WORDS) + r")\b", " ", query.lower())
+    q = re.sub(r"\s+", " ", q).strip()
+    return q or query
 
 
 def _resolve_facet(query: str, aliases: dict[str, str], facets: dict[str, str]) -> str | None:
-    """Return a real facet value (original casing) whose label is present in
-    ``query`` (whole word) or reachable via a synonym alias, else None.
+    """Return a real facet value (original casing) reachable via a synonym alias
+    in ``query`` (whole word), else None.
 
     ``facets`` maps normalized -> original facet value; ``aliases`` maps a synonym
-    phrase -> the keyword to look up in ``facets``. Longest direct label wins so
-    'fintech' beats shorter overlaps when several match."""
+    phrase -> the keyword to look up in ``facets``. Only explicit, curated
+    synonyms are matched (never raw facet labels), so common-word facet labels
+    like 'People' or 'General' can't be accidentally triggered by ordinary text."""
     q = query.lower()
-    # 1) Direct whole-word presence of any real facet label (prefer longest).
-    direct: str | None = None
-    for norm, orig in facets.items():
-        if re.search(r"\b" + re.escape(norm) + r"\b", q) and (direct is None or len(norm) > len(direct)):
-            direct = orig
-    if direct is not None:
-        return direct
-    # 2) Synonym aliases -> resolve keyword against the facet vocabulary.
     for alias, kw in aliases.items():
         if re.search(r"\b" + re.escape(alias) + r"\b", q):
             if kw in facets:
@@ -153,13 +171,13 @@ def _resolve_facet(query: str, aliases: dict[str, str], facets: dict[str, str]) 
 
 def extract_dealtype(query: str) -> str | None:
     """Map a natural-language query to a real ``dealtype_names`` facet value
-    (e.g. 'ipo news' -> 'IPO', 'fintech funding' -> 'Funding'), or None."""
+    (e.g. 'funding news' -> 'Venture Capital', 'merger news' -> 'M&A'), or None."""
     return _resolve_facet(query, _DEALTYPE_ALIASES, _DEALTYPE_FACETS)
 
 
 def extract_industry(query: str) -> str | None:
     """Map a natural-language query to a real ``industry_names`` facet value
-    (e.g. 'fintech funding' -> 'Fintech'), or None."""
+    (e.g. 'fintech funding' -> 'Finance'), or None."""
     return _resolve_facet(query, _INDUSTRY_ALIASES, _INDUSTRY_FACETS)
 
 
@@ -356,20 +374,22 @@ def _effective_intent(
 
     Returns (retrieval_q, eff_from, eff_to, dealtype, industry). The dealtype/
     industry are looked up against the live facet vocabulary and are None when the
-    query implies no category (or the facet maps are empty)."""
+    query implies no category (or the facet maps are empty). Generic noise words
+    (e.g. 'news') are stripped from the retrieval query so the embedding focuses
+    on the topic, while the facet filter (when one resolves) still scopes results."""
     q = normalize_word_numbers(q)
     retrieval_q, _ = rewrite_year_in_review(q)
     dealtype = extract_dealtype(q)
     industry = extract_industry(q)
     if from_date or to_date:
-        return retrieval_q, from_date, to_date, dealtype, industry
+        return _strip_query_noise(retrieval_q), from_date, to_date, dealtype, industry
     rng = extract_year_range(q)
     if rng:
         cleaned = range_query_topic(q)
         if cleaned:
             retrieval_q = cleaned
-        return retrieval_q, rng[0], rng[1], dealtype, industry
-    return retrieval_q, from_date, to_date, dealtype, industry
+        return _strip_query_noise(retrieval_q), rng[0], rng[1], dealtype, industry
+    return _strip_query_noise(retrieval_q), from_date, to_date, dealtype, industry
 
 
 def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
