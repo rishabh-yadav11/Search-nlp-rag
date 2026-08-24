@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import re
 import time
@@ -59,6 +60,123 @@ state = {}
 # onnxruntime thread pools. Async I/O (Qdrant/Redis) is unaffected.
 inference_lock = asyncio.Lock()
 
+logger = logging.getLogger(__name__)
+
+# Live facet vocabularies loaded once at startup from Qdrant (normalized
+# lowercased value -> original-cased value). Category extraction only ever emits
+# a value present in these maps, so a natural-language query like 'ipo news'
+# maps to the real 'IPO' facet instead of guessing a label that would match
+# nothing (an unknown filter value returns zero results and breaks the query).
+_DEALTYPE_FACETS: dict[str, str] = {}
+_INDUSTRY_FACETS: dict[str, str] = {}
+
+# Natural-language synonyms -> the facet keyword used to resolve against the live
+# vocabulary. Whole-word matched against the query; the keyword is then looked up
+# (exact, then substring) in the facet map. Resolution only succeeds when a real
+# facet value exists, so an unknown corpus degrades to no filter (current
+# behavior) rather than emitting a bogus value.
+_DEALTYPE_ALIASES: dict[str, str] = {
+    # IPO / public listing
+    "ipo": "ipo",
+    "ipos": "ipo",
+    "initial public offering": "ipo",
+    "public listing": "ipo",
+    "public offering": "ipo",
+    "listed": "ipo",
+    "listing": "ipo",
+    "listings": "ipo",
+    # Funding / capital raise
+    "funding": "funding",
+    "fundraise": "funding",
+    "fund raise": "funding",
+    "seed": "funding",
+    "raised": "funding",
+    "raising": "funding",
+    "capital": "funding",
+    "round": "funding",
+    # M&A / consolidation
+    "m&a": "m&a",
+    "merger": "m&a",
+    "mergers": "m&a",
+    "acquisition": "m&a",
+    "acquisitions": "m&a",
+    "acquire": "m&a",
+    "acquired": "m&a",
+    "buyout": "m&a",
+    "takeover": "m&a",
+    # Other deal types (verified against live facets at runtime)
+    "venture debt": "venture debt",
+    "stake sale": "stake sale",
+    "stake": "stake sale",
+    "secondary": "secondary",
+    "series a": "series a",
+    "series b": "series b",
+    "series c": "series c",
+}
+
+_INDUSTRY_ALIASES: dict[str, str] = {
+    "saas": "saas",
+    "ecommerce": "e-commerce",
+    "e-commerce": "e-commerce",
+    "e commerce": "e-commerce",
+    "healthcare": "healthtech",
+    "health care": "healthtech",
+    "health-tech": "healthtech",
+}
+
+
+def _resolve_facet(query: str, aliases: dict[str, str], facets: dict[str, str]) -> str | None:
+    """Return a real facet value (original casing) whose label is present in
+    ``query`` (whole word) or reachable via a synonym alias, else None.
+
+    ``facets`` maps normalized -> original facet value; ``aliases`` maps a synonym
+    phrase -> the keyword to look up in ``facets``. Longest direct label wins so
+    'fintech' beats shorter overlaps when several match."""
+    q = query.lower()
+    # 1) Direct whole-word presence of any real facet label (prefer longest).
+    direct: str | None = None
+    for norm, orig in facets.items():
+        if re.search(r"\b" + re.escape(norm) + r"\b", q) and (direct is None or len(norm) > len(direct)):
+            direct = orig
+    if direct is not None:
+        return direct
+    # 2) Synonym aliases -> resolve keyword against the facet vocabulary.
+    for alias, kw in aliases.items():
+        if re.search(r"\b" + re.escape(alias) + r"\b", q):
+            if kw in facets:
+                return facets[kw]
+            for norm, orig in facets.items():
+                if kw in norm:
+                    return orig
+    return None
+
+
+def extract_dealtype(query: str) -> str | None:
+    """Map a natural-language query to a real ``dealtype_names`` facet value
+    (e.g. 'ipo news' -> 'IPO', 'fintech funding' -> 'Funding'), or None."""
+    return _resolve_facet(query, _DEALTYPE_ALIASES, _DEALTYPE_FACETS)
+
+
+def extract_industry(query: str) -> str | None:
+    """Map a natural-language query to a real ``industry_names`` facet value
+    (e.g. 'fintech funding' -> 'Fintech'), or None."""
+    return _resolve_facet(query, _INDUSTRY_ALIASES, _INDUSTRY_FACETS)
+
+
+async def _load_facet_maps() -> None:
+    """Populate the live dealtype/industry facet maps from Qdrant so category
+    extraction emits only real facet values. Failures leave the maps empty, which
+    makes extraction a no-op (current behavior) — startup never depends on this."""
+    for target, key in ((_DEALTYPE_FACETS, "dealtype_names"), (_INDUSTRY_FACETS, "industry_names")):
+        try:
+            values = await _facet_values(key)
+        except Exception:  # noqa: BLE001 - degraded mode, never crash startup
+            logger.warning("facet map load failed for %s", key)
+            continue
+        target.clear()
+        for v in values:
+            target[v.strip().lower()] = v
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,6 +184,7 @@ async def lifespan(app: FastAPI):
     state["sparse_model"] = SparseTextEmbedding(config.SPARSE_MODEL)
     state["reranker"] = Reranker(config.RERANK_MODEL, backend=config.RERANK_BACKEND)
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
+    await _load_facet_maps()
     state["llm"] = AsyncOpenAI(api_key=config.GEMINI_API_KEY, base_url=config.GEMINI_BASE_URL) if config.GEMINI_API_KEY else None
 
     chat_store = chat_module.ChatStore(config.CHAT_DB_PATH)
@@ -225,25 +344,32 @@ def _effective_intent(
     q: str,
     from_date: str | None,
     to_date: str | None,
-) -> tuple[str, str | None, str | None]:
-    """Rewrite the query for retrieval and derive an auto date filter from the
-    query's date intent. Explicit user dates always win.
+) -> tuple[str, str | None, str | None, str | None, str | None]:
+    """Rewrite the query for retrieval, derive an auto date filter from the
+    query's date intent, and extract any category facets (dealtype/industry) the
+    natural-language query implies. Explicit user dates always win.
 
     Month-scoped queries (e.g. 'top pharma deals of month january 2025') use the
     bare topic as the retrieval query (the date filter scopes the month), so the
     noisy 'top/of/month/year' words don't dilute the embedding match. The same
-    applies to quarter, fiscal-year, and year-span queries."""
+    applies to quarter, fiscal-year, and year-span queries.
+
+    Returns (retrieval_q, eff_from, eff_to, dealtype, industry). The dealtype/
+    industry are looked up against the live facet vocabulary and are None when the
+    query implies no category (or the facet maps are empty)."""
     q = normalize_word_numbers(q)
     retrieval_q, _ = rewrite_year_in_review(q)
+    dealtype = extract_dealtype(q)
+    industry = extract_industry(q)
     if from_date or to_date:
-        return retrieval_q, from_date, to_date
+        return retrieval_q, from_date, to_date, dealtype, industry
     rng = extract_year_range(q)
     if rng:
         cleaned = range_query_topic(q)
         if cleaned:
             retrieval_q = cleaned
-        return retrieval_q, rng[0], rng[1]
-    return retrieval_q, from_date, to_date
+        return retrieval_q, rng[0], rng[1], dealtype, industry
+    return retrieval_q, from_date, to_date, dealtype, industry
 
 
 def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
@@ -555,7 +681,11 @@ async def search(
 ):
     start = time.perf_counter()
     q_fixed, _ = fix_query(q)
-    retrieval_q, eff_from, eff_to = _effective_intent(q_fixed, from_date, to_date)
+    retrieval_q, eff_from, eff_to, auto_dealtype, auto_industry = _effective_intent(q_fixed, from_date, to_date)
+    # Auto-extracted category facets fill in only when the caller didn't pass an
+    # explicit facet, so the UI filter (and /search callers) always win.
+    dealtype = dealtype or auto_dealtype
+    industry = industry or auto_industry
     if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
         retrieval_q = expand_query(retrieval_q)
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)

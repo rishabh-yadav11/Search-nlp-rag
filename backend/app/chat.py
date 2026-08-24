@@ -841,16 +841,17 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         to_summary,
     )
 
-    retrieval_q, eff_from, eff_to = _effective_intent(question, None, None)
+    retrieval_q, eff_from, eff_to, dealtype, industry = _effective_intent(question, None, None)
     k = _effective_chat_k(question)
     prev_question = _previous_user_question(history)
     if prev_question and _is_vague_followup(question):
         # A vague follow-up ('make this into a table', 'plot it', 'more') has no
         # standalone topic to retrieve on — 'make this into a table' as an
         # embedding query finds nothing and short-circuits the turn. Inherit the
-        # previous turn's retrieval query and date filter (and top-N size) so the
-        # same sources are re-presented, while the LLM still gets full history.
-        prev_q, prev_from, prev_to = _effective_intent(prev_question, None, None)
+        # previous turn's retrieval query, date filter, and category facets (and
+        # top-N size) so the same sources are re-presented, while the LLM still
+        # gets full history.
+        prev_q, prev_from, prev_to, prev_dealtype, prev_industry = _effective_intent(prev_question, None, None)
         rng = extract_year_range(question)
         if rng:
             from app.query_intent import extract_list_topic, range_query_topic
@@ -859,8 +860,9 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
             eff_from, eff_to = rng[0], rng[1]
         else:
             retrieval_q, eff_from, eff_to = prev_q, prev_from, prev_to
+        dealtype, industry = prev_dealtype, prev_industry
         k = _effective_chat_k(prev_question)
-    qfilter = build_facet_filter(None, None, None, eff_from, eff_to)
+    qfilter = build_facet_filter(industry, dealtype, None, eff_from, eff_to)
     reranked = await retrieve_and_rerank(retrieval_q, k, qfilter, need_body=True)
     if config.ENABLE_BODY_RESCUE:
         reranked = await body_rescue(retrieval_q, reranked)

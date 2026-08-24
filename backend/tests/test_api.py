@@ -78,21 +78,24 @@ def test_build_facet_filter_invalid_date_raises_400(field):
 
 
 def test_effective_intent_explicit_user_dates_win():
-    rq, fd, td = main._effective_intent("deals in 2025", "2024-01-01", "2024-12-31")
+    rq, fd, td, dt, ind = main._effective_intent("deals in 2025", "2024-01-01", "2024-12-31")
     assert (fd, td) == ("2024-01-01", "2024-12-31")
     assert rq == "deals in 2025"
+    assert dt is None and ind is None
 
 
 def test_effective_intent_auto_year_range():
-    rq, fd, td = main._effective_intent("deals in 2025", None, None)
+    rq, fd, td, dt, ind = main._effective_intent("deals in 2025", None, None)
     assert (fd, td) == ("2025-01-01", "2025-12-31")
     assert rq == "deals in 2025"
+    assert dt is None and ind is None
 
 
 def test_effective_intent_no_year_no_dates():
-    rq, fd, td = main._effective_intent("latest deals", None, None)
+    rq, fd, td, dt, ind = main._effective_intent("latest deals", None, None)
     assert (fd, td) == (None, None)
     assert rq == "latest deals"
+    assert dt is None and ind is None
 
 
 def test_sort_results_recency_ordering(monkeypatch):

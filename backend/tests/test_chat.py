@@ -574,7 +574,7 @@ def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: ("q", "2024-01-01", "2024-12-31"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: ("q", "2024-01-01", "2024-12-31", None, None))
 
     captured = {}
 
@@ -612,8 +612,8 @@ def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
 
     intents = {
-        "top ipo in 2025": ("Flashback 2025 IPO", "2025-01-01", "2025-12-31"),
-        "make this into a table": ("make this into a table", None, None),
+        "top ipo in 2025": ("Flashback 2025 IPO", "2025-01-01", "2025-12-31", None, None),
+        "make this into a table": ("make this into a table", None, None, None, None),
     }
     monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: intents[q])
 
@@ -658,7 +658,7 @@ def test_prepare_turn_real_question_does_not_inherit_previous_retrieval(monkeypa
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
 
     captured = {}
 
@@ -1042,7 +1042,7 @@ def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
 
     captured = {}
 
@@ -1082,7 +1082,7 @@ def test_prepare_turn_budgets_body_excerpts_across_sources(monkeypatch):
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
 
     async def fake_rescue(q, articles):
         return articles
@@ -1321,8 +1321,8 @@ def test_prepare_turn_vague_followup_with_year_range(monkeypatch):
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
     intents = {
-        "top ipo deals": ("top ipo deals", None, None),
-        "make this into a table for 2024": ("make this into a table for 2024", None, None),
+        "top ipo deals": ("top ipo deals", None, None, None, None),
+        "make this into a table for 2024": ("make this into a table for 2024", None, None, None, None),
     }
     monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: intents[q])
 
@@ -1365,7 +1365,7 @@ def test_prepare_turn_calls_body_rescue_when_enabled(monkeypatch):
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", True)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
 
     rescued = []
 
@@ -1394,7 +1394,7 @@ def test_prepare_turn_no_sources_short_circuit(monkeypatch):
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
 
     async def fake_retrieve(rq, top_k, qfilter, need_body=False):
         return [SourceArticle(id=1, title="t", url="u", published_date="2025-01-01",
@@ -1422,7 +1422,7 @@ def test_prepare_turn_weak_fallback(monkeypatch):
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
-    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
 
     async def fake_retrieve(rq, top_k, qfilter, need_body=False):
         return [SourceArticle(id=1, title="t", url="u", published_date="2025-01-01",
