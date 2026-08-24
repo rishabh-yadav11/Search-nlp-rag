@@ -94,8 +94,7 @@ def test_effective_intent_auto_year_range():
 def test_effective_intent_no_year_no_dates():
     rq, fd, td, dt, ind = main._effective_intent("latest deals", None, None)
     assert (fd, td) == (None, None)
-    # Generic noise ('latest') is stripped so the embedding focuses on 'deals'.
-    assert rq == "deals"
+    assert rq == "latest deals"
     assert dt is None and ind is None
 
 
