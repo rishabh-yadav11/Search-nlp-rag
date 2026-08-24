@@ -160,28 +160,31 @@ def test_embed_sparse_returns_first_element():
 
 
 def test_effective_intent_month_scoped_branch():
-    rq, fd, td = main._effective_intent("top pharma deals of month january 2025", None, None)
+    rq, fd, td, dt, ind = main._effective_intent("top pharma deals of month january 2025", None, None)
     assert (rq, fd, td) == ("pharma deals", "2025-01-01", "2025-01-31")
+    assert dt is None and ind is None
 
 
 def test_effective_intent_user_dates_win():
-    rq, fd, td = main._effective_intent("deals in 2025", "2024-01-01", "2024-12-31")
+    rq, fd, td, dt, ind = main._effective_intent("deals in 2025", "2024-01-01", "2024-12-31")
     assert (rq, fd, td) == ("deals in 2025", "2024-01-01", "2024-12-31")
+    assert dt is None and ind is None
 
 
 def test_effective_intent_no_intent_passthrough():
-    rq, fd, td = main._effective_intent("latest deals", None, None)
+    rq, fd, td, dt, ind = main._effective_intent("latest deals", None, None)
     assert (rq, fd, td) == ("latest deals", None, None)
+    assert dt is None and ind is None
 
 
 def test_effective_intent_normalizes_word_numbers():
     """'top ten ipo' must retrieve exactly like 'top 10 ipo': the literal word
     'ten' would otherwise dilute the embedding/rerank match against titles like
     'Ten Sports'."""
-    assert main._effective_intent("top ten ipo", None, None) == ("top 10 ipo", None, None)
-    assert main._effective_intent("top ten deals", None, None) == ("top 10 deals", None, None)
+    assert main._effective_intent("top ten ipo", None, None) == ("top 10 ipo", None, None, None, None)
+    assert main._effective_intent("top ten deals", None, None) == ("top 10 deals", None, None, None, None)
     assert main._effective_intent("top ten ipo", "2024-01-01", "2024-12-31") == (
-        "top 10 ipo", "2024-01-01", "2024-12-31",
+        "top 10 ipo", "2024-01-01", "2024-12-31", None, None,
     )
 
 
