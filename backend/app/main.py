@@ -133,23 +133,6 @@ _INDUSTRY_ALIASES: dict[str, str] = {
     "finance": "finance",
 }
 
-# Generic query-noise words that carry no retrieval signal and dilute the
-# embedding/rerank match (e.g. 'funding news' should retrieve on 'funding').
-# Stripped from the retrieval query so the semantic match focuses on the topic;
-# the category facet filter (when one resolves) still scopes the result set.
-_QUERY_NOISE_WORDS = frozenset(
-    ("news", "latest", "recent", "updates", "articles", "stories", "coverage", "today", "now", "current")
-)
-
-
-def _strip_query_noise(query: str) -> str:
-    """Drop generic noise words from a retrieval query, collapsing whitespace.
-    Returns the original string unchanged if stripping would leave it empty."""
-    q = re.sub(r"\b(?:" + "|".join(re.escape(w) for w in _QUERY_NOISE_WORDS) + r")\b", " ", query.lower())
-    q = re.sub(r"\s+", " ", q).strip()
-    return q or query
-
-
 def _resolve_facet(query: str, aliases: dict[str, str], facets: dict[str, str]) -> str | None:
     """Return a real facet value (original casing) reachable via a synonym alias
     in ``query`` (whole word), else None.
@@ -374,22 +357,24 @@ def _effective_intent(
 
     Returns (retrieval_q, eff_from, eff_to, dealtype, industry). The dealtype/
     industry are looked up against the live facet vocabulary and are None when the
-    query implies no category (or the facet maps are empty). Generic noise words
-    (e.g. 'news') are stripped from the retrieval query so the embedding focuses
-    on the topic, while the facet filter (when one resolves) still scopes results."""
+    query implies no category (or the facet maps are empty). Date words (months,
+    years, quarters) are stripped from the retrieval query because the date filter
+    already scopes the window; the natural phrasing (e.g. 'funding news') is kept
+    so the embedding/rerank match stays strong, while the facet filter (when one
+    resolves) still scopes results."""
     q = normalize_word_numbers(q)
     retrieval_q, _ = rewrite_year_in_review(q)
     dealtype = extract_dealtype(q)
     industry = extract_industry(q)
     if from_date or to_date:
-        return _strip_query_noise(retrieval_q), from_date, to_date, dealtype, industry
+        return retrieval_q, from_date, to_date, dealtype, industry
     rng = extract_year_range(q)
     if rng:
         cleaned = range_query_topic(q)
         if cleaned:
             retrieval_q = cleaned
-        return _strip_query_noise(retrieval_q), rng[0], rng[1], dealtype, industry
-    return _strip_query_noise(retrieval_q), from_date, to_date, dealtype, industry
+        return retrieval_q, rng[0], rng[1], dealtype, industry
+    return retrieval_q, from_date, to_date, dealtype, industry
 
 
 def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
@@ -721,9 +706,9 @@ async def search(
                               latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
     qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
-    # Rerank on the cleaned retrieval query (noise like 'news'/'jun' stripped),
-    # matching chat which already passes the cleaned query — otherwise the raw
-    # phrase dilutes the cross-encoder and weak scores slip through the gate.
+    # Rerank on the retrieval query (date words stripped, natural phrasing kept),
+    # matching chat which already passes the same query — otherwise the raw phrase
+    # with month/year tokens dilutes the cross-encoder and weak scores slip through.
     reranked = await retrieve_and_rerank(retrieval_q, eff_top_k, qfilter)
     if config.ENABLE_CLICK_BOOST:
         reranked = await apply_click_boost(q_fixed, reranked)
