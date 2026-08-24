@@ -65,17 +65,10 @@ def test_extract_industry_none() -> None:
     assert main.extract_industry("latest news") is None
 
 
-def test_strip_query_noise() -> None:
-    assert main._strip_query_noise("funding news") == "funding"
-    assert main._strip_query_noise("ipo news") == "ipo"
-    assert main._strip_query_noise("latest funding news today") == "funding"
-    # Never returns an empty string.
-    assert main._strip_query_noise("news") == "news"
-
-
 def test_effective_intent_funding_news_june() -> None:
     rq, f, t, dt, ind = main._effective_intent("funding news in jun", None, None)
-    assert rq == "funding"  # noise stripped, dealtype applied via filter
+    # Date word ('jun') stripped; natural phrasing kept so rerank stays strong.
+    assert rq == "funding news"
     assert dt == "Venture Capital"
     assert ind is None
     # June auto date filter is derived from the query.
@@ -85,7 +78,8 @@ def test_effective_intent_funding_news_june() -> None:
 
 def test_effective_intent_ipo_relies_on_embedding() -> None:
     rq, _, _, dt, ind = main._effective_intent("ipo news", None, None)
-    assert rq == "ipo"  # 'news' stripped; no IPO facet, so embedding carries it
+    # No IPO facet exists, so the full phrase (embedding carries 'ipo') is kept.
+    assert rq == "ipo news"
     assert dt is None and ind is None
 
 
