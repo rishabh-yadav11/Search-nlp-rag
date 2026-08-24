@@ -1,11 +1,14 @@
 """Unit tests for natural-language category extraction (dealtype/industry
-facets). The extractors resolve synonyms against the *live* facet vocabulary
-stored in module globals, so tests install a fixture vocabulary first."""
+facets) and retrieval-query cleanup. The extractors resolve synonyms against the
+*live* facet vocabulary stored in module globals, so tests install a fixture
+vocabulary that mirrors the real index (e.g. funding -> 'Venture Capital',
+not a mythical 'Funding' facet)."""
 
 from app import main
 
-_DEAL = ["Funding", "IPO", "M&A", "Venture Debt", "Series A", "Stake Sale"]
-_IND = ["Fintech", "Healthtech", "E-commerce", "SaaS", "Edtech"]
+# Mirror the real Qdrant facet labels so the synonym maps resolve as in prod.
+_DEAL = ["Venture Capital", "M&A", "Private Equity", "Credit", "Investment Banking", "Markets"]
+_IND = ["Finance", "Healthcare", "Education", "Technology", "Retail", "Cleantech"]
 
 
 def _set_facets() -> None:
@@ -26,18 +29,10 @@ def teardown_function(_) -> None:
     main._INDUSTRY_FACETS.clear()
 
 
-def test_extract_dealtype_ipo() -> None:
-    assert main.extract_dealtype("ipo news") == "IPO"
-    assert main.extract_dealtype("show me the latest IPO deals") == "IPO"
-    assert main.extract_dealtype("initial public offering 2025") == "IPO"
-    assert main.extract_dealtype("which companies listed this year") == "IPO"
-    assert main.extract_dealtype("how many IPOs this year") == "IPO"
-
-
 def test_extract_dealtype_funding() -> None:
-    assert main.extract_dealtype("funding news") == "Funding"
-    assert main.extract_dealtype("fintech funding") == "Funding"
-    assert main.extract_dealtype("startup raised capital") == "Funding"
+    assert main.extract_dealtype("funding news") == "Venture Capital"
+    assert main.extract_dealtype("fintech funding") == "Venture Capital"
+    assert main.extract_dealtype("startup raised capital") == "Venture Capital"
 
 
 def test_extract_dealtype_ma() -> None:
@@ -46,40 +41,58 @@ def test_extract_dealtype_ma() -> None:
     assert main.extract_dealtype("buyout of the startup") == "M&A"
 
 
-def test_extract_dealtype_series() -> None:
-    assert main.extract_dealtype("series a funding") == "Series A"
+def test_extract_dealtype_private_equity() -> None:
+    assert main.extract_dealtype("private equity deal") == "Private Equity"
 
 
 def test_extract_dealtype_none_when_no_match() -> None:
+    # No IPO facet exists in the corpus; extraction degrades to None (the query is
+    # still cleaned so the embedding focuses on 'ipo').
+    assert main.extract_dealtype("ipo news") is None
     assert main.extract_dealtype("latest news") is None
     assert main.extract_dealtype("how are you") is None
 
 
 def test_extract_industry() -> None:
-    assert main.extract_industry("fintech funding") == "Fintech"
-    assert main.extract_industry("healthtech deals") == "Healthtech"
-    assert main.extract_industry("ecommerce funding") == "E-commerce"
-    assert main.extract_industry("healthcare startup") == "Healthtech"
-    assert main.extract_industry("saas companies") == "SaaS"
+    assert main.extract_industry("fintech funding") == "Finance"
+    assert main.extract_industry("healthtech deals") == "Healthcare"
+    assert main.extract_industry("ecommerce funding") == "Retail"
+    assert main.extract_industry("saas companies") == "Technology"
+    assert main.extract_industry("cleantech startup") == "Cleantech"
 
 
 def test_extract_industry_none() -> None:
     assert main.extract_industry("latest news") is None
 
 
+def test_strip_query_noise() -> None:
+    assert main._strip_query_noise("funding news") == "funding"
+    assert main._strip_query_noise("ipo news") == "ipo"
+    assert main._strip_query_noise("latest funding news today") == "funding"
+    # Never returns an empty string.
+    assert main._strip_query_noise("news") == "news"
+
+
 def test_effective_intent_funding_news_june() -> None:
-    _, f, t, dt, ind = main._effective_intent("funding news in jun", None, None)
-    assert dt == "Funding"
+    rq, f, t, dt, ind = main._effective_intent("funding news in jun", None, None)
+    assert rq == "funding"  # noise stripped, dealtype applied via filter
+    assert dt == "Venture Capital"
     assert ind is None
     # June auto date filter is derived from the query.
     assert f is not None and t is not None
     assert f.startswith("20") and "-06-" in f
 
 
+def test_effective_intent_ipo_relies_on_embedding() -> None:
+    rq, _, _, dt, ind = main._effective_intent("ipo news", None, None)
+    assert rq == "ipo"  # 'news' stripped; no IPO facet, so embedding carries it
+    assert dt is None and ind is None
+
+
 def test_effective_intent_fintech_funding_year() -> None:
     _, f, t, dt, ind = main._effective_intent("top fintech funding 2025", None, None)
-    assert dt == "Funding"
-    assert ind == "Fintech"
+    assert dt == "Venture Capital"
+    assert ind == "Finance"
     assert f == "2025-01-01" and t == "2025-12-31"
 
 
