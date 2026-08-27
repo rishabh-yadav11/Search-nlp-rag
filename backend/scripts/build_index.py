@@ -109,9 +109,11 @@ def ensure_collection(client: QdrantClient) -> bool:
     dim_matches = dense_size == config.EMBED_DIM
 
     sparse_cfg = getattr(info.config, "sparse_vectors_config", None)
+    modifier = None
     if sparse_cfg is not None:
-        sparse_cfg = sparse_cfg.sparse if hasattr(sparse_cfg, "sparse") else sparse_cfg.get("sparse")
-    needs_idf = bool(sparse_cfg and sparse_cfg.modifier == Modifier.IDF)
+        inner = sparse_cfg.sparse if hasattr(sparse_cfg, "sparse") else sparse_cfg.get("sparse")
+        modifier = inner.get("modifier") if isinstance(inner, dict) else getattr(inner, "modifier", None)
+    needs_idf = bool(modifier == Modifier.IDF)
 
     if needs_idf and dim_matches:
         print(f"Collection '{config.QDRANT_COLLECTION}' already exists, resuming upserts into it")
@@ -230,11 +232,17 @@ def main():
     executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
     pbar = tqdm(total=total - start_line, desc="Embedding + indexing")
 
+    skipped = 0
     try:
         for i, line in enumerate(lines):
             if i < start_line:
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                log(f"Skipping malformed jsonl line {i + 1}: not valid JSON; build continues.")
+                continue
             batch_rows.append(row)
             dense_texts.append(compose_dense_text(row))
             sparse_texts.append(compose_sparse_text(row))
@@ -256,6 +264,11 @@ def main():
         executor.shutdown(wait=False)
 
     pbar.close()
+    if skipped:
+        log(
+            f"Build finished with {skipped} malformed jsonl line(s) skipped. "
+            f"Verify the source dataset if completeness matters.",
+        )
     try:
         info = client.get_collection(config.QDRANT_COLLECTION)
         count = info.points_count or 0
