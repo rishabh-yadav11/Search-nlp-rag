@@ -234,6 +234,7 @@ def _req(url: str, payload: dict | None = None, method: str | None = None,
 
 
 def run(q: dict) -> dict:
+    sid = None
     sid = _req(BASE + "/sessions", {"title": "quality-test"})["id"]
     try:
         d = _req(BASE + f"/sessions/{sid}/messages", {"content": q["q"]})
