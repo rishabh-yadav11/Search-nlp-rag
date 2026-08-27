@@ -482,7 +482,7 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
     return None
 
 
-_DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n```", re.DOTALL)
+_DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n?```", re.DOTALL)
 
 
 def _as_float(v: object) -> float | None:
