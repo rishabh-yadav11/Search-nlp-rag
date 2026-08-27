@@ -29,21 +29,26 @@ def _reset_redis_client(monkeypatch):
     monkeypatch.setattr(health, "_redis_client", None)
 
 
-def _app():
+@pytest.fixture
+def client():
     app = FastAPI()
     app.include_router(health.router)
-    return TestClient(app)
+    tc = TestClient(app)
+    try:
+        yield tc
+    finally:
+        tc.close()
 
 
 # --- /health, /live ---
 
 
-def test_health_endpoint():
-    assert _app().get("/health").json() == {"status": "ok"}
+def test_health_endpoint(client):
+    assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_live_endpoint():
-    assert _app().get("/live").json() == {"status": "ok"}
+def test_live_endpoint(client):
+    assert client.get("/live").json() == {"status": "ok"}
 
 
 # --- _qdrant_ok ---
@@ -244,29 +249,25 @@ def test_readiness_report_wires_real_checks(monkeypatch):
 # --- /ready, /readyz ---
 
 
-def test_ready_200_when_ready(monkeypatch):
-    client = _app()
+def test_ready_200_when_ready(client, monkeypatch):
     monkeypatch.setattr(health, "_readiness_report", _async((True, {"ready": True, "checks": {}})))
     r = client.get("/ready")
     assert r.status_code == 200
     assert r.json()["ready"] is True
 
 
-def test_ready_503_when_not_ready(monkeypatch):
-    client = _app()
+def test_ready_503_when_not_ready(client, monkeypatch):
     monkeypatch.setattr(health, "_readiness_report", _async((False, {"ready": False, "checks": {}})))
     r = client.get("/ready")
     assert r.status_code == 503
     assert r.json()["ready"] is False
 
 
-def test_readyz_200_when_ready(monkeypatch):
-    client = _app()
+def test_readyz_200_when_ready(client, monkeypatch):
     monkeypatch.setattr(health, "_readiness_report", _async((True, {})))
     assert client.get("/readyz").status_code == 200
 
 
-def test_readyz_503_when_not_ready(monkeypatch):
-    client = _app()
+def test_readyz_503_when_not_ready(client, monkeypatch):
     monkeypatch.setattr(health, "_readiness_report", _async((False, {})))
     assert client.get("/readyz").status_code == 503
