@@ -6,13 +6,13 @@ delta to Qdrant without touching the collection schema, so a running API is
 unaffected (Qdrant handles concurrent reads/writes; points are only appended
 or removed, never bulk-recreated).
 
-State lives in data/index_state.json: {last_id, updated_at, fingerprints}.
+State lives in data/index_state.json: {updated_at, fingerprints}.
 A fingerprint is the md5 of the *indexed* row values (title, summary, url,
 published_date, category, body and the facet lists), so any edit that would
 change the payload or the embedded text is caught.
 
 Durability & reconciliation:
-  * Upserts are acknowledged (wait=True); state fingerprints/last_id are
+  * Upserts are acknowledged (wait=True); state fingerprints are
     updated only after a successful upsert, so a failed batch is retried from
     the previous state on the next run.
   * reconcile() scrolls all point IDs in the collection and compares them to
@@ -54,7 +54,7 @@ def load_state() -> dict:
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH) as f:
             return json.load(f)
-    return {"last_id": 0, "updated_at": None, "fingerprints": {}}
+    return {"updated_at": None, "fingerprints": {}}
 
 
 def save_state(state: dict):
@@ -140,104 +140,105 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
     from qdrant_client.models import PointStruct, SparseVector
     from sentence_transformers import SentenceTransformer
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
-
-    if deleted:
-        client.delete(
-            collection_name=config.QDRANT_COLLECTION,
-            points_selector=sorted(deleted),
-            wait=True,
-        )
-        for i in deleted:
-            state["fingerprints"].pop(str(i), None)
-        log(f"deleted {len(deleted)} points")
-
-    to_index = new | changed
-    if not to_index:
-        return
-
-    log(f"loading models (indexing {len(to_index)} rows)...")
-    model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
-    sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
-
-    state_fps = state.setdefault("fingerprints", {})
-    last_id = state.get("last_id", 0)
-    to_index = sorted(to_index)
-    batch_size = config.EMBED_BATCH_SIZE
-
-    def encode_batch(dense_texts, sparse_texts):
-        dense_vecs = model.encode(
-            dense_texts,
-            batch_size=len(dense_texts),
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        sparse_vecs = list(sparse_model.embed(sparse_texts))
-        return dense_vecs, sparse_vecs
-
-    def build_point(rec, dvec, svec):
-        return PointStruct(
-            id=rec["id"],
-            vector={
-                "dense": dvec.tolist(),
-                "sparse": SparseVector(
-                    indices=svec.indices.tolist(),
-                    values=svec.values.tolist(),
-                ),
-            },
-            payload={
-                "title": rec["title"],
-                "url": rec["url"],
-                "published_date": rec.get("published_date"),
-                "category": rec.get("category"),
-                "summary": rec.get("summary") or "",
-                "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
-                "author_names": rec.get("author_names") or [],
-                "industry_names": rec.get("industry_names") or [],
-                "dealtype_names": rec.get("dealtype_names") or [],
-            },
-        )
-
-    executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
-    pending = deque()
-
-    def submit(batch):
-        dense_texts = [compose_dense_text(r) for r in batch]
-        sparse_texts = [compose_sparse_text(r) for r in batch]
-        pending.append((batch, executor.submit(encode_batch, dense_texts, sparse_texts)))
-
-    def upsert_one():
-        nonlocal last_id
-        batch, future = pending.popleft()
-        dense_vecs, sparse_vecs = future.result()
-        points = [build_point(r, dvec, svec) for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)]
-        try:
-            client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
-        except Exception as e:
-            log(
-                f"ERROR: upsert of batch ending at id {batch[-1]['id']} failed; state "
-                f"NOT updated (batch will be retried next run): {e}",
-            )
-            raise
-
-        for r in batch:
-            state_fps[str(r["id"])] = fingerprint(r)
-        last_id = max(last_id, max(r["id"] for r in batch))
-        state["last_id"] = last_id
-        state["updated_at"] = datetime.now(UTC).isoformat()
-        save_state(state)
-        log(f"upserted {len(batch)} points (last_id={last_id})")
-
+    client = None
     try:
-        for start in range(0, len(to_index), batch_size):
-            batch = [records[i] for i in to_index[start : start + batch_size]]
-            submit(batch)
-            while len(pending) >= config.INDEXER_WORKERS:
+        client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+        if deleted:
+            client.delete(
+                collection_name=config.QDRANT_COLLECTION,
+                points_selector=sorted(deleted),
+                wait=True,
+            )
+            for i in deleted:
+                state["fingerprints"].pop(str(i), None)
+            log(f"deleted {len(deleted)} points")
+            save_state(state)
+
+        to_index = new | changed
+        if not to_index:
+            return
+
+        log(f"loading models (indexing {len(to_index)} rows)...")
+        model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
+        sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
+
+        state_fps = state["fingerprints"]
+        to_index = sorted(to_index)
+        batch_size = config.EMBED_BATCH_SIZE
+
+        def encode_batch(dense_texts, sparse_texts):
+            dense_vecs = model.encode(
+                dense_texts,
+                batch_size=len(dense_texts),
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            sparse_vecs = list(sparse_model.embed(sparse_texts))
+            return dense_vecs, sparse_vecs
+
+        def build_point(rec, dvec, svec):
+            return PointStruct(
+                id=rec["id"],
+                vector={
+                    "dense": dvec.tolist(),
+                    "sparse": SparseVector(
+                        indices=svec.indices.tolist(),
+                        values=svec.values.tolist(),
+                    ),
+                },
+                payload={
+                    "title": rec["title"],
+                    "url": rec["url"],
+                    "published_date": rec.get("published_date"),
+                    "category": rec.get("category"),
+                    "summary": rec.get("summary") or "",
+                    "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
+                    "author_names": rec.get("author_names") or [],
+                    "industry_names": rec.get("industry_names") or [],
+                    "dealtype_names": rec.get("dealtype_names") or [],
+                },
+            )
+
+        executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
+        pending = deque()
+
+        def submit(batch):
+            dense_texts = [compose_dense_text(r) for r in batch]
+            sparse_texts = [compose_sparse_text(r) for r in batch]
+            pending.append((batch, executor.submit(encode_batch, dense_texts, sparse_texts)))
+
+        def upsert_one():
+            batch, future = pending.popleft()
+            dense_vecs, sparse_vecs = future.result()
+            points = [build_point(r, dvec, svec) for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)]
+            try:
+                client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
+            except Exception as e:
+                log(
+                    f"ERROR: upsert of batch ending at id {batch[-1]['id']} failed; state "
+                    f"NOT updated (batch will be retried next run): {e}",
+                )
+                raise
+
+            for r in batch:
+                state_fps[str(r["id"])] = fingerprint(r)
+            state["updated_at"] = datetime.now(UTC).isoformat()
+            save_state(state)
+            log(f"upserted {len(batch)} points (max_id={batch[-1]['id']})")
+
+        try:
+            for start in range(0, len(to_index), batch_size):
+                batch = [records[i] for i in to_index[start : start + batch_size]]
+                submit(batch)
+                while len(pending) >= config.INDEXER_WORKERS:
+                    upsert_one()
+            while pending:
                 upsert_one()
-        while pending:
-            upsert_one()
+        finally:
+            executor.shutdown(wait=False)
     finally:
-        executor.shutdown(wait=False)
+        if client is not None:
+            client.close()
 
 
 def reconcile(state: dict, records: dict[int, dict]) -> bool:
@@ -250,8 +251,9 @@ def reconcile(state: dict, records: dict[int, dict]) -> bool:
     """
     from qdrant_client import QdrantClient
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+    client = None
     try:
+        client = QdrantClient(url=config.QDRANT_URL, timeout=30)
         point_ids = set()
         next_offset = None
         while True:
@@ -284,6 +286,9 @@ def reconcile(state: dict, records: dict[int, dict]) -> bool:
     except Exception as e:
         log(f"WARNING: reconcile failed: {e}")
         return False
+    finally:
+        if client is not None:
+            client.close()
 
 
 async def main():
@@ -313,12 +318,11 @@ async def main():
     if do_init:
         state_fps = {str(i): fingerprint(records[i]) for i in records}
         state = {
-            "last_id": max(records) if records else 0,
             "updated_at": datetime.now(UTC).isoformat(),
             "fingerprints": state_fps,
         }
         save_state(state)
-        log(f"seeded {len(state_fps)} fingerprints (last_id={state['last_id']})")
+        log(f"seeded {len(state_fps)} fingerprints")
         return 0 if reconcile(state, records) else 1
 
     new, changed, deleted = sync_delta(state, records)

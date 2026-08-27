@@ -48,7 +48,6 @@ def test_fingerprint_sensitive_to_each_field(field):
 
 def _state_for(records: dict[int, dict]) -> dict:
     return {
-        "last_id": max(records, default=0),
         "updated_at": None,
         "fingerprints": {str(i): fingerprint(r) for i, r in records.items()},
     }
@@ -91,7 +90,7 @@ def test_sync_delta_empty_state_is_all_new():
 
 def test_load_state_default_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(update_index, "STATE_PATH", str(tmp_path / "missing.json"))
-    assert load_state() == {"last_id": 0, "updated_at": None, "fingerprints": {}}
+    assert load_state() == {"updated_at": None, "fingerprints": {}}
 
 
 def test_state_round_trip(tmp_path, monkeypatch):
@@ -99,7 +98,6 @@ def test_state_round_trip(tmp_path, monkeypatch):
     monkeypatch.setattr(update_index, "STATE_PATH", str(tmp_path / "index_state.json"))
 
     state = {
-        "last_id": 7,
         "updated_at": "2026-08-13T00:00:00+00:00",
         "fingerprints": {"1": fingerprint(_rec()), "2": fingerprint(_rec(id=2, title="Two"))},
     }
