@@ -38,4 +38,8 @@ class DenseEncoder:
         """Embed one query string into an L2-normalized vector."""
         if self._fallback is not None:
             return self._fallback.encode(text, normalize_embeddings=True)
-        return next(iter(self._model.embed([text], batch_size=1)))
+        vec = next(iter(self._model.embed([text], batch_size=1)))
+        norm = (vec ** 2).sum() ** 0.5
+        if norm > 0:
+            vec = vec / norm
+        return vec
