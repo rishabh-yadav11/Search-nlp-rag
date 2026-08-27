@@ -41,10 +41,9 @@ def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def scroll_stored_bodies() -> dict[int, str]:
+def scroll_stored_bodies(client: QdrantClient) -> dict[int, str]:
     """id -> currently stored `body` payload for every point."""
     bodies: dict[int, str] = {}
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     next_offset = None
     while True:
         pts, next_offset = client.scroll(
@@ -70,24 +69,24 @@ def main():
     records = asyncio.run(fetch_records())
     log(f"fetched {len(records)} MySQL rows in {time.perf_counter() - start:.1f}s")
 
-    stored = scroll_stored_bodies()
-    log(f"scrolled {len(stored)} stored bodies")
+    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    try:
+        stored = scroll_stored_bodies(client)
+        log(f"scrolled {len(stored)} stored bodies")
 
-    affected = [i for i, rec in records.items() if stored.get(i) != rec["body"]]
-    log(f"points needing a body update: {len(affected)}")
+        affected = [i for i, rec in records.items() if stored.get(i) != rec["body"]]
+        log(f"points needing a body update: {len(affected)}")
 
-    if not affected:
-        log("nothing to do")
-        return 0
+        if not affected:
+            log("nothing to do")
+            return 0
 
-    log(f"loading sparse model {config.SPARSE_MODEL}...")
-    sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
+        log(f"loading sparse model {config.SPARSE_MODEL}...")
+        sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
 
-    batches = [affected[i : i + BATCH_SIZE] for i in range(0, len(affected), BATCH_SIZE)]
-    updated = 0
-    for n, batch in enumerate(batches, 1):
-        client = QdrantClient(url=config.QDRANT_URL, timeout=60)
-        try:
+        batches = [affected[i : i + BATCH_SIZE] for i in range(0, len(affected), BATCH_SIZE)]
+        updated = 0
+        for n, batch in enumerate(batches, 1):
             sparse_texts = [compose_sparse_text(records[i]) for i in batch]
             svecs = list(sparse_model.embed(sparse_texts))
             vector_points = [
@@ -114,13 +113,11 @@ def main():
                     points=[i],
                     wait=True,
                 )
-        except Exception as e:
-            log(f"ERROR: batch {n} (ids {batch[0]}..{batch[-1]}) failed: {e}")
-            log("STOPPED — fix the error and rerun (script is idempotent)")
-            return 1
-        updated += len(batch)
-        if n % 10 == 0 or n == len(batches):
-            log(f"progress: {updated}/{len(affected)} ({n}/{len(batches)} batches)")
+            updated += len(batch)
+            if n % 10 == 0 or n == len(batches):
+                log(f"progress: {updated}/{len(affected)} ({n}/{len(batches)} batches)")
+    finally:
+        client.close()
 
     log(f"done: updated body + sparse vector on {updated} points in "
         f"{time.perf_counter() - start:.1f}s")
