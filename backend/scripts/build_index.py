@@ -263,7 +263,6 @@ def main():
                 row = json.loads(line)
             except json.JSONDecodeError:
                 skipped += 1
-                save_skipped(skipped)
                 log(f"Skipping malformed jsonl line {i + 1}: not valid JSON; build continues.")
                 continue
             batch_rows.append(row)
