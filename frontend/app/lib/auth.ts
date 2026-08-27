@@ -10,6 +10,26 @@ export const API_BASE =
   // auth token to localhost:8000 (NEXT_PUBLIC_API_BASE must be set at build).
   (process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '')
 
+/**
+ * Returns true only for a safe, same-origin, root-relative redirect path.
+ * Safe means the value starts with exactly one `/` and is NOT:
+ *  - a protocol-relative URL (e.g. `//evil.com`),
+ *  - an absolute URL (e.g. `https://evil.com`),
+ *  - an absolute path with an embedded scheme (any `:` before the first `/`
+ *    or where the path begins with `//`).
+ * Anything else is rejected and callers must fall back to a default like
+ * `/chat` or `/`.
+ */
+export function isSafeRedirect(next: unknown): next is string {
+  if (typeof next !== 'string' || next.length === 0) return false
+  if (!next.startsWith('/')) return false
+  // Reject protocol-relative URLs (`//evil.com`).
+  if (next.startsWith('//')) return false
+  // Reject any embedded scheme (`http:`, `javascript:`, etc.).
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(next)) return false
+  return true
+}
+
 export function getToken(): string | null {
   try {
     return window.localStorage.getItem(TOKEN_KEY)
@@ -19,6 +39,9 @@ export function getToken(): string | null {
 }
 
 export function setToken(token: string): void {
+  // SECURITY: localStorage is XSS-exfiltratable. The token must move to an
+  // httpOnly, Secure, SameSite cookie (backend change required). Never log or
+  // echo the token value. This storage path is a known risk until that lands.
   try {
     window.localStorage.setItem(TOKEN_KEY, token)
   } catch {
@@ -117,7 +140,9 @@ export function redirectToLogin(next?: string): void {
   clearToken()
   clearMeCache()
   if (typeof window !== 'undefined') {
-    const target = next && next.startsWith('/') ? `/login?next=${encodeURIComponent(next)}` : '/login'
+    // Only preserve `next` when it is a safe, root-relative path. A value like
+    // `//evil.com` or `https://evil.com` must fall back to a plain `/login`.
+    const target = isSafeRedirect(next) ? `/login?next=${encodeURIComponent(next)}` : '/login'
     window.location.replace(target)
   }
 }
