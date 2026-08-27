@@ -101,7 +101,7 @@ def backfill(records: dict[int, dict], missing: list[int]):
                 "published_date": rec.get("published_date"),
                 "category": rec.get("category"),
                 "summary": rec.get("summary") or "",
-                "body": (rec.get("body") or ""),
+                "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
                 "author_names": rec.get("author_names") or [],
                 "industry_names": rec.get("industry_names") or [],
                 "dealtype_names": rec.get("dealtype_names") or [],
