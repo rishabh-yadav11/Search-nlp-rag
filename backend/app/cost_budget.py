@@ -81,7 +81,13 @@ async def record_cost(cost_inr: float) -> None:
     if cost_inr <= 0:
         return
     try:
-        await _client().incrbyfloat(_day_key(), to_usd(cost_inr))
+        c = _client()
+        key = _day_key()
+        await c.incrbyfloat(key, to_usd(cost_inr))
+        # Bound the counter's lifetime: expire a fixed window after it is written
+        # so daily cost keys don't accumulate in Redis indefinitely. The window is
+        # set on every write, so an active day always stays alive past its end.
+        await c.expire(key, config.COST_DAY_TTL_SECONDS)
     except Exception as exc:
         logger.warning("cost budget Redis unavailable (%s); spend not recorded", exc)
 

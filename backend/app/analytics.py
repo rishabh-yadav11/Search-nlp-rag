@@ -92,12 +92,21 @@ async def record_click(query: str, position: int, article_id: int | None = None)
     which results users actually open for a query.
     """
     try:
+        # Defensive: the beacon is unauthenticated, so an attacker could send an
+        # arbitrarily long query. Bound it before it becomes a sorted-set member
+        # (unbounded member size = unbounded memory growth). Keep the key stable
+        # by truncating rather than hashing.
+        query = (query or "")[: config.CLICK_QUERY_MAX_LEN]
         p = _client().pipeline()
         p.incr("analytics:click:total")
         p.incr(f"analytics:click:pos:{position}")
         p.zincrby("analytics:click_top_queries", 1, query)
         if article_id is not None:
-            p.zincrby(f"analytics:query_click:{query}", 1, str(article_id))
+            qkey = f"analytics:query_click:{query}"
+            p.zincrby(qkey, 1, str(article_id))
+            # Expire the per-query set so distinct-query sets don't accumulate
+            # forever; refreshed on each click.
+            p.expire(qkey, config.CLICK_QUERY_TTL_SECONDS)
         await p.execute()
     except Exception as exc:
         _degraded(exc)
