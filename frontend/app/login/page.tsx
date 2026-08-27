@@ -60,6 +60,9 @@ function LoginForm() {
       return
     } catch (err) {
       clearTimeout(timeout)
+      // Guard against state updates on an unmounted component if the request
+      // was aborted by the cleanup (e.g. navigation away during the call).
+      if (!mountedRef.current) return
       if (controller.signal.aborted) {
         setError('The request timed out. Please try again.')
       } else {
