@@ -38,12 +38,15 @@ def fetch_rows():
             db=config.MYSQL_DATABASE, autocommit=True)
         try:
             async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
+                # config.MYSQL_TABLE is a trusted config identifier, not user
+                # input; it must never be derived from or concatenated with any
+                # request-supplied value.
                 await cur.execute(
                     f"SELECT title, summary, body FROM {config.MYSQL_TABLE} WHERE status=1")
                 rows = await cur.fetchall()
             return rows
         finally:
-            pool.close()
+            await pool.close()
             await pool.wait_closed()
 
     import asyncio
