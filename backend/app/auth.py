@@ -279,16 +279,18 @@ class AuthStore:
         return [UserOut.from_user(self._to_user(r)) for r in rows]
 
     async def update_user(self, user_id: str, name: str | None, role: str | None, is_active: bool | None) -> None:
+        # Whitelist the columns that may be set so a future caller can never inject
+        # a user-controlled column name into the SQL via f-string interpolation.
+        allowed: dict[str, object] = {"name": name, "role": role, "is_active": is_active}
         sets, params = [], []
-        if name is not None:
-            sets.append("name = ?")
-            params.append(name)
-        if role is not None:
-            sets.append("role = ?")
-            params.append(role)
-        if is_active is not None:
-            sets.append("is_active = ?")
-            params.append(1 if is_active else 0)
+        for col, val in allowed.items():
+            if val is None:
+                continue
+            sets.append(f"{col} = ?")
+            if col == "is_active":
+                params.append(1 if val else 0)
+            else:
+                params.append(val)
         if not sets:
             return
         params.append(user_id)
@@ -381,9 +383,13 @@ async def _check_rate_limit(request: Request, action: str, limit_per_min: int) -
     key = f"auth:rl:{action}:{_client_ip(request)}"
     try:
         rc = _rate_redis()
+        # Establish the sliding window atomically on the first hit: SET NX EX sets
+        # the value to 0 with the window TTL only if the key did not already
+        # exist, so the key always has a TTL. A later crash can never leave a
+        # counter with no expiry (which would block the IP forever under the old
+        # INCR + separate EXPIRE). Subsequent hits just increment.
+        await rc.set(key, 0, nx=True, ex=config.AUTH_RATE_WINDOW_SECONDS)
         n = await rc.incr(key)
-        if n == 1:
-            await rc.expire(key, config.AUTH_RATE_WINDOW_SECONDS)
         if n > limit_per_min:
             raise HTTPException(
                 status_code=429,
