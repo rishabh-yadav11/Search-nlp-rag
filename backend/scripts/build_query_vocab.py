@@ -55,7 +55,8 @@ def main() -> None:
     counter: Counter = Counter()
     for r in rows:
         text = clean(" ".join((r["title"] or "", r["summary"] or "", r["body"] or "")))
-        counter.update(_WORD_RE.findall(text.lower()))
+        # count each distinct token once per document for document-frequency/IDF
+        counter.update(set(_WORD_RE.findall(text.lower())))
     # keep tokens present in >= 3 documents to reduce symspell noise
     vocab = {t: c for t, c in counter.items() if c >= 3 and len(t) >= 3}
     for e in _NORMALIZED_ENTITIES:
