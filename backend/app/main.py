@@ -590,11 +590,24 @@ def _recency_multiplier(published_date: str | None) -> float:
     return 1.0 - config.RECENCY_STRENGTH * (1.0 - math.exp(-age_days / config.RECENCY_DECAY_DAYS))
 
 
+def _tz_stripped_pub(published_date: str | None) -> str:
+    """Normalize the stored published_date for raw-string comparison.
+
+    New records store naive RFC 3339 (e.g. '2020-01-01T12:00:00'); records
+    indexed before the UTC-shift fix carry a '+00:00' suffix. Stripping the
+    tz offset lets the string tiebreaker order them by wall-clock uniformly,
+    without reinterpreting or shifting the underlying time.
+    """
+    if not published_date:
+        return ""
+    return published_date.replace("+00:00", "").replace("Z", "")
+
+
 def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
     """Recency-tempered relevance first, recency second: blended score desc,
     then published_date desc (missing dates last)."""
     results.sort(
-        key=lambda a: (a.score * _recency_multiplier(a.published_date), a.published_date or ""),
+        key=lambda a: (a.score * _recency_multiplier(a.published_date), _tz_stripped_pub(a.published_date)),
         reverse=True,
     )
     return results
