@@ -92,7 +92,14 @@ export async function getMe(force = false): Promise<AuthUser | null> {
     return null
   }
   if (!res.ok) return null
-  meCache = (await res.json()) as AuthUser
+  try {
+    meCache = (await res.json()) as AuthUser
+  } catch {
+    // Malformed/non-JSON 200 response: don't throw (callers may lack a
+    // .catch); treat as an unexpected payload and return null safely.
+    console.error('getMe: failed to parse /api/auth/me response')
+    return null
+  }
   meCacheToken = token
   meCacheTs = Date.now()
   return meCache
