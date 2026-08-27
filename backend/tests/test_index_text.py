@@ -35,8 +35,11 @@ def test_clean_strips_html_and_collapses_whitespace():
     assert clean(None) == ""
 
 
-def test_split_names_dedupes_and_handles_json_lists():
+def test_split_names_json_keeps_order_no_dedup_plain_dedupes():
+    # JSON-list values are preserved verbatim (order kept, no dedup) because facet
+    # frequency/order can matter downstream.
     assert split_names('["Alice", "Alice", "Bob"]') == ["Alice", "Alice", "Bob"]
+    # Delimited (comma/pipe/slash) values are de-duplicated and trimmed.
     assert split_names("Fintech/Healthtech") == ["Fintech", "Healthtech"]
     assert split_names("TMT, Technology") == ["TMT", "Technology"]
     assert split_names("") == []
