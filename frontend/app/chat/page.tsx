@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
 import { API_BASE, authHeaders, getToken, redirectToLogin } from '../lib/auth'
@@ -41,11 +42,26 @@ type Session = {
 
 const CITATION_RE = /\[\d+\]/
 
+// Sanitize untrusted LLM markdown: strip script/iframe/on* handlers and
+// javascript: URLs while keeping legitimate formatting. `className` is allowed
+// so the citation `<sup class="cite">` markers survive.
+const sanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    '*': [...(defaultSchema.attributes?.['*'] ?? []), 'className'],
+  },
+}
+
 // Re-rendering the accumulated markdown on every SSE token is O(n^2): each
 // token re-parses the entire answer so far. Throttle streaming renders to at
 // most this many ms apart; the final chunk is always flushed when the stream
 // ends.
 const STREAM_RENDER_MS = 50
+// SSE connection guardrails: abort on unmount/session switch and don't hang
+// forever. Total patience = TIMEOUT × (RETRIES + 1), with linear backoff.
+const SSE_TIMEOUT_MS = 45000
+const SSE_MAX_RETRIES = 2
 
 function remarkCitations() {
   return (tree: any) => {
@@ -161,7 +177,11 @@ function AnswerBody({ content }: { content: string }) {
         part.type === 'viz' ? (
           <DataViz key={`viz-${i}`} block={part.block} />
         ) : (
-          <ReactMarkdown key={`md-${i}`} remarkPlugins={[remarkGfm, remarkCitations]} rehypePlugins={[rehypeRaw]}>
+          <ReactMarkdown
+            key={`md-${i}`}
+            remarkPlugins={[remarkGfm, remarkCitations]}
+            rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
+          >
             {part.md}
           </ReactMarkdown>
         ),
@@ -184,6 +204,9 @@ export default function ChatPage() {
   // advancing while the page stays open. No fetch — purely to recompute time.
   const [, setTick] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
+  // Holds the live SSE AbortController so we can cancel it on unmount, on
+  // starting a new session, or when switching conversations.
+  const abortRef = useRef<AbortController | null>(null)
 
   const loadSessions = useCallback(async () => {
     try {
@@ -212,8 +235,14 @@ export default function ChatPage() {
     return () => clearInterval(t)
   }, [])
 
+  // Cancel any in-flight SSE stream when the component unmounts.
+  useEffect(() => {
+    return () => abortRef.current?.abort()
+  }, [])
+
   const openSession = useCallback(
     async (id: string) => {
+      abortRef.current?.abort()
       setActiveId(id)
       setError('')
       try {
@@ -229,6 +258,7 @@ export default function ChatPage() {
   )
 
   const newSession = useCallback(() => {
+    abortRef.current?.abort()
     setActiveId(null)
     setMessages([])
     setInput('')
@@ -260,11 +290,44 @@ export default function ChatPage() {
     setSending(true)
 
     try {
-      const res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages/stream`, {
-        method: 'POST',
-        headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
-        body: JSON.stringify({ content: question }),
-      })
+      // Open the SSE stream with an AbortController, a per-attempt timeout, and
+      // a guarded retry/backoff so a transient failure or a hung connection
+      // doesn't leave the UI spinning forever.
+      let res: Response | null = null
+      let lastErr: Error | null = null
+      for (let attempt = 0; attempt <= SSE_MAX_RETRIES; attempt++) {
+        const ctrl = new AbortController()
+        abortRef.current = ctrl
+        let timedOut = false
+        const timer = setTimeout(() => {
+          timedOut = true
+          ctrl.abort()
+        }, SSE_TIMEOUT_MS)
+        try {
+          res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages/stream`, {
+            method: 'POST',
+            headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
+            body: JSON.stringify({ content: question }),
+            signal: ctrl.signal,
+          })
+          lastErr = null
+          break
+        } catch (e) {
+          lastErr = timedOut
+            ? new Error('Connection timed out. Please try again.')
+            : e instanceof Error
+              ? e
+              : new Error('Network error')
+          // Don't retry if the user aborted (unmount / new session).
+          if (ctrl.signal.aborted && !timedOut) break
+          if (attempt < SSE_MAX_RETRIES) {
+            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+          }
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      if (!res) throw lastErr ?? new Error('Streaming connection failed')
       if (res.status === 401) redirectToLogin()
       if (!res.ok) throw new Error(`Request failed (${res.status})`)
       if (!res.body) throw new Error('Streaming not supported')
