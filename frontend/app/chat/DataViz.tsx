@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 export type DataVizBlock = {
   title?: string
@@ -159,8 +159,8 @@ function BarChart({ block }: { block: DataVizBlock }) {
   const values = rows.map((r) => toNum(r[v]) ?? 0)
   // Domain spans the actual min/max (anchored at 0) so negatives render below
   // the zero baseline instead of being clipped or drawn the wrong way.
-  const maxVal = Math.max(0, ...values)
-  const minVal = Math.min(0, ...values)
+  const maxVal = values.reduce((a, b) => Math.max(a, b), 0)
+  const minVal = values.reduce((a, b) => Math.min(a, b), 0)
   const n = rows.length
   const slot = 64
   const padL = 56
@@ -230,8 +230,8 @@ function LineChart({ block }: { block: DataVizBlock }) {
   const values = rows.map((r) => toNum(r[v]) ?? 0)
   // Domain spans the actual min/max (anchored at 0) so negative values map
   // below the zero line instead of being pushed off the top.
-  const maxVal = Math.max(0, ...values)
-  const minVal = Math.min(0, ...values)
+  const maxVal = values.reduce((a, b) => Math.max(a, b), 0)
+  const minVal = values.reduce((a, b) => Math.min(a, b), 0)
   const n = rows.length
   const width = Math.max(340, n * 80 + 60)
   const height = 240
@@ -345,7 +345,7 @@ function PictogramChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
   const values = rows.map((r) => toNum(r[v]) ?? 0)
-  const maxVal = Math.max(1, ...values)
+  const maxVal = values.reduce((a, b) => Math.max(a, b), 1)
   const scale = maxVal > 40 ? Math.ceil(maxVal / 40) : 1
 
   return (
@@ -412,11 +412,16 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
 
 export default function DataViz({ block }: { block: DataVizBlock }) {
   const [view, setView] = useState<NonNullable<DataVizBlock['view']>>(block.kind ?? 'table')
-  // Re-validate the selected view whenever the underlying block changes so a
-  // stale selection (e.g. 'bar' left over from prior data) doesn't persist.
+  // Reset the selected view only when the block's CONTENT changes, not on every
+  // fresh object reference. Otherwise a parent that re-creates the block each
+  // render would silently discard the user's manual view selection.
+  const prevSig = useRef<string>('')
+  const sig = `${block.title ?? ''}|${block.rows.length}|${block.value_column ?? ''}|${block.kind ?? ''}`
   useEffect(() => {
+    if (prevSig.current === sig) return
+    prevSig.current = sig
     setView(block.kind ?? 'table')
-  }, [block])
+  }, [sig, block.kind])
   const vc = block.value_column
   // A chart is valid as long as at least one numeric value exists; missing
   // cells are skipped/zeroed per-series rather than forcing a table-only view.
