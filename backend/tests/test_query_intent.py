@@ -1,7 +1,7 @@
 
 
 from app.query_intent import (
-    _CURRENT_YEAR,
+    _current_year,
     _referenced_year,
     extract_list_topic,
     extract_month_range,
@@ -29,7 +29,7 @@ def test_extract_year_range_span():
 def test_extract_year_range_last_and_this_year():
     # query_intent derives "this/last year" from _CURRENT_YEAR, so assert relative
     # to it instead of hardcoding 2025/2026.
-    cur = _CURRENT_YEAR
+    cur = _current_year()
     last = cur - 1
     assert extract_year_range("top articles last year") == (f"{last}-01-01", f"{last}-12-31")
     assert extract_year_range("the last year's highlights") == (f"{last}-01-01", f"{last}-12-31")
@@ -167,7 +167,7 @@ def test_extract_month_range_full_and_abbrev():
 
 
 def test_extract_month_range_defaults_to_current_year():
-    cur = _CURRENT_YEAR
+    cur = _current_year()
     rng = extract_month_range("top deals in march")
     assert rng is not None
     assert rng[0].startswith(f"{cur}-03-")
@@ -217,7 +217,7 @@ def test_extract_year_range_short_span_rollover():
 
 
 def test_extract_year_range_month_span():
-    cur = _CURRENT_YEAR
+    cur = _current_year()
     assert extract_year_range("deals in jan-march") == (f"{cur}-01-01", f"{cur}-03-31")
     assert extract_year_range("x in jan-march 2025") == ("2025-01-01", "2025-03-31")
     assert extract_year_range("top 15 deals in jan to march 2025") == ("2025-01-01", "2025-03-31")
@@ -226,18 +226,18 @@ def test_extract_year_range_month_span():
 
 
 def test_extract_year_range_month_span_crosses_year():
-    cur = _CURRENT_YEAR
+    cur = _current_year()
     assert extract_year_range("deals from may to march") == (f"{cur}-05-01", f"{cur + 1}-03-31")
 
 
 def test_extract_month_range_month_span():
-    cur = _CURRENT_YEAR
+    cur = _current_year()
     assert extract_month_range("deals in jan-march") == (f"{cur}-01-01", f"{cur}-03-31")
     assert extract_month_range("january to march 2025") == ("2025-01-01", "2025-03-31")
 
 
 def test_extract_year_range_quarter():
-    cur = _CURRENT_YEAR
+    cur = _current_year()
     assert extract_year_range("deals in Q1 2025") == ("2025-01-01", "2025-03-31")
     assert extract_year_range("deals in Q2-2024") == ("2024-04-01", "2024-06-30")
     assert extract_year_range("deals in Q3 2024") == ("2024-07-01", "2024-09-30")
