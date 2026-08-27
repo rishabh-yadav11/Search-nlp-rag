@@ -37,6 +37,9 @@ async def fetch_all():
         autocommit=True,
         minsize=1,
         maxsize=5,
+        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30,
     )
 
     last_id = 0
@@ -93,35 +96,37 @@ async def fetch_all():
         LIMIT %s
     """
 
-    async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
-        await cur.execute(
-            f"SELECT COUNT(*) AS c FROM {config.MYSQL_TABLE} WHERE status = 1 AND feid > %s",
-            (last_id,),
-        )
-        remaining = (await cur.fetchone())["c"]
-        pbar = tqdm(total=remaining, desc="Fetching articles")
+    try:
+        async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                f"SELECT COUNT(*) AS c FROM {config.MYSQL_TABLE} WHERE status = 1 AND feid > %s",
+                (last_id,),
+            )
+            remaining = (await cur.fetchone())["c"]
+            pbar = tqdm(total=remaining, desc="Fetching articles")
 
-        with open(OUTPUT_PATH, "a") as out_f:
-            while True:
-                await cur.execute(query, (last_id, PAGE_SIZE))
-                rows = await cur.fetchall()
-                if not rows:
-                    break
+            with open(OUTPUT_PATH, "a") as out_f:
+                while True:
+                    await cur.execute(query, (last_id, PAGE_SIZE))
+                    rows = await cur.fetchall()
+                    if not rows:
+                        break
 
-                for row in rows:
-                    rec = record_from_row(row)
-                    out_f.write(json.dumps(rec, default=str) + "\n")
+                    for row in rows:
+                        rec = record_from_row(row)
+                        out_f.write(json.dumps(rec, default=str) + "\n")
 
-                out_f.flush()
-                last_id = rows[-1]["feid"]
-                total_written += len(rows)
-                pbar.update(len(rows))
+                    out_f.flush()
+                    last_id = rows[-1]["feid"]
+                    total_written += len(rows)
+                    pbar.update(len(rows))
 
-        pbar.close()
+            pbar.close()
 
-    pool.close()
-    await pool.wait_closed()
-    print(f"Done. {total_written} total articles written to {OUTPUT_PATH}")
+        print(f"Done. {total_written} total articles written to {OUTPUT_PATH}")
+    finally:
+        pool.close()
+        await pool.wait_closed()
 
 
 if __name__ == "__main__":
