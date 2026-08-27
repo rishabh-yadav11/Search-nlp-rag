@@ -72,7 +72,7 @@ def _extract_sparse_vector(vector, feid: int):
     # NamedVectors-like object (pydantic model / object with attributes).
     try:
         return getattr(vector, "sparse", None)
-    except Exception as exc:  # noqa: BLE001 - log, never crash the eval
+    except Exception as exc:
         print(f"  WARN  feid={feid}: unexpected vector shape {type(vector)!r}: {exc}")
         return None
 

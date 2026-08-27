@@ -29,12 +29,18 @@ class _FakeRedis:
         self.last_pipe.append(("incrbyfloat", key, amount))
         return self
 
+    def expire(self, key, seconds):
+        self.last_pipe.append(("expire", key, seconds))
+        return self
+
     async def execute(self):
         for cmd in self.last_pipe:
             if cmd[0] in ("incr", "zincrby"):
                 self.store[cmd[1]] = self.store.get(cmd[1], 0) + cmd[2]
             elif cmd[0] == "incrbyfloat":
                 self.store[cmd[1]] = self.store.get(cmd[1], 0.0) + cmd[2]
+            elif cmd[0] == "expire":
+                pass  # TTL not tracked by the fake
         self.last_pipe = []
         return []
 
@@ -147,6 +153,9 @@ def test_recording_never_raises_when_redis_down(monkeypatch):
             return self
 
         def zincrby(self, key, amount, member):
+            return self
+
+        def expire(self, key, seconds):
             return self
 
         async def execute(self):
