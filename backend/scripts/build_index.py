@@ -55,16 +55,47 @@ def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def load_checkpoint() -> int:
+def load_checkpoint() -> tuple[int, int]:
+    """Return (resume_line, skipped) persisted together in one checkpoint.
+
+    `skipped` counts malformed jsonl lines seen on the way to `resume_line`.
+    Storing it alongside the position means an aborted run keeps the exact
+    cumulative malformed-line count so a resume neither loses nor double-counts
+    it. A missing checkpoint yields (0, 0).
+    """
     if os.path.exists(CHECKPOINT_PATH):
         with open(CHECKPOINT_PATH) as f:
-            return int(f.read().strip() or 0)
-    return 0
+            data = f.read().strip()
+        if data:
+            try:
+                obj = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                # Legacy plain-integer checkpoint (old code wrote a bare number).
+                try:
+                    return int(data), 0
+                except (TypeError, ValueError):
+                    return 0, 0
+            if isinstance(obj, int):
+                return obj, 0
+            if isinstance(obj, dict):
+                return int(obj.get("line", 0)), int(obj.get("skipped", 0))
+            # Unknown but valid JSON content: fall back to a fresh start.
+            return 0, 0
+    return 0, 0
 
 
-def save_checkpoint(line_num: int):
-    with open(CHECKPOINT_PATH, "w") as f:
-        f.write(str(line_num))
+def save_checkpoint(line_num: int, skipped: int):
+    """Persist the resume position together with the cumulative `skipped` count.
+
+    Called on every batch and on abort, so the malformed-line count survives
+    any interruption instead of only being written at the very end of a run.
+    """
+    tmp_path = f"{CHECKPOINT_PATH}.tmp"
+    with open(tmp_path, "w") as f:
+        f.write(json.dumps({"line": line_num, "skipped": skipped}))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, CHECKPOINT_PATH)
 
 
 def backup_collection_best_effort(client: QdrantClient):
@@ -113,7 +144,7 @@ def ensure_collection(client: QdrantClient) -> bool:
     if sparse_cfg is not None:
         inner = sparse_cfg.sparse if hasattr(sparse_cfg, "sparse") else sparse_cfg.get("sparse")
         modifier = inner.get("modifier") if isinstance(inner, dict) else getattr(inner, "modifier", None)
-    needs_idf = bool(modifier == Modifier.IDF)
+    needs_idf = modifier is not None and modifier == Modifier.IDF
 
     if needs_idf and dim_matches:
         print(f"Collection '{config.QDRANT_COLLECTION}' already exists, resuming upserts into it")
@@ -180,14 +211,14 @@ def main():
     recreated = ensure_collection(client)
 
     if recreated:
-        save_checkpoint(0)
+        save_checkpoint(0, 0)
         print(
             "Collection was (re)created empty this run — embed checkpoint reset to 0 so "
             "the ENTIRE dataset is re-indexed (the old checkpoint referred to a "
             "collection that no longer exists).",
         )
 
-    start_line = load_checkpoint()
+    start_line, skipped = load_checkpoint()
 
     with open(DATA_PATH) as f:
         lines = f.readlines()
@@ -225,14 +256,13 @@ def main():
                 f"advanced (batch will be retried from the last saved checkpoint): {e}",
             )
             raise
-        save_checkpoint(end_line)
+        save_checkpoint(end_line, skipped)
         pbar.update(len(rows))
 
     batch_frames = {}
     executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
     pbar = tqdm(total=total - start_line, desc="Embedding + indexing")
 
-    skipped = 0
     try:
         for i, line in enumerate(lines):
             if i < start_line:
@@ -272,15 +302,16 @@ def main():
     try:
         info = client.get_collection(config.QDRANT_COLLECTION)
         count = info.points_count or 0
-        # Compare against the FULL dataset size, not the number of lines processed
-        # this run. A resume-from-checkpoint shortfall (e.g. rows skipped because
-        # the collection was recreated after a stale checkpoint) would otherwise
-        # pass verification even though the index is incomplete.
-        if count < total:
+        # Expected points = valid articles (total lines minus malformed lines
+        # that were skipped and can never be indexed). Comparing against the
+        # full dataset size would wrongly flag INCOMPLETE whenever some lines
+        # were skipped, even though the sync actually succeeded.
+        expected = total - skipped
+        if count < expected:
             log(
                 f"ERROR: collection '{config.QDRANT_COLLECTION}' has {count} points "
-                f"but the dataset has {total} articles ({total - count} missing). "
-                f"The index is INCOMPLETE — investigate before going live.",
+                f"but the valid dataset has {expected} articles ({expected - count} "
+                f"missing). The index is INCOMPLETE — investigate before going live.",
             )
         elif count > total:
             log(
@@ -289,7 +320,10 @@ def main():
                 f"previous schema). Consider a clean rebuild.",
             )
         else:
-            log(f"verified: {count} points in collection == {total} dataset articles")
+            log(
+                f"verified: {count} points in collection match the {expected} valid "
+                f"dataset articles (build complete).",
+            )
     except Exception as e:
         log(f"WARNING: could not verify points_count: {e}")
     print("Index build complete.")
