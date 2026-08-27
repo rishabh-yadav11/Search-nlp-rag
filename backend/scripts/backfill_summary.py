@@ -8,6 +8,7 @@ rerun.
 import asyncio
 import os
 import sys
+import traceback
 from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,9 +26,9 @@ def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def scroll_empty_points(client: QdrantClient) -> list[int]:
-    """All point IDs whose summary payload is empty/absent."""
-    ids: list[int] = []
+def scroll_empty_points(client: QdrantClient):
+    """Yield point IDs whose summary payload is empty/absent, one page at a
+    time, so the caller never holds the full id list in memory."""
     next_offset = None
     while True:
         pts, next_offset = client.scroll(
@@ -40,21 +41,25 @@ def scroll_empty_points(client: QdrantClient) -> list[int]:
         for p in pts:
             s = (p.payload or {}).get("summary") or ""
             if not s.strip():
-                ids.append(p.id)
+                yield p.id
         if next_offset is None:
             break
-    return ids
 
 
 def set_summary(client: QdrantClient, records: dict[int, dict], batch: list[int]):
-    """Set each point's own summary. set_payload applies one dict to many
-    points, so a single client+per-point calls keep the payloads distinct."""
+    """Set each point's own summary. set_payload applies the same payload dict
+    to many points, so group points that share a summary value into a single
+    call instead of one call per point."""
+    by_summary: dict[str, list[int]] = {}
     for pid in batch:
+        s = records.get(pid, {}).get("summary") or ""
+        by_summary.setdefault(s, []).append(pid)
+    for summary, pids in by_summary.items():
         client.set_payload(
             collection_name=config.QDRANT_COLLECTION,
-            payload={"summary": records.get(pid, {}).get("summary") or ""},
-            points=[pid],
-            wait=True,
+            payload={"summary": summary},
+            points=pids,
+            wait=False,
         )
 
 
@@ -65,31 +70,36 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     try:
-        empty_ids = scroll_empty_points(client)
-        log(f"scrolled: {len(empty_ids)} points with empty summary")
-
-        if not empty_ids:
-            log("nothing to backfill")
-            return 0
-
         records = asyncio.run(fetch_records())
         log(f"fetched {len(records)} MySQL rows for id->summary mapping")
 
-        batches = [empty_ids[i : i + BATCH_SIZE] for i in range(0, len(empty_ids), BATCH_SIZE)]
+        total_scrolled = 0
         updated = 0
-        for n, batch in enumerate(batches, 1):
-            missing = [i for i in batch if i not in records]
-            if missing:
-                log(f"WARNING: batch {n} has {len(missing)} ids not in MySQL (skipping them)")
-                batch = [i for i in batch if i in records]
-            if not batch:
-                continue
+        batch: list[int] = []
+        for pid in scroll_empty_points(client):
+            total_scrolled += 1
+            if pid in records:
+                batch.append(pid)
+            else:
+                log(f"WARNING: id {pid} not in MySQL (skipping)")
+            if len(batch) >= BATCH_SIZE:
+                set_summary(client=client, records=records, batch=batch)
+                updated += len(batch)
+                batch = []
+                if updated % (BATCH_SIZE * 25) == 0 or updated == total_scrolled:
+                    log(f"progress: {updated}/{total_scrolled} updated")
+
+        if batch:
             set_summary(client=client, records=records, batch=batch)
             updated += len(batch)
-            if n % 25 == 0 or n == len(batches):
-                log(f"progress: {updated}/{len(empty_ids)} ({n}/{len(batches)} batches)")
-    except Exception as e:
-        log(f"ERROR: batch failed: {e}")
+
+        if total_scrolled == 0:
+            log("nothing to backfill")
+            return 0
+
+        log(f"scrolled: {total_scrolled} points with empty summary")
+    except Exception:
+        log(f"ERROR: batch failed:\n{traceback.format_exc()}")
         log("STOPPED — fix the error and rerun (script is idempotent)")
         return 1
     finally:
