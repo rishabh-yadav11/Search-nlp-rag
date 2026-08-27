@@ -117,7 +117,7 @@ def test_rewrite_top_deals_in_year():
 def test_rewrite_top_articles_last_year():
     new_q, changed = rewrite_year_in_review("top articles last year")
     assert changed is True
-    assert new_q == "Flashback 2025 articles"
+    assert new_q == f"Flashback {_current_year() - 1} articles"
 
 
 def test_rewrite_unchanged_without_top_hint():
