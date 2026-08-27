@@ -69,10 +69,18 @@ def load_checkpoint() -> tuple[int, int]:
         if data:
             try:
                 obj = json.loads(data)
-                return int(obj.get("line", 0)), int(obj.get("skipped", 0))
             except (json.JSONDecodeError, ValueError):
-                # Tolerate a legacy plain-integer checkpoint.
-                return int(data), 0
+                # Legacy plain-integer checkpoint (old code wrote a bare number).
+                try:
+                    return int(data), 0
+                except (TypeError, ValueError):
+                    return 0, 0
+            if isinstance(obj, int):
+                return obj, 0
+            if isinstance(obj, dict):
+                return int(obj.get("line", 0)), int(obj.get("skipped", 0))
+            # Unknown but valid JSON content: fall back to a fresh start.
+            return 0, 0
     return 0, 0
 
 
