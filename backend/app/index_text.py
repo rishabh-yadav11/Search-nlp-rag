@@ -97,11 +97,12 @@ def normalize_date(value):
         return None
     if isinstance(value, datetime):
         dt = value
-        # Normalize any tz-aware input to naive wall-clock UTC so the stored
-        # string is always tz-less and compares uniformly with the tiebreaker
-        # in main.py (which strips only the +00:00/Z suffix).
+        # Normalize any tz-aware input to UTC (keeping the +00:00 suffix) so the
+        # stored string is consistent for the tiebreaker in main.py, which strips
+        # the +00:00/Z suffix. Naive inputs (local wall-clock from MySQL) are left
+        # untouched — attaching a UTC offset here would shift every date filter.
         if dt.tzinfo is not None:
-            dt = dt.astimezone(UTC).replace(tzinfo=None)
+            dt = dt.astimezone(UTC)
     else:
         s = str(value).strip()
         if not s:
