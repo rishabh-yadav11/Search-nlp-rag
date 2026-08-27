@@ -392,7 +392,7 @@ def test_smalltalk_short_circuits_rag(monkeypatch):
     assert (pt, ct, cost) == (0, 0, 0.0)
 
 
-def test_api_stream_smalltalk_short_circuits(tmp_path):
+def test_api_stream_smalltalk_short_circuits(tmp_path, monkeypatch):
     """SSE stream for small talk emits a single done event with a canned reply."""
     from app import main
 
@@ -404,14 +404,12 @@ def test_api_stream_smalltalk_short_circuits(tmp_path):
         async def boom(*args, **kwargs):
             raise AssertionError("retrieval should not run for small talk")
 
-        monkeypatch_global = pytest.MonkeyPatch()
-        monkeypatch_global.setattr(main, "retrieve_and_rerank", boom)
+        monkeypatch.setattr(main, "retrieve_and_rerank", boom)
 
         with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "good morning"}) as r:
             assert r.status_code == 200
             assert r.headers["content-type"].startswith("text/event-stream")
             body = "".join(r.iter_text())
-        monkeypatch_global.undo()
 
         assert "event: start" in body
         assert "event: done" in body
