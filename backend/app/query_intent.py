@@ -2,7 +2,10 @@ import calendar
 import re
 from datetime import date
 
-_CURRENT_YEAR = date.today().year
+def _current_year() -> int:
+    """The current year, computed at call time so resolution stays correct
+    across a calendar-year boundary in a long-running process."""
+    return date.today().year
 
 _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
 # Full year span: '2024 to 2025', '2023-2025', '2023 through 2025'.
@@ -218,7 +221,7 @@ def extract_month_range(query: str) -> tuple[str, str] | None:
         return None
     month = _MONTHS[m.group(1)]
     ym = _MONTH_YEAR_RE.search(q)
-    year = int(ym.group(2)) if ym and ym.group(2) else _CURRENT_YEAR
+    year = int(ym.group(2)) if ym and ym.group(2) else _current_year()
     last_day = calendar.monthrange(year, month)[1]
     return (f"{year}-{month:02d}-01", f"{year}-{month:02d}-{last_day:02d}")
 
@@ -231,7 +234,7 @@ def _extract_month_span(query: str) -> tuple[str, str] | None:
     if not m:
         return None
     m1, y1, m2, y2 = _MONTHS[m.group(1)], m.group(2), _MONTHS[m.group(3)], m.group(4)
-    year = int(y2 or y1) if (y2 or y1) else _CURRENT_YEAR
+    year = int(y2 or y1) if (y2 or y1) else _current_year()
     if m1 <= m2:
         end_year = year
     else:
@@ -246,17 +249,17 @@ def _quarter_range(query: str) -> tuple[str, str] | None:
     q = query.lower()
     m = _Q_YEAR_RE.search(q)
     if m:
-        qn, year = int(m.group(1)), _full_year(int(m.group(2)), _CURRENT_YEAR)
+        qn, year = int(m.group(1)), _full_year(int(m.group(2)), _current_year())
     else:
         m = _Q_RE.search(q)
         if m:
-            qn, year = int(m.group(1)), _CURRENT_YEAR
+            qn, year = int(m.group(1)), _current_year()
         else:
             m = _QUARTER_WORD_RE.search(q)
             if not m:
                 return None
             qn = _QUARTER_WORD_ORDER[m.group(1).lower()]
-            year = int(m.group(2)) if m.group(2) else _CURRENT_YEAR
+            year = int(m.group(2)) if m.group(2) else _current_year()
     sm, em = _QUARTER_MONTHS[qn]
     return (f"{year}-{sm:02d}-01", f"{year}-{em:02d}-{calendar.monthrange(year, em)[1]:02d}")
 
@@ -269,18 +272,18 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
         r"\bfy\s*((?:19|20)?\d{2})\s*(?:-|to|through)\s*((?:19|20)?\d{2})\b", q
     )
     if m:
-        start = _full_year(int(m.group(1)), _CURRENT_YEAR)
+        start = _full_year(int(m.group(1)), _current_year())
         end = _full_year(int(m.group(2)), start)
         if end < start:
             end += 100
         return (f"{end - 1}-04-01", f"{end}-03-31")
     m = re.search(r"\bfy\s*'?((?:19|20)?\d{2})\b", q)
     if m:
-        end = _full_year(int(m.group(1)), _CURRENT_YEAR)
+        end = _full_year(int(m.group(1)), _current_year())
         return (f"{end - 1}-04-01", f"{end}-03-31")
     m = re.search(r"\bfiscal(?:\s+year)?\s*((?:19|20)?\d{2})\b", q)
     if m:
-        end = _full_year(int(m.group(1)), _CURRENT_YEAR)
+        end = _full_year(int(m.group(1)), _current_year())
         return (f"{end - 1}-04-01", f"{end}-03-31")
     return None
 
@@ -316,10 +319,10 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
             end += 100
         return (f"{start}-01-01", f"{end}-12-31")
     if _LAST_YEAR_RE.search(q):
-        y = _CURRENT_YEAR - 1
+        y = _current_year() - 1
         return (f"{y}-01-01", f"{y}-12-31")
     if _THIS_YEAR_RE.search(q):
-        y = _CURRENT_YEAR
+        y = _current_year()
         return (f"{y}-01-01", f"{y}-12-31")
     m = _YEAR_RE.search(q)
     if m:
