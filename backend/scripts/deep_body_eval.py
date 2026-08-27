@@ -52,6 +52,31 @@ def tokens(text: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", text.lower()))
 
 
+def _extract_sparse_vector(vector, feid: int):
+    """Safely pull the `sparse` named vector out of a Qdrant result.
+
+    The stored collection uses named vectors (`{"dense": ..., "sparse": ...}`),
+    so `rec.vector` is normally a dict. Depending on the qdrant_client version
+    and query options it may instead be a `NamedVectors` object or `None`. This
+    helper returns the sparse vector (anything with `.indices`) or `None`, and
+    logs clearly rather than crashing on an unexpected shape.
+    """
+    if vector is None:
+        print(f"  WARN  feid={feid}: record has no vector (None); skipping sparse check")
+        return None
+    if isinstance(vector, dict):
+        sv = vector.get("sparse")
+        if sv is None:
+            print(f"  WARN  feid={feid}: sparse named vector missing from vector dict; skipping")
+        return sv
+    # NamedVectors-like object (pydantic model / object with attributes).
+    try:
+        return getattr(vector, "sparse", None)
+    except Exception as exc:  # noqa: BLE001 - log, never crash the eval
+        print(f"  WARN  feid={feid}: unexpected vector shape {type(vector)!r}: {exc}")
+        return None
+
+
 def _http_json(url: str, payload: dict | None = None, method: str | None = None,
                headers: dict | None = None, timeout: int = 120) -> dict:
     data = json.dumps(payload).encode() if payload is not None else None
@@ -126,7 +151,7 @@ def main() -> None:
         rec = by_id.get(feid)
         if not rec:
             continue
-        sv = rec.vector.get("sparse")
+        sv = _extract_sparse_vector(rec.vector, feid)
         if sv is None:
             continue
         sv_idx = {int(i) for i in sv.indices}
