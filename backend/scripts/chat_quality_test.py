@@ -22,8 +22,10 @@ import urllib.request
 
 from dotenv import load_dotenv
 
-# Load backend/.env (run from backend/) so AUTH_SERVICE_TOKEN is picked up.
-load_dotenv()
+# Load backend/.env explicitly from the script's directory so AUTH_SERVICE_TOKEN
+# is picked up regardless of the caller's current working directory.
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"))
 
 BASE = "http://localhost:8001/api/chat"
 # Machine-to-machine bypass for the internal eval scripts; must match the
@@ -44,12 +46,14 @@ QUERIES = [
         "category": "event-year (demonetisation; must NOT date-filter to 2016)",
         "q": "How did demonetisation in 2016 impact fintech startups in India?",
         "terms": ["demonetisation", "fintech"],
+        "not_filtered_year": 2016,
     },
     {
         "id": 4,
         "category": "event-year (covid lockdown; must NOT date-filter to 2020)",
         "q": "What happened to edtech startups during the 2020 Covid-19 lockdown?",
         "terms": ["covid", "lockdown"],
+        "not_filtered_year": 2020,
     },
     {
         "id": 5,
@@ -246,6 +250,11 @@ def run(q: dict) -> dict:
     year_ok = True
     if q.get("year"):
         year_ok = years == {str(q["year"])}
+    not_filtered_ok = True
+    if q.get("not_filtered_year"):
+        # The event-year must not be the ONLY year present: a correctly
+        # unfiltered query returns sources spanning multiple years.
+        not_filtered_ok = years != {str(q["not_filtered_year"])}
     dv = _parse_dataviz(a["content"]) if (q.get("dataviz") or q.get("no_dataviz")) else None
     dv_ok = True
     if q.get("dataviz"):
@@ -263,6 +272,7 @@ def run(q: dict) -> dict:
                 a["sources"][0]["title"][:55]) if a["sources"] else None,
         "years": sorted(years),
         "year_ok": year_ok,
+        "not_filtered_ok": not_filtered_ok,
         "dv_ok": dv_ok,
         "dv": dv,
         "answer_len": len(a["content"]),
@@ -275,7 +285,14 @@ def run(q: dict) -> dict:
 
 
 def main() -> None:
-    results = [run(q) for q in QUERIES]
+    results = []
+    failures = []
+    for q in QUERIES:
+        try:
+            results.append(run(q))
+        except Exception as exc:  # one failing query must not abort the run
+            failures.append(q["id"])
+            print(f"QUERY {q['id']} FAILED: {exc!r}")
     print(f"{'id':>3} {'llm':>4} {'src':>4} {'yr_ok':>6} {'dv':>4} {'toks':>7} {'INR':>6} {'lat':>6}  category")
     for r in results:
         print(f"{r['id']:>3} {r['llm']!s:>4} {r['n_src']:>4} {r['year_ok']!s:>6} "
@@ -285,6 +302,8 @@ def main() -> None:
         print(f"     source years: {r['years']} | note: {r['note']}")
         if r["missing_terms"]:
             print(f"     MISSING TERMS: {r['missing_terms']}")
+        if not r["not_filtered_ok"]:
+            print(f"     STALE DATE-FILTER: results restricted to event-year only")
         if r["dv"]:
             dv = r["dv"]
             print(f"     dataviz: cols={dv['columns']} rows={len(dv['rows'])} "
@@ -292,8 +311,10 @@ def main() -> None:
             for row in dv["rows"][:4]:
                 print(f"       {row}")
         print()
-    fails = [r["id"] for r in results if not r["llm"] or r["missing_terms"] or not r["year_ok"] or not r["dv_ok"]]
-    print("QUERIES WITH ISSUES:", fails if fails else "none")
+    issue_ids = [r["id"] for r in results if not r["llm"] or r["missing_terms"] or not r["year_ok"] or not r["not_filtered_ok"] or not r["dv_ok"]]
+    print("QUERIES WITH ISSUES:", issue_ids if issue_ids else "none")
+    if failures:
+        print("QUERIES THAT FAILED TO RUN:", failures)
 
 
 if __name__ == "__main__":
