@@ -180,6 +180,9 @@ export default function ChatPage() {
   const [streamingContent, setStreamingContent] = useState('')
   const [note, setNote] = useState('')
   const [error, setError] = useState('')
+  // Force a re-render each minute so relative timestamps ("5m ago") keep
+  // advancing while the page stays open. No fetch — purely to recompute time.
+  const [, setTick] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const loadSessions = useCallback(async () => {
@@ -203,6 +206,11 @@ export default function ChatPage() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
   }, [messages, sending])
+
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 60000)
+    return () => clearInterval(t)
+  }, [])
 
   const openSession = useCallback(
     async (id: string) => {
@@ -363,24 +371,33 @@ export default function ChatPage() {
             <div
               key={s.id}
               className={`chat-session-item${s.id === activeId ? ' active' : ''}`}
-              role="button"
-              tabIndex={0}
-              aria-label={`Open conversation: ${s.title || 'New chat'}`}
-              onClick={() => openSession(s.id)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault()
-                  openSession(s.id)
-                }
-              }}
             >
-              <div className="chat-session-title" title={s.title}>
-                {s.title || 'New chat'}
-              </div>
-              <div className="chat-session-meta">
-                <span suppressHydrationWarning>{relativeTime(s.updated_at)}</span>
-                {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
-              </div>
+              <button
+                type="button"
+                className="chat-session-main"
+                onClick={() => openSession(s.id)}
+                aria-label={`Open conversation: ${s.title || 'New chat'}`}
+                style={{
+                  border: 'none',
+                  background: 'none',
+                  padding: 0,
+                  margin: 0,
+                  font: 'inherit',
+                  color: 'inherit',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                  flex: 1,
+                  minWidth: 0,
+                }}
+              >
+                <div className="chat-session-title" title={s.title}>
+                  {s.title || 'New chat'}
+                </div>
+                <div className="chat-session-meta">
+                  <span suppressHydrationWarning>{relativeTime(s.updated_at)}</span>
+                  {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
+                </div>
+              </button>
               <button
                 type="button"
                 className="chat-session-del"
