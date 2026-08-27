@@ -45,7 +45,7 @@ _WORD_SEP = r"(?:\s+|-|\s+-\s+)"
 # Any list-hint word (top/best/leading/biggest/largest) may precede the count.
 _TOP_HINT_ALT = r"top|best|leading|biggest|largest"
 _TOP_N_RE = re.compile(
-    rf"\b({_TOP_HINT_ALT})\s+((?:\d{{1,2}})|(?:(?:{_NUM_WORD_ALT})(?:{_WORD_SEP}(?:{_NUM_WORD_ALT}))*))\b",
+    rf"\b({_TOP_HINT_ALT})\s+((?:\d{{1,4}})|(?:(?:{_NUM_WORD_ALT})(?:{_WORD_SEP}(?:{_NUM_WORD_ALT}))*))\b",
     re.IGNORECASE,
 )
 _TOP_HINT_RE = re.compile(r"\b(best|leading|biggest|largest|top)\b", re.IGNORECASE)
