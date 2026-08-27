@@ -213,7 +213,7 @@ def test_extract_year_range_short_span():
 
 
 def test_extract_year_range_short_span_rollover():
-    assert extract_year_range("deals 2024-23") == ("2024-01-01", "2023-12-31")
+    assert extract_year_range("deals 2024-23") == ("2023-01-01", "2024-12-31")
 
 
 def test_extract_year_range_month_span():

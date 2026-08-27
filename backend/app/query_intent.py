@@ -291,10 +291,14 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
         r"\bfy\s*((?:19|20)?\d{2})\s*(?:-|to|through)\s*((?:19|20)?\d{2})\b", q
     )
     if m:
-        start = _full_year(int(m.group(1)), _current_year())
-        end = _full_year(int(m.group(2)), start)
-        if end < start:
-            end += 100
+        y1 = _full_year(int(m.group(1)), _current_year())
+        y2 = _full_year(int(m.group(2)), y1)
+        # An FY span lists the start and end years (e.g. 'FY 2024-25' ->
+        # FY2024-2025). When written end-first ('fy 2025-24') the larger
+        # number is still the ending year, so take min/max rather than a
+        # wrong century rollover.
+        start = min(y1, y2)
+        end = max(y1, y2)
         return (f"{end - 1}-04-01", f"{end}-03-31")
     m = re.search(r"\bfy\s*'?((?:19|20)?\d{2})\b", q)
     if m:
@@ -334,8 +338,9 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
     if m:
         start = int(m.group(1))
         end = _full_year(int(m.group(2)), start)
-        if end < start:
-            end += 100
+        # A descending short span ('2024-23') is just a reversed year span;
+        # normalize to the ascending range instead of a century rollover.
+        start, end = min(start, end), max(start, end)
         return (f"{start}-01-01", f"{end}-12-31")
     if _LAST_YEAR_RE.search(q):
         y = _current_year() - 1
