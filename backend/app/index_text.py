@@ -69,7 +69,7 @@ def record_from_row(row: dict) -> dict:
         "id": row["feid"],
         "title": clean(row["title"]),
         "summary": clean(row["summary"]),
-        "body": clean(row["body"])[: config.BODY_CHAR_LIMIT],
+        "body": clean(row["body"]),
         "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
         "published_date": normalize_date(row["publish"]),
         "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
