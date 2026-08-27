@@ -86,6 +86,10 @@ def _http_json(url: str, payload: dict | None = None, method: str | None = None,
         return json.load(resp)
 
 
+def _coerce_score(value: object) -> float:
+    return value if isinstance(value, (int, float)) else 0
+
+
 async def fetch_rows():
     import aiomysql
     pool = await aiomysql.create_pool(
@@ -209,7 +213,10 @@ def main() -> None:
         q = "What companies presented at the Techcircle DEMO India 2013 event?"
         d = _http_json(base + f"/sessions/{sid}/messages", {"content": q}, headers=headers)
         a = d["assistant"]
-        sources = [(s["id"], round(s.get("score", 0), 3), s.get("title", "")[:60]) for s in a["sources"]]
+        sources = [
+            (s["id"], round(_coerce_score(s.get("score")), 3), s.get("title", "")[:60])
+            for s in a["sources"]
+        ]
         print(f"  chat answer len: {len(a['content'])} | tokens: {a['prompt_tokens']} | cost INR: {round(a['cost'], 3)}")
         for s in sources:
             print("  SOURCE", s[0], s[1], s[2])
