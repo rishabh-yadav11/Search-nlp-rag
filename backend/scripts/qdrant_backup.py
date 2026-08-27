@@ -72,17 +72,19 @@ def _snapshot_download_url(collection_name: str, snapshot_name: str) -> str:
 
 
 def _redact_url(url: str) -> str:
-    """Return the URL with any userinfo (credentials/token) stripped."""
+    """Return the URL with userinfo and query-param secrets stripped.
+
+    On any parse failure, returns a safe placeholder rather than the original
+    URL so a malformed (and potentially secret-bearing) value cannot leak.
+    """
     try:
         parsed = urlparse(url)
-        if parsed.username or parsed.password:
-            netloc = parsed.hostname or ""
-            if parsed.port:
-                netloc = f"{netloc}:{parsed.port}"
-            return parsed._replace(netloc=netloc).geturl()
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return parsed._replace(netloc=netloc, query="").geturl()
     except ValueError:
-        pass
-    return url
+        return "<redacted>"
 
 
 @contextmanager
