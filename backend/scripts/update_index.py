@@ -271,7 +271,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
                 return
 
             for r in batch:
-                state_fps[str(r["id"])] = fingerprint(r, include_body=False)
+                state_fps[str(r["id"])] = fingerprint(r)
             state["updated_at"] = datetime.now(UTC).isoformat()
             save_state(state)
             log(f"upserted {len(batch)} points (max_id={batch[-1]['id']})")
@@ -365,11 +365,16 @@ async def main():
         log("no state found — run 'python scripts/update_index.py --init' after a full build first")
         return
 
-    records = await fetch_records(with_body=False)
-    log(f"fetched {len(records)} published rows (metadata only)")
+    # Fetch the FULL indexed record (including body) for every published row.
+    # Body must be in the fingerprint so body-only edits are detected as
+    # changes; this also derives the indexing set (to_index) and the reconcile
+    # check from the SAME fetch, eliminating the TOCTOU race where a row
+    # unpublished between two fetches would KeyError.
+    records = await fetch_records(with_body=True)
+    log(f"fetched {len(records)} published rows (with body)")
 
     if do_init:
-        state_fps = {str(i): fingerprint(records[i], include_body=False) for i in records}
+        state_fps = {str(i): fingerprint(records[i]) for i in records}
         state = {
             "updated_at": datetime.now(UTC).isoformat(),
             "fingerprints": state_fps,
@@ -378,7 +383,7 @@ async def main():
         log(f"seeded {len(state_fps)} fingerprints")
         return 0 if reconcile(state, records) else 1
 
-    new, changed, deleted = sync_delta(state, records, include_body=False)
+    new, changed, deleted = sync_delta(state, records)
     log(
         f"delta: {len(new)} new, {len(changed)} changed, {len(deleted)} deleted, "
         f"{len(records) - len(new) - len(changed) - len(deleted)} unchanged"
@@ -388,11 +393,13 @@ async def main():
         log(f"index current ({time.perf_counter() - start:.2f}s, models not loaded)")
         return 0 if reconcile(state, records) else 1
 
+    # to_index is derived from `records`, the same fetch used to build points
+    # in apply_delta, so a row can never be in to_index but missing from the
+    # index source (no KeyError / TOCTOU).
     to_index = sorted(new | changed)
-    full_records = await fetch_records(with_body=True, ids=to_index)
-    apply_delta(full_records, new, changed, deleted, state)
+    apply_delta(records, new, changed, deleted, state)
     log(f"done in {time.perf_counter() - start:.2f}s")
-    return 0 if reconcile(state, full_records) else 1
+    return 0 if reconcile(state, records) else 1
 
 
 if __name__ == "__main__":
