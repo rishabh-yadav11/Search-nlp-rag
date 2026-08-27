@@ -165,7 +165,15 @@ def extract_entities(q: str) -> list[str]:
     for e in raw:
         if e not in ordered:
             ordered.append(e)
-    return [e for e in ordered if not any(e != other and e in other for other in ordered)]
+    # Drop any entity that is fully contained in a longer one (e.g. "acme" inside
+    # "acme corp"). Sort by descending length so the longer entity is kept first
+    # and the shorter substring is rejected in a single pass.
+    ordered.sort(key=len, reverse=True)
+    kept: list[str] = []
+    for e in ordered:
+        if not any(e in k for k in kept):
+            kept.append(e)
+    return kept
 
 
 def apply_entity_boost(q: str, results: list) -> list:

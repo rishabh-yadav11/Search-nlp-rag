@@ -212,11 +212,13 @@ class Config:
     # CORS: comma-separated allowed origins. Production serves the API and the
     # frontend same-origin through nginx, so this only matters for cross-origin
     # dev clients (e.g. the Next.js dev server on :3000 hitting :8000).
-    CORS_ORIGINS: ClassVar[list[str]] = [
+    # Immutable (tuple) so the CORS allow-list can't be mutated at runtime; the
+    # ClassVar marks it as a true class constant.
+    CORS_ORIGINS: ClassVar[tuple[str, ...]] = tuple(
         o.strip()
         for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
         if o.strip()
-    ]
+    )
 
 
 config = Config()
