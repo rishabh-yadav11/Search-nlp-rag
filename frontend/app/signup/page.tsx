@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useEffect, useState } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { API_BASE, getToken, setToken } from '../lib/auth'
@@ -14,10 +14,15 @@ function SignupForm() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     if (getToken()) router.replace(next)
   }, [router, next])
+
+  useEffect(() => {
+    return () => abortRef.current?.abort()
+  }, [])
 
   function validate(): string {
     if (!email.trim() || !password) return 'Email and password are required.'
@@ -30,6 +35,7 @@ function SignupForm() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
+    if (busy) return
     setError('')
     const problem = validate()
     if (problem) {
@@ -37,11 +43,15 @@ function SignupForm() {
       return
     }
     setBusy(true)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const timeout = setTimeout(() => controller.abort(), 15000)
     try {
       const res = await fetch(`${API_BASE}/api/auth/signup`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: email.trim(), password, name: name.trim() }),
+        signal: controller.signal,
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
@@ -51,9 +61,14 @@ function SignupForm() {
       const data = (await res.json()) as { token: string }
       setToken(data.token)
       router.replace(next)
-    } catch {
-      setError('Could not reach the server. Please try again.')
+    } catch (err) {
+      if (controller.signal.aborted) {
+        setError('Request timed out. Please try again.')
+      } else {
+        setError('Could not reach the server. Please try again.')
+      }
     } finally {
+      clearTimeout(timeout)
       setBusy(false)
     }
   }
