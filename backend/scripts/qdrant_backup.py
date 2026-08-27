@@ -24,13 +24,24 @@ kept; older ones are pruned by ``prune_backups``.
 import os
 import shutil
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUPS_DIR = os.path.join(BACKEND_DIR, "backups")
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
 
-RETENTION = int(os.getenv("BACKUP_RETENTION", "5"))
+def _parse_retention() -> int:
+    raw = os.getenv("BACKUP_RETENTION", "5")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log(f"WARNING: invalid BACKUP_RETENTION='{raw}', falling back to 5")
+        return 5
+
+
+RETENTION = _parse_retention()
 
 LOCAL_ARTIFACTS = ["articles.jsonl", "index_state.json"]
 
@@ -48,11 +59,37 @@ def new_backup_dir(collection_name: str) -> str:
 
 
 def _snapshot_download_url(collection_name: str, snapshot_name: str) -> str:
-    sys.path.append(BACKEND_DIR)
+    if BACKEND_DIR not in sys.path:
+        sys.path.append(BACKEND_DIR)
     from app.config import config
 
     base = config.QDRANT_URL.rstrip("/")
     return f"{base}/collections/{collection_name}/snapshots/{snapshot_name}"
+
+
+def _redact_url(url: str) -> str:
+    """Return the URL with any userinfo (credentials/token) stripped."""
+    try:
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return parsed._replace(netloc=netloc).geturl()
+    except ValueError:
+        pass
+    return url
+
+
+@contextmanager
+def _open_url(url: str, **kwargs):
+    import requests
+
+    resp = requests.get(url, **kwargs)
+    try:
+        yield resp
+    finally:
+        resp.close()
 
 
 def create_and_download_snapshot(client, collection_name: str, dest_dir: str):
@@ -76,12 +113,12 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str):
         import requests
 
         url = _snapshot_download_url(collection_name, name)
-        log(f"downloading snapshot '{name}' from {url}")
-        resp = requests.get(url, timeout=300, stream=True)
-        resp.raise_for_status()
-        dest = os.path.join(dest_dir, name)
-        with open(dest, "wb") as f:
-            shutil.copyfileobj(resp.raw, f)
+        log(f"downloading snapshot '{name}' from {_redact_url(url)}")
+        with _open_url(url, timeout=300, stream=True) as resp:
+            resp.raise_for_status()
+            dest = os.path.join(dest_dir, name)
+            with open(dest, "wb") as f:
+                shutil.copyfileobj(resp.raw, f)
         log(f"saved snapshot to {os.path.relpath(dest, BACKEND_DIR)}")
     except Exception as e:
         log(
@@ -104,7 +141,12 @@ def copy_local_artifacts(dest_dir: str) -> list:
 
 
 def backup_dirs(collection_name: str) -> list:
-    """Existing backup directories for a collection, oldest first."""
+    """Existing backup directories for a collection, oldest first.
+
+    Sorted by the backup's sortable creation timestamp encoded in the
+    directory name (``<collection>-<UTC-YYYYmmdd-HHMMSS-mmmmmm>``) rather than
+    directory mtime, which can be altered by copies/restores.
+    """
     prefix = f"{collection_name}-"
     if not os.path.isdir(BACKUPS_DIR):
         return []
@@ -113,7 +155,7 @@ def backup_dirs(collection_name: str) -> list:
         for d in os.listdir(BACKUPS_DIR)
         if d.startswith(prefix) and os.path.isdir(os.path.join(BACKUPS_DIR, d))
     ]
-    return sorted(dirs, key=os.path.getmtime)
+    return sorted(dirs, key=os.path.basename)
 
 
 def prune_backups(collection_name: str, retention: int | None = None) -> list:
