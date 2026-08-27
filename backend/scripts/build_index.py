@@ -49,6 +49,7 @@ from app.index_text import compose_dense_text, compose_sparse_text
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint")
+CHECKPOINT_SKIP_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint.skipped")
 
 
 def log(msg: str):
@@ -69,6 +70,22 @@ def save_checkpoint(line_num: int):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, CHECKPOINT_PATH)
+
+
+def load_skipped() -> int:
+    if os.path.exists(CHECKPOINT_SKIP_PATH):
+        with open(CHECKPOINT_SKIP_PATH) as f:
+            return int(f.read().strip() or 0)
+    return 0
+
+
+def save_skipped(skipped: int):
+    tmp_path = f"{CHECKPOINT_SKIP_PATH}.tmp"
+    with open(tmp_path, "w") as f:
+        f.write(str(skipped))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, CHECKPOINT_SKIP_PATH)
 
 
 def backup_collection_best_effort(client: QdrantClient):
@@ -185,6 +202,7 @@ def main():
 
     if recreated:
         save_checkpoint(0)
+        save_skipped(0)
         print(
             "Collection was (re)created empty this run — embed checkpoint reset to 0 so "
             "the ENTIRE dataset is re-indexed (the old checkpoint referred to a "
@@ -236,7 +254,7 @@ def main():
     executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
     pbar = tqdm(total=total - start_line, desc="Embedding + indexing")
 
-    skipped = 0
+    skipped = load_skipped()
     try:
         for i, line in enumerate(lines):
             if i < start_line:
@@ -245,6 +263,7 @@ def main():
                 row = json.loads(line)
             except json.JSONDecodeError:
                 skipped += 1
+                save_skipped(skipped)
                 log(f"Skipping malformed jsonl line {i + 1}: not valid JSON; build continues.")
                 continue
             batch_rows.append(row)
@@ -268,6 +287,7 @@ def main():
         executor.shutdown(wait=False)
 
     pbar.close()
+    save_skipped(skipped)
     if skipped:
         log(
             f"Build finished with {skipped} malformed jsonl line(s) skipped. "
