@@ -98,9 +98,10 @@ class _FakeStream:
 
 class _FakeCompletions:
     """Mirrors chat.completions.create. ``side_effect`` items may be exceptions,
-    responses, or zero-arg callables returning a fresh stream. The last item
-    repeats once the list is exhausted, so a single exception models permanent
-    failure."""
+    responses, or zero-arg callables returning a fresh stream. Side effects are
+    returned in order and wrap around once the list is exhausted, so a single
+    exception models permanent failure. Raises IndexError if configured with no
+    side effects at all."""
 
     def __init__(self, side_effect):
         self.side_effect = list(side_effect)
@@ -110,7 +111,9 @@ class _FakeCompletions:
     async def create(self, **kwargs):
         self.kwargs.append(kwargs)
         self.calls += 1
-        item = self.side_effect[min(self.calls - 1, len(self.side_effect) - 1)]
+        if not self.side_effect:
+            raise IndexError("no side effects configured for _FakeCompletions")
+        item = self.side_effect[(self.calls - 1) % len(self.side_effect)]
         if callable(item):
             item = item()
         if isinstance(item, Exception):
