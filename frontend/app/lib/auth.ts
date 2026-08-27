@@ -2,13 +2,183 @@
 
 export const TOKEN_KEY = 'vccircle_auth_token'
 
-export const API_BASE =
-  (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
-  process.env.NEXT_PUBLIC_API_BASE ||
-  // Only default to the local backend in development. In production an unset
-  // base falls back to same-origin relative requests rather than leaking the
-  // auth token to localhost:8000 (NEXT_PUBLIC_API_BASE must be set at build).
-  (process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '')
+// Hosts explicitly allowed to receive the auth Bearer token. This only matters
+// for a runtime-injected `window.API_BASE` (see below); build-time config is
+// operator-controlled and trusted. Set NEXT_PUBLIC_TRUSTED_API_HOSTS to a
+// comma-separated list (e.g. "api.example.com") to permit runtime overrides to
+// a known-good backend.
+const TRUSTED_API_HOSTS: string[] = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+// Candidates, in priority order. `window.API_BASE` is runtime/injectable (e.g.
+// via an XSS payload or a malicious inline script) and therefore untrusted
+// unless its host is explicitly allow-listed. The build-time env var and the dev
+// default are operator-controlled, but they still obey the SAME trust rule:
+// a cross-origin base is trusted only over https AND when allow-listed, or when
+// it is a loopback address (http loopback is not a network cleartext risk). No
+// non-loopback cross-origin http base may ever be trusted.
+const WIN_API_BASE =
+  (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
+const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
+const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : ''
+
+/**
+ * Validate a candidate API base. Rejects anything that is not a proper http(s)
+ * URL: no `javascript:`/other schemes, no protocol-relative URLs, no embedded
+ * credentials, and no whitespace that could cause host confusion. Returns the
+ * parsed URL (the trusted flag is derived by the caller via isSameOrigin /
+ * TRUSTED_API_HOSTS).
+ */
+function parseApiBase(value: string): URL | null {
+  if (!value || /\s/.test(value)) return null
+  // A root-relative path (e.g. "/api") is a same-origin relative base. Resolve
+  // it against the current origin so baseFromUrl keeps the path (and it is
+  // naturally same-origin → trusted). Without a window (SSR) we can't resolve an
+  // origin, so return null and let the caller fall back to a trusted empty base.
+  if (value.startsWith('/')) {
+    if (typeof window === 'undefined') return null
+    return new URL(value, window.location.origin)
+  }
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+  // Embedded userinfo (e.g. `https://user@host`) is a red flag — reject.
+  if (url.username || url.password) return null
+  return url
+}
+
+/** True when `url` resolves to the same origin as the current document. An
+ *  empty/relative base also resolves to same-origin, so callers should treat an
+ *  empty base as same-origin too (see resolveApiBase). */
+function isSameOrigin(url: URL): boolean {
+  if (typeof window === 'undefined') return false
+  return url.origin === window.location.origin
+}
+
+/** True when `url` uses the https scheme. Required for any cross-origin trusted
+ *  base so the Bearer token is never sent over cleartext http. */
+function isHttps(url: URL): boolean {
+  return url.protocol === 'https:'
+}
+
+/** True when `url` resolves to a loopback address (`localhost`, `127.0.0.1`,
+ *  `::1`). Loopback traffic never leaves the machine, so http over loopback is
+ *  NOT a network cleartext risk — a dev backend like `http://localhost:8000` is
+ *  therefore trusted even though it is cross-origin http. */
+function isLoopback(url: URL): boolean {
+  return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+}
+
+/** Normalize an allow-list entry or URL host for comparison: strip any leading
+ *  scheme (`https://` / `http://`), any trailing slash, a port, and any
+ *  trailing dot — so `https://api.example.com`, `http://api.example.com/`, and
+ *  `api.example.com:443` all normalize to `api.example.com` and match
+ *  `url.host` (`api.example.com`). */
+function normalizeHost(host: string): string {
+  return host
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/\.$/, '')
+}
+
+/** True when `url`'s host is present in NEXT_PUBLIC_TRUSTED_API_HOSTS (compared
+ *  without port, so `host` and `host:443` are equivalent). */
+function hostInAllowList(url: URL): boolean {
+  const h = normalizeHost(url.host)
+  return TRUSTED_API_HOSTS.some((entry) => normalizeHost(entry) === h)
+}
+
+/** Resolve the request base URL from a parsed API base, preserving any path
+ *  (e.g. `https://host/v1` → `https://host/v1`) rather than discarding it to
+ *  just the origin. Query/fragment are dropped as they are not part of a base. */
+function baseFromUrl(url: URL): string {
+  return url.origin + url.pathname
+}
+
+/** Trust rule: a base is trusted (allowed to receive the Bearer token) when it
+ *  is first-party — i.e. empty (relative → window.location.origin), same-origin
+ *  (http allowed for local dev), or a loopback address (e.g. http://localhost:
+ *  8000; cross-origin but never a network cleartext risk). An explicit
+ *  cross-origin host in NEXT_PUBLIC_TRUSTED_API_HOSTS is trusted only over
+ *  https. A non-loopback cross-origin http base is NEVER trusted so the token
+ *  is never sent over an unencrypted channel. Any other cross-origin host is
+ *  untrusted and must NOT receive the token. */
+function isTrustedBase(base: string, url: URL | null): boolean {
+  if (!base) return true // empty relative base → same-origin first-party
+  if (!url) return false
+  if (isSameOrigin(url)) return true // same-origin (http ok for local dev)
+  // Loopback (e.g. http://localhost:8000) is cross-origin but never a network
+  // cleartext risk, so it is trusted even over http.
+  if (isLoopback(url)) return true
+  // Cross-origin: only trusted when https AND explicitly allow-listed. A
+  // non-loopback cross-origin http base is NEVER trusted (cleartext).
+  return isHttps(url) && hostInAllowList(url)
+}
+
+function resolveApiBase(): { base: string; trusted: boolean } {
+  // Runtime-injected base (`window.API_BASE`): it is the only attacker-reachable
+  // vector (XSS / malicious inline script), so it is trusted ONLY when it is a
+  // valid http(s) URL that is same-origin OR explicitly allow-listed. A
+  // cross-origin override REQUIRES NEXT_PUBLIC_TRUSTED_API_HOSTS to be set at
+  // build; otherwise it is ignored and we fall back to the safe same-origin
+  // base (which is itself trusted first-party).
+  if (WIN_API_BASE) {
+    const url = parseApiBase(WIN_API_BASE)
+    if (!url) {
+      console.error(
+        '[auth] window.API_BASE is not a valid http(s) URL; ignoring it and using the safe same-origin base.'
+      )
+      return { base: '', trusted: true }
+    }
+    if (isTrustedBase(WIN_API_BASE, url)) {
+      return { base: baseFromUrl(url), trusted: true }
+    }
+    console.error(
+      `[auth] window.API_BASE host "${normalizeHost(url.host)}" is not same-origin and not in NEXT_PUBLIC_TRUSTED_API_HOSTS; using the safe same-origin base instead.`
+    )
+    return { base: '', trusted: true }
+  }
+  // Operator-controlled build-time config / dev default: apply the SAME trust
+  // rule as any other source. A cross-origin base is trusted ONLY over https
+  // AND when explicitly allow-listed; a cross-origin http base (e.g. an
+  // operator setting `NEXT_PUBLIC_API_BASE=http://host`) must NEVER be trusted,
+  // so the Bearer token is not attached over cleartext.
+  const trustedSource = ENV_API_BASE || DEV_API_BASE
+  if (trustedSource) {
+    const url = parseApiBase(trustedSource)
+    if (!url) {
+      console.error(
+        `[auth] Configured API base "${trustedSource}" is not a valid http(s) URL; falling back to the safe same-origin base.`
+      )
+      return { base: '', trusted: true }
+    }
+    const trusted = isTrustedBase(trustedSource, url)
+    if (!trusted) {
+      console.error(
+        `[auth] Configured API base "${trustedSource}" is cross-origin and not trusted (https + NEXT_PUBLIC_TRUSTED_API_HOSTS required); the Bearer token will NOT be attached.`
+      )
+    }
+    return { base: baseFromUrl(url), trusted }
+  }
+  // Production: no base set → same-origin relative requests. This is
+  // first-party, so it IS trusted and the token is attached. NEXT_PUBLIC_API_BASE
+  // must be set at build for a real backend.
+  return { base: '', trusted: true }
+}
+
+const RESOLVED_API_BASE = resolveApiBase()
+
+/** The validated API base. Empty string means same-origin relative requests. */
+export const API_BASE = RESOLVED_API_BASE.base
+/** True only when API_BASE is a trusted backend allowed to receive the token. */
+export const API_BASE_TRUSTED = RESOLVED_API_BASE.trusted
 
 /**
  * Returns true only for a safe, same-origin, root-relative redirect path.
@@ -39,9 +209,12 @@ export function getToken(): string | null {
 }
 
 export function setToken(token: string): void {
-  // SECURITY: localStorage is XSS-exfiltratable. The token must move to an
-  // httpOnly, Secure, SameSite cookie (backend change required). Never log or
-  // echo the token value. This storage path is a known risk until that lands.
+  // SECURITY: localStorage is XSS-exfiltratable — any script on the page can
+  // read this token, so a single XSS easily steals the session. The correct fix
+  // is a backend-set httpOnly + Secure + SameSite cookie (backend change, out of
+  // scope). This comment marks the token-storage site: the token MUST move to an
+  // httpOnly cookie. Until then, NEVER write the token value to logs, console,
+  // errors, analytics, or any outbound payload. This path is a known risk.
   try {
     window.localStorage.setItem(TOKEN_KEY, token)
   } catch {
@@ -64,7 +237,13 @@ export function clearToken(): void {
 export function authHeaders(init?: RequestInit): Headers {
   const headers = new Headers(init?.headers)
   const token = getToken()
-  if (token) headers.set('Authorization', `Bearer ${token}`)
+  // SECURITY: the Bearer token is only attached when API_BASE is a trusted
+  // backend (same-origin or an explicitly allow-listed host). Attaching it to
+  // an attacker-controlled/untrusted base would leak the credential
+  // cross-origin. See API_BASE_TRUSTED / resolveApiBase above. If the base is
+  // untrusted, requests are still sent (unauthenticated) but the token never
+  // leaves the first party.
+  if (token && API_BASE_TRUSTED) headers.set('Authorization', `Bearer ${token}`)
   return headers
 }
 
