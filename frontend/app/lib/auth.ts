@@ -16,8 +16,9 @@ const TRUSTED_API_HOSTS: string[] = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS |
 // via an XSS payload or a malicious inline script) and therefore untrusted
 // unless its host is explicitly allow-listed. The build-time env var and the dev
 // default are operator-controlled, but they still obey the SAME trust rule:
-// a cross-origin base is trusted only over https AND when allow-listed. No
-// cross-origin http base may ever be trusted.
+// a cross-origin base is trusted only over https AND when allow-listed, or when
+// it is a loopback address (http loopback is not a network cleartext risk). No
+// non-loopback cross-origin http base may ever be trusted.
 const WIN_API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
 const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
@@ -32,6 +33,14 @@ const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:
  */
 function parseApiBase(value: string): URL | null {
   if (!value || /\s/.test(value)) return null
+  // A root-relative path (e.g. "/api") is a same-origin relative base. Resolve
+  // it against the current origin so baseFromUrl keeps the path (and it is
+  // naturally same-origin → trusted). Without a window (SSR) we can't resolve an
+  // origin, so return null and let the caller fall back to a trusted empty base.
+  if (value.startsWith('/')) {
+    if (typeof window === 'undefined') return null
+    return new URL(value, window.location.origin)
+  }
   let url: URL
   try {
     url = new URL(value)
@@ -56,6 +65,14 @@ function isSameOrigin(url: URL): boolean {
  *  base so the Bearer token is never sent over cleartext http. */
 function isHttps(url: URL): boolean {
   return url.protocol === 'https:'
+}
+
+/** True when `url` resolves to a loopback address (`localhost`, `127.0.0.1`,
+ *  `::1`). Loopback traffic never leaves the machine, so http over loopback is
+ *  NOT a network cleartext risk — a dev backend like `http://localhost:8000` is
+ *  therefore trusted even though it is cross-origin http. */
+function isLoopback(url: URL): boolean {
+  return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
 }
 
 /** Normalize an allow-list entry or URL host for comparison: strip any leading
@@ -87,16 +104,21 @@ function baseFromUrl(url: URL): string {
 
 /** Trust rule: a base is trusted (allowed to receive the Bearer token) when it
  *  is first-party — i.e. empty (relative → window.location.origin), same-origin
- *  (http allowed for local dev), or an explicit cross-origin host in
- *  NEXT_PUBLIC_TRUSTED_API_HOSTS that is reached over https. A cross-origin
- *  allow-listed host over cleartext http is REJECTED so the token is never sent
- *  over an unencrypted channel. Any other cross-origin host is untrusted and
- *  must NOT receive the token. */
+ *  (http allowed for local dev), or a loopback address (e.g. http://localhost:
+ *  8000; cross-origin but never a network cleartext risk). An explicit
+ *  cross-origin host in NEXT_PUBLIC_TRUSTED_API_HOSTS is trusted only over
+ *  https. A non-loopback cross-origin http base is NEVER trusted so the token
+ *  is never sent over an unencrypted channel. Any other cross-origin host is
+ *  untrusted and must NOT receive the token. */
 function isTrustedBase(base: string, url: URL | null): boolean {
   if (!base) return true // empty relative base → same-origin first-party
   if (!url) return false
   if (isSameOrigin(url)) return true // same-origin (http ok for local dev)
-  // Cross-origin: only trusted when https AND explicitly allow-listed.
+  // Loopback (e.g. http://localhost:8000) is cross-origin but never a network
+  // cleartext risk, so it is trusted even over http.
+  if (isLoopback(url)) return true
+  // Cross-origin: only trusted when https AND explicitly allow-listed. A
+  // non-loopback cross-origin http base is NEVER trusted (cleartext).
   return isHttps(url) && hostInAllowList(url)
 }
 
