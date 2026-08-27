@@ -36,13 +36,25 @@ def cold_query(i: int, run_id: int) -> str:
     return f"{topics[i % len(topics)]} {run_id}-{i}"
 
 
-def hit(url: str, q: str, hot: bool, run_id: int) -> float:
+def hit(url: str, q: str, hot: bool, run_id: int):
+    """Return (latency_ms, error).
+
+    On a successful request ``error`` is None and ``latency_ms`` holds the
+    measured round-trip time. On any failure (timeout, HTTP 429/500, connection
+    reset, ...) ``latency_ms`` is None and ``error`` carries a short status
+    string so the caller can record the failure and keep the run alive.
+    """
     query = "top startup funding deals of 2024" if hot else cold_query(int(q), run_id)
     u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)
     t0 = time.perf_counter()
-    with urllib.request.urlopen(u, timeout=120) as r:
-        r.read()
-    return (time.perf_counter() - t0) * 1000
+    try:
+        with urllib.request.urlopen(u, timeout=120) as r:
+            r.read()
+        return (time.perf_counter() - t0) * 1000, None
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}"
+    except Exception as e:  # timeout / URLError / connection reset, etc.
+        return None, type(e).__name__
 
 
 def main() -> None:
@@ -57,11 +69,16 @@ def main() -> None:
 
     tasks = [str(i % 10000) for i in range(args.total)]
     latencies: list[float] = []
+    failures: list[str] = []
     t0 = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         futs = [ex.submit(hit, args.base, t, args.mode == "hot", args.run_id) for t in tasks]
         for f in cf.as_completed(futs):
-            latencies.append(f.result())
+            latency, err = f.result()
+            if err is None:
+                latencies.append(latency)
+            else:
+                failures.append(err)
     total_s = time.perf_counter() - t0
 
     latencies.sort()
@@ -71,8 +88,12 @@ def main() -> None:
         pctl = f"p50={p(50):.0f}ms p95={p(95):.0f}ms p99={p(99):.0f}ms"
     else:
         pctl = "p50=- p95=- p99=- (need >=2 samples)"
+    fail_str = f"  failures={len(failures)}"
+    if failures:
+        from collections import Counter
+        fail_str += " " + " ".join(f"{k}:{v}" for k, v in Counter(failures).items())
     print(f"[{args.mode:>4}] {label}  total={args.total} conc={args.concurrency} "
-          f"time={total_s:.2f}s  rps={args.total / total_s:.1f}  {pctl}")
+          f"time={total_s:.2f}s  rps={args.total / total_s:.1f}  {pctl}{fail_str}")
 
 
 if __name__ == "__main__":
