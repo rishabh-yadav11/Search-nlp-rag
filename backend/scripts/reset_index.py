@@ -91,7 +91,14 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=30)
     try:
-        existing = [c.name for c in client.get_collections().collections]
+        try:
+            existing = [c.name for c in client.get_collections().collections]
+        except Exception as exc:
+            log(
+                f"ERROR: could not connect to Qdrant at {config.QDRANT_URL}: {exc}\n"
+                f"       check that Qdrant is running and QDRANT_URL is correct; aborting reset.",
+            )
+            return
 
         if not skip_backup:
             if config.QDRANT_COLLECTION in existing:
