@@ -119,9 +119,11 @@ def backup_dirs(collection_name: str) -> list:
 def prune_backups(collection_name: str, retention: int | None = None) -> list:
     """Keep only the newest ``retention`` backups; return paths that were removed."""
     retention = retention if retention is not None else RETENTION
+    if retention <= 0:
+        return []
     dirs = backup_dirs(collection_name)
     removed = []
-    for d in dirs[:-retention] if retention > 0 else dirs:
+    for d in dirs[:-retention]:
         shutil.rmtree(d, ignore_errors=True)
         removed.append(d)
     return removed
