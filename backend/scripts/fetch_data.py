@@ -28,6 +28,11 @@ PAGE_SIZE = 5000
 async def fetch_all():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     tmp_path = OUTPUT_PATH + ".tmp"
+    # Remove any stale temp file unconditionally so a previous crash (which left
+    # a .tmp but never ran os.replace) can't have its rows re-fetched and
+    # appended again, producing duplicates in OUTPUT on the next run.
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
 
     last_id = 0
     total_written = 0
@@ -62,13 +67,12 @@ async def fetch_all():
         # Copy the valid prefix into a temp file. New rows are appended there and
         # only atomically renamed over OUTPUT_PATH on full success, so an errored
         # run never appends partial rows to the real file (no row duplication on
-        # re-run).
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # re-run). The stale temp was already removed unconditionally above.
         with open(OUTPUT_PATH, "rb") as src, open(tmp_path, "wb") as dst:
             dst.write(src.read(last_valid_offset))
         print(f"Resuming from id > {last_id} ({total_written} rows already written)")
 
+    pool = None
     pool = await aiomysql.create_pool(
         host=config.MYSQL_HOST,
         port=config.MYSQL_PORT,
@@ -143,8 +147,9 @@ async def fetch_all():
     finally:
         if pbar is not None:
             pbar.close()
-        pool.close()
-        await pool.wait_closed()
+        if pool is not None:
+            pool.close()
+            await pool.wait_closed()
 
 
 if __name__ == "__main__":
