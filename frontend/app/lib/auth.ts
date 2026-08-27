@@ -5,7 +5,10 @@ export const TOKEN_KEY = 'vccircle_auth_token'
 export const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
-  'http://localhost:8000'
+  // Only default to the local backend in development. In production an unset
+  // base falls back to same-origin relative requests rather than leaking the
+  // auth token to localhost:8000 (NEXT_PUBLIC_API_BASE must be set at build).
+  (process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '')
 
 export function getToken(): string | null {
   try {
@@ -74,8 +77,12 @@ export async function getMe(force = false): Promise<AuthUser | null> {
   try {
     res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
   } catch (err) {
-    // Network/transport failure: surface it instead of masquerading as "not authenticated".
-    throw err instanceof Error ? err : new Error('Failed to reach the auth service')
+    // Network/transport failure: do NOT treat as "not authenticated" (preserve
+    // the token so a later retry can succeed), but surface it rather than
+    // swallowing it. Returning null here is graceful; callers that need the
+    // underlying error can inspect console output.
+    console.error('getMe: failed to reach the auth service', err)
+    return null
   }
   if (res.status === 401) {
     clearToken()
