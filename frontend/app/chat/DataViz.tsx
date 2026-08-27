@@ -142,7 +142,7 @@ function formatValue(v: number, format?: string): string {
     case '₹B':
       return `₹${trim(v)}B`
     default:
-      return v.toLocaleString(undefined, { maximumFractionDigits: 2 })
+      return v.toLocaleString('en-US', { maximumFractionDigits: 2 })
   }
 }
 
@@ -367,8 +367,8 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
           <table className="chat-viz-table">
             <thead>
               <tr>
-                {block.columns.map((c) => (
-                  <th key={c}>{c}</th>
+                {block.columns.map((c, ci) => (
+                  <th key={ci}>{c}</th>
                 ))}
               </tr>
             </thead>
@@ -421,22 +421,22 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
       {!locked && (
         <div className="chat-viz-tools">
           <div className="chat-viz-toggle" role="group" aria-label="View">
-            <button type="button" className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}>
+            <button type="button" aria-pressed={view === 'table'} className={view === 'table' ? 'active' : ''} onClick={() => setView('table')}>
               Table
             </button>
             {numbers && (
               <>
-                <button type="button" className={view === 'bar' ? 'active' : ''} onClick={() => setView('bar')}>
+                <button type="button" aria-pressed={view === 'bar'} className={view === 'bar' ? 'active' : ''} onClick={() => setView('bar')}>
                   Bar
                 </button>
-                <button type="button" className={view === 'line' ? 'active' : ''} onClick={() => setView('line')}>
+                <button type="button" aria-pressed={view === 'line'} className={view === 'line' ? 'active' : ''} onClick={() => setView('line')}>
                   Line
                 </button>
-                <button type="button" className={view === 'pie' ? 'active' : ''} onClick={() => setView('pie')}>
+                <button type="button" aria-pressed={view === 'pie'} className={view === 'pie' ? 'active' : ''} onClick={() => setView('pie')}>
                   Pie
                 </button>
                 {pictoOk && (
-                  <button type="button" className={view === 'picto' ? 'active' : ''} onClick={() => setView('picto')}>
+                  <button type="button" aria-pressed={view === 'picto'} className={view === 'picto' ? 'active' : ''} onClick={() => setView('picto')}>
                     Pictogram
                   </button>
                 )}
