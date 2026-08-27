@@ -113,7 +113,7 @@ async def fetch_all():
             remaining = (await cur.fetchone())["c"]
             pbar = tqdm(total=remaining, desc="Fetching articles")
 
-            with open(tmp_path, "ab") as out_f:
+            with open(tmp_path, "a") as out_f:
                 while True:
                     await cur.execute(query, (last_id, PAGE_SIZE))
                     rows = await cur.fetchall()
