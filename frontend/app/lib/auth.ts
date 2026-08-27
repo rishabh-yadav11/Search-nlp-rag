@@ -26,7 +26,8 @@ const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:
  * Validate a candidate API base. Rejects anything that is not a proper http(s)
  * URL: no `javascript:`/other schemes, no protocol-relative URLs, no embedded
  * credentials, and no whitespace that could cause host confusion. Returns the
- * normalized origin (trusted flag set by the caller based on source).
+ * parsed URL (the trusted flag is derived by the caller via isSameOrigin /
+ * TRUSTED_API_HOSTS).
  */
 function parseApiBase(value: string): URL | null {
   if (!value || /\s/.test(value)) return null
@@ -42,39 +43,76 @@ function parseApiBase(value: string): URL | null {
   return url
 }
 
+/** True when `url` resolves to the same origin as the current document. An
+ *  empty/relative base also resolves to same-origin, so callers should treat an
+ *  empty base as same-origin too (see resolveApiBase). */
+function isSameOrigin(url: URL): boolean {
+  if (typeof window === 'undefined') return false
+  return url.origin === window.location.origin
+}
+
+/** Strip a port (and any trailing dot) so `api.example.com` and
+ *  `api.example.com:443` match the same allow-list entry. */
+function normalizeHost(host: string): string {
+  return host.replace(/:\d+$/, '').replace(/\.$/, '')
+}
+
+/** True when `url`'s host is present in NEXT_PUBLIC_TRUSTED_API_HOSTS (compared
+ *  without port, so `host` and `host:443` are equivalent). */
+function hostInAllowList(url: URL): boolean {
+  const h = normalizeHost(url.host)
+  return TRUSTED_API_HOSTS.some((entry) => normalizeHost(entry) === h)
+}
+
+/** Trust rule: a base is trusted (allowed to receive the Bearer token) when it
+ *  is first-party — i.e. empty (relative → window.location.origin), same-origin,
+ *  or an explicit cross-origin host in NEXT_PUBLIC_TRUSTED_API_HOSTS. Any other
+ *  cross-origin host is untrusted and must NOT receive the token. */
+function isTrustedBase(base: string, url: URL | null): boolean {
+  if (!base) return true // empty relative base → same-origin first-party
+  if (!url) return false
+  return isSameOrigin(url) || hostInAllowList(url)
+}
+
 function resolveApiBase(): { base: string; trusted: boolean } {
-  // Runtime-injected base: only trusted if its host is allow-listed.
+  // Runtime-injected base (`window.API_BASE`): it is the only attacker-reachable
+  // vector (XSS / malicious inline script), so it is trusted ONLY when it is a
+  // valid http(s) URL that is same-origin OR explicitly allow-listed. A
+  // cross-origin override REQUIRES NEXT_PUBLIC_TRUSTED_API_HOSTS to be set at
+  // build; otherwise it is ignored and we fall back to the safe same-origin
+  // base (which is itself trusted first-party).
   if (WIN_API_BASE) {
     const url = parseApiBase(WIN_API_BASE)
     if (!url) {
       console.error(
-        '[auth] window.API_BASE is not a valid http(s) URL; ignoring it and falling back to a safe same-origin base (auth token will not be sent cross-origin).'
+        '[auth] window.API_BASE is not a valid http(s) URL; ignoring it and using the safe same-origin base.'
       )
-      return { base: '', trusted: false }
+      return { base: '', trusted: true }
     }
-    if (TRUSTED_API_HOSTS.includes(url.host)) {
+    if (isTrustedBase(WIN_API_BASE, url)) {
       return { base: url.origin, trusted: true }
     }
     console.error(
-      `[auth] window.API_BASE host "${url.host}" is not in NEXT_PUBLIC_TRUSTED_API_HOSTS; falling back to a safe same-origin base (auth token will not be sent cross-origin).`
+      `[auth] window.API_BASE host "${normalizeHost(url.host)}" is not same-origin and not in NEXT_PUBLIC_TRUSTED_API_HOSTS; using the safe same-origin base instead.`
     )
-    return { base: '', trusted: false }
+    return { base: '', trusted: true }
   }
-  // Operator-controlled build-time config / dev default: trusted.
+  // Operator-controlled build-time config / dev default: trusted first-party.
   const trustedSource = ENV_API_BASE || DEV_API_BASE
   if (trustedSource) {
     const url = parseApiBase(trustedSource)
     if (!url) {
       console.error(
-        `[auth] Configured API base "${trustedSource}" is not a valid http(s) URL; falling back to a safe same-origin base.`
+        `[auth] Configured API base "${trustedSource}" is not a valid http(s) URL; falling back to the safe same-origin base.`
       )
-      return { base: '', trusted: false }
+      return { base: '', trusted: true }
     }
     return { base: url.origin, trusted: true }
   }
-  // Production: no base set → same-origin relative requests (safe, token stays
-  // first-party). NEXT_PUBLIC_API_BASE must be set at build for a real backend.
-  return { base: '', trusted: false }
+  // Production: no base set → same-origin relative requests. This is
+  // first-party, so it IS trusted and the token is attached. NEXT_PUBLIC_API_BASE
+  // must be set at build for a real backend.
+  return { base: '', trusted: true }
 }
 
 const RESOLVED_API_BASE = resolveApiBase()
