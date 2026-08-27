@@ -63,6 +63,9 @@ def test_suggested_top_k_numeric():
     assert suggested_top_k("top 5 deals") == 5
     assert suggested_top_k("show me top 20 startups") == 20
     assert suggested_top_k("best 10 companies") == 10
+    # Multi-digit counts must not be misparsed as a 2-digit prefix.
+    assert suggested_top_k("top 100 companies") == 100
+    assert suggested_top_k("top 150 deals") == 150
 
 
 def test_suggested_top_k_word_numbers():
