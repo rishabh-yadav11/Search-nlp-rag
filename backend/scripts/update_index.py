@@ -140,8 +140,9 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
     from qdrant_client.models import PointStruct, SparseVector
     from sentence_transformers import SentenceTransformer
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    client = None
     try:
+        client = QdrantClient(url=config.QDRANT_URL, timeout=60)
         if deleted:
             client.delete(
                 collection_name=config.QDRANT_COLLECTION,
@@ -236,7 +237,8 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
         finally:
             executor.shutdown(wait=False)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 def reconcile(state: dict, records: dict[int, dict]) -> bool:
@@ -249,8 +251,9 @@ def reconcile(state: dict, records: dict[int, dict]) -> bool:
     """
     from qdrant_client import QdrantClient
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+    client = None
     try:
+        client = QdrantClient(url=config.QDRANT_URL, timeout=30)
         point_ids = set()
         next_offset = None
         while True:
@@ -284,7 +287,8 @@ def reconcile(state: dict, records: dict[int, dict]) -> bool:
         log(f"WARNING: reconcile failed: {e}")
         return False
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 async def main():
