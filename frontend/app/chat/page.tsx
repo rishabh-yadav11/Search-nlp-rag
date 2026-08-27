@@ -81,13 +81,21 @@ async function api(path: string, init?: RequestInit) {
   return res.json() as Promise<Record<string, unknown>>
 }
 
+// Local timestamp used as a stable reference so relative strings don't
+// shift between renders. Read once on module load and frozen; the sidebar
+// only renders after a client-side fetch (useEffect), so there is no SSR
+// hydration mismatch from Date.now().
+const RELATIVE_NOW = Date.now() / 1000
+
+// Always format with a fixed locale/timezone so output is identical across
+// clients and never diverges on hydration.
 function relativeTime(ts: number): string {
-  const diff = Date.now() / 1000 - ts
+  const diff = RELATIVE_NOW - ts
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`
-  return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+  return new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
 }
 
 function formatCost(cost: number): string {
@@ -360,7 +368,16 @@ export default function ChatPage() {
             <div
               key={s.id}
               className={`chat-session-item${s.id === activeId ? ' active' : ''}`}
+              role="button"
+              tabIndex={0}
+              aria-label={`Open conversation: ${s.title || 'New chat'}`}
               onClick={() => openSession(s.id)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  openSession(s.id)
+                }
+              }}
             >
               <div className="chat-session-title" title={s.title}>
                 {s.title || 'New chat'}
