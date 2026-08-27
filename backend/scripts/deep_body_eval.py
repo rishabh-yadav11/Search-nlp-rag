@@ -101,6 +101,9 @@ async def fetch_rows():
         user=config.MYSQL_USER, password=config.MYSQL_PASSWORD,
         db=config.MYSQL_DATABASE, autocommit=True)
     async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
+        # config.MYSQL_TABLE is a trusted deployment config value (not user
+        # input); f-string interpolation here is safe only because it must
+        # remain a fixed identifier. Do NOT interpolate any user-supplied value.
         await cur.execute(
             f"SELECT feid, title, summary, body FROM {config.MYSQL_TABLE} WHERE status=1")
         rows = await cur.fetchall()
@@ -212,19 +215,32 @@ def main() -> None:
     if SERVICE_TOKEN:
         headers["X-Service-Token"] = SERVICE_TOKEN
     base = "http://localhost:8001/api/chat"
-    sid = _http_json(base + "/sessions", {"title": "deepeval"}, headers=headers)["id"]
+    sess = _http_json(base + "/sessions", {"title": "deepeval"}, headers=headers)
+    sid = sess.get("id") if isinstance(sess, dict) else None
+    if not sid:
+        print("\nCHAT: session id missing from response; skipping")
+        return
     try:
         q = "What companies presented at the Techcircle DEMO India 2013 event?"
         d = _http_json(base + f"/sessions/{sid}/messages", {"content": q}, headers=headers)
-        a = d["assistant"]
+        a = d.get("assistant") if isinstance(d, dict) else None
+        if not a or not isinstance(a, dict):
+            print("  WARN  chat response missing 'assistant'; skipping analysis")
+            return
+        raw_sources = a.get("sources") or []
         sources = [
-            (s["id"], round(_coerce_score(s.get("score")), 3), s.get("title", "")[:60])
-            for s in a["sources"]
+            (s.get("id"), round(_coerce_score(s.get("score")), 3), (s.get("title") or "")[:60])
+            for s in raw_sources if isinstance(s, dict)
         ]
-        print(f"  chat answer len: {len(a['content'])} | tokens: {a['prompt_tokens']} | cost INR: {round(a['cost'], 3)}")
+        content = a.get("content", "")
+        prompt_tokens = a.get("prompt_tokens")
+        cost = a.get("cost")
+        print(f"  chat answer len: {len(content)}"
+              f" | tokens: {prompt_tokens if isinstance(prompt_tokens, (int, float)) else 'n/a'}"
+              f" | cost INR: {round(cost, 3) if isinstance(cost, (int, float)) else 'n/a'}")
         for s in sources:
             print("  SOURCE", s[0], s[1], s[2])
-        low = a["content"].lower()
+        low = (a.get("content") or "").lower()
         print("  11283 in sources:", any(s[0] == 11283 for s in sources))
         for fact in DEEP_FACTS:
             print(f"  answer has {fact!r}:", fact in low)
