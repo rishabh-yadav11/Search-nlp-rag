@@ -18,15 +18,28 @@ def _set_facets() -> None:
     main._INDUSTRY_FACETS.update({i.lower(): i for i in _IND})
 
 
+_ORIG_DEAL: dict = {}
+_ORIG_IND: dict = {}
+
+
 def setup_function(_) -> None:
+    global _ORIG_DEAL, _ORIG_IND
+    # Snapshot whatever the module globals currently hold so teardown can restore
+    # them exactly, preventing any cross-module leakage (the extractors read these
+    # module-global facet maps).
+    _ORIG_DEAL = dict(main._DEALTYPE_FACETS)
+    _ORIG_IND = dict(main._INDUSTRY_FACETS)
     _set_facets()
 
 
 def teardown_function(_) -> None:
-    # The extractors read module-global facet maps; restore them so other test
-    # modules (which don't simulate a loaded vocabulary) aren't polluted.
+    # Restore the globals to their pre-test state rather than just clearing, so
+    # other test modules never see this module's simulated vocabulary (nor lose
+    # any state they had installed).
     main._DEALTYPE_FACETS.clear()
+    main._DEALTYPE_FACETS.update(_ORIG_DEAL)
     main._INDUSTRY_FACETS.clear()
+    main._INDUSTRY_FACETS.update(_ORIG_IND)
 
 
 def test_extract_dealtype_funding() -> None:

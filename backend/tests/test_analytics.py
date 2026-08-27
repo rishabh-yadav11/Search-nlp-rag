@@ -153,6 +153,9 @@ def test_recording_never_raises_when_redis_down(monkeypatch):
             raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
+    # Reset the process-global warning flag so this test independently verifies
+    # that a Redis failure triggers the warn-once path (order-independent).
+    monkeypatch.setattr(analytics, "_warned", False)
 
     _run(analytics.record_search("anything", 1, weak=False, cached=False, latency_ms=10, filtered=False))
     _run(analytics.record_click("anything", 1))
