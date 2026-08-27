@@ -1,10 +1,11 @@
-"""In-place backfill: store the WHOLE article body in Qdrant payloads and
-recompute the sparse (BM25) vector from the full text, for points that were
-indexed under the old body cap (6000 chars).
+"""In-place backfill: store the article body (truncated to BODY_CHAR_LIMIT) in
+Qdrant payloads and recompute the sparse (BM25) vector from that text, for
+points whose stored body differs from the freshly fetched, consistently
+truncated one.
 
-Reads all MySQL rows (whole bodies now that BODY_CHAR_LIMIT/EMBED_CHAR_LIMIT
-are raised), scrolls Qdrant for the currently stored body, and for every point
-whose stored body differs from the freshly fetched one, sets the new body
+Reads all MySQL rows, truncates each body to BODY_CHAR_LIMIT (the same cap every
+index path uses), scrolls Qdrant for the currently stored body, and for every
+point whose stored body differs from the freshly fetched one, sets the new body
 payload and updates the sparse vector. Dense vectors are untouched (the dense
 embedder ignores body by design), so this is a lightweight in-place update — no
 collection rebuild, no re-embedding of unchanged articles.
@@ -109,7 +110,7 @@ def main():
             for i in batch:
                 client.set_payload(
                     collection_name=config.QDRANT_COLLECTION,
-                    payload={"body": records[i]["body"]},
+                    payload={"body": records[i]["body"][: config.BODY_CHAR_LIMIT]},
                     points=[i],
                     wait=True,
                 )
