@@ -119,6 +119,8 @@ def _seg(p: str) -> str:
 
 
 def _join_vals(vals):
+    if not vals:
+        return ""
     return ", ".join(v for v in vals if v)
 
 
