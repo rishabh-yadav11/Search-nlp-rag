@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from qdrant_client import QdrantClient
 from update_index import fetch_records
+from typing import Iterator
 
 from app.config import config
 
@@ -26,7 +27,7 @@ def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def scroll_empty_points(client: QdrantClient):
+def scroll_empty_points(client: QdrantClient) -> Iterator[int]:
     """Yield point IDs whose summary payload is empty/absent, one page at a
     time, so the caller never holds the full id list in memory."""
     next_offset = None
@@ -59,7 +60,7 @@ def set_summary(client: QdrantClient, records: dict[int, dict], batch: list[int]
             collection_name=config.QDRANT_COLLECTION,
             payload={"summary": summary},
             points=pids,
-            wait=False,
+            wait=True,
         )
 
 
@@ -74,11 +75,13 @@ def main():
         log(f"fetched {len(records)} MySQL rows for id->summary mapping")
 
         total_scrolled = 0
+        eligible = 0
         updated = 0
         batch: list[int] = []
         for pid in scroll_empty_points(client):
             total_scrolled += 1
             if pid in records:
+                eligible += 1
                 batch.append(pid)
             else:
                 log(f"WARNING: id {pid} not in MySQL (skipping)")
@@ -86,8 +89,8 @@ def main():
                 set_summary(client=client, records=records, batch=batch)
                 updated += len(batch)
                 batch = []
-                if updated % (BATCH_SIZE * 25) == 0 or updated == total_scrolled:
-                    log(f"progress: {updated}/{total_scrolled} updated")
+                if updated % (BATCH_SIZE * 25) == 0 or updated == eligible:
+                    log(f"progress: {updated}/{eligible} updated")
 
         if batch:
             set_summary(client=client, records=records, batch=batch)
@@ -97,7 +100,7 @@ def main():
             log("nothing to backfill")
             return 0
 
-        log(f"scrolled: {total_scrolled} points with empty summary")
+        log(f"scrolled: {total_scrolled} points with empty summary; {eligible} eligible for update")
     except Exception:
         log(f"ERROR: batch failed:\n{traceback.format_exc()}")
         log("STOPPED — fix the error and rerun (script is idempotent)")
