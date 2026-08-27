@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useEffect, useState } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { API_BASE, getToken, setToken } from '../lib/auth'
@@ -13,9 +13,16 @@ function LoginForm() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const abortRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
 
   useEffect(() => {
+    mountedRef.current = true
     if (getToken()) router.replace(next)
+    return () => {
+      mountedRef.current = false
+      abortRef.current?.abort()
+    }
   }, [router, next])
 
   async function submit(e: React.FormEvent) {
@@ -27,12 +34,20 @@ function LoginForm() {
       return
     }
     setBusy(true)
+
+    // Abortable fetch so a hung request can't leave the UI stuck.
+    const controller = new AbortController()
+    abortRef.current = controller
+    const timeout = setTimeout(() => controller.abort(), 15000)
+
     try {
       const res = await fetch(`${API_BASE}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: trimmed, password }),
+        signal: controller.signal,
       })
+      clearTimeout(timeout)
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         setError((body as { detail?: string }).detail ?? `Login failed (${res.status}).`)
@@ -41,10 +56,22 @@ function LoginForm() {
       const data = (await res.json()) as { token: string }
       setToken(data.token)
       router.replace(next)
-    } catch {
-      setError('Could not reach the server. Please try again.')
+      // Navigate away immediately; no further state updates after this.
+      return
+    } catch (err) {
+      clearTimeout(timeout)
+      // Guard against state updates on an unmounted component if the request
+      // was aborted by the cleanup (e.g. navigation away during the call).
+      if (!mountedRef.current) return
+      if (controller.signal.aborted) {
+        setError('The request timed out. Please try again.')
+      } else {
+        setError('Could not reach the server. Please try again.')
+      }
+      return
     } finally {
-      setBusy(false)
+      // Guard against state updates on an unmounted component.
+      if (mountedRef.current) setBusy(false)
     }
   }
 
