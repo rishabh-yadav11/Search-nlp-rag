@@ -198,7 +198,8 @@ def test_client_lazy_init_replaces_redis_db(monkeypatch):
     client = analytics._client()
     assert analytics._client() is client  # cached, not recreated
     assert len(created) == 1
-    assert created[0][0] == "redis://localhost:6379/1"
+    assert created[0][0] == "redis://localhost:6379/0"
+    assert created[0][1]["db"] == 1
     assert created[0][1]["decode_responses"] is True
 
 
