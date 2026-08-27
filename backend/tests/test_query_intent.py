@@ -213,7 +213,7 @@ def test_extract_year_range_short_span():
 
 
 def test_extract_year_range_short_span_rollover():
-    assert extract_year_range("deals 2024-23") == ("2024-01-01", "2123-12-31")
+    assert extract_year_range("deals 2024-23") == ("2023-01-01", "2024-12-31")
 
 
 def test_extract_year_range_month_span():
@@ -253,7 +253,7 @@ def test_extract_year_range_fiscal_year():
 
 
 def test_extract_year_range_fiscal_span_rollover():
-    assert extract_year_range("deals in fy 2025-24") == ("2123-04-01", "2124-03-31")
+    assert extract_year_range("deals in fy 2025-24") == ("2024-04-01", "2025-03-31")
 
 
 def test_referenced_year_explicit_flashback_prefix():
