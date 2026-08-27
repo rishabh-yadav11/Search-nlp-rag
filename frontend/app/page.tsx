@@ -68,12 +68,35 @@ const RAW_API_BASE =
 const SAFE_DEFAULT_BASE =
   typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'
 
+const TRUSTED_API_HOSTS = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS || '')
+  .split(',')
+  .map((h) => h.trim().toLowerCase())
+  .filter(Boolean)
+
+function isSafeApiBase(url: string): boolean {
+  if (!url) return false
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+    if (typeof window === 'undefined') return true
+    const origin = window.location.origin.toLowerCase()
+    if (parsed.origin.toLowerCase() === origin) return true
+    if (TRUSTED_API_HOSTS.includes(parsed.host.toLowerCase())) return true
+    return false
+  } catch {
+    return false
+  }
+}
+
 const { API_BASE, API_BASE_ERROR } = (() => {
   const candidate = String(RAW_API_BASE || '')
-  if (isSafeUrl(candidate)) return { API_BASE: candidate, API_BASE_ERROR: '' }
+  if (isSafeApiBase(candidate)) return { API_BASE: candidate, API_BASE_ERROR: '' }
+  const reason = isSafeUrl(candidate)
+    ? `host "${(() => { try { return new URL(candidate).host } catch { return candidate } })()}" is not same-origin or in NEXT_PUBLIC_TRUSTED_API_HOSTS`
+    : 'schema must be http(s)'
   return {
     API_BASE: SAFE_DEFAULT_BASE,
-    API_BASE_ERROR: `Invalid API_BASE "${candidate}"; requests will use ${SAFE_DEFAULT_BASE}.`,
+    API_BASE_ERROR: `Invalid API_BASE "${candidate}" (${reason}); requests will use ${SAFE_DEFAULT_BASE}.`,
   }
 })()
 
@@ -139,7 +162,7 @@ function isSafeUrl(url: string): boolean {
   }
 }
 
-function trackClick(query: string, position: number, id?: number) {
+function trackClick(query: string, position: number, id?: string | number) {
   if (typeof navigator === 'undefined' || !query) return
   try {
     const payload = JSON.stringify({ query, position, id })
