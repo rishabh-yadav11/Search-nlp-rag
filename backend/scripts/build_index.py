@@ -158,7 +158,7 @@ def to_point(row: dict, dvec, svec) -> PointStruct:
             "published_date": row.get("published_date"),
             "category": row.get("category"),
             "summary": (row.get("summary") or ""),
-            "body": (row.get("body") or "")[: config.BODY_CHAR_LIMIT],
+            "body": (row.get("body") or ""),
             "author_names": row.get("author_names") or [],
             "industry_names": row.get("industry_names") or [],
             "dealtype_names": row.get("dealtype_names") or [],
