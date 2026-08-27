@@ -50,7 +50,10 @@ def diversify(results, n: int, lam: float = 0.7, sim_thresh: float = 0.4):
         best_val = float("-inf")
         for k in order:
             sim = max_sim(k, chosen_idx)
-            mmr = lam * results[k].score - (1 - lam) * sim
+            score = results[k].score
+            if score is None:
+                score = 0.0
+            mmr = lam * score - (1 - lam) * sim
             if mmr > best_val:
                 best_val = mmr
                 best_k = k
