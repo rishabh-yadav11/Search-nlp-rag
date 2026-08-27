@@ -16,10 +16,61 @@ Prints total time, requests/sec, and p50/p95/p99 latency (ms).
 """
 import argparse
 import concurrent.futures as cf
+import http.client
 import statistics
+import threading
 import time
 import urllib.parse
 import urllib.request
+
+
+class _KeepAliveHandler(urllib.request.AbstractHTTPHandler):
+    """Per-thread HTTP/1.1 keep-alive handler.
+
+    urllib's default opener opens (and closes) a fresh socket for every
+    request and even forces ``Connection: close``. The loader runs every task
+    through a fixed-size ThreadPoolExecutor, so each worker thread serves many
+    requests; this handler keeps one live connection per thread and reuses it,
+    avoiding connect latency and socket churn.
+    """
+
+    _local = threading.local()
+
+    def http_open(self, req):
+        netloc = req.host  # e.g. "localhost:8001"
+        timeout = req.timeout or 120
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = http.client.HTTPConnection(netloc, timeout=timeout)
+            self._local.conn = conn
+        try:
+            return self._exchange(conn, req)
+        except (OSError, http.client.HTTPException):
+            # Server dropped the keep-alive socket; reconnect once.
+            conn = http.client.HTTPConnection(netloc, timeout=timeout)
+            self._local.conn = conn
+            return self._exchange(conn, req)
+
+    def _exchange(self, conn, req):
+        headers = dict(req.unredirected_hdrs)
+        headers.update(req.headers)
+        headers["Connection"] = "keep-alive"
+        headers = {name.title(): val for name, val in headers.items()}
+        if conn.sock is None:
+            conn.connect()
+        conn.request(
+            req.get_method(), req.selector, req.data, headers,
+            encode_chunked=req.has_header("Transfer-encoding"),
+        )
+        r = conn.getresponse()
+        # Keep the socket open for the next request on this thread; neuter the
+        # context-manager close() so the caller's `with` block doesn't tear the
+        # connection down.
+        r.close = lambda: None
+        return r
+
+
+_opener = urllib.request.build_opener(_KeepAliveHandler())
 
 
 # Cold queries: each request gets a UNIQUE query so every one triggers a full
@@ -48,7 +99,7 @@ def hit(url: str, q: str, hot: bool, run_id: int):
     u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)
     t0 = time.perf_counter()
     try:
-        with urllib.request.urlopen(u, timeout=120) as r:
+        with _opener.open(u, timeout=120) as r:
             r.read()
         return (time.perf_counter() - t0) * 1000, None
     except urllib.error.HTTPError as e:
@@ -67,7 +118,7 @@ def main() -> None:
     ap.add_argument("--run-id", type=int, default=0, help="cold-query namespace per run")
     args = ap.parse_args()
 
-    tasks = [str(i % 10000) for i in range(args.total)]
+    tasks = [str(i) for i in range(args.total)]
     latencies: list[float] = []
     failures: list[str] = []
     t0 = time.perf_counter()
