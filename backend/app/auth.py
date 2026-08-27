@@ -346,6 +346,15 @@ class AuthStore:
         await self._db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
         await self._db.commit()
 
+    async def purge_expired_tokens(self) -> int:
+        """Delete rows whose expiry has passed. Parameterized to avoid SQL
+        injection; returns the number of rows removed. Run periodically so the
+        table can't grow without bound as tokens expire."""
+        now = _now()
+        cur = await self._db.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (now,))
+        await self._db.commit()
+        return cur.rowcount
+
 
 def _require_auth_store() -> AuthStore:
     if store is None:
@@ -365,6 +374,30 @@ def _rate_redis() -> aioredis.Redis:
             config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
         )
     return _rate_client
+
+
+async def close_rate_redis() -> None:
+    """Close the lazily-created auth rate-limit Redis client. Registered as a
+    shutdown hook so the connection isn't leaked on worker exit."""
+    global _rate_client
+    if _rate_client is not None:
+        await _rate_client.aclose()
+        _rate_client = None
+
+
+async def token_purge_loop() -> None:
+    """Background task: purge expired auth_tokens rows. Never raises. Disabled
+    when AUTH_TOKEN_PURGE_INTERVAL_SECONDS is 0 (e.g. tests)."""
+    interval = config.AUTH_TOKEN_PURGE_INTERVAL_SECONDS
+    while interval > 0:
+        try:
+            if store is not None:
+                n = await store.purge_expired_tokens()
+                if n:
+                    logger.info("auth: purged %d expired token(s)", n)
+        except Exception:
+            logger.exception("auth token purge failed")
+        await asyncio.sleep(interval)
 
 
 def _client_ip(request: Request) -> str:
