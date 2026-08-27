@@ -172,11 +172,11 @@ def _fake_client(calls):
         def __aexit__(self, *exc):
             return False
 
-        def incrbyfloat(self, key, amount):
+        async def incrbyfloat(self, key, amount):
             self._calls.append((key, amount))
             return self
 
-        def expire(self, key, seconds):
+        async def expire(self, key, seconds):
             return self
 
         async def execute(self):
@@ -190,12 +190,22 @@ def _fake_client(calls):
 
 
 def _raise_runtime_error_client(*args, **kwargs):
+    class _RaisePipe:
+        async def __aenter__(self):
+            raise RuntimeError("redis down")
+
+        def __aexit__(self, *exc):
+            return False
+
     class Client:
         async def get(self, key):
             raise RuntimeError("redis down")
 
         async def incrbyfloat(self, key, amount):
             raise RuntimeError("redis down")
+
+        def pipeline(self):
+            return _RaisePipe()
 
     return Client()
 
@@ -217,6 +227,10 @@ def test_facet_values_from_fake_qdrant(monkeypatch):
             None,
         )
 
-    main.state["qdrant"] = type("FakeQdrant", (), {"scroll": staticmethod(fake_scroll)})()
+    class FakeQdrant:
+        scroll = staticmethod(fake_scroll)
+
+    monkeypatch.setattr(main, "AsyncQdrantClient", lambda *a, **k: FakeQdrant())
+    main.state["qdrant"] = main.AsyncQdrantClient()
     values = _run(main._facet_values("industry_names"))
     assert values == ["Finance", "General", "TMT"]
