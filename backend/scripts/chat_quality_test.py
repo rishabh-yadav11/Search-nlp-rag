@@ -234,15 +234,15 @@ def _req(url: str, payload: dict | None = None, method: str | None = None,
 
 
 def run(q: dict) -> dict:
-    sid = None
     sid = _req(BASE + "/sessions", {"title": "quality-test"})["id"]
     try:
         d = _req(BASE + f"/sessions/{sid}/messages", {"content": q["q"]})
     finally:
-        try:  # best-effort cleanup; eval session deletion is optional
-            _req(BASE + f"/sessions/{sid}", method="DELETE")
-        except Exception:  # noqa: S110
-            pass
+        if sid is not None:  # best-effort cleanup; eval session deletion is optional
+            try:
+                _req(BASE + f"/sessions/{sid}", method="DELETE")
+            except Exception:  # noqa: S110
+                pass
     a = d["assistant"]
     low = a["content"].lower()
     terms = q.get("terms", [])
