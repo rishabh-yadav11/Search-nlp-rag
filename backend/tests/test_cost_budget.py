@@ -184,29 +184,20 @@ def _raise_runtime_error_client(*args, **kwargs):
 def test_facet_values_from_fake_qdrant(monkeypatch):
     from app import main
 
-    async def fake_request(**kwargs):
-        return {
-            "result": {
-                "hits": [
-                    {"value": "Finance", "count": 3},
-                    {"value": "TMT", "count": 5},
-                    {"value": "General", "count": 2},
-                ]
-            },
-            "status": "ok",
-        }
+    class _Point:
+        def __init__(self, payload):
+            self.payload = payload
 
-    class FakeApiClient:
-        @staticmethod
-        async def request(**kwargs):
-            return await fake_request(**kwargs)
+    async def fake_scroll(**kwargs):
+        return (
+            [
+                _Point({"industry_names": "Finance"}),
+                _Point({"industry_names": "TMT"}),
+                _Point({"industry_names": "General"}),
+            ],
+            None,
+        )
 
-    class FakeCollectionsApi:
-        api_client = FakeApiClient()
-
-    class FakeHttp:
-        collections_api = FakeCollectionsApi()
-
-    main.state["qdrant"] = type("FakeQdrant", (), {"http": FakeHttp()})()
+    main.state["qdrant"] = type("FakeQdrant", (), {"scroll": staticmethod(fake_scroll)})()
     values = _run(main._facet_values("industry_names"))
     assert values == ["Finance", "General", "TMT"]
