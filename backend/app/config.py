@@ -160,6 +160,16 @@ class Config:
     CLICK_BOOST_MIN_SHARE = float(os.getenv("CLICK_BOOST_MIN_SHARE", "0.3"))
     CLICK_BOOST_MULT = float(os.getenv("CLICK_BOOST_MULT", "1.3"))
 
+    # Bounds for the anonymous /analytics/click beacon so a hostile client can't
+    # grow Redis without limit: cap the stored query string length and expire the
+    # per-query click sorted sets a few days after the last click.
+    CLICK_QUERY_MAX_LEN = int(os.getenv("CLICK_QUERY_MAX_LEN", "256"))
+    CLICK_QUERY_TTL_SECONDS = int(os.getenv("CLICK_QUERY_TTL_SECONDS", str(7 * 24 * 3600)))
+
+    # Daily LLM cost counter TTL: kept well past the day it tracks so the budget
+    # guardrail survives brief outages, then auto-expires instead of accumulating.
+    COST_DAY_TTL_SECONDS = int(os.getenv("COST_DAY_TTL_SECONDS", str(7 * 24 * 3600)))
+
     # Chat-only "body rescue": when the top reranked score is below
     # BODY_RESCUE_THRESHOLD, re-score the candidates against the body region
     # with the most lexical query-token overlap and keep max(baseline, body).
