@@ -8,6 +8,8 @@ and appends a small, bounded set of synonym phrases so semantic retrieval also
 matches the corpus's wording. Stdlib only, fully offline.
 """
 
+import re
+
 CONCEPT_EXPANSIONS: dict[str, list[str]] = {
     "funding/raise/raising/raised/raises/fundraise/fundraising": [
         "fundraise",
@@ -208,17 +210,19 @@ _TRIGGERS: list[tuple[list[str], list[str]]] = [
 def expand_query(q: str) -> str:
     """Return ``q`` with a bounded set of corpus-friendly synonym phrases appended.
 
-    Detection is a plain substring test on the lowercased query. Only concepts
-    that actually appear in the query contribute expansions, terms already present
-    in the query are dropped, and the appended words never exceed
-    ``_MAX_EXTRA_TOKENS`` tokens. The original query text is preserved unchanged
-    at the front. Returns ``q`` untouched when nothing matches.
+    Detection matches trigger terms on word boundaries (not raw substring
+    containment), so short triggers like "ai"/"ml"/"ev" no longer fire inside
+    unrelated words ("email"/"small"/"every"). Only concepts that actually appear
+    in the query contribute expansions, terms already present in the query are
+    dropped, and the appended words never exceed ``_MAX_EXTRA_TOKENS`` tokens.
+    The original query text is preserved unchanged at the front. Returns ``q``
+    untouched when nothing matches.
     """
     q_lower = q.lower()
     candidates: list[str] = []
     seen: set[str] = set()
     for triggers, expansions in _TRIGGERS:
-        if not any(trigger in q_lower for trigger in triggers):
+        if not any(re.search(rf"\b{re.escape(trigger)}\b", q_lower) for trigger in triggers):
             continue
         for term in expansions:
             term_lower = term.lower()
