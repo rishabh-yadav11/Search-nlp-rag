@@ -91,6 +91,14 @@ def test_record_cost_converts_inr_to_usd(monkeypatch):
     assert abs(calls[0][1] - 1.0) < 1e-9  # ₹95.6 -> $1.0
 
 
+def test_to_usd_canonical_unit(monkeypatch):
+    """Cost accounting is canonical in USD; to_usd converts the INR figure
+    reported by LLMResult.cost() before it is stored/compared."""
+    monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 95.6)
+    assert abs(cost_budget.to_usd(95.6) - 1.0) < 1e-9
+    assert abs(cost_budget.to_usd(0.0) - 0.0) < 1e-9
+
+
 def test_close_resets_redis(monkeypatch):
     class FakeRedis:
         def __init__(self):
