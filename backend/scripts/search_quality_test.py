@@ -181,9 +181,38 @@ def ndcg(ids: list[int], expected: set[int]) -> float:
 
 def run_one(g: dict, k: int) -> dict:
     url = f"{BASE}/search?top_k={k}&q=" + urllib.parse.quote(g["q"])
-    with urllib.request.urlopen(url, timeout=90) as r:
-        d = json.load(r)
-    ids = [res["id"] for res in d["results"]]
+    try:
+        with urllib.request.urlopen(url, timeout=90) as r:
+            d = json.load(r)
+    except Exception as e:  # noqa: BLE001 - never abort the whole run on one bad response
+        print(f"[WARN] query {g['id']}: request/parse failed ({e}); skipping")
+        return _invalid(g, f"request/parse error: {e}")
+
+    if not isinstance(d, dict):
+        print(f"[WARN] query {g['id']}: malformed response (not an object); skipping")
+        return _invalid(g, "malformed response: not an object")
+    results = d.get("results")
+    if not isinstance(results, list):
+        print(f"[WARN] query {g['id']}: missing/invalid 'results' field; skipping")
+        return _invalid(g, "missing or non-list 'results'")
+
+    ids = []
+    for idx, res in enumerate(results):
+        if not isinstance(res, dict):
+            print(f"[WARN] query {g['id']}: result #{idx} is not an object; skipping entry")
+            continue
+        rid = res.get("id")
+        if rid is None:
+            print(f"[WARN] query {g['id']}: result #{idx} missing 'id'; skipping entry")
+            continue
+        if not isinstance(rid, int):
+            try:
+                rid = int(rid)
+            except (TypeError, ValueError):
+                print(f"[WARN] query {g['id']}: result #{idx} has non-int 'id' ({rid!r}); skipping entry")
+                continue
+        ids.append(rid)
+
     expected = set(g["expected"])
     found_ranks = [i + 1 for i, x in enumerate(ids) if x in expected]
     recall = len(found_ranks) / len(expected)
@@ -199,6 +228,21 @@ def run_one(g: dict, k: int) -> dict:
         "cached": d.get("cached"),
         "latency_ms": d.get("latency_ms"),
         "note": d.get("note"),
+    }
+
+
+def _invalid(g: dict, reason: str) -> dict:
+    return {
+        "id": g["id"],
+        "category": g["category"],
+        "recall": 0.0,
+        "ndcg": 0.0,
+        "mrr": 0.0,
+        "hit": 0,
+        "found": [],
+        "cached": None,
+        "latency_ms": None,
+        "note": f"INVALID RESPONSE: {reason}",
     }
 
 
