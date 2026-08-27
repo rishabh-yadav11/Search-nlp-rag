@@ -10,7 +10,6 @@ Recording is best-effort: a Redis outage never raises into the request path,
 it only logs a warning once and stops recording until Redis returns.
 """
 import logging
-import re
 from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
@@ -23,16 +22,15 @@ _redis = None
 _warned = False
 
 
-def _base_url(db: int) -> str:
-    """REDIS_URL with its database index replaced by ``db``."""
-    return re.sub(r"/\d+$", f"/{db}", config.REDIS_URL)
-
-
 def _client() -> aioredis.Redis:
     global _redis
     if _redis is None:
+        # Pin the DB explicitly so counters never silently land in DB 0 (which a
+        # deploy FLUSHDB would wipe). The ``db`` kwarg overrides any db segment in
+        # REDIS_URL, so this is safe whether or not the URL carries a db index.
         _redis = aioredis.from_url(
-            _base_url(config.ANALYTICS_REDIS_DB),
+            config.REDIS_URL,
+            db=config.ANALYTICS_REDIS_DB,
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=2,
