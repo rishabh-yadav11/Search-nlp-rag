@@ -691,8 +691,9 @@ async def search(
     # explicit facet, so the UI filter (and /search callers) always win.
     dealtype = dealtype or auto_dealtype
     industry = industry or auto_industry
-    if config.ENABLE_QUERY_EXPANSION and "flashback" not in retrieval_q.lower():
-        retrieval_q = expand_query(retrieval_q)
+    # NOTE: query expansion happens exactly once inside retrieve_and_rerank ->
+    # _retrieval_leg (which chat also uses), so we must NOT expand here too,
+    # otherwise /search expands twice and diverges from the chat pipeline.
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
     cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
     filtered = any((industry, dealtype, author, from_date, to_date))
@@ -749,21 +750,39 @@ FACETS_LIMIT = 200
 
 
 async def _facet_values(key: str) -> list[str]:
-    """Distinct payload values for ``key`` via Qdrant's vector-free facet API.
+    """Distinct payload values for ``key``, via the public ``scroll`` API.
 
-    Runs a single indexed query server-side instead of scrolling the whole
-    collection in Python. Returns values sorted alphabetically, capped at
-    FACETS_LIMIT.
+    Qdrant-client 1.11 does not expose a stable public facet method, so we page
+    through the collection (requesting only ``key``) and collect distinct values
+    instead of reaching into the client's private HTTP internals. The result is
+    capped at FACETS_LIMIT and cached by the caller. Array-valued keyword fields
+    (e.g. industry_names) contribute each element as a distinct value.
     """
-    raw = await state["qdrant"].http.collections_api.api_client.request(
-        type_=dict,
-        method="POST",
-        url="/collections/{collection_name}/facet",
-        path_params={"collection_name": config.QDRANT_COLLECTION},
-        json={"key": key, "limit": FACETS_LIMIT},
-    )
-    hits = ((raw or {}).get("result") or {}).get("hits") or []
-    return sorted(h["value"] for h in hits if isinstance(h.get("value"), str))
+    values: set[str] = set()
+    next_offset = None
+    while len(values) < FACETS_LIMIT:
+        pts, next_offset = await state["qdrant"].scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            limit=256,
+            with_payload=[key],
+            with_vectors=False,
+            offset=next_offset,
+        )
+        for p in pts:
+            v = (p.payload or {}).get(key)
+            if isinstance(v, str):
+                if v:
+                    values.add(v)
+            elif isinstance(v, (list, tuple)):
+                for item in v:
+                    if isinstance(item, str) and item:
+                        values.add(item)
+        if next_offset is None or not pts:
+            # `not pts` guards against a defensive edge case where the client
+            # returns an empty page without clearing the offset, which would
+            # otherwise loop forever.
+            break
+    return sorted(values)[:FACETS_LIMIT]
 
 
 @app.get("/facets")
