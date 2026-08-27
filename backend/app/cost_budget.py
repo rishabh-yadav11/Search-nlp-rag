@@ -10,7 +10,6 @@ we degrade to "over budget" only on a confirmed counter read, and skip recording
 on write failure.
 """
 import logging
-import re
 from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
@@ -26,16 +25,15 @@ class BudgetExceeded(Exception):
     """Raised when the configured daily LLM spend cap is already exhausted."""
 
 
-def _base_url(db: int) -> str:
-    """REDIS_URL with its database index replaced by ``db``."""
-    return re.sub(r"/\d+$", f"/{db}", config.REDIS_URL)
-
-
 def _client() -> aioredis.Redis:
     global _redis
     if _redis is None:
+        # Pin the DB explicitly so the daily cost counter never silently lands in
+        # DB 0 (which a deploy FLUSHDB would wipe), disabling the budget guardrail.
+        # The ``db`` kwarg overrides any db segment in REDIS_URL.
         _redis = aioredis.from_url(
-            _base_url(config.ANALYTICS_REDIS_DB),
+            config.REDIS_URL,
+            db=config.ANALYTICS_REDIS_DB,
             decode_responses=True,
             socket_connect_timeout=2,
             socket_timeout=2,
