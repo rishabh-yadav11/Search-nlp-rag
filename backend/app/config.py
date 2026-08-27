@@ -208,6 +208,8 @@ class Config:
     AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+    # Background purge interval for expired auth_tokens rows (0 disables the loop).
+    AUTH_TOKEN_PURGE_INTERVAL_SECONDS = int(os.getenv("AUTH_TOKEN_PURGE_INTERVAL_SECONDS", "3600"))
 
     # CORS: comma-separated allowed origins. Production serves the API and the
     # frontend same-origin through nginx, so this only matters for cross-origin
