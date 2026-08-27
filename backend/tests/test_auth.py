@@ -225,6 +225,11 @@ def test_rate_limit_429_and_reset(monkeypatch):
     calls = {"n": 0}
 
     class _FakeRedis:
+        async def set(self, key, value, nx=False, ex=None):
+            # First-hit window establishment; for the test we just need it to not
+            # raise so the subsequent incr drives the count.
+            return True
+
         async def incr(self, key):
             calls["n"] += 1
             return calls["n"]

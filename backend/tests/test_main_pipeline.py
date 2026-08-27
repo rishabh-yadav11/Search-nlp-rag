@@ -3,7 +3,6 @@ embedding, intent rewrite, retrieval, body rescue/attach, and facet values."""
 
 import asyncio
 import math
-import types
 
 import pytest
 from qdrant_client.models import Fusion, FusionQuery, SparseVector
@@ -71,11 +70,13 @@ class _QueryResult:
 
 
 class _FakeQdrant:
-    def __init__(self, points=None):
+    def __init__(self, points=None, scroll_pages=None):
         self.points = points or []
         self.retrieve_result = []
         self.query_points_calls = []
         self.retrieve_calls = []
+        self.scroll_pages = scroll_pages or []
+        self.scroll_calls = []
 
     async def query_points(self, **kwargs):
         self.query_points_calls.append(kwargs)
@@ -84,6 +85,12 @@ class _FakeQdrant:
     async def retrieve(self, **kwargs):
         self.retrieve_calls.append(kwargs)
         return self.retrieve_result
+
+    async def scroll(self, **kwargs):
+        self.scroll_calls.append(kwargs)
+        if self.scroll_pages:
+            return self.scroll_pages.pop(0)
+        return [], None
 
 
 class _FakeCache:
@@ -138,10 +145,10 @@ class _FakeFacetClient:
         return self.result
 
 
-def _with_facet(qdrant: _FakeQdrant, result):
-    qdrant.http = types.SimpleNamespace(
-        collections_api=types.SimpleNamespace(api_client=_FakeFacetClient(result))
-    )
+def _with_facet(qdrant: _FakeQdrant, pages):
+    """Configure a fake Qdrant to return ``pages`` (list of (points, next_offset))
+    from its public ``scroll`` method, used by _facet_values."""
+    qdrant.scroll_pages = pages
     return qdrant
 
 
@@ -517,46 +524,47 @@ def test_source_context_truncates_body_to_body_limit():
 # --- _facet_values ---
 
 
-def test_facet_values_sorted_and_request_kwargs(monkeypatch):
-    qdrant = _with_facet(
-        _FakeQdrant(), {"result": {"hits": [{"value": "Finance"}, {"value": "TMT"}, {"value": "General"}]}}
-    )
+def test_facet_values_sorted_and_scroll_kwargs(monkeypatch):
+    points = [
+        _Point(1, {"industry_names": "Finance"}),
+        _Point(2, {"industry_names": "TMT"}),
+        _Point(3, {"industry_names": "General"}),
+    ]
+    qdrant = _with_facet(_FakeQdrant(), [(points, None)])
     monkeypatch.setitem(main.state, "qdrant", qdrant)
     monkeypatch.setattr(main.config, "QDRANT_COLLECTION", "col")
 
     out = _run(main._facet_values("industry_names"))
 
     assert out == ["Finance", "General", "TMT"]
-    req = qdrant.http.collections_api.api_client.calls[0]
-    assert req["type_"] is dict
-    assert req["method"] == "POST"
-    assert req["url"] == "/collections/{collection_name}/facet"
-    assert req["path_params"] == {"collection_name": "col"}
-    assert req["json"] == {"key": "industry_names", "limit": main.FACETS_LIMIT}
+    assert qdrant.scroll_calls[0]["collection_name"] == "col"
+    assert qdrant.scroll_calls[0]["with_payload"] == ["industry_names"]
 
 
 def test_facet_values_filters_non_string_hits(monkeypatch):
-    qdrant = _with_facet(_FakeQdrant(), {"result": {"hits": [{"value": "Finance"}, {"value": 42}, {"value": None}]}})
+    points = [
+        _Point(1, {"industry_names": "Finance"}),
+        _Point(2, {"industry_names": 42}),
+        _Point(3, {"industry_names": None}),
+    ]
+    qdrant = _with_facet(_FakeQdrant(), [(points, None)])
     monkeypatch.setitem(main.state, "qdrant", qdrant)
     assert _run(main._facet_values("industry_names")) == ["Finance"]
 
 
-def test_facet_values_empty_or_none_result(monkeypatch):
-    qdrant = _with_facet(_FakeQdrant(), {})
+def test_facet_values_empty_result(monkeypatch):
+    qdrant = _with_facet(_FakeQdrant(), [([], None)])
     monkeypatch.setitem(main.state, "qdrant", qdrant)
-    assert _run(main._facet_values("industry_names")) == []
-    qdrant2 = _with_facet(_FakeQdrant(), None)
-    monkeypatch.setitem(main.state, "qdrant", qdrant2)
     assert _run(main._facet_values("industry_names")) == []
 
 
 def test_facet_values_error_propagates(monkeypatch):
-    class _Boom:
-        async def request(self, **kwargs):
-            raise RuntimeError("qdrant down")
-
     qdrant = _FakeQdrant()
-    qdrant.http = types.SimpleNamespace(collections_api=types.SimpleNamespace(api_client=_Boom()))
+
+    async def _boom(**kwargs):
+        raise RuntimeError("qdrant down")
+
+    qdrant.scroll = _boom
     monkeypatch.setitem(main.state, "qdrant", qdrant)
     with pytest.raises(RuntimeError):
         _run(main._facet_values("industry_names"))
