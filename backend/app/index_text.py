@@ -19,7 +19,7 @@ Helpers shared by the index scripts (fetch/build/update) and the API.
 import html
 import json
 import re
-from datetime import UTC, datetime
+from datetime import datetime
 
 from app.config import config
 
@@ -80,7 +80,19 @@ def record_from_row(row: dict) -> dict:
 
 
 def normalize_date(value):
-    """MySQL datetime -> RFC 3339 string (or None), safe for Qdrant/parsing."""
+    """MySQL datetime -> RFC 3339 string (or None), safe for Qdrant/parsing.
+
+    The MySQL `publish` column is a naive wall-clock value in the database's
+    local timezone (no offset is stored). We deliberately do NOT attach a
+    hardcoded UTC offset here: assuming UTC would shift every date/year filter
+    by the DB's tz offset (e.g. +5:30 for IST) versus what users expect.
+
+    Naive datetimes are kept naive. Qdrant interprets a tz-less RFC 3339
+    timestamp as UTC, which matches how the filter side (`_parse_date` in
+    main.py) treats naive user input, so stored values and range filters
+    compare on a consistent wall-clock basis. If a configured timezone ever
+    becomes available, attach that tz here instead of assuming UTC.
+    """
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -93,8 +105,6 @@ def normalize_date(value):
             dt = datetime.fromisoformat(s.replace(" ", "T", 1) if "T" not in s else s)
         except ValueError:
             return s
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
     return dt.isoformat()
 
 
