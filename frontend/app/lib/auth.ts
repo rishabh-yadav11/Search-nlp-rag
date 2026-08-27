@@ -5,7 +5,10 @@ export const TOKEN_KEY = 'vccircle_auth_token'
 export const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
-  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
+  // Only default to the local backend in development. In production an unset
+  // base falls back to same-origin relative requests rather than leaking the
+  // auth token to localhost:8000 (NEXT_PUBLIC_API_BASE must be set at build).
+  (process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '')
 
 export function getToken(): string | null {
   try {
@@ -21,6 +24,8 @@ export function setToken(token: string): void {
   } catch {
     /* storage unavailable */
   }
+  // Login (or re-login) may change role/is_active; drop any stale cached user.
+  clearMeCache()
 }
 
 export function clearToken(): void {
@@ -29,6 +34,8 @@ export function clearToken(): void {
   } catch {
     /* storage unavailable */
   }
+  // Logout invalidates the cached user so it is never served stale.
+  clearMeCache()
 }
 
 export function authHeaders(init?: RequestInit): Headers {
@@ -48,37 +55,60 @@ export interface AuthUser {
 
 let meCache: AuthUser | null | undefined
 let meCacheToken: string | null = null
+let meCacheTs = 0
+
+// Configurable TTL so role/is_active changes are eventually picked up even if
+// the caller forgets to clear the cache. 0 disables the time-based expiry.
+const ME_CACHE_TTL_MS = Number(process.env.NEXT_PUBLIC_ME_CACHE_TTL_MS || 60000)
 
 /** Fetch the current authenticated user (`/api/auth/me`), cached per token.
- *  Returns null when logged out or the token is rejected. Never redirects. */
+ *  Returns null when the token is missing/rejected (401) or when the request
+ *  fails (network/transport error or non-2xx). On a network/transport failure
+ *  the token is preserved (not cleared) so a later retry can recover — callers
+ *  must not treat a null return as a definitive "logged out" without also
+ *  checking the token. Network failures are logged, not thrown, so existing
+ *  `.catch` handlers don't misinterpret them as auth rejection. Never redirects. */
 export async function getMe(force = false): Promise<AuthUser | null> {
   const token = getToken()
   if (!token) {
-    meCache = null
-    meCacheToken = null
+    clearToken()
     return null
   }
-  if (!force && meCache !== undefined && meCacheToken === token) return meCache
+  const fresh = meCache !== undefined && meCacheToken === token && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
+  if (!force && fresh) return meCache ?? null
+  let res: Response
   try {
-    const res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
-    if (res.status === 401) {
-      clearToken()
-      meCache = null
-      meCacheToken = null
-      return null
-    }
-    if (!res.ok) return null
-    meCache = (await res.json()) as AuthUser
-    meCacheToken = token
-    return meCache
-  } catch {
+    res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
+  } catch (err) {
+    // Network/transport failure: do NOT treat as "not authenticated" (preserve
+    // the token so a later retry can succeed), but surface it rather than
+    // swallowing it. Returning null here is graceful; callers that need the
+    // underlying error can inspect console output.
+    console.error('getMe: failed to reach the auth service', err)
     return null
   }
+  if (res.status === 401) {
+    clearToken()
+    return null
+  }
+  if (!res.ok) return null
+  try {
+    meCache = (await res.json()) as AuthUser
+  } catch {
+    // Malformed/non-JSON 200 response: don't throw (callers may lack a
+    // .catch); treat as an unexpected payload and return null safely.
+    console.error('getMe: failed to parse /api/auth/me response')
+    return null
+  }
+  meCacheToken = token
+  meCacheTs = Date.now()
+  return meCache
 }
 
 export function clearMeCache(): void {
   meCache = undefined
   meCacheToken = null
+  meCacheTs = 0
 }
 
 /** Redirect to the login page (used when the backend rejects an expired token).
