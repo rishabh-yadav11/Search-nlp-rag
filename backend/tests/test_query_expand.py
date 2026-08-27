@@ -56,3 +56,11 @@ def test_ai_concept_expands_to_multi_token_terms_by_default():
 def test_expand_returns_query_unchanged_when_no_term_fits_token_budget(monkeypatch):
     monkeypatch.setattr(query_expand, "_MAX_EXTRA_TOKENS", 1)
     assert expand_query("ai") == "ai"
+
+
+def test_expand_does_not_trigger_on_substring_inside_words():
+    """Short triggers ('ai'/'ml'/'ev') must match on word boundaries, not as
+    substrings of unrelated words like email/small/every."""
+    assert expand_query("send me an email") == "send me an email"
+    assert expand_query("a small business") == "a small business"
+    assert expand_query("every weekend deal") == "every weekend deal"
