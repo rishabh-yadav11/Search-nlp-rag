@@ -199,26 +199,46 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
                 },
             )
 
-        executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
+        max_workers = max(1, config.INDEXER_WORKERS)
+        executor = ThreadPoolExecutor(max_workers=max_workers)
         pending = deque()
 
         def submit(batch):
             dense_texts = [compose_dense_text(r) for r in batch]
             sparse_texts = [compose_sparse_text(r) for r in batch]
-            pending.append((batch, executor.submit(encode_batch, dense_texts, sparse_texts)))
+            pending.append(
+                (batch, executor.submit(encode_batch, dense_texts, sparse_texts))
+            )
 
-        def upsert_one():
+        def drain_one():
+            """Gather one pending future, upsert it, and surface per-batch errors.
+
+            A failed batch is logged and skipped (its state stays unchanged so it
+            is retried next run) rather than aborting the whole index update.
+            """
             batch, future = pending.popleft()
-            dense_vecs, sparse_vecs = future.result()
-            points = [build_point(r, dvec, svec) for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)]
             try:
-                client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
+                dense_vecs, sparse_vecs = future.result()
             except Exception as e:
                 log(
-                    f"ERROR: upsert of batch ending at id {batch[-1]['id']} failed; state "
-                    f"NOT updated (batch will be retried next run): {e}",
+                    f"ERROR: encoding batch ending at id {batch[-1]['id']} failed; "
+                    f"skipped (will be retried next run): {e}",
                 )
-                raise
+                return
+            points = [
+                build_point(r, dvec, svec)
+                for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)
+            ]
+            try:
+                client.upsert(
+                    collection_name=config.QDRANT_COLLECTION, points=points, wait=True
+                )
+            except Exception as e:
+                log(
+                    f"ERROR: upsert of batch ending at id {batch[-1]['id']} failed; "
+                    f"state NOT updated (batch will be retried next run): {e}",
+                )
+                return
 
             for r in batch:
                 state_fps[str(r["id"])] = fingerprint(r)
@@ -230,12 +250,15 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
             for start in range(0, len(to_index), batch_size):
                 batch = [records[i] for i in to_index[start : start + batch_size]]
                 submit(batch)
-                while len(pending) >= config.INDEXER_WORKERS:
-                    upsert_one()
+                # Bound in-flight work to the worker count so memory and
+                # concurrency stay bounded even when encoding outpaces upserts.
+                while len(pending) >= max_workers:
+                    drain_one()
             while pending:
-                upsert_one()
+                drain_one()
         finally:
-            executor.shutdown(wait=False)
+            # Wait for any still-running workers so no futures are dropped.
+            executor.shutdown(wait=True)
     finally:
         if client is not None:
             client.close()
