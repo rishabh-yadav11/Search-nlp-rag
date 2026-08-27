@@ -199,11 +199,19 @@ def _year_is_event_reference(query: str, year: int) -> bool:
 
 def _full_year(y: int, near: int) -> int:
     """Expand a 2-digit year to 4 digits near ``near`` (e.g. '25' near 2024 ->
-    2025), handling century rollover ('99' near 2024 -> 1999)."""
+    2025), handling century rollover ('99' near 2024 -> 1999).
+
+    A 50-year pivot is used: the 2-digit year is placed in ``near``'s century,
+    then rolled back a century if it falls more than 50 years ahead of ``near``
+    (e.g. '99' -> 2099 -> 1999) or forward a century if it falls more than 50
+    years behind (e.g. '20' near 2071 -> 1920 -> 2020)."""
     if y >= 100:
         return y
-    full = (near // 100) * 100 + y
-    if full < near - 50:
+    base = (near // 100) * 100
+    full = base + y
+    if full - near > 50:
+        full -= 100
+    elif full - near < -50:
         full += 100
     return full
 
@@ -234,14 +242,24 @@ def _extract_month_span(query: str) -> tuple[str, str] | None:
     m = _MONTH_SPAN_RE.search(query)
     if not m:
         return None
-    m1, y1, m2, y2 = _MONTHS[m.group(1)], m.group(2), _MONTHS[m.group(3)], m.group(4)
-    year = int(y2 or y1) if (y2 or y1) else _current_year()
-    if m1 <= m2:
-        end_year = year
+    m1, y1, y2 = _MONTHS[m.group(1)], m.group(2), m.group(4)
+    m2 = _MONTHS[m.group(3)]
+    if y1 and y2:
+        # Two explicit years: honor each side's year exactly (e.g. 'dec 2023 to
+        # jan 2024' -> start 2023-12, end 2024-01).
+        start_year, end_year = int(y1), int(y2)
+    elif y2 or y1:
+        year = int(y2 or y1)
+        start_year = end_year = year
+        if m1 > m2:
+            end_year = year + 1
     else:
-        end_year = year + 1
+        year = _current_year()
+        start_year = end_year = year
+        if m1 > m2:
+            end_year = year + 1
     end_last = calendar.monthrange(end_year, m2)[1]
-    return (f"{year}-{m1:02d}-01", f"{end_year}-{m2:02d}-{end_last:02d}")
+    return (f"{start_year}-{m1:02d}-01", f"{end_year}-{m2:02d}-{end_last:02d}")
 
 
 def _quarter_range(query: str) -> tuple[str, str] | None:
