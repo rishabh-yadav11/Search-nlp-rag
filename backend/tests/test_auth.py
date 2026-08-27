@@ -395,54 +395,78 @@ def test_change_password_invalidates_other_tokens(tmp_path):
 
 
 def test_concurrent_create_duplicate_race_no_poison(tmp_path):
-    """The loser of a create_user race must roll back so its connection is not
-    left holding an open write transaction (which would lock the whole DB)."""
-    async def main():
-        store = AuthStore(str(tmp_path / "auth.db"))
-        await store.connect()
-        auth.store = store
+    """Two separate connections racing to INSERT the same UNIQUE email must yield
+    exactly one success and one DuplicateEmailError. Each attempt gets its own
+    AuthStore/connection: a single SQLite connection must never be shared across
+    concurrent coroutines (that was the source of the flakiness)."""
+    db_path = str(tmp_path / "auth.db")
+
+    async def attempt(name: str):
+        s = AuthStore(db_path)
+        await s.connect()
         try:
-            results = await asyncio.gather(
-                store.create_user("race@x.co", "secret12", "A", "user"),
-                store.create_user("race@x.co", "secret12", "B", "user"),
-                return_exceptions=True,
-            )
-            ok = [r for r in results if isinstance(r, StoredUser)]
-            dup = [r for r in results if isinstance(r, DuplicateEmailError)]
-            assert len(ok) == 1 and len(dup) == 1
-            # the failed insert must not have poisoned the connection
-            u = await store.create_user("after@x.co", "secret12", "C", "user")
-            token = await store.issue_token(u.id, 7)
-            assert (await store.user_for_token(token)).id == u.id
+            return await s.create_user("race@x.co", "secret12", name, "user")
         finally:
-            await store.close()
+            await s.close()
+
+    async def main():
+        # Prime the schema once on a throwaway connection.
+        prime = AuthStore(db_path)
+        await prime.connect()
+        await prime.close()
+
+        results = await asyncio.gather(attempt("A"), attempt("B"), return_exceptions=True)
+        ok = [r for r in results if isinstance(r, StoredUser)]
+        dup = [r for r in results if isinstance(r, DuplicateEmailError)]
+        assert len(ok) == 1 and len(dup) == 1
+        # the failed insert must not have poisoned either connection (use a fresh one)
+        after = AuthStore(db_path)
+        await after.connect()
+        try:
+            u = await after.create_user("after@x.co", "secret12", "C", "user")
+            token = await after.issue_token(u.id, 7)
+            assert (await after.user_for_token(token)).id == u.id
+        finally:
+            await after.close()
             auth.store = None
 
     asyncio.run(main())
 
 
 def test_signup_duplicate_race_returns_409(tmp_path):
-    import threading
+    """Two concurrent duplicate signups must yield exactly one 200 and one 409.
 
-    client, s = _auth_app(tmp_path)
-    try:
-        barrier = threading.Barrier(2)
-        statuses = []
+    The race is exercised as two coroutines on a single event loop (via an
+    ASGI transport) rather than two OS threads sharing one TestClient — the
+    latter is flaky because the store's SQLite connection is bound to the
+    thread it was opened on, so a cross-thread request can error out
+    intermittently. Coroutines keep the connection on one loop while still
+    racing the INSERTs. The store is opened/closed inside the same coroutine so
+    its aiosqlite connection stays bound to the loop that runs the requests."""
+    import asyncio
 
-        def do_signup():
-            barrier.wait()
-            statuses.append(client.post("/api/auth/signup", json={"email": "same@x.co", "password": "secret12"}).status_code)
+    import httpx
+    from fastapi import FastAPI
 
-        t1 = threading.Thread(target=do_signup)
-        t2 = threading.Thread(target=do_signup)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-        assert sorted(statuses) == [200, 409]
-    finally:
-        auth.store = None
-        asyncio.run(s.close())
+    async def main():
+        s = AuthStore(str(tmp_path / "auth.db"))
+        await s.connect()
+        auth.store = s
+        try:
+            app = FastAPI()
+            app.include_router(auth.router)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                results = await asyncio.gather(
+                    client.post("/api/auth/signup", json={"email": "same@x.co", "password": "secret12"}),
+                    client.post("/api/auth/signup", json={"email": "same@x.co", "password": "secret12"}),
+                )
+                assert sorted(r.status_code for r in results) == [200, 409]
+        finally:
+            await s.close()
+            auth.store = None
+
+    asyncio.run(main())
 
 
 def test_bootstrap_admin_survives_duplicate_and_lock_races(tmp_path, monkeypatch):
