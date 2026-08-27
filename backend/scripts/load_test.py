@@ -65,11 +65,14 @@ def main() -> None:
     total_s = time.perf_counter() - t0
 
     latencies.sort()
-    p = lambda q: statistics.quantiles(latencies, n=100)[q - 1]
     label = f"workers={args.workers or '?'}"
+    if len(latencies) >= 2:
+        p = lambda q: statistics.quantiles(latencies, n=100)[q - 1]
+        pctl = f"p50={p(50):.0f}ms p95={p(95):.0f}ms p99={p(99):.0f}ms"
+    else:
+        pctl = "p50=- p95=- p99=- (need >=2 samples)"
     print(f"[{args.mode:>4}] {label}  total={args.total} conc={args.concurrency} "
-          f"time={total_s:.2f}s  rps={args.total / total_s:.1f}  "
-          f"p50={p(50):.0f}ms p95={p(95):.0f}ms p99={p(99):.0f}ms")
+          f"time={total_s:.2f}s  rps={args.total / total_s:.1f}  {pctl}")
 
 
 if __name__ == "__main__":
