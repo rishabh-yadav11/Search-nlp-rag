@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders, getMe, getToken, redirectToLogin } from '../../lib/auth'
 
@@ -118,27 +118,74 @@ export default function AnalyticsDashboardPage() {
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
 
+  // Tracks the in-flight load so a polling tick can't race a previous
+  // load still running, and so we can abort the request on unmount.
+  const inFlight = useRef(false)
+  const controllerRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
+  const FETCH_TIMEOUT_MS = 15000
+  const GETME_TIMEOUT_MS = 10000
+
+  // Races the given promise against a timeout. Resolves with `{ timedOut: true }`
+  // if the promise doesn't settle in time (so a hung getMe can't keep inFlight
+  // stuck true forever), otherwise returns the resolved value. The dangling
+  // timer is always cleared once the wrapped promise settles.
+  function withTimeout<T>(p: Promise<T>, ms: number): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+    let timer: ReturnType<typeof setTimeout>
+    const onTimeout = new Promise<{ timedOut: true }>((resolve) => {
+      timer = setTimeout(() => resolve({ timedOut: true }), ms)
+    })
+    const onSettle = p.then(
+      (value) => {
+        clearTimeout(timer)
+        return { timedOut: false, value }
+      },
+      (err) => {
+        clearTimeout(timer)
+        throw err
+      },
+    )
+    return Promise.race([onSettle, onTimeout])
+  }
+
   async function load() {
+    // Skip a poll if a previous load is still in flight; we never want
+    // two overlapping fetches overwriting each other.
+    if (inFlight.current) return
     if (!getToken()) {
       redirectToLogin('/analytics/dashboard')
       return
     }
+    inFlight.current = true
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
-      const me = await getMe()
+      // Guard against a hung getMe: race it with a timeout, and release
+      // inFlight below regardless of how this resolves.
+      const meResult = await withTimeout(getMe(), GETME_TIMEOUT_MS)
+      if (meResult.timedOut) {
+        if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
+        return
+      }
+      const me = meResult.value
       if (!me) {
+        // Genuine auth rejection (401/expired token) or a network failure:
+        // send the user to login, restoring the original behavior.
         redirectToLogin('/analytics/dashboard')
         return
       }
+      if (!mountedRef.current) return
       // Client-side admin gate is a UX convenience only. Authoritative
       // enforcement happens in the backend API (which rejects non-admin
       // requests), so this check can never be the source of truth.
       if (me.role !== 'admin') {
-        setForbidden(true)
+        if (mountedRef.current) setForbidden(true)
         return
       }
       const [sRes, cRes] = await Promise.all([
-        fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders() }),
-        fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders() }),
+        fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders(), signal: controller.signal }),
+        fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders(), signal: controller.signal }),
       ])
       if (sRes.status === 401 || cRes.status === 401) {
         redirectToLogin('/analytics/dashboard')
@@ -146,19 +193,31 @@ export default function AnalyticsDashboardPage() {
       }
       if (!sRes.ok) throw new Error(`summary returned HTTP ${sRes.status}`)
       if (!cRes.ok) throw new Error(`chat returned HTTP ${cRes.status}`)
+      if (!mountedRef.current) return
       setSummary((await sRes.json()) as Summary)
       setChat((await cRes.json()) as ChatStats)
       setError('')
       setUpdated(`Updated ${new Date().toLocaleTimeString()}`)
     } catch (e) {
-      setError(`Analytics unavailable: ${(e as Error).message}`)
+      // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.
+      if ((e as Error).name === 'AbortError') return
+      if (mountedRef.current) setError(`Analytics unavailable: ${(e as Error).message}`)
+    } finally {
+      clearTimeout(timeout)
+      inFlight.current = false
+      controllerRef.current = null
     }
   }
 
   useEffect(() => {
     load()
     const t = setInterval(load, 30000)
-    return () => clearInterval(t)
+    return () => {
+      mountedRef.current = false
+      clearInterval(t)
+      // Abort any in-flight load so an unmounted component never sets state.
+      controllerRef.current?.abort()
+    }
   }, [])
 
   function logout() {
