@@ -63,8 +63,12 @@ def load_checkpoint() -> int:
 
 
 def save_checkpoint(line_num: int):
-    with open(CHECKPOINT_PATH, "w") as f:
+    tmp_path = f"{CHECKPOINT_PATH}.tmp"
+    with open(tmp_path, "w") as f:
         f.write(str(line_num))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, CHECKPOINT_PATH)
 
 
 def backup_collection_best_effort(client: QdrantClient):
@@ -113,7 +117,7 @@ def ensure_collection(client: QdrantClient) -> bool:
     if sparse_cfg is not None:
         inner = sparse_cfg.sparse if hasattr(sparse_cfg, "sparse") else sparse_cfg.get("sparse")
         modifier = inner.get("modifier") if isinstance(inner, dict) else getattr(inner, "modifier", None)
-    needs_idf = bool(modifier == Modifier.IDF)
+    needs_idf = modifier is not None and modifier == Modifier.IDF
 
     if needs_idf and dim_matches:
         print(f"Collection '{config.QDRANT_COLLECTION}' already exists, resuming upserts into it")
@@ -272,15 +276,16 @@ def main():
     try:
         info = client.get_collection(config.QDRANT_COLLECTION)
         count = info.points_count or 0
-        # Compare against the FULL dataset size, not the number of lines processed
-        # this run. A resume-from-checkpoint shortfall (e.g. rows skipped because
-        # the collection was recreated after a stale checkpoint) would otherwise
-        # pass verification even though the index is incomplete.
-        if count < total:
+        # Expected points = valid articles (total lines minus malformed lines
+        # that were skipped and can never be indexed). Comparing against the
+        # full dataset size would wrongly flag INCOMPLETE whenever some lines
+        # were skipped, even though the sync actually succeeded.
+        expected = total - skipped
+        if count < expected:
             log(
                 f"ERROR: collection '{config.QDRANT_COLLECTION}' has {count} points "
-                f"but the dataset has {total} articles ({total - count} missing). "
-                f"The index is INCOMPLETE — investigate before going live.",
+                f"but the valid dataset has {expected} articles ({expected - count} "
+                f"missing). The index is INCOMPLETE — investigate before going live.",
             )
         elif count > total:
             log(
@@ -289,7 +294,10 @@ def main():
                 f"previous schema). Consider a clean rebuild.",
             )
         else:
-            log(f"verified: {count} points in collection == {total} dataset articles")
+            log(
+                f"verified: {count} points in collection match the {expected} valid "
+                f"dataset articles (build complete).",
+            )
     except Exception as e:
         log(f"WARNING: could not verify points_count: {e}")
     print("Index build complete.")
