@@ -169,7 +169,7 @@ def _fake_client(calls):
         async def __aenter__(self):
             return self
 
-        def __aexit__(self, *exc):
+        async def __aexit__(self, *exc):
             return False
 
         async def incrbyfloat(self, key, amount):
@@ -194,7 +194,7 @@ def _raise_runtime_error_client(*args, **kwargs):
         async def __aenter__(self):
             raise RuntimeError("redis down")
 
-        def __aexit__(self, *exc):
+        async def __aexit__(self, *exc):
             return False
 
     class Client:
