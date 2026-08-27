@@ -60,8 +60,8 @@ def test_build_facet_filter_dates():
     assert all(isinstance(c.range, DatetimeRange) for c in date_conds)
     gtes = [c.range.gte for c in date_conds]
     ltes = [c.range.lte for c in date_conds]
-    assert _dt(2025, 1, 1, tzinfo=UTC) in gtes
-    assert _dt(2025, 12, 31, 23, 59, 59, 999999, tzinfo=UTC) in ltes
+    assert _dt(2025, 1, 1, tzinfo=UTC).isoformat() in gtes
+    assert _dt(2025, 12, 31, 23, 59, 59, 999999, tzinfo=UTC).isoformat() in ltes
 
 
 def test_build_facet_filter_none_when_unfiltered():
