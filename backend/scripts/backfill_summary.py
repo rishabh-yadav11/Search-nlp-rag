@@ -1,8 +1,9 @@
 """One-off backfill: populate the `summary` payload field for Qdrant points
 that were indexed before summaries were stored (empty summary). Reads the same
 MySQL rows as the indexer, scrolls Qdrant for points with an empty summary,
-and sets the payload in small batches with wait=True, using a fresh client per
-batch so a long-lived connection can't die mid-run. Idempotent; safe to rerun.
+and sets the payload in small batches with wait=True. A single Qdrant client is
+created for the whole run and closed in a finally block. Idempotent; safe to
+rerun.
 """
 import asyncio
 import os
@@ -24,10 +25,9 @@ def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def scroll_empty_points() -> list[int]:
+def scroll_empty_points(client: QdrantClient) -> list[int]:
     """All point IDs whose summary payload is empty/absent."""
     ids: list[int] = []
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     next_offset = None
     while True:
         pts, next_offset = client.scroll(
@@ -46,10 +46,9 @@ def scroll_empty_points() -> list[int]:
     return ids
 
 
-def set_summary(records: dict[int, dict], batch: list[int]):
+def set_summary(client: QdrantClient, records: dict[int, dict], batch: list[int]):
     """Set each point's own summary. set_payload applies one dict to many
     points, so a single client+per-point calls keep the payloads distinct."""
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     for pid in batch:
         client.set_payload(
             collection_name=config.QDRANT_COLLECTION,
@@ -64,34 +63,37 @@ def main():
         log("ERROR: MYSQL_PASSWORD not set; refusing to run (would fetch nothing)")
         return 1
 
-    empty_ids = scroll_empty_points()
-    log(f"scrolled: {len(empty_ids)} points with empty summary")
+    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    try:
+        empty_ids = scroll_empty_points(client)
+        log(f"scrolled: {len(empty_ids)} points with empty summary")
 
-    if not empty_ids:
-        log("nothing to backfill")
-        return 0
+        if not empty_ids:
+            log("nothing to backfill")
+            return 0
 
-    records = asyncio.run(fetch_records())
-    log(f"fetched {len(records)} MySQL rows for id->summary mapping")
+        records = asyncio.run(fetch_records())
+        log(f"fetched {len(records)} MySQL rows for id->summary mapping")
 
-    batches = [empty_ids[i : i + BATCH_SIZE] for i in range(0, len(empty_ids), BATCH_SIZE)]
-    updated = 0
-    for n, batch in enumerate(batches, 1):
-        missing = [i for i in batch if i not in records]
-        if missing:
-            log(f"WARNING: batch {n} has {len(missing)} ids not in MySQL (skipping them)")
-            batch = [i for i in batch if i in records]
-        if not batch:
-            continue
-        try:
-            set_summary(records=records, batch=batch)
+        batches = [empty_ids[i : i + BATCH_SIZE] for i in range(0, len(empty_ids), BATCH_SIZE)]
+        updated = 0
+        for n, batch in enumerate(batches, 1):
+            missing = [i for i in batch if i not in records]
+            if missing:
+                log(f"WARNING: batch {n} has {len(missing)} ids not in MySQL (skipping them)")
+                batch = [i for i in batch if i in records]
+            if not batch:
+                continue
+            set_summary(client=client, records=records, batch=batch)
             updated += len(batch)
-        except Exception as e:
-            log(f"ERROR: batch {n} (ids {batch[0]}..{batch[-1]}) failed: {e}")
-            log("STOPPED — fix the error and rerun (script is idempotent)")
-            return 1
-        if n % 25 == 0 or n == len(batches):
-            log(f"progress: {updated}/{len(empty_ids)} ({n}/{len(batches)} batches)")
+            if n % 25 == 0 or n == len(batches):
+                log(f"progress: {updated}/{len(empty_ids)} ({n}/{len(batches)} batches)")
+    except Exception as e:
+        log(f"ERROR: batch failed: {e}")
+        log("STOPPED — fix the error and rerun (script is idempotent)")
+        return 1
+    finally:
+        client.close()
 
     log(f"done: set summary on {updated} points")
     return 0
