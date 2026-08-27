@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from collections import OrderedDict
 
 import redis.asyncio as aioredis
 
@@ -20,7 +21,8 @@ class HybridCache:
     def __init__(self, redis_url: str, ttl: int, maxsize: int):
         self._url = redis_url
         self._ttl = ttl
-        self._mem: dict[str, tuple[object, float]] = {}
+        self._maxsize = maxsize
+        self._mem: "OrderedDict[str, tuple[object, float]]" = OrderedDict()
         self._redis = None
         self._warned = False
 
@@ -60,6 +62,7 @@ class HybridCache:
         if expires_at <= time.monotonic():
             self._mem.pop(key, None)
             return None
+        self._mem.move_to_end(key)
         return value
 
     async def set(self, key: str, value, ttl: int | None = None) -> None:
@@ -70,6 +73,9 @@ class HybridCache:
             self._degraded(exc)
         effective_ttl = self._ttl if ttl is None else ttl
         self._mem[key] = (value, time.monotonic() + effective_ttl)
+        self._mem.move_to_end(key)
+        while len(self._mem) > self._maxsize:
+            self._mem.popitem(last=False)
 
     async def close(self) -> None:
         if self._redis is not None:
