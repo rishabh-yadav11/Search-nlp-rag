@@ -87,7 +87,11 @@ def _http_json(url: str, payload: dict | None = None, method: str | None = None,
 
 
 def _coerce_score(value: object) -> float:
-    return value if isinstance(value, (int, float)) else 0
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0
 
 
 async def fetch_rows():
