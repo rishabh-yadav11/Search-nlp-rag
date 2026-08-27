@@ -138,12 +138,13 @@ def backfill(records: dict[int, dict], missing: list[int]):
         while pending:
             upsert_one()
     finally:
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=True)
         client.close()
 
 
-def reconcile(records: dict[int, dict]):
-    ids = qdrant_ids()
+def reconcile(records: dict[int, dict], ids: set[int] | None = None):
+    if ids is None:
+        ids = qdrant_ids()
     db_ids = set(records)
     missing = db_ids - ids
     extra = ids - db_ids
@@ -166,7 +167,8 @@ def main() -> None:
     else:
         log(f"backfilling {len(missing)} missing articles...")
         backfill(records, missing)
-    reconcile(records)
+        ids = qdrant_ids()
+    reconcile(records, ids)
     log(f"done in {time.perf_counter() - start:.2f}s")
 
 
