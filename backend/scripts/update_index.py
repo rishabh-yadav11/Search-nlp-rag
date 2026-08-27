@@ -65,7 +65,8 @@ def save_state(state: dict):
     os.replace(tmp, STATE_PATH)
 
 
-def fingerprint(rec: dict) -> str:
+def fingerprint(rec: dict, include_body: bool = True) -> str:
+    body = (rec.get("body") or "") if include_body else ""
     raw = "|".join(
         [
             rec.get("title") or "",
@@ -73,7 +74,7 @@ def fingerprint(rec: dict) -> str:
             rec.get("url") or "",
             rec.get("published_date") or "",
             rec.get("category") or "",
-            rec.get("body") or "",
+            body,
             ",".join(rec.get("author_names") or []),
             ",".join(rec.get("industry_names") or []),
             ",".join(rec.get("dealtype_names") or []),
@@ -82,8 +83,16 @@ def fingerprint(rec: dict) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-async def fetch_records() -> dict[int, dict]:
-    """All published rows, mapped to the canonical indexed record."""
+async def fetch_records(
+    with_body: bool = True, ids: list[int] | None = None
+) -> dict[int, dict]:
+    """Published rows mapped to the canonical indexed record.
+
+    `with_body=False` omits the (potentially large) body column for callers that
+    only need ids/metadata (e.g. delta detection), and `ids` restricts the
+    result set to a specific set of article ids (used to fetch full bodies only
+    for the rows that actually need (re)indexing).
+    """
     pool = await aiomysql.create_pool(
         host=config.MYSQL_HOST,
         port=config.MYSQL_PORT,
@@ -93,13 +102,23 @@ async def fetch_records() -> dict[int, dict]:
         autocommit=True,
         minsize=1,
         maxsize=3,
+        connect_timeout=10,
+        read_timeout=30,
+        write_timeout=30,
     )
+    body_select = "body," if with_body else ""
+    where = "WHERE status = 1"
+    params: list = []
+    if ids is not None:
+        placeholders = ",".join(["%s"] * len(ids))
+        where = f"WHERE status = 1 AND feid IN ({placeholders})"
+        params = list(ids)
     query = f"""
         SELECT
             feid,
             title,
             summary,
-            body,
+            {body_select}
             slug,
             {EXTERNAL_URL_SQL} AS ext_url,
             publish,
@@ -108,13 +127,15 @@ async def fetch_records() -> dict[int, dict]:
             industry_names,
             dealtype_names
         FROM {config.MYSQL_TABLE}
-        WHERE status = 1
+        {where}
     """
     records: dict[int, dict] = {}
     try:
         async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(query)
+            await cur.execute(query, params)
             async for row in cur:
+                if not with_body:
+                    row["body"] = ""
                 rec = record_from_row(row)
                 records[rec["id"]] = rec
     finally:
@@ -123,13 +144,22 @@ async def fetch_records() -> dict[int, dict]:
     return records
 
 
-def sync_delta(state: dict, records: dict[int, dict]):
+def sync_delta(state: dict, records: dict[int, dict], include_body: bool = True):
     state_fps = state.setdefault("fingerprints", {})
-    state_ids = {int(k) for k in state_fps}
+    state_ids: set[int] = set()
+    for k in state_fps:
+        try:
+            state_ids.add(int(k))
+        except (ValueError, TypeError):
+            continue
     db_ids = set(records)
 
     new = db_ids - state_ids
-    changed = {i for i in db_ids & state_ids if state_fps[str(i)] != fingerprint(records[i])}
+    changed = {
+        i
+        for i in db_ids & state_ids
+        if state_fps.get(str(i)) != fingerprint(records[i], include_body=include_body)
+    }
     deleted = state_ids - db_ids
     return new, changed, deleted
 
@@ -241,7 +271,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
                 return
 
             for r in batch:
-                state_fps[str(r["id"])] = fingerprint(r)
+                state_fps[str(r["id"])] = fingerprint(r, include_body=False)
             state["updated_at"] = datetime.now(UTC).isoformat()
             save_state(state)
             log(f"upserted {len(batch)} points (max_id={batch[-1]['id']})")
@@ -335,11 +365,11 @@ async def main():
         log("no state found — run 'python scripts/update_index.py --init' after a full build first")
         return
 
-    records = await fetch_records()
-    log(f"fetched {len(records)} published rows")
+    records = await fetch_records(with_body=False)
+    log(f"fetched {len(records)} published rows (metadata only)")
 
     if do_init:
-        state_fps = {str(i): fingerprint(records[i]) for i in records}
+        state_fps = {str(i): fingerprint(records[i], include_body=False) for i in records}
         state = {
             "updated_at": datetime.now(UTC).isoformat(),
             "fingerprints": state_fps,
@@ -348,7 +378,7 @@ async def main():
         log(f"seeded {len(state_fps)} fingerprints")
         return 0 if reconcile(state, records) else 1
 
-    new, changed, deleted = sync_delta(state, records)
+    new, changed, deleted = sync_delta(state, records, include_body=False)
     log(
         f"delta: {len(new)} new, {len(changed)} changed, {len(deleted)} deleted, "
         f"{len(records) - len(new) - len(changed) - len(deleted)} unchanged"
@@ -358,9 +388,11 @@ async def main():
         log(f"index current ({time.perf_counter() - start:.2f}s, models not loaded)")
         return 0 if reconcile(state, records) else 1
 
-    apply_delta(records, new, changed, deleted, state)
+    to_index = sorted(new | changed)
+    full_records = await fetch_records(with_body=True, ids=to_index)
+    apply_delta(full_records, new, changed, deleted, state)
     log(f"done in {time.perf_counter() - start:.2f}s")
-    return 0 if reconcile(state, records) else 1
+    return 0 if reconcile(state, full_records) else 1
 
 
 if __name__ == "__main__":
