@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
   AuthUser,
@@ -12,7 +12,7 @@ import {
 } from './lib/auth'
 
 type Result = {
-  id: number
+  id: number | string
   title: string
   url: string
   published_date: string
@@ -60,10 +60,22 @@ const SUGGESTIONS = [
   'top venture debt providers 2024',
 ]
 
-const API_BASE =
+const RAW_API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
   (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
+
+const SAFE_DEFAULT_BASE =
+  typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'
+
+const { API_BASE, API_BASE_ERROR } = (() => {
+  const candidate = String(RAW_API_BASE || '')
+  if (isSafeUrl(candidate)) return { API_BASE: candidate, API_BASE_ERROR: '' }
+  return {
+    API_BASE: SAFE_DEFAULT_BASE,
+    API_BASE_ERROR: `Invalid API_BASE "${candidate}"; requests will use ${SAFE_DEFAULT_BASE}.`,
+  }
+})()
 
 const TIMEOUT_MS = 30_000
 
@@ -94,7 +106,7 @@ function sanitizeResponse(raw: unknown): ResponseData {
     const r = (typeof item === 'object' && item !== null ? item : {}) as Record<string, unknown>
     const summary = typeof r.summary === 'string' ? r.summary.trim() : ''
     return {
-      id: typeof r.id === 'number' ? r.id : i,
+      id: typeof r.id === 'number' ? r.id : `missing-${i}-${typeof r.title === 'string' ? r.title : ''}-${typeof r.url === 'string' ? r.url : ''}`,
       title: typeof r.title === 'string' ? r.title : '',
       url: typeof r.url === 'string' ? r.url : '',
       published_date: typeof r.published_date === 'string' ? r.published_date : '',
@@ -158,7 +170,9 @@ export default function Page() {
     dealtype: [],
   })
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
+  const requestSeqRef = useRef(0)
   const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
+  const [configError, setConfigError] = useState('')
 
   useEffect(() => {
     if (!getToken()) {
@@ -176,6 +190,10 @@ export default function Page() {
     return () => {
       cancelled = true
     }
+  }, [])
+
+  useEffect(() => {
+    if (API_BASE_ERROR) setConfigError(API_BASE_ERROR)
   }, [])
 
   function logout() {
@@ -213,18 +231,19 @@ export default function Page() {
 
   async function run(qOverride?: string) {
     const q = (qOverride ?? query).trim()
-    if (loading) return
     if (!q) {
       setMeta('')
       setStatus({ kind: 'done', query: '', results: [], hint: 'Please enter a query to search.' })
       return
     }
 
+    const reqId = ++requestSeqRef.current
+    const isLatest = () => reqId === requestSeqRef.current
+
     submittedRef.current?.controller.abort()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort('timeout'), TIMEOUT_MS)
-    const submitted = { controller }
-    submittedRef.current = submitted
+    submittedRef.current = { controller }
 
     setLoading(true)
     setMeta('')
@@ -241,6 +260,7 @@ export default function Page() {
         signal: controller.signal,
       })
 
+      if (!isLatest()) return
       if (!res.ok) {
         const detail = await res.text()
         console.error(`Search API ${res.status}: ${detail}`)
@@ -253,6 +273,7 @@ export default function Page() {
       const cached = data.cached ? 'cached · ' : ''
       setMeta(`${cached}${data.latency_ms.toFixed(0)}ms server · ${(performance.now() - t0).toFixed(0)}ms round-trip`)
     } catch (err) {
+      if (!isLatest()) return
       if (!controller.signal.aborted) {
         console.error('Search API network error', err)
         setStatus({ kind: 'error', message: 'Something went wrong. Please try again.' })
@@ -261,7 +282,7 @@ export default function Page() {
       }
     } finally {
       clearTimeout(timer)
-      if (submittedRef.current === submitted) {
+      if (isLatest()) {
         submittedRef.current = null
         setLoading(false)
       }
@@ -448,6 +469,11 @@ export default function Page() {
           )}
 
         <div className="results-region" aria-live="polite" aria-busy={loading}>
+          {configError ? (
+            <div className="error" role="alert">
+              {configError}
+            </div>
+          ) : null}
           <div className="meta-row">{meta}</div>
           <ResultBlock status={status} sortBy={sortBy} onSort={setSortBy} hideLow={hideLow} onHideLow={setHideLow} />
         </div>
@@ -480,6 +506,10 @@ function ResultBlock({
   hideLow: boolean
   onHideLow: (v: boolean) => void
 }) {
+  const processedResults = useMemo(
+    () => (status.kind === 'done' ? filterByRelevance(sortResults(status.results, sortBy), hideLow) : []),
+    [status, sortBy, hideLow],
+  )
   switch (status.kind) {
     case 'idle':
       return <div className="empty">Results will appear here.</div>
@@ -528,15 +558,24 @@ function ResultBlock({
               Hide low relevance
             </label>
           </div>
-          {renderResults(filterByRelevance(sortResults(status.results, sortBy), hideLow), status.query)}
+          {renderResults(processedResults, status.query)}
         </div>
       )
   }
 }
 
+function parseLocalDate(s: string): number {
+  if (!s) return NaN
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [y, m, d] = s.split('-').map(Number)
+    return new Date(y, m - 1, d).getTime()
+  }
+  return Date.parse(s)
+}
+
 function formatDate(s: string): string {
   if (!s) return 'n/a'
-  const d = new Date(s)
+  const d = new Date(parseLocalDate(s))
   if (isNaN(d.getTime())) return s
   const now = Date.now()
   const diff = now - d.getTime()
@@ -564,8 +603,8 @@ function sortResults(items: Result[], sortBy: SortBy): Result[] {
   switch (sortBy) {
     case 'date_desc':
       return sorted.sort((a, b) => {
-        const da = Date.parse(a.published_date)
-        const db = Date.parse(b.published_date)
+        const da = parseLocalDate(a.published_date)
+        const db = parseLocalDate(b.published_date)
         if (!isNaN(da) && !isNaN(db)) return db - da
         if (!isNaN(db)) return 1
         if (!isNaN(da)) return -1
@@ -573,8 +612,8 @@ function sortResults(items: Result[], sortBy: SortBy): Result[] {
       })
     case 'date_asc':
       return sorted.sort((a, b) => {
-        const da = Date.parse(a.published_date)
-        const db = Date.parse(b.published_date)
+        const da = parseLocalDate(a.published_date)
+        const db = parseLocalDate(b.published_date)
         if (!isNaN(da) && !isNaN(db)) return da - db
         if (!isNaN(db)) return -1
         if (!isNaN(da)) return 1
