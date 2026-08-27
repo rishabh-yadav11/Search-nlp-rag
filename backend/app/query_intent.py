@@ -2,6 +2,7 @@ import calendar
 import re
 from datetime import date
 
+
 def _current_year() -> int:
     """The current year, computed at call time so resolution stays correct
     across a calendar-year boundary in a long-running process."""

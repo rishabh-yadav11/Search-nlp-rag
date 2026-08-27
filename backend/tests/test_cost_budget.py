@@ -162,10 +162,29 @@ def raise_runtime_error(*args, **kwargs):
 
 
 def _fake_client(calls):
+    class _Pipe:
+        def __init__(self, calls):
+            self._calls = calls
+
+        async def __aenter__(self):
+            return self
+
+        def __aexit__(self, *exc):
+            return False
+
+        def incrbyfloat(self, key, amount):
+            self._calls.append((key, amount))
+            return self
+
+        def expire(self, key, seconds):
+            return self
+
+        async def execute(self):
+            return None
+
     class Client:
-        async def incrbyfloat(self, key, amount):
-            calls.append((key, amount))
-            return amount
+        def pipeline(self):
+            return _Pipe(calls)
 
     return Client()
 
