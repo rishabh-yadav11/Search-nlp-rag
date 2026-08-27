@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 
 
-class _KeepAliveHandler(urllib.request.AbstractHTTPHandler):
+class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
     """Per-thread HTTP/1.1 keep-alive handler.
 
     urllib's default opener opens (and closes) a fresh socket for every
@@ -32,30 +32,59 @@ class _KeepAliveHandler(urllib.request.AbstractHTTPHandler):
     through a fixed-size ThreadPoolExecutor, so each worker thread serves many
     requests; this handler keeps one live connection per thread and reuses it,
     avoiding connect latency and socket churn.
+
+    It subclasses ``HTTPHandler``/``HTTPSHandler`` and is the ONLY protocol
+    opener registered (we build the ``OpenerDirector`` by hand rather than via
+    ``build_opener``), so our ``http_open``/``https_open`` actually win instead
+    of being shadowed by the default handlers.
     """
 
     _local = threading.local()
 
     def http_open(self, req):
+        return self._open(req, "http")
+
+    def https_open(self, req):
+        return self._open(req, "https")
+
+    def _open(self, req, scheme):
         netloc = req.host  # e.g. "localhost:8001"
         timeout = req.timeout or 120
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = http.client.HTTPConnection(netloc, timeout=timeout)
-            self._local.conn = conn
-        try:
-            return self._exchange(conn, req)
-        except (OSError, http.client.HTTPException):
-            # Server dropped the keep-alive socket; reconnect once.
-            conn = http.client.HTTPConnection(netloc, timeout=timeout)
-            self._local.conn = conn
-            return self._exchange(conn, req)
-
-    def _exchange(self, conn, req):
-        headers = dict(req.unredirected_hdrs)
-        headers.update(req.headers)
+        conn = self._conn(scheme, netloc, timeout)
+        headers = dict(req.header_items())
+        # Preserve the caller's header names verbatim; do NOT .title()/mangle
+        # multi-word header names (e.g. "Content-Type" -> "Content-Type" must
+        # stay intact).
         headers["Connection"] = "keep-alive"
-        headers = {name.title(): val for name, val in headers.items()}
+        try:
+            return self._exchange(conn, req, headers)
+        except (OSError, http.client.HTTPException):
+            # Server dropped the keep-alive socket; close the dead one so we
+            # don't leak it, then reconnect once on a fresh connection.
+            conn.close()
+            conn = self._new(scheme, netloc, timeout)
+            self._set_conn(conn)
+            return self._exchange(conn, req, headers)
+
+    def _conn(self, scheme, netloc, timeout):
+        key = (scheme, netloc)
+        conn = getattr(self._local, "conn", None)
+        if conn is None or getattr(self._local, "key", None) != key:
+            conn = self._new(scheme, netloc, timeout)
+            self._set_conn(conn, key)
+        return conn
+
+    def _set_conn(self, conn, key=None):
+        self._local.conn = conn
+        if key is not None:
+            self._local.key = key
+
+    def _new(self, scheme, netloc, timeout):
+        if scheme == "https":
+            return http.client.HTTPSConnection(netloc, timeout=timeout)
+        return http.client.HTTPConnection(netloc, timeout=timeout)
+
+    def _exchange(self, conn, req, headers):
         if conn.sock is None:
             conn.connect()
         conn.request(
@@ -70,7 +99,16 @@ class _KeepAliveHandler(urllib.request.AbstractHTTPHandler):
         return r
 
 
-_opener = urllib.request.build_opener(_KeepAliveHandler())
+# Build the opener by hand so the default HTTPHandler/HTTPSHandler are NOT also
+# registered (build_opener would add them and let their http_open win over
+# ours). We register our keep-alive handler plus the standard error/redirect
+# processors so 3xx and 4xx/5xx are handled like the normal opener.
+_opener = urllib.request.OpenerDirector()
+_opener.add_handler(_KeepAliveHandler())
+_opener.add_handler(urllib.request.HTTPRedirectHandler())
+_opener.add_handler(urllib.request.HTTPErrorProcessor())
+# OpenerDirector needs an UnknownHandler to reject unsupported schemes cleanly.
+_opener.add_handler(urllib.request.UnknownHandler())
 
 
 # Cold queries: each request gets a UNIQUE query so every one triggers a full
