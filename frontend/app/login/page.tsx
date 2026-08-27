@@ -3,12 +3,16 @@
 import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { API_BASE, getToken, setToken } from '../lib/auth'
+import { API_BASE, getToken, isSafeRedirect, setToken } from '../lib/auth'
 
 function LoginForm() {
   const router = useRouter()
   const params = useSearchParams()
-  const next = params.get('next') || '/chat'
+  // Only honor `next` when it is a safe, same-origin, root-relative path.
+  // Unvalidated values like `//evil.com` or `https://evil.com` would let an
+  // attacker redirect the victim off-site after login, so fall back to `/chat`.
+  const rawNext = params.get('next') || '/chat'
+  const next = isSafeRedirect(rawNext) ? rawNext : '/chat'
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
@@ -54,6 +58,12 @@ function LoginForm() {
         return
       }
       const data = (await res.json()) as { token: string }
+      // SECURITY: The JWT is persisted in localStorage, which is readable by any
+      // script on the origin — a single XSS can exfiltrate it. This is a known
+      // risk and must be fixed by a BACKEND change: issue the token as an
+      // httpOnly, Secure, SameSite cookie instead of returning it in JSON, so
+      // JS never sees it. Do NOT log, print, or include the token in error
+      // payloads. Keep this comment until the cookie migration lands.
       setToken(data.token)
       router.replace(next)
       // Navigate away immediately; no further state updates after this.
