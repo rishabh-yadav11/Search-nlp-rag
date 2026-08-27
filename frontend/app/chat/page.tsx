@@ -358,7 +358,7 @@ export default function ChatPage() {
         const { done, value } = await reader.read()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
-        const events = buffer.split('\n\n')
+        const events = buffer.replace(/\r\n/g, '\n').split('\n\n')
         buffer = events.pop() ?? ''
         for (const evt of events) {
           const lines = evt.split('\n')
