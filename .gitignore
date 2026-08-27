@@ -25,3 +25,4 @@ qdrant_config.yaml
 .pid/
 AGENTS.md
 backend/.coverage
+REVIEWER.md
