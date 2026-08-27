@@ -59,14 +59,14 @@ function TopTable({ rows }: { rows: [string, number][] | undefined }) {
     <table>
       <thead>
         <tr>
-          <th>Query</th>
-          <th className="num">Count</th>
-          <th></th>
+          <th scope="col">Query</th>
+          <th scope="col" className="num">Count</th>
+          <th scope="col"></th>
         </tr>
       </thead>
       <tbody>
-        {rows.map(([q, n]) => (
-          <tr key={q}>
+        {rows.map(([q, n], i) => (
+          <tr key={`topq-${i}-${q}`}>
             <td>{q}</td>
             <td className="num">{fmt(n)}</td>
             <td width="34%">
@@ -91,10 +91,10 @@ function ChatTable({
     <table>
       <thead>
         <tr>
-          <th>Conversation</th>
-          <th className="num">Msgs</th>
-          <th className="num">{cost ? 'Cost' : 'Tokens'}</th>
-          <th>Updated</th>
+          <th scope="col">Conversation</th>
+          <th scope="col" className="num">Msgs</th>
+          <th scope="col" className="num">{cost ? 'Cost' : 'Tokens'}</th>
+          <th scope="col">Updated</th>
         </tr>
       </thead>
       <tbody>
@@ -129,6 +129,9 @@ export default function AnalyticsDashboardPage() {
         redirectToLogin('/analytics/dashboard')
         return
       }
+      // Client-side admin gate is a UX convenience only. Authoritative
+      // enforcement happens in the backend API (which rejects non-admin
+      // requests), so this check can never be the source of truth.
       if (me.role !== 'admin') {
         setForbidden(true)
         return
@@ -137,7 +140,10 @@ export default function AnalyticsDashboardPage() {
         fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders() }),
         fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders() }),
       ])
-      if (sRes.status === 401 || cRes.status === 401) redirectToLogin('/analytics/dashboard')
+      if (sRes.status === 401 || cRes.status === 401) {
+        redirectToLogin('/analytics/dashboard')
+        return
+      }
       if (!sRes.ok) throw new Error(`summary returned HTTP ${sRes.status}`)
       if (!cRes.ok) throw new Error(`chat returned HTTP ${cRes.status}`)
       setSummary((await sRes.json()) as Summary)
@@ -217,8 +223,8 @@ export default function AnalyticsDashboardPage() {
                     <table>
                       <thead>
                         <tr>
-                          <th>Result slot</th>
-                          <th className="num">Clicks</th>
+                          <th scope="col">Result slot</th>
+                          <th scope="col" className="num">Clicks</th>
                         </tr>
                       </thead>
                       <tbody>
