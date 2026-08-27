@@ -151,6 +151,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
             for i in deleted:
                 state["fingerprints"].pop(str(i), None)
             log(f"deleted {len(deleted)} points")
+            save_state(state)
 
         to_index = new | changed
         if not to_index:
@@ -160,7 +161,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
         model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
         sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
 
-        state_fps = state.setdefault("fingerprints", {})
+        state_fps = state["fingerprints"]
         to_index = sorted(to_index)
         batch_size = config.EMBED_BATCH_SIZE
 
