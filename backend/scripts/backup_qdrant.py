@@ -27,21 +27,23 @@ from app.config import config
 
 def main():
     client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+    try:
+        if "--prune-only" in sys.argv:
+            removed = prune_backups(config.QDRANT_COLLECTION)
+            if removed:
+                for r in removed:
+                    log(f"pruned {r}")
+            else:
+                log(f"no backups to prune for '{config.QDRANT_COLLECTION}'")
+            return
 
-    if "--prune-only" in sys.argv:
-        removed = prune_backups(config.QDRANT_COLLECTION)
-        if removed:
-            for r in removed:
-                log(f"pruned {r}")
-        else:
-            log(f"no backups to prune for '{config.QDRANT_COLLECTION}'")
-        return
-
-    dest, snapshot_ok = make_backup(client, config.QDRANT_COLLECTION)
-    if dest is None:
-        log("backup failed — nothing was written")
-        sys.exit(1)
-    log(f"backup complete: {dest} (snapshot {'ok' if snapshot_ok else 'failed but artifacts copied'})")
+        dest, snapshot_ok = make_backup(client, config.QDRANT_COLLECTION)
+        if dest is None:
+            log("backup failed — nothing was written")
+            sys.exit(1)
+        log(f"backup complete: {dest} (snapshot {'ok' if snapshot_ok else 'failed but artifacts copied'})")
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
