@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders, getMe, getToken, redirectToLogin } from '../../lib/auth'
 
@@ -118,11 +118,24 @@ export default function AnalyticsDashboardPage() {
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
 
+  // Tracks the in-flight load so a polling tick can't race a previous
+  // load still running, and so we can abort the request on unmount.
+  const inFlight = useRef(false)
+  const controllerRef = useRef<AbortController | null>(null)
+  const FETCH_TIMEOUT_MS = 15000
+
   async function load() {
+    // Skip a poll if a previous load is still in flight; we never want
+    // two overlapping fetches overwriting each other.
+    if (inFlight.current) return
     if (!getToken()) {
       redirectToLogin('/analytics/dashboard')
       return
     }
+    inFlight.current = true
+    const controller = new AbortController()
+    controllerRef.current = controller
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
       const me = await getMe()
       if (!me) {
@@ -137,8 +150,8 @@ export default function AnalyticsDashboardPage() {
         return
       }
       const [sRes, cRes] = await Promise.all([
-        fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders() }),
-        fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders() }),
+        fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders(), signal: controller.signal }),
+        fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders(), signal: controller.signal }),
       ])
       if (sRes.status === 401 || cRes.status === 401) {
         redirectToLogin('/analytics/dashboard')
@@ -151,14 +164,24 @@ export default function AnalyticsDashboardPage() {
       setError('')
       setUpdated(`Updated ${new Date().toLocaleTimeString()}`)
     } catch (e) {
+      // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.
+      if ((e as Error).name === 'AbortError') return
       setError(`Analytics unavailable: ${(e as Error).message}`)
+    } finally {
+      clearTimeout(timeout)
+      inFlight.current = false
+      controllerRef.current = null
     }
   }
 
   useEffect(() => {
     load()
     const t = setInterval(load, 30000)
-    return () => clearInterval(t)
+    return () => {
+      clearInterval(t)
+      // Abort any in-flight load so an unmounted component never sets state.
+      controllerRef.current?.abort()
+    }
   }, [])
 
   function logout() {
