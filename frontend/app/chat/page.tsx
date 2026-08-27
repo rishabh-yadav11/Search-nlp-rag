@@ -378,7 +378,7 @@ export default function ChatPage() {
                 {s.title || 'New chat'}
               </div>
               <div className="chat-session-meta">
-                {relativeTime(s.updated_at)}
+                <span suppressHydrationWarning>{relativeTime(s.updated_at)}</span>
                 {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
               </div>
               <button
