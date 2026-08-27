@@ -19,7 +19,7 @@ Helpers shared by the index scripts (fetch/build/update) and the API.
 import html
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 
 from app.config import config
 
@@ -97,6 +97,11 @@ def normalize_date(value):
         return None
     if isinstance(value, datetime):
         dt = value
+        # Normalize any tz-aware input to naive wall-clock UTC so the stored
+        # string is always tz-less and compares uniformly with the tiebreaker
+        # in main.py (which strips only the +00:00/Z suffix).
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(UTC).replace(tzinfo=None)
     else:
         s = str(value).strip()
         if not s:
