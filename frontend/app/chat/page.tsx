@@ -305,6 +305,9 @@ export default function ChatPage() {
       let res: Response | null = null
       let lastErr: Error | null = null
       for (let attempt = 0; attempt <= SSE_MAX_RETRIES; attempt++) {
+        // Honor an intentional cancel (unmount / new session / switch) even
+        // mid-retry so we don't re-fetch the old session after a clear.
+        if (cancelledRef.current) break
         const ctrl = new AbortController()
         abortRef.current = ctrl
         let timedOut = false
@@ -331,6 +334,7 @@ export default function ChatPage() {
           if (ctrl.signal.aborted && !timedOut) break
           if (attempt < SSE_MAX_RETRIES) {
             await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
+            if (cancelledRef.current) break
           }
         } finally {
           clearTimeout(timer)
