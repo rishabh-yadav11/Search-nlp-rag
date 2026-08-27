@@ -75,7 +75,15 @@ def main():
         stored = scroll_stored_bodies(client)
         log(f"scrolled {len(stored)} stored bodies")
 
-        affected = [i for i, rec in records.items() if stored.get(i) != rec["body"]]
+        # Only update points that already exist in Qdrant (this is an in-place
+        # backfill). Rows whose id is absent from Qdrant are out of scope here
+        # (they get seeded by the normal index path), so excluding them prevents
+        # a massive unintended backfill when Qdrant is empty or partially built.
+        affected = [
+            i
+            for i, rec in records.items()
+            if i in stored and stored[i] != rec["body"]
+        ]
         log(f"points needing a body update: {len(affected)}")
 
         if not affected:
