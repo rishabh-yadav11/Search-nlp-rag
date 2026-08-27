@@ -136,7 +136,8 @@ def test_boost_min_share_gate(monkeypatch):
 
 def test_boost_min_share_floor_at_one(monkeypatch):
     _enable(monkeypatch, min_article=1, min_share=0.3, mult=2.0)
-    # total = 2 -> int(2*0.3) = 0 -> max(1, 0) = 1, so a single click qualifies.
+    # total = 1 (defaults to sum of by_id) -> int(1*0.3) = 0 -> max(1, 0) = 1,
+    # so a single click qualifies.
     monkeypatch.setattr(click_boost, "click_signals", _signals({1: 1}))
 
     out = _run(click_boost.apply_click_boost("q", [_res(1, 0.5)]))
