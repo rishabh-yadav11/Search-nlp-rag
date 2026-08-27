@@ -777,7 +777,10 @@ async def _facet_values(key: str) -> list[str]:
                 for item in v:
                     if isinstance(item, str) and item:
                         values.add(item)
-        if next_offset is None:
+        if next_offset is None or not pts:
+            # `not pts` guards against a defensive edge case where the client
+            # returns an empty page without clearing the offset, which would
+            # otherwise loop forever.
             break
     return sorted(values)[:FACETS_LIMIT]
 
