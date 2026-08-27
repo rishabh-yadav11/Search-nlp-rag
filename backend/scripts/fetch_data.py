@@ -42,16 +42,32 @@ async def fetch_all():
     last_id = 0
     total_written = 0
 
-    # Resume support: if output file already exists, find max id already written
+    # Resume support: if the output file already exists, find the max id already
+    # written. A previous run may have been interrupted mid-write, leaving a
+    # truncated trailing jsonl line; detect it and drop it so downstream
+    # build_index.py never reads corrupt records.
     if os.path.exists(OUTPUT_PATH):
-        with open(OUTPUT_PATH, "r") as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                    last_id = max(last_id, row["id"])
-                    total_written += 1
-                except (json.JSONDecodeError, KeyError):
-                    continue
+        with open(OUTPUT_PATH, "rb") as f:
+            data = f.read()
+        lines = data.split(b"\n")
+        last_valid_offset = 0
+        for raw in lines:
+            if raw == b"":
+                break
+            try:
+                row = json.loads(raw)
+            except (json.JSONDecodeError, KeyError):
+                break
+            last_valid_offset += len(raw) + 1
+            last_id = max(last_id, row.get("id", 0))
+            total_written += 1
+        if last_valid_offset < len(data):
+            with open(OUTPUT_PATH, "r+b") as f:
+                f.truncate(last_valid_offset)
+            print(
+                f"Resuming: dropped {len(data) - last_valid_offset} byte(s) of "
+                f"incomplete trailing line from a previous interrupted run.",
+            )
         print(f"Resuming from id > {last_id} ({total_written} rows already written)")
 
     # Only published content ('article'/'interview'/'video'); the table pk is `feid`.
