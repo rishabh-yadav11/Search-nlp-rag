@@ -137,6 +137,22 @@ _STOPWORDS = {
 
 _CAP_RE = re.compile(r"[A-Z][a-zA-Z0-9.]*")
 
+# Generic capitalized words that are NOT proper-noun entities (sentence-start
+# pronouns, articles, prepositions, and vague adjectives). These are filtered
+# out so that e.g. "Electric" or "This" do not trigger spurious entity boosts.
+_GENERIC_CAP_WORDS = {
+    "this", "that", "these", "those", "it", "we", "they", "he", "she",
+    "you", "i", "or", "but",
+    "with", "as", "my",
+    "our", "your", "their", "his", "her", "its", "new", "old", "first",
+    "last", "top", "best", "big", "small", "high", "low", "global", "local",
+    "national", "international", "annual", "quarterly", "monthly", "weekly",
+    "daily", "recent", "latest", "major", "minor", "key", "main", "total",
+    "electric", "vehicles", "vehicle", "power", "energy", "deal", "deals",
+    "company", "companies", "startup", "startups", "market", "business",
+    "technology", "tech", "services", "solution", "solutions",
+}
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().replace("'", "").replace("\u2019", "").strip())
@@ -159,8 +175,11 @@ def extract_entities(q: str) -> list[str]:
     if not nq:
         return []
     raw = [m.group(0) for m in _BRAND_RE.finditer(nq)]
-    raw.extend(_normalize(t) for t in _CAP_RE.findall(q))
-    raw = [e for e in raw if e not in _STOPWORDS]
+    for t in _CAP_RE.findall(q):
+        nt = _normalize(t)
+        if nt in _STOPWORDS or nt in _GENERIC_CAP_WORDS:
+            continue
+        raw.append(nt)
     ordered: list[str] = []
     for e in raw:
         if e not in ordered:
@@ -184,13 +203,25 @@ def apply_entity_boost(q: str, results: list) -> list:
     entities = extract_entities(q)
     if not entities:
         return list(results)
+    # Compile once per entity: require a word boundary at the START of the entity,
+    # and at the END only disallow a following LETTER (so "tcs" still matches
+    # "tcs2024"/"tcs." but "ola" does NOT match inside "solar"/"polar" since "ola"
+    # is preceded by 's' and hence not at a word start).
+    entity_res = [
+        re.compile(rf"\b{re.escape(e)}(?![a-zA-Z])", re.IGNORECASE)
+        for e in entities
+    ]
+
+    def _matches(text: str) -> bool:
+        return any(p.search(text) for p in entity_res)
+
     boosted = []
     for r in results:
         title = _normalize(r.title or "")
         summary = _normalize(getattr(r, "summary", "") or "")
-        if any(e in title for e in entities):
+        if _matches(title):
             new_score = r.score * BOOST_TITLE
-        elif any(e in summary for e in entities):
+        elif _matches(summary):
             new_score = r.score * BOOST_SUMMARY
         else:
             new_score = r.score
