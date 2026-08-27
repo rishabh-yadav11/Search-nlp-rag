@@ -56,6 +56,18 @@ def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
+def _click_query_key(q: str) -> str:
+    # Normalize identically on the read and write paths so a stored key is
+    # always retrievable. The beacon is unauthenticated, so bound the query
+    # length before it becomes a Redis key (unbounded key size = unbounded
+    # memory growth); truncate rather than hash to keep the key human-readable
+    # in diagnostics. NOTE: two distinct queries sharing a 256-char prefix
+    # collide into one aggregated key; that is acceptable for top-query
+    # analytics, where the signal is intentionally coarse.
+    q = (q or "").strip()[: config.CLICK_QUERY_MAX_LEN]
+    return f"analytics:query_click:{q}"
+
+
 async def record_search(
     query: str,
     result_count: int,
@@ -96,13 +108,13 @@ async def record_click(query: str, position: int, article_id: int | None = None)
         # arbitrarily long query. Bound it before it becomes a sorted-set member
         # (unbounded member size = unbounded memory growth). Keep the key stable
         # by truncating rather than hashing.
-        query = (query or "")[: config.CLICK_QUERY_MAX_LEN]
+        query = (query or "").strip()[: config.CLICK_QUERY_MAX_LEN]
         p = _client().pipeline()
         p.incr("analytics:click:total")
         p.incr(f"analytics:click:pos:{position}")
         p.zincrby("analytics:click_top_queries", 1, query)
         if article_id is not None:
-            qkey = f"analytics:query_click:{query}"
+            qkey = _click_query_key(query)
             p.zincrby(qkey, 1, str(article_id))
             # Expire the per-query set so distinct-query sets don't accumulate
             # forever; refreshed on each click.
@@ -117,7 +129,7 @@ async def click_signals(query: str) -> dict | None:
     has too little click volume to act on. Returns ``{"total": int, "by_id": {id: count}}``."""
     try:
         c = _client()
-        key = f"analytics:query_click:{query}"
+        key = _click_query_key(query)
         raw = await c.zrevrange(key, 0, 50, withscores=True)
         if not raw:
             return None
