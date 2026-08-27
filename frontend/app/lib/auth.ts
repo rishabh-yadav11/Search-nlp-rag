@@ -14,9 +14,10 @@ const TRUSTED_API_HOSTS: string[] = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS |
 
 // Candidates, in priority order. `window.API_BASE` is runtime/injectable (e.g.
 // via an XSS payload or a malicious inline script) and therefore untrusted
-// unless its host is explicitly allow-listed — it is the only attacker-reachable
-// vector here. The build-time env var and the dev default are operator-controlled
-// and treated as trusted.
+// unless its host is explicitly allow-listed. The build-time env var and the dev
+// default are operator-controlled, but they still obey the SAME trust rule:
+// a cross-origin base is trusted only over https AND when allow-listed. No
+// cross-origin http base may ever be trusted.
 const WIN_API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
 const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
@@ -57,10 +58,17 @@ function isHttps(url: URL): boolean {
   return url.protocol === 'https:'
 }
 
-/** Strip a port (and any trailing dot) so `api.example.com` and
- *  `api.example.com:443` match the same allow-list entry. */
+/** Normalize an allow-list entry or URL host for comparison: strip any leading
+ *  scheme (`https://` / `http://`), any trailing slash, a port, and any
+ *  trailing dot — so `https://api.example.com`, `http://api.example.com/`, and
+ *  `api.example.com:443` all normalize to `api.example.com` and match
+ *  `url.host` (`api.example.com`). */
 function normalizeHost(host: string): string {
-  return host.replace(/:\d+$/, '').replace(/\.$/, '')
+  return host
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/\.$/, '')
 }
 
 /** True when `url`'s host is present in NEXT_PUBLIC_TRUSTED_API_HOSTS (compared
@@ -115,7 +123,11 @@ function resolveApiBase(): { base: string; trusted: boolean } {
     )
     return { base: '', trusted: true }
   }
-  // Operator-controlled build-time config / dev default: trusted first-party.
+  // Operator-controlled build-time config / dev default: apply the SAME trust
+  // rule as any other source. A cross-origin base is trusted ONLY over https
+  // AND when explicitly allow-listed; a cross-origin http base (e.g. an
+  // operator setting `NEXT_PUBLIC_API_BASE=http://host`) must NEVER be trusted,
+  // so the Bearer token is not attached over cleartext.
   const trustedSource = ENV_API_BASE || DEV_API_BASE
   if (trustedSource) {
     const url = parseApiBase(trustedSource)
@@ -125,7 +137,13 @@ function resolveApiBase(): { base: string; trusted: boolean } {
       )
       return { base: '', trusted: true }
     }
-    return { base: baseFromUrl(url), trusted: true }
+    const trusted = isTrustedBase(trustedSource, url)
+    if (!trusted) {
+      console.error(
+        `[auth] Configured API base "${trustedSource}" is cross-origin and not trusted (https + NEXT_PUBLIC_TRUSTED_API_HOSTS required); the Bearer token will NOT be attached.`
+      )
+    }
+    return { base: baseFromUrl(url), trusted }
   }
   // Production: no base set → same-origin relative requests. This is
   // first-party, so it IS trusted and the token is attached. NEXT_PUBLIC_API_BASE
