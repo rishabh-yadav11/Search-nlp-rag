@@ -60,8 +60,11 @@ def test_build_facet_filter_dates():
     assert all(isinstance(c.range, DatetimeRange) for c in date_conds)
     gtes = [c.range.gte for c in date_conds]
     ltes = [c.range.lte for c in date_conds]
-    assert _dt(2025, 1, 1, tzinfo=UTC).isoformat() in gtes
-    assert _dt(2025, 12, 31, 23, 59, 59, 999999, tzinfo=UTC).isoformat() in ltes
+    # DatetimeRange parses the ISO string back into datetime objects, so compare
+    # against the isoformat of the expected datetimes (not the datetimes directly,
+    # to avoid tzinfo-identity mismatches between Qdrant's tz class and timezone.utc).
+    assert _dt(2025, 1, 1, tzinfo=UTC).isoformat() in [g.isoformat() for g in gtes if g is not None]
+    assert _dt(2025, 12, 31, 23, 59, 59, 999999, tzinfo=UTC).isoformat() in [l.isoformat() for l in ltes if l is not None]
 
 
 def test_build_facet_filter_none_when_unfiltered():

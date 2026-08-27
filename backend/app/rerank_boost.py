@@ -203,12 +203,13 @@ def apply_entity_boost(q: str, results: list) -> list:
     entities = extract_entities(q)
     if not entities:
         return list(results)
-    # Compile once per entity: require a word boundary at the START of the entity,
-    # and at the END only disallow a following LETTER (so "tcs" still matches
-    # "tcs2024"/"tcs." but "ola" does NOT match inside "solar"/"polar" since "ola"
-    # is preceded by 's' and hence not at a word start).
+    # Compile once per entity: require a word boundary at the START (so "ola"
+    # does NOT match inside "solar"/"polar"), allow a trailing non-letter (so
+    # "tcs" still matches "tcs2024"/"tcs." but not "tcsql"), and tolerate a
+    # possessive suffix ("'s" or bare "s") so "Ola Electric" still matches the
+    # apostrophe-stripped "ola electrics" in a summary.
     entity_res = [
-        re.compile(rf"\b{re.escape(e)}(?![a-zA-Z])", re.IGNORECASE)
+        re.compile(rf"\b{re.escape(e)}(?:['’]?s)?(?![a-zA-Z])", re.IGNORECASE)
         for e in entities
     ]
 
