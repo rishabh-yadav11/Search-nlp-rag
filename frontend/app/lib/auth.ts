@@ -62,9 +62,12 @@ let meCacheTs = 0
 const ME_CACHE_TTL_MS = Number(process.env.NEXT_PUBLIC_ME_CACHE_TTL_MS || 60000)
 
 /** Fetch the current authenticated user (`/api/auth/me`), cached per token.
- *  Returns null when logged out or the token is rejected (401). A genuine
- *  network/transport error is surfaced by throwing, not swallowed as "no user".
- *  Never redirects. */
+ *  Returns null when the token is missing/rejected (401) or when the request
+ *  fails (network/transport error or non-2xx). On a network/transport failure
+ *  the token is preserved (not cleared) so a later retry can recover — callers
+ *  must not treat a null return as a definitive "logged out" without also
+ *  checking the token. Network failures are logged, not thrown, so existing
+ *  `.catch` handlers don't misinterpret them as auth rejection. Never redirects. */
 export async function getMe(force = false): Promise<AuthUser | null> {
   const token = getToken()
   if (!token) {
