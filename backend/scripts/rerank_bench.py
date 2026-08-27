@@ -27,6 +27,8 @@ import time
 
 sys.path.insert(0, os.path.abspath("."))
 
+from qdrant_client.models import Fusion, FusionQuery, Prefetch, SparseVector
+
 from app.config import config
 from app.encoders import DenseEncoder
 
@@ -206,6 +208,8 @@ def main() -> None:
     # client + encoders instead of importing app.state.
     from qdrant_client import AsyncQdrantClient
 
+    from app.main import inference_lock
+
     async def _candidates():
         dense = DenseEncoder(config.EMBED_MODEL, config.EMBED_DEVICE, config.TORCH_THREADS)
         from fastembed import SparseTextEmbedding
@@ -215,10 +219,9 @@ def main() -> None:
         try:
             groups = []
             for q in QUERIES:
-                async with __import__("app.main", fromlist=["inference_lock"]).inference_lock:
+                async with inference_lock:
                     dense_vec = (await asyncio.to_thread(dense.encode, q)).tolist()
                     sp = next(iter(sparse_m.embed([q])))
-                from qdrant_client.models import Fusion, FusionQuery, Prefetch, SparseVector
 
                 sparse_vec = SparseVector(indices=sp.indices.tolist(), values=sp.values.tolist())
                 r = await client.query_points(

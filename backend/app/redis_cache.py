@@ -39,11 +39,18 @@ class HybridCache:
     async def get(self, key: str):
         try:
             raw = await self._client().get(key)
-            if raw is not None:
-                return json.loads(raw)
         except Exception as exc:
             self._degraded(exc)
-        return self._mem.get(key)
+            return self._mem.get(key)
+        if raw is None:
+            return self._mem.get(key)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            # Corrupt payload in Redis: log it distinctly (don't silently swallow
+            # into the in-process fallback) and degrade to the memory cache.
+            self._degraded(exc)
+            return self._mem.get(key)
 
     async def set(self, key: str, value, ttl: int | None = None) -> None:
         try:
