@@ -123,9 +123,11 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str):
                 shutil.copyfileobj(resp.raw, f)
         log(f"saved snapshot to {os.path.relpath(dest, BACKEND_DIR)}")
     except Exception as e:
+        redacted = _redact_url(url)
+        redacted_err = str(e).replace(url, redacted)
         log(
             f"WARNING: snapshot '{name}' was created server-side but could not be "
-            f"downloaded locally: {e}",
+            f"downloaded locally: {redacted_err}",
         )
     return name
 
