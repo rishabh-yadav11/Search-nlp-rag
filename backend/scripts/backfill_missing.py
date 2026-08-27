@@ -167,6 +167,7 @@ def main() -> None:
     else:
         log(f"backfilling {len(missing)} missing articles...")
         backfill(records, missing)
+        ids = qdrant_ids()
     reconcile(records, ids)
     log(f"done in {time.perf_counter() - start:.2f}s")
 
