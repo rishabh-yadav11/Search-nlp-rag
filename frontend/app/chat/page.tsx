@@ -81,13 +81,16 @@ async function api(path: string, init?: RequestInit) {
   return res.json() as Promise<Record<string, unknown>>
 }
 
+// Always format with a fixed locale/timezone so output is identical across
+// clients and never diverges on hydration. `now` is computed at call time so
+// relative strings keep advancing while the page is open.
 function relativeTime(ts: number): string {
   const diff = Date.now() / 1000 - ts
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
   if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`
-  return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+  return new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
 }
 
 function formatCost(cost: number): string {
@@ -177,6 +180,9 @@ export default function ChatPage() {
   const [streamingContent, setStreamingContent] = useState('')
   const [note, setNote] = useState('')
   const [error, setError] = useState('')
+  // Force a re-render each minute so relative timestamps ("5m ago") keep
+  // advancing while the page stays open. No fetch — purely to recompute time.
+  const [, setTick] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   const loadSessions = useCallback(async () => {
@@ -200,6 +206,11 @@ export default function ChatPage() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
   }, [messages, sending])
+
+  useEffect(() => {
+    const t = setInterval(() => setTick((n) => n + 1), 60000)
+    return () => clearInterval(t)
+  }, [])
 
   const openSession = useCallback(
     async (id: string) => {
@@ -360,15 +371,33 @@ export default function ChatPage() {
             <div
               key={s.id}
               className={`chat-session-item${s.id === activeId ? ' active' : ''}`}
-              onClick={() => openSession(s.id)}
             >
-              <div className="chat-session-title" title={s.title}>
-                {s.title || 'New chat'}
-              </div>
-              <div className="chat-session-meta">
-                {relativeTime(s.updated_at)}
-                {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
-              </div>
+              <button
+                type="button"
+                className="chat-session-main"
+                onClick={() => openSession(s.id)}
+                aria-label={`Open conversation: ${s.title || 'New chat'}`}
+                style={{
+                  border: 'none',
+                  background: 'none',
+                  padding: 0,
+                  margin: 0,
+                  font: 'inherit',
+                  color: 'inherit',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                  flex: 1,
+                  minWidth: 0,
+                }}
+              >
+                <div className="chat-session-title" title={s.title}>
+                  {s.title || 'New chat'}
+                </div>
+                <div className="chat-session-meta">
+                  <span suppressHydrationWarning>{relativeTime(s.updated_at)}</span>
+                  {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
+                </div>
+              </button>
               <button
                 type="button"
                 className="chat-session-del"
