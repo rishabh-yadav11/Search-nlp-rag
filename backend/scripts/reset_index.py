@@ -138,7 +138,10 @@ def main():
                     os.remove(p)
                     log(f"removed {os.path.relpath(p, BACKEND_DIR)}")
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
 
     print("\nNext steps to rebuild from zero:")
     print("  1. python scripts/fetch_data.py")
