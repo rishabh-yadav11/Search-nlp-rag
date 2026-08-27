@@ -81,6 +81,15 @@ async def record_cost(cost_inr: float) -> None:
     if cost_inr <= 0:
         return
     try:
-        await _client().incrbyfloat(_day_key(), cost_inr / (config.INR_PER_USD or 1.0))
+        await _client().incrbyfloat(_day_key(), to_usd(cost_inr))
     except Exception as exc:
         logger.warning("cost budget Redis unavailable (%s); spend not recorded", exc)
+
+
+def to_usd(cost_inr: float) -> float:
+    """Convert an INR cost (as reported by ``LLMResult.cost()``) to USD.
+
+    All cost accounting in this project is canonical in USD (the daily budget
+    counter, analytics, and stored message costs), so callers convert at the
+    recording boundary instead of mixing units."""
+    return cost_inr / (config.INR_PER_USD or 1.0)

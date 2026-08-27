@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from app.auth import require_auth, require_permission
 from app.config import config
-from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost
+from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost, to_usd
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
 from app.query_intent import extract_year_range, suggested_top_k
 
@@ -247,7 +247,7 @@ class ChatStore:
             (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms),
         )
         await self._db.execute(
-            "UPDATE sessions SET updated_at = ?, title = COALESCE(NULLIF(title, ''), 'New chat') WHERE id = ?",
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
             (ts, session_id),
         )
         await self._db.commit()
@@ -933,7 +933,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         turn.note,
         result.prompt_tokens,
         result.completion_tokens,
-        result.cost(),
+        to_usd(result.cost()),
     )
 
 
@@ -1207,7 +1207,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 session_id, user_id, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
-                cost=result.cost(),
+                cost=to_usd(result.cost()),
                 latency_ms=latency_ms,
             )
             await _auto_title(s, session_id, user_id, question)
