@@ -195,4 +195,5 @@ async def summary() -> dict:
         }
     except Exception as exc:
         _degraded(exc)
-        return {"error": "analytics unavailable", "detail": str(exc)}
+        logger.exception("analytics summary failed; returning generic error to client")
+        return {"error": "analytics unavailable"}
