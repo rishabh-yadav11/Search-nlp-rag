@@ -20,6 +20,7 @@ The point: decide whether INT8 dynamic quantization of bge-reranker-base is
 fast enough without meaningfully changing top-8 ordering.
 """
 import asyncio
+import math
 import os
 import statistics
 import sys
@@ -168,7 +169,7 @@ def _ranks(vals: list[float]) -> list[float]:
     i = 0
     while i < len(order):
         j = i
-        while j + 1 < len(order) and vals[order[j + 1]] == vals[order[i]]:
+        while j + 1 < len(order) and math.isclose(vals[order[j + 1]], vals[order[i]]):
             j += 1
         r = (i + j) / 2 + 1
         for k in range(i, j + 1):
@@ -221,7 +222,7 @@ def main() -> None:
             for q in QUERIES:
                 async with inference_lock:
                     dense_vec = (await asyncio.to_thread(dense.encode, q)).tolist()
-                    sp = next(iter(sparse_m.embed([q])))
+                    sp = next(iter(await asyncio.to_thread(sparse_m.embed, [q])))
 
                 sparse_vec = SparseVector(indices=sp.indices.tolist(), values=sp.values.tolist())
                 r = await client.query_points(
@@ -303,7 +304,9 @@ def main() -> None:
         print(f"{a:>16}" + "".join(f"{statistics.mean(ovl[a][b]):>16.2f}" for b in names))
 
     int8_vs_fp32 = statistics.mean(ovl["bge  onnx-int8 "]["bge  onnx-fp32"])
-    speedup = statistics.median(lat_batch["bge  onnx-fp32"]) / statistics.median(lat_batch["bge  onnx-int8 "])
+    fp32_med = statistics.median(lat_batch.get("bge  onnx-fp32", [])) if lat_batch.get("bge  onnx-fp32") else 0.0
+    int8_med = statistics.median(lat_batch.get("bge  onnx-int8 ", [])) if lat_batch.get("bge  onnx-int8 ") else 0.0
+    speedup = fp32_med / int8_med if int8_med > 0 else 0.0
     print(f"\nint8 vs fp32: top-8 overlap={int8_vs_fp32:.3f}  batch speedup={speedup:.2f}x")
     ok = int8_vs_fp32 >= 0.98 and speedup >= 1.4
     print(f"recommend {'int8' if ok else 'fp32'} (overlap>=0.98 and speedup>=1.4: {'YES' if ok else 'NO'})")
