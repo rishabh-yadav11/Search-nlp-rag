@@ -5,7 +5,7 @@ export const TOKEN_KEY = 'vccircle_auth_token'
 export const API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
-  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
+  'http://localhost:8000'
 
 export function getToken(): string | null {
   try {
@@ -21,6 +21,8 @@ export function setToken(token: string): void {
   } catch {
     /* storage unavailable */
   }
+  // Login (or re-login) may change role/is_active; drop any stale cached user.
+  clearMeCache()
 }
 
 export function clearToken(): void {
@@ -29,6 +31,8 @@ export function clearToken(): void {
   } catch {
     /* storage unavailable */
   }
+  // Logout invalidates the cached user so it is never served stale.
+  clearMeCache()
 }
 
 export function authHeaders(init?: RequestInit): Headers {
@@ -48,37 +52,46 @@ export interface AuthUser {
 
 let meCache: AuthUser | null | undefined
 let meCacheToken: string | null = null
+let meCacheTs = 0
+
+// Configurable TTL so role/is_active changes are eventually picked up even if
+// the caller forgets to clear the cache. 0 disables the time-based expiry.
+const ME_CACHE_TTL_MS = Number(process.env.NEXT_PUBLIC_ME_CACHE_TTL_MS || 60000)
 
 /** Fetch the current authenticated user (`/api/auth/me`), cached per token.
- *  Returns null when logged out or the token is rejected. Never redirects. */
+ *  Returns null when logged out or the token is rejected (401). A genuine
+ *  network/transport error is surfaced by throwing, not swallowed as "no user".
+ *  Never redirects. */
 export async function getMe(force = false): Promise<AuthUser | null> {
   const token = getToken()
   if (!token) {
-    meCache = null
-    meCacheToken = null
+    clearToken()
     return null
   }
-  if (!force && meCache !== undefined && meCacheToken === token) return meCache
+  const fresh = meCache !== undefined && meCacheToken === token && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
+  if (!force && fresh) return meCache ?? null
+  let res: Response
   try {
-    const res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
-    if (res.status === 401) {
-      clearToken()
-      meCache = null
-      meCacheToken = null
-      return null
-    }
-    if (!res.ok) return null
-    meCache = (await res.json()) as AuthUser
-    meCacheToken = token
-    return meCache
-  } catch {
+    res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
+  } catch (err) {
+    // Network/transport failure: surface it instead of masquerading as "not authenticated".
+    throw err instanceof Error ? err : new Error('Failed to reach the auth service')
+  }
+  if (res.status === 401) {
+    clearToken()
     return null
   }
+  if (!res.ok) return null
+  meCache = (await res.json()) as AuthUser
+  meCacheToken = token
+  meCacheTs = Date.now()
+  return meCache
 }
 
 export function clearMeCache(): void {
   meCache = undefined
   meCacheToken = null
+  meCacheTs = 0
 }
 
 /** Redirect to the login page (used when the backend rejects an expired token).
