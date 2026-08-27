@@ -39,7 +39,15 @@ DATA_FILES = [
     os.path.join(DATA_DIR, "update.lock"),
 ]
 
-API_PORT = int(os.getenv("API_PORT", "8001"))
+def _parse_api_port(default: str = "8001") -> int:
+    raw = os.getenv("API_PORT", default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+API_PORT = _parse_api_port()
 
 
 def api_is_live() -> bool:
@@ -82,7 +90,8 @@ def main():
         log(f"WARNING: something is listening on port {API_PORT} — live queries will fail after this")
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=30)
-    existing = [c.name for c in client.get_collections().collections]
+    try:
+        existing = [c.name for c in client.get_collections().collections]
 
     if not skip_backup:
         if config.QDRANT_COLLECTION in existing:
@@ -121,6 +130,8 @@ def main():
             if os.path.exists(p):
                 os.remove(p)
                 log(f"removed {os.path.relpath(p, BACKEND_DIR)}")
+    finally:
+        client.close()
 
     print("\nNext steps to rebuild from zero:")
     print("  1. python scripts/fetch_data.py")
