@@ -122,7 +122,18 @@ export default function AnalyticsDashboardPage() {
   // load still running, and so we can abort the request on unmount.
   const inFlight = useRef(false)
   const controllerRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
   const FETCH_TIMEOUT_MS = 15000
+  const GETME_TIMEOUT_MS = 10000
+
+  // Resolves null if the promise doesn't settle in time, so a hung getMe
+  // can't keep inFlight stuck true forever.
+  function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+    return Promise.race([
+      p,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+    ])
+  }
 
   async function load() {
     // Skip a poll if a previous load is still in flight; we never want
@@ -137,16 +148,19 @@ export default function AnalyticsDashboardPage() {
     controllerRef.current = controller
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
-      const me = await getMe()
+      // Guard against a hung getMe: race it with a timeout that resolves
+      // to null so we can always release inFlight below.
+      const me = await withTimeout(getMe(), GETME_TIMEOUT_MS)
       if (!me) {
-        redirectToLogin('/analytics/dashboard')
+        if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
         return
       }
+      if (!mountedRef.current) return
       // Client-side admin gate is a UX convenience only. Authoritative
       // enforcement happens in the backend API (which rejects non-admin
       // requests), so this check can never be the source of truth.
       if (me.role !== 'admin') {
-        setForbidden(true)
+        if (mountedRef.current) setForbidden(true)
         return
       }
       const [sRes, cRes] = await Promise.all([
@@ -159,6 +173,7 @@ export default function AnalyticsDashboardPage() {
       }
       if (!sRes.ok) throw new Error(`summary returned HTTP ${sRes.status}`)
       if (!cRes.ok) throw new Error(`chat returned HTTP ${cRes.status}`)
+      if (!mountedRef.current) return
       setSummary((await sRes.json()) as Summary)
       setChat((await cRes.json()) as ChatStats)
       setError('')
@@ -166,7 +181,7 @@ export default function AnalyticsDashboardPage() {
     } catch (e) {
       // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.
       if ((e as Error).name === 'AbortError') return
-      setError(`Analytics unavailable: ${(e as Error).message}`)
+      if (mountedRef.current) setError(`Analytics unavailable: ${(e as Error).message}`)
     } finally {
       clearTimeout(timeout)
       inFlight.current = false
@@ -178,6 +193,7 @@ export default function AnalyticsDashboardPage() {
     load()
     const t = setInterval(load, 30000)
     return () => {
+      mountedRef.current = false
       clearInterval(t)
       // Abort any in-flight load so an unmounted component never sets state.
       controllerRef.current?.abort()
