@@ -38,6 +38,7 @@ from app.config import config
 from app.cost_budget import close as close_cost_budget
 from app.diversity import diversify
 from app.encoders import DenseEncoder
+from app.health import close_redis as health_module_close_redis
 from app.health import router as health_router
 from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
@@ -197,6 +198,7 @@ async def lifespan(app: FastAPI):
     await auth_store.connect()
     auth_module.store = auth_store
     await auth_module.bootstrap_admin()
+    state["auth_token_purge"] = asyncio.create_task(auth_module.token_purge_loop())
 
     init_fixer(
         config.ENABLE_QUERY_FIX,
@@ -215,6 +217,10 @@ async def lifespan(app: FastAPI):
     await cache.close()
     await close_analytics()
     await close_cost_budget()
+    state["auth_token_purge"].cancel()
+    await asyncio.gather(state["auth_token_purge"], return_exceptions=True)
+    await auth_module.close_rate_redis()
+    await health_module_close_redis()
 
 
 app = FastAPI(title="VCCircle New Search", lifespan=lifespan)

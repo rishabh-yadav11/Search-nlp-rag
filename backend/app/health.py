@@ -16,6 +16,15 @@ async def health():
     return {"status": "ok"}
 
 
+async def close_redis() -> None:
+    """Close the lazily-created readiness-check Redis client. Registered as a
+    shutdown hook so the connection isn't leaked on worker exit."""
+    global _redis_client
+    if _redis_client is not None:
+        await _redis_client.aclose()
+        _redis_client = None
+
+
 @router.get("/live")
 async def live():
     return {"status": "ok"}
