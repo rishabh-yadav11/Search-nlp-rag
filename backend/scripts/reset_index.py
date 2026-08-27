@@ -96,7 +96,19 @@ def main():
                 return
             log(f"backup before reset: {dest}")
         else:
-            log(f"collection '{config.QDRANT_COLLECTION}' does not exist — nothing to snapshot")
+            # Collection is missing: still attempt a backup of any local artifacts
+            # so the reset leaves a recoverable record instead of silently doing nothing.
+            dest, snapshot_ok = make_backup(client, config.QDRANT_COLLECTION)
+            if dest is None:
+                log(
+                    f"collection '{config.QDRANT_COLLECTION}' does not exist and no local "
+                    f"artifacts were available to back up — nothing to snapshot; proceeding",
+                )
+            else:
+                log(
+                    f"collection '{config.QDRANT_COLLECTION}' does not exist; backed up "
+                    f"available local artifacts only before reset: {dest}",
+                )
 
     if config.QDRANT_COLLECTION in existing:
         client.delete_collection(collection_name=config.QDRANT_COLLECTION)
