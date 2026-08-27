@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 export type DataVizBlock = {
   title?: string
@@ -157,7 +157,10 @@ function BarChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
   const values = rows.map((r) => toNum(r[v]) ?? 0)
-  const maxVal = Math.max(1, ...values)
+  // Domain spans the actual min/max (anchored at 0) so negatives render below
+  // the zero baseline instead of being clipped or drawn the wrong way.
+  const maxVal = values.reduce((a, b) => Math.max(a, b), 0)
+  const minVal = values.reduce((a, b) => Math.min(a, b), 0)
   const n = rows.length
   const slot = 64
   const padL = 56
@@ -174,20 +177,34 @@ function BarChart({ block }: { block: DataVizBlock }) {
   const labelY = height - 34
   const angle = rotate ? -20 : 0
 
+  // Map a value to a y pixel; the scale accounts for both positive and
+  // negative extents so the zero line sits wherever the data requires.
+  const domain = maxVal - minVal || 1
+  const yOf = (val: number) => plotBottom - ((val - minVal) / domain) * plotH
+  const zeroY = yOf(0)
+
   return (
     <div className="chat-viz-chart">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={block.title || 'bar chart'}>
+        {/* Zero baseline (only meaningful when data crosses zero). */}
+        {minVal < 0 && (
+          <line x1={padL - 4} y1={zeroY} x2={width - 12} y2={zeroY} stroke="#9a9a9a" strokeWidth={1} strokeDasharray="3 3" />
+        )}
         {values.map((val, i) => {
-          const bh = Math.max(2, (val / maxVal) * plotH)
+          // Bars grow from the zero baseline: upward for positives, downward
+          // for negatives.
+          const barTop = val >= 0 ? yOf(val) : zeroY
+          const bh = Math.max(2, Math.abs(yOf(val) - zeroY))
           const x = padL + i * slot
-          const y = plotBottom - bh
+          const y = barTop
+          const valTextY = val >= 0 ? barTop - 5 : barTop + bh + 12
           const full = String(rows[i][0] ?? '')
           const label = full.length > 14 ? `${full.slice(0, 13)}…` : full
           return (
             <g key={i}>
               <title>{full}</title>
               <rect x={x} y={y} width={barW} height={bh} rx={3} fill={COLORS[i % COLORS.length]} />
-              <text x={x + barW / 2} y={y - 5} textAnchor="middle" className="chat-viz-bar-val">
+              <text x={x + barW / 2} y={valTextY} textAnchor="middle" className="chat-viz-bar-val">
                 {formatValue(val, format)}
               </text>
               <text
@@ -211,7 +228,10 @@ function LineChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
   const values = rows.map((r) => toNum(r[v]) ?? 0)
-  const maxVal = Math.max(1, ...values)
+  // Domain spans the actual min/max (anchored at 0) so negative values map
+  // below the zero line instead of being pushed off the top.
+  const maxVal = values.reduce((a, b) => Math.max(a, b), 0)
+  const minVal = values.reduce((a, b) => Math.min(a, b), 0)
   const n = rows.length
   const width = Math.max(340, n * 80 + 60)
   const height = 240
@@ -221,8 +241,9 @@ function LineChart({ block }: { block: DataVizBlock }) {
   const padB = 40
   const plotW = width - padL - padR
   const plotH = height - padT - padB
+  const domain = maxVal - minVal || 1
   const xs = rows.map((_, i) => padL + (i * plotW) / Math.max(1, n - 1))
-  const ys = values.map((v) => padT + plotH - (v / maxVal) * plotH)
+  const ys = values.map((val) => padT + plotH - ((val - minVal) / domain) * plotH)
   const pts = rows.map((_, i) => `${xs[i]},${ys[i]}`).join(' ')
   const step = Math.max(1, Math.ceil(n / 8))
 
@@ -324,7 +345,7 @@ function PictogramChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
   const values = rows.map((r) => toNum(r[v]) ?? 0)
-  const maxVal = Math.max(1, ...values)
+  const maxVal = values.reduce((a, b) => Math.max(a, b), 1)
   const scale = maxVal > 40 ? Math.ceil(maxVal / 40) : 1
 
   return (
@@ -391,20 +412,30 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
 
 export default function DataViz({ block }: { block: DataVizBlock }) {
   const [view, setView] = useState<NonNullable<DataVizBlock['view']>>(block.kind ?? 'table')
+  // Reset the selected view only when the block's CONTENT changes, not on every
+  // fresh object reference. Otherwise a parent that re-creates the block each
+  // render would silently discard the user's manual view selection.
+  const prevSig = useRef<string>('')
+  const sig = `${block.title ?? ''}|${block.rows.length}|${block.value_column ?? ''}|${block.kind ?? ''}`
+  useEffect(() => {
+    if (prevSig.current === sig) return
+    prevSig.current = sig
+    setView(block.kind ?? 'table')
+  }, [sig, block.kind])
   const vc = block.value_column
+  // A chart is valid as long as at least one numeric value exists; missing
+  // cells are skipped/zeroed per-series rather than forcing a table-only view.
   const numbers = useMemo(
-    () => vc != null && block.rows.every((r) => toNum(r[vc]) != null),
+    () => vc != null && block.rows.some((r) => toNum(r[vc]) != null),
     [block, vc],
   )
-  const pictoOk = useMemo(
-    () =>
-      vc != null &&
-      block.rows.every((r) => {
-        const v = toNum(r[vc])
-        return v != null && Number.isInteger(v) && v >= 0
-      }),
-    [block, vc],
-  )
+  const pictoOk = useMemo(() => {
+    if (vc == null) return false
+    const present = block.rows.map((r) => toNum(r[vc])).filter((x) => x != null) as number[]
+    // Tolerate missing cells, but every present value must be a non-negative
+    // integer for the pictogram to make sense.
+    return present.length > 0 && present.every((x) => Number.isInteger(x) && x >= 0)
+  }, [block, vc])
   // When the user explicitly asked for one view (block.view set by the backend),
   // render ONLY that view; otherwise keep the interactive view toggles.
   const locked = block.view
