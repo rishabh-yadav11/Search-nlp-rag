@@ -51,6 +51,12 @@ function isSameOrigin(url: URL): boolean {
   return url.origin === window.location.origin
 }
 
+/** True when `url` uses the https scheme. Required for any cross-origin trusted
+ *  base so the Bearer token is never sent over cleartext http. */
+function isHttps(url: URL): boolean {
+  return url.protocol === 'https:'
+}
+
 /** Strip a port (and any trailing dot) so `api.example.com` and
  *  `api.example.com:443` match the same allow-list entry. */
 function normalizeHost(host: string): string {
@@ -64,14 +70,26 @@ function hostInAllowList(url: URL): boolean {
   return TRUSTED_API_HOSTS.some((entry) => normalizeHost(entry) === h)
 }
 
+/** Resolve the request base URL from a parsed API base, preserving any path
+ *  (e.g. `https://host/v1` → `https://host/v1`) rather than discarding it to
+ *  just the origin. Query/fragment are dropped as they are not part of a base. */
+function baseFromUrl(url: URL): string {
+  return url.origin + url.pathname
+}
+
 /** Trust rule: a base is trusted (allowed to receive the Bearer token) when it
- *  is first-party — i.e. empty (relative → window.location.origin), same-origin,
- *  or an explicit cross-origin host in NEXT_PUBLIC_TRUSTED_API_HOSTS. Any other
- *  cross-origin host is untrusted and must NOT receive the token. */
+ *  is first-party — i.e. empty (relative → window.location.origin), same-origin
+ *  (http allowed for local dev), or an explicit cross-origin host in
+ *  NEXT_PUBLIC_TRUSTED_API_HOSTS that is reached over https. A cross-origin
+ *  allow-listed host over cleartext http is REJECTED so the token is never sent
+ *  over an unencrypted channel. Any other cross-origin host is untrusted and
+ *  must NOT receive the token. */
 function isTrustedBase(base: string, url: URL | null): boolean {
   if (!base) return true // empty relative base → same-origin first-party
   if (!url) return false
-  return isSameOrigin(url) || hostInAllowList(url)
+  if (isSameOrigin(url)) return true // same-origin (http ok for local dev)
+  // Cross-origin: only trusted when https AND explicitly allow-listed.
+  return isHttps(url) && hostInAllowList(url)
 }
 
 function resolveApiBase(): { base: string; trusted: boolean } {
@@ -90,7 +108,7 @@ function resolveApiBase(): { base: string; trusted: boolean } {
       return { base: '', trusted: true }
     }
     if (isTrustedBase(WIN_API_BASE, url)) {
-      return { base: url.origin, trusted: true }
+      return { base: baseFromUrl(url), trusted: true }
     }
     console.error(
       `[auth] window.API_BASE host "${normalizeHost(url.host)}" is not same-origin and not in NEXT_PUBLIC_TRUSTED_API_HOSTS; using the safe same-origin base instead.`
@@ -107,7 +125,7 @@ function resolveApiBase(): { base: string; trusted: boolean } {
       )
       return { base: '', trusted: true }
     }
-    return { base: url.origin, trusted: true }
+    return { base: baseFromUrl(url), trusted: true }
   }
   // Production: no base set → same-origin relative requests. This is
   // first-party, so it IS trusted and the token is attached. NEXT_PUBLIC_API_BASE
