@@ -81,16 +81,11 @@ async function api(path: string, init?: RequestInit) {
   return res.json() as Promise<Record<string, unknown>>
 }
 
-// Local timestamp used as a stable reference so relative strings don't
-// shift between renders. Read once on module load and frozen; the sidebar
-// only renders after a client-side fetch (useEffect), so there is no SSR
-// hydration mismatch from Date.now().
-const RELATIVE_NOW = Date.now() / 1000
-
 // Always format with a fixed locale/timezone so output is identical across
-// clients and never diverges on hydration.
+// clients and never diverges on hydration. `now` is computed at call time so
+// relative strings keep advancing while the page is open.
 function relativeTime(ts: number): string {
-  const diff = RELATIVE_NOW - ts
+  const diff = Date.now() / 1000 - ts
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
