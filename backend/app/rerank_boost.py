@@ -137,6 +137,22 @@ _STOPWORDS = {
 
 _CAP_RE = re.compile(r"[A-Z][a-zA-Z0-9.]*")
 
+# Generic capitalized words that are NOT proper-noun entities (sentence-start
+# pronouns, articles, prepositions, and vague adjectives). These are filtered
+# out so that e.g. "Electric" or "This" do not trigger spurious entity boosts.
+_GENERIC_CAP_WORDS = {
+    "the", "this", "that", "these", "those", "it", "we", "they", "he", "she",
+    "you", "i", "in", "on", "at", "to", "of", "a", "an", "and", "or", "but",
+    "for", "with", "as", "by", "from", "is", "are", "was", "were", "my",
+    "our", "your", "their", "his", "her", "its", "new", "old", "first",
+    "last", "top", "best", "big", "small", "high", "low", "global", "local",
+    "national", "international", "annual", "quarterly", "monthly", "weekly",
+    "daily", "recent", "latest", "major", "minor", "key", "main", "total",
+    "electric", "vehicles", "vehicle", "power", "energy", "deal", "deals",
+    "company", "companies", "startup", "startups", "market", "business",
+    "technology", "tech", "services", "solution", "solutions",
+}
+
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower().replace("'", "").replace("\u2019", "").strip())
@@ -159,8 +175,11 @@ def extract_entities(q: str) -> list[str]:
     if not nq:
         return []
     raw = [m.group(0) for m in _BRAND_RE.finditer(nq)]
-    raw.extend(_normalize(t) for t in _CAP_RE.findall(q))
-    raw = [e for e in raw if e not in _STOPWORDS]
+    for t in _CAP_RE.findall(q):
+        nt = _normalize(t)
+        if nt in _STOPWORDS or nt in _GENERIC_CAP_WORDS:
+            continue
+        raw.append(nt)
     ordered: list[str] = []
     for e in raw:
         if e not in ordered:
@@ -184,13 +203,19 @@ def apply_entity_boost(q: str, results: list) -> list:
     entities = extract_entities(q)
     if not entities:
         return list(results)
+    # Compile once per call: case-insensitive, word-boundary matches so that
+    # short entities (e.g. "ola") do not spuriously match inside "solar"/"polar".
+    entity_re = re.compile(
+        r"\b(?:" + "|".join(re.escape(e) for e in entities) + r")\b",
+        re.IGNORECASE,
+    )
     boosted = []
     for r in results:
         title = _normalize(r.title or "")
         summary = _normalize(getattr(r, "summary", "") or "")
-        if any(e in title for e in entities):
+        if entity_re.search(title):
             new_score = r.score * BOOST_TITLE
-        elif any(e in summary for e in entities):
+        elif entity_re.search(summary):
             new_score = r.score * BOOST_SUMMARY
         else:
             new_score = r.score
