@@ -207,6 +207,9 @@ export default function ChatPage() {
   // Holds the live SSE AbortController so we can cancel it on unmount, on
   // starting a new session, or when switching conversations.
   const abortRef = useRef<AbortController | null>(null)
+  // Distinguishes an intentional cancel (unmount / new session / switch) from a
+  // real failure (e.g. timeout), so we don't surface a spurious error on cancel.
+  const cancelledRef = useRef(false)
 
   const loadSessions = useCallback(async () => {
     try {
@@ -237,11 +240,15 @@ export default function ChatPage() {
 
   // Cancel any in-flight SSE stream when the component unmounts.
   useEffect(() => {
-    return () => abortRef.current?.abort()
+    return () => {
+      cancelledRef.current = true
+      abortRef.current?.abort()
+    }
   }, [])
 
   const openSession = useCallback(
     async (id: string) => {
+      cancelledRef.current = true
       abortRef.current?.abort()
       setActiveId(id)
       setError('')
@@ -258,6 +265,7 @@ export default function ChatPage() {
   )
 
   const newSession = useCallback(() => {
+    cancelledRef.current = true
     abortRef.current?.abort()
     setActiveId(null)
     setMessages([])
@@ -270,6 +278,7 @@ export default function ChatPage() {
     const question = input.trim()
     if (!question || sending) return
     setError('')
+    cancelledRef.current = false
 
     let sessionId = activeId
     if (!sessionId) {
@@ -400,6 +409,12 @@ export default function ChatPage() {
         throw new Error('No response received.')
       }
     } catch (err) {
+      // An intentional cancel (unmount / new session / switch) aborts the
+      // stream; don't surface a spurious error for that.
+      if (cancelledRef.current) {
+        cancelledRef.current = false
+        return
+      }
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
       setStreamingContent('')
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
