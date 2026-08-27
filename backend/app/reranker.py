@@ -72,9 +72,22 @@ class Reranker:
                     return orm_cls.from_pretrained(cache_dir), tokenizer_cls.from_pretrained(cache_dir)
                 model = orm_cls.from_pretrained(model_name, export=True)
                 tokenizer = tokenizer_cls.from_pretrained(model_name)
-                os.makedirs(cache_dir, exist_ok=True)
-                model.save_pretrained(cache_dir)
-                tokenizer.save_pretrained(cache_dir)
+                # Persist into a dedicated subdir of the base cache so we never
+                # clobber a shared/read-only base cache. Skip the write if the
+                # artifacts already exist to avoid an unintentional overwrite,
+                # and tolerate a read-only cache by keeping the in-memory model
+                # for this process rather than failing startup.
+                if not os.path.isfile(ready):
+                    try:
+                        os.makedirs(cache_dir, exist_ok=True)
+                        model.save_pretrained(cache_dir)
+                        tokenizer.save_pretrained(cache_dir)
+                    except OSError as exc:
+                        logger.warning(
+                            "reranker: could not persist ONNX cache to %s (%s); "
+                            "using in-memory model for this process",
+                            cache_dir, exc,
+                        )
                 return model, tokenizer
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
