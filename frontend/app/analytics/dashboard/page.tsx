@@ -126,13 +126,26 @@ export default function AnalyticsDashboardPage() {
   const FETCH_TIMEOUT_MS = 15000
   const GETME_TIMEOUT_MS = 10000
 
-  // Resolves null if the promise doesn't settle in time, so a hung getMe
-  // can't keep inFlight stuck true forever.
-  function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
-    return Promise.race([
-      p,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
-    ])
+  // Races the given promise against a timeout. Resolves with `{ timedOut: true }`
+  // if the promise doesn't settle in time (so a hung getMe can't keep inFlight
+  // stuck true forever), otherwise returns the resolved value. The dangling
+  // timer is always cleared once the wrapped promise settles.
+  function withTimeout<T>(p: Promise<T>, ms: number): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
+    let timer: ReturnType<typeof setTimeout>
+    const onTimeout = new Promise<{ timedOut: true }>((resolve) => {
+      timer = setTimeout(() => resolve({ timedOut: true }), ms)
+    })
+    const onSettle = p.then(
+      (value) => {
+        clearTimeout(timer)
+        return { timedOut: false, value }
+      },
+      (err) => {
+        clearTimeout(timer)
+        throw err
+      },
+    )
+    return Promise.race([onSettle, onTimeout])
   }
 
   async function load() {
@@ -148,11 +161,18 @@ export default function AnalyticsDashboardPage() {
     controllerRef.current = controller
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
-      // Guard against a hung getMe: race it with a timeout that resolves
-      // to null so we can always release inFlight below.
-      const me = await withTimeout(getMe(), GETME_TIMEOUT_MS)
-      if (!me) {
+      // Guard against a hung getMe: race it with a timeout, and release
+      // inFlight below regardless of how this resolves.
+      const meResult = await withTimeout(getMe(), GETME_TIMEOUT_MS)
+      if (meResult.timedOut) {
         if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
+        return
+      }
+      const me = meResult.value
+      if (!me) {
+        // Genuine auth rejection (401/expired token) or a network failure:
+        // send the user to login, restoring the original behavior.
+        redirectToLogin('/analytics/dashboard')
         return
       }
       if (!mountedRef.current) return
