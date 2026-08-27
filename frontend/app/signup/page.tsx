@@ -5,10 +5,26 @@ import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { API_BASE, getToken, setToken } from '../lib/auth'
 
+// Local safe-redirect guard (should be consolidated into lib/auth.ts).
+// A safe target is a root-relative path: it starts with a single "/", is not
+// protocol-relative ("//"), and is not an absolute URL (no scheme/hostname).
+function isSafeRedirect(target: string): boolean {
+  if (typeof target !== 'string' || target.length === 0) return false
+  if (!target.startsWith('/')) return false
+  if (target.startsWith('//')) return false
+  // Reject absolute URLs (e.g. "http://", "https://", "javascript:").
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(target)) return false
+  return true
+}
+
+function safeNext(target: string | null): string {
+  return target && isSafeRedirect(target) ? target : '/chat'
+}
+
 function SignupForm() {
   const router = useRouter()
   const params = useSearchParams()
-  const next = params.get('next') || '/chat'
+  const next = safeNext(params.get('next'))
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
