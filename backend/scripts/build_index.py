@@ -49,43 +49,45 @@ from app.index_text import compose_dense_text, compose_sparse_text
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint")
-CHECKPOINT_SKIP_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint.skipped")
 
 
 def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-def load_checkpoint() -> int:
+def load_checkpoint() -> tuple[int, int]:
+    """Return (resume_line, skipped) persisted together in one checkpoint.
+
+    `skipped` counts malformed jsonl lines seen on the way to `resume_line`.
+    Storing it alongside the position means an aborted run keeps the exact
+    cumulative malformed-line count so a resume neither loses nor double-counts
+    it. A missing checkpoint yields (0, 0).
+    """
     if os.path.exists(CHECKPOINT_PATH):
         with open(CHECKPOINT_PATH) as f:
-            return int(f.read().strip() or 0)
-    return 0
+            data = f.read().strip()
+        if data:
+            try:
+                obj = json.loads(data)
+                return int(obj.get("line", 0)), int(obj.get("skipped", 0))
+            except (json.JSONDecodeError, ValueError):
+                # Tolerate a legacy plain-integer checkpoint.
+                return int(data), 0
+    return 0, 0
 
 
-def save_checkpoint(line_num: int):
+def save_checkpoint(line_num: int, skipped: int):
+    """Persist the resume position together with the cumulative `skipped` count.
+
+    Called on every batch and on abort, so the malformed-line count survives
+    any interruption instead of only being written at the very end of a run.
+    """
     tmp_path = f"{CHECKPOINT_PATH}.tmp"
     with open(tmp_path, "w") as f:
-        f.write(str(line_num))
+        f.write(json.dumps({"line": line_num, "skipped": skipped}))
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, CHECKPOINT_PATH)
-
-
-def load_skipped() -> int:
-    if os.path.exists(CHECKPOINT_SKIP_PATH):
-        with open(CHECKPOINT_SKIP_PATH) as f:
-            return int(f.read().strip() or 0)
-    return 0
-
-
-def save_skipped(skipped: int):
-    tmp_path = f"{CHECKPOINT_SKIP_PATH}.tmp"
-    with open(tmp_path, "w") as f:
-        f.write(str(skipped))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, CHECKPOINT_SKIP_PATH)
 
 
 def backup_collection_best_effort(client: QdrantClient):
@@ -201,15 +203,14 @@ def main():
     recreated = ensure_collection(client)
 
     if recreated:
-        save_checkpoint(0)
-        save_skipped(0)
+        save_checkpoint(0, 0)
         print(
             "Collection was (re)created empty this run — embed checkpoint reset to 0 so "
             "the ENTIRE dataset is re-indexed (the old checkpoint referred to a "
             "collection that no longer exists).",
         )
 
-    start_line = load_checkpoint()
+    start_line, skipped = load_checkpoint()
 
     with open(DATA_PATH) as f:
         lines = f.readlines()
@@ -247,14 +248,13 @@ def main():
                 f"advanced (batch will be retried from the last saved checkpoint): {e}",
             )
             raise
-        save_checkpoint(end_line)
+        save_checkpoint(end_line, skipped)
         pbar.update(len(rows))
 
     batch_frames = {}
     executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
     pbar = tqdm(total=total - start_line, desc="Embedding + indexing")
 
-    skipped = load_skipped()
     try:
         for i, line in enumerate(lines):
             if i < start_line:
@@ -286,7 +286,6 @@ def main():
         executor.shutdown(wait=False)
 
     pbar.close()
-    save_skipped(skipped)
     if skipped:
         log(
             f"Build finished with {skipped} malformed jsonl line(s) skipped. "
