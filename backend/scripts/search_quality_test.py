@@ -205,6 +205,12 @@ def run_one(g: dict, k: int) -> dict:
         if rid is None:
             print(f"[WARN] query {g['id']}: result #{idx} missing 'id'; skipping entry")
             continue
+        if not isinstance(rid, int):
+            try:
+                rid = int(rid)
+            except (TypeError, ValueError):
+                print(f"[WARN] query {g['id']}: result #{idx} has non-int 'id' ({rid!r}); skipping entry")
+                continue
         ids.append(rid)
 
     expected = set(g["expected"])
