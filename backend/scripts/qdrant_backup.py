@@ -22,6 +22,7 @@ Only the most recent ``BACKUP_RETENTION`` (default 5) backups per collection are
 kept; older ones are pruned by ``prune_backups``.
 """
 import os
+import re
 import shutil
 import sys
 from contextlib import contextmanager
@@ -31,6 +32,13 @@ from urllib.parse import urlparse
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUPS_DIR = os.path.join(BACKEND_DIR, "backups")
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
+
+TS_RE = re.compile(r"^\d{8}-\d{6}-\d{6}$")
+
+
+def log(msg: str):
+    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
+
 
 def _parse_retention() -> int:
     raw = os.getenv("BACKUP_RETENTION", "5")
@@ -44,10 +52,6 @@ def _parse_retention() -> int:
 RETENTION = _parse_retention()
 
 LOCAL_ARTIFACTS = ["articles.jsonl", "index_state.json"]
-
-
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def new_backup_dir(collection_name: str) -> str:
@@ -110,8 +114,6 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str):
 
     name = snap.name
     try:
-        import requests
-
         url = _snapshot_download_url(collection_name, name)
         log(f"downloading snapshot '{name}' from {_redact_url(url)}")
         with _open_url(url, timeout=300, stream=True) as resp:
@@ -153,7 +155,9 @@ def backup_dirs(collection_name: str) -> list:
     dirs = [
         os.path.join(BACKUPS_DIR, d)
         for d in os.listdir(BACKUPS_DIR)
-        if d.startswith(prefix) and os.path.isdir(os.path.join(BACKUPS_DIR, d))
+        if d.startswith(prefix)
+        and TS_RE.match(d[len(prefix):]) is not None
+        and os.path.isdir(os.path.join(BACKUPS_DIR, d))
     ]
     return sorted(dirs, key=os.path.basename)
 
