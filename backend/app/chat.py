@@ -212,7 +212,7 @@ class ChatStore:
         # row after the first. No-op if the caller already limits the query, or
         # the query ends in a trailing SQL comment (appending LIMIT there would
         # land inside the comment and be silently ignored).
-        stripped = query.rstrip()
+        stripped = query.rstrip().rstrip(";").rstrip()
         has_limit = re.search(r"\blimit\b", stripped, re.IGNORECASE) is not None
         has_comment = ("--" in stripped) or ("/*" in stripped and "*/" not in stripped)
         if not has_limit and not has_comment:
@@ -641,7 +641,11 @@ def _finalize_answer(text: str, question: str) -> str:
         return _sanitize_dataviz(_apply_requested_view(text, question))
     if not text or "```dataviz" not in text:
         return text
-    return _sanitize_dataviz(text).rstrip()
+    # Non-chart question: charts must NEVER appear. The model may emit a dataviz
+    # block non-deterministically even without a chart ask, so strip every
+    # fence (the chart-intent nudge only appends a block for explicit chart
+    # requests, which take the branch above).
+    return _DATAVIZ_FENCE_RE.sub("", text).rstrip()
 
 
 def _append_nudge(answer: str, nudge_content: str) -> str:
@@ -1162,6 +1166,12 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
             status_code=503,
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
+    except Exception:
+        # Any other failure during the turn (DB error, retrieval error, etc.)
+        # must also roll back the dangling user message — the stream path deletes
+        # on every error. Re-raise so the caller still surfaces the 500.
+        await s.delete_message(session_id, user_id, user_msg.id)
+        raise
 
     latency_ms = (time.perf_counter() - start) * 1000
 
