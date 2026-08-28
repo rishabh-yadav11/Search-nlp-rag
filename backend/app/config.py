@@ -218,6 +218,15 @@ class Config:
     AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+    # Only trust the client-supplied X-Forwarded-For header when this API is
+    # deployed behind a known reverse proxy (e.g. nginx). Otherwise the real
+    # socket peer is authoritative so a client cannot spoof its IP for
+    # rate-limiting. Local/dev should leave this off.
+    AUTH_TRUST_X_FORWARDED_FOR = os.getenv("AUTH_TRUST_X_FORWARDED_FOR", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     # Background purge interval for expired auth_tokens rows (0 disables the loop).
     AUTH_TOKEN_PURGE_INTERVAL_SECONDS = int(os.getenv("AUTH_TOKEN_PURGE_INTERVAL_SECONDS", "3600"))
 
