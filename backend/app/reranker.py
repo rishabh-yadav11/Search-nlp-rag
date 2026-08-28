@@ -70,8 +70,8 @@ class Reranker:
             try:
                 if os.path.isfile(ready):
                     return orm_cls.from_pretrained(cache_dir), tokenizer_cls.from_pretrained(cache_dir)
-                model = orm_cls.from_pretrained(model_name, export=True)
-                tokenizer = tokenizer_cls.from_pretrained(model_name)
+                model = orm_cls.from_pretrained(model_name, export=True, timeout=300)
+                tokenizer = tokenizer_cls.from_pretrained(model_name, timeout=300)
                 # Persist into a dedicated subdir of the base cache so we never
                 # clobber a shared/read-only base cache. Skip the write if the
                 # artifacts already exist to avoid an unintentional overwrite,
