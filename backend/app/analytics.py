@@ -18,6 +18,16 @@ from app.config import config
 
 logger = logging.getLogger("analytics")
 
+# Click positions are bucketed 1..CLICK_POSITION_MAX in the summary view, so an
+# unauthenticated beacon can only poison within this range (never create
+# arbitrarily-named ``analytics:click:pos:{n}`` keys).
+CLICK_POSITION_MIN = 1
+CLICK_POSITION_MAX = 10
+
+# Sorted-set reads are paginated in batches of this size when we need a true
+# sum of all member scores (the top-50 window otherwise undercounts).
+_ZSUM_BATCH = 200
+
 _redis = None
 _warned = False
 
@@ -109,13 +119,30 @@ async def record_click(query: str, position: int, article_id: int | None = None)
         # (unbounded member size = unbounded memory growth). Keep the key stable
         # by truncating rather than hashing.
         query = (query or "").strip()[: config.CLICK_QUERY_MAX_LEN]
+        # Clamp position into the valid display range so a poisoned beacon cannot
+        # create arbitrary ``analytics:click:pos:{n}`` keys. Position 0 or
+        # negative collapses to the first slot; values above the max cap at the
+        # last tracked slot.
+        try:
+            pos = int(position)
+        except (TypeError, ValueError):
+            pos = CLICK_POSITION_MIN
+        pos = max(CLICK_POSITION_MIN, min(CLICK_POSITION_MAX, pos))
+        # Validate the article id before it becomes a sorted-set member; an
+        # invalid id is skipped so it can't poison the per-query click signal.
+        q_article_id = None
+        if article_id is not None:
+            try:
+                q_article_id = int(article_id)
+            except (TypeError, ValueError):
+                q_article_id = None
         p = _client().pipeline()
         p.incr("analytics:click:total")
-        p.incr(f"analytics:click:pos:{position}")
+        p.incr(f"analytics:click:pos:{pos}")
         p.zincrby("analytics:click_top_queries", 1, query)
-        if article_id is not None:
+        if q_article_id is not None:
             qkey = _click_query_key(query)
-            p.zincrby(qkey, 1, str(article_id))
+            p.zincrby(qkey, 1, str(q_article_id))
             # Expire the per-query set so distinct-query sets don't accumulate
             # forever; refreshed on each click.
             p.expire(qkey, config.CLICK_QUERY_TTL_SECONDS)
@@ -130,21 +157,49 @@ async def click_signals(query: str) -> dict | None:
     try:
         c = _client()
         key = _click_query_key(query)
-        raw = await c.zrevrange(key, 0, 50, withscores=True)
-        if not raw:
+        # "total clicks" and the per-article breakdown are built from ALL members
+        # of the sorted set, paginated in batches. Using only a top-50 window
+        # would undercount once a query has more than 50 clicked articles and
+        # break the invariant ``sum(by_id.values()) == total`` that the click-boost
+        # layer relies on. Paginate the full set so the reported total and
+        # breakdown stay consistent.
+        total = 0
+        by_id: dict[int, int] = {}
+        offset = 0
+        while True:
+            chunk = await c.zrevrange(
+                key, offset, offset + _ZSUM_BATCH - 1, withscores=True
+            )
+            if not chunk:
+                break
+            for article_id, count in chunk:
+                count_i = int(count)
+                if count_i < 1:
+                    continue
+                # Guard the article-id cast: a poisoned/garbage member is skipped
+                # rather than raising, so one bad beacon can't break the signal.
+                aid = _safe_int(article_id)
+                if aid is None:
+                    continue
+                total += count_i
+                by_id[aid] = by_id.get(aid, 0) + count_i
+            if len(chunk) < _ZSUM_BATCH:
+                break
+            offset += _ZSUM_BATCH
+        if not by_id:
             return None
-        # "total clicks" is the sum of per-article click counts, not the number
-        # of distinct articles (zcard) — repeated clicks on one article still
-        # count as query volume.
-        total = sum(int(count) for _article, count in raw)
         if total < config.CLICK_BOOST_MIN_CLICKS:
             return None
-        return {
-            "total": total,
-            "by_id": {int(article_id): int(count) for article_id, count in raw if count >= 1},
-        }
+        return {"total": total, "by_id": by_id}
     except Exception as exc:
         _degraded(exc)
+        return None
+
+
+def _safe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
 
 
