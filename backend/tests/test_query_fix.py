@@ -100,9 +100,16 @@ def test_load_vocab_corrupt_gzip_or_json_returns_empty(tmp_path, caplog):
 def test_load_vocab_filters_non_conforming_rows(tmp_path):
     vocab = _write_vocab(
         tmp_path,
-        [["good", 5], ["", 5], [3, 5], ["bad-count", "x"], ["floaty", 7.5]],
+        [
+            ["good", 5],
+            ["", 5],
+            [3, 5],
+            ["bad-count", "x"],
+            ["fractional", 7.5],  # fractional float -> dropped (not a whole count)
+            ["whole", 8.0],  # whole-number float -> admitted as int
+        ],
     )
-    assert QueryFixer._load_vocab(vocab) == {"good": 5, "floaty": 7}
+    assert QueryFixer._load_vocab(vocab) == {"good": 5, "whole": 8}
 
 
 # --- _build (lines 92-111) ---
@@ -110,7 +117,7 @@ def test_load_vocab_filters_non_conforming_rows(tmp_path):
 
 def test_build_with_vocab_and_curated_entities(monkeypatch, tmp_path):
     calls = _fake_symspell(monkeypatch)
-    vocab = _write_vocab(tmp_path, [["funding", 42], ["flipkart", 3], ["flip-kart", 7.5]])
+    vocab = _write_vocab(tmp_path, [["funding", 42], ["flipkart", 3], ["flip-kart", 7]])
 
     f = QueryFixer(vocab, entities=["Flipkart", "ABC Corp"])
 

@@ -189,7 +189,8 @@ def test_generate_answer_retries_on_retryable_error(monkeypatch, exc):
     assert result.content == "retried"
     assert result.prompt_tokens == 3
     assert client.chat.completions.calls == 2
-    assert slept == [0.5]
+    # Backoff has jitter: base 0.5 + uniform(0, 0.25).
+    assert 0.5 <= slept[0] <= 0.75
 
 
 def test_generate_answer_exhaustion_raises_and_backs_off(monkeypatch):
@@ -202,7 +203,10 @@ def test_generate_answer_exhaustion_raises_and_backs_off(monkeypatch):
         _run(generate_answer(client, "P", "m"))
 
     assert client.chat.completions.calls == 4
-    assert slept == [0.5, 1.0, 2.0]
+    # Backoff has jitter: base*(2**attempt) + uniform(0, base*2**attempt*0.5).
+    assert 0.5 <= slept[0] <= 0.75
+    assert 1.0 <= slept[1] <= 1.5
+    assert 2.0 <= slept[2] <= 3.0
 
 
 @pytest.mark.parametrize("exc", [_bad_request(), ValueError("nope")])
@@ -273,7 +277,8 @@ def test_stream_answer_retries_before_first_chunk(monkeypatch):
 
     assert pieces == ["Hel", "lo"]
     assert client.chat.completions.calls == 2
-    assert slept == [0.5]
+    # Backoff has jitter: base 0.5 + uniform(0, 0.25).
+    assert 0.5 <= slept[0] <= 0.75
 
 
 def test_stream_answer_mid_stream_failure_never_retries(monkeypatch):
@@ -300,7 +305,9 @@ def test_stream_answer_exhausts_retries_before_first_chunk(monkeypatch):
         _run(_collect(stream_answer(client, "P", "m")))
 
     assert client.chat.completions.calls == 3
-    assert slept == [0.5, 1.0]
+    # Backoff has jitter: base*(2**attempt) + uniform(0, base*2**attempt*0.5).
+    assert 0.5 <= slept[0] <= 0.75
+    assert 1.0 <= slept[1] <= 1.5
 
 
 def test_stream_answer_without_usage_holder(monkeypatch):

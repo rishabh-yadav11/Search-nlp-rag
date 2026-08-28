@@ -5,6 +5,7 @@ between tests."""
 
 import asyncio
 
+import redis
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -165,10 +166,11 @@ def test_redis_status_ping_fails_degraded(monkeypatch):
 
     class FakeRedis:
         async def ping(self):
-            raise RuntimeError("redis down")
+            raise redis.exceptions.RedisError("redis down")
 
     monkeypatch.setattr(health.aioredis, "from_url", lambda url, **kw: FakeRedis())
-    assert _run(health._redis_status()) == (True, "degraded")
+    # A ping failure is a real Redis error -> degraded (client reset, not ok).
+    assert _run(health._redis_status()) == (False, "degraded")
 
 
 def test_redis_status_ping_times_out_degraded(monkeypatch):
@@ -179,7 +181,8 @@ def test_redis_status_ping_times_out_degraded(monkeypatch):
             raise TimeoutError()
 
     monkeypatch.setattr(health.aioredis, "from_url", lambda url, **kw: FakeRedis())
-    assert _run(health._redis_status()) == (True, "degraded")
+    # A ping timeout -> degraded (client reset, not ok).
+    assert _run(health._redis_status()) == (False, "degraded")
 
 
 # --- _readiness_report ---
