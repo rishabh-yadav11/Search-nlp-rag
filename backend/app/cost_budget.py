@@ -74,10 +74,35 @@ async def assert_within_budget() -> None:
         raise BudgetExceeded()
 
 
+# Atomic check-and-increment: read the running total, add the delta only if the
+# result would not exceed the budget, and (re)set the TTL — all in one Lua
+# round-trip so concurrent requests cannot both pass a pre-check and then
+# overshoot the cap. Returns the new total, or -1 when the increment would push
+# spend past the budget (the caller then skips recording to stay within cap).
+_RECORD_SCRIPT = """
+local cur = tonumber(redis.call('get', KEYS[1]) or '0')
+local delta = tonumber(ARGV[1])
+local budget = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+if budget > 0 and (cur + delta) > budget then
+    return -1
+end
+redis.call('incrbyfloat', KEYS[1], delta)
+redis.call('expire', KEYS[1], ttl)
+return tonumber(redis.call('get', KEYS[1]) or '0')
+"""
+
+
 async def record_cost(cost_inr: float) -> None:
     """Add ``cost_inr`` (INR, as reported by LLMResult.cost()) to today's
     running total, converted to USD so the counter is comparable to
-    LLM_DAILY_BUDGET_USD. Best-effort, never raises."""
+    LLM_DAILY_BUDGET_USD.
+
+    The check-and-increment is atomic (a single Lua script), so concurrent
+    requests can't all clear a pre-flight budget check and then collectively
+    overshoot the daily cap. If recording would push spend past the budget, the
+    increment is refused (fails closed) rather than letting the counter exceed
+    the cap. Best-effort, never raises."""
     if cost_inr <= 0:
         return
     try:
@@ -85,13 +110,19 @@ async def record_cost(cost_inr: float) -> None:
         key = _day_key()
         # Record the cost and set the TTL atomically in a pipeline so a crash
         # between the two commands can't leave a day key with no expiry.
-        async with c.pipeline() as pipe:
-            await pipe.incrbyfloat(key, to_usd(cost_inr))
-            # Bound the counter's lifetime: expire a fixed window after it is
-            # written so daily cost keys don't accumulate in Redis indefinitely.
-            # Set on every write, so an active day always stays alive past its end.
-            await pipe.expire(key, config.COST_DAY_TTL_SECONDS)
-            await pipe.execute()
+        new = await c.eval(
+            _RECORD_SCRIPT,
+            1,
+            key,
+            to_usd(cost_inr),
+            config.LLM_DAILY_BUDGET_USD,
+            config.COST_DAY_TTL_SECONDS,
+        )
+        if new == -1:
+            logger.warning(
+                "daily LLM budget reached; cost of %.4f USD not recorded to avoid overshoot",
+                to_usd(cost_inr),
+            )
     except Exception as exc:
         logger.warning("cost budget Redis unavailable (%s); spend not recorded", exc)
 
