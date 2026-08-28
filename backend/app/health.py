@@ -22,7 +22,8 @@ async def close_redis() -> None:
     global _redis_client
     if _redis_client is not None:
         await _redis_client.aclose()
-        _redis_client = None
+_redis_client = None
+_redis_init_lock = asyncio.Lock()
 
 
 @router.get("/live")
@@ -57,15 +58,19 @@ async def _redis_status() -> tuple[bool, str]:
     global _redis_client
     if not config.REDIS_URL:
         return True, "memory"
-    if _redis_client is None:
-        _redis_client = aioredis.from_url(
-            config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
-        )
+    async with _redis_init_lock:
+        if _redis_client is None:
+            try:
+                _redis_client = aioredis.from_url(
+                    config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
+                )
+            except Exception:
+                return False, "down"
     try:
         await asyncio.wait_for(_redis_client.ping(), timeout=2.0)
         return True, "redis"
     except Exception:
-        return True, "degraded"
+        return False, "degraded"
 
 
 async def _readiness_report(state) -> tuple[bool, dict]:
