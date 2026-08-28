@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from dataclasses import dataclass
 
 import openai
@@ -42,7 +43,10 @@ def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
     if isinstance(exc, openai.APIStatusError):
-        return exc.status_code >= 500 or exc.status_code == 429
+        # Retry only transient failures: 5xx server errors and rate-limit (429).
+        # Do NOT retry 4xx client errors (e.g. 400 invalid request) — they won't
+        # succeed on retry and would just burn attempts/budget.
+        return exc.status_code is not None and (exc.status_code >= 500 or exc.status_code == 429)
     return False
 
 
@@ -64,6 +68,8 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
                 timeout=config.LLM_TIMEOUT_SECONDS,
             )
             usage = response.usage
+            if not response.choices:
+                raise LLMUnavailableError("LLM returned an empty choices list") from None
             return LLMResult(
                 content=response.choices[0].message.content or "",
                 prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
@@ -74,6 +80,7 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
             if not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
                 raise LLMUnavailableError() from exc
             delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            delay += random.uniform(0, delay * 0.5)
             logger.warning(
                 "LLM call failed on attempt %d/%d (%s); retrying in %.1fs",
                 attempt + 1,
@@ -132,6 +139,7 @@ async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list 
             if started or not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
                 raise LLMUnavailableError() from exc
             delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            delay += random.uniform(0, delay * 0.5)
             logger.warning(
                 "LLM stream failed on attempt %d/%d (%s); retrying in %.1fs",
                 attempt + 1,
