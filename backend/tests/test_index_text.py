@@ -35,12 +35,13 @@ def test_clean_strips_html_and_collapses_whitespace():
     assert clean(None) == ""
 
 
-def test_split_names_json_keeps_order_no_dedup_plain_dedupes():
-    # JSON-list values are preserved verbatim (order kept, no dedup) because facet
-    # frequency/order can matter downstream.
-    assert split_names('["Alice", "Alice", "Bob"]') == ["Alice", "Alice", "Bob"]
-    # Delimited (comma/pipe/slash) values are de-duplicated and trimmed.
-    assert split_names("Fintech/Healthtech") == ["Fintech", "Healthtech"]
+def test_split_names_json_dedupes_plain_dedupes():
+    # JSON-list values are flattened (nested lists unwrapped) and de-duplicated.
+    assert split_names('["Alice", "Alice", "Bob"]') == ["Alice", "Bob"]
+    assert split_names('[["Alice", "Bob"], "Bob"]') == ["Alice", "Bob"]
+    # Delimited (comma/pipe) values are de-duplicated and trimmed. Slashes are
+    # NOT a delimiter — they are legitimate within facet values.
+    assert split_names("Fintech/Healthtech") == ["Fintech/Healthtech"]
     assert split_names("TMT, Technology") == ["TMT", "Technology"]
     assert split_names("") == []
     assert split_names(None) == []
@@ -54,7 +55,7 @@ def test_split_names_whitespace_only_and_malformed_json():
 def test_normalize_date_edge_values():
     assert normalize_date(None) is None
     assert normalize_date("   ") is None
-    assert normalize_date("not-a-date") == "not-a-date"
+    assert normalize_date("not-a-date") is None
 
 
 def test_normalize_date_datetime_instance():
@@ -69,8 +70,8 @@ def test_record_from_row_builds_canonical_payload():
     assert rec["url"] == "https://www.vccircle.com/ola-electric-ipo"
     assert rec["published_date"].startswith("2025-06-01T00:00:00")
     assert rec["category"] == "Series A, M&A"
-    assert rec["author_names"] == ["Alice", "Alice", "Bob"]
-    assert rec["industry_names"] == ["Fintech", "Healthtech"]
+    assert rec["author_names"] == ["Alice", "Bob"]
+    assert rec["industry_names"] == ["Fintech/Healthtech"]
 
 
 def test_record_from_row_external_url_wins():

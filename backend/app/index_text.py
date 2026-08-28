@@ -18,10 +18,13 @@ Helpers shared by the index scripts (fetch/build/update) and the API.
 """
 import html
 import json
+import logging
 import re
 from datetime import UTC, datetime
 
 from app.config import config
+
+logger = logging.getLogger(__name__)
 
 # vcc_frontend schema -> canonical record mapping. The table/pk come from config.
 # external_url wins over canonical_url for the canonical article link.
@@ -29,25 +32,45 @@ EXTERNAL_URL_SQL = "COALESCE(NULLIF(external_url, ''), NULLIF(canonical_url, '')
 
 
 def split_names(value) -> list[str]:
-    """Split a *_names column ('TMT,Technology' or JSON-like list) into values."""
+    """Split a *_names column ('TMT,Technology' or JSON-like list) into values.
+
+    Always returns a flat, deduplicated list of non-empty strings (never None).
+    """
     if not value:
         return []
-    s = str(value).strip()
-    if not s:
-        return []
-    if s.startswith("["):
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
-        except (ValueError, TypeError):
-            pass
-    seen: list[str] = []
-    for part in re.split(r"[,|/]+", s):
-        p = part.strip()
-        if p and p not in seen:
-            seen.append(p)
-    return seen
+    if isinstance(value, list):
+        items = _flatten_names(value)
+    else:
+        s = str(value).strip()
+        if not s:
+            return []
+        items = []
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    items = _flatten_names(parsed)
+            except (ValueError, TypeError):
+                items = []
+        if not items:
+            for part in re.split(r"[,|]+", s):
+                items.extend(_flatten_names([part]))
+    flat: list[str] = []
+    for p in items:
+        if p and p not in flat:
+            flat.append(p)
+    return flat
+
+
+def _flatten_names(values) -> list[str]:
+    """Recursively flatten arbitrary nested lists into a clean str list."""
+    out: list[str] = []
+    for x in values:
+        if isinstance(x, list):
+            out.extend(_flatten_names(x))
+        else:
+            out.append(str(x).strip())
+    return out
 
 
 def clean(text) -> str:
@@ -110,7 +133,8 @@ def normalize_date(value):
         try:
             dt = datetime.fromisoformat(s.replace(" ", "T", 1) if "T" not in s else s)
         except ValueError:
-            return s
+            logger.warning("normalize_date: unparseable date value %r; skipping", value)
+            return None
     return dt.isoformat()
 
 
