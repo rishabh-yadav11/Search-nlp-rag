@@ -48,7 +48,8 @@ def test_spend_today_redis_down_returns_zero_and_warns(monkeypatch):
 def test_spend_today_reads_counter(monkeypatch):
     class Client:
         async def get(self, key):
-            return "2.5"
+            # Counter is stored as integer micro-USD (2.5 USD == 2_500_000).
+            return "2500000"
 
     monkeypatch.setattr(cost_budget, "_client", lambda: Client())
     assert _run(cost_budget.spend_today()) == 2.5
@@ -82,13 +83,17 @@ def test_record_cost_redis_down_never_raises(monkeypatch):
 
 def test_record_cost_converts_inr_to_usd(monkeypatch):
     """Regression: the day counter is compared against LLM_DAILY_BUDGET_USD, so
-    INR cost from LLMResult.cost() must be converted to USD before incrementing."""
+    INR cost from LLMResult.cost() must be converted to USD (and stored as
+    integer micro-USD) before incrementing."""
     calls = []
     monkeypatch.setattr(cost_budget, "_client", lambda: _fake_client(calls))
     monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 95.6)
     _run(cost_budget.record_cost(95.6))
     assert len(calls) == 1
-    assert abs(calls[0][1] - 1.0) < 1e-9  # ₹95.6 -> $1.0
+    keys, args = calls[0]
+    # args == [amount_micros, ttl_seconds, budget_micros]; ₹95.6 -> $1.0 -> 1_000_000 micros.
+    assert keys == [cost_budget._day_key()]
+    assert args[0] == 1_000_000
 
 
 def test_to_usd_canonical_unit(monkeypatch):
@@ -162,29 +167,17 @@ def raise_runtime_error(*args, **kwargs):
 
 
 def _fake_client(calls):
-    class _Pipe:
+    class _Script:
         def __init__(self, calls):
             self._calls = calls
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def incrbyfloat(self, key, amount):
-            self._calls.append((key, amount))
-            return self
-
-        async def expire(self, key, seconds):
-            return self
-
-        async def execute(self):
-            return None
+        async def __call__(self, keys=None, args=None, client=None):
+            self._calls.append((keys, args))
+            return 0
 
     class Client:
-        def pipeline(self):
-            return _Pipe(calls)
+        def register_script(self, lua):
+            return _Script(calls)
 
     return Client()
 

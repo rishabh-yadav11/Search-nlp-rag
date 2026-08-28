@@ -20,6 +20,31 @@ logger = logging.getLogger("cost_budget")
 
 _redis = None
 
+# Store the daily counter as integer micro-USD (1 USD == _COST_SCALE units)
+# instead of a float. Many small INCRBYFLOAT calls otherwise drift in floating
+# point; integer accumulation is exact and the comparison against the cap is
+# done in the same units.
+_COST_SCALE = 1_000_000
+
+# One Lua script makes the "increment + enforce cap + refresh TTL" sequence
+# atomic on the server, so concurrent requests can't each read "under budget"
+# and then all increment past LLM_DAILY_BUDGET_USD (a TOCTOU race). If the
+# increment would exceed the cap it is rolled back (fail closed) and the
+# script returns 1; otherwise 0.
+_RECORD_LUA = """
+local cur = redis.call('incrbyfloat', KEYS[1], ARGV[1])
+redis.call('expire', KEYS[1], ARGV[2])
+local budget = tonumber(ARGV[3])
+if budget > 0 and tonumber(cur) > budget then
+  redis.call('incrbyfloat', KEYS[1], -tonumber(ARGV[1]))
+  return 1
+end
+return 0
+"""
+
+_inr_fallback_warned = False
+_budget_reached_warned = False
+
 
 class BudgetExceeded(Exception):
     """Raised when the configured daily LLM spend cap is already exhausted."""
@@ -53,9 +78,15 @@ def _day_key() -> str:
 
 
 async def spend_today() -> float:
-    """Cumulative LLM cost for today (USD). Returns 0 on Redis failure."""
+    """Cumulative LLM cost for today (USD). Returns 0 on Redis failure.
+
+    The stored counter is integer micro-USD; it is divided back to USD here so
+    the rest of the app keeps working in its canonical USD unit."""
     try:
-        return float(await _client().get(_day_key()) or 0.0)
+        raw = await _client().get(_day_key())
+        if not raw:
+            return 0.0
+        return float(raw) / _COST_SCALE
     except Exception as exc:
         logger.warning("cost budget Redis unavailable (%s); assuming no spend", exc)
         return 0.0
@@ -76,24 +107,44 @@ async def assert_within_budget() -> None:
 
 async def record_cost(cost_inr: float) -> None:
     """Add ``cost_inr`` (INR, as reported by LLMResult.cost()) to today's
-    running total, converted to USD so the counter is comparable to
-    LLM_DAILY_BUDGET_USD. Best-effort, never raises."""
+    running total, converted to USD (then integer micro-USD) so the counter is
+    comparable to LLM_DAILY_BUDGET_USD. Best-effort, never raises.
+
+    The increment, cap enforcement, and TTL refresh run in one atomic Lua
+    script: if the new total would exceed the daily cap the increment is rolled
+    back and the cost is not recorded (fail closed), so concurrent requests
+    cannot collectively push spend past the budget."""
     if cost_inr <= 0:
         return
     try:
-        c = _client()
+        amount = _to_micros(to_usd(cost_inr))
+        if amount <= 0:
+            return
         key = _day_key()
-        # Record the cost and set the TTL atomically in a pipeline so a crash
-        # between the two commands can't leave a day key with no expiry.
-        async with c.pipeline() as pipe:
-            await pipe.incrbyfloat(key, to_usd(cost_inr))
-            # Bound the counter's lifetime: expire a fixed window after it is
-            # written so daily cost keys don't accumulate in Redis indefinitely.
-            # Set on every write, so an active day always stays alive past its end.
-            await pipe.expire(key, config.COST_DAY_TTL_SECONDS)
-            await pipe.execute()
+        script = _client().register_script(_RECORD_LUA)
+        rejected = await script(
+            keys=[key],
+            args=[amount, config.COST_DAY_TTL_SECONDS, _budget_micros()],
+        )
+        if rejected:
+            global _budget_reached_warned
+            if not _budget_reached_warned:
+                logger.warning(
+                    "LLM daily budget reached; further spend not recorded (fail closed)"
+                )
+                _budget_reached_warned = True
     except Exception as exc:
         logger.warning("cost budget Redis unavailable (%s); spend not recorded", exc)
+
+
+def _to_micros(usd: float) -> int:
+    """Convert a USD amount to integer micro-USD for exact counter storage."""
+    return round(usd * _COST_SCALE)
+
+
+def _budget_micros() -> int:
+    """The daily cap expressed in the same integer micro-USD units as the counter."""
+    return _to_micros(config.LLM_DAILY_BUDGET_USD)
 
 
 def to_usd(cost_inr: float) -> float:
@@ -101,5 +152,16 @@ def to_usd(cost_inr: float) -> float:
 
     All cost accounting in this project is canonical in USD (the daily budget
     counter, analytics, and stored message costs), so callers convert at the
-    recording boundary instead of mixing units."""
-    return cost_inr / (config.INR_PER_USD or 1.0)
+    recording boundary instead of mixing units. Falls back to a 1.0 rate if
+    INR_PER_USD is unset (and warns once, since that misconfiguration yields
+    wrong costs)."""
+    global _inr_fallback_warned
+    rate = config.INR_PER_USD
+    if not rate:
+        if not _inr_fallback_warned:
+            logger.warning(
+                "INR_PER_USD not configured; falling back to 1.0, so recorded USD costs will be wrong"
+            )
+            _inr_fallback_warned = True
+        rate = 1.0
+    return round(cost_inr / rate, 6)
