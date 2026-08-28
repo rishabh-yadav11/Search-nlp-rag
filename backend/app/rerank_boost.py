@@ -135,7 +135,7 @@ _STOPWORDS = {
     "why",
 }
 
-_CAP_RE = re.compile(r"[A-Z][a-zA-Z0-9.]*")
+_CAP_RE = re.compile(r"[A-Z][A-Za-z0-9.']*")
 
 # Generic capitalized words that are NOT proper-noun entities (sentence-start
 # pronouns, articles, prepositions, and vague adjectives). These are filtered
