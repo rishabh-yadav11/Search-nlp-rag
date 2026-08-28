@@ -157,14 +157,14 @@ async def click_signals(query: str) -> dict | None:
     try:
         c = _client()
         key = _click_query_key(query)
-        raw = await c.zrevrange(key, 0, 50, withscores=True)
-        if not raw:
-            return None
-        # "total clicks" is the sum of per-article click counts across ALL
-        # members, not just the top-50 window returned above (which would
-        # undercount once a query has more than 50 clicked articles). Paginate
-        # the full set so the reported total is accurate.
+        # "total clicks" and the per-article breakdown are built from ALL members
+        # of the sorted set, paginated in batches. Using only a top-50 window
+        # would undercount once a query has more than 50 clicked articles and
+        # break the invariant ``sum(by_id.values()) == total`` that the click-boost
+        # layer relies on. Paginate the full set so the reported total and
+        # breakdown stay consistent.
         total = 0
+        by_id: dict[int, int] = {}
         offset = 0
         while True:
             chunk = await c.zrevrange(
@@ -172,23 +172,25 @@ async def click_signals(query: str) -> dict | None:
             )
             if not chunk:
                 break
-            total += sum(int(count) for _article, count in chunk)
+            for article_id, count in chunk:
+                count_i = int(count)
+                if count_i < 1:
+                    continue
+                # Guard the article-id cast: a poisoned/garbage member is skipped
+                # rather than raising, so one bad beacon can't break the signal.
+                aid = _safe_int(article_id)
+                if aid is None:
+                    continue
+                total += count_i
+                by_id[aid] = by_id.get(aid, 0) + count_i
             if len(chunk) < _ZSUM_BATCH:
                 break
             offset += _ZSUM_BATCH
+        if not by_id:
+            return None
         if total < config.CLICK_BOOST_MIN_CLICKS:
             return None
-        return {
-            "total": total,
-            # Guard the article-id cast: a poisoned/garbage member is skipped
-            # rather than raising, so one bad beacon can't break the signal.
-            "by_id": {
-                int(article_id): int(count)
-                for article_id, count in raw
-                if count >= 1
-                and _safe_int(article_id) is not None
-            },
-        }
+        return {"total": total, "by_id": by_id}
     except Exception as exc:
         _degraded(exc)
         return None
