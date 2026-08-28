@@ -18,10 +18,13 @@ Helpers shared by the index scripts (fetch/build/update) and the API.
 """
 import html
 import json
+import logging
 import re
 from datetime import UTC, datetime
 
 from app.config import config
+
+logger = logging.getLogger(__name__)
 
 # vcc_frontend schema -> canonical record mapping. The table/pk come from config.
 # external_url wins over canonical_url for the canonical article link.
@@ -42,7 +45,7 @@ def split_names(value) -> list[str]:
                 items: list[str] = []
                 for x in parsed:
                     if isinstance(x, list):
-                        items.extend(str(y).strip() for y in x)
+                        items.extend(_flatten_names(x))
                     else:
                         items.append(str(x).strip())
                 flat: list[str] = []
@@ -53,6 +56,18 @@ def split_names(value) -> list[str]:
         except (ValueError, TypeError):
             pass
     seen: list[str] = []
+
+
+def _flatten_names(values) -> list[str]:
+    """Recursively flatten arbitrary nested lists into a clean str list."""
+    out: list[str] = []
+    for x in values:
+        if isinstance(x, list):
+            out.extend(_flatten_names(x))
+        else:
+            out.append(str(x).strip())
+    return out
+
     for part in re.split(r"[,|]+", s):
         p = part.strip()
         if p and p not in seen:
@@ -120,6 +135,7 @@ def normalize_date(value):
         try:
             dt = datetime.fromisoformat(s.replace(" ", "T", 1) if "T" not in s else s)
         except ValueError:
+            logger.warning("normalize_date: unparseable date value %r; skipping", value)
             return None
     return dt.isoformat()
 
