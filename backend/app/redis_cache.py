@@ -24,7 +24,8 @@ class HybridCache:
         self._maxsize = maxsize
         self._mem: "OrderedDict[str, tuple[object, float]]" = OrderedDict()
         self._redis = None
-        self._warned = False
+        self._decode_warned = False
+        self._conn_warned = False
 
     def _client(self) -> aioredis.Redis:
         if self._redis is None:
@@ -34,9 +35,14 @@ class HybridCache:
         return self._redis
 
     def _degraded(self, exc: Exception) -> None:
-        if not self._warned:
-            logger.warning("Redis unavailable (%s); using in-process cache", exc)
-            self._warned = True
+        if isinstance(exc, json.JSONDecodeError):
+            if not self._decode_warned:
+                logger.warning("Redis payload decode failed (%s); using in-process cache", exc)
+                self._decode_warned = True
+        else:
+            if not self._conn_warned:
+                logger.warning("Redis unavailable (%s); using in-process cache", exc)
+                self._conn_warned = True
 
     async def get(self, key: str):
         try:
@@ -80,6 +86,7 @@ class HybridCache:
     async def close(self) -> None:
         if self._redis is not None:
             await self._redis.aclose()
+            self._redis = None
 
 
 cache = HybridCache(config.REDIS_URL, config.CACHE_TTL_SECONDS, config.CACHE_MAX_SIZE)
