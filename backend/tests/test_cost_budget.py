@@ -65,6 +65,7 @@ def test_spend_today_zero_when_no_counter(monkeypatch):
 
 
 def test_record_cost_skips_nonpositive(monkeypatch):
+    cost_budget._RECORD_SCRIPT = None
     calls = []
     monkeypatch.setattr(cost_budget, "_client", lambda: _fake_client(calls))
     _run(cost_budget.record_cost(0.0))
@@ -74,6 +75,7 @@ def test_record_cost_skips_nonpositive(monkeypatch):
 
 def test_record_cost_redis_down_never_raises(monkeypatch):
     """ERROR PATH — Redis down on write: skip recording, warn once, no raise."""
+    cost_budget._RECORD_SCRIPT = None
     monkeypatch.setattr(cost_budget, "_client", _raise_runtime_error_client)
     warnings = []
     monkeypatch.setattr(cost_budget.logger, "warning", lambda *a, **k: warnings.append(a))
@@ -85,6 +87,7 @@ def test_record_cost_converts_inr_to_usd(monkeypatch):
     """Regression: the day counter is compared against LLM_DAILY_BUDGET_USD, so
     INR cost from LLMResult.cost() must be converted to USD (and stored as
     integer micro-USD) before incrementing."""
+    cost_budget._RECORD_SCRIPT = None
     calls = []
     monkeypatch.setattr(cost_budget, "_client", lambda: _fake_client(calls))
     monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 95.6)
