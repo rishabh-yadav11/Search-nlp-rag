@@ -69,7 +69,7 @@ def test_ttl_expiry():
 def test_degraded_mode_falls_back_and_warns_once(monkeypatch):
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
     cache._redis = _FakeRedis()
-    assert cache._warned is False
+    assert cache._conn_warned is False
 
     warnings = []
     monkeypatch.setattr("app.redis_cache.logger.warning", lambda *a, **k: warnings.append(a))
@@ -83,7 +83,7 @@ def test_degraded_mode_falls_back_and_warns_once(monkeypatch):
 
     _run(scenario())
 
-    assert cache._warned is True
+    assert cache._conn_warned is True
     assert len(warnings) == 1, "degraded warning should be logged exactly once"
 
 
@@ -96,9 +96,9 @@ def test_degraded_warn_flag_stays_set(monkeypatch):
         await cache.set("b", 2)
 
     _run(scenario())
-    assert cache._warned is True
+    assert cache._conn_warned is True
     _run(scenario())
-    assert cache._warned is True
+    assert cache._conn_warned is True
 
 
 def test_get_redis_hit_decodes_json():
