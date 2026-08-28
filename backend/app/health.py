@@ -71,12 +71,12 @@ async def _redis_status() -> tuple[bool, str]:
                 _redis_client = aioredis.from_url(
                     config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
                 )
-            except (redis.exceptions.RedisError, OSError, asyncio.TimeoutError):
+            except (TimeoutError, redis.exceptions.RedisError, OSError):
                 return False, "down"
     try:
         await asyncio.wait_for(_redis_client.ping(), timeout=2.0)
         return True, "redis"
-    except (redis.exceptions.RedisError, OSError, asyncio.TimeoutError):
+    except (TimeoutError, redis.exceptions.RedisError, OSError):
         _redis_client = None
         return False, "degraded"
 
