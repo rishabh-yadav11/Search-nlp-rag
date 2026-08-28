@@ -84,7 +84,13 @@ class QueryFixer:
         try:
             with gzip.open(path, "rt", encoding="utf-8") as f:
                 rows = json.load(f)
-            return {str(t): int(c) for t, c in rows if isinstance(t, str) and t and isinstance(c, (int, float))}
+            return {
+                str(t): int(c)
+                for t, c in rows
+                if isinstance(t, str)
+                and t
+                and (isinstance(c, int) or (isinstance(c, float) and c.is_integer()))
+            }
         except Exception as exc:  # noqa: BLE001 - degraded mode, never crash startup
             logger.warning("query_fix: vocab load failed (%s); continuing without it", exc)
             return {}
