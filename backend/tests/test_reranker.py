@@ -242,7 +242,10 @@ def test_load_onnx_export_under_lock(monkeypatch, tmp_path):
     model, tokenizer = rer._load_onnx("model-x", orm_cls, tokenizer_cls)
 
     assert model is not None and tokenizer is not None
-    assert calls["from_pretrained"] == [(("model-x",), {"export": True}), (("model-x",), {})]
+    assert calls["from_pretrained"] == [
+        (("model-x",), {"export": True, "timeout": 300}),
+        (("model-x",), {"timeout": 300}),
+    ]
     assert calls["save"] == [("model", cache_dir), ("tokenizer", cache_dir)]
     assert os.path.isfile(os.path.join(cache_dir, "model.onnx"))
     assert flock_calls == [fcntl.LOCK_EX, fcntl.LOCK_UN]
