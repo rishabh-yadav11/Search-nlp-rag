@@ -39,7 +39,7 @@ def diversify(results, n: int, lam: float = 0.7, sim_thresh: float = 0.4):
         best = 0.0
         for j in chosen_idx:
             s = _jaccard(tok[i], tok[j])
-            if s > sim_thresh and s > best:
+            if s >= sim_thresh and s > best:
                 best = s
         return best
 
