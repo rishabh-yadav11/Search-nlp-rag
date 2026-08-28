@@ -54,7 +54,10 @@ ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
 SERVICE_USER_ID = "service-token"
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-_MAX_PASSWORD_LEN = 128
+# bcrypt silently truncates its input at 72 bytes; cap there so validation
+# matches what bcrypt actually hashes (otherwise two distinct long passwords
+# can collide on their shared 72-byte prefix).
+_BCRYPT_MAX_BYTES = 72
 
 
 class SignupIn(BaseModel):
@@ -125,10 +128,15 @@ def validate_email(email: str) -> str:
 
 def validate_password(password: str) -> str:
     """Validate a password (length + letter/digit), raising 422 on violation."""
-    if not password or len(password) < config.AUTH_PASSWORD_MIN_LEN or len(password) > _MAX_PASSWORD_LEN:
+    if not password or len(password) < config.AUTH_PASSWORD_MIN_LEN:
         raise HTTPException(
             status_code=422,
-            detail=f"password must be {config.AUTH_PASSWORD_MIN_LEN}-{_MAX_PASSWORD_LEN} characters",
+            detail=f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters",
+        )
+    if len(password.encode("utf-8")) > _BCRYPT_MAX_BYTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"password too long (max {_BCRYPT_MAX_BYTES} bytes)",
         )
     if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
         raise HTTPException(status_code=422, detail="password must contain a letter and a digit")
@@ -145,13 +153,19 @@ def validate_name(name: str) -> str:
     return name
 
 
+def _password_bytes(password: str) -> bytes:
+    """Normalize a password to exactly the bytes bcrypt will hash, so the
+    set and verify paths agree (bcrypt truncates at 72 bytes)."""
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+
+
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(password: str, hashed: str) -> bool:
     try:
-        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+        return bcrypt.checkpw(_password_bytes(password), hashed.encode("utf-8"))
     except ValueError:
         return False
 
@@ -238,10 +252,11 @@ class AuthStore:
         )
 
     async def create_user(self, email: str, password: str, name: str, role: str) -> StoredUser:
+        password_hash = await asyncio.to_thread(hash_password, password)
         user = StoredUser(
             id=uuid.uuid4().hex,
             email=email,
-            password_hash=hash_password(password),
+            password_hash=password_hash,
             name=name,
             role=role,
             is_active=True,
@@ -278,7 +293,14 @@ class AuthStore:
         rows = await self._fetchall("SELECT * FROM users ORDER BY created_at DESC")
         return [UserOut.from_user(self._to_user(r)) for r in rows]
 
-    async def update_user(self, user_id: str, name: str | None, role: str | None, is_active: bool | None) -> None:
+    async def update_user(
+        self,
+        user_id: str,
+        name: str | None,
+        role: str | None,
+        is_active: bool | None,
+        guard_last_admin: bool = False,
+    ) -> int:
         # Whitelist the columns that may be set so a future caller can never inject
         # a user-controlled column name into the SQL via f-string interpolation.
         allowed: dict[str, object] = {"name": name, "role": role, "is_active": is_active}
@@ -292,15 +314,40 @@ class AuthStore:
             else:
                 params.append(val)
         if not sets:
-            return
+            return 1
         params.append(user_id)
-        await self._db.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        where = "id = ?"
+        if guard_last_admin:
+            # Atomic guard: block only when this update would remove the last
+            # remaining admin (demote to user or deactivate). A single statement
+            # keeps the check and the write free of a count-then-set race.
+            where += (
+                " AND NOT (role = 'admin'"
+                " AND (SELECT COUNT(*) FROM users WHERE role = 'admin') <= 1"
+                " AND (? OR ?))"
+            )
+            params.append(1 if role == "user" else 0)
+            params.append(1 if is_active is False else 0)
+        cur = await self._db.execute(
+            f"UPDATE users SET {', '.join(sets)} WHERE {where}", tuple(params)
+        )
         await self._db.commit()
+        return cur.rowcount
 
-    async def delete_user(self, user_id: str) -> None:
-        await self._db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
-        await self._db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    async def delete_user(self, user_id: str, guard_last_admin: bool = False) -> int:
+        where = "id = ?"
+        params: tuple = (user_id,)
+        if guard_last_admin:
+            where += (
+                " AND NOT (role = 'admin'"
+                " AND (SELECT COUNT(*) FROM users WHERE role = 'admin') <= 1)"
+            )
+        cur = await self._db.execute(f"DELETE FROM users WHERE {where}", params)
+        n = cur.rowcount
+        if n:
+            await self._db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
         await self._db.commit()
+        return n
 
     async def set_password(self, user_id: str, password_hash: str) -> None:
         await self._db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
@@ -401,10 +448,13 @@ async def token_purge_loop() -> None:
 
 
 def _client_ip(request: Request) -> str:
-    """Client IP from the first X-Forwarded-For hop (nginx), else the socket."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """Client IP. The X-Forwarded-For header is only honored when the API is
+    deployed behind a configured reverse proxy, so a raw client cannot spoof
+    its IP (e.g. for bypassing rate limits). Otherwise the socket peer wins."""
+    if config.AUTH_TRUST_X_FORWARDED_FOR:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -521,7 +571,10 @@ async def login(body: LoginIn, request: Request):
     email = validate_email(body.email)
     s = _require_auth_store()
     user = await s.get_user_by_email(email)
-    if user is None or not verify_password(body.password, user.password_hash) or not user.is_active:
+    password_ok = user is not None and await asyncio.to_thread(
+        verify_password, body.password, user.password_hash
+    )
+    if not password_ok or not user.is_active:
         raise HTTPException(status_code=401, detail="invalid email or password")
     token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
     return AuthOut(token=token, user=UserOut.from_user(user))
@@ -548,10 +601,12 @@ async def change_password(body: ChangePasswordIn, request: Request, _: None = De
     user = request.state.user
     s = _require_auth_store()
     stored = await s.get_user(user.id)
-    if stored is None or not verify_password(body.current_password, stored.password_hash):
+    if stored is None or not await asyncio.to_thread(
+        verify_password, body.current_password, stored.password_hash
+    ):
         raise HTTPException(status_code=400, detail="current password is incorrect")
     new_password = validate_password(body.new_password)
-    await s.set_password(user.id, hash_password(new_password))
+    await s.set_password(user.id, await asyncio.to_thread(hash_password, new_password))
     await s.revoke_all_tokens(user.id)
     token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
     return AuthOut(token=token, user=UserOut.from_user(stored))
@@ -601,10 +656,11 @@ async def patch_user(
     target = await _get_user_or_404(s, user_id)
     if body.role is not None and body.role not in VALID_ROLES:
         raise HTTPException(status_code=422, detail="invalid role")
-    if target.role == "admin" and (body.role == "user" or body.is_active is False) and await s.count_admins() <= 1:
-        raise HTTPException(status_code=400, detail="cannot demote or deactivate the last admin")
+    is_demote = target.role == "admin" and (body.role == "user" or body.is_active is False)
     name = validate_name(body.name) if body.name is not None else None
-    await s.update_user(user_id, name, body.role, body.is_active)
+    rowcount = await s.update_user(user_id, name, body.role, body.is_active, guard_last_admin=is_demote)
+    if is_demote and rowcount == 0:
+        raise HTTPException(status_code=400, detail="cannot demote or deactivate the last admin")
     return UserOut.from_user(await _get_user_or_404(s, user_id))
 
 
@@ -618,9 +674,9 @@ async def delete_user(
     """Permanently remove a user and revoke all their tokens."""
     s = _require_auth_store()
     target = await _get_user_or_404(s, user_id)
-    if target.role == "admin" and await s.count_admins() <= 1:
+    n = await s.delete_user(user_id, guard_last_admin=(target.role == "admin"))
+    if target.role == "admin" and n == 0:
         raise HTTPException(status_code=400, detail="cannot delete the last admin")
-    await s.delete_user(user_id)
     return {"ok": True}
 
 

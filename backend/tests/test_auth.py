@@ -623,12 +623,21 @@ def test_require_auth_store_uninitialized_503(monkeypatch):
 
 
 def test_client_ip_x_forwarded_for_and_fallback():
-    """_client_ip trusts the first X-Forwarded-For hop (nginx) and falls back to
-    the socket peer, then 'unknown'."""
+    """_client_ip honors X-Forwarded-For only behind a trusted proxy, else the
+    real socket peer, then 'unknown'."""
+    # Default (no trusted proxy): XFF is ignored, the socket peer is authoritative.
     req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
-    assert auth._client_ip(req) == "203.0.113.9"
-    req = _req({"x-forwarded-for": " 203.0.113.9 "})
-    assert auth._client_ip(req) == "203.0.113.9"
+    req.client = SimpleNamespace(host="1.2.3.4")
+    assert auth._client_ip(req) == "1.2.3.4"
+    # Behind a trusted proxy: first XFF hop wins.
+    auth.config.AUTH_TRUST_X_FORWARDED_FOR = True
+    try:
+        req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
+        assert auth._client_ip(req) == "203.0.113.9"
+        req = _req({"x-forwarded-for": " 203.0.113.9 "})
+        assert auth._client_ip(req) == "203.0.113.9"
+    finally:
+        auth.config.AUTH_TRUST_X_FORWARDED_FOR = False
     # socket peer fallback
     req = _req({})
     req.client = SimpleNamespace(host="1.2.3.4")
