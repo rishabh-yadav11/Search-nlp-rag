@@ -39,11 +39,21 @@ def split_names(value) -> list[str]:
         try:
             parsed = json.loads(s)
             if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
+                items: list[str] = []
+                for x in parsed:
+                    if isinstance(x, list):
+                        items.extend(str(y).strip() for y in x)
+                    else:
+                        items.append(str(x).strip())
+                flat: list[str] = []
+                for p in items:
+                    if p and p not in flat:
+                        flat.append(p)
+                return flat
         except (ValueError, TypeError):
             pass
     seen: list[str] = []
-    for part in re.split(r"[,|/]+", s):
+    for part in re.split(r"[,|]+", s):
         p = part.strip()
         if p and p not in seen:
             seen.append(p)
@@ -110,7 +120,7 @@ def normalize_date(value):
         try:
             dt = datetime.fromisoformat(s.replace(" ", "T", 1) if "T" not in s else s)
         except ValueError:
-            return s
+            return None
     return dt.isoformat()
 
 
