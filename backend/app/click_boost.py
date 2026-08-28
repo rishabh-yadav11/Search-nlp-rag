@@ -21,7 +21,7 @@ async def apply_click_boost(query: str, results: list) -> list:
         return results
     total = sig["total"]
     by_id = sig["by_id"]
-    min_share = max(1, int(total * config.CLICK_BOOST_MIN_SHARE))
+    min_share = max(1, round(total * config.CLICK_BOOST_MIN_SHARE))
     changed = False
     for r in results:
         c = by_id.get(getattr(r, "id", None), 0)
