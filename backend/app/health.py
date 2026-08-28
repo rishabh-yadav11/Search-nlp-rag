@@ -1,5 +1,6 @@
 import asyncio
 
+import redis
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
@@ -16,13 +17,17 @@ async def health():
     return {"status": "ok"}
 
 
+_redis_init_lock = None
+
+
 async def close_redis() -> None:
     """Close the lazily-created readiness-check Redis client. Registered as a
     shutdown hook so the connection isn't leaked on worker exit."""
-    global _redis_client
+    global _redis_client, _redis_init_lock
     if _redis_client is not None:
         await _redis_client.aclose()
         _redis_client = None
+    _redis_init_lock = None
 
 
 @router.get("/live")
@@ -57,15 +62,23 @@ async def _redis_status() -> tuple[bool, str]:
     global _redis_client
     if not config.REDIS_URL:
         return True, "memory"
-    if _redis_client is None:
-        _redis_client = aioredis.from_url(
-            config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
-        )
+    global _redis_init_lock
+    if _redis_init_lock is None:
+        _redis_init_lock = asyncio.Lock()
+    async with _redis_init_lock:
+        if _redis_client is None:
+            try:
+                _redis_client = aioredis.from_url(
+                    config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
+                )
+            except (redis.exceptions.RedisError, OSError, asyncio.TimeoutError):
+                return False, "down"
     try:
         await asyncio.wait_for(_redis_client.ping(), timeout=2.0)
         return True, "redis"
-    except Exception:
-        return True, "degraded"
+    except (redis.exceptions.RedisError, OSError, asyncio.TimeoutError):
+        _redis_client = None
+        return False, "degraded"
 
 
 async def _readiness_report(state) -> tuple[bool, dict]:
