@@ -16,14 +16,16 @@ async def health():
     return {"status": "ok"}
 
 
+_redis_init_lock = None
+
+
 async def close_redis() -> None:
     """Close the lazily-created readiness-check Redis client. Registered as a
     shutdown hook so the connection isn't leaked on worker exit."""
-    global _redis_client
+    global _redis_client, _redis_init_lock
     if _redis_client is not None:
         await _redis_client.aclose()
-_redis_client = None
-_redis_init_lock = asyncio.Lock()
+        _redis_client = None
 
 
 @router.get("/live")
@@ -58,6 +60,9 @@ async def _redis_status() -> tuple[bool, str]:
     global _redis_client
     if not config.REDIS_URL:
         return True, "memory"
+    global _redis_init_lock
+    if _redis_init_lock is None:
+        _redis_init_lock = asyncio.Lock()
     async with _redis_init_lock:
         if _redis_client is None:
             try:
