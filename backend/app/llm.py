@@ -75,6 +75,8 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
                 prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
                 completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
             )
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             last_error = exc
             if not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
