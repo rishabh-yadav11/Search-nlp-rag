@@ -24,7 +24,14 @@ _redis = None
 # instead of a float. Many small INCRBYFLOAT calls otherwise drift in floating
 # point; integer accumulation is exact and the comparison against the cap is
 # done in the same units.
+#
+# The counter uses a DISTINCT key namespace (`llm:cost:micro:...`) from the
+# legacy USD-valued `llm:cost:day:...` key. A pre-existing USD-valued key at
+# deploy time would otherwise be misread (divided by _COST_SCALE) and have
+# micro-USD added to a USD value, corrupting that day's total until the key
+# rolls. The separate key never collides with any legacy USD key.
 _COST_SCALE = 1_000_000
+_COST_KEY_PREFIX = "llm:cost:micro"
 
 # One Lua script makes the "increment + enforce cap + refresh TTL" sequence
 # atomic on the server, so concurrent requests can't each read "under budget"
@@ -41,6 +48,10 @@ if budget > 0 and tonumber(cur) > budget then
 end
 return 0
 """
+
+# Registered once at first use and reused; register_script compiles the Lua
+# source on the server, so re-registering on every call is wasteful.
+_RECORD_SCRIPT = None
 
 _inr_fallback_warned = False
 _budget_reached_warned = False
@@ -74,7 +85,7 @@ async def close() -> None:
 
 
 def _day_key() -> str:
-    return f"llm:cost:day:{datetime.now(UTC).strftime('%Y-%m-%d')}"
+    return f"{_COST_KEY_PREFIX}:{datetime.now(UTC).strftime('%Y-%m-%d')}"
 
 
 async def spend_today() -> float:
@@ -121,8 +132,10 @@ async def record_cost(cost_inr: float) -> None:
         if amount <= 0:
             return
         key = _day_key()
-        script = _client().register_script(_RECORD_LUA)
-        rejected = await script(
+        global _RECORD_SCRIPT
+        if _RECORD_SCRIPT is None:
+            _RECORD_SCRIPT = _client().register_script(_RECORD_LUA)
+        rejected = await _RECORD_SCRIPT(
             keys=[key],
             args=[amount, config.COST_DAY_TTL_SECONDS, _budget_micros()],
         )
@@ -138,8 +151,11 @@ async def record_cost(cost_inr: float) -> None:
 
 
 def _to_micros(usd: float) -> int:
-    """Convert a USD amount to integer micro-USD for exact counter storage."""
-    return round(usd * _COST_SCALE)
+    """Convert a USD amount to integer micro-USD for exact counter storage.
+
+    This is the single rounding point: the USD value is rounded to the nearest
+    micro-USD here, so callers must not round again before this conversion."""
+    return int(round(usd * _COST_SCALE))
 
 
 def _budget_micros() -> int:
@@ -164,4 +180,4 @@ def to_usd(cost_inr: float) -> float:
             )
             _inr_fallback_warned = True
         rate = 1.0
-    return round(cost_inr / rate, 6)
+    return cost_inr / rate
