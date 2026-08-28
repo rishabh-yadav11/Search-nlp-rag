@@ -168,13 +168,24 @@ class ChatStore:
         return SessionOut(id=session_id, title=title, created_at=ts, updated_at=ts)
 
     async def list_sessions(self, user_id: str, limit: int = 100) -> list[SessionOut]:
+        # One query (window functions + LEFT JOIN) instead of two correlated
+        # subqueries per session row — avoids the N+1 round-trip pattern.
         rows = await self._db.execute_fetchall(
             """
+            WITH ranked AS (
+                SELECT session_id,
+                       content,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id ORDER BY created_at DESC, id DESC
+                       ) AS rn,
+                       SUM(cost) OVER (PARTITION BY session_id) AS total_cost
+                FROM messages
+            )
             SELECT s.id, s.title, s.created_at, s.updated_at,
-                   (SELECT m.content FROM messages m
-                     WHERE m.session_id = s.id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last,
-                   (SELECT COALESCE(SUM(m.cost), 0) FROM messages m WHERE m.session_id = s.id) AS total_cost
+                   r.content AS last,
+                   COALESCE(r.total_cost, 0) AS total_cost
             FROM sessions s
+            LEFT JOIN ranked r ON r.session_id = s.id AND r.rn = 1
             WHERE s.user_id = ?
             ORDER BY s.updated_at DESC
             LIMIT ?
@@ -197,6 +208,15 @@ class ChatStore:
         return out
 
     async def _fetchone(self, query: str, params: tuple = ()):
+        # Cap the result to a single row so we never fetch (and discard) every
+        # row after the first. No-op if the caller already limits the query, or
+        # the query ends in a trailing SQL comment (appending LIMIT there would
+        # land inside the comment and be silently ignored).
+        stripped = query.rstrip().rstrip(";").rstrip()
+        has_limit = re.search(r"\blimit\b", stripped, re.IGNORECASE) is not None
+        has_comment = ("--" in stripped) or ("/*" in stripped and "*/" not in stripped)
+        if not has_limit and not has_comment:
+            query = stripped + " LIMIT 1"
         rows = await self._db.execute_fetchall(query, params)
         return rows[0] if rows else None
 
@@ -282,6 +302,16 @@ class ChatStore:
             raise HTTPException(status_code=404, detail="conversation not found")
         await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         await self._db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        await self._db.commit()
+
+    async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
+        """Remove a single message (used to roll back a dangling user message
+        when the rest of the turn fails). No-op if the session is gone."""
+        if await self.get_session(session_id, user_id) is None:
+            return
+        await self._db.execute(
+            "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session_id)
+        )
         await self._db.commit()
 
     async def recent_turns(self, session_id: str, user_id: str, max_turns: int) -> list[MessageOut]:
@@ -605,12 +635,37 @@ def _finalize_answer(text: str, question: str) -> str:
     chart/graph/plot/table, any dataviz block the model emitted anyway is
     removed (guarding against non-deterministic emission). When a chart IS
     requested, the block is pinned to the requested view and malformed fences
-    are stripped."""
+    are stripped. In both cases only malformed/uncapped fences are stripped; a
+    valid appended dataviz block (e.g. from a chart-intent nudge) is preserved."""
     if _CHART_INTENT_RE.search(question):
         return _sanitize_dataviz(_apply_requested_view(text, question))
     if not text or "```dataviz" not in text:
         return text
+    # Non-chart question: charts must NEVER appear. The model may emit a dataviz
+    # block non-deterministically even without a chart ask, so strip every
+    # fence (the chart-intent nudge only appends a block for explicit chart
+    # requests, which take the branch above).
     return _DATAVIZ_FENCE_RE.sub("", text).rstrip()
+
+
+def _append_nudge(answer: str, nudge_content: str) -> str:
+    """Merge a nudge retry into the already-streamed ``answer`` without ever
+    overwriting it. The nudge's prose is always kept; when the nudge also carries
+    a dataviz block, that structured block is appended alongside the prose (never
+    dropped, so a corrected list's explanatory text is preserved)."""
+    nudge_content = (nudge_content or "").strip()
+    if not nudge_content:
+        return answer
+    m = _DATAVIZ_FENCE_RE.search(nudge_content)
+    if m is not None and parse_dataviz(m.group(0)) is not None:
+        block = m.group(0)
+        prose = _DATAVIZ_FENCE_RE.sub("", nudge_content).strip()
+        addition = (prose + "\n\n" + block).strip() if prose else block
+    else:
+        addition = nudge_content
+    if not addition:
+        return answer
+    return (answer.rstrip() + "\n\n" + addition).strip()
 
 
 def _effective_chat_k(question: str) -> int:
@@ -1098,16 +1153,25 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
 
     try:
         answer, sources, note, prompt_tokens, completion_tokens, cost = await _run_turn(question, history)
-    except BudgetExceeded:
-        raise HTTPException(
-            status_code=429,
-            detail={"error": "Daily AI budget reached", "detail": "The daily chat budget is exhausted; please try again tomorrow."},
-        )
-    except LLMUnavailableError:
+    except (BudgetExceeded, LLMUnavailableError) as exc:
+        # Roll back the user message so a failed turn never leaves a dangling
+        # user message with no assistant reply.
+        await s.delete_message(session_id, user_id, user_msg.id)
+        if isinstance(exc, BudgetExceeded):
+            raise HTTPException(
+                status_code=429,
+                detail={"error": "Daily AI budget reached", "detail": "The daily chat budget is exhausted; please try again tomorrow."},
+            )
         raise HTTPException(
             status_code=503,
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
+    except Exception:
+        # Any other failure during the turn (DB error, retrieval error, etc.)
+        # must also roll back the dangling user message — the stream path deletes
+        # on every error. Re-raise so the caller still surfaces the 500.
+        await s.delete_message(session_id, user_id, user_msg.id)
+        raise
 
     latency_ms = (time.perf_counter() - start) * 1000
 
@@ -1181,7 +1245,10 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 except LLMUnavailableError:
                     nudge = None
                 if nudge is not None:
-                    answer = nudge.content
+                    # Preserve the already-streamed prose; only append the
+                    # nudge's structured data (the dataviz block) so the final
+                    # answer is never overwritten or duplicated.
+                    answer = _append_nudge(answer, nudge.content)
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
             if _is_ranking_question(question) and _is_ranking_refusal(answer):
@@ -1193,7 +1260,9 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 except LLMUnavailableError:
                     nudge = None
                 if nudge is not None:
-                    answer = nudge.content
+                    # Append the corrected list; never overwrite the prose the
+                    # user already saw stream in.
+                    answer = _append_nudge(answer, nudge.content)
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
             answer = _finalize_answer(answer, question)
@@ -1220,11 +1289,14 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 },
             )
         except LLMUnavailableError:
+            await s.delete_message(session_id, user_id, user_msg.id)
             yield _sse("error", {"error": "LLM temporarily unavailable"})
         except BudgetExceeded:
+            await s.delete_message(session_id, user_id, user_msg.id)
             yield _sse("error", {"error": "Daily AI budget reached"})
         except Exception:
             logger.exception("chat stream turn failed")
+            await s.delete_message(session_id, user_id, user_msg.id)
             yield _sse("error", {"error": "Something went wrong"})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
