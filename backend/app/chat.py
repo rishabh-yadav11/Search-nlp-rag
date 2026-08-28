@@ -209,9 +209,14 @@ class ChatStore:
 
     async def _fetchone(self, query: str, params: tuple = ()):
         # Cap the result to a single row so we never fetch (and discard) every
-        # row after the first. No-op if the caller already limits the query.
-        if not re.search(r"\blimit\b", query, re.IGNORECASE):
-            query = query.rstrip("; \t\n") + " LIMIT 1"
+        # row after the first. No-op if the caller already limits the query, or
+        # the query ends in a trailing SQL comment (appending LIMIT there would
+        # land inside the comment and be silently ignored).
+        stripped = query.rstrip()
+        has_limit = re.search(r"\blimit\b", stripped, re.IGNORECASE) is not None
+        has_comment = ("--" in stripped) or ("/*" in stripped and "*/" not in stripped)
+        if not has_limit and not has_comment:
+            query = stripped + " LIMIT 1"
         rows = await self._db.execute_fetchall(query, params)
         return rows[0] if rows else None
 
@@ -630,24 +635,30 @@ def _finalize_answer(text: str, question: str) -> str:
     chart/graph/plot/table, any dataviz block the model emitted anyway is
     removed (guarding against non-deterministic emission). When a chart IS
     requested, the block is pinned to the requested view and malformed fences
-    are stripped."""
+    are stripped. In both cases only malformed/uncapped fences are stripped; a
+    valid appended dataviz block (e.g. from a chart-intent nudge) is preserved."""
     if _CHART_INTENT_RE.search(question):
         return _sanitize_dataviz(_apply_requested_view(text, question))
     if not text or "```dataviz" not in text:
         return text
-    return _DATAVIZ_FENCE_RE.sub("", text).rstrip()
+    return _sanitize_dataviz(text).rstrip()
 
 
 def _append_nudge(answer: str, nudge_content: str) -> str:
     """Merge a nudge retry into the already-streamed ``answer`` without ever
-    overwriting it. When the nudge carries a dataviz block, only that block is
-    appended (its prose is dropped so the streamed prose is not duplicated);
-    otherwise the full nudge text is appended after the existing prose."""
-    m = _DATAVIZ_FENCE_RE.search(nudge_content or "")
+    overwriting it. The nudge's prose is always kept; when the nudge also carries
+    a dataviz block, that structured block is appended alongside the prose (never
+    dropped, so a corrected list's explanatory text is preserved)."""
+    nudge_content = (nudge_content or "").strip()
+    if not nudge_content:
+        return answer
+    m = _DATAVIZ_FENCE_RE.search(nudge_content)
     if m is not None and parse_dataviz(m.group(0)) is not None:
-        addition = m.group(0)
+        block = m.group(0)
+        prose = _DATAVIZ_FENCE_RE.sub("", nudge_content).strip()
+        addition = (prose + "\n\n" + block).strip() if prose else block
     else:
-        addition = (nudge_content or "").strip()
+        addition = nudge_content
     if not addition:
         return answer
     return (answer.rstrip() + "\n\n" + addition).strip()
