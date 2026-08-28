@@ -35,7 +35,10 @@ class HybridCache:
 
     def _degraded(self, exc: Exception) -> None:
         if not self._warned:
-            logger.warning("Redis unavailable (%s); using in-process cache", exc)
+            if isinstance(exc, json.JSONDecodeError):
+                logger.warning("Redis payload decode failed (%s); using in-process cache", exc)
+            else:
+                logger.warning("Redis unavailable (%s); using in-process cache", exc)
             self._warned = True
 
     async def get(self, key: str):
@@ -80,6 +83,7 @@ class HybridCache:
     async def close(self) -> None:
         if self._redis is not None:
             await self._redis.aclose()
+            self._redis = None
 
 
 cache = HybridCache(config.REDIS_URL, config.CACHE_TTL_SECONDS, config.CACHE_MAX_SIZE)
