@@ -141,15 +141,27 @@ def _resolve_facet(query: str, aliases: dict[str, str], facets: dict[str, str]) 
     ``facets`` maps normalized -> original facet value; ``aliases`` maps a synonym
     phrase -> the keyword to look up in ``facets``. Only explicit, curated
     synonyms are matched (never raw facet labels), so common-word facet labels
-    like 'People' or 'General' can't be accidentally triggered by ordinary text."""
+    like 'People' or 'General' can't be accidentally triggered by ordinary text.
+
+    Aliases are tried longest-first so a longer phrase (e.g. 'venture capital')
+    wins over a shorter word it embeds (e.g. 'capital'). For a matched keyword, an
+    exact normalized facet name is preferred; only if no exact facet exists do we
+    fall back to a substring match, choosing the tightest (shortest) candidate so
+    the resolution is deterministic rather than an artifact of dict insertion
+    order."""
     q = query.lower()
-    for alias, kw in aliases.items():
+    # Longest alias first: a specific multi-word synonym must beat a shorter word
+    # it embeds (otherwise 'capital' could shadow 'venture capital').
+    for alias, kw in sorted(aliases.items(), key=lambda kv: -len(kv[0])):
         if re.search(r"\b" + re.escape(alias) + r"\b", q):
+            # Exact keyword match against the normalized facet vocabulary wins.
             if kw in facets:
                 return facets[kw]
-            for norm, orig in facets.items():
-                if kw in norm:
-                    return orig
+            # Substring fallback: prefer the tightest (shortest) normalized facet
+            # containing the keyword so the choice is deterministic.
+            candidates = [orig for norm, orig in facets.items() if kw in norm]
+            if candidates:
+                return min(candidates, key=lambda o: (len(o), o.lower()))
     return None
 
 
@@ -484,18 +496,21 @@ async def hybrid_search(
     return [
         SourceArticle(
             id=p.id,
-            title=p.payload.get("title", ""),
-            url=p.payload.get("url", ""),
-            published_date=p.payload.get("published_date"),
-            category=p.payload.get("category"),
-            summary=p.payload.get("summary", ""),
-            body=p.payload.get("body", ""),
-            author_names=p.payload.get("author_names") or [],
-            industry_names=p.payload.get("industry_names") or [],
-            dealtype_names=p.payload.get("dealtype_names") or [],
+            title=payload.get("title", ""),
+            url=payload.get("url", ""),
+            published_date=payload.get("published_date"),
+            category=payload.get("category"),
+            summary=payload.get("summary", ""),
+            body=payload.get("body", ""),
+            author_names=payload.get("author_names") or [],
+            industry_names=payload.get("industry_names") or [],
+            dealtype_names=payload.get("dealtype_names") or [],
             score=p.score,
         )
         for p in result.points
+        # Skip points with a null payload (shouldn't happen, but a malformed
+        # point would otherwise raise AttributeError on p.payload.get).
+        if (payload := p.payload or {}) is not None
     ]
 
 
@@ -601,12 +616,19 @@ def _tz_stripped_pub(published_date: str | None) -> str:
 
     New records store naive RFC 3339 (e.g. '2020-01-01T12:00:00'); records
     indexed before the UTC-shift fix carry a '+00:00' suffix. Stripping the
-    tz offset lets the string tiebreaker order them by wall-clock uniformly,
-    without reinterpreting or shifting the underlying time.
+    trailing tz offset (any of 'Z', '+HH:MM', '+HHMM', '-HH:MM', '-HHMM') lets
+    the string tiebreaker order records by wall-clock uniformly, without
+    reinterpreting or shifting the underlying time. Only a trailing offset is
+    removed, so an embedded '+' (rare in these fields) is left intact.
     """
     if not published_date:
         return ""
-    return published_date.replace("+00:00", "").replace("Z", "")
+    return _TZ_RE.sub("", published_date)
+
+
+# Trailing ISO-8601 timezone designator (UTC 'Z' or a numeric ±HH:MM / ±HHMM
+# offset). Used by _tz_stripped_pub to normalize dates for string comparison.
+_TZ_RE = re.compile(r"(?:[zZ]|[+-]\d{2}:?\d{2})$")
 
 
 def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
@@ -760,7 +782,11 @@ def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) ->
     if s.summary:
         parts.append(s.summary)
     if s.body:
-        parts.append(s.body[: min(body_limit or config.CHAT_BODY_CHAR_LIMIT, len(s.body))])
+        # Apply the body cap uniformly: an explicit ``body_limit`` always wins
+        # (even 0, meaning "no body"), and only when it is None do we fall back
+        # to the configured default. Negative values are clamped to 0.
+        limit = config.CHAT_BODY_CHAR_LIMIT if body_limit is None else max(0, int(body_limit))
+        parts.append(s.body[: min(limit, len(s.body))])
     return "\n".join(parts)
 
 
@@ -774,8 +800,14 @@ async def _facet_values(key: str) -> list[str]:
     Qdrant-client 1.11 does not expose a stable public facet method, so we page
     through the collection (requesting only ``key``) and collect distinct values
     instead of reaching into the client's private HTTP internals. The result is
-    capped at FACETS_LIMIT and cached by the caller. Array-valued keyword fields
-    (e.g. industry_names) contribute each element as a distinct value.
+    explicitly capped at FACETS_LIMIT and cached by the caller. Array-valued
+    keyword fields (e.g. industry_names) contribute each element as a distinct
+    value.
+
+    NOTE: the cap is intentional and is NOT silently dropping data — facet
+    vocabularies here are small (well under FACETS_LIMIT); if the cap is ever hit
+    a warning is logged so it can be raised deliberately rather than masking a
+    runaway vocabulary.
     """
     values: set[str] = set()
     next_offset = None
@@ -801,6 +833,10 @@ async def _facet_values(key: str) -> list[str]:
             # returns an empty page without clearing the offset, which would
             # otherwise loop forever.
             break
+    # Explicit cap: if we stopped because the vocabulary hit FACETS_LIMIT (rather
+    # than exhausting the collection), flag it — the data is truncated by design.
+    if len(values) >= FACETS_LIMIT:
+        logger.warning("facet %s hit FACETS_LIMIT=%d; results truncated", key, FACETS_LIMIT)
     return sorted(values)[:FACETS_LIMIT]
 
 
