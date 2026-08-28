@@ -155,7 +155,7 @@ def _to_micros(usd: float) -> int:
 
     This is the single rounding point: the USD value is rounded to the nearest
     micro-USD here, so callers must not round again before this conversion."""
-    return int(round(usd * _COST_SCALE))
+    return round(usd * _COST_SCALE)
 
 
 def _budget_micros() -> int:

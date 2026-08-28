@@ -22,7 +22,7 @@ class HybridCache:
         self._url = redis_url
         self._ttl = ttl
         self._maxsize = maxsize
-        self._mem: "OrderedDict[str, tuple[object, float]]" = OrderedDict()
+        self._mem: OrderedDict[str, tuple[object, float]] = OrderedDict()
         self._redis = None
         self._decode_warned = False
         self._conn_warned = False
