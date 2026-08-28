@@ -32,30 +32,34 @@ EXTERNAL_URL_SQL = "COALESCE(NULLIF(external_url, ''), NULLIF(canonical_url, '')
 
 
 def split_names(value) -> list[str]:
-    """Split a *_names column ('TMT,Technology' or JSON-like list) into values."""
+    """Split a *_names column ('TMT,Technology' or JSON-like list) into values.
+
+    Always returns a flat, deduplicated list of non-empty strings (never None).
+    """
     if not value:
         return []
-    s = str(value).strip()
-    if not s:
-        return []
-    if s.startswith("["):
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                items: list[str] = []
-                for x in parsed:
-                    if isinstance(x, list):
-                        items.extend(_flatten_names(x))
-                    else:
-                        items.append(str(x).strip())
-                flat: list[str] = []
-                for p in items:
-                    if p and p not in flat:
-                        flat.append(p)
-                return flat
-        except (ValueError, TypeError):
-            pass
-    seen: list[str] = []
+    if isinstance(value, list):
+        items = _flatten_names(value)
+    else:
+        s = str(value).strip()
+        if not s:
+            return []
+        items = []
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    items = _flatten_names(parsed)
+            except (ValueError, TypeError):
+                items = []
+        if not items:
+            for part in re.split(r"[,|]+", s):
+                items.extend(_flatten_names([part]))
+    flat: list[str] = []
+    for p in items:
+        if p and p not in flat:
+            flat.append(p)
+    return flat
 
 
 def _flatten_names(values) -> list[str]:
@@ -67,12 +71,6 @@ def _flatten_names(values) -> list[str]:
         else:
             out.append(str(x).strip())
     return out
-
-    for part in re.split(r"[,|]+", s):
-        p = part.strip()
-        if p and p not in seen:
-            seen.append(p)
-    return seen
 
 
 def clean(text) -> str:
