@@ -226,7 +226,7 @@ def expand_query(q: str) -> str:
             continue
         for term in expansions:
             term_lower = term.lower()
-            if term_lower in seen or term_lower in q_lower:
+            if term_lower in seen or re.search(rf"\b{re.escape(term_lower)}\b", q_lower):
                 continue
             seen.add(term_lower)
             candidates.append(term)
