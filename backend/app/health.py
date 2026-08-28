@@ -1,5 +1,6 @@
 import asyncio
 
+import redis
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ async def close_redis() -> None:
     if _redis_client is not None:
         await _redis_client.aclose()
         _redis_client = None
+    _redis_init_lock = None
 
 
 @router.get("/live")
@@ -69,12 +71,13 @@ async def _redis_status() -> tuple[bool, str]:
                 _redis_client = aioredis.from_url(
                     config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
                 )
-            except Exception:
+            except (redis.exceptions.RedisError, OSError, asyncio.TimeoutError):
                 return False, "down"
     try:
         await asyncio.wait_for(_redis_client.ping(), timeout=2.0)
         return True, "redis"
-    except Exception:
+    except (redis.exceptions.RedisError, OSError, asyncio.TimeoutError):
+        _redis_client = None
         return False, "degraded"
 
 
