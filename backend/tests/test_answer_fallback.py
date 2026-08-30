@@ -75,6 +75,39 @@ def test_weak_results_note_weak_results_string():
     assert isinstance(weak_results_note([]), str)
 
 
+def test_weak_results_note_empty_does_not_claim_to_show_matches():
+    """Regression: an empty score list still counts as weak (chat depends on
+    that to refuse to answer), but the note must not then announce matches that
+    were never returned."""
+    note = weak_results_note([])
+    assert isinstance(note, str)
+    assert "Showing the closest" not in note
+    assert "No articles matched" in note
+
+
+def test_weak_results_note_empty_with_label_mentions_period():
+    note = weak_results_note([], "2020")
+    assert isinstance(note, str)
+    assert "Showing the closest" not in note
+    assert "2020" in note
+    assert "No articles matched" in note
+
+    note_month = weak_results_note([], "January 2025")
+    assert "Showing the closest" not in note_month
+    assert "January 2025" in note_month
+
+
+def test_weak_results_note_non_empty_weak_scores_unchanged():
+    """Only the empty case changed: a weak-but-non-empty result set is still
+    described as the closest matches."""
+    assert weak_results_note([0.1, 0.2], "2020") == (
+        "Showing the closest 2020 matches — only a few articles cover this exact topic."
+    )
+    assert weak_results_note([0.1, 0.2]) == (
+        "Top results are weakly related to this query — consider rephrasing."
+    )
+
+
 def test_date_label_month_and_year():
     assert date_label("2025-01-01", "2025-01-31") == "January 2025"
     assert date_label("2025-02-01", "2025-02-28") == "February 2025"
