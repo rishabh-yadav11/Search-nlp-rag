@@ -1373,6 +1373,48 @@ def test_dataviz_helpers_edge_branches():
     assert chat_module._first_numeric_column([["x", 3.0]]) == 1
 
 
+def test_as_float_rejects_bool_before_int_coercion():
+    """Regression (#176): bool is a subclass of int, so an int-first coercion
+    turns True/False into 1.0/0.0. _as_float must reject bools before the
+    int/float branch, while genuine numbers (and numeric strings, including a
+    legit 0/1 cell) still coerce and non-numeric input still returns None.
+
+    The isinstance(v, bool) guard already existed when #176 was reported, so
+    this test locks in behaviour that was already correct: it exists purely to
+    fail if the guard is ever removed or reordered below the int/float branch.
+    """
+    assert chat_module._as_float(True) is None
+    assert chat_module._as_float(False) is None
+    assert chat_module._as_float("true") is None
+    assert chat_module._as_float("false") is None
+
+    # Genuine ints (0 and 1 included), floats and numeric strings still coerce.
+    assert chat_module._as_float(0) == 0.0
+    assert chat_module._as_float(1) == 1.0
+    assert chat_module._as_float(-3) == -3.0
+    assert chat_module._as_float(2.5) == 2.5
+    assert chat_module._as_float("0") == 0.0
+    assert chat_module._as_float("-1.5") == -1.5
+
+    # Non-numeric input keeps returning None.
+    assert chat_module._as_float("abc") is None
+    assert chat_module._as_float(None) is None
+    assert chat_module._as_float([]) is None
+    assert chat_module._as_float({}) is None
+
+    # Callers (_valid_value_column / _first_numeric_column, reached from
+    # parse_dataviz) must not treat a boolean column as numeric either.
+    assert chat_module._valid_value_column([["x", True]], 1) is False
+    assert chat_module._valid_value_column([["x", 1.0], ["y", False]], 1) is False
+    assert chat_module._first_numeric_column([["Funded", True], ["Not", False]]) is None
+    assert chat_module._first_numeric_column([["Flag", True, 5.0], ["Amount", False, 6.0]]) == 2
+
+    # A chart block whose only value column holds JSON true/false is malformed.
+    assert chat_module.parse_dataviz(
+        '```dataviz\n{"columns": ["Deal", "Flag"], "rows": [["A", true], ["B", false]], "view": "bar"}\n```'
+    ) is None
+
+
 def test_parse_dataviz_rejection_paths():
     # line 561: data is not a dict
     assert chat_module.parse_dataviz("```dataviz\n[1, 2, 3]\n```") is None
