@@ -957,6 +957,26 @@ def _apply_requested_view(text: str, question: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_rewrite, text)
 
 
+async def _nudge_retry_allowed(spent_this_turn_inr: float = 0.0) -> bool:
+    """True when the daily LLM spend cap still permits one more nudge call.
+
+    The retry is a second (billed) call, so it re-checks the cap instead of
+    relying on the outer caller's single check. The re-check counts
+    ``spent_this_turn_inr`` (INR, as reported by ``LLMResult.cost()``): that
+    spend is already incurred but only reaches the Redis counter when the turn
+    ends, so reading the counter alone would pass even when this turn's first
+    call already used up the day's budget (#177). The pending figure is a
+    read-only input to the comparison — the end-of-turn ``record_cost`` remains
+    the sole write, so nothing is counted twice. Returns False instead of
+    raising, so a budget-stopped retry degrades to the answer already produced."""
+    try:
+        await assert_within_budget(pending_usd=to_usd(spent_this_turn_inr))
+    except BudgetExceeded:
+        logger.info("LLM daily budget reached; skipping nudge retry")
+        return False
+    return True
+
+
 async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     """Call the LLM once, nudging it to include a dataviz data block when the
     question explicitly asks for a chart/graph/plot/table and the model skipped
@@ -964,6 +984,8 @@ async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     retry keeps the first answer instead of erroring the turn."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
     if parse_dataviz(result.content) is None and _CHART_INTENT_RE.search(question):
+        if not await _nudge_retry_allowed(result.cost()):
+            return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _dataviz_nudge(question), config.LLM_MODEL)
         except LLMUnavailableError:
@@ -1016,6 +1038,11 @@ async def _answer_ranked(question: str, prompt: str) -> LLMResult:
     answer instead of erroring the turn."""
     result = await _answer_with_dataviz(question, prompt)
     if _is_ranking_question(question) and _is_ranking_refusal(result.content):
+        # The retry is a second billed call, so it re-checks the daily cap the
+        # same way the dataviz nudge does, counting this turn's spend (which
+        # only reaches the counter at the end of the turn).
+        if not await _nudge_retry_allowed(result.cost()):
+            return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _RANKING_NUDGE, config.LLM_MODEL)
         except LLMUnavailableError:
@@ -1397,16 +1424,24 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
+            # Cost already incurred by this turn (the stream plus any nudge
+            # call) but not yet in the daily counter, which is only written at
+            # the end of the turn.
+            spent_this_turn_inr = usage.cost() if usage else 0.0
             if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
                 # The user explicitly asked for a chart/graph/plot/table but the
                 # answer streamed without one; ask once more so visual requests
                 # reliably carry a dataviz block. A failed retry keeps the
                 # streamed answer instead of erroring the whole turn after the
-                # user already saw it stream in.
-                try:
-                    nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
-                except LLMUnavailableError:
-                    nudge = None
+                # user already saw it stream in. The retry is a second billed
+                # call, so it re-checks the daily cap, counting the spend this
+                # turn has already incurred.
+                nudge = None
+                if await _nudge_retry_allowed(spent_this_turn_inr):
+                    try:
+                        nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
+                    except LLMUnavailableError:
+                        nudge = None
                 if nudge is not None:
                     # Preserve the already-streamed prose; only append the
                     # nudge's structured data (the dataviz block) so the final
@@ -1414,14 +1449,20 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer = _append_nudge(answer, nudge.content)
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
+                    spent_this_turn_inr += nudge.cost()
             if _is_ranking_question(question) and _is_ranking_refusal(answer):
                 # A ranked/numeric list question streamed back as a refusal
                 # ("cannot be generated", "no specific amounts"). Ask once more
                 # to rank the named items with "value not stated" for unknowns.
-                try:
-                    nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
-                except LLMUnavailableError:
-                    nudge = None
+                # Same cap re-check as the dataviz nudge: this is a second
+                # billed call, and it counts the spend the stream (and any
+                # dataviz nudge) has already incurred this turn.
+                nudge = None
+                if await _nudge_retry_allowed(spent_this_turn_inr):
+                    try:
+                        nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
+                    except LLMUnavailableError:
+                        nudge = None
                 if nudge is not None:
                     # Append the corrected list; never overwrite the prose the
                     # user already saw stream in.

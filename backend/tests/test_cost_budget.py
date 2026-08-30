@@ -30,6 +30,17 @@ def test_assert_within_budget_allows_under_cap(monkeypatch):
     _run(cost_budget.assert_within_budget())  # must not raise
 
 
+def test_assert_within_budget_counts_pending_spend(monkeypatch):
+    """Regression (#177): spend a turn has already incurred is only written to
+    the counter when the turn ends, so callers must be able to count it against
+    the cap. Pending spend is comparison-only — it is never recorded here."""
+    monkeypatch.setattr(cost_budget.config, "LLM_DAILY_BUDGET_USD", 1.0)
+    monkeypatch.setattr(cost_budget, "spend_today", _async(lambda: 0.5))
+    _run(cost_budget.assert_within_budget(pending_usd=0.1))  # 0.6 < 1.0
+    with pytest.raises(cost_budget.BudgetExceeded):
+        _run(cost_budget.assert_within_budget(pending_usd=0.5))  # 1.0 == cap
+
+
 def test_assert_within_budget_redis_down_allows(monkeypatch):
     monkeypatch.setattr(cost_budget.config, "LLM_DAILY_BUDGET_USD", 1.0)
     monkeypatch.setattr(cost_budget, "_client", _raise_runtime_error_client)
