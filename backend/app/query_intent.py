@@ -333,7 +333,12 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
         return quarter
     m = _YEAR_SPAN_RE.search(q)
     if m:
-        return (f"{m.group(1)}-01-01", f"{m.group(2)}-12-31")
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        # A descending span ('2025 to 2024') is the same window written
+        # end-first; normalize to the ascending range instead of emitting an
+        # inverted (from > to) date window that matches nothing.
+        start, end = min(y1, y2), max(y1, y2)
+        return (f"{start}-01-01", f"{end}-12-31")
     m = _YEAR_SPAN_SHORT_RE.search(q)
     if m:
         start = int(m.group(1))

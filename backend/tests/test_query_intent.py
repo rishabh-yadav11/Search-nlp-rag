@@ -26,6 +26,19 @@ def test_extract_year_range_span():
     assert extract_year_range("deals 2023 through 2025") == ("2023-01-01", "2025-12-31")
 
 
+def test_extract_year_range_span_reversed():
+    """A span written end-first is the same window, not an inverted one:
+    '2025 to 2024' must match '2024 to 2025' rather than from_date > to_date."""
+    assert extract_year_range("deals 2025 to 2024") == ("2024-01-01", "2025-12-31")
+    assert extract_year_range("deals 2025-2024") == ("2024-01-01", "2025-12-31")
+    assert extract_year_range("deals 2025 through 2024") == ("2024-01-01", "2025-12-31")
+    assert extract_year_range("deals 1998-1995") == ("1995-01-01", "1998-12-31")
+
+
+def test_extract_year_range_span_reversed_matches_ascending():
+    assert extract_year_range("deals 2025 to 2024") == extract_year_range("deals 2024 to 2025")
+
+
 def test_extract_year_range_last_and_this_year():
     # query_intent derives "this/last year" from _CURRENT_YEAR, so assert relative
     # to it instead of hardcoding 2025/2026.
