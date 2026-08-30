@@ -1,8 +1,9 @@
 """Diversity tests: MMR `diversify` short-circuit, the greedy MMR loop
-(sim_thresh floor, lam weighting, multi-chosen max_sim), and the
-`_tokens`/`_jaccard` helpers."""
+(sim_thresh floor, lam weighting, multi-chosen max_sim), the NaN early-stop,
+and the `_tokens`/`_jaccard` helpers."""
 
 import itertools
+import logging
 import random
 from types import SimpleNamespace
 
@@ -158,7 +159,7 @@ def test_diversify_mmr_loop_max_sim_over_multiple_chosen():
     assert diversify(results, 3) == [results[0], results[2], results[1]]
 
 
-# --- #193: O(n) selection must keep the O(n^2) selection order identical ---
+# --- #193: no-mutation selection must keep the legacy order identical ---
 
 
 def test_diversify_matches_legacy_order_on_random_inputs():
@@ -222,3 +223,59 @@ def test_diversify_stops_after_all_candidates_when_n_exceeds_len():
     results = [_res("a b", 0.9), _res("a b c", 0.8)]
     assert _ids(diversify(results, 5), results) == [0, 1]
     assert _ids(_legacy_diversify(results, 5), results) == [0, 1]
+
+
+# --- NaN early-stop (lines 92-104) ---
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_diversify_all_nan_scores_returns_empty_and_warns(caplog):
+    # NaN compares false against everything, so no candidate ever beats -inf
+    # and nothing is selected. The pre-#193 loop crashed here
+    # (``order.remove(-1)`` -> ValueError); on the /search read path a short
+    # list plus a warning is better than a failed request.
+    nan = float("nan")
+    results = [_res("a b", nan), _res("a b c", nan), _res("x y", nan)]
+    try:
+        _legacy_diversify(results, 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("legacy loop was expected to raise on all-NaN")
+    with caplog.at_level(logging.WARNING, logger="diversity"):
+        assert diversify(results, 2) == []
+    assert len(_warnings(caplog)) == 1
+    assert "no candidate beat -inf" in caplog.text
+    assert "after 0 of 2 picks" in caplog.text
+
+
+def test_diversify_nan_remainder_stops_after_usable_scores_and_warns(caplog):
+    # The usable candidate is picked first; the NaN ones can never be, so
+    # selection stops at 1 of 3 instead of padding the tail with the sentinel.
+    nan = float("nan")
+    results = [
+        _res("a b", 0.9),
+        _res("a b c", nan),
+        _res("x y", nan),
+        _res("x y z", nan),
+    ]
+    with caplog.at_level(logging.WARNING, logger="diversity"):
+        assert _ids(diversify(results, 3), results) == [0]
+    assert len(_warnings(caplog)) == 1
+    assert "after 1 of 3 picks" in caplog.text
+
+
+def test_diversify_usable_scores_never_warn(caplog):
+    # Guards against the early-stop warning becoming noise on healthy input,
+    # None scores included (they are coerced to 0.0, not NaN).
+    results = [
+        _res("acme buys widget corp", 0.9),
+        _res("acme buys widget corp again", 0.8),
+        _res("completely different news story", None),
+    ]
+    with caplog.at_level(logging.WARNING, logger="diversity"):
+        assert _ids(diversify(results, 2), results) == [0, 1]
+    assert _warnings(caplog) == []
