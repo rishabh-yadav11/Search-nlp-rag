@@ -4,6 +4,7 @@ import redis
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
+from qdrant_client.http.exceptions import ApiException
 
 from app.config import config
 
@@ -43,7 +44,7 @@ async def _qdrant_ok(state) -> bool:
     try:
         await asyncio.wait_for(client.collection_exists(config.QDRANT_COLLECTION), timeout=2.5)
         return True
-    except Exception:
+    except (TimeoutError, ApiException):
         return False
 
 
