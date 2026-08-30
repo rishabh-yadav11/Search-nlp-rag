@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import time
@@ -31,12 +32,43 @@ class HybridCache:
         self._decode_warned = False
         self._conn_warned = False
 
-    def _client(self) -> aioredis.Redis:
+    def _new_client(self) -> aioredis.Redis:
+        return aioredis.from_url(
+            self._url, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
+        )
+
+    def _acquire(self) -> tuple[aioredis.Redis, bool]:
+        """Return ``(client, is_new)`` for one cache operation.
+
+        A brand new client is *not* published to ``self._redis`` here: it
+        becomes the shared client only once its first command succeeds. If
+        that first command raises, the caller discards it (see
+        :meth:`_discard`) instead of leaving an open connection nobody can
+        reach.
+        """
+        if self._redis is not None:
+            return self._redis, False
+        return self._new_client(), True
+
+    @staticmethod
+    async def _discard(client: aioredis.Redis) -> None:
+        """Close a client this cache will not keep, either because its first
+        command failed or because it lost the publish race. Close errors are
+        ignored: the caller is already on the degraded path."""
+        with contextlib.suppress(Exception):
+            await client.aclose()
+
+    async def _publish(self, client: aioredis.Redis) -> None:
+        """Share ``client`` once one of its commands has succeeded.
+
+        Concurrent calls can each build their own client while ``_redis`` is
+        still unset; the first one to finish wins and the loser is closed
+        rather than silently dropped while still holding a connection.
+        """
         if self._redis is None:
-            self._redis = aioredis.from_url(
-                self._url, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
-            )
-        return self._redis
+            self._redis = client
+        elif self._redis is not client:
+            await self._discard(client)
 
     def _degraded(self, exc: Exception) -> None:
         if isinstance(exc, json.JSONDecodeError):
@@ -49,11 +81,15 @@ class HybridCache:
                 self._conn_warned = True
 
     async def get(self, key: str) -> object | None:
+        client, is_new = self._acquire()
         try:
-            raw = await self._client().get(key)
+            raw = await client.get(key)
         except _REDIS_ERRORS as exc:
+            if is_new:
+                await self._discard(client)
             self._degraded(exc)
             return self._get_mem(key)
+        await self._publish(client)
         if raw is None:
             return self._get_mem(key)
         try:
@@ -77,11 +113,16 @@ class HybridCache:
 
     async def set(self, key: str, value, ttl: int | None = None) -> None:
         payload = json.dumps(value)
+        client, is_new = self._acquire()
         try:
-            await self._client().set(key, payload, ex=self._ttl if ttl is None else ttl)
-            return
+            await client.set(key, payload, ex=self._ttl if ttl is None else ttl)
         except _REDIS_ERRORS as exc:
+            if is_new:
+                await self._discard(client)
             self._degraded(exc)
+        else:
+            await self._publish(client)
+            return
         effective_ttl = self._ttl if ttl is None else ttl
         self._mem[key] = (value, time.monotonic() + effective_ttl)
         self._mem.move_to_end(key)

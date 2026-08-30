@@ -24,6 +24,7 @@ class _RecordingRedis:
         self.store = store if store is not None else {}
         self.sets = []
         self.closed = False
+        self.close_attempts = 0
 
     async def get(self, key):
         return self.store.get(key)
@@ -33,7 +34,42 @@ class _RecordingRedis:
         self.store[key] = value
 
     async def aclose(self):
+        self.close_attempts += 1
         self.closed = True
+
+
+class _FailingRedis(_RecordingRedis):
+    """Redis stand-in whose every command fails on first use."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.error = error if error is not None else ConnectionError("redis unreachable")
+
+    async def get(self, key):
+        raise self.error
+
+    async def set(self, key, value, ex=None):
+        raise self.error
+
+
+class _FlakyRedis(_RecordingRedis):
+    """Redis stand-in that works until ``fail`` is flipped on."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.fail = False
+        self.error = error if error is not None else ConnectionError("redis unreachable")
+
+    async def get(self, key):
+        if self.fail:
+            raise self.error
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        if self.fail:
+            raise self.error
+        self.sets.append((key, value, ex))
+        self.store[key] = value
 
 
 def _run(coro):
@@ -127,21 +163,108 @@ def test_set_success_writes_json_with_ttl():
     assert redis.store["k"] == '{"b": 2}'
 
 
-def test_client_lazy_init_and_reuse(monkeypatch):
-    redis = _RecordingRedis()
+def _patch_from_url(monkeypatch, factory):
+    """Route client construction to ``factory`` and record every client built."""
     created = []
 
     def fake_from_url(url, **kwargs):
-        created.append((url, kwargs))
-        return redis
+        client = factory()
+        created.append(client)
+        return client
+
+    monkeypatch.setattr("app.redis_cache.aioredis.from_url", fake_from_url)
+    return created
+
+
+def test_client_lazy_init_and_reuse(monkeypatch):
+    client = _RecordingRedis()
+    built = []
+
+    def fake_from_url(url, **kwargs):
+        built.append((url, kwargs))
+        return client
 
     monkeypatch.setattr("app.redis_cache.aioredis.from_url", fake_from_url)
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
-    assert cache._client() is redis
-    assert cache._client() is redis  # reused, not recreated
+    assert built == []  # nothing is built until the cache is actually used
+
+    async def scenario():
+        await cache.set("k", "v")
+        await cache.get("k")
+        await cache.get("other")
+
+    _run(scenario())
+
+    assert len(built) == 1  # built once, then reused
+    assert built[0][0] == "redis://fake:6379/0"
+    assert built[0][1]["decode_responses"] is True
+    assert cache._redis is client  # published after its first successful command
+
+
+def test_new_client_closed_when_first_get_fails(monkeypatch):
+    created = _patch_from_url(monkeypatch, _FailingRedis)
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+
+    assert _run(cache.get("k")) is None
+
     assert len(created) == 1
-    assert created[0][0] == "redis://fake:6379/0"
-    assert created[0][1]["decode_responses"] is True
+    assert created[0].closed is True, "client that failed its first use must be closed"
+    assert cache._redis is None, "a failed client must not become the shared client"
+
+
+def test_new_client_closed_when_first_set_fails(monkeypatch):
+    created = _patch_from_url(monkeypatch, _FailingRedis)
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+
+    _run(cache.set("k", "v"))
+
+    assert len(created) == 1
+    assert created[0].closed is True, "client that failed its first use must be closed"
+    assert cache._redis is None, "a failed client must not become the shared client"
+    assert cache._mem["k"][0] == "v"  # still degraded to the in-process cache
+
+
+def test_close_failure_on_discarded_client_is_swallowed(monkeypatch):
+    class _UnclosableRedis(_FailingRedis):
+        async def aclose(self):
+            self.close_attempts += 1
+            raise RuntimeError("close failed")
+
+    created = _patch_from_url(monkeypatch, _UnclosableRedis)
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+
+    assert _run(cache.get("k")) is None  # must not propagate the close error
+    assert created[0].close_attempts == 1
+    assert cache._redis is None
+
+
+def test_losing_client_closed_when_another_task_published_first():
+    winner = _RecordingRedis()
+    loser = _RecordingRedis()
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    cache._redis = winner
+
+    _run(cache._publish(loser))
+
+    assert cache._redis is winner
+    assert loser.closed is True, "a client that lost the publish race must be closed"
+    assert winner.closed is False
+
+
+def test_published_client_kept_when_a_later_command_fails():
+    redis = _FlakyRedis()
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    cache._redis = redis  # already published by an earlier success
+
+    async def scenario():
+        await cache.set("k", "v")
+        redis.fail = True
+        await cache.set("k2", "v2")
+
+    _run(scenario())
+
+    assert cache._redis is redis  # connection pool survives a transient failure
+    assert redis.closed is False
 
 
 def test_close_with_active_client():
