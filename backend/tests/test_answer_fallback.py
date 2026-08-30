@@ -80,6 +80,22 @@ def test_date_label_month_and_year():
     assert date_label("2024-03-01", "2024-03-31") == "March 2024"
 
 
+def test_date_label_impossible_month_returns_none_instead_of_raising():
+    """An out-of-range month must fall back to None like any other window that
+    isn't a plain month/year. Regression: the except clause named
+    calendar.IllegalYearError, which does not exist, so evaluating the except
+    tuple itself raised AttributeError (issue #169)."""
+    assert date_label("2025-13-01", "2025-12-31") is None
+    assert date_label("2025-00-01", "2025-12-31") is None
+    assert date_label("2025-99-01", "2025-99-31") is None
+
+
+def test_date_label_degenerate_year_does_not_raise():
+    """A year calendar cannot represent (e.g. 0000) must not escape as an
+    exception; it returns None or a label, depending on the interpreter."""
+    assert date_label("0000-01-01", "0000-01-31") in (None, "January 0")
+
+
 def test_date_label_unknown_window():
     assert date_label(None, None) is None
     assert date_label("2025-01-05", "2025-06-30") is None
