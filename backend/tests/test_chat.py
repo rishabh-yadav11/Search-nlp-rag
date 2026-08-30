@@ -2,9 +2,11 @@
 retention purging, and the message-turn flow (retrieval + LLM stubbed)."""
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
+from typing import ClassVar
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -1214,6 +1216,101 @@ def test_log_preview_is_bounded_for_large_payloads():
     # Small payloads are rendered verbatim, with no truncation or omission marker.
     assert chat_module._log_preview([{"a": 1}]) == "[{'a': 1}]"
     assert chat_module._log_preview("{not json") == "{not json"
+
+
+class _LazyItemsDict(dict):
+    """Mapping that counts how many of its members a consumer actually walks.
+
+    Lazy on purpose: the count is what distinguishes a preview that streams the
+    first few members from one that materialises the whole mapping first.
+    """
+
+    def __init__(self, source):
+        super().__init__(source)
+        self.yielded = 0
+
+    def items(self):
+        for pair in super().items():
+            self.yielded += 1
+            yield pair
+
+
+class _ReprSpy:
+    """Value that records whether anything ever rendered it."""
+
+    rendered: ClassVar[list[str]] = []
+
+    def __init__(self, label):
+        self.label = label
+
+    def __repr__(self):
+        _ReprSpy.rendered.append(self.label)
+        return f"<spy {self.label}>"
+
+
+def test_log_preview_does_not_materialise_a_huge_mapping():
+    """A preview must pull only the members it renders: building the whole
+    items() list first would cost O(size of the payload) on an error path, which
+    is exactly what the preview limits are there to prevent (#175).
+
+    A repr-then-truncate implementation walks every member, so it fails here.
+    """
+    mapping = _LazyItemsDict({f"key-{i}": i for i in range(500_000)})
+
+    preview = chat_module._log_preview(mapping)
+
+    assert mapping.yielded <= chat_module._JSON_PREVIEW_ITEMS
+    assert len(preview) <= chat_module._JSON_LOG_PREVIEW + 100
+
+
+def test_log_preview_never_renders_dropped_or_over_deep_values():
+    """Members past the preview window and containers nested deeper than the
+    depth cap must be stubbed out, not rendered: both are unbounded otherwise,
+    and only the final clip would hide it (#175).
+
+    A repr-then-truncate implementation renders both spies, so it fails here.
+    """
+    _ReprSpy.rendered = []
+    dropped = _ReprSpy("dropped-member")
+    over_deep = _ReprSpy("over-deep-member")
+
+    wide = chat_module._log_preview([{"kept": 1}] * chat_module._JSON_PREVIEW_ITEMS + [{"dropped": dropped}])
+    nested = chat_module._log_preview([[[over_deep, "x" * 2_000_000]]])
+
+    assert _ReprSpy.rendered == []
+    assert "dropped-member" not in wide
+    assert "over-deep-member" not in nested
+    assert "x" * 1000 not in nested
+    assert "<list len=2 omitted>" in nested  # the depth cap stubbed the container
+    assert len(nested) <= chat_module._JSON_LOG_PREVIEW + 100
+
+
+def test_json_loads_degrades_on_pathological_nesting(caplog):
+    """Nesting deep enough to blow the decoder's stack raises RecursionError,
+    which is not a ValueError: it must degrade to [] with the row id instead of
+    escaping as a 500 out of a history read (#175)."""
+    payload = "[" * 100_000 + "]" * 100_000
+    with pytest.raises(RecursionError):  # guard: the payload really hits the limit
+        json.loads(payload)
+
+    with caplog.at_level(logging.WARNING, logger="chat"):
+        assert chat_module.json_loads(payload, row_id=12) == []
+
+    assert "chat.json_loads: malformed stored JSON" in caplog.text
+    assert "RecursionError" in caplog.text
+    assert "row_id=12" in caplog.text
+
+
+def test_json_loads_empty_payload_is_not_corruption(caplog):
+    """An empty payload holds no data, in any str/bytes flavour: it degrades to
+    [] silently rather than reporting b''/bytearray(b'') as corrupt (#175)."""
+    with caplog.at_level(logging.WARNING, logger="chat"):
+        assert chat_module.json_loads("") == []
+        assert chat_module.json_loads(b"") == []
+        assert chat_module.json_loads(bytearray(b"")) == []
+        assert chat_module.json_loads(None) == []
+
+    assert "chat.json_loads" not in caplog.text
 
 
 def test_row_to_message_coerces_legacy_fields():
