@@ -21,3 +21,6 @@ tqdm==4.66.5
 aiosqlite==0.20.0
 bcrypt==4.2.1
 symspellpy==6.10.0
+# Fallback tz database for stdlib zoneinfo (app/query_intent.py resolves
+# Asia/Kolkata); used when the container has no system /usr/share/zoneinfo.
+tzdata==2026.3
