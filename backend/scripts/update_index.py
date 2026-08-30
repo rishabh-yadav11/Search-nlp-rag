@@ -393,10 +393,9 @@ async def main():
         log(f"index current ({time.perf_counter() - start:.2f}s, models not loaded)")
         return 0 if reconcile(state, records) else 1
 
-    # to_index is derived from `records`, the same fetch used to build points
-    # in apply_delta, so a row can never be in to_index but missing from the
-    # index source (no KeyError / TOCTOU).
-    to_index = sorted(new | changed)
+    # apply_delta derives its indexing set from `records`, the same fetch used
+    # to build the points, so a row can never be selected for indexing but
+    # missing from the index source (no KeyError / TOCTOU).
     apply_delta(records, new, changed, deleted, state)
     log(f"done in {time.perf_counter() - start:.2f}s")
     return 0 if reconcile(state, records) else 1

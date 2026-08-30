@@ -305,7 +305,7 @@ def main() -> None:
         if r["missing_terms"]:
             print(f"     MISSING TERMS: {r['missing_terms']}")
         if not r["not_filtered_ok"]:
-            print(f"     STALE DATE-FILTER: results restricted to event-year only")
+            print("     STALE DATE-FILTER: results restricted to event-year only")
         if r["dv"]:
             dv = r["dv"]
             print(f"     dataviz: cols={dv['columns']} rows={len(dv['rows'])} "
