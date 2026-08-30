@@ -819,6 +819,22 @@ def _apply_requested_view(text: str, question: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_rewrite, text)
 
 
+async def _nudge_retry_allowed() -> bool:
+    """True when the daily LLM spend cap still permits one more nudge call.
+
+    The outer caller checks the cap once before the first LLM call, but the
+    retry is a second (billed) call whose cost is only recorded after the turn
+    finishes, so it must re-check the cap itself — otherwise a retry can spend
+    past LLM_DAILY_BUDGET_USD. Returns False instead of raising, so a
+    budget-stopped retry degrades to the answer already produced."""
+    try:
+        await assert_within_budget()
+    except BudgetExceeded:
+        logger.info("LLM daily budget reached; skipping nudge retry")
+        return False
+    return True
+
+
 async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     """Call the LLM once, nudging it to include a dataviz data block when the
     question explicitly asks for a chart/graph/plot/table and the model skipped
@@ -826,6 +842,8 @@ async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     retry keeps the first answer instead of erroring the turn."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
     if parse_dataviz(result.content) is None and _CHART_INTENT_RE.search(question):
+        if not await _nudge_retry_allowed():
+            return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _dataviz_nudge(question), config.LLM_MODEL)
         except LLMUnavailableError:
@@ -1264,11 +1282,14 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # answer streamed without one; ask once more so visual requests
                 # reliably carry a dataviz block. A failed retry keeps the
                 # streamed answer instead of erroring the whole turn after the
-                # user already saw it stream in.
-                try:
-                    nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
-                except LLMUnavailableError:
-                    nudge = None
+                # user already saw it stream in. The retry is a second billed
+                # call, so it re-checks the daily cap itself.
+                nudge = None
+                if await _nudge_retry_allowed():
+                    try:
+                        nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
+                    except LLMUnavailableError:
+                        nudge = None
                 if nudge is not None:
                     # Preserve the already-streamed prose; only append the
                     # nudge's structured data (the dataviz block) so the final
