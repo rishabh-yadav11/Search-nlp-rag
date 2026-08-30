@@ -238,21 +238,31 @@ def extract_month_range(query: str) -> tuple[str, str] | None:
 def _extract_month_span(query: str) -> tuple[str, str] | None:
     """A span of months as (from_date, to_date), or None. Handles 'jan-march',
     'january to march 2025', 'january 2025 to march 2025', and 'january and
-    february'. A reverse span (e.g. 'may to march') crosses a year boundary."""
+    february'. A reverse span (e.g. 'may to march') crosses a year boundary; a
+    single year anchors the month it is written next to ('dec to jan 2024' ->
+    2023-12..2024-01, 'dec 2023 to jan' -> 2023-12..2024-01)."""
     m = _MONTH_SPAN_RE.search(query)
     if not m:
         return None
     m1, y1, y2 = _MONTHS[m.group(1)], m.group(2), m.group(4)
     m2 = _MONTHS[m.group(3)]
+    crosses_year = m1 > m2
     if y1 and y2:
         # Two explicit years: honor each side's year exactly (e.g. 'dec 2023 to
         # jan 2024' -> start 2023-12, end 2024-01).
         start_year, end_year = int(y1), int(y2)
-    elif y2 or y1:
-        year = int(y2 or y1)
-        start_year = end_year = year
-        if m1 > m2:
-            end_year = year + 1
+    elif y2:
+        # One explicit year attached to the END month (e.g. 'dec to jan 2024'):
+        # it anchors the end, so a boundary-crossing span starts the year BEFORE
+        # it, not a year after (2023-12 to 2024-01).
+        end_year = int(y2)
+        start_year = end_year - 1 if crosses_year else end_year
+    elif y1:
+        # One explicit year attached to the START month (e.g. 'dec 2023 to
+        # jan'): it anchors the start, so a boundary-crossing span ends the year
+        # after it (2023-12 to 2024-01).
+        start_year = int(y1)
+        end_year = start_year + 1 if crosses_year else start_year
     else:
         year = _current_year()
         start_year = end_year = year
