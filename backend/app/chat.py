@@ -900,6 +900,11 @@ async def _answer_ranked(question: str, prompt: str) -> LLMResult:
     answer instead of erroring the turn."""
     result = await _answer_with_dataviz(question, prompt)
     if _is_ranking_question(question) and _is_ranking_refusal(result.content):
+        # The retry is a second billed call, so it re-checks the daily cap the
+        # same way the dataviz nudge does, counting this turn's spend (which
+        # only reaches the counter at the end of the turn).
+        if not await _nudge_retry_allowed(result.cost()):
+            return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _RANKING_NUDGE, config.LLM_MODEL)
         except LLMUnavailableError:
@@ -1281,9 +1286,10 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
-            # Cost already incurred by this turn's stream but not yet in the
-            # daily counter, which is only written at the end of the turn.
-            streamed_cost = LLMResult(content="", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens).cost()
+            # Cost already incurred by this turn (the stream plus any nudge
+            # call) but not yet in the daily counter, which is only written at
+            # the end of the turn.
+            spent_this_turn_inr = usage.cost() if usage else 0.0
             if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
                 # The user explicitly asked for a chart/graph/plot/table but the
                 # answer streamed without one; ask once more so visual requests
@@ -1293,7 +1299,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # call, so it re-checks the daily cap, counting the spend this
                 # turn has already incurred.
                 nudge = None
-                if await _nudge_retry_allowed(streamed_cost):
+                if await _nudge_retry_allowed(spent_this_turn_inr):
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
                     except LLMUnavailableError:
@@ -1305,14 +1311,20 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer = _append_nudge(answer, nudge.content)
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
+                    spent_this_turn_inr += nudge.cost()
             if _is_ranking_question(question) and _is_ranking_refusal(answer):
                 # A ranked/numeric list question streamed back as a refusal
                 # ("cannot be generated", "no specific amounts"). Ask once more
                 # to rank the named items with "value not stated" for unknowns.
-                try:
-                    nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
-                except LLMUnavailableError:
-                    nudge = None
+                # Same cap re-check as the dataviz nudge: this is a second
+                # billed call, and it counts the spend the stream (and any
+                # dataviz nudge) has already incurred this turn.
+                nudge = None
+                if await _nudge_retry_allowed(spent_this_turn_inr):
+                    try:
+                        nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
+                    except LLMUnavailableError:
+                        nudge = None
                 if nudge is not None:
                     # Append the corrected list; never overwrite the prose the
                     # user already saw stream in.
