@@ -21,7 +21,10 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
     year, month = int(m1.group(1)), int(m1.group(2))
     try:
         last = calendar.monthrange(year, month)[1]
-    except (calendar.IllegalMonthError, calendar.IllegalYearError):
+    except ValueError:
+        # calendar has no IllegalYearError; an impossible month raises
+        # calendar.IllegalMonthError (a ValueError subclass) and an impossible
+        # year raises ValueError from date construction, so this covers both.
         return None
     if to_date == f"{year}-{month:02d}-{last:02d}":
         return f"{_MONTH_NAMES[month]} {year}"
