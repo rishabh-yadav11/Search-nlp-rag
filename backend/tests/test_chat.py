@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app import auth as auth_module
 from app import chat as chat_module
+from app import cost_budget as cost_budget_module
 from app.auth import AuthStore
 from app.chat import ChatStore, _smalltalk_reply
 
@@ -1138,7 +1139,7 @@ def test_answer_with_dataviz_skips_nudge_when_budget_exhausted(monkeypatch):
             completion_tokens=8,
         )
 
-    async def exhausted():
+    async def exhausted(*args, **kwargs):
         raise chat_module.BudgetExceeded()
 
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
@@ -1150,6 +1151,82 @@ def test_answer_with_dataviz_skips_nudge_when_budget_exhausted(monkeypatch):
     assert result.content == "No chart here [1]."
     assert result.prompt_tokens == 10
     assert result.completion_tokens == 5
+
+
+def _async(fn):
+    async def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _pin_cost_accounting(monkeypatch, budget_usd, spend_usd):
+    """Pin pricing so the turn's cost arithmetic is deterministic ($1 per 1M
+    prompt tokens, ₹100 == $1) and fake the day's ALREADY-RECORDED spend.
+
+    The fake counter is what the real ``assert_within_budget`` reads, so the
+    cost a turn incurs before the guard runs is NOT in it — exactly the
+    single-turn hole from #177."""
+    monkeypatch.setattr(cost_budget_module.config, "INR_PER_USD", 100.0)
+    monkeypatch.setattr(cost_budget_module.config, "LLM_PRICE_INPUT_PER_1M", 1.0)
+    monkeypatch.setattr(cost_budget_module.config, "LLM_PRICE_OUTPUT_PER_1M", 0.0)
+    monkeypatch.setattr(cost_budget_module.config, "LLM_DAILY_BUDGET_USD", budget_usd)
+    monkeypatch.setattr(cost_budget_module, "spend_today", _async(lambda: spend_usd))
+
+
+def test_answer_with_dataviz_skips_nudge_when_turn_spend_exhausts_budget(monkeypatch):
+    """Regression (#177, the ORDINARY single-turn case): the first call's cost
+    only reaches the daily counter at the end of the turn, so the guard must
+    count it. Here the recorded total is still under the cap but this turn's
+    first call pushes the day past it, so the retry is skipped and the first
+    answer is kept (no error surfaced)."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            # 1M prompt tokens == $1.00 with the pinned pricing.
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=1_000_000, completion_tokens=0)
+        return chat_module.LLMResult(
+            content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
+            prompt_tokens=20,
+            completion_tokens=8,
+        )
+
+    # $1.50 recorded + $1.00 for this turn's first call = $2.50 > $2.00 cap.
+    _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=1.5)
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
+    assert len(calls) == 1  # retry never billed
+    assert result.content == "No chart here [1]."
+    assert result.prompt_tokens == 1_000_000
+
+
+def test_answer_with_dataviz_nudges_when_turn_spend_still_within_budget(monkeypatch):
+    """Counterpart to the case above: with headroom left after this turn's
+    first call, the guard must NOT block the retry."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=1_000_000, completion_tokens=0)
+        return chat_module.LLMResult(
+            content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
+            prompt_tokens=20,
+            completion_tokens=8,
+        )
+
+    # $0.00 recorded + $1.00 for this turn = $1.00 < $2.00 cap.
+    _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
+    assert len(calls) == 2
+    assert "dataviz" in result.content
 
 
 def test_json_loads_malformed_returns_empty():
@@ -1729,7 +1806,7 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
 
         budget_calls = {"n": 0}
 
-        async def exhausted_after_first_check():
+        async def exhausted_after_first_check(*args, **kwargs):
             budget_calls["n"] += 1
             if budget_calls["n"] > 1:
                 raise chat_module.BudgetExceeded()
@@ -1747,6 +1824,55 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
         assert nudge_calls == []  # retry never billed
         assert "streamed answer without a block [1]." in body
         assert '"prompt_tokens":10' in body  # unchanged
+        assert "event: done" in body
+        assert "event: error" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_path, monkeypatch):
+    """Streaming regression (#177, the ORDINARY single-turn case): the streamed
+    call's cost is recorded only at the end of the turn, so the guard must count
+    it. The recorded total is under the cap but the stream alone pushes the day
+    past it, so the retry is skipped and the streamed answer is served (no
+    error event)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "streamed answer without a block [1]."
+            if usage_holder is not None:
+                # 1M prompt tokens == $1.00 with the pinned pricing.
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=1_000_000, completion_tokens=0))
+
+        nudge_calls = []
+
+        async def fake_generate(client, prompt, model):
+            nudge_calls.append(prompt)
+            return chat_module.LLMResult(
+                content='Prose.\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
+                prompt_tokens=20,
+                completion_tokens=8,
+            )
+
+        async def noop(*args, **kwargs):
+            return None
+
+        # $1.50 recorded + $1.00 streamed = $2.50 > $2.00 cap, while the
+        # outer pre-turn check still passes ($1.50 < $2.00).
+        _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=1.5)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "show me a chart of top deals")
+        assert nudge_calls == []  # retry never billed
+        assert "streamed answer without a block [1]." in body
+        assert '"prompt_tokens":1000000' in body  # unchanged
         assert "event: done" in body
         assert "event: error" not in body
     finally:
