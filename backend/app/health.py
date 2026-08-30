@@ -9,15 +9,15 @@ from app.config import config
 
 router = APIRouter()
 
-_redis_client = None
+_redis_client: aioredis.Redis | None = None
 
 
 @router.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-_redis_init_lock = None
+_redis_init_lock: asyncio.Lock | None = None
 
 
 async def close_redis() -> None:
@@ -31,11 +31,11 @@ async def close_redis() -> None:
 
 
 @router.get("/live")
-async def live():
+async def live() -> dict[str, str]:
     return {"status": "ok"}
 
 
-async def _qdrant_ok(state) -> bool:
+async def _qdrant_ok(state: dict) -> bool:
     """Qdrant client present and the collection check succeeds (bounded <3s)."""
     client = state.get("qdrant")
     if client is None:
@@ -47,7 +47,7 @@ async def _qdrant_ok(state) -> bool:
         return False
 
 
-def _models_ok(state) -> bool:
+def _models_ok(state: dict) -> bool:
     return all(state.get(key) is not None for key in ("model", "sparse_model", "reranker"))
 
 
@@ -73,15 +73,18 @@ async def _redis_status() -> tuple[bool, str]:
                 )
             except (TimeoutError, redis.exceptions.RedisError, OSError):
                 return False, "down"
+    client = _redis_client
+    if client is None:
+        return False, "degraded"
     try:
-        await asyncio.wait_for(_redis_client.ping(), timeout=2.0)
+        await asyncio.wait_for(client.ping(), timeout=2.0)
         return True, "redis"
     except (TimeoutError, redis.exceptions.RedisError, OSError):
         _redis_client = None
         return False, "degraded"
 
 
-async def _readiness_report(state) -> tuple[bool, dict]:
+async def _readiness_report(state: dict) -> tuple[bool, dict]:
     qdrant_ok = await _qdrant_ok(state)
     models_ok = _models_ok(state)
     redis_ok, cache_mode = await _redis_status()
@@ -100,7 +103,7 @@ async def _readiness_report(state) -> tuple[bool, dict]:
 
 
 @router.get("/ready")
-async def ready():
+async def ready() -> JSONResponse:
     from app.main import state  # lazy: avoid circular import at startup
 
     ready, report = await _readiness_report(state)
@@ -108,7 +111,7 @@ async def ready():
 
 
 @router.get("/readyz")
-async def readyz():
+async def readyz() -> Response:
     from app.main import state  # lazy: avoid circular import at startup
 
     ready, _ = await _readiness_report(state)
