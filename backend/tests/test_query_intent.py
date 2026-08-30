@@ -303,6 +303,38 @@ def test_extract_year_range_fiscal_span_rollover():
     assert extract_year_range("deals in fy 2025-24") == ("2024-04-01", "2025-03-31")
 
 
+def test_extract_year_range_fiscal_span_multi_year():
+    """A multi-year FY span must cover every fiscal year in it, not silently
+    collapse to the last one ('fy 2020-2025' -> 2020-04-01..2025-03-31, which
+    spans FY2020 through FY2024, i.e. five fiscal years)."""
+    assert extract_year_range("deals fy 2020-2025") == ("2020-04-01", "2025-03-31")
+    assert extract_year_range("deals fy 2019-2021") == ("2019-04-01", "2021-03-31")
+    # End-first (reversed) multi-year spans resolve to the same window.
+    assert extract_year_range("deals fy 2025-2020") == ("2020-04-01", "2025-03-31")
+
+
+def test_extract_year_range_fiscal_span_same_year_is_single_fy():
+    """A degenerate span naming one year twice is a single fiscal year, so it
+    must yield the same valid window as 'FY 2025' (start < end), never an
+    inverted Apr-N..Mar-N range that matches zero rows."""
+    for q in ("deals fy 25-25", "deals fy 2025-25", "deals fy 2025 to 2025"):
+        from_date, to_date = extract_year_range(q)
+        assert from_date < to_date, f"inverted window for {q!r}: {from_date}..{to_date}"
+        assert (from_date, to_date) == ("2024-04-01", "2025-03-31")
+        assert extract_year_range(q) == extract_year_range("deals fy 2025")
+
+
+def test_extract_year_range_fiscal_single_and_consecutive_unchanged():
+    """Single-FY and consecutive two-year spans are unaffected by the
+    multi-year fix: their start is always end - 1."""
+    assert extract_year_range("deals fy 2025") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in FY25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in FY 2024-25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in fy24-25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("deals in fiscal year 2025") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("deals fy 2025-24") == ("2024-04-01", "2025-03-31")
+
+
 def test_referenced_year_explicit_flashback_prefix():
     assert _referenced_year("flashback 2025 ipos") == 2025
     assert _referenced_year("what happened in flashback 2020") == 2020
