@@ -72,8 +72,8 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
                 raise LLMUnavailableError("LLM returned an empty choices list") from None
             return LLMResult(
                 content=response.choices[0].message.content or "",
-                prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-                completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+                prompt_tokens=(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+                completion_tokens=(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
             )
         except LLMUnavailableError:
             raise
@@ -131,8 +131,8 @@ async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list 
                 usage_holder.append(
                     LLMResult(
                         content="",
-                        prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-                        completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+                        prompt_tokens=(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+                        completion_tokens=(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
                     )
                 )
             return
