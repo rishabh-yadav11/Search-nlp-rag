@@ -11,6 +11,7 @@ never fails.
 """
 
 import logging
+from typing import Any
 
 logger = logging.getLogger("encoders")
 
@@ -19,8 +20,8 @@ class DenseEncoder:
     """Dense embedder with a fastembed/ONNX fast path and a torch fallback."""
 
     def __init__(self, model_name: str, device: str, threads: int):
-        self._fallback = None
-        self._model = None
+        self._fallback: Any = None
+        self._model: Any = None
         try:
             from fastembed import TextEmbedding
 
@@ -34,7 +35,7 @@ class DenseEncoder:
 
             self._fallback = SentenceTransformer(model_name, device=device)
 
-    def encode(self, text: str):
+    def encode(self, text: str) -> Any:
         """Embed one query string into an L2-normalized vector."""
         if self._fallback is not None:
             return self._fallback.encode(text, normalize_embeddings=True)
