@@ -102,14 +102,19 @@ def test_init_fastembed_failure_falls_back_to_torch(monkeypatch):
 
 
 def test_encode_fastembed_generator_path():
-    model_cls, fe_calls = _make_text_embedding(vectors=[np.array([0.1, 0.2])])
+    raw = np.array([0.1, 0.2])
+    # encode() L2-normalizes the fastembed vector before returning it, so the
+    # expectation is the raw generator output scaled to unit length.
+    expected = raw / np.linalg.norm(raw)
+    model_cls, fe_calls = _make_text_embedding(vectors=[raw])
     enc = DenseEncoder.__new__(DenseEncoder)
     enc._model = model_cls("model-x", False, 2)
     enc._fallback = None
 
     result = enc.encode("query")
 
-    assert np.allclose(result, [0.1, 0.2])
+    assert np.allclose(result, expected)
+    assert np.allclose(np.linalg.norm(result), 1.0)
     assert fe_calls["embed"] == [(["query"], 1)]
 
 
