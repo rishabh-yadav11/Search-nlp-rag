@@ -21,7 +21,13 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
     year, month = int(m1.group(1)), int(m1.group(2))
     try:
         last = calendar.monthrange(year, month)[1]
-    except (calendar.IllegalMonthError, calendar.IllegalYearError):
+    except ValueError:
+        # Only the month is range-checked: calendar.monthrange raises
+        # calendar.IllegalMonthError (a ValueError subclass) for a month
+        # outside 1-12. There is no calendar.IllegalYearError and an
+        # out-of-range year is normalized rather than rejected
+        # (calendar.monthrange(0, 1) succeeds, CPython 3.11+), so this handler
+        # exists for the month case and any other ValueError monthrange raises.
         return None
     if to_date == f"{year}-{month:02d}-{last:02d}":
         return f"{_MONTH_NAMES[month]} {year}"
