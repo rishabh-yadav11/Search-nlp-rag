@@ -1,12 +1,40 @@
 import calendar
 import re
-from datetime import date
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
+
+# The app serves Indian news, so 'today' follows the Indian calendar, not the
+# host's: between 00:00 and 05:30 IST the UTC date is still the previous day,
+# which would resolve the wrong year around New Year on a UTC server.
+# `tzdata` is pinned in requirements.txt: stdlib zoneinfo falls back to that
+# package when the host has no system tz database. That pin -- not the stdlib
+# alone -- is what makes this zone resolvable on a slim container. If it is not
+# installed (an image built from older requirements, or a deploy that skips
+# `pip install -r requirements.txt`), this import raises ZoneInfoNotFoundError
+# and the app dies at boot; there is deliberately no degraded UTC-offset
+# fallback, because deployments always install requirements.txt.
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _now() -> datetime:
+    """The current instant, as an aware UTC datetime. This is the module's
+    single clock seam: tests freeze time by patching this helper
+    (``monkeypatch.setattr(query_intent, "_now", lambda: frozen)``) rather than
+    the imported ``datetime`` class, so they keep working if this changes."""
+    return datetime.now(UTC)
+
+
+def _today() -> date:
+    """Today's date in Asia/Kolkata (UTC+05:30). Single source of 'now' for
+    this module; the conversion from UTC happens here so freezing ``_now``
+    still exercises the Indian-calendar resolution."""
+    return _now().astimezone(_IST).date()
 
 
 def _current_year() -> int:
-    """The current year, computed at call time so resolution stays correct
-    across a calendar-year boundary in a long-running process."""
-    return date.today().year
+    """The current Indian year, computed at call time so resolution stays
+    correct across a calendar-year boundary in a long-running process."""
+    return _today().year
 
 _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
 # Full year span: '2024 to 2025', '2023-2025', '2023 through 2025'.
