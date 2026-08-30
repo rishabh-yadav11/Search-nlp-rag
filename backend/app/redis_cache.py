@@ -3,11 +3,15 @@ import logging
 import time
 from collections import OrderedDict
 
+import redis
 import redis.asyncio as aioredis
 
 from app.config import config
 
 logger = logging.getLogger("cache")
+
+
+_REDIS_ERRORS = (redis.exceptions.RedisError, OSError, TimeoutError)
 
 
 class HybridCache:
@@ -47,7 +51,7 @@ class HybridCache:
     async def get(self, key: str) -> object | None:
         try:
             raw = await self._client().get(key)
-        except Exception as exc:
+        except _REDIS_ERRORS as exc:
             self._degraded(exc)
             return self._get_mem(key)
         if raw is None:
@@ -72,10 +76,11 @@ class HybridCache:
         return value
 
     async def set(self, key: str, value, ttl: int | None = None) -> None:
+        payload = json.dumps(value)
         try:
-            await self._client().set(key, json.dumps(value), ex=self._ttl if ttl is None else ttl)
+            await self._client().set(key, payload, ex=self._ttl if ttl is None else ttl)
             return
-        except Exception as exc:
+        except _REDIS_ERRORS as exc:
             self._degraded(exc)
         effective_ttl = self._ttl if ttl is None else ttl
         self._mem[key] = (value, time.monotonic() + effective_ttl)
