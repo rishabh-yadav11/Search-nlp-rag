@@ -23,7 +23,7 @@ class HybridCache:
         self._ttl = ttl
         self._maxsize = maxsize
         self._mem: OrderedDict[str, tuple[object, float]] = OrderedDict()
-        self._redis = None
+        self._redis: aioredis.Redis | None = None
         self._decode_warned = False
         self._conn_warned = False
 
@@ -44,7 +44,7 @@ class HybridCache:
                 logger.warning("Redis unavailable (%s); using in-process cache", exc)
                 self._conn_warned = True
 
-    async def get(self, key: str):
+    async def get(self, key: str) -> object | None:
         try:
             raw = await self._client().get(key)
         except Exception as exc:
@@ -60,7 +60,7 @@ class HybridCache:
             self._degraded(exc)
             return self._get_mem(key)
 
-    def _get_mem(self, key: str):
+    def _get_mem(self, key: str) -> object | None:
         entry = self._mem.get(key)
         if entry is None:
             return None
