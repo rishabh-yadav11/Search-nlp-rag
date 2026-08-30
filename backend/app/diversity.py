@@ -60,12 +60,15 @@ def diversify(
         return best
     # Complexity, with m = len(results) and n the requested count: ``order`` is
     # never mutated -- each round scans it once and skips indices already in
-    # ``chosen_set``. That removes the O(m) ``list.remove`` per round (O(m*n)
-    # across the n rounds) that #193 flagged, but only as a lower-order term:
-    # every candidate visit also calls ``max_sim``, which is O(len(chosen_idx))
-    # and so O(m*n^2) summed over the rounds -- still the dominant cost. The
-    # win is the per-round list-mutation overhead and constant factor, not a
-    # better asymptotic bound.
+    # ``chosen_set``. That removes the per-round O(m) ``list.remove``, i.e. an
+    # O(m*n) term across the n rounds, which is the pattern #193 flagged.
+    # It is not a measurable latency win: the number of ``max_sim``/Jaccard
+    # computations is identical to the mutating version, and every candidate
+    # visit still calls ``max_sim``, which is O(len(chosen_idx)) and therefore
+    # O(m*n^2) summed over the rounds -- that remains the dominant cost, with
+    # the removed list-mutation work only a lower-order term. So the change
+    # removes the flagged quadratic list-mutation pattern rather than buying a
+    # better asymptotic bound or a measured constant-factor speedup.
     #
     # Termination: every round either appends to ``chosen_idx`` (capped at n)
     # or breaks below, so the loop cannot spin. No ``len(chosen_set) <
