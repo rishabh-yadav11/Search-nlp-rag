@@ -303,6 +303,26 @@ def test_extract_year_range_fiscal_span_rollover():
     assert extract_year_range("deals in fy 2025-24") == ("2024-04-01", "2025-03-31")
 
 
+def test_extract_year_range_fiscal_span_multi_year():
+    """A multi-year FY span must cover every fiscal year in it, not silently
+    collapse to the last one ('fy 2020-2025' -> FY2020..FY2025)."""
+    assert extract_year_range("deals fy 2020-2025") == ("2020-04-01", "2025-03-31")
+    assert extract_year_range("deals fy 2019-2021") == ("2019-04-01", "2021-03-31")
+    # End-first (reversed) multi-year spans resolve to the same window.
+    assert extract_year_range("deals fy 2025-2020") == ("2020-04-01", "2025-03-31")
+
+
+def test_extract_year_range_fiscal_single_and_consecutive_unchanged():
+    """Single-FY and consecutive two-year spans are unaffected by the
+    multi-year fix: their start is always end - 1."""
+    assert extract_year_range("deals fy 2025") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in FY25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in FY 2024-25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("top 15 deals in fy24-25") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("deals in fiscal year 2025") == ("2024-04-01", "2025-03-31")
+    assert extract_year_range("deals fy 2025-24") == ("2024-04-01", "2025-03-31")
+
+
 def test_referenced_year_explicit_flashback_prefix():
     assert _referenced_year("flashback 2025 ipos") == 2025
     assert _referenced_year("what happened in flashback 2020") == 2020
