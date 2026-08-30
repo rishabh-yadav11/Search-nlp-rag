@@ -236,6 +236,34 @@ def test_extract_year_range_month_span_crosses_year():
     assert extract_year_range("deals from may to march") == (f"{cur}-05-01", f"{cur + 1}-03-31")
 
 
+def test_extract_month_range_span_crosses_year_with_end_year():
+    """A single year written after the END month anchors the end: a span that
+    crosses the boundary must start the year BEFORE it, not return a future
+    span (issue #172: 'dec to jan 2024' was 2024-12..2025-01)."""
+    assert extract_month_range("deals in dec to jan 2024") == ("2023-12-01", "2024-01-31")
+    assert extract_month_range("deals from december to january 2024") == ("2023-12-01", "2024-01-31")
+    assert extract_month_range("deals in dec-jan 2024") == ("2023-12-01", "2024-01-31")
+
+
+def test_extract_month_range_span_crosses_year_with_start_year():
+    """A single year written after the START month anchors the start, so a
+    crossing span ends the year after it."""
+    assert extract_month_range("deals in dec 2023 to jan") == ("2023-12-01", "2024-01-31")
+    assert extract_month_range("deals in december 2023 through january") == ("2023-12-01", "2024-01-31")
+
+
+def test_extract_month_range_span_single_year_not_crossing_boundary():
+    """A forward span inside one year keeps that year on both sides."""
+    assert extract_month_range("deals in jan to mar 2024") == ("2024-01-01", "2024-03-31")
+    assert extract_month_range("deals in january to march 2024") == ("2024-01-01", "2024-03-31")
+    assert extract_month_range("deals in jan 2024 to mar") == ("2024-01-01", "2024-03-31")
+
+
+def test_extract_month_range_span_two_years_honored_exactly():
+    assert extract_month_range("deals in dec 2023 to jan 2024") == ("2023-12-01", "2024-01-31")
+    assert extract_month_range("deals in jan 2024 to mar 2024") == ("2024-01-01", "2024-03-31")
+
+
 def test_extract_month_range_month_span():
     cur = _current_year()
     assert extract_month_range("deals in jan-march") == (f"{cur}-01-01", f"{cur}-03-31")
