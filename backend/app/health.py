@@ -13,6 +13,11 @@ router = APIRouter()
 
 _redis_client: aioredis.Redis | None = None
 
+# Teardown of a client that just failed its ping gets the same 2s budget as the
+# ping itself (see _redis_status): a readiness probe must answer on time even
+# when the connection it is releasing is dying.
+_REDIS_CLOSE_TIMEOUT = 2.0
+
 
 @router.get("/health")
 async def health() -> dict[str, str]:
@@ -38,17 +43,25 @@ async def _close_quietly(client: aioredis.Redis) -> None:
 
     ``aioredis.Redis`` owns a connection pool, so dropping a reference without
     closing leaves the socket to the GC. A client that just failed its ping can
-    also fail to close, so every error from the close itself is swallowed: the
-    caller only cares that readiness is degraded, not about teardown."""
+    also fail to close, so every ``Exception`` raised by the close itself -
+    including the ``TimeoutError`` raised when it exceeds
+    ``_REDIS_CLOSE_TIMEOUT`` - is swallowed: the caller only cares that
+    readiness is degraded, not about teardown.
+
+    ``BaseException`` subclasses are deliberately *not* swallowed, notably
+    ``asyncio.CancelledError``: a cancelled probe (client disconnect, server
+    shutdown) must still unwind instead of being reported as a clean teardown."""
     close = getattr(client, "aclose", None) or getattr(client, "close", None)
     if close is None:
         return
     with contextlib.suppress(Exception):
         # redis.asyncio exposes the awaitable aclose(); the sync close() is the
-        # fallback for test doubles and older redis-py.
+        # fallback for test doubles and older redis-py. Either way the call is
+        # bounded: a hung close is cancelled and abandoned so /ready and /readyz
+        # answer on time regardless of what the dying connection does.
         outcome = close()
         if asyncio.iscoroutine(outcome) or isinstance(outcome, asyncio.Future):
-            await outcome
+            await asyncio.wait_for(outcome, timeout=_REDIS_CLOSE_TIMEOUT)
 
 
 async def _drop_redis_client(client: aioredis.Redis) -> None:
