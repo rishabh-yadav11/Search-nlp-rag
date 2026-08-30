@@ -18,6 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 
 import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -443,16 +444,149 @@ def json_dumps(v) -> str:
     return json.dumps(v, separators=(",", ":"))
 
 
-def json_loads(s: str) -> list[dict]:
-    """Parse stored JSON as a list of dicts, returning [] when the payload is
-    not shaped as a list of objects (defensive against malformed/legacy rows)."""
+_JSON_LOG_PREVIEW = 200
+_JSON_PREVIEW_ITEMS = 3
+
+
+def _clip_for_log(text: str) -> str:
+    """Cap a log fragment's length, marking anything dropped. Server-side only."""
+    if len(text) <= _JSON_LOG_PREVIEW:
+        return text
+    return text[:_JSON_LOG_PREVIEW] + "...(truncated)"
+
+
+def _container_stub(value: object) -> str:
+    """Describe a container without rendering any of it, so a structure nested
+    deeper than the preview depth cannot leak an unbounded repr."""
     try:
-        data = json.loads(s or "[]")
-    except (ValueError, TypeError):
+        size = len(value)
+    except TypeError:  # sized-less iterable: no cheap length to report
+        return f"<{type(value).__name__} omitted>"
+    return f"<{type(value).__name__} len={size} omitted>"
+
+
+def _shrink_for_log(value: object, depth: int = 2) -> object:
+    """Cheap-to-render stand-in for ``value``: long str/bytes are clipped and
+    containers keep only their first few members (each shrunk in turn), so the
+    work is capped by _JSON_LOG_PREVIEW/_JSON_PREVIEW_ITEMS rather than by the
+    size of the payload.
+
+    Containers are only ever walked through islice, so a mapping's members are
+    never materialised as a whole list first. Anything nested deeper than
+    ``depth`` degrades to a length-only stub instead of being returned for a
+    full repr.
+    """
+    if isinstance(value, str):
+        return _clip_for_log(value)
+    if isinstance(value, (bytes, bytearray)):
+        return _clip_for_log(bytes(value[:_JSON_LOG_PREVIEW]).decode("utf-8", "replace"))
+    if isinstance(value, dict):
+        if depth <= 0:
+            return _container_stub(value)
+        return {
+            (_clip_for_log(key) if isinstance(key, str) else key): _shrink_for_log(item, depth - 1)
+            for key, item in islice(value.items(), _JSON_PREVIEW_ITEMS)
+        }
+    if isinstance(value, (list, tuple)):
+        if depth <= 0:
+            return _container_stub(value)
+        return [_shrink_for_log(item, depth - 1) for item in islice(value, _JSON_PREVIEW_ITEMS)]
+    if isinstance(value, (set, frozenset)):
+        return _container_stub(value)
+    return value
+
+
+def _omitted_suffix(value: object) -> str:
+    """Say how much of a container the preview left out, so a short render is
+    never mistaken for the whole payload."""
+    if isinstance(value, (list, tuple, dict)) and len(value) > _JSON_PREVIEW_ITEMS:
+        return f" (showing {_JSON_PREVIEW_ITEMS} of {len(value)} item(s))"
+    return ""
+
+
+def _log_preview(value: object) -> str:
+    """Bounded, log-safe rendering of a payload (or any object) for diagnostics.
+
+    Non-str payloads are shrunk *before* repr() is taken, so a large list/dict is
+    never materialised in full just to be truncated afterwards. Log output is
+    server-side only and never reaches users.
+    """
+    if isinstance(value, str):
+        return _clip_for_log(value)
+    return _clip_for_log(repr(_shrink_for_log(value))) + _omitted_suffix(value)
+
+
+def _is_blank_payload(s: object) -> bool:
+    """True when the stored value carries no content at all: there is nothing to
+    parse, and nothing to report as corruption."""
+    if s is None:
+        return True
+    if isinstance(s, str):
+        return s == ""
+    if isinstance(s, (bytes, bytearray)):
+        return len(s) == 0
+    return False
+
+
+def _log_origin(row_id: object) -> str:
+    """Name the source row in a log record, so a corrupt row can be located."""
+    if row_id is None:
+        return "row_id=unknown"
+    return f"row_id={row_id}"
+
+
+def json_loads(s: object, *, row_id: object = None) -> list[dict]:
+    """Parse stored JSON as a list of dicts, returning [] when the payload is
+    not shaped as a list of objects (defensive against malformed/legacy rows).
+
+    Accepts any object: values that are not str/bytes are a caller bug but still
+    degrade to [] rather than propagating. Never raises on a bad payload —
+    corrupt JSON, pathological nesting (RecursionError), a non-list shape and a
+    non-str/bytes value all degrade to [] and are logged with the row id (when
+    the caller passes one) plus a bounded preview, so the offending row can be
+    found. Failing soft is deliberate — the callers are history reads
+    (messages()/recent_turns()), where an unexpected stored value must not become
+    a 500. Log records are server-side only; nothing here is returned to users.
+    """
+    if _is_blank_payload(s):
+        return []
+    origin = _log_origin(row_id)
+    try:
+        data = json.loads(s)
+    except (ValueError, RecursionError) as exc:
+        logger.warning(
+            "chat.json_loads: malformed stored JSON (%s: %s); %s payload(%s)=%s",
+            type(exc).__name__,
+            exc,
+            origin,
+            type(s).__name__,
+            _log_preview(s),
+        )
+        return []
+    except TypeError:
+        logger.error(
+            "chat.json_loads: payload must be str/bytes, got %s; %s payload=%s; "
+            "caller bug rather than corrupt data, degrading to []",
+            type(s).__name__,
+            origin,
+            _log_preview(s),
+        )
         return []
     if not isinstance(data, list):
+        logger.warning(
+            "chat.json_loads: expected a JSON list, got %s; %s",
+            type(data).__name__,
+            origin,
+        )
         return []
-    return [d for d in data if isinstance(d, dict)]
+    rows = [d for d in data if isinstance(d, dict)]
+    if len(rows) != len(data):
+        logger.warning(
+            "chat.json_loads: dropped %d non-object item(s) from stored JSON list; %s",
+            len(data) - len(rows),
+            origin,
+        )
+    return rows
 
 
 def _row_to_message(r) -> MessageOut:
@@ -460,7 +594,7 @@ def _row_to_message(r) -> MessageOut:
         id=r["id"],
         role=r["role"],
         content=r["content"],
-        sources=json_loads(r["sources"]),
+        sources=json_loads(r["sources"], row_id=r["id"]),
         created_at=r["created_at"],
         prompt_tokens=int(r["prompt_tokens"] or 0),
         completion_tokens=int(r["completion_tokens"] or 0),
