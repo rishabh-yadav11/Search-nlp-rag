@@ -25,6 +25,11 @@ def _async(result):
     return wrapper
 
 
+# Slack over the close timeout: a correctly bounded teardown finishes near
+# _REDIS_CLOSE_TIMEOUT, an unbounded one never finishes and trips this guard.
+_HUNG_CLOSE_GUARD = health._REDIS_CLOSE_TIMEOUT + 5.0
+
+
 @pytest.fixture(autouse=True)
 def _reset_redis_client(monkeypatch):
     monkeypatch.setattr(health, "_redis_client", None)
@@ -262,6 +267,25 @@ def test_drop_redis_client_close_failure_is_suppressed(monkeypatch):
     assert client.closed == 1
 
 
+def test_close_quietly_lets_cancellation_propagate(monkeypatch):
+    """Only ``Exception`` is swallowed: a cancellation raised by the close (or
+    by the probe being cancelled) is a ``BaseException`` and must unwind, as the
+    docstring states."""
+
+    class CancelledClose:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+            raise asyncio.CancelledError()
+
+    client = CancelledClose()
+    with pytest.raises(asyncio.CancelledError):
+        _run(health._close_quietly(client))
+    assert client.closed == 1
+
+
 def test_drop_redis_client_without_close_method(monkeypatch):
     """Doubles (and bare sentinels) with no close method are dropped cleanly."""
     client = object()
@@ -294,6 +318,73 @@ def test_drop_redis_client_closes_outside_the_init_lock(monkeypatch):
 
     assert reentered == ["close"]
     assert health._redis_client is None
+
+
+def test_drop_redis_client_hung_close_is_abandoned(monkeypatch):
+    """A close that never completes is cancelled at the close timeout, so a
+    dying connection cannot stall the probe that is releasing it.
+
+    Without the bound, ``await outcome`` in ``_close_quietly`` never returns and
+    the guard below trips."""
+    close_started = asyncio.Event()
+
+    class HungClose:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+            close_started.set()
+            await asyncio.Event().wait()  # never set: the teardown hangs
+
+    stale = HungClose()
+    monkeypatch.setattr(health, "_redis_client", stale)
+
+    async def scenario():
+        started = asyncio.get_running_loop().time()
+        await asyncio.wait_for(health._drop_redis_client(stale), timeout=_HUNG_CLOSE_GUARD)
+        return asyncio.get_running_loop().time() - started
+
+    elapsed = _run(scenario())
+
+    # The client is still invalidated, and the probe returned on time.
+    assert health._redis_client is None
+    assert stale.closed == 1
+    assert close_started.is_set()
+    assert elapsed < _HUNG_CLOSE_GUARD
+
+
+def test_redis_status_hung_close_still_reports_degraded(monkeypatch):
+    """End-to-end: a failed ping whose client hangs on close must not hang the
+    readiness probe either. The result is still degraded."""
+    monkeypatch.setattr(config, "REDIS_URL", "redis://x/0")
+    created = []
+
+    class FailingHungRedis:
+        def __init__(self):
+            self.closed = 0
+
+        async def ping(self):
+            raise redis.exceptions.RedisError("redis down")
+
+        async def aclose(self):
+            self.closed += 1
+            await asyncio.Event().wait()  # never set: the teardown hangs
+
+    def fake_from_url(url, **kwargs):
+        client = FailingHungRedis()
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(health.aioredis, "from_url", fake_from_url)
+
+    async def scenario():
+        return await asyncio.wait_for(health._redis_status(), timeout=_HUNG_CLOSE_GUARD)
+
+    assert _run(scenario()) == (False, "degraded")
+    assert health._redis_client is None
+    assert len(created) == 1
+    assert created[0].closed == 1
 
 
 def test_redis_status_ping_failure_closes_the_client(monkeypatch):
