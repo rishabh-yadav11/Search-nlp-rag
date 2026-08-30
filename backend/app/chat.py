@@ -424,10 +424,15 @@ def json_dumps(v) -> str:
 
 
 def json_loads(s: str) -> list[dict]:
+    """Parse stored JSON as a list of dicts, returning [] when the payload is
+    not shaped as a list of objects (defensive against malformed/legacy rows)."""
     try:
-        return json.loads(s or "[]")
+        data = json.loads(s or "[]")
     except (ValueError, TypeError):
         return []
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict)]
 
 
 def _row_to_message(r) -> MessageOut:
