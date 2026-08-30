@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 
 import redis
 import redis.asyncio as aioredis
@@ -32,6 +33,24 @@ def _get_redis_init_lock() -> asyncio.Lock:
     return _redis_init_lock
 
 
+async def _close_quietly(client: aioredis.Redis) -> None:
+    """Best-effort release of a client we are about to discard.
+
+    ``aioredis.Redis`` owns a connection pool, so dropping a reference without
+    closing leaves the socket to the GC. A client that just failed its ping can
+    also fail to close, so every error from the close itself is swallowed: the
+    caller only cares that readiness is degraded, not about teardown."""
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is None:
+        return
+    with contextlib.suppress(Exception):
+        # redis.asyncio exposes the awaitable aclose(); the sync close() is the
+        # fallback for test doubles and older redis-py.
+        outcome = close()
+        if asyncio.iscoroutine(outcome) or isinstance(outcome, asyncio.Future):
+            await outcome
+
+
 async def _drop_redis_client(client: aioredis.Redis) -> None:
     """Invalidate the cached client under the init lock, and only if it is
     still the client that failed.
@@ -40,11 +59,19 @@ async def _drop_redis_client(client: aioredis.Redis) -> None:
     serialize every readiness probe), so by the time a ping fails another
     caller may already have replaced the dead client with a fresh one. A blind
     ``_redis_client = None`` would discard that replacement - and leak its
-    connection - forcing yet another reconnect for no reason."""
+    connection - forcing yet another reconnect for no reason.
+
+    The lock is held only for the identity check and the swap: the failing
+    client is closed afterwards, outside the critical section, so no I/O (and
+    no re-entry into this non-reentrant lock) happens under it. A client that
+    is still cached - i.e. one installed by another caller - is never closed;
+    only the client actually dropped here is released."""
     global _redis_client
     async with _get_redis_init_lock():
-        if _redis_client is client:
-            _redis_client = None
+        if _redis_client is not client:
+            return
+        _redis_client = None
+    await _close_quietly(client)
 
 
 async def close_redis() -> None:
