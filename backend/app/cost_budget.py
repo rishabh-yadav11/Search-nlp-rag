@@ -103,8 +103,16 @@ async def spend_today() -> float:
         return 0.0
 
 
-async def assert_within_budget() -> None:
+async def assert_within_budget(pending_usd: float = 0.0) -> None:
     """Raise BudgetExceeded when today's spend already hits the cap.
+
+    ``pending_usd`` is USD spend already incurred by the current request but
+    not yet written to the counter: recording happens once, at the end of the
+    turn, so a second LLM call inside that turn would otherwise see a counter
+    that still lacks the first call's cost. It is added to the persisted total
+    for the comparison ONLY — never recorded here, so the caller's single
+    ``record_cost`` at the end of the turn stays the only write and the in-turn
+    spend is not counted twice.
 
     Disabled (cap <= 0) or unreadable Redis -> always allowed; we never block a
     request because the counter store is down, but we do fail closed on a
@@ -112,7 +120,7 @@ async def assert_within_budget() -> None:
     """
     if config.LLM_DAILY_BUDGET_USD <= 0:
         return
-    if await spend_today() >= config.LLM_DAILY_BUDGET_USD:
+    if await spend_today() + pending_usd >= config.LLM_DAILY_BUDGET_USD:
         raise BudgetExceeded()
 
 
