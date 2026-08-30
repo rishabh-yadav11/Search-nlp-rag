@@ -334,10 +334,21 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
         # An FY span lists the start and end years (e.g. 'FY 2024-25' ->
         # FY2024-2025). When written end-first ('fy 2025-24') the larger
         # number is still the ending year, so take min/max rather than a
-        # wrong century rollover.
+        # wrong century rollover. `start` is the first fiscal year of the
+        # span and `end` the year the last one closes, so a multi-year span
+        # ('fy 2020-2025') spans the whole range: Apr (start) to Mar (end);
+        # that window starts on f"{start}-04-01" and closes on
+        # f"{end}-03-31", so it is only valid while start < end.
         start = min(y1, y2)
         end = max(y1, y2)
-        return (f"{end - 1}-04-01", f"{end}-03-31")
+        # min/max guarantees start <= end, so start == end is the sole
+        # inverted-window case. It means the span names one year twice
+        # ('fy 25-25', 'fy 2025-25', 'fy 2025 to 2025'), which is a single
+        # fiscal year, not a span: fall back to end - 1 as the start so the
+        # window stays valid instead of matching zero rows.
+        if start == end:
+            start = end - 1
+        return (f"{start}-04-01", f"{end}-03-31")
     m = re.search(r"\bfy\s*'?((?:19|20)?\d{2})\b", q)
     if m:
         end = _full_year(int(m.group(1)), _current_year())
