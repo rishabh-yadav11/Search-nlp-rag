@@ -444,48 +444,109 @@ def json_dumps(v) -> str:
 
 
 _JSON_LOG_PREVIEW = 200
+_JSON_PREVIEW_ITEMS = 3
 
 
-def _log_preview(value: object) -> str:
-    """Bounded, log-safe rendering of a payload (or any object) for diagnostics."""
-    text = value if isinstance(value, str) else repr(value)
+def _clip_for_log(text: str) -> str:
+    """Cap a log fragment's length, marking anything dropped. Server-side only."""
     if len(text) <= _JSON_LOG_PREVIEW:
         return text
     return text[:_JSON_LOG_PREVIEW] + "...(truncated)"
 
 
-def json_loads(s: str | bytes | bytearray | None) -> list[dict]:
+def _shrink_for_log(value: object, depth: int = 2) -> object:
+    """Cheap-to-render stand-in for ``value``: long str/bytes are clipped and
+    containers keep only their first few members (each shrunk in turn), so the
+    work is capped by _JSON_LOG_PREVIEW/_JSON_PREVIEW_ITEMS rather than by the
+    size of the payload."""
+    if isinstance(value, str):
+        return _clip_for_log(value)
+    if isinstance(value, (bytes, bytearray)):
+        return _clip_for_log(bytes(value[:_JSON_LOG_PREVIEW]).decode("utf-8", "replace"))
+    if depth > 0 and isinstance(value, (list, tuple)):
+        return [_shrink_for_log(item, depth - 1) for item in value[:_JSON_PREVIEW_ITEMS]]
+    if depth > 0 and isinstance(value, dict):
+        return {
+            (_clip_for_log(key) if isinstance(key, str) else key): _shrink_for_log(item, depth - 1)
+            for key, item in list(value.items())[:_JSON_PREVIEW_ITEMS]
+        }
+    return value
+
+
+def _omitted_suffix(value: object) -> str:
+    """Say how much of a container the preview left out, so a short render is
+    never mistaken for the whole payload."""
+    if isinstance(value, (list, tuple, dict)) and len(value) > _JSON_PREVIEW_ITEMS:
+        return f" (showing {_JSON_PREVIEW_ITEMS} of {len(value)} item(s))"
+    return ""
+
+
+def _log_preview(value: object) -> str:
+    """Bounded, log-safe rendering of a payload (or any object) for diagnostics.
+
+    Non-str payloads are shrunk *before* repr() is taken, so a large list/dict is
+    never materialised in full just to be truncated afterwards. Log output is
+    server-side only and never reaches users.
+    """
+    if isinstance(value, str):
+        return _clip_for_log(value)
+    return _clip_for_log(repr(_shrink_for_log(value))) + _omitted_suffix(value)
+
+
+def _log_origin(row_id: object) -> str:
+    """Name the source row in a log record, so a corrupt row can be located."""
+    if row_id is None:
+        return "row_id=unknown"
+    return f"row_id={row_id}"
+
+
+def json_loads(s: str | bytes | bytearray | None, *, row_id: object = None) -> list[dict]:
     """Parse stored JSON as a list of dicts, returning [] when the payload is
     not shaped as a list of objects (defensive against malformed/legacy rows).
 
-    A decode failure on a str/bytes payload means corrupt or legacy stored data,
-    so it still degrades to [] (never break a history read) but is logged with a
-    preview of the payload so the corruption is diagnosable. A non-str/bytes
-    payload is a programming error rather than corrupt data: it is logged at
-    error level and re-raised instead of being masked as an empty result.
+    Never raises on a bad payload: corrupt JSON, a non-list shape, and a value
+    that is not str/bytes at all all degrade to [] and are logged with the row id
+    (when the caller passes one) plus a bounded preview, so the offending row can
+    be found. Failing soft is deliberate — the callers are history reads
+    (messages()/recent_turns()), where an unexpected stored value must not become
+    a 500. Log records are server-side only; nothing here is returned to users.
     """
     if s is None or s == "":
         return []
+    origin = _log_origin(row_id)
     try:
         data = json.loads(s)
     except ValueError as exc:
-        logger.warning("chat.json_loads: malformed stored JSON (%s); payload=%s", exc, _log_preview(s))
-        return []
-    except TypeError:
-        logger.error(
-            "chat.json_loads: payload must be str/bytes, got %s (%s); this is a caller bug, not corrupt data",
+        logger.warning(
+            "chat.json_loads: malformed stored JSON (%s); %s payload(%s)=%s",
+            exc,
+            origin,
             type(s).__name__,
             _log_preview(s),
         )
-        raise
+        return []
+    except TypeError:
+        logger.error(
+            "chat.json_loads: payload must be str/bytes, got %s; %s payload=%s; "
+            "caller bug rather than corrupt data, degrading to []",
+            type(s).__name__,
+            origin,
+            _log_preview(s),
+        )
+        return []
     if not isinstance(data, list):
-        logger.warning("chat.json_loads: expected a JSON list, got %s", type(data).__name__)
+        logger.warning(
+            "chat.json_loads: expected a JSON list, got %s; %s",
+            type(data).__name__,
+            origin,
+        )
         return []
     rows = [d for d in data if isinstance(d, dict)]
     if len(rows) != len(data):
         logger.warning(
-            "chat.json_loads: dropped %d non-object item(s) from stored JSON list",
+            "chat.json_loads: dropped %d non-object item(s) from stored JSON list; %s",
             len(data) - len(rows),
+            origin,
         )
     return rows
 
@@ -495,7 +556,7 @@ def _row_to_message(r) -> MessageOut:
         id=r["id"],
         role=r["role"],
         content=r["content"],
-        sources=json_loads(r["sources"]),
+        sources=json_loads(r["sources"], row_id=r["id"]),
         created_at=r["created_at"],
         prompt_tokens=int(r["prompt_tokens"] or 0),
         completion_tokens=int(r["completion_tokens"] or 0),
