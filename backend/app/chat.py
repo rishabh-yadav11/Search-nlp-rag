@@ -40,6 +40,7 @@ router = APIRouter(
 
 MAX_CONTENT_LEN = 8000
 PREVIEW_LEN = 140
+MAX_TOKEN_SUM = 2**31 - 1
 
 # Module-level store; set by main.lifespan (and by tests).
 store: "ChatStore | None" = None
@@ -368,7 +369,10 @@ class ChatStore:
         return SessionStatsOut(
             sessions=int(sessions_row["n"]) if sessions_row else 0,
             messages=int(msgs_row["n"]) if msgs_row else 0,
-            total_tokens=int((msgs_row["pt"] if msgs_row else 0) + (msgs_row["ct"] if msgs_row else 0)),
+            total_tokens=min(
+                int(msgs_row["pt"] if msgs_row else 0) + int(msgs_row["ct"] if msgs_row else 0),
+                MAX_TOKEN_SUM,
+            ),
             total_cost=float(msgs_row["cost"] if msgs_row else 0.0),
         )
 
@@ -419,7 +423,10 @@ class ChatStore:
                 "sessions": int(sessions_row["n"]) if sessions_row else 0,
                 "users": int(users_row["n"]) if users_row else 0,
                 "messages": int(msgs_row["n"]) if msgs_row else 0,
-                "total_tokens": int((msgs_row["pt"] if msgs_row else 0) + (msgs_row["ct"] if msgs_row else 0)),
+                "total_tokens": min(
+                    int(msgs_row["pt"] if msgs_row else 0) + int(msgs_row["ct"] if msgs_row else 0),
+                    MAX_TOKEN_SUM,
+                ),
                 "total_cost": float(msgs_row["cost"] if msgs_row else 0.0),
                 "avg_latency_ms": round(float(msgs_row["latency"] if msgs_row else 0.0), 1),
                 "top_by_cost": [[r["title"], int(r["messages"]), round(float(r["cost"]), 4), r["updated_at"]] for r in top_cost],
