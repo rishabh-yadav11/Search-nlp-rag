@@ -188,18 +188,140 @@ def test_redis_status_ping_times_out_degraded(monkeypatch):
     assert _run(health._redis_status()) == (False, "degraded")
 
 
+class _EqualSentinel:
+    """Client stand-in whose instances compare equal but are not identical.
+
+    Two distinct instances satisfy ``==`` while failing ``is``, so only an
+    identity check can separate them - a guard regressed to value comparison
+    cannot."""
+
+    def __init__(self, tag):
+        self.tag = tag
+        self.closed = 0
+
+    def __eq__(self, other):
+        return isinstance(other, _EqualSentinel)
+
+    def __hash__(self):
+        return hash(_EqualSentinel)
+
+    async def aclose(self):
+        self.closed += 1
+
+
 def test_drop_redis_client_is_identity_guarded(monkeypatch):
     """Invalidation only clears the client that actually failed: a client
-    installed by another caller in the meantime survives."""
-    stale = object()
-    current = object()
+    installed by another caller in the meantime survives.
+
+    The sentinels compare equal while being distinct objects, so swapping the
+    ``is`` guard for ``==`` would null the surviving client and fail here."""
+    stale = _EqualSentinel("stale")
+    current = _EqualSentinel("current")
+    assert stale == current and stale is not current
     monkeypatch.setattr(health, "_redis_client", current)
 
     _run(health._drop_redis_client(stale))
     assert health._redis_client is current
+    assert (stale.closed, current.closed) == (0, 0)
 
     _run(health._drop_redis_client(current))
     assert health._redis_client is None
+    # Only the client that was actually dropped gets released.
+    assert (stale.closed, current.closed) == (0, 1)
+
+
+def test_drop_redis_client_closes_the_failing_client(monkeypatch):
+    """The dropped client's pool is closed instead of being left to the GC."""
+    stale = _EqualSentinel("stale")
+    monkeypatch.setattr(health, "_redis_client", stale)
+
+    _run(health._drop_redis_client(stale))
+
+    assert health._redis_client is None
+    assert stale.closed == 1
+
+
+def test_drop_redis_client_close_failure_is_suppressed(monkeypatch):
+    """A client that failed its ping may fail to close too; teardown errors
+    must not mask the degraded-readiness result."""
+
+    class FailingClose:
+        def __init__(self):
+            self.closed = 0
+
+        async def aclose(self):
+            self.closed += 1
+            raise redis.exceptions.RedisError("socket already gone")
+
+    client = FailingClose()
+    monkeypatch.setattr(health, "_redis_client", client)
+
+    _run(health._drop_redis_client(client))
+
+    assert health._redis_client is None
+    assert client.closed == 1
+
+
+def test_drop_redis_client_without_close_method(monkeypatch):
+    """Doubles (and bare sentinels) with no close method are dropped cleanly."""
+    client = object()
+    monkeypatch.setattr(health, "_redis_client", client)
+
+    _run(health._drop_redis_client(client))
+
+    assert health._redis_client is None
+
+
+def test_drop_redis_client_closes_outside_the_init_lock(monkeypatch):
+    """The close runs after the critical section: a close that re-enters the
+    (non-reentrant) init lock must not deadlock."""
+    stale = _EqualSentinel("stale")
+    replacement = _EqualSentinel("replacement")
+    reentered = []
+
+    async def reentrant_aclose():
+        reentered.append("close")
+        await health._drop_redis_client(replacement)
+
+    stale.aclose = reentrant_aclose
+    monkeypatch.setattr(health, "_redis_client", stale)
+
+    async def scenario():
+        # A hang would mean the close ran while the lock was still held.
+        await asyncio.wait_for(health._drop_redis_client(stale), timeout=2.0)
+
+    _run(scenario())
+
+    assert reentered == ["close"]
+    assert health._redis_client is None
+
+
+def test_redis_status_ping_failure_closes_the_client(monkeypatch):
+    """End-to-end: a failed ping drops *and* closes the cached client."""
+    monkeypatch.setattr(config, "REDIS_URL", "redis://x/0")
+    created = []
+
+    class FailingRedis:
+        def __init__(self):
+            self.closed = 0
+
+        async def ping(self):
+            raise redis.exceptions.RedisError("redis down")
+
+        async def aclose(self):
+            self.closed += 1
+
+    def fake_from_url(url, **kwargs):
+        client = FailingRedis()
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(health.aioredis, "from_url", fake_from_url)
+    assert _run(health._redis_status()) == (False, "degraded")
+
+    assert health._redis_client is None
+    assert len(created) == 1
+    assert created[0].closed == 1
 
 
 def test_redis_status_stale_ping_failure_keeps_replacement(monkeypatch):
@@ -215,14 +337,26 @@ def test_redis_status_stale_ping_failure_keeps_replacement(monkeypatch):
     release_stale = asyncio.Event()
 
     class StaleRedis:
+        def __init__(self):
+            self.closed = 0
+
         async def ping(self):
             stale_ping_started.set()
             await release_stale.wait()
             raise redis.exceptions.RedisError("connection died")
 
+        async def aclose(self):
+            self.closed += 1
+
     class FreshRedis:
+        def __init__(self):
+            self.closed = 0
+
         async def ping(self):
             return True
+
+        async def aclose(self):
+            self.closed += 1
 
     def fake_from_url(url, **kwargs):
         client = FreshRedis() if created else StaleRedis()
@@ -234,9 +368,10 @@ def test_redis_status_stale_ping_failure_keeps_replacement(monkeypatch):
     async def scenario():
         stale_ping = asyncio.create_task(health._redis_status())
         await stale_ping_started.wait()
-        # Second caller sees the dead client as gone, reconnects and succeeds
-        # while the first ping is still in flight.
-        health._redis_client = None
+        # Second caller's own ping also failed, so it drops the dead client
+        # (releasing it) and reconnects while the first ping is still in flight.
+        stale = health._redis_client
+        await health._drop_redis_client(stale)
         assert await health._redis_status() == (True, "redis")
         replacement = health._redis_client
         release_stale.set()
@@ -249,6 +384,9 @@ def test_redis_status_stale_ping_failure_keeps_replacement(monkeypatch):
     # The healthy replacement is reused, so no third reconnect happens.
     assert _run(health._redis_status()) == (True, "redis")
     assert len(created) == 2
+    # Only the client that failed got released; the live replacement is open.
+    assert created[0].closed == 1
+    assert replacement.closed == 0
 
 
 # --- _readiness_report ---
