@@ -9,8 +9,14 @@ where sim is Jaccard similarity of title word-tokens. Lambda near 1 favours
 pure relevance; lower values trade a little relevance for headline diversity.
 """
 import re
+from typing import Protocol
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+class _Result(Protocol):
+    title: str
+    score: float | None
 
 
 def _tokens(title: str) -> frozenset[str]:
@@ -23,7 +29,9 @@ def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     return len(a & b) / len(a | b)
 
 
-def diversify(results, n: int, lam: float = 0.7, sim_thresh: float = 0.4):
+def diversify(
+    results: list[_Result], n: int, lam: float = 0.7, sim_thresh: float = 0.4
+) -> list[_Result]:
     """Return a greedily MMR-diverse reordering of ``results`` (length ``n``).
 
     ``results`` are objects with a ``title`` and a numeric ``score`` (assumed
@@ -42,7 +50,6 @@ def diversify(results, n: int, lam: float = 0.7, sim_thresh: float = 0.4):
             if s >= sim_thresh and s > best:
                 best = s
         return best
-
     order = list(range(len(results)))
     chosen_idx: list[int] = []
     while len(chosen_idx) < n and order:
