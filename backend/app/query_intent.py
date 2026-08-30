@@ -1,19 +1,30 @@
 import calendar
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 # The app serves Indian news, so 'today' follows the Indian calendar, not the
 # host's: between 00:00 and 05:30 IST the UTC date is still the previous day,
 # which would resolve the wrong year around New Year on a UTC server.
+# `tzdata` is pinned in requirements.txt: stdlib zoneinfo falls back to that
+# package when the host has no system tz database, so this import cannot fail
+# at boot on a slim container.
 _IST = ZoneInfo("Asia/Kolkata")
+
+
+def _now() -> datetime:
+    """The current instant, as an aware UTC datetime. This is the module's
+    single clock seam: tests freeze time by patching this helper
+    (``monkeypatch.setattr(query_intent, "_now", lambda: frozen)``) rather than
+    the imported ``datetime`` class, so they keep working if this changes."""
+    return datetime.now(UTC)
 
 
 def _today() -> date:
     """Today's date in Asia/Kolkata (UTC+05:30). Single source of 'now' for
-    this module; tests freeze time by patching this helper or the module-level
-    ``datetime`` (e.g. ``monkeypatch.setattr(query_intent, "datetime", Fake)``)."""
-    return datetime.now(_IST).date()
+    this module; the conversion from UTC happens here so freezing ``_now``
+    still exercises the Indian-calendar resolution."""
+    return _now().astimezone(_IST).date()
 
 
 def _current_year() -> int:
