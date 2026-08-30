@@ -1,8 +1,14 @@
 
 
+import datetime as dt
+
+import pytest
+
+from app import query_intent
 from app.query_intent import (
     _current_year,
     _referenced_year,
+    _today,
     extract_list_topic,
     extract_month_range,
     extract_year_range,
@@ -314,3 +320,59 @@ def test_chart_filler_not_stripped_from_real_topic_words():
     """'table' as a real topic word (not part of a chart request) must survive."""
     assert extract_list_topic("top table manufacturing deals in 2025") == "table manufacturing deals"
     assert range_query_topic("top table games funding") is None
+
+
+def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
+    """Pin the module's clock to ``when``, which MUST be tz-aware (the stdlib
+    has no ``AwareDatetime`` to annotate that with, so it is enforced here).
+
+    Only the clock is frozen: the module still converts to Asia/Kolkata
+    itself, so the date assertions below fail if that conversion is dropped
+    instead of passing on whatever the implementation happens to return.
+
+    A naive datetime is rejected rather than converted, because
+    ``astimezone`` would silently read it in the *host's* timezone -- the very
+    naive/aware bug this freeze exists to catch.
+    """
+    if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
+        raise ValueError(f"_freeze_utc needs an aware datetime, got {when!r}")
+    frozen = when.astimezone(dt.UTC)
+    monkeypatch.setattr(query_intent, "_now", lambda: frozen)
+
+
+def test_today_is_resolved_in_indian_timezone(monkeypatch):
+    """Between 18:30Z and 24:00Z India is already on the next calendar day:
+    at 2023-12-31T20:00Z the Indian date is 2024-01-01 while the UTC date is
+    still 2023-12-31, so a naive date.today() on a UTC server resolves a day
+    (and, across New Year, a whole year) behind."""
+    _freeze_utc(monkeypatch, dt.datetime(2023, 12, 31, 20, 0, tzinfo=dt.UTC))
+    assert _today() == dt.date(2024, 1, 1)
+    assert _current_year() == 2024
+
+
+def test_current_year_uses_indian_date_across_new_year(monkeypatch):
+    """'last year'/'this year' and the default year for a bare month must follow
+    the Indian calendar: at 2024-12-31T19:00Z India is in 2025, UTC in 2024."""
+    _freeze_utc(monkeypatch, dt.datetime(2024, 12, 31, 19, 0, tzinfo=dt.UTC))
+    assert _current_year() == 2025
+    assert extract_year_range("top articles last year") == ("2024-01-01", "2024-12-31")
+    assert extract_year_range("this year's funding") == ("2025-01-01", "2025-12-31")
+    # A month range without an explicit year defaults to the Indian year too.
+    assert extract_month_range("top deals in march") == ("2025-03-01", "2025-03-31")
+
+
+def test_today_matches_utc_date_outside_the_offset_window(monkeypatch):
+    """Outside the 18:30Z-24:00Z window both calendars agree, so resolving in
+    Asia/Kolkata must not shift the date in the other direction either."""
+    _freeze_utc(monkeypatch, dt.datetime(2024, 6, 15, 12, 0, tzinfo=dt.UTC))
+    assert _today() == dt.date(2024, 6, 15)
+    assert _current_year() == 2024
+
+
+def test_freeze_rejects_naive_datetime(monkeypatch):
+    """A naive instant would be reinterpreted in the host's timezone, so the
+    freeze helper refuses it instead of letting the suite pass or fail by
+    accident of where it runs."""
+    naive = dt.datetime(2023, 12, 31, 20, 0)  # noqa: DTZ001
+    with pytest.raises(ValueError, match="aware datetime"):
+        _freeze_utc(monkeypatch, naive)
