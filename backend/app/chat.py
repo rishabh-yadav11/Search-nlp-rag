@@ -1118,7 +1118,10 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
     sources = [s for s in reranked if s.score >= gate][: k]
 
-    if not faceted:
+    # The note only annotates a non-empty, weak result set. When sources is
+    # empty (score-gated out), the fallback answer below already explains that
+    # nothing matched; attaching weak_results_note too would just duplicate it.
+    if not faceted and sources:
         note = (
             weak_results_note([s.score for s in sources], date_label(eff_from, eff_to))
             if config.ENABLE_WEAK_FALLBACK

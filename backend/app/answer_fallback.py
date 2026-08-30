@@ -98,9 +98,18 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
 
 def weak_results_note(scores: list[float], label: str | None = None) -> str | None:
     """Short annotation for /search when results are weak, else None. With a
-    date label the note is framed as a best-effort for that period."""
+    date label the note is framed as a best-effort for that period.
+
+    ``results_are_weak`` still reports an empty score list as weak — chat relies
+    on that to refuse to answer instead of guessing — but the note must not then
+    claim to be showing matches that do not exist, so the empty case gets its
+    own honest wording."""
     if not results_are_weak(scores):
         return None
+    if not scores:
+        if label:
+            return f"No articles matched this query for {label}. Try a different period or rephrase."
+        return "No articles matched this query. Try rephrasing, or ask about a specific company/sector."
     if label:
         return f"Showing the closest {label} matches — only a few articles cover this exact topic."
     return "Top results are weakly related to this query — consider rephrasing."
