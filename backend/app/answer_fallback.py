@@ -51,6 +51,11 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
         # `n_weak` counts the sources actually retrieved, so the message must
         # never advertise a count (or sources) that don't exist: with zero
         # matches there is nothing below to check.
+        #
+        # Defensive branch: the only production caller (chat.py) returns early
+        # on an empty source list, so it always passes n_weak >= 1. Kept
+        # because this function is public and any caller may pass 0 — the
+        # wording therefore claims no count and references no source.
         if n_weak <= 0:
             return (
                 f"I couldn't find any articles matching '{query}' for {label}. "
@@ -58,7 +63,7 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
             )
         if n_weak == 1:
             return (
-                f"I found only a few articles matching '{query}' for {label}. "
+                f"I found only one article matching '{query}' for {label}. "
                 "Here is the closest match, but it isn't a strong fit — "
                 "check the source below."
             )
