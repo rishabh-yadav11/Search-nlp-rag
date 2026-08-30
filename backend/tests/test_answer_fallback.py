@@ -106,9 +106,10 @@ def test_fallback_answer_with_label_best_effort():
 
 
 def test_fallback_answer_with_label_zero_weak_claims_no_sources():
-    """n_weak == 0 means no source was retrieved: the answer must not claim a
-    closest match (regression: it said 'the closest 1 matches') nor point at
-    sources that don't exist."""
+    """Contract test for the defensive n_weak == 0 branch (the production caller
+    in chat.py returns early on an empty source list, so this is called directly
+    rather than implying a live path). Zero sources means the answer must not
+    claim a closest match nor point at sources that don't exist."""
     answer = fallback_answer("top pharma deals of month january 2025", 0, "January 2025")
     assert "January 2025" in answer
     assert "closest" not in answer
@@ -122,6 +123,16 @@ def test_fallback_answer_with_label_singular_is_grammatical():
     assert "1 matches" not in answer
     assert "closest 1 " not in answer
     assert "the source below" in answer
+
+
+def test_fallback_answer_with_label_singular_no_plural_count_claim():
+    """Exactly one weak match must be described as one article: 'only a few
+    articles' advertises a count that the single source does not back up."""
+    answer = fallback_answer("top pharma deals of month january 2025", 1, "January 2025")
+    assert "I found only one article matching" in answer
+    assert "a few articles" not in answer
+    assert "articles" not in answer
+    assert "matches" not in answer.lower()
 
 
 def test_fallback_answer_with_label_plural_is_grammatical():
