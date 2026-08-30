@@ -54,14 +54,39 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
     """Honest fallback for chat: never fabricates facts, mentions the query.
     With a date label, frames the result as a best-effort for that period."""
     if label:
+        # `n_weak` counts the sources actually retrieved, so the message must
+        # never advertise a count (or sources) that don't exist: with zero
+        # matches there is nothing below to check.
+        #
+        # Defensive branch: the only production caller (chat.py) returns early
+        # on an empty source list, so it always passes n_weak >= 1. Kept
+        # because this function is public and any caller may pass 0 — the
+        # wording therefore claims no count and references no source.
+        if n_weak <= 0:
+            return (
+                f"I couldn't find any articles matching '{query}' for {label}. "
+                "Try rephrasing, or ask about a specific company/sector."
+            )
+        if n_weak == 1:
+            return (
+                f"I found only one article matching '{query}' for {label}. "
+                "Here is the closest match, but it isn't a strong fit — "
+                "check the source below."
+            )
         return (
             f"I found only a few articles matching '{query}' for {label}. "
-            f"Here are the closest {n_weak if n_weak > 0 else 1} matches, "
+            f"Here are the closest {n_weak} matches, "
             "but none is a strong fit — check the sources below."
         )
     if n_weak <= 0:
         return (
             f"I couldn't find strong matches in the VCCircle corpus for '{query}'. "
+            "Try rephrasing, or ask about a specific company/sector."
+        )
+    if n_weak == 1:
+        return (
+            f"I couldn't find strong matches in the VCCircle corpus for '{query}'. "
+            "The closest article is only weakly related, so I won't guess. "
             "Try rephrasing, or ask about a specific company/sector."
         )
     return (
