@@ -50,12 +50,18 @@ def diversify(
             if s >= sim_thresh and s > best:
                 best = s
         return best
+    # ``order`` is never mutated: each round iterates it once and skips the
+    # indices already in ``chosen_set``, so selection is O(n) per round
+    # (O(n^2) overall) instead of paying an O(n) list.remove per round.
     order = list(range(len(results)))
     chosen_idx: list[int] = []
-    while len(chosen_idx) < n and order:
+    chosen_set: set[int] = set()
+    while len(chosen_idx) < n and len(chosen_set) < len(order):
         best_k = -1
         best_val = float("-inf")
         for k in order:
+            if k in chosen_set:
+                continue
             sim = max_sim(k, chosen_idx)
             score = results[k].score
             if score is None:
@@ -64,6 +70,10 @@ def diversify(
             if mmr > best_val:
                 best_val = mmr
                 best_k = k
+        if best_k < 0:
+            # No candidate beat -inf (every score was NaN); stop instead of
+            # re-picking the sentinel forever.
+            break
         chosen_idx.append(best_k)
-        order.remove(best_k)
+        chosen_set.add(best_k)
     return [results[i] for i in chosen_idx]
