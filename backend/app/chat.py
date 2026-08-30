@@ -819,16 +819,20 @@ def _apply_requested_view(text: str, question: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_rewrite, text)
 
 
-async def _nudge_retry_allowed() -> bool:
+async def _nudge_retry_allowed(spent_this_turn_inr: float = 0.0) -> bool:
     """True when the daily LLM spend cap still permits one more nudge call.
 
-    The outer caller checks the cap once before the first LLM call, but the
-    retry is a second (billed) call whose cost is only recorded after the turn
-    finishes, so it must re-check the cap itself — otherwise a retry can spend
-    past LLM_DAILY_BUDGET_USD. Returns False instead of raising, so a
-    budget-stopped retry degrades to the answer already produced."""
+    The retry is a second (billed) call, so it re-checks the cap instead of
+    relying on the outer caller's single check. The re-check counts
+    ``spent_this_turn_inr`` (INR, as reported by ``LLMResult.cost()``): that
+    spend is already incurred but only reaches the Redis counter when the turn
+    ends, so reading the counter alone would pass even when this turn's first
+    call already used up the day's budget (#177). The pending figure is a
+    read-only input to the comparison — the end-of-turn ``record_cost`` remains
+    the sole write, so nothing is counted twice. Returns False instead of
+    raising, so a budget-stopped retry degrades to the answer already produced."""
     try:
-        await assert_within_budget()
+        await assert_within_budget(pending_usd=to_usd(spent_this_turn_inr))
     except BudgetExceeded:
         logger.info("LLM daily budget reached; skipping nudge retry")
         return False
@@ -842,7 +846,7 @@ async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
     retry keeps the first answer instead of erroring the turn."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
     if parse_dataviz(result.content) is None and _CHART_INTENT_RE.search(question):
-        if not await _nudge_retry_allowed():
+        if not await _nudge_retry_allowed(result.cost()):
             return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _dataviz_nudge(question), config.LLM_MODEL)
@@ -1277,15 +1281,19 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
+            # Cost already incurred by this turn's stream but not yet in the
+            # daily counter, which is only written at the end of the turn.
+            streamed_cost = LLMResult(content="", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens).cost()
             if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
                 # The user explicitly asked for a chart/graph/plot/table but the
                 # answer streamed without one; ask once more so visual requests
                 # reliably carry a dataviz block. A failed retry keeps the
                 # streamed answer instead of erroring the whole turn after the
                 # user already saw it stream in. The retry is a second billed
-                # call, so it re-checks the daily cap itself.
+                # call, so it re-checks the daily cap, counting the spend this
+                # turn has already incurred.
                 nudge = None
-                if await _nudge_retry_allowed():
+                if await _nudge_retry_allowed(streamed_cost):
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
                     except LLMUnavailableError:
