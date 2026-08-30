@@ -14,9 +14,10 @@ from datetime import UTC, datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from collections.abc import Iterator
+
 from qdrant_client import QdrantClient
 from update_index import fetch_records
-from typing import Iterator
 
 from app.config import config
 
