@@ -157,20 +157,27 @@ class ChatStore:
             await self._db.close()
             self._db = None
 
+    def _require_db(self) -> aiosqlite.Connection:
+        if self._db is None:
+            raise RuntimeError("ChatStore is not connected; call connect() first")
+        return self._db
+
     async def create_session(self, user_id: str, title: str = "New chat") -> SessionOut:
+        db = self._require_db()
         session_id = uuid.uuid4().hex
         ts = _now()
-        await self._db.execute(
+        await db.execute(
             "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
             (session_id, user_id, title, ts, ts),
         )
-        await self._db.commit()
+        await db.commit()
         return SessionOut(id=session_id, title=title, created_at=ts, updated_at=ts)
 
     async def list_sessions(self, user_id: str, limit: int = 100) -> list[SessionOut]:
+        db = self._require_db()
         # One query (window functions + LEFT JOIN) instead of two correlated
         # subqueries per session row — avoids the N+1 round-trip pattern.
-        rows = await self._db.execute_fetchall(
+        rows = await db.execute_fetchall(
             """
             WITH ranked AS (
                 SELECT session_id,
@@ -217,11 +224,11 @@ class ChatStore:
         has_comment = ("--" in stripped) or ("/*" in stripped and "*/" not in stripped)
         if not has_limit and not has_comment:
             query = stripped + " LIMIT 1"
-        rows = await self._db.execute_fetchall(query, params)
+        rows = await self._require_db().execute_fetchall(query, params)
         return rows[0] if rows else None
 
     async def _fetchall(self, query: str, params: tuple = ()):
-        return await self._db.execute_fetchall(query, params)
+        return await self._require_db().execute_fetchall(query, params)
 
     async def get_session(self, session_id: str, user_id: str) -> SessionOut | None:
         row = await self._fetchone(
@@ -237,7 +244,7 @@ class ChatStore:
     async def messages(self, session_id: str, user_id: str) -> list[MessageOut]:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
-        rows = await self._db.execute_fetchall(
+        rows = await self._require_db().execute_fetchall(
             """
             SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms
             FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC
@@ -260,17 +267,18 @@ class ChatStore:
     ) -> MessageOut:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
+        db = self._require_db()
         ts = _now()
-        cur = await self._db.execute(
+        cur = await db.execute(
             "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms),
         )
-        await self._db.execute(
+        await db.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?",
             (ts, session_id),
         )
-        await self._db.commit()
+        await db.commit()
         return MessageOut(
             id=cur.lastrowid,
             role=role,
@@ -288,8 +296,9 @@ class ChatStore:
         if session is None:
             raise HTTPException(status_code=404, detail="conversation not found")
         clean = (title or "").strip()[:200]
-        await self._db.execute("UPDATE sessions SET title = ? WHERE id = ?", (clean, session_id))
-        await self._db.commit()
+        db = self._require_db()
+        await db.execute("UPDATE sessions SET title = ? WHERE id = ?", (clean, session_id))
+        await db.commit()
         return SessionOut(
             id=session_id,
             title=clean,
@@ -300,24 +309,27 @@ class ChatStore:
     async def delete_session(self, session_id: str, user_id: str) -> None:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
-        await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        await self._db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-        await self._db.commit()
+        db = self._require_db()
+        await db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        await db.commit()
 
     async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
         """Remove a single message (used to roll back a dangling user message
         when the rest of the turn fails). No-op if the session is gone."""
         if await self.get_session(session_id, user_id) is None:
             return
-        await self._db.execute(
+        db = self._require_db()
+        await db.execute(
             "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session_id)
         )
-        await self._db.commit()
+        await db.commit()
 
     async def recent_turns(self, session_id: str, user_id: str, max_turns: int) -> list[MessageOut]:
         """The most recent `max_turns` user/assistant message pairs (oldest
         first), used as conversation context for the LLM prompt."""
-        rows = await self._db.execute_fetchall(
+        db = self._require_db()
+        rows = await db.execute_fetchall(
             """
             SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms
             FROM messages WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
@@ -330,11 +342,12 @@ class ChatStore:
     async def purge_expired(self) -> int:
         """Delete conversations idle for CHAT_RETENTION_DAYS or longer."""
         cutoff = _now() - config.CHAT_RETENTION_DAYS * 86400
-        stale = await self._db.execute_fetchall("SELECT id FROM sessions WHERE updated_at < ?", (cutoff,))
+        db = self._require_db()
+        stale = await db.execute_fetchall("SELECT id FROM sessions WHERE updated_at < ?", (cutoff,))
         for r in stale:
-            await self._db.execute("DELETE FROM messages WHERE session_id = ?", (r["id"],))
-            await self._db.execute("DELETE FROM sessions WHERE id = ?", (r["id"],))
-        await self._db.commit()
+            await db.execute("DELETE FROM messages WHERE session_id = ?", (r["id"],))
+            await db.execute("DELETE FROM sessions WHERE id = ?", (r["id"],))
+        await db.commit()
         return len(stale)
 
     async def stats(self, user_id: str) -> SessionStatsOut:
