@@ -2,6 +2,8 @@
 
 import datetime as dt
 
+import pytest
+
 from app import query_intent
 from app.query_intent import (
     _current_year,
@@ -321,12 +323,19 @@ def test_chart_filler_not_stripped_from_real_topic_words():
 
 
 def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
-    """Pin the module's clock to ``when`` (an aware UTC instant).
+    """Pin the module's clock to ``when``, which MUST be tz-aware (the stdlib
+    has no ``AwareDatetime`` to annotate that with, so it is enforced here).
 
     Only the clock is frozen: the module still converts to Asia/Kolkata
     itself, so the date assertions below fail if that conversion is dropped
     instead of passing on whatever the implementation happens to return.
+
+    A naive datetime is rejected rather than converted, because
+    ``astimezone`` would silently read it in the *host's* timezone -- the very
+    naive/aware bug this freeze exists to catch.
     """
+    if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
+        raise ValueError(f"_freeze_utc needs an aware datetime, got {when!r}")
     frozen = when.astimezone(dt.UTC)
     monkeypatch.setattr(query_intent, "_now", lambda: frozen)
 
@@ -358,3 +367,12 @@ def test_today_matches_utc_date_outside_the_offset_window(monkeypatch):
     _freeze_utc(monkeypatch, dt.datetime(2024, 6, 15, 12, 0, tzinfo=dt.UTC))
     assert _today() == dt.date(2024, 6, 15)
     assert _current_year() == 2024
+
+
+def test_freeze_rejects_naive_datetime(monkeypatch):
+    """A naive instant would be reinterpreted in the host's timezone, so the
+    freeze helper refuses it instead of letting the suite pass or fail by
+    accident of where it runs."""
+    naive = dt.datetime(2023, 12, 31, 20, 0)  # noqa: DTZ001
+    with pytest.raises(ValueError, match="aware datetime"):
+        _freeze_utc(monkeypatch, naive)

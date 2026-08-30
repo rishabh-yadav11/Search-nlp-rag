@@ -7,8 +7,12 @@ from zoneinfo import ZoneInfo
 # host's: between 00:00 and 05:30 IST the UTC date is still the previous day,
 # which would resolve the wrong year around New Year on a UTC server.
 # `tzdata` is pinned in requirements.txt: stdlib zoneinfo falls back to that
-# package when the host has no system tz database, so this import cannot fail
-# at boot on a slim container.
+# package when the host has no system tz database. That pin -- not the stdlib
+# alone -- is what makes this zone resolvable on a slim container. If it is not
+# installed (an image built from older requirements, or a deploy that skips
+# `pip install -r requirements.txt`), this import raises ZoneInfoNotFoundError
+# and the app dies at boot; there is deliberately no degraded UTC-offset
+# fallback, because deployments always install requirements.txt.
 _IST = ZoneInfo("Asia/Kolkata")
 
 
