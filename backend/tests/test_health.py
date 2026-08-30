@@ -5,8 +5,8 @@ between tests."""
 
 import asyncio
 
-import redis
 import pytest
+import redis
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -69,9 +69,12 @@ def test_qdrant_ok_success():
 
 
 def test_qdrant_ok_call_failing(monkeypatch):
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
     class FakeClient:
         async def collection_exists(self, name):
-            raise RuntimeError("qdrant down")
+            raise ResponseHandlingException(RuntimeError("qdrant down"))
+
 
     assert _run(health._qdrant_ok({"qdrant": FakeClient()})) is False
 
