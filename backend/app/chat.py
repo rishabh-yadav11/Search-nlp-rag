@@ -675,7 +675,11 @@ _DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n?```", re.DOTALL)
 
 
 def _as_float(v: object) -> float | None:
-    """Coerce a cell to float (ints, floats, or digit strings), else None."""
+    """Coerce a cell to float (ints, floats, or digit strings), else None.
+
+    Bools are rejected first: bool subclasses int, so the int/float branch below
+    would otherwise turn True/False into 1.0/0.0 and make a yes/no column look
+    numeric (#176)."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
