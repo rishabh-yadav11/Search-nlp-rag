@@ -601,6 +601,61 @@ def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
     assert len(turn.sources) == 1
 
 
+def test_prepare_turn_no_note_when_sources_score_gated_empty(monkeypatch):
+    """Empty (score-gated) sources must NOT carry a weak_results_note: the
+    'No sufficiently relevant articles' answer already explains the miss, and a
+    note saying 'Showing the closest 2020 matches' alongside zero results is a
+    lie (regression: weak_results_note([]) returned a misleading string)."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: ("q", None, None, None, None))
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-06-01",
+                              summary="s", body="b", score=0.1)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("edtech startups 2020", []))
+    assert turn.sources == []
+    assert "No sufficiently relevant articles" in turn.answer
+    assert turn.note is None
+
+
+def test_prepare_turn_weak_nonempty_sources_keep_note(monkeypatch):
+    """Non-empty weak sources (score above the ASK_MIN_SCORE gate but below the
+    weak threshold) must still get the weak_results_note on the fallback turn."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: ("q", None, None, None, None))
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-06-01",
+                              summary="s", body="b", score=0.25)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("some niche topic", []))
+    assert len(turn.sources) == 1
+    assert isinstance(turn.note, str)
+
+
 def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
     """A vague follow-up ('make this into a table') has no standalone topic:
     retrieval must inherit the previous turn's query + date filter + top-N,
