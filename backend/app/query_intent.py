@@ -1,12 +1,25 @@
 import calendar
 import re
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+# The app serves Indian news, so 'today' follows the Indian calendar, not the
+# host's: between 00:00 and 05:30 IST the UTC date is still the previous day,
+# which would resolve the wrong year around New Year on a UTC server.
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _today() -> date:
+    """Today's date in Asia/Kolkata (UTC+05:30). Single source of 'now' for
+    this module; tests freeze time by patching this helper or the module-level
+    ``datetime`` (e.g. ``monkeypatch.setattr(query_intent, "datetime", Fake)``)."""
+    return datetime.now(_IST).date()
 
 
 def _current_year() -> int:
-    """The current year, computed at call time so resolution stays correct
-    across a calendar-year boundary in a long-running process."""
-    return date.today().year
+    """The current Indian year, computed at call time so resolution stays
+    correct across a calendar-year boundary in a long-running process."""
+    return _today().year
 
 _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
 # Full year span: '2024 to 2025', '2023-2025', '2023 through 2025'.
