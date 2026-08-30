@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 
 import redis
 import redis.asyncio as aioredis
@@ -11,6 +12,11 @@ from app.config import config
 router = APIRouter()
 
 _redis_client: aioredis.Redis | None = None
+
+# Teardown of a client that just failed its ping gets the same 2s budget as the
+# ping itself (see _redis_status): a readiness probe must answer on time even
+# when the connection it is releasing is dying.
+_REDIS_CLOSE_TIMEOUT = 2.0
 
 
 @router.get("/health")
@@ -30,6 +36,55 @@ async def health() -> dict[str, str]:
 # property of an atomic check. Python 3.10+ no longer binds an asyncio.Lock to
 # an event loop at construction, so a module-level instance is safe.
 _redis_init_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def _close_quietly(client: aioredis.Redis) -> None:
+    """Best-effort release of a client we are about to discard.
+
+    ``aioredis.Redis`` owns a connection pool, so dropping a reference without
+    closing leaves the socket to the GC. A client that just failed its ping can
+    also fail to close, so every ``Exception`` raised by the close itself -
+    including the ``TimeoutError`` raised when it exceeds
+    ``_REDIS_CLOSE_TIMEOUT`` - is swallowed: the caller only cares that
+    readiness is degraded, not about teardown.
+
+    ``BaseException`` subclasses are deliberately *not* swallowed, notably
+    ``asyncio.CancelledError``: a cancelled probe (client disconnect, server
+    shutdown) must still unwind instead of being reported as a clean teardown."""
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is None:
+        return
+    with contextlib.suppress(Exception):
+        # redis.asyncio exposes the awaitable aclose(); the sync close() is the
+        # fallback for test doubles and older redis-py. Either way the call is
+        # bounded: a hung close is cancelled and abandoned so /ready and /readyz
+        # answer on time regardless of what the dying connection does.
+        outcome = close()
+        if asyncio.iscoroutine(outcome) or isinstance(outcome, asyncio.Future):
+            await asyncio.wait_for(outcome, timeout=_REDIS_CLOSE_TIMEOUT)
+
+
+async def _drop_redis_client(client: aioredis.Redis) -> None:
+    """Invalidate the cached client under the init lock, and only if it is
+    still the client that failed.
+
+    The ping runs outside the lock (holding it across a 2s network call would
+    serialize every readiness probe), so by the time a ping fails another
+    caller may already have replaced the dead client with a fresh one. A blind
+    ``_redis_client = None`` would discard that replacement - and leak its
+    connection - forcing yet another reconnect for no reason.
+
+    The lock is held only for the identity check and the swap: the failing
+    client is closed afterwards, outside the critical section, so no I/O (and
+    no re-entry into this non-reentrant lock) happens under it. A client that
+    is still cached - i.e. one installed by another caller - is never closed;
+    only the client actually dropped here is released."""
+    global _redis_client
+    async with _redis_init_lock:
+        if _redis_client is not client:
+            return
+        _redis_client = None
+    await _close_quietly(client)
 
 
 async def close_redis() -> None:
@@ -84,15 +139,15 @@ async def _redis_status() -> tuple[bool, str]:
                 )
             except (TimeoutError, redis.exceptions.RedisError, OSError):
                 return False, "down"
-    client = _redis_client
+        client = _redis_client
     if client is None:
         return False, "degraded"
     try:
         await asyncio.wait_for(client.ping(), timeout=2.0)
-        return True, "redis"
     except (TimeoutError, redis.exceptions.RedisError, OSError):
-        _redis_client = None
+        await _drop_redis_client(client)
         return False, "degraded"
+    return True, "redis"
 
 
 async def _readiness_report(state: dict) -> tuple[bool, dict]:
