@@ -73,8 +73,11 @@ async def _redis_status() -> tuple[bool, str]:
                 )
             except (TimeoutError, redis.exceptions.RedisError, OSError):
                 return False, "down"
+    client = _redis_client
+    if client is None:
+        return False, "degraded"
     try:
-        await asyncio.wait_for(_redis_client.ping(), timeout=2.0)
+        await asyncio.wait_for(client.ping(), timeout=2.0)
         return True, "redis"
     except (TimeoutError, redis.exceptions.RedisError, OSError):
         _redis_client = None
