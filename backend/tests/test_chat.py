@@ -1122,6 +1122,36 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
     assert result.completion_tokens == 5
 
 
+def test_answer_with_dataviz_skips_nudge_when_budget_exhausted(monkeypatch):
+    """Regression (#177): the nudge retry is a second billed call, so it must
+    re-check the daily cap instead of relying on the outer caller's check. An
+    exhausted budget skips the retry and keeps the first answer."""
+    calls = []
+
+    async def fake_generate(client, prompt, model):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
+        return chat_module.LLMResult(
+            content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]]}\n```',
+            prompt_tokens=20,
+            completion_tokens=8,
+        )
+
+    async def exhausted():
+        raise chat_module.BudgetExceeded()
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+    monkeypatch.setattr(chat_module, "assert_within_budget", exhausted)
+
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
+    assert len(calls) == 1  # retry never billed
+    assert result.content == "No chart here [1]."
+    assert result.prompt_tokens == 10
+    assert result.completion_tokens == 5
+
+
 def test_json_loads_malformed_returns_empty():
     assert chat_module.json_loads("{not json") == []
     assert chat_module.json_loads(None) == []
@@ -1664,6 +1694,57 @@ def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
         monkeypatch.setattr(chat_module, "record_cost", noop)
 
         body = _stream_body(client, h, sid, "show me a chart of top deals")
+        assert "streamed answer without a block [1]." in body
+        assert '"prompt_tokens":10' in body  # unchanged
+        assert "event: done" in body
+        assert "event: error" not in body
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkeypatch):
+    """Streaming regression (#177): a dataviz nudge retry is a second billed
+    call that re-checks the cap; once the budget is gone the retry is skipped
+    and the already-streamed answer is served."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "streamed answer without a block [1]."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
+
+        nudge_calls = []
+
+        async def fake_generate(client, prompt, model):
+            nudge_calls.append(prompt)
+            return chat_module.LLMResult(
+                content='Prose.\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
+                prompt_tokens=20,
+                completion_tokens=8,
+            )
+
+        budget_calls = {"n": 0}
+
+        async def exhausted_after_first_check():
+            budget_calls["n"] += 1
+            if budget_calls["n"] > 1:
+                raise chat_module.BudgetExceeded()
+
+        async def noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+        monkeypatch.setattr(chat_module, "assert_within_budget", exhausted_after_first_check)
+        monkeypatch.setattr(chat_module, "record_cost", noop)
+
+        body = _stream_body(client, h, sid, "show me a chart of top deals")
+        assert nudge_calls == []  # retry never billed
         assert "streamed answer without a block [1]." in body
         assert '"prompt_tokens":10' in body  # unchanged
         assert "event: done" in body
