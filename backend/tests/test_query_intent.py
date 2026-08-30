@@ -321,15 +321,14 @@ def test_chart_filler_not_stripped_from_real_topic_words():
 
 
 def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
-    """Pin the module's clock to ``when`` (an aware UTC instant)."""
+    """Pin the module's clock to ``when`` (an aware UTC instant).
+
+    Only the clock is frozen: the module still converts to Asia/Kolkata
+    itself, so the date assertions below fail if that conversion is dropped
+    instead of passing on whatever the implementation happens to return.
+    """
     frozen = when.astimezone(dt.UTC)
-
-    class _FrozenDatetime(dt.datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return frozen if tz is None else frozen.astimezone(tz)
-
-    monkeypatch.setattr(query_intent, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(query_intent, "_now", lambda: frozen)
 
 
 def test_today_is_resolved_in_indian_timezone(monkeypatch):
