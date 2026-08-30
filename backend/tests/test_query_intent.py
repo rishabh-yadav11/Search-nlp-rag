@@ -1,8 +1,12 @@
 
 
+import datetime as dt
+
+from app import query_intent
 from app.query_intent import (
     _current_year,
     _referenced_year,
+    _today,
     extract_list_topic,
     extract_month_range,
     extract_year_range,
@@ -314,3 +318,44 @@ def test_chart_filler_not_stripped_from_real_topic_words():
     """'table' as a real topic word (not part of a chart request) must survive."""
     assert extract_list_topic("top table manufacturing deals in 2025") == "table manufacturing deals"
     assert range_query_topic("top table games funding") is None
+
+
+def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
+    """Pin the module's clock to ``when`` (an aware UTC instant)."""
+    frozen = when.astimezone(dt.UTC)
+
+    class _FrozenDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is None else frozen.astimezone(tz)
+
+    monkeypatch.setattr(query_intent, "datetime", _FrozenDatetime)
+
+
+def test_today_is_resolved_in_indian_timezone(monkeypatch):
+    """Between 18:30Z and 24:00Z India is already on the next calendar day:
+    at 2023-12-31T20:00Z the Indian date is 2024-01-01 while the UTC date is
+    still 2023-12-31, so a naive date.today() on a UTC server resolves a day
+    (and, across New Year, a whole year) behind."""
+    _freeze_utc(monkeypatch, dt.datetime(2023, 12, 31, 20, 0, tzinfo=dt.UTC))
+    assert _today() == dt.date(2024, 1, 1)
+    assert _current_year() == 2024
+
+
+def test_current_year_uses_indian_date_across_new_year(monkeypatch):
+    """'last year'/'this year' and the default year for a bare month must follow
+    the Indian calendar: at 2024-12-31T19:00Z India is in 2025, UTC in 2024."""
+    _freeze_utc(monkeypatch, dt.datetime(2024, 12, 31, 19, 0, tzinfo=dt.UTC))
+    assert _current_year() == 2025
+    assert extract_year_range("top articles last year") == ("2024-01-01", "2024-12-31")
+    assert extract_year_range("this year's funding") == ("2025-01-01", "2025-12-31")
+    # A month range without an explicit year defaults to the Indian year too.
+    assert extract_month_range("top deals in march") == ("2025-03-01", "2025-03-31")
+
+
+def test_today_matches_utc_date_outside_the_offset_window(monkeypatch):
+    """Outside the 18:30Z-24:00Z window both calendars agree, so resolving in
+    Asia/Kolkata must not shift the date in the other direction either."""
+    _freeze_utc(monkeypatch, dt.datetime(2024, 6, 15, 12, 0, tzinfo=dt.UTC))
+    assert _today() == dt.date(2024, 6, 15)
+    assert _current_year() == 2024
