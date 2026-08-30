@@ -2,6 +2,7 @@
 retention purging, and the message-turn flow (retrieval + LLM stubbed)."""
 
 import asyncio
+import logging
 import sqlite3
 import time
 
@@ -1122,12 +1123,35 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
     assert result.completion_tokens == 5
 
 
-def test_json_loads_malformed_returns_empty():
-    assert chat_module.json_loads("{not json") == []
-    assert chat_module.json_loads(None) == []
-    assert chat_module.json_loads("") == []
-    assert chat_module.json_loads('[]') == []
-    assert chat_module.json_loads(123) == []  # TypeError branch
+def test_json_loads_malformed_returns_empty(caplog):
+    """Decode failures on a str/bytes payload still degrade to [] but must be
+    logged, so corrupt stored rows are diagnosable instead of silently empty."""
+    with caplog.at_level(logging.WARNING, logger="chat"):
+        assert chat_module.json_loads("{not json") == []
+        assert chat_module.json_loads(None) == []
+        assert chat_module.json_loads("") == []
+        assert chat_module.json_loads("[]") == []
+    assert "chat.json_loads: malformed stored JSON" in caplog.text
+    assert "{not json" in caplog.text
+
+
+def test_json_loads_logs_unexpected_shape(caplog):
+    """Corrupt payloads that decode but are not a list-of-objects are logged,
+    not silently dropped (#175)."""
+    with caplog.at_level(logging.WARNING, logger="chat"):
+        assert chat_module.json_loads('{"sources": 1}') == []
+        assert chat_module.json_loads('[1, {"a": 1}]') == [{"a": 1}]
+    assert "expected a JSON list" in caplog.text
+    assert "dropped 1 non-object item(s)" in caplog.text
+
+
+def test_json_loads_non_str_payload_is_not_swallowed(caplog):
+    """A non-str/bytes payload is a programming error: it must not be masked as
+    an empty result (#175)."""
+    with caplog.at_level(logging.ERROR, logger="chat"), pytest.raises(TypeError):
+        chat_module.json_loads(123)
+    assert "payload must be str/bytes, got int" in caplog.text
+    assert "123" in caplog.text
 
 
 def test_row_to_message_coerces_legacy_fields():

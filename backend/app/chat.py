@@ -443,16 +443,51 @@ def json_dumps(v) -> str:
     return json.dumps(v, separators=(",", ":"))
 
 
-def json_loads(s: str) -> list[dict]:
+_JSON_LOG_PREVIEW = 200
+
+
+def _log_preview(value: object) -> str:
+    """Bounded, log-safe rendering of a payload (or any object) for diagnostics."""
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) <= _JSON_LOG_PREVIEW:
+        return text
+    return text[:_JSON_LOG_PREVIEW] + "...(truncated)"
+
+
+def json_loads(s: str | bytes | bytearray | None) -> list[dict]:
     """Parse stored JSON as a list of dicts, returning [] when the payload is
-    not shaped as a list of objects (defensive against malformed/legacy rows)."""
+    not shaped as a list of objects (defensive against malformed/legacy rows).
+
+    A decode failure on a str/bytes payload means corrupt or legacy stored data,
+    so it still degrades to [] (never break a history read) but is logged with a
+    preview of the payload so the corruption is diagnosable. A non-str/bytes
+    payload is a programming error rather than corrupt data: it is logged at
+    error level and re-raised instead of being masked as an empty result.
+    """
+    if s is None or s == "":
+        return []
     try:
-        data = json.loads(s or "[]")
-    except (ValueError, TypeError):
+        data = json.loads(s)
+    except ValueError as exc:
+        logger.warning("chat.json_loads: malformed stored JSON (%s); payload=%s", exc, _log_preview(s))
         return []
+    except TypeError:
+        logger.error(
+            "chat.json_loads: payload must be str/bytes, got %s (%s); this is a caller bug, not corrupt data",
+            type(s).__name__,
+            _log_preview(s),
+        )
+        raise
     if not isinstance(data, list):
+        logger.warning("chat.json_loads: expected a JSON list, got %s", type(data).__name__)
         return []
-    return [d for d in data if isinstance(d, dict)]
+    rows = [d for d in data if isinstance(d, dict)]
+    if len(rows) != len(data):
+        logger.warning(
+            "chat.json_loads: dropped %d non-object item(s) from stored JSON list",
+            len(data) - len(rows),
+        )
+    return rows
 
 
 def _row_to_message(r) -> MessageOut:
