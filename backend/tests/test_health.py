@@ -188,6 +188,69 @@ def test_redis_status_ping_times_out_degraded(monkeypatch):
     assert _run(health._redis_status()) == (False, "degraded")
 
 
+def test_drop_redis_client_is_identity_guarded(monkeypatch):
+    """Invalidation only clears the client that actually failed: a client
+    installed by another caller in the meantime survives."""
+    stale = object()
+    current = object()
+    monkeypatch.setattr(health, "_redis_client", current)
+
+    _run(health._drop_redis_client(stale))
+    assert health._redis_client is current
+
+    _run(health._drop_redis_client(current))
+    assert health._redis_client is None
+
+
+def test_redis_status_stale_ping_failure_keeps_replacement(monkeypatch):
+    """A slow failing ping must not invalidate a client created after it started.
+
+    The ping runs outside the init lock, so it can resolve after another caller
+    already dropped the dead client and reconnected. Nulling ``_redis_client``
+    unconditionally discards that healthy replacement and forces another
+    reconnect (issue #184)."""
+    monkeypatch.setattr(config, "REDIS_URL", "redis://x/0")
+    created = []
+    stale_ping_started = asyncio.Event()
+    release_stale = asyncio.Event()
+
+    class StaleRedis:
+        async def ping(self):
+            stale_ping_started.set()
+            await release_stale.wait()
+            raise redis.exceptions.RedisError("connection died")
+
+    class FreshRedis:
+        async def ping(self):
+            return True
+
+    def fake_from_url(url, **kwargs):
+        client = FreshRedis() if created else StaleRedis()
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(health.aioredis, "from_url", fake_from_url)
+
+    async def scenario():
+        stale_ping = asyncio.create_task(health._redis_status())
+        await stale_ping_started.wait()
+        # Second caller sees the dead client as gone, reconnects and succeeds
+        # while the first ping is still in flight.
+        health._redis_client = None
+        assert await health._redis_status() == (True, "redis")
+        replacement = health._redis_client
+        release_stale.set()
+        return await stale_ping, replacement
+
+    (ok, mode), replacement = _run(scenario())
+    assert (ok, mode) == (False, "degraded")
+    assert health._redis_client is replacement
+    assert len(created) == 2
+    # The healthy replacement is reused, so no third reconnect happens.
+    assert _run(health._redis_status()) == (True, "redis")
+    assert len(created) == 2
+
+
 # --- _readiness_report ---
 
 
