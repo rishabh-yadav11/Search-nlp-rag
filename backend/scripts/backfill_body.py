@@ -19,7 +19,6 @@ Usage:
     python scripts/backfill_body.py
 """
 import asyncio
-import os
 import sys
 import time
 from datetime import UTC, datetime
