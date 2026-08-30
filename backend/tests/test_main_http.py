@@ -70,6 +70,10 @@ class _FakeCache:
 # --- /search ---
 
 
+async def _passthrough_boost(q, results):
+    return results
+
+
 def test_search_cache_hit_returns_cached_summaries(monkeypatch):
     records = []
     cached = [_summary_dict(1, 0.9), _summary_dict(2, 0.7)]
@@ -212,6 +216,144 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch):
     assert {c.key for c in qfilter.must} == {"industry_names", "published_date"}
     assert resp.cached is False
     assert [r.id for r in resp.results] == [1, 2]
+
+
+def test_search_cache_miss_does_not_cache_empty_results(monkeypatch):
+    """Regression: an empty result set was cached and then replayed as
+    authoritative 'no results' for the whole TTL, so a date-filtered query that
+    transiently retrieved nothing kept returning nothing for minutes."""
+    cache = _FakeCache()
+
+    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+        return []
+
+    async def fake_record_search(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(main, "cache", cache)
+    monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
+    monkeypatch.setattr(main, "expand_query", lambda q: q)
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "apply_click_boost", _passthrough_boost)
+    monkeypatch.setattr(main, "diversify", lambda results, eff_top_k, **kw: results)
+    monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
+    monkeypatch.setattr(main, "record_search", fake_record_search)
+
+    resp = _run(main.search(q="edtech startups 2020", top_k=8, industry=None, dealtype=None,
+                            author=None, from_date=None, to_date=None))
+
+    assert resp.results == []
+    assert resp.cached is False
+    assert cache.sets == [], "empty result sets must never be written to the cache"
+
+
+def test_search_empty_results_are_not_served_from_cache(monkeypatch):
+    """The whole point of the guard: a second identical query must re-run
+    retrieval instead of being answered from a poisoned empty cache entry."""
+    cache = _FakeCache()
+    calls = []
+
+    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+        calls.append(q)
+        return [_article(1, 0.9)] if len(calls) > 1 else []
+
+    async def fake_record_search(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(main, "cache", cache)
+    monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
+    monkeypatch.setattr(main, "expand_query", lambda q: q)
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "apply_click_boost", _passthrough_boost)
+    monkeypatch.setattr(main, "diversify", lambda results, eff_top_k, **kw: results)
+    monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
+    monkeypatch.setattr(main, "record_search", fake_record_search)
+
+    kwargs = {"top_k": 8, "industry": None, "dealtype": None, "author": None,
+              "from_date": None, "to_date": None}
+    first = _run(main.search(q="edtech startups 2020", **kwargs))
+    second = _run(main.search(q="edtech startups 2020", **kwargs))
+
+    assert first.results == []
+    assert len(calls) == 2, "the second query must re-run retrieval, not hit the cache"
+    assert [r.id for r in second.results] == [1]
+    assert second.cached is False
+
+
+def test_search_non_empty_results_are_still_cached(monkeypatch):
+    """Guard against over-correcting: the cache must stay enabled for real
+    result sets, only empty ones are skipped."""
+    cache = _FakeCache()
+    articles = [_article(1, 0.9)]
+
+    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+        return articles
+
+    async def fake_record_search(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(main, "cache", cache)
+    monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
+    monkeypatch.setattr(main, "expand_query", lambda q: q)
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "apply_click_boost", _passthrough_boost)
+    monkeypatch.setattr(main, "diversify", lambda results, eff_top_k, **kw: results)
+    monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
+    monkeypatch.setattr(main, "record_search", fake_record_search)
+
+    _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
+                     author=None, from_date=None, to_date=None))
+
+    assert len(cache.sets) == 1
+    assert cache.sets[0][0].startswith("search:")
+    assert [d["id"] for d in cache.sets[0][1]] == [1]
+
+
+# --- retrieve_and_rerank caching ---
+
+
+def _patch_retrieval_pipeline(monkeypatch, articles):
+    """Wires retrieve_and_rerank's collaborators to fakes returning `articles`."""
+
+    async def fake_leg(rq, top_k, qfilter):
+        return list(articles)
+
+    async def fake_rerank(q, results):
+        return list(results)
+
+    monkeypatch.setattr(main, "_retrieval_queries", lambda q: [q])
+    monkeypatch.setattr(main, "_retrieval_leg", fake_leg)
+    monkeypatch.setattr(main, "rerank", fake_rerank)
+    monkeypatch.setattr(main, "sort_results", lambda r: r)
+    monkeypatch.setattr(main, "apply_entity_boost", lambda q, r: r)
+
+
+def test_retrieve_and_rerank_does_not_cache_empty_results(monkeypatch):
+    cache = _FakeCache()
+    monkeypatch.setattr(main, "cache", cache)
+    _patch_retrieval_pipeline(monkeypatch, [])
+
+    out = _run(main.retrieve_and_rerank("edtech startups 2020", 8, None))
+
+    assert out == []
+    assert cache.sets == [], "empty result sets must never be written to the cache"
+    assert cache.store == {}
+
+
+def test_retrieve_and_rerank_non_empty_results_are_still_cached(monkeypatch):
+    cache = _FakeCache()
+    monkeypatch.setattr(main, "cache", cache)
+    _patch_retrieval_pipeline(monkeypatch, [_article(1, 0.9)])
+
+    out = _run(main.retrieve_and_rerank("fintech funding", 8, None))
+
+    assert [a.id for a in out] == [1]
+    assert len(cache.sets) == 1
+    assert cache.sets[0][0].startswith("retrieve:")
+    assert "body" not in cache.sets[0][1][0]
 
 
 def test_search_retrieve_error_returns_500(monkeypatch):

@@ -711,7 +711,16 @@ async def retrieve_and_rerank(
         await _attach_bodies(reranked)
     # Bodies are deliberately excluded from the cache entry: they are large and
     # chat re-fetches them from Qdrant on a cache hit (_attach_bodies).
-    await cache.set(cache_key, [a.model_dump(exclude={"body"}) for a in reranked])
+    #
+    # Empty result sets are never cached: a transient retrieval failure (or a
+    # momentary empty candidate set) would otherwise be replayed as an
+    # authoritative "no results" for the whole CACHE_TTL_SECONDS window, which
+    # is exactly the bug where a date-filtered query returned nothing for
+    # minutes. Skipping the write (rather than caching a short TTL) is the safer
+    # default: it fails toward correctness, and re-running the pipeline costs
+    # far less than serving a wrong answer.
+    if reranked:
+        await cache.set(cache_key, [a.model_dump(exclude={"body"}) for a in reranked])
     return reranked
 
 
@@ -759,7 +768,11 @@ async def search(
                              sim_thresh=config.DIVERSITY_SIM_THRESHOLD)
     results = reranked[:eff_top_k]
     note = weak_results_note([r.score for r in results], date_label(eff_from, eff_to))
-    await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
+    # Same empty-set guard as retrieve_and_rerank: an empty result set is never
+    # cached, so a transient miss can't be replayed as "no results" for the
+    # whole TTL. Non-empty sets are cached as before.
+    if results:
+        await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
     await record_search(q, len(results), bool(note), cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
     return SearchResponse(query=q, results=[to_summary(r) for r in results], cached=False,
