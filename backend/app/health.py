@@ -21,6 +21,32 @@ async def health() -> dict[str, str]:
 _redis_init_lock: asyncio.Lock | None = None
 
 
+def _get_redis_init_lock() -> asyncio.Lock:
+    """Return the lock guarding ``_redis_client`` creation/invalidation.
+
+    Created lazily on first use so the module stays importable outside a
+    running event loop."""
+    global _redis_init_lock
+    if _redis_init_lock is None:
+        _redis_init_lock = asyncio.Lock()
+    return _redis_init_lock
+
+
+async def _drop_redis_client(client: aioredis.Redis) -> None:
+    """Invalidate the cached client under the init lock, and only if it is
+    still the client that failed.
+
+    The ping runs outside the lock (holding it across a 2s network call would
+    serialize every readiness probe), so by the time a ping fails another
+    caller may already have replaced the dead client with a fresh one. A blind
+    ``_redis_client = None`` would discard that replacement - and leak its
+    connection - forcing yet another reconnect for no reason."""
+    global _redis_client
+    async with _get_redis_init_lock():
+        if _redis_client is client:
+            _redis_client = None
+
+
 async def close_redis() -> None:
     """Close the lazily-created readiness-check Redis client. Registered as a
     shutdown hook so the connection isn't leaked on worker exit."""
@@ -63,10 +89,7 @@ async def _redis_status() -> tuple[bool, str]:
     global _redis_client
     if not config.REDIS_URL:
         return True, "memory"
-    global _redis_init_lock
-    if _redis_init_lock is None:
-        _redis_init_lock = asyncio.Lock()
-    async with _redis_init_lock:
+    async with _get_redis_init_lock():
         if _redis_client is None:
             try:
                 _redis_client = aioredis.from_url(
@@ -74,15 +97,15 @@ async def _redis_status() -> tuple[bool, str]:
                 )
             except (TimeoutError, redis.exceptions.RedisError, OSError):
                 return False, "down"
-    client = _redis_client
+        client = _redis_client
     if client is None:
         return False, "degraded"
     try:
         await asyncio.wait_for(client.ping(), timeout=2.0)
-        return True, "redis"
     except (TimeoutError, redis.exceptions.RedisError, OSError):
-        _redis_client = None
+        await _drop_redis_client(client)
         return False, "degraded"
+    return True, "redis"
 
 
 async def _readiness_report(state: dict) -> tuple[bool, dict]:
