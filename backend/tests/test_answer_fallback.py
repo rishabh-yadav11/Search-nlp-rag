@@ -1,4 +1,6 @@
 
+import pytest
+
 from app.answer_fallback import (
     TOP_WEAK_THRESHOLD,
     date_label,
@@ -121,3 +123,55 @@ def test_fallback_answer_with_label_best_effort():
     assert "January 2025" in answer
     assert "3" in answer
     assert "closest" in answer
+
+
+def test_fallback_answer_with_label_zero_weak_claims_no_sources():
+    """Contract test for the defensive n_weak == 0 branch (the production caller
+    in chat.py returns early on an empty source list, so this is called directly
+    rather than implying a live path). Zero sources means the answer must not
+    claim a closest match nor point at sources that don't exist."""
+    answer = fallback_answer("top pharma deals of month january 2025", 0, "January 2025")
+    assert "January 2025" in answer
+    assert "closest" not in answer
+    assert "source" not in answer.lower()
+    assert "below" not in answer.lower()
+
+
+def test_fallback_answer_with_label_singular_is_grammatical():
+    answer = fallback_answer("top pharma deals of month january 2025", 1, "January 2025")
+    assert "Here is the closest match" in answer
+    assert "1 matches" not in answer
+    assert "closest 1 " not in answer
+    assert "the source below" in answer
+
+
+def test_fallback_answer_with_label_singular_no_plural_count_claim():
+    """Exactly one weak match must be described as one article: 'only a few
+    articles' advertises a count that the single source does not back up."""
+    answer = fallback_answer("top pharma deals of month january 2025", 1, "January 2025")
+    assert "I found only one article matching" in answer
+    assert "a few articles" not in answer
+    assert "articles" not in answer
+    assert "matches" not in answer.lower()
+
+
+def test_fallback_answer_with_label_plural_is_grammatical():
+    answer = fallback_answer("top pharma deals of month january 2025", 2, "January 2025")
+    assert "Here are the closest 2 matches" in answer
+    assert "the sources below" in answer
+
+
+@pytest.mark.parametrize("n_weak", [0, 2, 3, 7])
+def test_fallback_answer_with_label_never_claims_one_match(n_weak):
+    """Only a genuine single match may be described as one match; other counts
+    must not be rounded to 'the closest 1 matches'."""
+    answer = fallback_answer("hydrogen funding", n_weak, "March 2025")
+    assert "closest 1 " not in answer
+    assert "1 matches" not in answer
+
+
+@pytest.mark.parametrize("n_weak", [0, 1])
+def test_fallback_answer_without_label_no_plural_articles(n_weak):
+    answer = fallback_answer("who acquired Housing.com", n_weak)
+    assert "1 closest articles" not in answer
+    assert "closest articles are" not in answer
