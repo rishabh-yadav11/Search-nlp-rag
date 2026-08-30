@@ -1145,13 +1145,75 @@ def test_json_loads_logs_unexpected_shape(caplog):
     assert "dropped 1 non-object item(s)" in caplog.text
 
 
-def test_json_loads_non_str_payload_is_not_swallowed(caplog):
-    """A non-str/bytes payload is a programming error: it must not be masked as
-    an empty result (#175)."""
-    with caplog.at_level(logging.ERROR, logger="chat"), pytest.raises(TypeError):
-        chat_module.json_loads(123)
+def test_json_loads_non_str_payload_degrades_to_empty(caplog):
+    """A non-str/bytes payload is a caller bug, but still must not break a
+    history read: it degrades to [] and is logged at error level with the type,
+    the row id and a bounded preview (#175)."""
+    with caplog.at_level(logging.ERROR, logger="chat"):
+        assert chat_module.json_loads(123, row_id=5) == []
+        assert chat_module.json_loads({"a": 1}) == []
     assert "payload must be str/bytes, got int" in caplog.text
     assert "123" in caplog.text
+    assert "row_id=5" in caplog.text
+    assert "row_id=unknown" in caplog.text
+    assert "got dict" in caplog.text
+
+
+def test_json_loads_logs_row_id_for_shape_problems(caplog):
+    """Every degraded path names the row, so the corrupt stored row can be found
+    from the logs (#175)."""
+    with caplog.at_level(logging.WARNING, logger="chat"):
+        assert chat_module.json_loads('{"sources": 1}', row_id=99) == []
+        assert chat_module.json_loads("[1]", row_id=99) == []
+    assert "expected a JSON list" in caplog.text
+    assert "dropped 1 non-object item(s)" in caplog.text
+    assert "row_id=99" in caplog.text
+
+
+def test_row_to_message_passes_row_id_to_json_loads(caplog):
+    """The only caller must identify the row it read, otherwise the corruption
+    warning cannot be traced back to a stored message (#175)."""
+    row = {
+        "id": 7,
+        "role": "user",
+        "content": "hello",
+        "sources": "{bad json",
+        "created_at": 123.0,
+        "prompt_tokens": None,
+        "completion_tokens": "12",
+        "cost": None,
+        "latency_ms": "0.5",
+    }
+    with caplog.at_level(logging.WARNING, logger="chat"):
+        assert chat_module._row_to_message(row).sources == []
+    assert "row_id=7" in caplog.text
+
+
+def test_log_preview_is_bounded_for_large_payloads():
+    """A huge non-str payload must not be repr'd in full on the error path: the
+    render cost is capped by the preview limits, not the payload size (#175)."""
+    budget = chat_module._JSON_LOG_PREVIEW + 100  # clip marker + omitted-count suffix
+
+    huge_list = [{"id": i, "body": "x" * 50_000} for i in range(5_000)]
+    list_preview = chat_module._log_preview(huge_list)
+    assert len(list_preview) <= budget
+    assert "x" * 1000 not in list_preview
+    assert list_preview.endswith("(showing 3 of 5000 item(s))")
+
+    bytes_preview = chat_module._log_preview(b"y" * 5_000_000)
+    assert len(bytes_preview) <= budget
+    assert "y" * 1000 not in bytes_preview
+
+    dict_preview = chat_module._log_preview({f"key-{i}": "z" * 20_000 for i in range(2_000)})
+    assert len(dict_preview) <= budget
+    assert dict_preview.endswith("(showing 3 of 2000 item(s))")
+
+    long_str = "s" * 1_000_000
+    assert chat_module._log_preview(long_str) == "s" * chat_module._JSON_LOG_PREVIEW + "...(truncated)"
+
+    # Small payloads are rendered verbatim, with no truncation or omission marker.
+    assert chat_module._log_preview([{"a": 1}]) == "[{'a': 1}]"
+    assert chat_module._log_preview("{not json") == "{not json"
 
 
 def test_row_to_message_coerces_legacy_fields():
