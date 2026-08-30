@@ -184,7 +184,7 @@ def run_one(g: dict, k: int) -> dict:
     try:
         with urllib.request.urlopen(url, timeout=90) as r:
             d = json.load(r)
-    except Exception as e:  # noqa: BLE001 - never abort the whole run on one bad response
+    except Exception as e:  # never abort the whole run on one bad response
         print(f"[WARN] query {g['id']}: request/parse failed ({e}); skipping")
         return _invalid(g, f"request/parse error: {e}")
 

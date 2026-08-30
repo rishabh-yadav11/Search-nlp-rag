@@ -140,8 +140,9 @@ def main():
     finally:
         try:
             client.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # Cleanup only: a close failure must not mask the reset result.
+            log(f"warning: could not close the Qdrant client ({e})")
 
     print("\nNext steps to rebuild from zero:")
     print("  1. python scripts/fetch_data.py")
