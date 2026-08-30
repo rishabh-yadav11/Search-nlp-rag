@@ -356,7 +356,10 @@ class ChatStore:
         return SessionStatsOut(
             sessions=int(sessions_row["n"]) if sessions_row else 0,
             messages=int(msgs_row["n"]) if msgs_row else 0,
-            total_tokens=int((msgs_row["pt"] if msgs_row else 0) + (msgs_row["ct"] if msgs_row else 0)),
+            total_tokens=min(
+                int(msgs_row["pt"] if msgs_row else 0) + int(msgs_row["ct"] if msgs_row else 0),
+                MAX_TOKEN_SUM,
+            ),
             total_cost=float(msgs_row["cost"] if msgs_row else 0.0),
         )
 
