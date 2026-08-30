@@ -685,12 +685,13 @@ async def retrieve_and_rerank(
     """Run every retrieval leg, merge RRF candidates, cross-encode rerank, and
     apply the entity-mention boost. Returns the recency-sorted articles.
 
-    Shared by /search and /chat so the two pipelines stay consistent. The
-    reranked article set is cached in Redis (same TTL as /search) because it is
-    deterministic for a (query, filter) pair; chat follows-up re-run the same
-    retrieval on every turn, and this cache makes those turns skip embedding +
-    rerank entirely. Bodies are not cached (they are large); when ``need_body``
-    is set they are fetched from Qdrant for the returned set.
+    Shared by /search and /chat so the two pipelines stay consistent. A
+    non-empty reranked article set is cached in Redis (same TTL as /search)
+    because it is deterministic for a (query, filter) pair; chat follow-ups
+    re-run the same retrieval on every turn, and this cache makes those turns
+    skip embedding + rerank entirely. Empty sets are never cached (see the
+    guard comment by ``cache.set``). Bodies are not cached (they are large);
+    when ``need_body`` is set they are fetched from Qdrant for the returned set.
     """
     q = fix_query(q)[0]  # typo-corrected query flows to cache key, legs, boost
     cache_key = f"retrieve:{q}:{top_k}:{_filter_token(qfilter)}"
