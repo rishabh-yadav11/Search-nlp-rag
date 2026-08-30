@@ -741,7 +741,7 @@ def _requested_view(question: str) -> str | None:
         return None
     q = question.lower()
     for term, view in _VIEW_TERMS:
-        if re.search(rf"\b{term}\b", q):
+        if re.search(rf"\b{re.escape(term)}\b", q):
             return view
     return None
 
