@@ -90,10 +90,14 @@ def test_date_label_impossible_month_returns_none_instead_of_raising():
     assert date_label("2025-99-01", "2025-99-31") is None
 
 
-def test_date_label_degenerate_year_does_not_raise():
-    """A year calendar cannot represent (e.g. 0000) must not escape as an
-    exception; it returns None or a label, depending on the interpreter."""
-    assert date_label("0000-01-01", "0000-01-31") in (None, "January 0")
+def test_date_label_out_of_range_year_is_normalized_not_raised():
+    """An out-of-range year (0000) is normalized by calendar, not rejected:
+    calendar.monthrange(0, 1) succeeds, so date_label never raises here. The
+    zero-padded window still yields None because to_date is compared against
+    the int year ('0-01-31'); the matching unpadded window labels as
+    'January 0'. Regression guard for issue #169: no IllegalYearError exists."""
+    assert date_label("0000-01-01", "0000-01-31") is None
+    assert date_label("0000-01-01", "0-01-31") == "January 0"
 
 
 def test_date_label_unknown_window():
