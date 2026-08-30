@@ -76,8 +76,9 @@ class HybridCache:
         return value
 
     async def set(self, key: str, value, ttl: int | None = None) -> None:
+        payload = json.dumps(value)
         try:
-            await self._client().set(key, json.dumps(value), ex=self._ttl if ttl is None else ttl)
+            await self._client().set(key, payload, ex=self._ttl if ttl is None else ttl)
             return
         except _REDIS_ERRORS as exc:
             self._degraded(exc)
