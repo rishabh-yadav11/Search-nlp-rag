@@ -189,6 +189,23 @@ class Config:
     CHAT_MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "10"))
     CHAT_PURGE_INTERVAL_SECONDS = int(os.getenv("CHAT_PURGE_INTERVAL_SECONDS", "86400"))
 
+    # Recommendation engine
+    ENABLE_RECOMMENDATIONS = os.getenv("ENABLE_RECOMMENDATIONS", "true").lower() in ("1", "true", "yes")
+    # Hybrid scoring weights
+    RECOMMEND_SIMILARITY_WEIGHT = float(os.getenv("RECOMMEND_SIMILARITY_WEIGHT", "0.4"))
+    RECOMMEND_CATEGORY_WEIGHT = float(os.getenv("RECOMMEND_CATEGORY_WEIGHT", "0.3"))
+    RECOMMEND_RECENCY_WEIGHT = float(os.getenv("RECOMMEND_RECENCY_WEIGHT", "0.2"))
+    RECOMMEND_POPULARITY_WEIGHT = float(os.getenv("RECOMMEND_POPULARITY_WEIGHT", "0.1"))
+    # User profile decay rate for interaction history (exponential)
+    USER_PROFILE_DECAY_LAMBDA = float(os.getenv("USER_PROFILE_DECAY_LAMBDA", "0.1"))
+    USER_INTERACTION_TTL_DAYS = int(os.getenv("USER_INTERACTION_TTL_DAYS", "90"))
+    RECOMMEND_DEFAULT_LIMIT = int(os.getenv("RECOMMEND_DEFAULT_LIMIT", "10"))
+    RECOMMEND_CANDIDATES_LIMIT = int(os.getenv("RECOMMEND_CANDIDATES_LIMIT", "50"))
+    # Redis keys for user profiles and interactions
+    USER_PROFILE_REDIS_DB = int(os.getenv("USER_PROFILE_REDIS_DB", "2"))
+    # Trending/viral signal TTL
+    TRENDING_VELOCITY_WINDOW_DAYS = int(os.getenv("TRENDING_VELOCITY_WINDOW_DAYS", "7"))
+
     # Analytics
     # Aggregates live in Redis DB 1 (the query cache uses DB 0 and is flushed
     # during deploys). Read endpoints are gated by the auth layer (admin role).

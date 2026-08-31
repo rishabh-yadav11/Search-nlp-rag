@@ -1,0 +1,515 @@
+"""Hybrid recommendation engine for similar articles and personalized feeds.
+
+Provides:
+  1. Similar articles for a given article (item-based collaborative filtering via
+     dense vector similarity in Qdrant)
+  2. Personalized recommendations for a user (user-based via aggregated profile
+     vector + category affinity)
+  3. Trending/popular articles (click-velocity based, Redis-backed)
+  4. Latest top stories (cold-start fallback)
+
+Architecture:
+  - Candidate generators fetch articles from different sources
+  - A hybrid scorer combines signals with configurable weights
+  - Post-processing applies diversity and exclusion filters
+"""
+import asyncio
+import logging
+import math
+from datetime import UTC, datetime
+
+from qdrant_client.models import (
+    FieldCondition,
+    Filter,
+    MatchAny,
+    ScoredPoint,
+)
+
+from app.config import config
+from app.user_profile import (
+    get_trending_articles,
+    get_user_interactions,
+    get_user_profile_categories,
+)
+
+logger = logging.getLogger(__name__)
+
+# Redis keys for cached recommendations
+SIMILAR_ARTICLES_TTL_SECONDS = 3600  # 1 hour
+USER_RECOMMENDATIONS_TTL_SECONDS = 1800  # 30 minutes
+
+
+async def get_similar_articles(
+    article_id: int | str,
+    limit: int = config.RECOMMEND_DEFAULT_LIMIT,
+    same_category: bool = False,
+    exclude_ids: list[int | str] | None = None,
+) -> list[dict]:
+    """Get articles similar to the given article using dense vector similarity.
+
+    Args:
+        article_id: The article ID to find similar articles for
+        limit: Maximum number of similar articles to return
+        same_category: If True, filter to same industry/dealtype
+        exclude_ids: Articles to exclude from results
+
+    Returns:
+        List of article dicts with 'id', 'title', 'score', etc.
+    """
+    if not config.ENABLE_RECOMMENDATIONS:
+        return []
+
+    try:
+        client = state["qdrant"]
+        exclude_ids = exclude_ids or []
+
+        # Build filter to exclude the source article and any specified IDs
+        must_not = []
+        if article_id:
+            must_not.append(FieldCondition(key="id", match={"value": int(article_id)}))
+        for eid in exclude_ids:
+            try:
+                must_not.append(FieldCondition(key="id", match={"value": int(eid)}))
+            except (ValueError, TypeError):
+                pass
+
+        # Optionally filter to same category
+        qfilter = None
+        if same_category:
+            # Fetch the source article's categories first
+            source_result = await client.retrieve(
+                collection_name=config.QDRANT_COLLECTION,
+                point_id=int(article_id),
+                with_payload=["industry_names", "dealtype_names"],
+            )
+            if source_result:
+                payload = source_result[0].payload or {}
+                industry = payload.get("industry_names")
+                dealtype = payload.get("dealtype_names")
+
+                conditions = []
+                if industry:
+                    conditions.append(FieldCondition(
+                        key="industry_names",
+                        match=MatchAny(any=industry if isinstance(industry, list) else [industry])
+                    ))
+                if dealtype:
+                    conditions.append(FieldCondition(
+                        key="dealtype_names",
+                        match=MatchAny(any=dealtype if isinstance(dealtype, list) else [dealtype])
+                    ))
+
+                if conditions:
+                    qfilter = Filter(must=conditions, must_not=must_not)
+                else:
+                    qfilter = Filter(must_not=must_not)
+            else:
+                qfilter = Filter(must_not=must_not)
+        else:
+            qfilter = Filter(must_not=must_not) if must_not else None
+
+        # Query using the article's own vector as a query point (point_id query)
+        result = await client.query_points(
+            collection_name=config.QDRANT_COLLECTION,
+            query=int(article_id),  # Use point ID as query for nearest neighbors
+            query_filter=qfilter,
+            limit=limit * 3,  # Fetch more to apply filters/post-processing
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        return _format_articles(result.points, exclude_ids=[int(article_id)] + [int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and eid.isdigit()])
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Error getting similar articles for %s: %s", article_id, exc)
+        return []
+
+
+async def get_personalized_recommendations(
+    user_id: str,
+    limit: int = config.RECOMMEND_DEFAULT_LIMIT,
+    exclude_ids: list[int | str] | None = None,
+) -> list[dict]:
+    """Get personalized recommendations for a user.
+
+    Uses:
+      1. User's interaction history to build preference profile
+      2. Dense vector similarity to find related articles
+      3. Category affinity matching
+      4. Recency boost for fresh content
+      5. Popularity signal from Redis
+
+    Falls back to latest top stories if no user history exists.
+
+    Args:
+        user_id: The user ID to get recommendations for
+        limit: Maximum number of recommendations
+        exclude_ids: Articles to exclude (e.g., already viewed)
+
+    Returns:
+        List of article dicts with scores and metadata
+    """
+    if not config.ENABLE_RECOMMENDATIONS:
+        return []
+
+    try:
+        client = state["qdrant"]
+        exclude_ids = exclude_ids or []
+
+        # Get user's interaction history
+        interactions = await get_user_interactions(user_id)
+        categories = await get_user_profile_categories(user_id)
+
+        if not interactions:
+            # Cold start: return latest diverse articles
+            logger.info("Cold start for user %s, returning latest articles", user_id)
+            return await _get_latest_top_stories(limit, exclude_ids)
+
+        # Build filter to exclude already-interacted articles
+        must_not = [FieldCondition(key="id", match=MatchAny(any=[int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and str(eid).isdigit()]))]
+        # Also exclude recently interacted articles
+        recent_article_ids = [aid for aid, _ in interactions[:10]]  # Last 10 interactions
+        if recent_article_ids:
+            must_not.append(FieldCondition(key="id", match=MatchAny(any=recent_article_ids)))
+
+        qfilter = Filter(must_not=must_not) if must_not else None
+
+        # Get user's top categories
+        top_categories = categories[:3] if categories else []
+        category_filter = None
+        if top_categories:
+            # Build a filter for top industries
+            industry_conditions = []
+            for cat, _ in top_categories:
+                if "industry" in cat.lower():
+                    industry_conditions.append(FieldCondition(
+                        key="industry_names",
+                        match=MatchAny(any=[cat])
+                    ))
+            if industry_conditions:
+                category_filter = Filter(must=industry_conditions)
+
+        # Fetch candidate articles using different strategies
+        candidates: dict[int | str, dict] = {}
+
+        # 1. Vector similarity from recent interactions (semantic)
+        async def _vector_candidates():
+            """Get candidates from vector similarity to recent interactions."""
+            results = []
+            for article_id, _ in interactions[:5]:  # Use last 5 interactions
+                try:
+                    pts = await client.query_points(
+                        collection_name=config.QDRANT_COLLECTION,
+                        query=int(article_id),
+                        query_filter=qfilter,
+                        limit=limit,
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    results.extend(pts.points)
+                except Exception:  # noqa: BLE001, S112
+                    continue
+            return results
+
+        # 2. Category-based candidates
+        async def _category_candidates():
+            """Get candidates matching user's top categories."""
+            if not category_filter:
+                return []
+            try:
+                pts = await client.query_points(
+                    collection_name=config.QDRANT_COLLECTION,
+                    query_filter=category_filter,
+                    limit=limit * 2,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                return pts.points
+            except Exception:  # noqa: BLE001
+                return []
+
+        # 3. Trending candidates
+        async def _trending_candidates():
+            """Get trending articles."""
+            try:
+                trending = await get_trending_articles(limit)
+                if not trending:
+                    return []
+                ids = [t["article_id"] for t in trending]
+                pts = await client.scroll(
+                    collection_name=config.QDRANT_COLLECTION,
+                    limit=len(ids),
+                    offset=None,
+                    with_payload=True,
+                    with_vectors=False,
+                    filter=qfilter,
+                )
+                # Match by ID
+                id_set = set(ids)
+                return [p for p in pts[0] if p.id in id_set]
+            except Exception:  # noqa: BLE001
+                return []
+
+        # Fetch all candidate sources in parallel
+        vector_results, category_results, trending_results = await asyncio.gather(
+            _vector_candidates(),
+            _category_candidates(),
+            _trending_candidates(),
+        )
+
+        # Score and blend candidates
+        now = datetime.now(UTC)
+        for point in vector_results:
+            pid = point.id
+            if pid in candidates:
+                continue
+            payload = point.payload or {}
+            published = payload.get("published_date", "")
+            score = _calculate_recency_score(published, now)
+            candidates[pid] = {
+                "point": point,
+                "payload": payload,
+                "semantic_score": score,
+                "category_score": 0.0,
+                "trending_score": 0.0,
+            }
+
+        for point in category_results:
+            pid = point.id
+            if pid in candidates:
+                continue
+            payload = point.payload or {}
+            published = payload.get("published_date", "")
+            score = _calculate_recency_score(published, now)
+            candidates[pid] = {
+                "point": point,
+                "payload": payload,
+                "semantic_score": 0.0,
+                "category_score": score,
+                "trending_score": 0.0,
+            }
+
+        for point in trending_results:
+            pid = point.id
+            if pid in candidates:
+                continue
+            payload = point.payload or {}
+            published = payload.get("published_date", "")
+            score = _calculate_recency_score(published, now)
+            candidates[pid] = {
+                "point": point,
+                "payload": payload,
+                "semantic_score": 0.0,
+                "category_score": 0.0,
+                "trending_score": score,
+            }
+
+        # Apply hybrid scoring
+        scored = []
+        for pid, data in candidates.items():
+            final_score = (
+                config.RECOMMEND_SIMILARITY_WEIGHT * data["semantic_score"] +
+                config.RECOMMEND_CATEGORY_WEIGHT * data["category_score"] +
+                config.RECOMMEND_RECENCY_WEIGHT * _calculate_recency_score(
+                    data["payload"].get("published_date", ""), now
+                ) +
+                config.RECOMMEND_POPULARITY_WEIGHT * data["trending_score"]
+            )
+            scored.append({
+                **data,
+                "final_score": final_score,
+                "point_id": pid,
+            })
+
+        # Sort by final score and return top results
+        scored.sort(key=lambda x: x["final_score"], reverse=True)
+        top_candidates = scored[:limit * 2]
+
+        return _format_articles(
+            [c["point"] for c in top_candidates],
+            exclude_ids=[int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and str(eid).isdigit()] + recent_article_ids
+        )
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Error getting personalized recommendations for %s: %s", user_id, exc)
+        return []
+
+
+async def get_trending_feed(
+    limit: int = config.RECOMMEND_DEFAULT_LIMIT,
+    exclude_ids: list[int | str] | None = None,
+) -> list[dict]:
+    """Get trending/popular articles based on click velocity.
+
+    Args:
+        limit: Maximum number of articles
+        exclude_ids: Articles to exclude
+
+    Returns:
+        List of article dicts sorted by trending score
+    """
+    if not config.ENABLE_RECOMMENDATIONS:
+        return []
+
+    try:
+        client = state["qdrant"]
+        exclude_ids = exclude_ids or []
+
+        # Get trending data from Redis
+        trending = await get_trending_articles(limit * 2)
+        if not trending:
+            # Fallback to latest articles
+            return await _get_latest_top_stories(limit, exclude_ids)
+
+        # Fetch full article details from Qdrant
+        ids = [t["article_id"] for t in trending]
+        pts, _ = await client.scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            limit=len(ids),
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        # Build score lookup
+        score_lookup = {t["article_id"]: t["score"] for t in trending}
+
+        # Filter and format
+        result = []
+        for point in pts:
+            pid = point.id
+            if pid in exclude_ids:
+                continue
+            if pid in score_lookup:
+                payload = point.payload or {}
+                result.append({
+                    "id": pid,
+                    "title": payload.get("title", ""),
+                    "url": payload.get("url", ""),
+                    "published_date": payload.get("published_date"),
+                    "category": payload.get("category"),
+                    "summary": payload.get("summary", ""),
+                    "author_names": payload.get("author_names", []),
+                    "industry_names": payload.get("industry_names", []),
+                    "dealtype_names": payload.get("dealtype_names", []),
+                    "score": score_lookup[pid],
+                })
+            if len(result) >= limit:
+                break
+
+        return result
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Error getting trending feed: %s", exc)
+        return []
+
+
+async def get_latest_top_stories(
+    limit: int = config.RECOMMEND_DEFAULT_LIMIT,
+    exclude_ids: list[int | str] | None = None,
+) -> list[dict]:
+    """Get latest top stories for cold-start fallback.
+
+    Returns diverse articles from recent time period.
+    """
+    return await _get_latest_top_stories(limit, exclude_ids)
+
+
+async def _get_latest_top_stories(
+    limit: int = config.RECOMMEND_DEFAULT_LIMIT,
+    exclude_ids: list[int | str] | None = None,
+) -> list[dict]:
+    """Internal: Get latest top stories with diversity."""
+    try:
+        client = state["qdrant"]
+        exclude_ids = exclude_ids or []
+
+        # Build filter
+        qfilter = None
+        if exclude_ids:
+            qfilter = Filter(must_not=[
+                FieldCondition(key="id", match=MatchAny(any=[int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and str(eid).isdigit()]))
+            ])
+
+        # Get recent articles (last 30 days)
+        pts, _ = await client.scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            limit=limit * 3,
+            with_payload=True,
+            with_vectors=False,
+            scroll_filter=qfilter,
+        )
+
+        # Sort by published date and take most recent
+        now = datetime.now(UTC)
+        scored = []
+        for point in pts:
+            payload = point.payload or {}
+            published = payload.get("published_date", "")
+            recency = _calculate_recency_score(published, now)
+            scored.append((point, recency))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return _format_articles([p for p, _ in scored[:limit * 2]], exclude_ids=exclude_ids)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Error getting latest top stories: %s", exc)
+        return []
+
+
+def _calculate_recency_score(published_date: str, now: datetime) -> float:
+    """Calculate recency score for an article.
+
+    Returns a value between 0 and 1, where 1 is very recent and 0 is old.
+    """
+    if not published_date:
+        return 0.5  # Default middle score for missing dates
+
+    try:
+        if published_date.endswith("Z"):
+            published_date = published_date[:-1] + "+00:00"
+        pub_dt = datetime.fromisoformat(published_date)
+        if pub_dt.tzinfo is None:
+            pub_dt = pub_dt.replace(tzinfo=UTC)
+        age_days = (now - pub_dt).total_seconds() / 86400
+        # Exponential decay: half-life of 30 days
+        return math.exp(-age_days / 30)
+    except (ValueError, TypeError):
+        return 0.5
+
+
+def _format_articles(
+    points: list[ScoredPoint],
+    exclude_ids: list[int] | None = None,
+) -> list[dict]:
+    """Format Qdrant points into article dicts."""
+    exclude_ids = exclude_ids or []
+    results = []
+
+    for point in points:
+        pid = point.id
+        if pid in exclude_ids:
+            continue
+
+        payload = point.payload or {}
+        if not payload:
+            continue
+
+        results.append({
+            "id": pid,
+            "title": payload.get("title", ""),
+            "url": payload.get("url", ""),
+            "published_date": payload.get("published_date"),
+            "category": payload.get("category"),
+            "summary": payload.get("summary", ""),
+            "body": payload.get("body", ""),
+            "author_names": payload.get("author_names", []) or [],
+            "industry_names": payload.get("industry_names", []) or [],
+            "dealtype_names": payload.get("dealtype_names", []) or [],
+            "score": point.score if hasattr(point, 'score') else 0.0,
+        })
+
+    return results
+
+
+# Module-level state reference (set during app startup from main.state)
+state: dict = {}

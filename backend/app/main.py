@@ -7,7 +7,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastembed import SparseTextEmbedding
 from openai import AsyncOpenAI
@@ -50,9 +50,18 @@ from app.query_intent import (
     rewrite_year_in_review,
     suggested_top_k,
 )
+from app.recommender import (
+    SIMILAR_ARTICLES_TTL_SECONDS,
+    USER_RECOMMENDATIONS_TTL_SECONDS,
+    get_latest_top_stories,
+    get_personalized_recommendations,
+    get_similar_articles,
+    get_trending_feed,
+)
 from app.redis_cache import cache
 from app.rerank_boost import apply_entity_boost
 from app.reranker import Reranker
+from app.user_profile import get_user_interactions, invalidate_user_profile, record_interaction
 
 state = {}
 
@@ -220,6 +229,10 @@ async def lifespan(app: FastAPI):
         min_token_len=config.QUERY_FIX_MIN_TOKEN_LEN,
     )
 
+    # Connect recommender engine to shared state
+    from app import recommender
+    recommender.state = state
+
     yield
     state["chat_retention"].cancel()
     await asyncio.gather(state["chat_retention"], return_exceptions=True)
@@ -300,6 +313,22 @@ def to_summary(a: SourceArticle) -> SourceSummary:
         industry_names=a.industry_names,
         dealtype_names=a.dealtype_names,
     )
+
+
+def _article_to_dict(a: SourceArticle) -> dict:
+    """Convert a SourceArticle to a plain dict for recommendation responses."""
+    return {
+        "id": a.id,
+        "title": a.title,
+        "url": a.url,
+        "published_date": a.published_date,
+        "category": a.category,
+        "summary": a.summary,
+        "author_names": a.author_names,
+        "industry_names": a.industry_names,
+        "dealtype_names": a.dealtype_names,
+        "score": a.score,
+    }
 
 
 def _parse_date(s: str) -> datetime | None:
@@ -975,3 +1004,186 @@ async def get_analytics_chat(
 ):
     """Cross-user chat usage (sessions, messages, tokens, cost). Admin-only."""
     return await chat_module._require_store().global_stats()
+
+
+# =============================================================================
+# Recommendation API
+# =============================================================================
+
+class InteractionEvent(BaseModel):
+    """User article interaction event for personalization."""
+    article_id: int
+    interaction_type: str = "click"  # 'view', 'click', 'read'
+    dwell_time_ms: int | None = None
+
+
+class SimilarArticlesResponse(BaseModel):
+    """Response for similar articles endpoint."""
+    article_id: int | str
+    similar_articles: list[dict]
+    limit: int
+    cached: bool = False
+
+
+class RecommendationsResponse(BaseModel):
+    """Response for personalized recommendations."""
+    user_id: str
+    recommendations: list[dict]
+    limit: int
+    cold_start: bool = False
+    cached: bool = False
+
+
+class TrendingResponse(BaseModel):
+    """Response for trending articles."""
+    articles: list[dict]
+    limit: int
+    window_days: int
+
+
+@app.post("/recommend/interaction")
+async def record_user_interaction(
+    event: InteractionEvent,
+    request: Request,
+    _auth: None = Depends(require_auth),
+):
+    """Record a user-article interaction for personalization.
+
+    Authenticated users only. Logs clicks, views, and reads to build
+    user preference profiles for personalized recommendations.
+    """
+    user_id = getattr(request.state, "user_id", "unknown")
+    await record_interaction(
+        user_id=user_id,
+        article_id=event.article_id,
+        interaction_type=event.interaction_type,
+        dwell_time_ms=event.dwell_time_ms,
+    )
+    await invalidate_user_profile(user_id)
+    return {"status": "ok", "article_id": event.article_id}
+
+
+@app.get("/recommend/similar/{article_id}", response_model=SimilarArticlesResponse)
+async def get_similar(
+    article_id: int,
+    limit: int = Query(config.RECOMMEND_DEFAULT_LIMIT, ge=1, le=20),
+    same_category: bool = Query(False),
+    _auth: None = Depends(require_auth),
+):
+    """Get articles similar to the specified article.
+
+    Uses dense vector similarity from Qdrant with optional category filtering.
+    """
+    cached_key = f"recommend:similar:{article_id}:{limit}:{same_category}"
+    cached = await cache.get(cached_key)
+    if cached:
+        articles = [SourceArticle.model_validate(a) for a in cached]
+        return SimilarArticlesResponse(
+            article_id=article_id,
+            similar_articles=[_article_to_dict(a) for a in articles],
+            limit=limit,
+            cached=True,
+        )
+
+    articles = await get_similar_articles(
+        article_id=article_id,
+        limit=limit,
+        same_category=same_category,
+    )
+    if articles:
+        await cache.set(cached_key, [a.model_dump() for a in articles], ttl=SIMILAR_ARTICLES_TTL_SECONDS)
+
+    return SimilarArticlesResponse(
+        article_id=article_id,
+        similar_articles=articles,
+        limit=limit,
+        cached=False,
+    )
+
+
+@app.get("/recommend/for-you", response_model=RecommendationsResponse)
+async def get_for_you(
+    limit: int = Query(config.RECOMMEND_DEFAULT_LIMIT, ge=1, le=20),
+    _auth: None = Depends(require_auth),
+    request: Request = None,
+):
+    """Get personalized recommendations for the authenticated user.
+
+    Uses user interaction history, category affinity, and hybrid scoring
+    to surface relevant articles. Falls back to latest top stories for
+    cold-start users with no history.
+    """
+    user_id = getattr(request.state, "user_id", "unknown")
+
+    if user_id == "unknown":
+        articles = await get_latest_top_stories(limit)
+        return RecommendationsResponse(
+            user_id="anonymous",
+            recommendations=articles,
+            limit=limit,
+            cold_start=True,
+        )
+
+    cached_key = f"recommend:for-you:{user_id}:{limit}"
+    cached = await cache.get(cached_key)
+    if cached:
+        articles = [SourceArticle.model_validate(a) for a in cached]
+        return RecommendationsResponse(
+            user_id=user_id,
+            recommendations=[_article_to_dict(a) for a in articles],
+            limit=limit,
+            cached=True,
+        )
+
+    interactions = await get_user_interactions(user_id)
+    exclude_ids = [aid for aid, _ in interactions[:20]]
+
+    articles = await get_personalized_recommendations(
+        user_id=user_id,
+        limit=limit,
+        exclude_ids=exclude_ids,
+    )
+
+    cold_start = len(interactions) == 0
+    if articles:
+        await cache.set(cached_key, [a.model_dump() for a in articles], ttl=USER_RECOMMENDATIONS_TTL_SECONDS)
+
+    return RecommendationsResponse(
+        user_id=user_id,
+        recommendations=articles,
+        limit=limit,
+        cold_start=cold_start,
+        cached=False,
+    )
+
+
+@app.get("/recommend/trending", response_model=TrendingResponse)
+async def get_trending(
+    limit: int = Query(config.RECOMMEND_DEFAULT_LIMIT, ge=1, le=20),
+    _auth: None = Depends(require_auth),
+):
+    """Get trending/popular articles based on click velocity.
+
+    Queries Redis for recent interaction counts and returns the most
+    engaged-with articles from the configured time window.
+    """
+    start = time.perf_counter()  # noqa: F841
+    cached_key = f"recommend:trending:{limit}"
+    cached = await cache.get(cached_key)
+    if cached:
+        articles = [SourceArticle.model_validate(a) for a in cached]
+        return TrendingResponse(
+            articles=[_article_to_dict(a) for a in articles],
+            limit=limit,
+            window_days=config.TRENDING_VELOCITY_WINDOW_DAYS,
+        )
+
+    articles = await get_trending_feed(limit=limit)
+    if articles:
+        await cache.set(cached_key, [a.model_dump() for a in articles], ttl=SIMILAR_ARTICLES_TTL_SECONDS)
+
+    return TrendingResponse(
+        articles=articles,
+        limit=limit,
+        window_days=config.TRENDING_VELOCITY_WINDOW_DAYS,
+    )
