@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders, getToken } from '../lib/auth'
+import type { MouseEvent } from 'react'
 
 interface Article {
   id: number | string
@@ -78,7 +79,7 @@ export default function ForYouPage() {
     return () => controller.abort()
   }, [feedType, limit])
 
-  const handleInteraction = async (articleId: number | string, e: React.MouseEvent) => {
+  const handleInteraction = async (articleId: number | string, e: MouseEvent) => {
     const token = getToken()
     if (!token) return
 
@@ -158,7 +159,7 @@ function ArticleCard({
   onInteraction,
 }: {
   article: Article
-  onInteraction: (e: React.MouseEvent) => void
+  onInteraction: (e: MouseEvent) => void
 }) {
   return (
     <div className="feed-card" onClick={onInteraction}>
