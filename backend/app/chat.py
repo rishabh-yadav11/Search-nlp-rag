@@ -1080,8 +1080,7 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     from app.main import (
         _effective_intent,
         body_rescue,
-        build_facet_filter,
-        retrieve_and_rerank,
+        retrieve_with_auto_facet_fallback,
         source_context,
         to_summary,
     )
@@ -1107,14 +1106,21 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
             retrieval_q, eff_from, eff_to = prev_q, prev_from, prev_to
         dealtype, industry = prev_dealtype, prev_industry
         k = _effective_chat_k(prev_question)
-    qfilter = build_facet_filter(industry, dealtype, None, eff_from, eff_to)
-    reranked = await retrieve_and_rerank(retrieval_q, k, qfilter, need_body=True)
+    reranked, final_dealtype, final_industry = await retrieve_with_auto_facet_fallback(
+        retrieval_q, k,
+        industry=None, dealtype=None, author=None,
+        eff_from=eff_from, eff_to=eff_to,
+        auto_industry=industry, auto_dealtype=dealtype,
+        need_body=True,
+    )
     if config.ENABLE_BODY_RESCUE:
         reranked = await body_rescue(retrieval_q, reranked)
     # A category facet resolved from the query (dealtype/industry) already scopes
     # results to the requested topic, so the cross-encoder score only ranks within
-    # an on-topic set — don't reject those matches as "weakly related".
-    faceted = bool(dealtype or industry)
+    # an on-topic set — don't reject those matches as "weakly related". The final
+    # facets reflect any auto-facet fallback (a dropped facet means the results
+    # are not scoped to that category, so the normal gate applies).
+    faceted = bool(final_dealtype or final_industry)
     gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
     sources = [s for s in reranked if s.score >= gate][: k]
 
