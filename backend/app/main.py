@@ -754,6 +754,16 @@ async def retrieve_with_auto_facet_fallback(
     empty attempt is not cached), and only the auto facets are dropped: an
     explicit user-supplied facet and the date window always stay, so a genuinely
     empty corpus still reports an honest "no results".
+
+    The fallback is deliberately bounded: it fires only when the first retrieval
+    returned nothing AND an auto facet is present, and the retry itself re-runs
+    retrieval (so a transient miss that then succeeds simply restores the good
+    path). The only cost of a double-transient miss is that the auto facet is
+    relaxed into a broader result — a graceful degradation, never a crash or
+    fabricated data. All auto facets are dropped together (rather than probing
+    each alone): dropping any one of them is a relaxation of the same semantic
+    guess, and the broader set is the safer answer for a query that otherwise
+    would have returned nothing.
     """
     eff_industry = industry or auto_industry
     eff_dealtype = dealtype or auto_dealtype
@@ -835,8 +845,9 @@ async def search(
     fell_back = final_industry != industry or final_dealtype != dealtype
     if results and not fell_back:
         await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
-    # Record what was actually filtered (the fallback may have dropped an auto facet).
-    filtered = any((final_industry, final_dealtype, author, from_date, to_date))
+    # `filtered` (computed above from the effective facets) is used unchanged so
+    # the cache-hit and cache-miss paths report the same semantics: the user's
+    # query intent carried the facet even when the fallback relaxed it out.
     await record_search(q, len(results), bool(note), cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
     return SearchResponse(query=q, results=[to_summary(r) for r in results], cached=False,
