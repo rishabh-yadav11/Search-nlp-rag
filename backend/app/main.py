@@ -1176,7 +1176,7 @@ async def get_trending(
 
     articles = await get_trending_feed(limit=limit)
     if articles:
-        await cache.set(cached_key, [a.model_dump() for a in articles], ttl=SIMILAR_ARTICLES_TTL_SECONDS)
+        await cache.set(cached_key, articles, ttl=SIMILAR_ARTICLES_TTL_SECONDS)
 
     return TrendingResponse(
         articles=articles,
