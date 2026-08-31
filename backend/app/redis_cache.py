@@ -129,6 +129,28 @@ class HybridCache:
         while len(self._mem) > self._maxsize:
             self._mem.popitem(last=False)
 
+    async def delete_prefix(self, prefix: str) -> None:
+        """Delete every cached key starting with ``prefix`` (Redis + memory).
+
+        Used to invalidate per-user recommendation caches (whose keys embed a
+        varying limit component, e.g. ``recommend:for-you:{user}:{limit}``)
+        when a new interaction lands. Scans Redis and also purges any matching
+        in-process entries so the fallback cache does not return stale data.
+        """
+        for key in list(self._mem.keys()):
+            if key.startswith(prefix):
+                self._mem.pop(key, None)
+        client, is_new = self._acquire()
+        try:
+            async for key in client.scan_iter(match=f"{prefix}*", count=100):
+                await client.delete(key)
+        except _REDIS_ERRORS as exc:
+            if is_new:
+                await self._discard(client)
+            self._degraded(exc)
+        else:
+            await self._publish(client)
+
     async def close(self) -> None:
         if self._redis is not None:
             await self._redis.aclose()
