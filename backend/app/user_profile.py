@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 # Redis DB for user profiles (separate from analytics DB to survive deploy flushes).
 _PROFILE_REDIS_DB = config.USER_PROFILE_REDIS_DB
 
+# Lightweight cached client reuse so repeated calls share one socket-pooled
+# instance rather than re-creating connections on every call. Calls can arrive
+# before app startup sets it, so fall back to creating a short-lived client.
+_redis_client_instance: aioredis.Redis | None = None
+
 # TTL constants
 _INTERACTION_SET_TTL_DAYS = 365  # keep raw interactions long-term for profile building
 _PROFILE_VECTOR_TTL_HOURS = 6    # recompute profile periodically as new signals arrive
@@ -31,13 +36,16 @@ _PROFILE_MAX_INTERACTIONS = 50
 
 
 def _redis_client() -> aioredis.Redis:
-    return aioredis.from_url(
-        config.REDIS_URL,
-        db=_PROFILE_REDIS_DB,
-        decode_responses=True,
-        socket_connect_timeout=2,
-        socket_timeout=2,
-    )
+    global _redis_client_instance
+    if _redis_client_instance is None:
+        _redis_client_instance = aioredis.from_url(
+            config.REDIS_URL,
+            db=_PROFILE_REDIS_DB,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+    return _redis_client_instance
 
 
 async def record_interaction(
@@ -172,6 +180,8 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
                 break
             for key in keys:
                 article_id = key.split(":")[-1]
+                if not key.startswith("article:interactions:"):
+                    continue
                 counts = await client.hgetall(key)
                 total = sum(int(v) for v in counts.values() if v.isdigit())
                 if total > 0:
