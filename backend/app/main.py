@@ -1060,6 +1060,7 @@ async def record_user_interaction(
         dwell_time_ms=event.dwell_time_ms,
     )
     await invalidate_user_profile(user_id)
+    await cache.delete_prefix(f"recommend:for-you:{user_id}:")
     return {"status": "ok", "article_id": event.article_id}
 
 
