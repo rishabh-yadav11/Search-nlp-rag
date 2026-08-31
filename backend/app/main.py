@@ -1052,7 +1052,7 @@ async def record_user_interaction(
     Authenticated users only. Logs clicks, views, and reads to build
     user preference profiles for personalized recommendations.
     """
-    user_id = getattr(request.state, "user_id", "unknown")
+    user_id = request.state.user_id
     await record_interaction(
         user_id=user_id,
         article_id=event.article_id,
@@ -1113,7 +1113,7 @@ async def get_for_you(
     to surface relevant articles. Falls back to latest top stories for
     cold-start users with no history.
     """
-    user_id = getattr(request.state, "user_id", "unknown")
+    user_id = request.state.user_id
 
     if user_id == "unknown":
         articles = await get_latest_top_stories(limit)
