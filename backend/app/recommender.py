@@ -112,6 +112,7 @@ async def get_similar_articles(
         result = await client.query_points(
             collection_name=config.QDRANT_COLLECTION,
             query=int(article_id),  # Use point ID as query for nearest neighbors
+            using="dense",  # Collection uses a named 'dense' vector
             query_filter=qfilter,
             limit=limit * 3,  # Fetch more to apply filters/post-processing
             with_payload=True,
@@ -201,6 +202,7 @@ async def get_personalized_recommendations(
                     pts = await client.query_points(
                         collection_name=config.QDRANT_COLLECTION,
                         query=int(article_id),
+                        using="dense",  # Collection uses a named 'dense' vector
                         query_filter=qfilter,
                         limit=limit,
                         with_payload=True,
