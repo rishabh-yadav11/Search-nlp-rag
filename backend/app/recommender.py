@@ -118,7 +118,7 @@ async def get_similar_articles(
             with_vectors=False,
         )
 
-        return _format_articles(result.points, exclude_ids=[int(article_id)] + [int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and eid.isdigit()])
+        return _format_articles(result.points, exclude_ids=[int(article_id)] + [int(eid) for eid in exclude_ids if isinstance(eid, str) and eid.isdigit()])
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Error getting similar articles for %s: %s", article_id, exc)
@@ -236,17 +236,17 @@ async def get_personalized_recommendations(
                 if not trending:
                     return []
                 ids = [t["article_id"] for t in trending]
-                pts = await client.scroll(
+                pts, _ = await client.scroll(
                     collection_name=config.QDRANT_COLLECTION,
-                    limit=len(ids),
+                    limit=len(ids) * 5,
                     offset=None,
                     with_payload=True,
                     with_vectors=False,
-                    filter=qfilter,
+                    scroll_filter=qfilter,
                 )
-                # Match by ID
+                # Match by ID, preserving the trending score order
                 id_set = set(ids)
-                return [p for p in pts[0] if p.id in id_set]
+                return [p for p in pts if isinstance(p.id, int) and p.id in id_set][:len(ids)]
             except Exception:  # noqa: BLE001
                 return []
 

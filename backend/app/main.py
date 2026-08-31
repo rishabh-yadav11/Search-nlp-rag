@@ -1077,10 +1077,9 @@ async def get_similar(
     cached_key = f"recommend:similar:{article_id}:{limit}:{same_category}"
     cached = await cache.get(cached_key)
     if cached:
-        articles = [SourceArticle.model_validate(a) for a in cached]
         return SimilarArticlesResponse(
             article_id=article_id,
-            similar_articles=[_article_to_dict(a) for a in articles],
+            similar_articles=cached,
             limit=limit,
             cached=True,
         )
@@ -1091,7 +1090,7 @@ async def get_similar(
         same_category=same_category,
     )
     if articles:
-        await cache.set(cached_key, [a.model_dump() for a in articles], ttl=SIMILAR_ARTICLES_TTL_SECONDS)
+        await cache.set(cached_key, articles, ttl=SIMILAR_ARTICLES_TTL_SECONDS)
 
     return SimilarArticlesResponse(
         article_id=article_id,
@@ -1127,10 +1126,9 @@ async def get_for_you(
     cached_key = f"recommend:for-you:{user_id}:{limit}"
     cached = await cache.get(cached_key)
     if cached:
-        articles = [SourceArticle.model_validate(a) for a in cached]
         return RecommendationsResponse(
             user_id=user_id,
-            recommendations=[_article_to_dict(a) for a in articles],
+            recommendations=cached,
             limit=limit,
             cached=True,
         )
@@ -1146,7 +1144,7 @@ async def get_for_you(
 
     cold_start = len(interactions) == 0
     if articles:
-        await cache.set(cached_key, [a.model_dump() for a in articles], ttl=USER_RECOMMENDATIONS_TTL_SECONDS)
+        await cache.set(cached_key, articles, ttl=USER_RECOMMENDATIONS_TTL_SECONDS)
 
     return RecommendationsResponse(
         user_id=user_id,
@@ -1167,13 +1165,11 @@ async def get_trending(
     Queries Redis for recent interaction counts and returns the most
     engaged-with articles from the configured time window.
     """
-    start = time.perf_counter()  # noqa: F841
     cached_key = f"recommend:trending:{limit}"
     cached = await cache.get(cached_key)
     if cached:
-        articles = [SourceArticle.model_validate(a) for a in cached]
         return TrendingResponse(
-            articles=[_article_to_dict(a) for a in articles],
+            articles=cached,
             limit=limit,
             window_days=config.TRENDING_VELOCITY_WINDOW_DAYS,
         )
