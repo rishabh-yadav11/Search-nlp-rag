@@ -725,6 +725,63 @@ async def retrieve_and_rerank(
     return reranked
 
 
+async def retrieve_with_auto_facet_fallback(
+    retrieval_q: str,
+    top_k: int,
+    *,
+    industry: str | None,
+    dealtype: str | None,
+    author: str | None,
+    eff_from: str | None,
+    eff_to: str | None,
+    auto_industry: str | None,
+    auto_dealtype: str | None,
+    need_body: bool = False,
+) -> tuple[list[SourceArticle], str | None, str | None]:
+    """Retrieve with the effective (explicit-or-auto) category facets applied,
+    and fall back to dropping an *auto* facet when it zeroes out an otherwise
+    valid query. Returns ``(results, final_industry, final_dealtype)`` where the
+    final facets reflect any fallback, so callers can key caches/notes on what
+    was actually retrieved.
+
+    ``industry``/``dealtype`` are the caller-supplied (explicit) facets; when one
+    is None the matching ``auto_*`` value is used instead. An auto facet is a
+    *semantic* guess mapped onto the corpus's tag vocabulary (e.g. 'edtech' ->
+    the 'Education' industry facet). When the corpus tags most of those articles
+    differently (VCCircle tags edtech articles 'TMT', not 'Education'), the
+    exact-match industry filter combined with a date window returns nothing and
+    silently kills the query. Only an *empty* result set triggers the retry (the
+    empty attempt is not cached), and only the auto facets are dropped: an
+    explicit user-supplied facet and the date window always stay, so a genuinely
+    empty corpus still reports an honest "no results".
+
+    The fallback is deliberately bounded: it fires only when the first retrieval
+    returned nothing AND an auto facet is present, and the retry itself re-runs
+    retrieval (so a transient miss that then succeeds simply restores the good
+    path). The only cost of a double-transient miss is that the auto facet is
+    relaxed into a broader result — a graceful degradation, never a crash or
+    fabricated data. All auto facets are dropped together (rather than probing
+    each alone): dropping any one of them is a relaxation of the same semantic
+    guess, and the broader set is the safer answer for a query that otherwise
+    would have returned nothing.
+    """
+    eff_industry = industry or auto_industry
+    eff_dealtype = dealtype or auto_dealtype
+    qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to)
+    results = await retrieve_and_rerank(retrieval_q, top_k, qfilter, need_body=need_body)
+    if results or not (auto_industry or auto_dealtype):
+        return results, eff_industry, eff_dealtype
+    # An auto facet zeroed the set: drop each auto facet that wasn't explicitly
+    # supplied (an explicit facet is never dropped) and retry once.
+    relaxed_industry = eff_industry if not (auto_industry and industry is None) else None
+    relaxed_dealtype = eff_dealtype if not (auto_dealtype and dealtype is None) else None
+    relaxed = build_facet_filter(relaxed_industry, relaxed_dealtype, author, eff_from, eff_to)
+    if relaxed == qfilter:
+        return results, eff_industry, eff_dealtype
+    relaxed_results = await retrieve_and_rerank(retrieval_q, top_k, relaxed, need_body=need_body)
+    return relaxed_results, relaxed_industry, relaxed_dealtype
+
+
 @app.get("/search", response_model=SearchResponse)
 async def search(
     q: str = Query(..., min_length=1),
@@ -739,7 +796,10 @@ async def search(
     q_fixed, _ = fix_query(q)
     retrieval_q, eff_from, eff_to, auto_dealtype, auto_industry = _effective_intent(q_fixed, from_date, to_date)
     # Auto-extracted category facets fill in only when the caller didn't pass an
-    # explicit facet, so the UI filter (and /search callers) always win.
+    # explicit facet, so the UI filter (and /search callers) always win. The raw
+    # explicit params are kept apart so the auto-facet fallback can tell whether
+    # a facet was user-supplied (never dropped) or auto-derived (droppable).
+    explicit_industry, explicit_dealtype = industry, dealtype
     dealtype = dealtype or auto_dealtype
     industry = industry or auto_industry
     # NOTE: query expansion happens exactly once inside retrieve_and_rerank ->
@@ -757,11 +817,17 @@ async def search(
         return SearchResponse(query=q, results=summaries, cached=True,
                               latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
-    qfilter = build_facet_filter(industry, dealtype, author, eff_from, eff_to)
     # Rerank on the retrieval query (date words stripped, natural phrasing kept),
     # matching chat which already passes the same query — otherwise the raw phrase
     # with month/year tokens dilutes the cross-encoder and weak scores slip through.
-    reranked = await retrieve_and_rerank(retrieval_q, eff_top_k, qfilter)
+    # The effective industry/dealtype may relax below if an auto facet zeroed the
+    # result set; cache/note on the facets actually retrieved.
+    reranked, final_industry, final_dealtype = await retrieve_with_auto_facet_fallback(
+        retrieval_q, eff_top_k,
+        industry=explicit_industry, dealtype=explicit_dealtype, author=author,
+        eff_from=eff_from, eff_to=eff_to,
+        auto_industry=auto_industry, auto_dealtype=auto_dealtype,
+    )
     if config.ENABLE_CLICK_BOOST:
         reranked = await apply_click_boost(q_fixed, reranked)
     if config.ENABLE_DIVERSITY:
@@ -771,9 +837,17 @@ async def search(
     note = weak_results_note([r.score for r in results], date_label(eff_from, eff_to))
     # Same empty-set guard as retrieve_and_rerank: an empty result set is never
     # cached, so a transient miss can't be replayed as "no results" for the
-    # whole TTL. Non-empty sets are cached as before.
-    if results:
+    # whole TTL. Non-empty sets are cached as before — except when the auto
+    # facet fallback relaxed the effective filter: those results are correct
+    # but their cache key (which still names the auto facet) would collide with
+    # an explicit-facet request, so the /search cache is skipped for them (the
+    # retrieve_and_rerank cache, keyed by the actual filter, still applies).
+    fell_back = final_industry != industry or final_dealtype != dealtype
+    if results and not fell_back:
         await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
+    # `filtered` (computed above from the effective facets) is used unchanged so
+    # the cache-hit and cache-miss paths report the same semantics: the user's
+    # query intent carried the facet even when the fallback relaxed it out.
     await record_search(q, len(results), bool(note), cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
     return SearchResponse(query=q, results=[to_summary(r) for r in results], cached=False,
