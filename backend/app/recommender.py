@@ -361,42 +361,37 @@ async def get_trending_feed(
             # Fallback to latest articles
             return await _get_latest_top_stories(limit, exclude_ids)
 
-        # Fetch full article details from Qdrant
+        # Fetch full article details from Qdrant by their point IDs.
         ids = [t["article_id"] for t in trending]
-        pts, _ = await client.scroll(
+        points = await client.retrieve(
             collection_name=config.QDRANT_COLLECTION,
-            limit=len(ids),
+            ids=ids,
             with_payload=True,
             with_vectors=False,
         )
 
-        # Build score lookup
         score_lookup = {t["article_id"]: t["score"] for t in trending}
-
-        # Filter and format
         result = []
-        for point in pts:
+        for point in points:
             pid = point.id
-            if pid in exclude_ids:
+            if pid in exclude_ids or pid not in score_lookup:
                 continue
-            if pid in score_lookup:
-                payload = point.payload or {}
-                result.append({
-                    "id": pid,
-                    "title": payload.get("title", ""),
-                    "url": payload.get("url", ""),
-                    "published_date": payload.get("published_date"),
-                    "category": payload.get("category"),
-                    "summary": payload.get("summary", ""),
-                    "author_names": payload.get("author_names", []),
-                    "industry_names": payload.get("industry_names", []),
-                    "dealtype_names": payload.get("dealtype_names", []),
-                    "score": score_lookup[pid],
-                })
-            if len(result) >= limit:
-                break
+            payload = point.payload or {}
+            result.append({
+                "id": pid,
+                "title": payload.get("title", ""),
+                "url": payload.get("url", ""),
+                "published_date": payload.get("published_date"),
+                "category": payload.get("category"),
+                "summary": payload.get("summary", ""),
+                "author_names": payload.get("author_names", []),
+                "industry_names": payload.get("industry_names", []),
+                "dealtype_names": payload.get("dealtype_names", []),
+                "score": score_lookup[pid],
+            })
 
-        return result
+        result.sort(key=lambda article: article["score"], reverse=True)
+        return result[:limit]
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Error getting trending feed: %s", exc)

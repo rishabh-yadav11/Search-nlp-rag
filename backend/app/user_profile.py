@@ -73,9 +73,8 @@ async def record_interaction(
         # Update article-level interaction counts (for future popularity scoring)
         article_key = f"article:interactions:{article_id}"
         pipe.hincrby(article_key, interaction_type, 1)
-        pipe.hset(f"article:interactions:{article_id}:last", value=str(now))
+        pipe.hset(article_key, "last_timestamp", str(now))
         pipe.expire(article_key, config.USER_INTERACTION_TTL_DAYS * 86400)
-        pipe.expire(f"article:interactions:{article_id}:last", config.USER_INTERACTION_TTL_DAYS * 86400)
 
         await pipe.execute()
     except Exception as exc:  # noqa: BLE001
