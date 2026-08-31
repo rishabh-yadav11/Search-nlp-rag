@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
+import SimilarArticles from './components/SimilarArticles'
 import {
   AuthUser,
   authHeaders,
@@ -328,6 +329,9 @@ export default function Page() {
           <nav className="topbar-nav" aria-label="Primary">
             <Link href="/" className="topbar-nav-link active">
               Search
+            </Link>
+            <Link href="/for-you" className="topbar-nav-link">
+              For You
             </Link>
             <Link href="/chat" className="topbar-nav-link">
               Chat
@@ -702,6 +706,7 @@ function renderResults(items: Result[], query: string) {
                 {industries ? <span className="facet">◆ {industries}</span> : null}
                 {dealtypes ? <span className="facet">● {dealtypes}</span> : null}
               </div>
+              <SimilarArticles articleId={r.id} limit={3} compact />
             </div>
           </div>
         )
