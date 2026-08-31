@@ -7,6 +7,7 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
+import SimilarArticles from '../components/SimilarArticles'
 import { API_BASE, authHeaders, getToken, redirectToLogin } from '../lib/auth'
 
 type Source = {
@@ -159,6 +160,7 @@ function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
                     <span>{s.title || `Source ${s.id}`}</span>
                   )}
                   {s.published_date ? <span className="chat-sources-date">{s.published_date.slice(0, 10)}</span> : null}
+                  <SimilarArticles articleId={s.id} limit={3} compact />
                 </li>
               ))}
             </ol>
