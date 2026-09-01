@@ -9,6 +9,10 @@ from app.config import config
 
 logger = logging.getLogger("llm")
 
+# Upper bound (seconds) on a provider-supplied Retry-After wait so a huge or
+# malformed hint can never make a chat/SSE request hang instead of failing fast.
+MAX_BACKOFF_SECONDS = 60
+
 
 class LLMUnavailableError(Exception):
     """Raised when the LLM cannot be reached, after retries are exhausted."""
@@ -48,13 +52,18 @@ def _retry_after_seconds(exc: Exception) -> float | None:
     resp = getattr(exc, "response", None)
     if resp is None:
         return None
-    value = getattr(resp, "headers", {}).get("Retry-After") if resp is not None else None
+    headers = getattr(resp, "headers", None) or {}
+    value = headers.get("Retry-After")
     if not value:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
+        logger.debug("Unparseable Retry-After header %r; ignoring hint", value)
         return None
+    if parsed <= 0:
+        return None
+    return min(parsed, MAX_BACKOFF_SECONDS)
 
 
 def _is_retryable(exc: Exception) -> bool:
