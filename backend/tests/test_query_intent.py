@@ -12,6 +12,7 @@ from app.query_intent import (
     extract_list_topic,
     extract_month_range,
     extract_year_range,
+    is_aggregation_intent,
     month_query_topic,
     normalize_word_numbers,
     range_query_topic,
@@ -125,6 +126,22 @@ def test_suggested_top_k_default_and_none():
     assert suggested_top_k("leading funds") == 10
     assert suggested_top_k("latest news") is None
     assert suggested_top_k("") is None
+
+
+def test_suggested_top_k_superlative_default():
+    assert suggested_top_k("biggest funding rounds") == 10
+    assert suggested_top_k("highest valued startups") == 10
+    assert suggested_top_k("most active investors") == 10
+
+
+def test_is_aggregation_intent():
+    assert is_aggregation_intent("top 5 deals")
+    assert is_aggregation_intent("biggest funding rounds in 2025")
+    assert is_aggregation_intent("most active investors")
+    assert is_aggregation_intent("highest valued startups this year")
+    assert not is_aggregation_intent("latest news")
+    assert not is_aggregation_intent("who invested in Ola Electric")
+    assert not is_aggregation_intent("most of the time the market is up")
 
 
 def test_rewrite_top_deals_in_year():

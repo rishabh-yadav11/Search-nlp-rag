@@ -82,6 +82,20 @@ _TOP_N_RE = re.compile(
 )
 _TOP_HINT_RE = re.compile(r"\b(best|leading|biggest|largest|top)\b", re.IGNORECASE)
 _DEFAULT_LIST_K = 10
+# Superlative/aggregation hints beyond the plain list words. These signal the
+# user wants a ranked/aggregated answer over many items ("biggest funding
+# rounds", "highest valued startups", "most active investors") rather than a
+# single fact. "most" only counts when it precedes an aggregation noun
+# (active/funded/valued/...): bare "most" is far too common ("most of the time").
+_SUPERLATIVE_ALT = r"biggest|largest|highest|greatest|maximum|smallest|lowest|least"
+_AGG_NOUN_ALT = (
+    r"active|funded|funding|invested|investing|investments?|valuable|valued|"
+    r"profitable|raised|successful|mentioned|cited|covered|popular|influential|"
+    r"deal(s|making)?|acquisitive"
+)
+_SUPERLATIVE_RE = re.compile(
+    rf"\b({_SUPERLATIVE_ALT})\b|\bmost\s+({_AGG_NOUN_ALT})\b", re.IGNORECASE
+)
 # Filler/time words dropped when extracting a bare topic from a query
 _NOISE_WORDS_RE = re.compile(
     r"\bof\b|\bin\b|\bfor\b|\bto\b|\bmonth\b|\bmonths\b|\byear\b|\byears\b|\bflashback\b",
@@ -441,15 +455,33 @@ def normalize_word_numbers(query: str) -> str:
 def suggested_top_k(query: str) -> int | None:
     """Suggested top_k from a 'top N' in the query (digit or word form, e.g.
     'top ten'), or a small default for a generic top/best intent without a
-    number. None when no list intent."""
+    number. Also defaults for a superlative/aggregation intent ('biggest
+    funding rounds', 'most active investors') so chat fetches enough articles
+    to aggregate into a ranked list. None when no list intent."""
     m = _TOP_N_RE.search(query)
     if m:
         n = _top_n_to_int(m.group(2))
         if n is not None:
             return n
-    if _TOP_HINT_RE.search(query):
+    if _TOP_HINT_RE.search(query) or _is_superlative(query):
         return _DEFAULT_LIST_K
     return None
+
+
+def _is_superlative(query: str) -> bool:
+    """True when the query uses a superlative/aggregation phrase ('biggest',
+    'highest', 'most active'), independent of any explicit 'top N' count."""
+    return bool(_SUPERLATIVE_RE.search(query))
+
+
+def is_aggregation_intent(query: str) -> bool:
+    """True when the query asks for a ranked/aggregated answer over many items
+    (a 'top N' count, a top/best/leading hint, or a superlative like 'biggest
+    funding rounds' / 'most active investors'), so chat must present a ranked
+    top-N with the metric that justifies the ordering rather than isolated
+    single items. Used to widen the retrieved source set and to trigger the
+    ranked-list prompt and refusal nudge."""
+    return suggested_top_k(query) is not None or _is_superlative(query)
 
 
 def _strip_time_tokens(text: str) -> str:
@@ -560,3 +592,73 @@ def _strip_noise_words(query: str) -> str | None:
     q = _strip_time_tokens(query)
     q = re.sub(r"[\s-]+", " ", q).strip()
     return q or None
+
+
+# Comparison cues: a question that names two entities and asks to weigh them
+# against each other ("X vs Y", "compare A and B", "difference between A and B").
+_COMPARE_RE = re.compile(
+    r"\b(versus|vs\.?|compare|compared to|compared with|"
+    r"differences? between|contrast|how do(?:es)? .* compare)\b",
+    re.IGNORECASE,
+)
+# Intersection cues: a question that wants what is shared across entities
+# ("companies backed by both A and B", "deals with all of A, B and C").
+_BOTH_AND_RE = re.compile(r"\bboth\b.+?\band\b", re.IGNORECASE)
+_ALL_OF_RE = re.compile(r"\ball (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
+
+
+def _strip_entities(text: str, entities: list[str]) -> str:
+    """Remove each entity mention (word-bounded, case-insensitive) from ``text``."""
+    s = text
+    for e in entities:
+        s = re.sub(rf"\b{re.escape(e)}\b", " ", s, flags=re.IGNORECASE)
+    return s
+
+
+def _multi_entity_scaffold(query: str, entities: list[str]) -> str:
+    """The topical remainder of a multi-entity query once the entity names and
+    the comparison/intersection connectives are removed, e.g. 'compare funding of
+    SoftBank and Tiger Global' -> 'funding'. Used to build a per-entity retrieval
+    query that keeps the topic while swapping in a single entity."""
+    from app.rerank_boost import extract_entities
+
+    s = _strip_entities(query.lower(), entities)
+    s = _COMPARE_RE.sub(" ", s)
+    s = _BOTH_AND_RE.sub(" ", s)
+    s = _ALL_OF_RE.sub(" ", s)
+    s = re.sub(r"\b(?:both|all|and|with|the|of|for|to|in|by|from|between)\b", " ", s)
+    s = re.sub(r"[\s-]+", " ", s).strip()
+    return s or extract_entities(query)[0] if entities else ""
+
+
+class MultiEntityQuery:
+    """A query that spans two or more entities, either as a comparison (weigh
+    entities against each other) or an intersection (what is shared across all of
+    them). ``entities`` are the extracted proper nouns; ``scaffold`` is the
+    topic left after stripping the entities and connectives, used to build a
+    per-entity retrieval query."""
+
+    def __init__(self, mode: str, entities: list[str], scaffold: str):
+        self.mode = mode
+        self.entities = entities
+        self.scaffold = scaffold
+
+
+def detect_multi_entity(query: str) -> MultiEntityQuery | None:
+    """Detect a comparison or intersection query over two or more entities.
+
+    Returns a :class:`MultiEntityQuery` when the query both names at least two
+    entities AND carries a comparison or intersection cue, else None. Single-entity
+    queries (the default path) return None so the caller's normal retrieval runs."""
+    from app.rerank_boost import extract_entities
+
+    entities = extract_entities(query)
+    if len(entities) < 2:
+        return None
+    is_intersection = bool(_BOTH_AND_RE.search(query) or _ALL_OF_RE.search(query))
+    is_comparison = bool(_COMPARE_RE.search(query))
+    if not (is_intersection or is_comparison):
+        return None
+    mode = "intersection" if is_intersection else "comparison"
+    scaffold = _multi_entity_scaffold(query, entities)
+    return MultiEntityQuery(mode=mode, entities=entities, scaffold=scaffold)
