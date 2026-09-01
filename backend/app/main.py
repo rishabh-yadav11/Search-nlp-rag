@@ -50,6 +50,7 @@ from app.query_intent import (
     normalize_word_numbers,
     range_query_topic,
     rewrite_year_in_review,
+    strip_recency_intent,
     strip_recency_window,
     suggested_top_k,
 )
@@ -427,12 +428,22 @@ def _effective_intent(
     # Rolling recency windows ('this week', 'today') resolve to a recent date
     # range so the filter drops old evergreen articles; the window words are
     # stripped from the retrieval query because the date filter already scopes it.
+    # Soft recency terms ('latest', 'recent') are also stripped so they don't
+    # dilute the embedding match — but the recency intent itself is still detected
+    # on the original query (is_recency_intent) for ranking weight.
     rng = extract_recency_range(q)
     if rng:
-        cleaned = strip_recency_window(q)
+        cleaned = strip_recency_intent(strip_recency_window(q))
         if cleaned:
             retrieval_q = cleaned
         return retrieval_q, rng[0], rng[1], dealtype, industry
+    # Soft recency-intent queries (no hard window) still have their recency terms
+    # removed from the retrieval text for the same relevance reason, while the
+    # ranking weight derived from is_recency_intent is preserved.
+    if is_recency_intent(q):
+        cleaned = strip_recency_intent(retrieval_q)
+        if cleaned:
+            retrieval_q = cleaned
     return retrieval_q, from_date, to_date, dealtype, industry
 
 
@@ -644,8 +655,9 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
 
 
 # Stronger recency weighting applied when the query expresses a recency intent
-# ('latest', 'recent', 'this week'), so old evergreen articles are pushed below
-# newer ones instead of surfacing on relevance alone.
+# ('latest', 'recent', 'fresh'), so old evergreen articles are pushed below
+# newer ones instead of surfacing on relevance alone. Hard-window phrases
+# ('this week') are filtered separately and are not part of this boost.
 RECENCY_BOOST_STRENGTH = 0.85
 RECENCY_BOOST_DECAY_DAYS = 30.0
 
