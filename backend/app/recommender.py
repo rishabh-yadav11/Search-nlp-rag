@@ -14,8 +14,10 @@ Architecture:
   - Post-processing applies diversity and exclusion filters
 """
 import asyncio
+import copy
 import logging
 import math
+import re
 from datetime import UTC, datetime
 
 from qdrant_client.models import (
@@ -26,6 +28,7 @@ from qdrant_client.models import (
 )
 
 from app.config import config
+from app.rerank_boost import extract_entities
 from app.user_profile import (
     get_trending_articles,
     get_user_interactions,
@@ -510,3 +513,92 @@ def _format_articles(
 
 # Module-level state reference (set during app startup from main.state)
 state: dict = {}
+
+
+# Acquisition relation-direction reranking. When a query names a company in a
+# specific acquisition role (target vs buyer), results where that company plays
+# the WRONG role (e.g. X as the acquirer in a "who acquired X?" query) are
+# demoted and results where it plays the RIGHT role are promoted. This keeps
+# "who acquired X?" from surfacing articles where X itself did the buying.
+_ACQ_ROLE_VERB_RE = re.compile(
+    r"\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b", re.IGNORECASE
+)
+
+
+def _entity_acquisition_role(text: str, entity: str) -> bool | None:
+    """Whether ``entity`` is the acquirer (True) or the acquired/target (False)
+    in ``text``, or None when the text states no clear relation.
+
+    "X acquired Y" / "X bought Y" -> X is the acquirer (True). "Y acquired X" /
+    "X was acquired by Y" -> X is the target (False). Target (passive) forms are
+    tested first so the passive "X was acquired by Y" is not mistaken for an
+    active acquirer mention.
+    """
+    e = re.escape(entity)
+    if re.search(
+        rf"\b{e}\b[^.?!]*?\b(?:was|were|is|are|been|be)\b[^.?!]*?\b"
+        rf"(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b",
+        text, re.IGNORECASE,
+    ):
+        return False
+    if re.search(
+        rf"\b{e}\b[^.?!]*?\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b",
+        text, re.IGNORECASE,
+    ):
+        return False
+    if re.search(
+        rf"\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b[^.?!]*?\b{e}\b",
+        text, re.IGNORECASE,
+    ):
+        return False
+    if re.search(
+        rf"\b{e}\b[^.?!]*?\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b",
+        text, re.IGNORECASE,
+    ):
+        return True
+    return None
+
+
+def rerank_acquisition_relation(query: str, results: list, direction: str | None = None) -> list:
+    """Re-rank ``results`` by acquisition relation direction.
+
+    ``direction`` comes from ``query_intent.acquisition_relation``: ``'target'``
+    means the query's company was acquired (so articles where it is the buyer are
+    demoted), ``'buyer'`` means it did the acquiring (so articles where it is the
+    target are demoted). Returns an unchanged copy when ``direction`` is None or
+    no entity can be identified. Inputs are never mutated.
+    """
+    if not direction:
+        return list(results)
+    entities = extract_entities(query)
+    if not entities:
+        return list(results)
+
+    PROMOTE, DEMOTE = 1.30, 0.70
+    scored: list[tuple[float, object]] = []
+    for r in results:
+        title = getattr(r, "title", "") or ""
+        summary = getattr(r, "summary", "") or ""
+        text = f"{title}. {summary}"
+        role = None
+        for e in entities:
+            role = _entity_acquisition_role(text, e)
+            if role is not None:
+                break
+        if role is None:
+            new_score = r.score
+        elif direction == "target" and role is False:
+            new_score = r.score * PROMOTE
+        elif direction == "target" and role is True:
+            new_score = r.score * DEMOTE
+        elif direction == "buyer" and role is True:
+            new_score = r.score * PROMOTE
+        elif direction == "buyer" and role is False:
+            new_score = r.score * DEMOTE
+        else:
+            new_score = r.score
+        clone = copy.copy(r)
+        clone.score = new_score
+        scored.append((new_score, clone))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [clone for _, clone in scored]
