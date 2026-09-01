@@ -141,6 +141,14 @@ def _req(url: str, payload: dict | None = None, method: str | None = None, timeo
         raise ApiError(exc.code, body) from exc
 
 
+def _delete(url: str) -> None:
+    """DELETE that never fails on a 2xx response with an empty/non-JSON body."""
+    try:
+        _req(url, method="DELETE")
+    except json.JSONDecodeError:
+        pass
+
+
 class ResultStore:
     """Rewrites the whole JSON document after each prompt so a long run can be
     interrupted at any point without losing earlier results."""
@@ -227,6 +235,10 @@ def run_search_suite(prompts: list[dict], start: int, limit: int | None) -> str:
 
 
 def run_chat_suite(prompts: list[dict], start: int, limit: int | None) -> str:
+    if not SERVICE_TOKEN:
+        raise SystemExit(
+            "AUTH_SERVICE_TOKEN missing from backend/.env — chat turns would all 401; aborting before any calls."
+        )
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     meta = {
         "suite": "chat",
@@ -282,7 +294,7 @@ def run_chat_suite(prompts: list[dict], start: int, limit: int | None) -> str:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             # Tolerate a degraded response shape: keep whatever arrived instead
             # of discarding a billed answer to a KeyError.
-            a = d.get("assistant") or {}
+            a = (d.get("assistant") or {}) if isinstance(d, dict) else {}
             answer = a.get("content")
             sources = a.get("sources") or []
             entry = {
@@ -311,7 +323,7 @@ def run_chat_suite(prompts: list[dict], start: int, limit: int | None) -> str:
             }
         finally:
             try:
-                _req(CHAT_BASE + f"/sessions/{sid}", method="DELETE")
+                _delete(CHAT_BASE + f"/sessions/{sid}")
             except Exception:
                 note_orphan()
         store.add(entry)
