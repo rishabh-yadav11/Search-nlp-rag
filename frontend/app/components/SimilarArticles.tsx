@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders } from '../lib/auth'
+import styles from './SimilarArticles.module.css'
 
 interface Article {
   id: number | string
@@ -63,7 +64,7 @@ export default function SimilarArticles({
 
   if (loading && articles.length === 0) {
     return compact ? (
-      <span className="similar-loading">Loading...</span>
+      <span className={styles['similar-loading']}>Loading...</span>
     ) : null
   }
 
@@ -79,20 +80,20 @@ export default function SimilarArticles({
 
   if (compact) {
     return (
-      <div className="similar-articles-compact">
-        <div className="similar-heading">Similar articles</div>
-        <div className="similar-list">
+        <div className={styles['similar-articles-compact']}>
+        <div className={styles['similar-heading']}>Similar articles</div>
+        <div className={styles['similar-list']}>
           {displayArticles.map((article) => (
             <Link
               key={article.id}
               href={article.url}
               target="_blank"
               rel="noopener noreferrer"
-              className="similar-item"
+              className={styles['similar-item']}
             >
-              <span className="similar-title">{article.title}</span>
+              <span className={styles['similar-title']}>{article.title}</span>
               {article.category && (
-                <span className="similar-category">{article.category}</span>
+                <span className={styles['similar-category']}>{article.category}</span>
               )}
             </Link>
           ))}
@@ -100,7 +101,7 @@ export default function SimilarArticles({
         {articles.length > 3 && (
           <button
             type="button"
-            className="similar-show-more"
+            className={styles['similar-show-more']}
             onClick={() => setExpanded((e) => !e)}
           >
             {expanded ? 'Show less' : `Show ${articles.length - 3} more`}
@@ -111,25 +112,25 @@ export default function SimilarArticles({
   }
 
   return (
-    <div className="similar-articles">
-      <div className="similar-heading">Similar articles</div>
-      <div className="similar-list">
+    <div className={styles['similar-articles']}>
+      <div className={styles['similar-heading']}>Similar articles</div>
+      <div className={styles['similar-list']}>
         {displayArticles.map((article) => (
           <Link
             key={article.id}
             href={article.url}
             target="_blank"
             rel="noopener noreferrer"
-            className="similar-card"
+            className={styles['similar-card']}
           >
-            <div className="similar-card-content">
-              <span className="similar-card-title">{article.title}</span>
+            <div className={styles['similar-card-content']}>
+              <span className={styles['similar-card-title']}>{article.title}</span>
               {article.summary && (
-                <p className="similar-card-summary">{article.summary}</p>
+                <p className={styles['similar-card-summary']}>{article.summary}</p>
               )}
-              <div className="similar-card-meta">
+              <div className={styles['similar-card-meta']}>
                 {article.category && (
-                  <span className="similar-card-category">{article.category}</span>
+                  <span className={styles['similar-card-category']}>{article.category}</span>
                 )}
                 {article.published_date && (
                   <span className="similar-card-date">
@@ -144,7 +145,7 @@ export default function SimilarArticles({
       {articles.length > 3 && (
         <button
           type="button"
-          className="similar-show-more"
+          className={styles['similar-show-more']}
           onClick={() => setExpanded((e) => !e)}
         >
           {expanded ? 'Show less' : `Show ${articles.length - 3} more`}
