@@ -1,0 +1,128 @@
+
+Tell me everything about Paytm brand.
+What is the latest news about Banyan Netfaqs Pvt Ltd?
+Show me the funding history of [Company Name].
+Who are the investors in [Company Name]?
+Who are the founders of [Company Name]?
+What is the business model of [Company Name]?
+How has [Company Name] grown over the last 3 years?
+What are the major acquisitions made by [Company Name]?
+Show me the latest financial performance of [Company Name].
+Who are the key competitors of [Company Name]?
+
+Funding & Startup Deals
+
+What are the latest startup funding deals in India?
+Show me startup funding deals announced this week.
+Which Indian startups raised more than $10 million recently?
+What were the biggest funding rounds this month?
+Show me all Series A funding deals in [year].
+Which startups recently raised seed funding?
+What are the largest Series B deals in India?
+Show me funding deals in the fintech sector.
+Show me startup investments in the AI sector.
+Which investors were most active this year?
+
+Private Equity
+
+What are the latest private equity deals in India?
+Show me the biggest PE investments this year.
+Which PE firms invested in Indian healthcare companies?
+Show me recent PE exits in India.
+What are the latest buyout deals?
+Which sectors attracted the most PE investment?
+Show me all investments by [PE Firm Name].
+What companies are in [PE Firm Name]'s portfolio?
+Which PE firms are investing in consumer businesses?
+Compare the investment activity of [PE Firm 1] and [PE Firm 2].
+
+Venture Capital
+
+Which VC firms are most active in India?
+Show me the latest investments by [VC Firm Name].
+What startups are backed by [VC Firm Name]?
+Which VCs are investing in AI startups?
+Which investors are backing fintech startups?
+Show me the top VC funding rounds this year.
+Which VC firms invested in SaaS companies recently?
+Find startups backed by both [Investor 1] and [Investor 2].
+Which new VC funds were launched recently?
+What are the latest fundraising activities by Indian VC firms?
+
+Mergers & Acquisitions
+
+What are the latest M&A deals in India?
+Show me the biggest acquisitions this year.
+Which companies were acquired recently?
+Show me M&A deals in the technology sector.
+What are the latest cross-border acquisitions involving Indian companies?
+Which startups were acquired recently?
+Show me all acquisitions made by [Company Name].
+Who acquired [Company Name]?
+Compare M&A activity across different sectors.
+What are the biggest M&A trends in India?
+
+Sector Analysis
+
+What are the latest trends in Indian fintech?
+How is the Indian startup ecosystem performing?
+What is happening in India's healthcare sector?
+Show me the latest developments in the EV industry.
+What are the biggest trends in artificial intelligence in India?
+Which sectors are attracting the most investment?
+Show me the latest news from the edtech sector.
+How is India's real estate sector performing?
+What is the outlook for the consumer internet sector?
+Which sectors are seeing the highest deal activity?
+
+Industry-Specific Questions
+
+Show me the top investments in Indian SaaS companies.
+What are the latest deals in the renewable energy sector?
+Which companies are leading India's EV ecosystem?
+Show me recent investments in D2C brands.
+What is the latest funding activity in agritech?
+Show me deals in the logistics and supply chain sector.
+Which healthcare startups raised funding recently?
+What are the latest developments in India's semiconductor industry?
+Show me investments in climate-tech companies.
+Which quick-commerce companies are attracting investors?
+
+People & Leadership
+
+Tell me about [Person Name].
+What companies has [Person Name] founded or invested in?
+Show me recent news involving [Person Name].
+Who are the most active startup investors in India?
+Which founders raised the most capital recently?
+Show me the latest CEO appointments.
+Who recently joined the leadership team of [Company Name]?
+Which business leaders are making headlines this month?
+Show me interviews with [Person Name].
+What are the latest career moves of senior executives?
+
+Trends & Market Intelligence
+
+What were the biggest business stories this week?
+Summarize today's most important VCCircle news.
+What business trends should investors watch right now?
+Compare startup funding this year versus last year.
+Which sectors are gaining investor interest?
+What are the biggest investment themes for [year]?
+Identify emerging startups to watch.
+What are the major challenges facing Indian startups?
+Which companies are preparing for an IPO?
+What are the biggest exits expected in the Indian startup ecosystem?
+
+Search, Analysis & Custom Queries
+
+Summarize everything VCCircle has reported about [Company Name].
+Give me a timeline of major events involving [Company Name].
+Compare [Company 1] vs [Company 2].
+What are the top 5 stories about [Sector]?
+Find all recent articles about [Topic].
+Summarize the key insights from recent articles on [Topic].
+What has changed in [Sector] over the last 12 months?
+Give me an investor's view of [Company/Sector] based on VCCircle coverage.
+What should I know about [Company/Sector] before making an investment decision?
+What are the most important business developments I may have missed this week?
