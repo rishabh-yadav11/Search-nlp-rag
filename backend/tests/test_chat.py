@@ -28,6 +28,20 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _stub_temporal_date_window(monkeypatch):
+    """retrieve_by_date_window needs a live Qdrant client (state['qdrant']); chat
+    unit tests stub retrieval at retrieve_and_rerank and do not stand up Qdrant,
+    so neutralize the temporal fallback here. The fallback itself is exercised by
+    the date-window retrieval path, not by these chat unit tests."""
+    from app import main as _main
+
+    async def _noop(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(_main, "retrieve_by_date_window", _noop)
+
+
 def _store(tmp_path):
     s = ChatStore(str(tmp_path / "chat.db"))
     _run(s.connect())
