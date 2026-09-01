@@ -149,12 +149,16 @@ _BRAND_RE = re.compile(r"\b(?:" + "|".join(re.escape(b) for b in _NORMALIZED_BRA
 
 def _strip_entity_phrase(phrase: str) -> str:
     """Normalize a multi-word capitalized run into one entity: lowercased, with
-    trailing legal-entity suffixes and generic tail nouns removed. Returns "" when
-    the run is empty or consists solely of generic nouns."""
+    leading/trailing legal-entity suffixes and generic nouns removed. Returns ""
+    when the run is empty, consists solely of generic nouns/suffixes, or is left
+    with only a bare generic/suffix token after stripping (which would otherwise
+    over-boost unrelated articles)."""
     words = [_normalize(w) for w in phrase.split()]
     while len(words) > 1 and (words[-1] in _GENERIC_NOUNS or words[-1] in _ENTITY_SUFFIXES):
         words.pop()
-    if not words or all(w in _GENERIC_NOUNS for w in words):
+    while len(words) > 1 and (words[0] in _GENERIC_NOUNS or words[0] in _ENTITY_SUFFIXES):
+        words.pop(0)
+    if not words or all(w in _GENERIC_NOUNS or w in _ENTITY_SUFFIXES for w in words):
         return ""
     return " ".join(words)
 
@@ -223,12 +227,15 @@ def apply_entity_boost(q: str, results: list) -> list:
     for r in results:
         title = _normalize(r.title or "")
         summary = _normalize(getattr(r, "summary", "") or "")
+        score = getattr(r, "score", None)
+        if score is None:
+            score = 0.0
         if _matches(title):
-            new_score = r.score * BOOST_TITLE
+            new_score = score * BOOST_TITLE
         elif _matches(summary):
-            new_score = r.score * BOOST_SUMMARY
+            new_score = score * BOOST_SUMMARY
         else:
-            new_score = r.score
+            new_score = score
         clone = copy.copy(r)
         clone.score = new_score
         boosted.append((new_score, clone))
