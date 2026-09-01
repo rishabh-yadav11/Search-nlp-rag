@@ -24,8 +24,11 @@ def _api_conn():
     return openai.APIConnectionError(request=_req())
 
 
-def _rate_limit():
-    return openai.RateLimitError("rate limited", response=httpx.Response(429, request=_req()), body=None)
+def _rate_limit(retry_after=None):
+    headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+    return openai.RateLimitError(
+        "rate limited", response=httpx.Response(429, request=_req(), headers=headers), body=None
+    )
 
 
 def _server_error():
@@ -308,6 +311,37 @@ def test_stream_answer_exhausts_retries_before_first_chunk(monkeypatch):
     # Backoff has jitter: base*(2**attempt) + uniform(0, base*2**attempt*0.5).
     assert 0.5 <= slept[0] <= 0.75
     assert 1.0 <= slept[1] <= 1.5
+
+
+def test_generate_answer_honors_retry_after(monkeypatch):
+    monkeypatch.setattr(config, "LLM_MAX_RETRIES", 2)
+    monkeypatch.setattr(config, "LLM_RETRY_BACKOFF", 0.5)
+    slept = _record_sleep(monkeypatch)
+
+    client = _FakeClient(_FakeCompletions([_rate_limit(retry_after=3), _Resp(content="ok", prompt=3, completion=2)]))
+    result = _run(generate_answer(client, "P", "m"))
+
+    assert result.content == "ok"
+    assert client.chat.completions.calls == 2
+    # Retry-After (3s) must win over the base backoff (0.5s) + jitter (0..50%).
+    assert 3.0 <= slept[0] <= 4.5
+
+
+def test_stream_answer_honors_retry_after(monkeypatch):
+    monkeypatch.setattr(config, "LLM_MAX_RETRIES", 2)
+    monkeypatch.setattr(config, "LLM_RETRY_BACKOFF", 0.5)
+    slept = _record_sleep(monkeypatch)
+
+    def stream():
+        return _FakeStream(chunks=[_Chunk("Hel", 5, 2), _Chunk("lo", 3, 1)])
+
+    client = _FakeClient(_FakeCompletions([_rate_limit(retry_after=2), stream]))
+    holder = []
+    pieces = _run(_collect(stream_answer(client, "P", "m", holder)))
+
+    assert pieces == ["Hel", "lo"]
+    assert client.chat.completions.calls == 2
+    assert 2.0 <= slept[0] <= 3.0
 
 
 def test_stream_answer_without_usage_holder(monkeypatch):
