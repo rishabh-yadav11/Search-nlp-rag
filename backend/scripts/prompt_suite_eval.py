@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
@@ -32,9 +33,20 @@ load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"))
 
 PROMPTS_FILE = os.path.join(_BACKEND_DIR, "scripts", "prompt_suite_prompts.txt")
 RESULTS_DIR = os.path.join(_BACKEND_DIR, "data", "eval_results")
-SEARCH_BASE = "http://localhost:8001/search"
-CHAT_BASE = "http://localhost:8001/api/chat"
+# Loopback defaults; overridable because the eval box may expose other ports.
+SEARCH_BASE = os.getenv("EVAL_SEARCH_BASE", "http://localhost:8001/search")
+CHAT_BASE = os.getenv("EVAL_CHAT_BASE", "http://localhost:8001/api/chat")
 SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
+
+
+class ApiError(Exception):
+    """HTTP failure with the response body preserved for diagnosis."""
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"HTTP {status}: {body[:500]}")
+        self.status = status
+        self.body = body
+
 
 # Deterministic placeholder substitutions so every templated prompt runs against
 # a concrete entity VCCircle covers. Rotations spread different entities across
@@ -119,8 +131,14 @@ def _req(url: str, payload: dict | None = None, method: str | None = None, timeo
     req = urllib.request.Request(
         url, data=data, method=method or ("POST" if payload is not None else "GET"), headers=headers
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.load(resp)
+    # Direct loopback opener: never route the service token through env proxies.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise ApiError(exc.code, body) from exc
 
 
 class ResultStore:
@@ -144,12 +162,20 @@ class ResultStore:
         os.replace(tmp, self.path)
 
 
+def _results_filename(ts: str, suite: str) -> str:
+    return os.path.join(RESULTS_DIR, f"prompt_suite_{ts}_{os.getpid()}_{suite}.json")
+
+
 def run_search_suite(prompts: list[dict], start: int, limit: int | None) -> str:
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    store = ResultStore(
-        os.path.join(RESULTS_DIR, f"prompt_suite_{ts}_search.json"),
-        {"suite": "search", "endpoint": "/search", "started_utc": ts, "total_prompts": len(prompts)},
-    )
+    meta = {
+        "suite": "search",
+        "endpoint": "/search",
+        "started_utc": ts,
+        "total_prompts": len(prompts),
+        "resumed_from": start if start > 1 else None,
+    }
+    store = ResultStore(_results_filename(ts, "search"), meta)
     for p in prompts:
         if p["id"] < start:
             continue
@@ -202,30 +228,72 @@ def run_search_suite(prompts: list[dict], start: int, limit: int | None) -> str:
 
 def run_chat_suite(prompts: list[dict], start: int, limit: int | None) -> str:
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    store = ResultStore(
-        os.path.join(RESULTS_DIR, f"prompt_suite_{ts}_chat.json"),
-        {"suite": "chat", "endpoint": "/api/chat", "started_utc": ts, "total_prompts": len(prompts)},
-    )
+    meta = {
+        "suite": "chat",
+        "endpoint": "/api/chat",
+        "started_utc": ts,
+        "total_prompts": len(prompts),
+        "resumed_from": start if start > 1 else None,
+        "orphan_session_risk": 0,
+    }
+    store = ResultStore(_results_filename(ts, "chat"), meta)
+
+    def note_orphan() -> None:
+        meta["orphan_session_risk"] += 1
+        print("WARN: failed to delete eval chat session (orphan risk)", flush=True)
+
     for p in prompts:
         if p["id"] < start:
             continue
         if limit is not None and p["id"] >= start + limit:
             break
         sid = None
+        try:
+            sid = _req(CHAT_BASE + "/sessions", {"title": "prompt-suite-eval"}).get("id")
+        except Exception as exc:  # session create failed; nothing billed yet
+            store.add(
+                {
+                    **p,
+                    "ok": False,
+                    "error": f"session create failed: {exc!r}",
+                    "answer": None,
+                    "sources": [],
+                    "latency_ms": 0,
+                }
+            )
+            print(f"[{p['id']:>3}/{len(prompts)}] chat ERROR session-create :: {p['prompt'][:80]}")
+            continue
+        if sid is None:
+            note_orphan()
+            store.add(
+                {
+                    **p,
+                    "ok": False,
+                    "error": "session create response missing id",
+                    "answer": None,
+                    "sources": [],
+                    "latency_ms": 0,
+                }
+            )
+            continue
         t0 = time.perf_counter()
         try:
-            sid = _req(CHAT_BASE + "/sessions", {"title": "prompt-suite-eval"})["id"]
             d = _req(CHAT_BASE + f"/sessions/{sid}/messages", {"content": p["prompt"]})
             elapsed_ms = (time.perf_counter() - t0) * 1000
-            a = d["assistant"]
+            # Tolerate a degraded response shape: keep whatever arrived instead
+            # of discarding a billed answer to a KeyError.
+            a = d.get("assistant") or {}
+            answer = a.get("content")
+            sources = a.get("sources") or []
             entry = {
                 **p,
-                "ok": True,
-                "error": None,
-                "answer": a.get("content"),
-                "sources": a.get("sources", []),
+                "ok": answer is not None,
+                "error": None if answer is not None else "assistant message missing from response",
+                "raw_response": None if answer is not None else d,
+                "answer": answer,
+                "sources": sources,
                 "note": d.get("note") or a.get("note"),
-                "n_sources": len(a.get("sources", [])),
+                "n_sources": len(sources),
                 "prompt_tokens": a.get("prompt_tokens"),
                 "completion_tokens": a.get("completion_tokens"),
                 "cost_inr": a.get("cost"),
@@ -242,11 +310,10 @@ def run_chat_suite(prompts: list[dict], start: int, limit: int | None) -> str:
                 "latency_ms": round((time.perf_counter() - t0) * 1000),
             }
         finally:
-            if sid is not None:
-                try:
-                    _req(CHAT_BASE + f"/sessions/{sid}", method="DELETE")
-                except Exception:  # noqa: S110 — cleanup is best-effort
-                    pass
+            try:
+                _req(CHAT_BASE + f"/sessions/{sid}", method="DELETE")
+            except Exception:
+                note_orphan()
         store.add(entry)
         status = "ok" if entry["ok"] else f"ERROR {entry['error']}"
         print(
@@ -258,20 +325,17 @@ def run_chat_suite(prompts: list[dict], start: int, limit: int | None) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--suite", choices=["search", "chat", "both"], default="both")
+    # Chat intentionally requires an explicit flag: every turn is a billed LLM
+    # call, so a bare invocation must never burn the daily budget.
+    ap.add_argument("--suite", choices=["search", "chat"], default="search")
     ap.add_argument("--start", type=int, default=1, help="first prompt id to run")
     ap.add_argument("--limit", type=int, default=None, help="how many prompts to run")
     args = ap.parse_args()
 
     prompts = load_prompts()
     print(f"loaded {len(prompts)} prompts; suite={args.suite} start={args.start} limit={args.limit}")
-    paths = []
-    if args.suite in ("search", "both"):
-        paths.append(run_search_suite(prompts, args.start, args.limit))
-    if args.suite in ("chat", "both"):
-        paths.append(run_chat_suite(prompts, args.start, args.limit))
-    for p in paths:
-        print("results:", p)
+    runner = run_search_suite if args.suite == "search" else run_chat_suite
+    print("results:", runner(prompts, args.start, args.limit))
 
 
 if __name__ == "__main__":
