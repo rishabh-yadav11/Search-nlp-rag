@@ -615,6 +615,8 @@ def _strip_entities(text: str, entities: list[str]) -> str:
     """Remove each entity mention (word-bounded, case-insensitive) from ``text``."""
     s = text
     for e in entities:
+        if not e:
+            continue
         s = re.sub(rf"\b{re.escape(e)}\b", " ", s, flags=re.IGNORECASE)
     return s
 
