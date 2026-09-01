@@ -29,7 +29,7 @@ from app.auth import require_auth, require_permission
 from app.config import config
 from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost, to_usd
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
-from app.query_intent import extract_year_range, suggested_top_k
+from app.query_intent import extract_year_range, is_aggregation_intent, suggested_top_k
 
 logger = logging.getLogger("chat")
 
@@ -1018,8 +1018,9 @@ def _is_ranking_refusal(text: str) -> bool:
 
 def _is_ranking_question(question: str) -> bool:
     """True for a ranked/numeric list question (a 'top N' or top/best/leading/
-    biggest/largest intent), for which a refusal must trigger a nudge retry."""
-    return suggested_top_k(question) is not None
+    biggest/largest intent, or any superlative/aggregation intent like 'most
+    active investors'), for which a refusal must trigger a nudge retry."""
+    return is_aggregation_intent(question)
 
 
 _RANKING_NUDGE = (
@@ -1215,6 +1216,18 @@ by whatever is known — prominence, size, or recency — and write "value not s
 value. A ranked list of the named items (even with every value "not stated") always beats a refusal.
 - This applies to EVERY ranked/numeric list question, not just IPOs: funding rounds, deals, M&A, \
 stake sales, companies, funds raised, hires — all of them.
+
+## Aggregation & superlative questions
+When asked a superlative/aggregation question (e.g. "biggest funding rounds", "most active \
+investors", "highest valued startups", "top 5 deals"), you must AGGREGATE ACROSS the articles you \
+were given, not describe them one by one as isolated items. Build a single ranked top-N list:
+- Combine the articles' evidence first: count appearances (for "most active"), compare the stated \
+metric (deal value, amount raised, valuation), or otherwise rank by whatever the articles support.
+- Present ONE ranked list (numbered or bulleted) where every entry shows the metric that justifies \
+its rank — e.g. "1. Investor X — led 7 deals", "2. Deal Y — $1.2B". Never leave the ranking \
+unexplained.
+- If the articles name fewer items than the implied top-N, list those and say you found fewer.
+- Cite the article number(s) for each entry. Never invent an item or a metric the articles don't name.
 
 ## IPO-specific questions
 For questions about IPOs or public listings ("top IPOs of 2025", "table of top 10 IPOs"), the list items \
