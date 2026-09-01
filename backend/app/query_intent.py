@@ -560,3 +560,44 @@ def _strip_noise_words(query: str) -> str | None:
     q = _strip_time_tokens(query)
     q = re.sub(r"[\s-]+", " ", q).strip()
     return q or None
+
+
+# Acquisition relation direction. "who acquired X?" names X as the company that
+# WAS acquired (the target), whereas "what did X acquire?" names X as the company
+# that DID the acquiring (the buyer). Retrieval must honor this direction so it
+# surfaces the right counterpart instead of inverting the relation.
+_ACQUIRE_VERB_RE = re.compile(
+    r"\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b", re.IGNORECASE
+)
+_WHO_ACQUIRED_RE = re.compile(
+    r"\b(who|whom|which\s+(?:company|firm|business))\b.*\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b",
+    re.IGNORECASE,
+)
+_ACQUIRED_BY_RE = re.compile(
+    r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b[^.?!]*?\b(who|whom)\b",
+    re.IGNORECASE,
+)
+_BUYER_AUX_RE = re.compile(
+    r"\b(what|which)\b.*\b(did|has|have|is|are|was|were)\b", re.IGNORECASE
+)
+_BUYER_TRAILING_RE = re.compile(
+    r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b.*\b(what|whom|who)\b",
+    re.IGNORECASE,
+)
+
+
+def acquisition_relation(query: str) -> str | None:
+    """Infer the acquisition relation direction implied by ``query``.
+
+    Returns ``'target'`` when the named company is the one that WAS acquired
+    (e.g. "who acquired X?" -> X is the target), ``'buyer'`` when the named
+    company is the one doing the acquiring (e.g. "what did X acquire?" -> X is
+    the buyer), or ``None`` when the query has no acquisition-relation intent.
+    """
+    if not _ACQUIRE_VERB_RE.search(query):
+        return None
+    if _WHO_ACQUIRED_RE.search(query) or _ACQUIRED_BY_RE.search(query):
+        return "target"
+    if _BUYER_AUX_RE.search(query) or _BUYER_TRAILING_RE.search(query):
+        return "buyer"
+    return None
