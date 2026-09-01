@@ -1,6 +1,6 @@
 import calendar
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # The app serves Indian news, so 'today' follows the Indian calendar, not the
@@ -358,6 +358,103 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
         end = _full_year(int(m.group(1)), _current_year())
         return (f"{end - 1}-04-01", f"{end}-03-31")
     return None
+
+
+# Rolling-window recency phrases ("this week", "today", "past 3 days") resolve to a
+# concrete recent date range so the filter excludes old evergreen articles. Softer
+# recency signals ("latest", "recent") have no fixed window and are handled by
+# ``is_recency_intent`` (a ranking weight) instead. Number-bearing forms capture
+# (count, unit) in groups 1-2 ("past 3 days") or 3-4 ("2 weeks ago").
+_RECENCY_WINDOW_RE = re.compile(
+    r"\b(?:today|"
+    r"this\s+week|past\s+week|last\s+week|"
+    r"this\s+month|past\s+month|last\s+month|"
+    r"(?:past|last)\s+(\d+)\s*(day|days|week|weeks|month|months)|"
+    r"(\d+)\s*(day|days|week|weeks|month|months)\s*ago)\b",
+    re.IGNORECASE,
+)
+# Soft recency/freshness signals express a preference for recent articles without
+# naming a fixed window: they weight recency in ranking rather than filtering.
+# 'current'/'upcoming' are excluded: 'current account' is a finance topic, and
+# 'upcoming' points at future events the corpus may not yet cover.
+_RECENCY_INTENT_RE = re.compile(
+    r"\b(latest|recent|newest|freshest|fresh|lately|breaking|of\s+late)\b",
+    re.IGNORECASE,
+)
+
+_UNIT_DAYS = {"day": 1, "days": 1, "week": 7, "weeks": 7, "month": 30, "months": 30}
+
+
+def _days_ago_iso(days: int) -> str:
+    """ISO date ``days`` before today (Asia/Kolkata). Used for rolling recency
+    windows so the resolution matches the module's Indian-calendar 'now'."""
+    return (_today() - timedelta(days=days)).isoformat()
+
+
+def _month_start_iso() -> str:
+    """ISO date of the first day of the current (Indian) month. Used to anchor
+    'this month' to the calendar boundary so prior-month articles are excluded."""
+    return _today().replace(day=1).isoformat()
+
+
+def _week_start_iso() -> str:
+    """ISO date of Monday of the current week (Indian 'now'). Used to anchor
+    'this week' to the calendar boundary so last week's articles are excluded."""
+    t = _today()
+    return (t - timedelta(days=t.weekday())).isoformat()
+
+
+def extract_recency_range(query: str) -> tuple[str, str] | None:
+    """(from_date, to_date) ISO strings for a rolling recency window in the
+    query ('this week', 'this month', 'today', 'past 3 days', '2 weeks ago'), or
+    None. A hard window is applied so old evergreen articles are filtered out;
+    soft recency signals ('latest', 'recent') have no fixed window and are left
+    to ``is_recency_intent`` (ranking weight) instead."""
+    m = _RECENCY_WINDOW_RE.search(query)
+    if not m:
+        return None
+    num = m.group(1) or m.group(3)
+    unit = m.group(2) or m.group(4)
+    if num and unit:
+        return (_days_ago_iso(int(num) * _UNIT_DAYS[unit.lower()]), _today().isoformat())
+    text = m.group(0).lower()
+    if "today" in text:
+        return (_days_ago_iso(0), _today().isoformat())
+    # 'this week'/'this month' anchor to the calendar boundary of the current
+    # week/month so prior-period articles are excluded; other week/month forms
+    # ('past week', 'last month') keep their rolling window semantics.
+    if "this week" in text:
+        return (_week_start_iso(), _today().isoformat())
+    if "this month" in text:
+        return (_month_start_iso(), _today().isoformat())
+    if "week" in text:
+        return (_days_ago_iso(7), _today().isoformat())
+    if "month" in text:
+        return (_days_ago_iso(30), _today().isoformat())
+    return None
+
+
+def strip_recency_window(query: str) -> str:
+    """Remove rolling-window recency phrases ('this week', 'today', 'past 3 days')
+    from a query, leaving the bare topic text for retrieval."""
+    return _RECENCY_WINDOW_RE.sub(" ", query).strip()
+
+
+def strip_recency_intent(query: str) -> str:
+    """Remove soft recency/freshness signals ('latest', 'recent', 'fresh') from a
+    query, leaving the bare topic text for retrieval. The recency intent for
+    ranking (``is_recency_intent``) must be detected on the original query, so
+    this only affects retrieval text, never intent detection."""
+    return _RECENCY_INTENT_RE.sub(" ", query).strip()
+
+
+def is_recency_intent(query: str) -> bool:
+    """True when the query expresses a soft recency/freshness preference ('latest
+    news', 'recent funding', 'fresh updates') with no fixed window. Such queries
+    should weight recency in ranking so recent articles outrank old evergreen
+    ones. Hard-window phrases ('this week') are filtered separately and are not
+    flagged here."""
+    return bool(_RECENCY_INTENT_RE.search(query))
 
 
 def extract_year_range(query: str) -> tuple[str, str] | None:
