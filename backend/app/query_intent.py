@@ -481,7 +481,7 @@ def is_aggregation_intent(query: str) -> bool:
     top-N with the metric that justifies the ordering rather than isolated
     single items. Used to widen the retrieved source set and to trigger the
     ranked-list prompt and refusal nudge."""
-    return suggested_top_k(query) is not None or _is_superlative(query)
+    return suggested_top_k(query) is not None
 
 
 def _strip_time_tokens(text: str) -> str:
@@ -619,16 +619,14 @@ def _multi_entity_scaffold(query: str, entities: list[str]) -> str:
     """The topical remainder of a multi-entity query once the entity names and
     the comparison/intersection connectives are removed, e.g. 'compare funding of
     SoftBank and Tiger Global' -> 'funding'. Used to build a per-entity retrieval
-    query that keeps the topic while swapping in a single entity."""
-    from app.rerank_boost import extract_entities
-
+    query that keeps the topic while swapping in a     single entity."""
     s = _strip_entities(query.lower(), entities)
     s = _COMPARE_RE.sub(" ", s)
     s = _BOTH_AND_RE.sub(" ", s)
     s = _ALL_OF_RE.sub(" ", s)
     s = re.sub(r"\b(?:both|all|and|with|the|of|for|to|in|by|from|between)\b", " ", s)
     s = re.sub(r"[\s-]+", " ", s).strip()
-    return s or extract_entities(query)[0] if entities else ""
+    return s or (entities[0] if entities else "")
 
 
 class MultiEntityQuery:
