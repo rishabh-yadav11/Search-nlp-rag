@@ -102,56 +102,36 @@ _BRAND_ENTITIES = [
     "Ashok Leyland",
 ]
 
-_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "at",
-    "by",
-    "did",
-    "do",
-    "does",
-    "for",
-    "from",
-    "has",
-    "have",
-    "how",
-    "in",
-    "is",
-    "of",
-    "on",
-    "the",
-    "to",
-    "was",
-    "were",
-    "what",
-    "when",
-    "where",
-    "which",
-    "who",
-    "whom",
-    "whose",
-    "why",
+# Common nouns / sector labels that are NOT proper-noun entities. A capitalized
+# word in this set is never treated as a standalone entity, and it is stripped
+# from the tail of a multi-word entity phrase. This stops a bare sector noun
+# (e.g. "internet" / "consumer") from over-boosting unrelated articles, and
+# keeps a query like "consumer internet" from drifting to every "internet" hit.
+_GENERIC_NOUNS = {
+    "consumer", "internet", "sector", "sectors", "industry", "industries",
+    "market", "markets", "funding", "news", "deal", "deals", "company",
+    "companies", "startup", "startups", "outlook", "growth", "latest",
+    "business", "technology", "tech", "services", "service", "solution",
+    "solutions", "digital", "online", "report", "reports", "update",
+    "updates", "trend", "trends", "analysis", "view", "views", "story",
+    "stories", "round", "rounds", "fund", "funds", "capital", "venture",
+    "india", "indian", "global", "domestic", "foreign", "year", "years",
+    "quarter", "month", "months",
 }
 
-_CAP_RE = re.compile(r"[A-Z][A-Za-z0-9.']*")
-
-# Generic capitalized words that are NOT proper-noun entities (sentence-start
-# pronouns, articles, prepositions, and vague adjectives). These are filtered
-# out so that e.g. "Electric" or "This" do not trigger spurious entity boosts.
-_GENERIC_CAP_WORDS = {
-    "this", "that", "these", "those", "it", "we", "they", "he", "she",
-    "you", "i", "or", "but",
-    "with", "as", "my",
-    "our", "your", "their", "his", "her", "its", "new", "old", "first",
-    "last", "top", "best", "big", "small", "high", "low", "global", "local",
-    "national", "international", "annual", "quarterly", "monthly", "weekly",
-    "daily", "recent", "latest", "major", "minor", "key", "main", "total",
-    "electric", "vehicles", "vehicle", "power", "energy", "deal", "deals",
-    "company", "companies", "startup", "startups", "market", "business",
-    "technology", "tech", "services", "solution", "solutions",
+# Legal-entity suffixes stripped from the tail of a multi-word entity phrase so
+# e.g. "Banyan Netfaqs Pvt Ltd" resolves to the distinct entity "banyan
+# netfaqs" rather than the bare, over-broad token "banyan".
+_ENTITY_SUFFIXES = {
+    "pvt", "ltd", "private", "limited", "inc", "incorporated", "corp",
+    "corporation", "co", "company", "llp", "llc", "plc", "sa", "ag",
 }
+
+# A run of two or more consecutive capitalized words is treated as a single
+# proper-noun phrase (a company / fund / person name spoken as one entity),
+# rather than being exploded into individual tokens that would each boost
+# independently and conflate distinct entities sharing a headword.
+_RUN_RE = re.compile(r"[A-Z][A-Za-z0-9.']+(?:\s+[A-Z][A-Za-z0-9.']+)+")
 
 
 def _normalize(text: str) -> str:
@@ -163,34 +143,57 @@ _NORMALIZED_BRANDS = sorted(
     key=lambda b: (len(b), b),
     reverse=True,
 )
+_BRAND_SET = set(_NORMALIZED_BRANDS)
 _BRAND_RE = re.compile(r"\b(?:" + "|".join(re.escape(b) for b in _NORMALIZED_BRANDS) + r")\b")
+
+
+def _strip_entity_phrase(phrase: str) -> str:
+    """Normalize a multi-word capitalized run into one entity: lowercased, with
+    trailing legal-entity suffixes and generic tail nouns removed. Returns "" when
+    the run is empty or consists solely of generic nouns."""
+    words = [_normalize(w) for w in phrase.split()]
+    while len(words) > 1 and (words[-1] in _GENERIC_NOUNS or words[-1] in _ENTITY_SUFFIXES):
+        words.pop()
+    if not words or all(w in _GENERIC_NOUNS for w in words):
+        return ""
+    return " ".join(words)
 
 
 def extract_entities(q: str) -> list[str]:
     """Extract proper-noun-like entities from a query. Handles known brand names
-    (including spaces and apostrophes) plus capitalized words/phrases, strips
-    stopwords, and returns entities normalized to lowercase with possessive
-    apostrophes removed."""
+    (including spaces and apostrophes) plus multi-word capitalized phrases,
+    normalizes to lowercase with possessive apostrophes removed, and returns
+    distinct entities.
+
+    Consecutive capitalized words are kept as ONE entity (e.g. "Banyan Netfaqs
+    Pvt Ltd" -> "banyan netfaqs"), so distinct entities sharing a headword are
+    not conflated, and generic sector nouns ("consumer internet") are not
+    over-expanded into bare tokens that over-boost unrelated articles."""
     nq = _normalize(q)
     if not nq:
         return []
-    raw = [m.group(0) for m in _BRAND_RE.finditer(nq)]
-    for t in _CAP_RE.findall(q):
-        nt = _normalize(t)
-        if nt in _STOPWORDS or nt in _GENERIC_CAP_WORDS:
-            continue
-        raw.append(nt)
+    raw: list[str] = [m.group(0) for m in _BRAND_RE.finditer(nq)]
+    for run in _RUN_RE.findall(q):
+        phrase = _strip_entity_phrase(run)
+        if phrase and phrase not in raw:
+            raw.append(phrase)
     ordered: list[str] = []
     for e in raw:
         if e not in ordered:
             ordered.append(e)
-    # Drop any entity that is fully contained in a longer one (e.g. "acme" inside
+    # Drop any entity fully contained in a longer one (e.g. "acme" inside
     # "acme corp"). Sort by descending length so the longer entity is kept first
-    # and the shorter substring is rejected in a single pass.
+    # and the shorter substring is rejected in a single pass. A known brand is
+    # never dropped even when a longer non-brand run subsumes it (e.g. "ola
+    # electric" must survive the run "ola electric ipo price band").
     ordered.sort(key=len, reverse=True)
     kept: list[str] = []
     for e in ordered:
-        if not any(e in k for k in kept):
+        if e in _BRAND_SET:
+            if e not in kept:
+                kept.append(e)
+            continue
+        if not any(e != k and e in k for k in kept):
             kept.append(e)
     return kept
 
