@@ -9,6 +9,7 @@ from app import main
 # Mirror the real Qdrant facet labels so the synonym maps resolve as in prod.
 _DEAL = ["Venture Capital", "M&A", "Private Equity", "Credit", "Investment Banking", "Markets"]
 _IND = ["Finance", "Healthcare", "Education", "Technology", "Retail", "Cleantech"]
+_CT = ["Article", "Interview", "Video", "Founder", "Competitor", "Appointment"]
 
 
 def _set_facets() -> None:
@@ -16,19 +17,23 @@ def _set_facets() -> None:
     main._DEALTYPE_FACETS.update({d.lower(): d for d in _DEAL})
     main._INDUSTRY_FACETS.clear()
     main._INDUSTRY_FACETS.update({i.lower(): i for i in _IND})
+    main._CONTENT_TYPE_FACETS.clear()
+    main._CONTENT_TYPE_FACETS.update({c.lower(): c for c in _CT})
 
 
 _ORIG_DEAL: dict = {}
 _ORIG_IND: dict = {}
+_ORIG_CT: dict = {}
 
 
 def setup_function(_) -> None:
-    global _ORIG_DEAL, _ORIG_IND
+    global _ORIG_DEAL, _ORIG_IND, _ORIG_CT
     # Snapshot whatever the module globals currently hold so teardown can restore
     # them exactly, preventing any cross-module leakage (the extractors read these
     # module-global facet maps).
     _ORIG_DEAL = dict(main._DEALTYPE_FACETS)
     _ORIG_IND = dict(main._INDUSTRY_FACETS)
+    _ORIG_CT = dict(main._CONTENT_TYPE_FACETS)
     _set_facets()
 
 
@@ -40,6 +45,8 @@ def teardown_function(_) -> None:
     main._DEALTYPE_FACETS.update(_ORIG_DEAL)
     main._INDUSTRY_FACETS.clear()
     main._INDUSTRY_FACETS.update(_ORIG_IND)
+    main._CONTENT_TYPE_FACETS.clear()
+    main._CONTENT_TYPE_FACETS.update(_ORIG_CT)
 
 
 def test_extract_dealtype_funding() -> None:
@@ -76,6 +83,40 @@ def test_extract_industry() -> None:
 
 def test_extract_industry_none() -> None:
     assert main.extract_industry("latest news") is None
+
+
+def test_extract_content_type() -> None:
+    # Content-type modifiers resolve to a real `content_type` facet value.
+    assert main.extract_content_type("interviews with Narayana Murthy") == "Interview"
+    assert main.extract_content_type("founders of Curefit") == "Founder"
+    assert main.extract_content_type("competitors of Zomato") == "Competitor"
+    assert main.extract_content_type("appointments in the TCS board") == "Appointment"
+    assert main.extract_content_type("a video on fundraising") == "Video"
+
+
+def test_extract_content_type_none_when_no_match() -> None:
+    # Queries without a content-type modifier degrade to None (current behavior).
+    assert main.extract_content_type("top funding deals 2025") is None
+    assert main.extract_content_type("latest news") is None
+
+
+def test_extract_content_type_unknown_facet_degrades() -> None:
+    # When the corpus has no matching `content_type` facet, resolution degrades
+    # to None rather than emitting a bogus value.
+    main._CONTENT_TYPE_FACETS.clear()
+    main._CONTENT_TYPE_FACETS.update({"article": "Article", "interview": "Interview"})
+    assert main.extract_content_type("interviews with X") == "Interview"
+    assert main.extract_content_type("founders of Y") is None
+    assert main.extract_content_type("competitors of Z") is None
+
+
+def test_build_facet_filter_content_type() -> None:
+    # A content_type facet value becomes a Qdrant `content_type` filter condition.
+    f = main.build_facet_filter(None, None, None, None, None, "Interview")
+    assert f is not None
+    assert [c.key for c in f.must] == ["content_type"]
+    # None content_type yields no filter (current behavior).
+    assert main.build_facet_filter(None, None, None, None, None, None) is None
 
 
 def test_effective_intent_funding_news_june() -> None:

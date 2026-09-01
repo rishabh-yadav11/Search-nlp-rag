@@ -29,7 +29,12 @@ from app.auth import require_auth, require_permission
 from app.config import config
 from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost, to_usd
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
-from app.query_intent import extract_year_range, suggested_top_k
+from app.query_intent import (
+    MultiEntityQuery,
+    detect_multi_entity,
+    extract_year_range,
+    suggested_top_k,
+)
 
 logger = logging.getLogger("chat")
 
@@ -1076,16 +1081,22 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     if smalltalk is not None:
         return PreparedTurn(answer=smalltalk, sources=[], note=None)
 
+    multi = detect_multi_entity(question)
+    if multi is not None:
+        return await _prepare_multi_entity_turn(multi, question, history)
+
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
     from app.main import (
         _effective_intent,
         body_rescue,
+        extract_content_type,
         retrieve_with_auto_facet_fallback,
         source_context,
         to_summary,
     )
 
     retrieval_q, eff_from, eff_to, dealtype, industry = _effective_intent(question, None, None)
+    content_type = extract_content_type(question)
     k = _effective_chat_k(question)
     prev_question = _previous_user_question(history)
     if prev_question and _is_vague_followup(question):
@@ -1096,6 +1107,7 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         # top-N size) so the same sources are re-presented, while the LLM still
         # gets full history.
         prev_q, prev_from, prev_to, prev_dealtype, prev_industry = _effective_intent(prev_question, None, None)
+        prev_content_type = extract_content_type(prev_question)
         rng = extract_year_range(question)
         if rng:
             from app.query_intent import extract_list_topic, range_query_topic
@@ -1104,13 +1116,14 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
             eff_from, eff_to = rng[0], rng[1]
         else:
             retrieval_q, eff_from, eff_to = prev_q, prev_from, prev_to
-        dealtype, industry = prev_dealtype, prev_industry
+        dealtype, industry, content_type = prev_dealtype, prev_industry, prev_content_type
         k = _effective_chat_k(prev_question)
-    reranked, final_dealtype, final_industry = await retrieve_with_auto_facet_fallback(
+    reranked, final_dealtype, final_industry, final_content_type = await retrieve_with_auto_facet_fallback(
         retrieval_q, k,
-        industry=None, dealtype=None, author=None,
+        industry=None, dealtype=None, author=None, content_type=None,
         eff_from=eff_from, eff_to=eff_to,
         auto_industry=industry, auto_dealtype=dealtype,
+        auto_content_type=content_type,
         need_body=True,
     )
     if config.ENABLE_BODY_RESCUE:
@@ -1120,7 +1133,7 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     # an on-topic set — don't reject those matches as "weakly related". The final
     # facets reflect any auto-facet fallback (a dropped facet means the results
     # are not scoped to that category, so the normal gate applies).
-    faceted = bool(final_dealtype or final_industry)
+    faceted = bool(final_dealtype or final_industry or final_content_type)
     gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
     sources = [s for s in reranked if s.score >= gate][: k]
 
@@ -1157,10 +1170,124 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         question=question,
         dataviz_max_rows=k,
         dataviz_view_instruction=_dataviz_view_instruction(question),
+        comparison_instruction="",
     )
     return PreparedTurn(
         answer=prompt,
         sources=[to_summary(s).model_dump() for s in sources],
+        note=note,
+        needs_llm=True,
+    )
+
+
+async def _prepare_multi_entity_turn(
+    multi: MultiEntityQuery, question: str, history: list[MessageOut]
+) -> PreparedTurn:
+    """Handle a comparison or intersection query over two or more entities.
+
+    Retrieves separately for each entity (keeping the shared topic scaffold), then
+    combines the results: a comparison keeps every article tagged by which entity
+    it matches; an intersection keeps only articles that match ALL entities (the
+    "both A and B" case), degrading to the per-entity union with a note when
+    nothing is common to all. The prompt gains a comparison/intersection
+    instruction so the LLM produces a comparative answer."""
+    from app.main import (
+        SourceArticle,
+        _effective_intent,
+        body_rescue,
+        retrieve_with_auto_facet_fallback,
+        source_context,
+        to_summary,
+    )
+
+    k = _effective_chat_k(" ".join(multi.entities + [multi.scaffold]))
+    per_entity: list[list[SourceArticle]] = []
+    for entity in multi.entities:
+        sub_query = (entity + " " + multi.scaffold).strip()
+        rq, eff_from, eff_to, dealtype, industry = _effective_intent(sub_query, None, None)
+        reranked, final_dealtype, final_industry, final_content_type = await retrieve_with_auto_facet_fallback(
+            rq, k,
+            industry=None, dealtype=None, author=None,
+            eff_from=eff_from, eff_to=eff_to,
+            auto_industry=industry, auto_dealtype=dealtype,
+            auto_content_type=None,
+            need_body=True,
+        )
+        if config.ENABLE_BODY_RESCUE:
+            reranked = await body_rescue(sub_query, reranked)
+        faceted = bool(final_dealtype or final_industry or final_content_type)
+        gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
+        per_entity.append([a for a in reranked if a.score >= gate])
+
+    by_id: dict[int, SourceArticle] = {}
+    id_entities: dict[int, list[str]] = {}
+    for entity, results in zip(multi.entities, per_entity):
+        for a in results:
+            if a.id not in by_id:
+                by_id[a.id] = a
+                id_entities[a.id] = []
+            id_entities[a.id].append(entity)
+
+    common_ids = {aid for aid, ents in id_entities.items() if len(ents) == len(multi.entities)}
+    if multi.mode == "intersection" and common_ids:
+        chosen = common_ids
+        note = None
+    elif multi.mode == "intersection":
+        chosen = set(by_id)
+        note = (
+            f"No single article covers all of {', '.join(multi.entities)}; "
+            "showing related articles per entity."
+        )
+    else:
+        chosen = set(by_id)
+        note = None
+
+    chosen_articles = [by_id[aid] for aid in chosen]
+    chosen_articles.sort(key=lambda a: (len(id_entities[a.id]), a.score), reverse=True)
+    top_n = min(max(k, 4 * len(multi.entities)), config.CHAT_MAX_SOURCES)
+    sources_models = chosen_articles[:top_n]
+    if not sources_models:
+        return PreparedTurn(
+            answer="No sufficiently relevant articles were found for this query.",
+            sources=[],
+            note=note,
+        )
+
+    body_limit = min(config.CHAT_BODY_CHAR_LIMIT, config.CHAT_TOTAL_BODY_CHARS // max(1, len(sources_models)))
+    blocks = []
+    for i, s in enumerate(sources_models):
+        block = source_context(s, i + 1, body_limit=body_limit)
+        ents = ", ".join(id_entities[s.id])
+        blocks.append(f"{block}\nEntities: {ents}")
+    context = "\n\n".join(blocks)
+    history_text = "\n".join(f"{m.role}: {m.content}" for m in history if m.role in ("user", "assistant"))
+
+    if multi.mode == "intersection":
+        comparison_instruction = (
+            f"\n\n## Multi-entity intersection\n"
+            f"This question asks for what is shared across ALL of these entities: {', '.join(multi.entities)}. "
+            f"Emphasize articles that relate to more than one of them, and state which entities each finding "
+            f"applies to, citing the article numbers."
+        )
+    else:
+        comparison_instruction = (
+            f"\n\n## Multi-entity comparison\n"
+            f"This is a comparison between these entities: {', '.join(multi.entities)}. "
+            f"Compare and contrast them using the articles, organizing the answer by entity where useful, and "
+            f"cite which entity each claim refers to using the article numbers."
+        )
+
+    prompt = CHAT_PROMPT.format(
+        history=history_text or "(none)",
+        context=context,
+        question=question,
+        dataviz_max_rows=k,
+        dataviz_view_instruction=_dataviz_view_instruction(question),
+        comparison_instruction=comparison_instruction,
+    )
+    return PreparedTurn(
+        answer=prompt,
+        sources=[to_summary(s).model_dump() for s in sources_models],
         note=note,
         needs_llm=True,
     )
@@ -1278,6 +1405,7 @@ implying the fact still holds today. Never present stale facts as if they were c
 - If two articles conflict on a fact (e.g. different deal values), surface both with their citations \
 rather than silently picking one.
 - Keep answers concise by default; expand only as far as the articles support.
+{comparison_instruction}
 
 Conversation so far:
 {history}

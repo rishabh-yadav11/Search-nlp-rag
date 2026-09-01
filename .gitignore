@@ -26,3 +26,7 @@ qdrant_config.yaml
 AGENTS.md
 backend/.coverage
 REVIEWER.md
+
+# local git worktrees
+swt/
+wt/
