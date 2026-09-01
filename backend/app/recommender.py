@@ -520,9 +520,6 @@ state: dict = {}
 # the WRONG role (e.g. X as the acquirer in a "who acquired X?" query) are
 # demoted and results where it plays the RIGHT role are promoted. This keeps
 # "who acquired X?" from surfacing articles where X itself did the buying.
-_ACQ_ROLE_VERB_RE = re.compile(
-    r"\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b", re.IGNORECASE
-)
 
 
 def _entity_acquisition_role(text: str, entity: str) -> bool | None:
