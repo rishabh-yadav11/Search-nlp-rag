@@ -1255,6 +1255,16 @@ are `"not stated"`, and set `"value_column"` to `null`.
 - Keep `[n]` citations only in the prose, never inside the data block.
 - Omit the block entirely unless the user explicitly asked for a chart, graph, plot, diagram, or table/visual view.
 
+## Source vintage and tense
+Each article block shows its publication date in the meta line, e.g. `[1] Title (2023-05-12)`. \
+Use that date to frame every answer:
+- When the sources are not recent, do NOT state the information in the present tense as if it is \
+currently true. Disclose the time period the data is from — open with "As of <date>..." or anchor \
+the claim to its publication date/year (e.g. "In 2021, ..."), and cite the article.
+- If the user's question implies a current state but the best sources are old, say so plainly \
+(e.g. "As of the most recent article (2021), ... — this may have changed since") instead of \
+implying the fact still holds today. Never present stale facts as if they were current.
+
 ## Grounding discipline
 - If two articles conflict on a fact (e.g. different deal values), surface both with their citations \
 rather than silently picking one.
