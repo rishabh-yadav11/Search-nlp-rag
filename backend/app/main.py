@@ -879,13 +879,24 @@ async def retrieve_by_date_window(
     qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
     if qfilter is None:
         return []
-    points, _ = await state["qdrant"].scroll(
-        collection_name=config.QDRANT_COLLECTION,
-        scroll_filter=qfilter,
-        limit=max(top_k, config.RERANK_CANDIDATES),
-        with_payload=_PAYLOAD_FIELDS,
-        with_vectors=False,
-    )
+    # Qdrant `scroll` returns points in ID/storage order (no recency guarantee),
+    # so a limited scroll would surface an arbitrary subset of the window. Page
+    # through the entire window and sort explicitly by published date descending
+    # so the most-recent articles are selected rather than an ID-ordered slice.
+    points: list = []
+    next_offset: object | None = None
+    while True:
+        page, next_offset = await state["qdrant"].scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            scroll_filter=qfilter,
+            offset=next_offset,
+            limit=config.RERANK_CANDIDATES,
+            with_payload=_PAYLOAD_FIELDS,
+            with_vectors=False,
+        )
+        points.extend(page)
+        if not page or next_offset is None:
+            break
     if not points:
         return []
     articles = [
@@ -900,12 +911,19 @@ async def retrieve_by_date_window(
             author_names=payload.get("author_names") or [],
             industry_names=payload.get("industry_names") or [],
             dealtype_names=payload.get("dealtype_names") or [],
-            score=_recency_multiplier(payload.get("published_date")),
+            # Score on a recency-agnostic base; the recency multiplier is applied
+            # exactly once in sort_results so merged results share one scale with
+            # lexical (cross-encoder) hits instead of double-counting recency.
+            score=1.0,
         )
         for p in points
     ]
     if need_body:
         await _attach_bodies(articles)
+    articles.sort(
+        key=lambda a: (_tz_stripped_pub(a.published_date),),
+        reverse=True,
+    )
     return sort_results(articles)[:top_k]
 
 
