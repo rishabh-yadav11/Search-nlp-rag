@@ -96,6 +96,7 @@ def record_from_row(row: dict) -> dict:
         "url": row["ext_url"] or f"https://www.vccircle.com/{row['slug'] or row['feid']}",
         "published_date": normalize_date(row["publish"]),
         "category": (row["dealtype_names"] or row["content_type"] or "").strip(),
+        "content_type": (row["content_type"] or "").strip(),
         "author_names": split_names(row["author_names"]),
         "industry_names": split_names(row["industry_names"]),
         "dealtype_names": split_names(row["dealtype_names"]),
