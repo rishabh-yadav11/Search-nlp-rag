@@ -89,7 +89,7 @@ def test_search_cache_hit_returns_cached_summaries(monkeypatch):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                            author=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None))
 
     assert resp.cached is True
     assert [r.id for r in resp.results] == [1, 2]
@@ -134,7 +134,7 @@ def test_search_cache_miss_runs_full_pipeline(monkeypatch):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                            author=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None))
 
     assert boost_calls, "apply_click_boost should have been called"
     assert div_calls, "diversify should have been called"
@@ -181,7 +181,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch):
     monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                            author=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None))
 
     assert resp.cached is False
     assert boost_calls == []
@@ -209,7 +209,7 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch):
     monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry="Fintech", dealtype=None,
-                            author=None, from_date="2025-01-01", to_date=None))
+                            author=None, content_type=None, from_date="2025-01-01", to_date=None))
 
     qfilter = captured["qfilter"]
     assert isinstance(qfilter, Filter)
@@ -241,7 +241,7 @@ def test_search_cache_miss_does_not_cache_empty_results(monkeypatch):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     resp = _run(main.search(q="edtech startups 2020", top_k=8, industry=None, dealtype=None,
-                            author=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None))
 
     assert resp.results == []
     assert resp.cached is False
@@ -271,7 +271,7 @@ def test_search_empty_results_are_not_served_from_cache(monkeypatch):
     monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
-    kwargs = {"top_k": 8, "industry": None, "dealtype": None, "author": None,
+    kwargs = {"top_k": 8, "industry": None, "dealtype": None, "author": None, "content_type": None,
               "from_date": None, "to_date": None}
     first = _run(main.search(q="edtech startups 2020", **kwargs))
     second = _run(main.search(q="edtech startups 2020", **kwargs))
@@ -305,7 +305,7 @@ def test_search_non_empty_results_are_still_cached(monkeypatch):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                     author=None, from_date=None, to_date=None))
+                     author=None, content_type=None, from_date=None, to_date=None))
 
     assert len(cache.sets) == 1
     assert cache.sets[0][0].startswith("search:")

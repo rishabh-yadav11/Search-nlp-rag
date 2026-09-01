@@ -66,6 +66,7 @@ def test_source_summary_dump_contains_only_public_fields():
         "author_names",
         "industry_names",
         "dealtype_names",
+        "content_type",
     }
     assert set(summary.model_dump()) == public_fields
     assert summary.summary == ""

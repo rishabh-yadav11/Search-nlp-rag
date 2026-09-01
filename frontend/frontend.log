@@ -1,0 +1,33 @@
+
+> vccircle-search-frontend@1.0.0 dev
+> next dev
+
+   ▲ Next.js 15.5.23
+   - Local:        http://localhost:3000
+   - Network:      http://192.168.1.6:3000
+
+ ✓ Starting...
+ ✓ Ready in 1367ms
+ ✓ Compiled /middleware in 389ms (115 modules)
+ ○ Compiling / ...
+ ✓ Compiled / in 2.2s (624 modules)
+ GET / 200 in 2494ms
+ ✓ Compiled /for-you in 275ms (602 modules)
+ GET /for-you 200 in 448ms
+ ✓ Compiled /login in 303ms (606 modules)
+ GET /login 200 in 501ms
+ GET /login? 200 in 50ms
+ GET /login? 200 in 39ms
+ GET /login? 200 in 34ms
+ GET /login? 200 in 36ms
+ GET /login? 200 in 53ms
+ ✓ Compiled in 203ms (257 modules)
+ ✓ Compiled /for-you in 129ms (372 modules)
+ GET /for-you 200 in 303ms
+ GET /for-you 200 in 34ms
+ ✓ Compiled in 178ms (610 modules)
+ ✓ Compiled in 41ms (238 modules)
+ GET /for-you 200 in 161ms
+ ✓ Compiled in 88ms (234 modules)
+ ✓ Compiled in 82ms (257 modules)
+[?25h
