@@ -1124,22 +1124,21 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
     sources = [s for s in reranked if s.score >= gate][: k]
 
-    # The note only annotates a non-empty, weak result set. When sources is
-    # empty (score-gated out), the fallback answer below already explains that
-    # nothing matched; attaching weak_results_note too would just duplicate it.
-    if not faceted and sources:
-        note = (
-            weak_results_note([s.score for s in sources], date_label(eff_from, eff_to))
-            if config.ENABLE_WEAK_FALLBACK
-            else None
-        )
-    else:
-        note = None
-
     if not sources:
-        return PreparedTurn(answer="No sufficiently relevant articles were found for this query.", sources=[], note=note)
+        # Score-gated to empty pre-empts any weak annotation: the answer below
+        # already explains that nothing matched, so a note would just repeat it.
+        return PreparedTurn(answer="No sufficiently relevant articles were found for this query.", sources=[], note=None)
 
-    if not faceted and config.ENABLE_WEAK_FALLBACK and results_are_weak([s.score for s in sources]):
+    note = None
+
+    # The weak-retrieval gate refuses only when retrieval is genuinely
+    # insufficient: a lone match that is itself weak (below the weak threshold).
+    # A query that returns several on-topic sources — even if each scores only
+    # modestly above the inclusion gate — still has material to answer from, so
+    # it must not be refused (regression: many moderate sources were wrongly
+    # gated out as "weakly related"). The note then only accompanies the refusal.
+    if not faceted and config.ENABLE_WEAK_FALLBACK and len(sources) <= 1 and results_are_weak([s.score for s in sources]):
+        note = weak_results_note([s.score for s in sources], date_label(eff_from, eff_to))
         return PreparedTurn(
             answer=fallback_answer(question, len(sources), date_label(eff_from, eff_to)),
             sources=[to_summary(s).model_dump() for s in sources],
