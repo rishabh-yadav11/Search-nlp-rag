@@ -43,6 +43,7 @@ from app.health import router as health_router
 from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
+    acquisition_relation,
     extract_list_topic,
     extract_recency_range,
     extract_year_range,
@@ -61,6 +62,7 @@ from app.recommender import (
     get_personalized_recommendations,
     get_similar_articles,
     get_trending_feed,
+    rerank_acquisition_relation,
 )
 from app.redis_cache import cache
 from app.rerank_boost import apply_entity_boost
@@ -800,6 +802,9 @@ async def retrieve_and_rerank(
     reranked = await rerank(range_query_topic(q) or q, _merge_results(*groups))
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(range_query_topic(q) or q, reranked)
+    direction = acquisition_relation(q)
+    if direction:
+        reranked = rerank_acquisition_relation(q, reranked, direction)
     reranked = sort_results(reranked, recency_boost)
     if need_body:
         await _attach_bodies(reranked)
