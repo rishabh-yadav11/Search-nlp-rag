@@ -39,6 +39,24 @@ class LLMResult:
         return usd * config.INR_PER_USD
 
 
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Provider's suggested backoff (seconds) from a 429 ``Retry-After`` header.
+
+    Returns None when the error carries no usable hint, so the caller falls back
+    to its own exponential backoff. Only consulted for transient failures, so a
+    hinted wait never applies to non-retryable errors."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    value = getattr(resp, "headers", {}).get("Retry-After") if resp is not None else None
+    if not value:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
@@ -82,6 +100,9 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
             if not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
                 raise LLMUnavailableError() from exc
             delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
             delay += random.uniform(0, delay * 0.5)
             logger.warning(
                 "LLM call failed on attempt %d/%d (%s); retrying in %.1fs",
@@ -141,6 +162,9 @@ async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list 
             if started or not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
                 raise LLMUnavailableError() from exc
             delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
             delay += random.uniform(0, delay * 0.5)
             logger.warning(
                 "LLM stream failed on attempt %d/%d (%s); retrying in %.1fs",
