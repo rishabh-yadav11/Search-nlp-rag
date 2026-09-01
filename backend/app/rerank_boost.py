@@ -127,11 +127,47 @@ _ENTITY_SUFFIXES = {
     "corporation", "co", "company", "llp", "llc", "plc", "sa", "ag",
 }
 
+# Trailing query-context nouns stripped from the tail of a multi-word entity
+# phrase so e.g. "Banyan Netfaqs IPO Price Band" resolves to the recognizable
+# base entity "banyan netfaqs" rather than an over-long phrase that fails to
+# match the same company named without that context in other articles. Stripping
+# stops at len==1 so a trailing context word can never collapse a distinct
+# multi-word entity into a single bare token.
+_CONTEXT_NOUNS = {
+    "ipo", "price", "band", "bands", "result", "results", "earnings",
+    "share", "shares", "stock", "stocks", "outlook", "performance",
+    "profit", "loss", "revenue", "quarter", "q1", "q2", "q3", "q4",
+    "fy", "fiscal", "financial", "subsidiary", "holdings", "group",
+    "ventures", "capital", "partners", "enterprises", "industries",
+}
+
 # A run of two or more consecutive capitalized words is treated as a single
 # proper-noun phrase (a company / fund / person name spoken as one entity),
 # rather than being exploded into individual tokens that would each boost
 # independently and conflate distinct entities sharing a headword.
 _RUN_RE = re.compile(r"[A-Z][A-Za-z0-9.']+(?:\s+[A-Z][A-Za-z0-9.']+)+")
+
+# A single capitalized word (e.g. "Apple", "HDFC") that is NOT part of a
+# multi-word run and NOT a generic/common word is extracted as its own entity so
+# single-word companies still get a boost even when absent from the curated
+# brand list. Matches like "banyan" inside "Banyan Netfaqs" are excluded by span
+# checks in extract_entities.
+_SINGLE_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9.']+\b")
+
+# Capitalized words never treated as standalone entities: question/function
+# words likely capitalized at a query's start, plus the generic-noun and
+# query-context sets, so common sentence starts and bare query nouns (e.g.
+# "Results", "Earnings") don't over-boost unrelated articles.
+_SINGLE_WORD_IGNORE = (
+    _GENERIC_NOUNS
+    | _CONTEXT_NOUNS
+    | {
+        "what", "why", "how", "when", "where", "which", "who", "whom",
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
+        "is", "are", "was", "were", "be", "been", "being",
+        "this", "that", "these", "those", "my", "our", "your",
+    }
+)
 
 
 def _normalize(text: str) -> str:
@@ -149,16 +185,19 @@ _BRAND_RE = re.compile(r"\b(?:" + "|".join(re.escape(b) for b in _NORMALIZED_BRA
 
 def _strip_entity_phrase(phrase: str) -> str:
     """Normalize a multi-word capitalized run into one entity: lowercased, with
-    leading/trailing legal-entity suffixes and generic nouns removed. Returns ""
-    when the run is empty, consists solely of generic nouns/suffixes, or is left
-    with only a bare generic/suffix token after stripping (which would otherwise
-    over-boost unrelated articles)."""
+    leading/trailing legal-entity suffixes, generic nouns, and query-context
+    nouns removed so the result is the recognizable base entity (e.g. "banyan
+    netfaqs") rather than an over-long phrase. Returns "" when the run is empty,
+    consists solely of generic/suffix/context tokens, or is left with only a
+    bare such token after stripping (which would otherwise over-boost unrelated
+    articles)."""
     words = [_normalize(w) for w in phrase.split()]
-    while len(words) > 1 and (words[-1] in _GENERIC_NOUNS or words[-1] in _ENTITY_SUFFIXES):
+    _strip_trail = _GENERIC_NOUNS | _ENTITY_SUFFIXES | _CONTEXT_NOUNS
+    while len(words) > 1 and words[-1] in _strip_trail:
         words.pop()
     while len(words) > 1 and (words[0] in _GENERIC_NOUNS or words[0] in _ENTITY_SUFFIXES):
         words.pop(0)
-    if not words or all(w in _GENERIC_NOUNS or w in _ENTITY_SUFFIXES for w in words):
+    if not words or all(w in _strip_trail for w in words):
         return ""
     return " ".join(words)
 
@@ -177,10 +216,24 @@ def extract_entities(q: str) -> list[str]:
     if not nq:
         return []
     raw: list[str] = [m.group(0) for m in _BRAND_RE.finditer(nq)]
+    run_spans = [m.span() for m in _RUN_RE.finditer(q)]
     for run in _RUN_RE.findall(q):
         phrase = _strip_entity_phrase(run)
         if phrase and phrase not in raw:
             raw.append(phrase)
+    # Single capitalized proper nouns NOT inside a multi-word run and NOT a
+    # generic/common word are extracted as their own entity, so single-word
+    # companies ("Apple", "HDFC") still boost even when absent from the curated
+    # brand list. This restores the recall the old single-cap path provided.
+    for m in _SINGLE_CAP_RE.finditer(q):
+        s, e = m.span()
+        if any(lo <= s < hi for lo, hi in run_spans):
+            continue
+        word = _normalize(m.group(0))
+        if word in _SINGLE_WORD_IGNORE:
+            continue
+        if word not in raw:
+            raw.append(word)
     ordered: list[str] = []
     for e in raw:
         if e not in ordered:
