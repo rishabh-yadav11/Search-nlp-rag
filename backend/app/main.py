@@ -44,10 +44,13 @@ from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
     extract_list_topic,
+    extract_recency_range,
     extract_year_range,
+    is_recency_intent,
     normalize_word_numbers,
     range_query_topic,
     rewrite_year_in_review,
+    strip_recency_window,
     suggested_top_k,
 )
 from app.recommender import (
@@ -421,6 +424,15 @@ def _effective_intent(
         if cleaned:
             retrieval_q = cleaned
         return retrieval_q, rng[0], rng[1], dealtype, industry
+    # Rolling recency windows ('this week', 'today') resolve to a recent date
+    # range so the filter drops old evergreen articles; the window words are
+    # stripped from the retrieval query because the date filter already scopes it.
+    rng = extract_recency_range(q)
+    if rng:
+        cleaned = strip_recency_window(q)
+        if cleaned:
+            retrieval_q = cleaned
+        return retrieval_q, rng[0], rng[1], dealtype, industry
     return retrieval_q, from_date, to_date, dealtype, industry
 
 
@@ -631,13 +643,24 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
     return articles
 
 
-def _recency_multiplier(published_date: str | None) -> float:
+# Stronger recency weighting applied when the query expresses a recency intent
+# ('latest', 'recent', 'this week'), so old evergreen articles are pushed below
+# newer ones instead of surfacing on relevance alone.
+RECENCY_BOOST_STRENGTH = 0.85
+RECENCY_BOOST_DECAY_DAYS = 30.0
+
+
+def _recency_multiplier(
+    published_date: str | None,
+    recency_strength: float = config.RECENCY_STRENGTH,
+    recency_decay_days: float = config.RECENCY_DECAY_DAYS,
+) -> float:
     """1 - STRENGTH * (1 - exp(-age_days / DECAY)); no boost for missing dates."""
     dt = _parse_date(published_date)
     if dt is None:
         return 1.0
     age_days = max(0.0, (datetime.now(UTC) - dt).total_seconds() / 86400.0)
-    return 1.0 - config.RECENCY_STRENGTH * (1.0 - math.exp(-age_days / config.RECENCY_DECAY_DAYS))
+    return 1.0 - recency_strength * (1.0 - math.exp(-age_days / recency_decay_days))
 
 
 def _tz_stripped_pub(published_date: str | None) -> str:
@@ -660,11 +683,21 @@ def _tz_stripped_pub(published_date: str | None) -> str:
 _TZ_RE = re.compile(r"(?:[zZ]|[+-]\d{2}:?\d{2})$")
 
 
-def sort_results(results: list[SourceArticle]) -> list[SourceArticle]:
+def sort_results(
+    results: list[SourceArticle],
+    recency_boost: bool = False,
+) -> list[SourceArticle]:
     """Recency-tempered relevance first, recency second: blended score desc,
-    then published_date desc (missing dates last)."""
+    then published_date desc (missing dates last). When ``recency_boost`` is set
+    (a recency intent like 'latest'/'recent'), freshness is weighted far more
+    heavily so old evergreen articles rank below recent ones."""
+    strength = RECENCY_BOOST_STRENGTH if recency_boost else config.RECENCY_STRENGTH
+    decay = RECENCY_BOOST_DECAY_DAYS if recency_boost else config.RECENCY_DECAY_DAYS
     results.sort(
-        key=lambda a: (a.score * _recency_multiplier(a.published_date), _tz_stripped_pub(a.published_date)),
+        key=lambda a: (
+            a.score * _recency_multiplier(a.published_date, strength, decay),
+            _tz_stripped_pub(a.published_date),
+        ),
         reverse=True,
     )
     return results
@@ -723,6 +756,10 @@ async def retrieve_and_rerank(
     when ``need_body`` is set they are fetched from Qdrant for the returned set.
     """
     q = fix_query(q)[0]  # typo-corrected query flows to cache key, legs, boost
+    # A recency intent ('latest', 'recent') weights freshness heavily in ranking
+    # so new articles outrank old evergreen ones; rolling windows ('this week')
+    # are already scoped by the date filter and need no extra ranking boost.
+    recency_boost = is_recency_intent(q)
     cache_key = f"retrieve:{q}:{top_k}:{_filter_token(qfilter)}"
     cached = await cache.get(cache_key)
     if cached is not None:
@@ -736,7 +773,7 @@ async def retrieve_and_rerank(
     reranked = await rerank(range_query_topic(q) or q, _merge_results(*groups))
     if config.ENABLE_ENTITY_BOOST:
         reranked = apply_entity_boost(range_query_topic(q) or q, reranked)
-    reranked = sort_results(reranked)
+    reranked = sort_results(reranked, recency_boost)
     if need_body:
         await _attach_bodies(reranked)
     # Bodies are deliberately excluded from the cache entry: they are large and
