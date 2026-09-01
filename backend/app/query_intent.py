@@ -569,16 +569,31 @@ def _strip_noise_words(query: str) -> str | None:
 _ACQUIRE_VERB_RE = re.compile(
     r"\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b", re.IGNORECASE
 )
+# An active acquisition predicate: the grammatical subject in front of it is the
+# buyer, so "<interrogative> <predicate> X" makes X the target.
+_ACTIVE_ACQ_PREDICATE = (
+    r"(?:has|have|had)\s+(?:acquired|bought|purchased|taken\s*over)"
+    r"|(?:is|are|was|were)\s+(?:acquiring|buying|taking\s*over|(?:the\s+)?acquirers?)"
+    r"|acquired|acquires|bought|buys|purchased|purchases|took\s*over|takes?\s*over"
+)
+# "who acquired X?" / "which company bought X?": the interrogative is the SUBJECT
+# of an active acquisition predicate, so the named company X is the target. The
+# predicate has to follow the interrogative directly, which keeps "who did X
+# acquire?" and "who was acquired by X?" -- where X is the buyer -- from matching.
 _WHO_ACQUIRED_RE = re.compile(
-    r"\b(who|whom|which\s+(?:company|firm|business))\b.*\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b",
+    rf"\b(?:who|which\s+(?:compan(?:y|ies)|firms?|business(?:es)?))\s+(?:{_ACTIVE_ACQ_PREDICATE})\b",
     re.IGNORECASE,
 )
 _ACQUIRED_BY_RE = re.compile(
     r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b[^.?!]*?\b(who|whom)\b",
     re.IGNORECASE,
 )
+# "who did X acquire?" / "which company was acquired by X?": the interrogative
+# stands for the counterpart, so the named company X is the buyer.
 _BUYER_AUX_RE = re.compile(
-    r"\b(what|which)\b.*\b(did|has|have|is|are|was|were)\b", re.IGNORECASE
+    r"\b(?:who|whom|what|which\s+\w+)\b[^.?!]*?\b(?:did|does|do|has|have|had|is|are|was|were)\b"
+    r"[^.?!]*?\b(acquir\w+|bought|buys?|buying|purchas\w+|take\s*over|taken\s*over|took\s*over|takeover)\b",
+    re.IGNORECASE,
 )
 _BUYER_TRAILING_RE = re.compile(
     r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b.*\b(what|whom|who)\b",
@@ -596,6 +611,9 @@ def acquisition_relation(query: str) -> str | None:
     """
     if not _ACQUIRE_VERB_RE.search(query):
         return None
+    # Target patterns are the stricter ones, so they are tested first: "who has
+    # acquired X?" is a target query even though the looser buyer pattern would
+    # also match its "who ... has ... acquired" shape.
     if _WHO_ACQUIRED_RE.search(query) or _ACQUIRED_BY_RE.search(query):
         return "target"
     if _BUYER_AUX_RE.search(query) or _BUYER_TRAILING_RE.search(query):
