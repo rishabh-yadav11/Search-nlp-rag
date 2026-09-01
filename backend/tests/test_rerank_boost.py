@@ -101,3 +101,54 @@ def test_input_not_mutated():
 def test_boost_constants():
     assert BOOST_TITLE == 1.25
     assert BOOST_SUMMARY == 1.10
+
+
+def test_multiword_entity_kept_distinct_not_bare_headword():
+    # "Banyan Netfaqs Pvt Ltd" must resolve to the single entity "banyan
+    # netfaqs", never the bare token "banyan" that would conflate it with
+    # "Banyan Tree Finance" / "Banyan Green".
+    ents = extract_entities("What is the latest news about Banyan Netfaqs Pvt Ltd?")
+    assert "banyan netfaqs" in ents
+    assert "banyan" not in ents
+    assert "netfaqs" not in ents
+    assert "pvt" not in ents
+    assert "ltd" not in ents
+
+
+def test_sector_noun_not_over_expanded():
+    # The generic sector phrase "consumer internet" must not emit bare tokens
+    # ("consumer", "internet") that over-boost unrelated articles.
+    ents = extract_entities("What is the outlook for the consumer internet sector?")
+    assert "consumer" not in ents
+    assert "internet" not in ents
+
+
+def test_capitalized_sector_phrase_not_over_expanded():
+    # Realistic capitalized input hits the multi-word run path. A leading generic
+    # noun ("Consumer") and trailing generic noun ("Sector") must be stripped, and
+    # the surviving bare "internet" must not be emitted as a spurious entity that
+    # over-boosts every internet-sector article.
+    ents = extract_entities("What is the outlook for the Consumer Internet Sector?")
+    assert "consumer" not in ents
+    assert "internet" not in ents
+    assert "sector" not in ents
+
+
+def test_suffix_only_phrase_yields_no_entity():
+    # "Pvt Ltd" / "Co Ltd" leave only a bare suffix/head token after stripping and
+    # must not produce spurious short entities ("pvt"/"co").
+    assert "pvt" not in extract_entities("Pvt Ltd leads funding")
+    assert "co" not in extract_entities("Co Ltd acquisition")
+
+
+def test_known_brand_survives_subsuming_run():
+    # A brand must stay even when a longer non-brand run contains it.
+    ents = extract_entities("Ola Electric IPO price band")
+    assert "ola electric" in ents
+
+
+def test_single_unknown_capitalized_word_not_an_entity():
+    # "Latest" / "Funding" alone (not part of a multi-word proper noun) are
+    # common nouns, not entities.
+    assert "funding" not in extract_entities("Latest funding news round")
+    assert "latest" not in extract_entities("Latest funding news round")
