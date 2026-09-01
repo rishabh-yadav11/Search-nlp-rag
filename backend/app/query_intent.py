@@ -82,6 +82,22 @@ _TOP_N_RE = re.compile(
 )
 _TOP_HINT_RE = re.compile(r"\b(best|leading|biggest|largest|top)\b", re.IGNORECASE)
 _DEFAULT_LIST_K = 10
+# Superlative/aggregation hints beyond the plain list words. These signal the
+# user wants a ranked/aggregated answer over many items ("biggest funding
+# rounds", "highest valued startups", "most active investors") rather than a
+# single fact. "most" only counts when it precedes an aggregation noun
+# (active/funded/valued/...): bare "most" is far too common ("most of the time").
+# "least" is a genuine superlative ("least funded"), but the common threshold
+# phrase "at least" must NOT be treated as one, so we negative-lookbehind "at ".
+_SUPERLATIVE_ALT = r"biggest|largest|highest|greatest|maximum|smallest|lowest|(?<!at\s)least"
+_AGG_NOUN_ALT = (
+    r"active|funded|funding|invested|investing|investments?|valuable|valued|"
+    r"profitable|raised|successful|mentioned|cited|covered|popular|influential|"
+    r"deal(s|making)?|acquisitive"
+)
+_SUPERLATIVE_RE = re.compile(
+    rf"\b({_SUPERLATIVE_ALT})\b|\bmost\s+({_AGG_NOUN_ALT})\b", re.IGNORECASE
+)
 # Filler/time words dropped when extracting a bare topic from a query
 _NOISE_WORDS_RE = re.compile(
     r"\bof\b|\bin\b|\bfor\b|\bto\b|\bmonth\b|\bmonths\b|\byear\b|\byears\b|\bflashback\b",
@@ -574,15 +590,33 @@ def normalize_word_numbers(query: str) -> str:
 def suggested_top_k(query: str) -> int | None:
     """Suggested top_k from a 'top N' in the query (digit or word form, e.g.
     'top ten'), or a small default for a generic top/best intent without a
-    number. None when no list intent."""
+    number. Also defaults for a superlative/aggregation intent ('biggest
+    funding rounds', 'most active investors') so chat fetches enough articles
+    to aggregate into a ranked list. None when no list intent."""
     m = _TOP_N_RE.search(query)
     if m:
         n = _top_n_to_int(m.group(2))
         if n is not None:
             return n
-    if _TOP_HINT_RE.search(query):
+    if _TOP_HINT_RE.search(query) or _is_superlative(query):
         return _DEFAULT_LIST_K
     return None
+
+
+def _is_superlative(query: str) -> bool:
+    """True when the query uses a superlative/aggregation phrase ('biggest',
+    'highest', 'most active'), independent of any explicit 'top N' count."""
+    return bool(_SUPERLATIVE_RE.search(query))
+
+
+def is_aggregation_intent(query: str) -> bool:
+    """True when the query asks for a ranked/aggregated answer over many items
+    (a 'top N' count, a top/best/leading hint, or a superlative like 'biggest
+    funding rounds' / 'most active investors'), so chat must present a ranked
+    top-N with the metric that justifies the ordering rather than isolated
+    single items. Used to widen the retrieved source set and to trigger the
+    ranked-list prompt and refusal nudge."""
+    return suggested_top_k(query) is not None
 
 
 def _strip_time_tokens(text: str) -> str:
