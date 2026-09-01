@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders, getToken } from '../lib/auth'
 import type { MouseEvent } from 'react'
+import styles from './page.module.css'
 
 interface Article {
   id: number | string
@@ -98,27 +99,27 @@ export default function ForYouPage() {
   }
 
   return (
-    <div className="for-you-page">
-      <div className="for-you-header">
+    <div className={styles['for-you-page']}>
+      <div className={styles['for-you-header']}>
         <h1>For You</h1>
-        <div className="for-you-tabs">
+        <div className={styles['for-you-tabs']}>
           <button
             type="button"
-            className={`tab ${feedType === 'personalized' ? 'active' : ''}`}
+            className={`${styles.tab} ${feedType === 'personalized' ? styles.active : ''}`}
             onClick={() => setFeedType('personalized')}
           >
             Recommended
           </button>
           <button
             type="button"
-            className={`tab ${feedType === 'trending' ? 'active' : ''}`}
+            className={`${styles.tab} ${feedType === 'trending' ? styles.active : ''}`}
             onClick={() => setFeedType('trending')}
           >
             Trending
           </button>
           <button
             type="button"
-            className={`tab ${feedType === 'latest' ? 'active' : ''}`}
+            className={`${styles.tab} ${feedType === 'latest' ? styles.active : ''}`}
             onClick={() => setFeedType('latest')}
           >
             Latest
@@ -127,20 +128,20 @@ export default function ForYouPage() {
       </div>
 
       {coldStart && (
-        <div className="cold-start-notice">
+        <div className={styles['cold-start-notice']}>
           You have not interacted with any articles yet. We are showing the latest stories.
           Start clicking on articles to get personalized recommendations!
         </div>
       )}
 
       {loading ? (
-        <div className="feed-loading">Loading...</div>
+        <div className={styles.loading}>Loading...</div>
       ) : error ? (
-        <div className="feed-error">{error}</div>
+        <div className={styles.error}>{error}</div>
       ) : articles.length === 0 ? (
-        <div className="feed-empty">No articles found.</div>
+        <div className={styles.empty}>No articles found.</div>
       ) : (
-        <div className="feed-grid">
+        <div className={styles['articles-grid']}>
           {articles.map((article) => (
             <ArticleCard
               key={article.id}
@@ -162,24 +163,24 @@ function ArticleCard({
   onInteraction: (e: MouseEvent) => void
 }) {
   return (
-    <div className="feed-card" onClick={onInteraction}>
-      <Link href={article.url} target="_blank" rel="noopener noreferrer" className="feed-card-link">
-        <div className="feed-card-content">
-          <h2 className="feed-card-title">{article.title}</h2>
+    <div className={styles['article-card']} onClick={onInteraction}>
+      <Link href={article.url} target="_blank" rel="noopener noreferrer" className={styles['article-link']}>
+        <div className={styles['article-content']}>
+          <h2 className={styles['article-title']}>{article.title}</h2>
           {article.summary && (
-            <p className="feed-card-summary">{article.summary}</p>
+            <p className={styles['article-summary']}>{article.summary}</p>
           )}
-          <div className="feed-card-meta">
+          <div className={styles['article-meta']}>
             {article.category && (
-              <span className="feed-card-category">{article.category}</span>
+                <span className={styles['article-category']}>{article.category}</span>
             )}
             {article.industry_names && article.industry_names.length > 0 && (
-              <span className="feed-card-industry">
+              <span>
                 {article.industry_names.slice(0, 2).join(', ')}
               </span>
             )}
             {article.published_date && (
-              <span className="feed-card-date">
+              <span>
                 {new Date(article.published_date).toLocaleDateString()}
               </span>
             )}

@@ -2,19 +2,19 @@
 .similar-articles {
   margin-top: 1.5rem;
   padding-top: 1.5rem;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--line);
 }
 
 .similar-articles-compact {
   margin-top: 1rem;
   padding-top: 0.75rem;
-  border-top: 1px solid #f3f4f6;
+  border-top: 1px solid var(--line-dark);
 }
 
 .similar-heading {
   font-size: 0.85rem;
   font-weight: 600;
-  color: #666;
+  color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-bottom: 0.75rem;
@@ -38,19 +38,19 @@
 }
 
 .similar-item:hover {
-  background: #f9fafb;
+  background: var(--card-bg);
 }
 
 .similar-title {
   font-size: 0.875rem;
-  color: #111;
+  color: var(--ink);
   line-height: 1.4;
 }
 
 .similar-category {
   font-size: 0.75rem;
-  color: #666;
-  background: #f3f4f6;
+  color: var(--muted);
+  background: var(--card-border);
   padding: 0.15rem 0.4rem;
   border-radius: 4px;
   margin-left: 0.5rem;
@@ -59,7 +59,7 @@
 .similar-card {
   display: block;
   padding: 1rem;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--line);
   border-radius: 8px;
   text-decoration: none;
   color: inherit;
@@ -67,7 +67,7 @@
 }
 
 .similar-card:hover {
-  border-color: #d1d5db;
+  border-color: var(--line-dark);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
 }
 
@@ -85,7 +85,7 @@
 
 .similar-card-summary {
   font-size: 0.85rem;
-  color: #555;
+  color: var(--ink-2);
   margin: 0;
   line-height: 1.5;
 }
@@ -94,11 +94,11 @@
   display: flex;
   gap: 0.75rem;
   font-size: 0.75rem;
-  color: #888;
+  color: var(--muted);
 }
 
 .similar-card-category {
-  background: #f3f4f6;
+  background: var(--card-border);
   padding: 0.15rem 0.4rem;
   border-radius: 4px;
 }
@@ -107,22 +107,22 @@
   margin-top: 0.75rem;
   padding: 0.4rem 0.75rem;
   background: none;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--line-dark);
   border-radius: 6px;
   font-size: 0.8rem;
-  color: #666;
+  color: var(--muted);
   cursor: pointer;
   transition: all 0.15s;
 }
 
 .similar-show-more:hover {
-  background: #f9fafb;
-  border-color: #9ca3af;
-  color: #111;
+  background: var(--card-bg);
+  border-color: var(--muted);
+  color: var(--ink);
 }
 
 .similar-loading {
   font-size: 0.75rem;
-  color: #999;
+  color: var(--muted);
   font-style: italic;
 }
