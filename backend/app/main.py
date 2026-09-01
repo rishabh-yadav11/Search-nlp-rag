@@ -43,6 +43,9 @@ from app.health import router as health_router
 from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
+    extract_content_type as _classify_content_type,
+)
+from app.query_intent import (
     extract_list_topic,
     extract_year_range,
     normalize_word_numbers,
@@ -81,6 +84,9 @@ logger = logging.getLogger(__name__)
 # the live index, not from hard-coded assumptions.
 _DEALTYPE_FACETS: dict[str, str] = {}
 _INDUSTRY_FACETS: dict[str, str] = {}
+# Live `content_type` vocabulary (article/interview/video in the corpus), populated
+# from Qdrant at startup so content-type intent resolves only to real values.
+_CONTENT_TYPE_FACETS: dict[str, str] = {}
 
 # Natural-language synonyms -> the facet keyword used to resolve against the live
 # vocabulary. Whole-word matched against the query; the keyword is then looked up
@@ -186,11 +192,34 @@ def extract_industry(query: str) -> str | None:
     return _resolve_facet(query, _INDUSTRY_ALIASES, _INDUSTRY_FACETS)
 
 
+def extract_content_type(query: str) -> str | None:
+    """Map a content-type intent modifier to a real ``content_type`` facet value
+    (e.g. 'interviews with X' -> 'interview', 'founders of Y' -> 'founder'), or
+    None. The bare modifier is classified in query_intent and promoted here to a
+    real facet value from the live ``content_type`` vocabulary (exact, then
+    substring), so an unknown corpus degrades to no filter (current behavior)."""
+    kw = _classify_content_type(query)
+    if kw is None:
+        return None
+    if kw in _CONTENT_TYPE_FACETS:
+        return _CONTENT_TYPE_FACETS[kw]
+    # Substring fallback: prefer the tightest (shortest) normalized facet value
+    # containing the keyword so the choice is deterministic, not dict-order bound.
+    candidates = [orig for norm, orig in _CONTENT_TYPE_FACETS.items() if kw in norm]
+    if candidates:
+        return min(candidates, key=lambda o: (len(o), o.lower()))
+    return None
+
+
 async def _load_facet_maps() -> None:
     """Populate the live dealtype/industry facet maps from Qdrant so category
     extraction emits only real facet values. Failures leave the maps empty, which
     makes extraction a no-op (current behavior) — startup never depends on this."""
-    for target, key in ((_DEALTYPE_FACETS, "dealtype_names"), (_INDUSTRY_FACETS, "industry_names")):
+    for target, key in (
+        (_DEALTYPE_FACETS, "dealtype_names"),
+        (_INDUSTRY_FACETS, "industry_names"),
+        (_CONTENT_TYPE_FACETS, "content_type"),
+    ):
         try:
             values = await _facet_values(key)
         except Exception:  # noqa: BLE001 - degraded mode, never crash startup
@@ -273,6 +302,7 @@ class SourceArticle(BaseModel):
     author_names: list[str] = []
     industry_names: list[str] = []
     dealtype_names: list[str] = []
+    content_type: str | None = None
     score: float
 
 
@@ -289,6 +319,7 @@ class SourceSummary(BaseModel):
     author_names: list[str] = []
     industry_names: list[str] = []
     dealtype_names: list[str] = []
+    content_type: str | None = None
     score: float
 
 
@@ -312,6 +343,7 @@ def to_summary(a: SourceArticle) -> SourceSummary:
         author_names=a.author_names,
         industry_names=a.industry_names,
         dealtype_names=a.dealtype_names,
+        content_type=a.content_type,
     )
 
 
@@ -327,6 +359,7 @@ def _article_to_dict(a: SourceArticle) -> dict:
         "author_names": a.author_names,
         "industry_names": a.industry_names,
         "dealtype_names": a.dealtype_names,
+        "content_type": a.content_type,
         "score": a.score,
     }
 
@@ -354,10 +387,16 @@ def build_facet_filter(
     author: str | None,
     from_date: str | None,
     to_date: str | None,
+    content_type: str | None = None,
 ) -> Filter | None:
     """Qdrant filter for the faceted search params, or None when unfiltered."""
     conditions = []
-    for key, raw in (("industry_names", industry), ("dealtype_names", dealtype), ("author_names", author)):
+    for key, raw in (
+        ("industry_names", industry),
+        ("dealtype_names", dealtype),
+        ("author_names", author),
+        ("content_type", content_type),
+    ):
         if raw:
             values = [v.strip() for v in raw.split(",") if v.strip()]
             if values:
@@ -384,8 +423,9 @@ def facet_cache_token(
     author: str | None,
     from_date: str | None,
     to_date: str | None,
+    content_type: str | None = None,
 ) -> str:
-    return f"{industry or ''}|{dealtype or ''}|{author or ''}|{from_date or ''}|{to_date or ''}"
+    return f"{industry or ''}|{dealtype or ''}|{author or ''}|{from_date or ''}|{to_date or ''}|{content_type or ''}"
 
 
 def _effective_intent(
@@ -408,7 +448,9 @@ def _effective_intent(
     years, quarters) are stripped from the retrieval query because the date filter
     already scopes the window; the natural phrasing (e.g. 'funding news') is kept
     so the embedding/rerank match stays strong, while the facet filter (when one
-    resolves) still scopes results."""
+    resolves) still scopes results. The content-type modifier (interviews/
+    founders/etc.) is derived separately by extract_content_type so the facet maps
+    can stay cold-start-safe and the call sites control its fallback."""
     q = normalize_word_numbers(q)
     retrieval_q, _ = rewrite_year_in_review(q)
     dealtype = extract_dealtype(q)
@@ -468,6 +510,7 @@ _PAYLOAD_FIELDS = [
     "author_names",
     "industry_names",
     "dealtype_names",
+    "content_type",
 ]
 
 
@@ -534,6 +577,7 @@ async def hybrid_search(
             author_names=payload.get("author_names") or [],
             industry_names=payload.get("industry_names") or [],
             dealtype_names=payload.get("dealtype_names") or [],
+            content_type=payload.get("content_type") or None,
             score=p.score,
         )
         for p in result.points
@@ -761,24 +805,26 @@ async def retrieve_with_auto_facet_fallback(
     industry: str | None,
     dealtype: str | None,
     author: str | None,
+    content_type: str | None = None,
     eff_from: str | None,
     eff_to: str | None,
     auto_industry: str | None,
     auto_dealtype: str | None,
+    auto_content_type: str | None = None,
     need_body: bool = False,
-) -> tuple[list[SourceArticle], str | None, str | None]:
+) -> tuple[list[SourceArticle], str | None, str | None, str | None]:
     """Retrieve with the effective (explicit-or-auto) category facets applied,
     and fall back to dropping an *auto* facet when it zeroes out an otherwise
-    valid query. Returns ``(results, final_industry, final_dealtype)`` where the
-    final facets reflect any fallback, so callers can key caches/notes on what
-    was actually retrieved.
+    valid query. Returns ``(results, final_industry, final_dealtype,
+    final_content_type)`` where the final facets reflect any fallback, so callers
+    can key caches/notes on what was actually retrieved.
 
-    ``industry``/``dealtype`` are the caller-supplied (explicit) facets; when one
-    is None the matching ``auto_*`` value is used instead. An auto facet is a
-    *semantic* guess mapped onto the corpus's tag vocabulary (e.g. 'edtech' ->
-    the 'Education' industry facet). When the corpus tags most of those articles
-    differently (VCCircle tags edtech articles 'TMT', not 'Education'), the
-    exact-match industry filter combined with a date window returns nothing and
+    ``industry``/``dealtype``/``content_type`` are the caller-supplied (explicit)
+    facets; when one is None the matching ``auto_*`` value is used instead. An auto
+    facet is a *semantic* guess mapped onto the corpus's tag vocabulary (e.g.
+    'edtech' -> the 'Education' industry facet). When the corpus tags most of those
+    articles differently (VCCircle tags edtech articles 'TMT', not 'Education'),
+    the exact-match industry filter combined with a date window returns nothing and
     silently kills the query. Only an *empty* result set triggers the retry (the
     empty attempt is not cached), and only the auto facets are dropped: an
     explicit user-supplied facet and the date window always stay, so a genuinely
@@ -796,19 +842,21 @@ async def retrieve_with_auto_facet_fallback(
     """
     eff_industry = industry or auto_industry
     eff_dealtype = dealtype or auto_dealtype
-    qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to)
+    eff_content_type = content_type or auto_content_type
+    qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to, eff_content_type)
     results = await retrieve_and_rerank(retrieval_q, top_k, qfilter, need_body=need_body)
-    if results or not (auto_industry or auto_dealtype):
-        return results, eff_industry, eff_dealtype
+    if results or not (auto_industry or auto_dealtype or auto_content_type):
+        return results, eff_industry, eff_dealtype, eff_content_type
     # An auto facet zeroed the set: drop each auto facet that wasn't explicitly
     # supplied (an explicit facet is never dropped) and retry once.
     relaxed_industry = eff_industry if not (auto_industry and industry is None) else None
     relaxed_dealtype = eff_dealtype if not (auto_dealtype and dealtype is None) else None
-    relaxed = build_facet_filter(relaxed_industry, relaxed_dealtype, author, eff_from, eff_to)
+    relaxed_content_type = eff_content_type if not (auto_content_type and content_type is None) else None
+    relaxed = build_facet_filter(relaxed_industry, relaxed_dealtype, author, eff_from, eff_to, relaxed_content_type)
     if relaxed == qfilter:
-        return results, eff_industry, eff_dealtype
+        return results, eff_industry, eff_dealtype, eff_content_type
     relaxed_results = await retrieve_and_rerank(retrieval_q, top_k, relaxed, need_body=need_body)
-    return relaxed_results, relaxed_industry, relaxed_dealtype
+    return relaxed_results, relaxed_industry, relaxed_dealtype, relaxed_content_type
 
 
 @app.get("/search", response_model=SearchResponse)
@@ -818,25 +866,28 @@ async def search(
     industry: str | None = Query(None),
     dealtype: str | None = Query(None),
     author: str | None = Query(None),
+    content_type: str | None = Query(None),
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
 ):
     start = time.perf_counter()
     q_fixed, _ = fix_query(q)
     retrieval_q, eff_from, eff_to, auto_dealtype, auto_industry = _effective_intent(q_fixed, from_date, to_date)
+    auto_content_type = extract_content_type(q_fixed)
     # Auto-extracted category facets fill in only when the caller didn't pass an
     # explicit facet, so the UI filter (and /search callers) always win. The raw
     # explicit params are kept apart so the auto-facet fallback can tell whether
     # a facet was user-supplied (never dropped) or auto-derived (droppable).
-    explicit_industry, explicit_dealtype = industry, dealtype
+    explicit_industry, explicit_dealtype, explicit_content_type = industry, dealtype, content_type
     dealtype = dealtype or auto_dealtype
     industry = industry or auto_industry
+    content_type = content_type or auto_content_type
     # NOTE: query expansion happens exactly once inside retrieve_and_rerank ->
     # _retrieval_leg (which chat also uses), so we must NOT expand here too,
     # otherwise /search expands twice and diverges from the chat pipeline.
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
-    cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to)}"
-    filtered = any((industry, dealtype, author, from_date, to_date))
+    cache_key = f"search:{retrieval_q}:{eff_top_k}:{facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type)}"
+    filtered = any((industry, dealtype, author, content_type, from_date, to_date))
     cached_results = await cache.get(cache_key)
     if cached_results is not None:
         summaries = [SourceSummary.model_validate(d) for d in cached_results]
@@ -851,11 +902,13 @@ async def search(
     # with month/year tokens dilutes the cross-encoder and weak scores slip through.
     # The effective industry/dealtype may relax below if an auto facet zeroed the
     # result set; cache/note on the facets actually retrieved.
-    reranked, final_industry, final_dealtype = await retrieve_with_auto_facet_fallback(
+    reranked, final_industry, final_dealtype, final_content_type = await retrieve_with_auto_facet_fallback(
         retrieval_q, eff_top_k,
         industry=explicit_industry, dealtype=explicit_dealtype, author=author,
+        content_type=explicit_content_type,
         eff_from=eff_from, eff_to=eff_to,
         auto_industry=auto_industry, auto_dealtype=auto_dealtype,
+        auto_content_type=auto_content_type,
     )
     if config.ENABLE_CLICK_BOOST:
         reranked = await apply_click_boost(q_fixed, reranked)
@@ -871,7 +924,7 @@ async def search(
     # but their cache key (which still names the auto facet) would collide with
     # an explicit-facet request, so the /search cache is skipped for them (the
     # retrieve_and_rerank cache, keyed by the actual filter, still applies).
-    fell_back = final_industry != industry or final_dealtype != dealtype
+    fell_back = final_industry != industry or final_dealtype != dealtype or final_content_type != content_type
     if results and not fell_back:
         await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
     # `filtered` (computed above from the effective facets) is used unchanged so
