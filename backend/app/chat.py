@@ -1171,6 +1171,7 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         question=question,
         dataviz_max_rows=k,
         dataviz_view_instruction=_dataviz_view_instruction(question),
+        comparison_instruction="",
     )
     return PreparedTurn(
         answer=prompt,
@@ -1192,6 +1193,7 @@ async def _prepare_multi_entity_turn(
     nothing is common to all. The prompt gains a comparison/intersection
     instruction so the LLM produces a comparative answer."""
     from app.main import (
+        SourceArticle,
         _effective_intent,
         body_rescue,
         retrieve_with_auto_facet_fallback,
@@ -1200,22 +1202,25 @@ async def _prepare_multi_entity_turn(
     )
 
     k = _effective_chat_k(" ".join(multi.entities + [multi.scaffold]))
-    per_entity: list[list] = []
+    per_entity: list[list[SourceArticle]] = []
     for entity in multi.entities:
         sub_query = (entity + " " + multi.scaffold).strip()
         rq, eff_from, eff_to, dealtype, industry = _effective_intent(sub_query, None, None)
-        reranked, _, _ = await retrieve_with_auto_facet_fallback(
+        reranked, final_dealtype, final_industry, final_content_type = await retrieve_with_auto_facet_fallback(
             rq, k,
             industry=None, dealtype=None, author=None,
             eff_from=eff_from, eff_to=eff_to,
             auto_industry=industry, auto_dealtype=dealtype,
+            auto_content_type=None,
             need_body=True,
         )
         if config.ENABLE_BODY_RESCUE:
             reranked = await body_rescue(sub_query, reranked)
-        per_entity.append([a for a in reranked if a.score >= config.ASK_MIN_SCORE])
+        faceted = bool(final_dealtype or final_industry or final_content_type)
+        gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
+        per_entity.append([a for a in reranked if a.score >= gate])
 
-    by_id: dict[int, object] = {}
+    by_id: dict[int, SourceArticle] = {}
     id_entities: dict[int, list[str]] = {}
     for entity, results in zip(multi.entities, per_entity):
         for a in results:
@@ -1381,6 +1386,7 @@ are `"not stated"`, and set `"value_column"` to `null`.
 - If two articles conflict on a fact (e.g. different deal values), surface both with their citations \
 rather than silently picking one.
 - Keep answers concise by default; expand only as far as the articles support.
+{comparison_instruction}
 
 Conversation so far:
 {history}
