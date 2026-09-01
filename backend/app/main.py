@@ -799,6 +799,9 @@ async def retrieve_with_auto_facet_fallback(
     qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to)
     results = await retrieve_and_rerank(retrieval_q, top_k, qfilter, need_body=need_body)
     if results or not (auto_industry or auto_dealtype):
+        results = await _temporal_date_fallback(
+            results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, need_body
+        )
         return results, eff_industry, eff_dealtype
     # An auto facet zeroed the set: drop each auto facet that wasn't explicitly
     # supplied (an explicit facet is never dropped) and retry once.
@@ -806,9 +809,104 @@ async def retrieve_with_auto_facet_fallback(
     relaxed_dealtype = eff_dealtype if not (auto_dealtype and dealtype is None) else None
     relaxed = build_facet_filter(relaxed_industry, relaxed_dealtype, author, eff_from, eff_to)
     if relaxed == qfilter:
+        results = await _temporal_date_fallback(
+            results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, need_body
+        )
         return results, eff_industry, eff_dealtype
     relaxed_results = await retrieve_and_rerank(retrieval_q, top_k, relaxed, need_body=need_body)
+    relaxed_results = await _temporal_date_fallback(
+        relaxed_results, top_k, eff_from, eff_to, relaxed_industry, relaxed_dealtype, author, need_body
+    )
     return relaxed_results, relaxed_industry, relaxed_dealtype
+
+
+# A temporal query whose lexical signal is too weak to pass the chat relevance
+# gate (e.g. 'what happened in May 2021', which strips down to 'what happened')
+# still needs to surface something. Below this many relevance-passing hits within
+# a date window, the window's own recency-sorted articles are used to fill it.
+_TEMPORAL_FALLBACK_MIN = 3
+
+
+async def _temporal_date_fallback(
+    results: list[SourceArticle],
+    top_k: int,
+    from_date: str | None,
+    to_date: str | None,
+    industry: str | None,
+    dealtype: str | None,
+    author: str | None,
+    need_body: bool,
+) -> list[SourceArticle]:
+    """When a date-scoped query has too few relevance-passing hits, fill the gap
+    with the window's most recent articles (retrieved purely by date, ignoring the
+    weak lexical query).
+
+    A temporal query's date window IS the intent, so recency within that window
+    is a valid relevance signal even when the words carry no lexical match. Returns
+    ``results`` unchanged when no date window is set, when enough hits already
+    pass, or when the date window itself is empty."""
+    if not (from_date or to_date):
+        return results
+    strong = [r for r in results if r.score >= config.ASK_MIN_SCORE]
+    if len(strong) >= min(_TEMPORAL_FALLBACK_MIN, top_k):
+        return results
+    date_only = await retrieve_by_date_window(
+        top_k, from_date, to_date,
+        industry=industry, dealtype=dealtype, author=author, need_body=need_body,
+    )
+    if not date_only:
+        return results
+    merged = _merge_results(results, date_only)
+    return sort_results(merged)[:top_k]
+
+
+async def retrieve_by_date_window(
+    top_k: int,
+    from_date: str | None,
+    to_date: str | None,
+    *,
+    industry: str | None = None,
+    dealtype: str | None = None,
+    author: str | None = None,
+    need_body: bool = False,
+) -> list[SourceArticle]:
+    """Date-scoped retrieval that ignores the lexical query entirely: returns the
+    most recent articles published in [from_date, to_date], optionally narrowed by
+    category facets. Used as the temporal fallback when lexical matching is too
+    weak to surface anything — recency within the window becomes the relevance
+    signal. Articles are scored by recency so they clear the chat relevance gate
+    and sort newest-first."""
+    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
+    if qfilter is None:
+        return []
+    points, _ = await state["qdrant"].scroll(
+        collection_name=config.QDRANT_COLLECTION,
+        scroll_filter=qfilter,
+        limit=max(top_k, config.RERANK_CANDIDATES),
+        with_payload=_PAYLOAD_FIELDS,
+        with_vectors=False,
+    )
+    if not points:
+        return []
+    articles = [
+        SourceArticle(
+            id=p.id,
+            title=(payload := p.payload or {}).get("title", ""),
+            url=payload.get("url", ""),
+            published_date=payload.get("published_date"),
+            category=payload.get("category"),
+            summary=payload.get("summary", ""),
+            body="",
+            author_names=payload.get("author_names") or [],
+            industry_names=payload.get("industry_names") or [],
+            dealtype_names=payload.get("dealtype_names") or [],
+            score=_recency_multiplier(payload.get("published_date")),
+        )
+        for p in points
+    ]
+    if need_body:
+        await _attach_bodies(articles)
+    return sort_results(articles)[:top_k]
 
 
 @app.get("/search", response_model=SearchResponse)
