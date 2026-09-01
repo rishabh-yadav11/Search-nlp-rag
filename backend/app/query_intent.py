@@ -391,6 +391,19 @@ def _days_ago_iso(days: int) -> str:
     return (_today() - timedelta(days=days)).isoformat()
 
 
+def _month_start_iso() -> str:
+    """ISO date of the first day of the current (Indian) month. Used to anchor
+    'this month' to the calendar boundary so prior-month articles are excluded."""
+    return _today().replace(day=1).isoformat()
+
+
+def _week_start_iso() -> str:
+    """ISO date of Monday of the current week (Indian 'now'). Used to anchor
+    'this week' to the calendar boundary so last week's articles are excluded."""
+    t = _today()
+    return (t - timedelta(days=t.weekday())).isoformat()
+
+
 def extract_recency_range(query: str) -> tuple[str, str] | None:
     """(from_date, to_date) ISO strings for a rolling recency window in the
     query ('this week', 'this month', 'today', 'past 3 days', '2 weeks ago'), or
@@ -407,6 +420,13 @@ def extract_recency_range(query: str) -> tuple[str, str] | None:
     text = m.group(0).lower()
     if "today" in text:
         return (_days_ago_iso(0), _today().isoformat())
+    # 'this week'/'this month' anchor to the calendar boundary of the current
+    # week/month so prior-period articles are excluded; other week/month forms
+    # ('past week', 'last month') keep their rolling window semantics.
+    if "this week" in text:
+        return (_week_start_iso(), _today().isoformat())
+    if "this month" in text:
+        return (_month_start_iso(), _today().isoformat())
     if "week" in text:
         return (_days_ago_iso(7), _today().isoformat())
     if "month" in text:
@@ -418,6 +438,14 @@ def strip_recency_window(query: str) -> str:
     """Remove rolling-window recency phrases ('this week', 'today', 'past 3 days')
     from a query, leaving the bare topic text for retrieval."""
     return _RECENCY_WINDOW_RE.sub(" ", query).strip()
+
+
+def strip_recency_intent(query: str) -> str:
+    """Remove soft recency/freshness signals ('latest', 'recent', 'fresh') from a
+    query, leaving the bare topic text for retrieval. The recency intent for
+    ranking (``is_recency_intent``) must be detected on the original query, so
+    this only affects retrieval text, never intent detection."""
+    return _RECENCY_INTENT_RE.sub(" ", query).strip()
 
 
 def is_recency_intent(query: str) -> bool:
