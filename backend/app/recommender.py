@@ -539,7 +539,7 @@ def _entity_acquisition_role(text: str, entity: str) -> bool | None:
     ):
         return False
     if re.search(
-        rf"\b{e}\b[^.?!]*?\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b",
+        rf"\b{e}\b[^.?!]*?\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b(?=\s+[A-Z])",
         text, re.IGNORECASE,
     ):
         return False
@@ -582,20 +582,24 @@ def rerank_acquisition_relation(query: str, results: list, direction: str | None
             role = _entity_acquisition_role(text, e)
             if role is not None:
                 break
-        if role is None:
-            new_score = r.score
+        score = getattr(r, "score", None)
+        if score is None:
+            new_score = 0.0
+        elif role is None:
+            new_score = score
         elif direction == "target" and role is False:
-            new_score = r.score * PROMOTE
+            new_score = score * PROMOTE
         elif direction == "target" and role is True:
-            new_score = r.score * DEMOTE
+            new_score = score * DEMOTE
         elif direction == "buyer" and role is True:
-            new_score = r.score * PROMOTE
+            new_score = score * PROMOTE
         elif direction == "buyer" and role is False:
-            new_score = r.score * DEMOTE
+            new_score = score * DEMOTE
         else:
-            new_score = r.score
+            new_score = score
         clone = copy.copy(r)
         clone.score = new_score
         scored.append((new_score, clone))
     scored.sort(key=lambda t: t[0], reverse=True)
     return [clone for _, clone in scored]
+
