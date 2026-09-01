@@ -429,12 +429,27 @@ def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
 
     Used to combine the raw RRF-candidate sets from the Flashback and bare-topic
     retrieval legs *before* a single cross-encoder rerank against the original
-    query, so scores remain comparable across legs."""
+    query, so scores remain comparable across legs.
+
+    A body-less entry is never allowed to override a body-bearing entry sharing
+    the same id (e.g. a date-only fallback filler must not shadow a lexical hit
+    that carries the article body chat needs). When one side has a body and the
+    other does not, the body-bearing entry wins regardless of score; otherwise
+    the higher score wins."""
     best: dict[int, SourceArticle] = {}
     for group in groups:
         for a in group:
             prev = best.get(a.id)
-            if prev is None or a.score > prev.score:
+            if prev is None:
+                best[a.id] = a
+                continue
+            prev_has_body = bool(prev.body)
+            a_has_body = bool(a.body)
+            if a_has_body and not prev_has_body:
+                best[a.id] = a
+            elif prev_has_body and not a_has_body:
+                continue
+            elif a.score > prev.score:
                 best[a.id] = a
     return list(best.values())
 
@@ -826,6 +841,13 @@ async def retrieve_with_auto_facet_fallback(
 # a date window, the window's own recency-sorted articles are used to fill it.
 _TEMPORAL_FALLBACK_MIN = 3
 
+# Date-only fallback fillers score at a modest floor: at/below the chat relevance
+# gate but strictly below the typical lexical/cross-encoder relevance band (real
+# relevant hits sigmoid-score well above the gate). This lets fillers still clear
+# the chat gate and surface in context without ever outranking a genuine lexical
+# match, and (via _merge_results' body preference) never drops an article body.
+_DATE_FILLER_SCORE = config.ASK_MIN_SCORE
+
 
 async def _temporal_date_fallback(
     results: list[SourceArticle],
@@ -879,24 +901,20 @@ async def retrieve_by_date_window(
     qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
     if qfilter is None:
         return []
-    # Qdrant `scroll` returns points in ID/storage order (no recency guarantee),
-    # so a limited scroll would surface an arbitrary subset of the window. Page
-    # through the entire window and sort explicitly by published date descending
-    # so the most-recent articles are selected rather than an ID-ordered slice.
-    points: list = []
-    next_offset: object | None = None
-    while True:
-        page, next_offset = await state["qdrant"].scroll(
-            collection_name=config.QDRANT_COLLECTION,
-            scroll_filter=qfilter,
-            offset=next_offset,
-            limit=config.RERANK_CANDIDATES,
-            with_payload=_PAYLOAD_FIELDS,
-            with_vectors=False,
-        )
-        points.extend(page)
-        if not page or next_offset is None:
-            break
+    # `published_date` carries a DATETIME payload index, so `order_by` returns the
+    # window's most-recent `top_k` articles directly — no full-window
+    # materialization (a year-wide window could otherwise page millions of points
+    # into memory). This bounds the work to O(top_k) while still selecting by true
+    # recency rather than an arbitrary ID-ordered slice.
+    points, _ = await state["qdrant"].scroll(
+        collection_name=config.QDRANT_COLLECTION,
+        scroll_filter=qfilter,
+        limit=top_k,
+        offset=None,
+        order_by={"key": "published_date", "direction": "desc"},
+        with_payload=_PAYLOAD_FIELDS,
+        with_vectors=False,
+    )
     if not points:
         return []
     articles = [
@@ -914,7 +932,8 @@ async def retrieve_by_date_window(
             # Score on a recency-agnostic base; the recency multiplier is applied
             # exactly once in sort_results so merged results share one scale with
             # lexical (cross-encoder) hits instead of double-counting recency.
-            score=1.0,
+            # _DATE_FILLER_SCORE keeps these below genuine lexical hits.
+            score=_DATE_FILLER_SCORE,
         )
         for p in points
     ]
@@ -924,7 +943,7 @@ async def retrieve_by_date_window(
         key=lambda a: (_tz_stripped_pub(a.published_date),),
         reverse=True,
     )
-    return sort_results(articles)[:top_k]
+    return articles[:top_k]
 
 
 @app.get("/search", response_model=SearchResponse)
