@@ -9,6 +9,10 @@ from app.config import config
 
 logger = logging.getLogger("llm")
 
+# Upper bound (seconds) on a provider-supplied Retry-After wait so a huge or
+# malformed hint can never make a chat/SSE request hang instead of failing fast.
+MAX_BACKOFF_SECONDS = 60
+
 
 class LLMUnavailableError(Exception):
     """Raised when the LLM cannot be reached, after retries are exhausted."""
@@ -37,6 +41,29 @@ class LLMResult:
             + self.completion_tokens / 1_000_000 * config.LLM_PRICE_OUTPUT_PER_1M
         )
         return usd * config.INR_PER_USD
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Provider's suggested backoff (seconds) from a 429 ``Retry-After`` header.
+
+    Returns None when the error carries no usable hint, so the caller falls back
+    to its own exponential backoff. Only consulted for transient failures, so a
+    hinted wait never applies to non-retryable errors."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    headers = getattr(resp, "headers", None) or {}
+    value = headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.debug("Unparseable Retry-After header %r; ignoring hint", value)
+        return None
+    if parsed <= 0:
+        return None
+    return min(parsed, MAX_BACKOFF_SECONDS)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -82,6 +109,9 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
             if not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
                 raise LLMUnavailableError() from exc
             delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
             delay += random.uniform(0, delay * 0.5)
             logger.warning(
                 "LLM call failed on attempt %d/%d (%s); retrying in %.1fs",
@@ -141,6 +171,9 @@ async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list 
             if started or not _is_retryable(exc) or attempt >= config.LLM_MAX_RETRIES:
                 raise LLMUnavailableError() from exc
             delay = config.LLM_RETRY_BACKOFF * (2**attempt)
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = max(delay, retry_after)
             delay += random.uniform(0, delay * 0.5)
             logger.warning(
                 "LLM stream failed on attempt %d/%d (%s); retrying in %.1fs",
