@@ -1975,6 +1975,40 @@ def test_prepare_turn_faceted_low_score_surfaces(monkeypatch):
     assert turn.note is None
 
 
+def test_prepare_turn_multiple_moderate_sources_not_weak(monkeypatch):
+    """Regression (issue #196): a query whose several on-topic sources each
+    score only modestly above the inclusion gate (but below TOP_WEAK_THRESHOLD)
+    must still be answered, not refused as 'weakly related'. Retrieval with
+    several relevant sources is genuinely sufficient."""
+    from app import main
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: (q, None, None, None, None))
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        return [
+            SourceArticle(id=i, title=f"t{i}", url=f"u{i}", published_date="2025-06-10",
+                          summary="s", body="b", score=0.25)
+            for i in range(1, 6)
+        ]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    turn = _run(chat_module._prepare_turn("broad but moderate topic", []))
+    assert turn.needs_llm  # answered, not the weak short-circuit
+    assert len(turn.sources) == 5
+    assert "No sufficiently relevant" not in turn.answer
+    assert "closest" not in turn.answer
+    assert turn.note is None
+
+
 def test_run_turn_records_cost_and_finalizes(monkeypatch):
     """Lines 917-920: _run_turn checks the budget, calls the LLM, records cost,
     and finalizes the answer (strips unrequested dataviz blocks)."""
