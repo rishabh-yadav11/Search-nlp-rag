@@ -7,7 +7,7 @@ qdrant-client==1.11.3
 fastembed==0.8.0
 sentence-transformers==5.3.0
 torch==2.13.0
-transformers==5.5.4
+transformers==5.10.1
 onnxruntime==1.28.0
 # ONNX cross-encoder (optimum[onnxruntime]) is intentionally NOT installed:
 # optimum-onnx pins transformers<4.58, which conflicts with the pinned
