@@ -16,13 +16,17 @@ LLM calls against the daily budget — use --dry-run to validate loading only.
     ./venv/bin/python scripts/eval_runner.py --input /path/to/prompts.json
 
 Results land in eval_results/<timestamp>.json and <timestamp>_report.md,
-relative to the working directory (override with EVAL_RESULTS_DIR).
+relative to the working directory (override with EVAL_RESULTS_DIR). During the
+run results are appended one-per-line to <timestamp>.jsonl (crash-safe, cheap);
+on completion they are consolidated into <timestamp>.json and the .jsonl is
+removed. If a run dies, the .jsonl still holds every completed prompt.
 """
 
 import argparse
 import json
 import os
 import re
+import signal
 import statistics
 import time
 import urllib.error
@@ -121,10 +125,13 @@ def _req(url: str, payload: dict | None = None, method: str | None = None, timeo
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return json.load(resp)
+            data = json.load(resp)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise ApiError(exc.code, body) from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"expected a JSON object response, got {type(data).__name__}")  # noqa: TRY004 — API-shape guard, not a local type bug
+    return data
 
 
 def _delete(url: str) -> None:
@@ -212,24 +219,33 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
 
 
 class ResultStore:
-    """Rewrites the whole JSON document after each prompt so a long run can be
-    interrupted at any point without losing earlier results."""
+    """Appends one JSON line per prompt so a long run can be interrupted at any
+    point without losing earlier results, and never re-serializes the growing
+    document. finish() consolidates the log into the single <ts>.json document
+    the report and downstream tooling expect."""
 
-    def __init__(self, path: str, meta: dict):
-        self.path = path
-        self.doc = {"meta": meta, "results": []}
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self._flush()
+    def __init__(self, json_path: str, meta: dict):
+        self.json_path = json_path
+        self.log_path = json_path.removesuffix(".json") + ".jsonl"
+        self.meta = meta
+        self.results: list[dict] = []
+        os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+        with open(self.log_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"meta": meta}, ensure_ascii=False) + "\n")
 
     def add(self, entry: dict) -> None:
-        self.doc["results"].append(entry)
-        self._flush()
+        self.results.append(entry)
+        with open(self.log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-    def _flush(self) -> None:
-        tmp = self.path + ".tmp"
+    def finish(self) -> dict:
+        doc = {"meta": self.meta, "results": self.results}
+        tmp = self.json_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.doc, fh, indent=1, ensure_ascii=False)
-        os.replace(tmp, self.path)
+            json.dump(doc, fh, indent=1, ensure_ascii=False)
+        os.replace(tmp, self.json_path)
+        os.remove(self.log_path)
+        return doc
 
 
 def _failure_entry(index: int, group: str | None, prompt: str, error: str, session_id: str | None = None) -> dict:
@@ -272,11 +288,12 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
     except Exception as exc:
         return _failure_entry(index, group, prompt, repr(exc), session_id=sid)
     latency_ms = round((time.perf_counter() - t0) * 1000)
-    # Tolerate a degraded response shape: keep whatever arrived instead of
-    # discarding a billed answer to a KeyError.
-    a = (d.get("assistant") or {}) if isinstance(d, dict) else {}
+    a = d.get("assistant")
+    if not isinstance(a, dict):
+        a = {}
     answer = a.get("content")
-    sources = a.get("sources") or []
+    sources = a.get("sources")
+    sources = sources if isinstance(sources, list) else []
     source_ids = _citation_ids(sources)
     bodies, body_error = _fetch_bodies(client, source_ids) if source_ids else ({}, None)
     return {
@@ -330,6 +347,11 @@ def run_eval(
     qdrant = QdrantClient(url=QDRANT_URL, timeout=30)
     index = start
     interrupted = False
+
+    def _terminate(signum, frame) -> None:
+        raise KeyboardInterrupt
+
+    previous_term_handler = signal.signal(signal.SIGTERM, _terminate)
     try:
         for index, prompt in enumerate(prompts, start=1):
             if index < start:
@@ -368,6 +390,7 @@ def run_eval(
     except KeyboardInterrupt:
         interrupted = True
     finally:
+        signal.signal(signal.SIGTERM, previous_term_handler)
         qdrant.close()
     if interrupted:
         print(f"interrupted at prompt {index}; resume with --start {index}", flush=True)
@@ -389,13 +412,14 @@ def _pairwise_source_jaccard(results: list[dict]) -> float | None:
     return statistics.mean(len(a & b) / len(a | b) for a, b in pairs)
 
 
-def build_report(store: ResultStore) -> str:
-    meta = store.doc["meta"]
-    results = store.doc["results"]
+def build_report(meta: dict, results: list[dict]) -> str:
     ok = [r for r in results if r.get("ok")]
     latencies = [r["latency_ms"] for r in ok if isinstance(r.get("latency_ms"), (int, float))]
     costs = [r["cost_inr"] for r in ok if isinstance(r.get("cost_inr"), (int, float)) and r["cost_inr"]]
     median_cost = statistics.median(costs) if costs else None
+
+    def _num(value) -> int:
+        return value if isinstance(value, (int, float)) else 0
 
     by_group: dict[str, list[dict]] = {}
     for r in ok:
@@ -420,6 +444,9 @@ def build_report(store: ResultStore) -> str:
             anomalies.append(f"{label}: empty answer")
         if r.get("n_sources") == 0:
             anomalies.append(f"{label}: zero sources")
+        missing_bodies = r.get("n_sources", 0) - len(r.get("bodies") or {})
+        if missing_bodies > 0:
+            anomalies.append(f"{label}: {missing_bodies} cited source(s) missing from Qdrant body fetch")
         if r.get("body_error"):
             anomalies.append(f"{label}: body fetch failed — {r['body_error']}")
         if isinstance(r.get("latency_ms"), (int, float)) and r["latency_ms"] > HIGH_LATENCY_MS:
@@ -450,8 +477,8 @@ def build_report(store: ResultStore) -> str:
             f"p95: {fmt(_p95(latencies))}, max: {fmt(max(latencies) if latencies else None)}"
         ),
         (
-            f"- Total cost: {sum(costs):.2f} INR | prompt tokens: {sum(r.get('prompt_tokens') or 0 for r in ok)}, "
-            f"completion tokens: {sum(r.get('completion_tokens') or 0 for r in ok)}"
+            f"- Total cost: {sum(costs):.2f} INR | prompt tokens: {sum(_num(r.get('prompt_tokens')) for r in ok)}, "
+            f"completion tokens: {sum(_num(r.get('completion_tokens')) for r in ok)}"
         ),
         "",
         "## Cross-variation consistency",
@@ -497,6 +524,10 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="validate prompt loading and grouping without executing")
     ap.add_argument("--input", default=DEFAULT_INPUT, help=f"prompt source (default: {DEFAULT_INPUT})")
     args = ap.parse_args()
+    if args.delay < 0:
+        ap.error("--delay must be >= 0")
+    if args.start < 1:
+        ap.error("--start must be >= 1")
 
     prompts = load_prompts(args.input)
     groups = group_prompts(prompts)
@@ -504,10 +535,11 @@ def main() -> None:
         dry_run(prompts, groups, args.input)
         return
     store = run_eval(prompts, groups, args.input, args.start, args.limit, args.delay)
-    report_path = store.path.removesuffix(".json") + "_report.md"
+    doc = store.finish()
+    report_path = store.json_path.removesuffix(".json") + "_report.md"
     with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(build_report(store))
-    print("results:", store.path)
+        fh.write(build_report(doc["meta"], doc["results"]))
+    print("results:", store.json_path)
     print("report:", report_path)
 
 
