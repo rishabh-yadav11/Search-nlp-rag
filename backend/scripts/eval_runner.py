@@ -17,14 +17,18 @@ LLM calls against the daily budget — use --dry-run to validate loading only.
     ./venv/bin/python scripts/eval_runner.py --input /path/to/prompts.json
 
 Results land in eval_results/<timestamp>.json and <timestamp>_report.md,
-relative to the working directory (override with EVAL_RESULTS_DIR). During the
-run results are appended one-per-line to <timestamp>.jsonl (crash-safe, cheap);
-on completion they are consolidated into <timestamp>.json and the .jsonl is
-removed. If a run dies, the .jsonl still holds every completed prompt.
+relative to the working directory (override with EVAL_RESULTS_DIR). Each
+invocation writes its own file covering the slice it ran; a resumed slice's
+report aggregates only that slice. During the run results are appended
+one-per-line to <timestamp>.jsonl (crash-safe, cheap); on completion they are
+consolidated into <timestamp>.json and the .jsonl is removed. If a run dies
+before that (SIGKILL, power loss), the next invocation consolidates the
+orphaned .jsonl — including a report — before starting fresh.
 """
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -281,7 +285,12 @@ def _citation_ids(sources: list) -> list[int]:
 def _fetch_bodies(client: "QdrantClient", source_ids: list[int]) -> tuple[dict[str, str], str | None]:
     try:
         points = client.retrieve(collection_name=QDRANT_COLLECTION, ids=source_ids, with_payload=True)
-        return {str(p.id): (p.payload or {}).get("body", "") for p in points}, None
+        fetched = {}
+        for p in points:
+            body = (p.payload or {}).get("body")
+            if isinstance(body, str) and body:
+                fetched[str(p.id)] = body
+        return fetched, None
     except Exception as exc:
         return {}, repr(exc)
 
@@ -323,6 +332,45 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
     }
 
 
+def _recover_orphan_logs(results_dir: str) -> None:
+    """Consolidate any <ts>.jsonl left behind by a run that died before
+    finish() (SIGKILL, power loss, hard crash) so its completed prompts are not
+    stranded in a log nothing reads. Tolerates a torn final line."""
+    if not os.path.isdir(results_dir):
+        return
+    for log_name in sorted(os.listdir(results_dir)):
+        if not log_name.endswith(".jsonl"):
+            continue
+        log_path = os.path.join(results_dir, log_name)
+        json_path = log_path.removesuffix(".jsonl") + ".json"
+        if os.path.exists(json_path):
+            continue
+        try:
+            with open(log_path, encoding="utf-8") as fh:
+                first_line, *rest = fh.readlines()
+            meta = json.loads(first_line).get("meta")
+            if not isinstance(meta, dict):
+                raise ValueError("first line carries no meta record")  # noqa: TRY004 — data-shape guard, not a local type bug
+        except (OSError, ValueError, IndexError) as exc:
+            print(f"WARN: skipping unreadable eval log {log_path}: {exc!r}", flush=True)
+            continue
+        results = []
+        for line in rest:
+            try:
+                results.append(json.loads(line))
+            except ValueError:
+                print(f"WARN: dropped a truncated result line from {log_path}", flush=True)
+        tmp = json_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "results": results}, fh, indent=1, ensure_ascii=False)
+        os.replace(tmp, json_path)
+        report_path = json_path.removesuffix(".json") + "_report.md"
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.write(build_report(meta, results))
+        os.remove(log_path)
+        print(f"recovered {len(results)} result(s) from orphaned log {log_path}", flush=True)
+
+
 def run_eval(
     prompts: list[str],
     groups: dict[str, list[int]],
@@ -337,6 +385,7 @@ def run_eval(
         )
     from qdrant_client import QdrantClient
 
+    _recover_orphan_logs(RESULTS_DIR)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     group_of = {index: label for label, members in groups.items() for index in members}
     meta = {
@@ -387,6 +436,10 @@ def run_eval(
                     except Exception:
                         meta["orphan_session_risk"] += 1
                         print("WARN: failed to delete eval chat session (orphan risk)", flush=True)
+                    except BaseException:
+                        meta["orphan_session_risk"] += 1
+                        print("WARN: eval chat session left orphaned by interrupt", flush=True)
+                        raise
             store.add(entry)
             stored_current = True
             status = "ok" if entry["ok"] else f"ERROR {entry['error']}"
@@ -456,7 +509,7 @@ def build_report(meta: dict, results: list[dict]) -> str:
             anomalies.append(f"{label}: zero sources")
         missing_bodies = r.get("n_cited_ids", 0) - len(r.get("bodies") or {})
         if missing_bodies > 0:
-            anomalies.append(f"{label}: {missing_bodies} cited source(s) missing from Qdrant body fetch")
+            anomalies.append(f"{label}: {missing_bodies} cited source(s) without body text")
         if r.get("body_error"):
             anomalies.append(f"{label}: body fetch failed — {r['body_error']}")
         if isinstance(r.get("latency_ms"), (int, float)) and r["latency_ms"] > HIGH_LATENCY_MS:
@@ -534,8 +587,8 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="validate prompt loading and grouping without executing")
     ap.add_argument("--input", default=DEFAULT_INPUT, help=f"prompt source (default: {DEFAULT_INPUT})")
     args = ap.parse_args()
-    if args.delay < 0:
-        ap.error("--delay must be >= 0")
+    if args.delay < 0 or not math.isfinite(args.delay):
+        ap.error("--delay must be a finite number >= 0")
     if args.start < 1:
         ap.error("--start must be >= 1")
     if args.limit is not None and args.limit < 1:
