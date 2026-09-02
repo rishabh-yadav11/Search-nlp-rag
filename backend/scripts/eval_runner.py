@@ -20,15 +20,16 @@ Results land in eval_results/<timestamp>.json and <timestamp>_report.md,
 relative to the working directory (override with EVAL_RESULTS_DIR). Each
 invocation writes its own file covering the slice it ran; a resumed slice's
 report aggregates only that slice. Run one eval at a time — concurrent runs
-would collide on filenames, and recovery skips logs touched within the last
-LOG_ACTIVE_WINDOW_SECONDS because a live run could be mid-prompt. During the
-run results are appended one-per-line to <timestamp>.jsonl (crash-safe,
-cheap); after the report is written the .jsonl is removed. If a run dies
-before that (SIGKILL, power loss), the next invocation consolidates the
-orphaned .jsonl — including a report — before starting fresh.
+would collide on filenames. During the run results are appended one-per-line
+to <timestamp>.jsonl (crash-safe, cheap) under an exclusive advisory lock;
+after the report is written the .jsonl is removed. If a run dies before that
+(SIGKILL, power loss), the OS releases the lock and the next invocation
+consolidates the orphaned .jsonl — including a report — before starting
+fresh. Recovery never touches a live run's log: the lock attempt blocks it.
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -60,7 +61,6 @@ HIGH_LATENCY_MS = 60_000
 COST_OUTLIER_FACTOR = 3.0
 SIMILARITY_THRESHOLD = 0.5
 VARIATION_RUN = 4
-LOG_ACTIVE_WINDOW_SECONDS = 300  # must exceed REQUEST_TIMEOUT so recovery never eats a live run's log
 
 _CONTRACTIONS = {
     "what's": "what is",
@@ -233,8 +233,11 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
 class ResultStore:
     """Appends one JSON line per prompt so a long run can be interrupted at any
     point without losing earlier results, and never re-serializes the growing
-    document. finish() consolidates the log into the single <ts>.json document
-    the report and downstream tooling expect."""
+    document. An exclusive advisory lock is held on the log for the store's
+    lifetime: recovery uses lock acquisition to tell a dead run's log from a
+    live one. finish() consolidates the log into the single <ts>.json document
+    the report and downstream tooling expect; cleanup_log() releases the lock
+    and removes the log once the report is safely on disk."""
 
     def __init__(self, json_path: str, meta: dict):
         self.json_path = json_path
@@ -242,22 +245,21 @@ class ResultStore:
         self.meta = meta
         self.results: list[dict] = []
         os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
-        with open(self.log_path, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"meta": meta}, ensure_ascii=False) + "\n")
+        self._log_fh = open(self.log_path, "a", encoding="utf-8")
+        fcntl.flock(self._log_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self._log_fh.write(json.dumps({"meta": meta}, ensure_ascii=False) + "\n")
+        self._log_fh.flush()
 
     def add(self, entry: dict) -> None:
         self.results.append(entry)
-        with open(self.log_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._log_fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._log_fh.flush()
 
     def log_meta_update(self, update: dict) -> None:
         """Persist a mid-run meta mutation so recovery of a dead run's log
-        reconstructs the final meta (only ResultEntry lines carry "index")."""
-        with open(self.log_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(update, ensure_ascii=False) + "\n")
-
-    def cleanup_log(self) -> None:
-        os.remove(self.log_path)
+        reconstructs the final meta (only result entries carry "index")."""
+        self._log_fh.write(json.dumps(update, ensure_ascii=False) + "\n")
+        self._log_fh.flush()
 
     def finish(self) -> dict:
         doc = {"meta": self.meta, "results": self.results}
@@ -266,6 +268,10 @@ class ResultStore:
             json.dump(doc, fh, indent=1, ensure_ascii=False)
         os.replace(tmp, self.json_path)
         return doc
+
+    def cleanup_log(self) -> None:
+        self._log_fh.close()
+        os.remove(self.log_path)
 
 
 def _failure_entry(index: int, group: str | None, prompt: str, error: str, session_id: str | None = None) -> dict:
@@ -321,6 +327,7 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
     sources = a.get("sources")
     sources = sources if isinstance(sources, list) else []
     source_ids = _citation_ids(sources)
+    dropped_citations = sum(1 for s in sources if not (isinstance(s, dict) and isinstance(s.get("id"), int)))
     bodies, body_error = _fetch_bodies(client, source_ids) if source_ids else ({}, None)
     return {
         "index": index,
@@ -336,6 +343,7 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
         "body_error": body_error,
         "n_sources": len(sources),
         "n_cited_ids": len(source_ids),
+        "n_dropped_citations": dropped_citations,
         "prompt_tokens": a.get("prompt_tokens"),
         "completion_tokens": a.get("completion_tokens"),
         "cost_inr": a.get("cost"),
@@ -347,9 +355,9 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
 def _recover_orphan_logs(results_dir: str) -> None:
     """Consolidate any <ts>.jsonl left behind by a run that died before its
     report was written (SIGKILL, power loss, hard crash) so its completed
-    prompts are not stranded in a log nothing reads. Logs touched within
-    LOG_ACTIVE_WINDOW_SECONDS are skipped — a live run could be mid-prompt.
-    Tolerates a torn final line."""
+    prompts are not stranded in a log nothing reads. A log still held by a
+    live run is skipped: the advisory lock attempt fails. Tolerates a torn
+    final line."""
     if not os.path.isdir(results_dir):
         return
     for log_name in sorted(os.listdir(results_dir)):
@@ -358,41 +366,49 @@ def _recover_orphan_logs(results_dir: str) -> None:
         log_path = os.path.join(results_dir, log_name)
         json_path = log_path.removesuffix(".jsonl") + ".json"
         report_path = json_path.removesuffix(".json") + "_report.md"
-        if os.path.exists(json_path) and os.path.exists(report_path):
-            os.remove(log_path)
-            continue
-        if time.time() - os.path.getmtime(log_path) < LOG_ACTIVE_WINDOW_SECONDS:
-            print(f"skipping {log_path}: modified recently — a run may be active", flush=True)
+        try:
+            lock_fh = open(log_path, "a", encoding="utf-8")
+        except OSError as exc:
+            print(f"WARN: cannot open eval log {log_path}: {exc!r}", flush=True)
             continue
         try:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"skipping {log_path}: locked — a run is active", flush=True)
+                continue
+            if os.path.exists(json_path) and os.path.exists(report_path):
+                os.remove(log_path)
+                continue
             with open(log_path, encoding="utf-8") as fh:
                 first_line, *rest = fh.readlines()
             meta = json.loads(first_line).get("meta")
             if not isinstance(meta, dict):
                 raise ValueError("first line carries no meta record")  # noqa: TRY004 — data-shape guard, not a local type bug
+            results = []
+            for line in rest:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    print(f"WARN: dropped a truncated result line from {log_path}", flush=True)
+                    continue
+                if isinstance(record, dict) and "index" not in record:
+                    if isinstance(record.get("orphan_session_risk"), int):
+                        meta["orphan_session_risk"] = record["orphan_session_risk"]
+                    continue
+                results.append(record)
+            tmp = json_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"meta": meta, "results": results}, fh, indent=1, ensure_ascii=False)
+            os.replace(tmp, json_path)
+            with open(report_path, "w", encoding="utf-8") as fh:
+                fh.write(build_report(meta, results))
+            os.remove(log_path)
+            print(f"recovered {len(results)} result(s) from orphaned log {log_path}", flush=True)
         except (OSError, ValueError, IndexError) as exc:
             print(f"WARN: skipping unreadable eval log {log_path}: {exc!r}", flush=True)
-            continue
-        results = []
-        for line in rest:
-            try:
-                record = json.loads(line)
-            except ValueError:
-                print(f"WARN: dropped a truncated result line from {log_path}", flush=True)
-                continue
-            if isinstance(record, dict) and "index" not in record:
-                if isinstance(record.get("orphan_session_risk"), int):
-                    meta["orphan_session_risk"] = record["orphan_session_risk"]
-                continue
-            results.append(record)
-        tmp = json_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"meta": meta, "results": results}, fh, indent=1, ensure_ascii=False)
-        os.replace(tmp, json_path)
-        with open(report_path, "w", encoding="utf-8") as fh:
-            fh.write(build_report(meta, results))
-        os.remove(log_path)
-        print(f"recovered {len(results)} result(s) from orphaned log {log_path}", flush=True)
+        finally:
+            lock_fh.close()
 
 
 def run_eval(
@@ -425,7 +441,7 @@ def run_eval(
     store = ResultStore(os.path.join(RESULTS_DIR, f"{ts}.json"), meta)
     qdrant = QdrantClient(url=QDRANT_URL, timeout=30)
     index = start
-    stored_current = False
+    resume_at = start
     interrupted = False
 
     def _terminate(signum, frame) -> None:
@@ -438,7 +454,6 @@ def run_eval(
                 continue
             if limit is not None and index >= start + limit:
                 break
-            stored_current = False
             group = group_of.get(index)
             sid = None
             try:
@@ -467,7 +482,7 @@ def run_eval(
                         print("WARN: eval chat session left orphaned by interrupt", flush=True)
                         raise
             store.add(entry)
-            stored_current = True
+            resume_at = index + 1
             status = "ok" if entry["ok"] else f"ERROR {entry['error']}"
             print(
                 f"[{index:>3}/{len(prompts)}] {status} src={entry.get('n_sources')} "
@@ -481,8 +496,7 @@ def run_eval(
         signal.signal(signal.SIGTERM, previous_term_handler)
         qdrant.close()
     if interrupted:
-        resume_at = index + 1 if stored_current else index
-        print(f"interrupted after prompt {index}; resume with --start {resume_at}", flush=True)
+        print(f"interrupted before prompt {resume_at}; resume with --start {resume_at}", flush=True)
     return store
 
 
@@ -533,6 +547,9 @@ def build_report(meta: dict, results: list[dict]) -> str:
             anomalies.append(f"{label}: empty answer")
         if r.get("n_sources") == 0:
             anomalies.append(f"{label}: zero sources")
+        dropped = r.get("n_dropped_citations") or 0
+        if dropped:
+            anomalies.append(f"{label}: {dropped} source citation(s) without a parsable article id")
         missing_bodies = r.get("n_cited_ids", 0) - len(r.get("bodies") or {})
         if missing_bodies > 0:
             anomalies.append(f"{label}: {missing_bodies} cited source(s) without body text")
