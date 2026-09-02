@@ -2,10 +2,11 @@
 
 For every prompt: create a chat session, POST one message, capture the answer,
 sources, token usage and cost, fetch the cited articles' full bodies from
-Qdrant, then delete the session. The JSON document is rewritten after every
-prompt so an interrupted run keeps partial data; pass --start/--limit to resume.
-A companion markdown report aggregates success/latency/cost, cross-variation
-consistency (prompts are grouped by normalized text similarity) and anomalies.
+Qdrant, then delete the session. Results are appended one-per-line to a JSONL
+log after every prompt so an interrupted run keeps partial data; pass
+--start/--limit to resume. A companion markdown report aggregates
+success/latency/cost, cross-variation consistency (prompts are grouped by
+normalized text similarity) and anomalies.
 
 Prerequisites: backend on localhost:8001 with AUTH_SERVICE_TOKEN in
 backend/.env, plus Qdrant reachable at QDRANT_URL. Chat turns make real (billed)
@@ -135,10 +136,10 @@ def _req(url: str, payload: dict | None = None, method: str | None = None, timeo
 
 
 def _delete(url: str) -> None:
-    """DELETE that never fails on a 2xx response with an empty/non-JSON body."""
+    """DELETE that never fails on a 2xx response with an empty/non-object JSON body."""
     try:
         _req(url, method="DELETE")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         pass
 
 
@@ -213,7 +214,11 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
         clusters.setdefault(uf.find(i), []).append(i + 1)
     grouped: dict[str, list[int]] = {}
     for members in clusters.values():
-        label = min((keys[m - 1] for m in members), key=lambda k: (len(k), k))
+        base = min((keys[m - 1] for m in members), key=lambda k: (len(k), k))
+        label, n = base, 2
+        while label in grouped:  # identical normalized text can occur in separate runs
+            label = f"{base} ({n})"
+            n += 1
         grouped[label] = sorted(members)
     return dict(sorted(grouped.items(), key=lambda kv: kv[1][0]))
 
@@ -309,6 +314,7 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
         "bodies": bodies,
         "body_error": body_error,
         "n_sources": len(sources),
+        "n_cited_ids": len(source_ids),
         "prompt_tokens": a.get("prompt_tokens"),
         "completion_tokens": a.get("completion_tokens"),
         "cost_inr": a.get("cost"),
@@ -346,6 +352,7 @@ def run_eval(
     store = ResultStore(os.path.join(RESULTS_DIR, f"{ts}.json"), meta)
     qdrant = QdrantClient(url=QDRANT_URL, timeout=30)
     index = start
+    stored_current = False
     interrupted = False
 
     def _terminate(signum, frame) -> None:
@@ -358,6 +365,7 @@ def run_eval(
                 continue
             if limit is not None and index >= start + limit:
                 break
+            stored_current = False
             group = group_of.get(index)
             sid = None
             try:
@@ -380,6 +388,7 @@ def run_eval(
                         meta["orphan_session_risk"] += 1
                         print("WARN: failed to delete eval chat session (orphan risk)", flush=True)
             store.add(entry)
+            stored_current = True
             status = "ok" if entry["ok"] else f"ERROR {entry['error']}"
             print(
                 f"[{index:>3}/{len(prompts)}] {status} src={entry.get('n_sources')} "
@@ -393,7 +402,8 @@ def run_eval(
         signal.signal(signal.SIGTERM, previous_term_handler)
         qdrant.close()
     if interrupted:
-        print(f"interrupted at prompt {index}; resume with --start {index}", flush=True)
+        resume_at = index + 1 if stored_current else index
+        print(f"interrupted after prompt {index}; resume with --start {resume_at}", flush=True)
     return store
 
 
@@ -444,7 +454,7 @@ def build_report(meta: dict, results: list[dict]) -> str:
             anomalies.append(f"{label}: empty answer")
         if r.get("n_sources") == 0:
             anomalies.append(f"{label}: zero sources")
-        missing_bodies = r.get("n_sources", 0) - len(r.get("bodies") or {})
+        missing_bodies = r.get("n_cited_ids", 0) - len(r.get("bodies") or {})
         if missing_bodies > 0:
             anomalies.append(f"{label}: {missing_bodies} cited source(s) missing from Qdrant body fetch")
         if r.get("body_error"):
@@ -528,6 +538,8 @@ def main() -> None:
         ap.error("--delay must be >= 0")
     if args.start < 1:
         ap.error("--start must be >= 1")
+    if args.limit is not None and args.limit < 1:
+        ap.error("--limit must be >= 1")
 
     prompts = load_prompts(args.input)
     groups = group_prompts(prompts)
