@@ -19,9 +19,11 @@ LLM calls against the daily budget — use --dry-run to validate loading only.
 Results land in eval_results/<timestamp>.json and <timestamp>_report.md,
 relative to the working directory (override with EVAL_RESULTS_DIR). Each
 invocation writes its own file covering the slice it ran; a resumed slice's
-report aggregates only that slice. During the run results are appended
-one-per-line to <timestamp>.jsonl (crash-safe, cheap); on completion they are
-consolidated into <timestamp>.json and the .jsonl is removed. If a run dies
+report aggregates only that slice. Run one eval at a time — concurrent runs
+would collide on filenames, and recovery skips logs touched within the last
+LOG_ACTIVE_WINDOW_SECONDS because a live run could be mid-prompt. During the
+run results are appended one-per-line to <timestamp>.jsonl (crash-safe,
+cheap); after the report is written the .jsonl is removed. If a run dies
 before that (SIGKILL, power loss), the next invocation consolidates the
 orphaned .jsonl — including a report — before starting fresh.
 """
@@ -58,6 +60,7 @@ HIGH_LATENCY_MS = 60_000
 COST_OUTLIER_FACTOR = 3.0
 SIMILARITY_THRESHOLD = 0.5
 VARIATION_RUN = 4
+LOG_ACTIVE_WINDOW_SECONDS = 300  # must exceed REQUEST_TIMEOUT so recovery never eats a live run's log
 
 _CONTRACTIONS = {
     "what's": "what is",
@@ -247,13 +250,21 @@ class ResultStore:
         with open(self.log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def log_meta_update(self, update: dict) -> None:
+        """Persist a mid-run meta mutation so recovery of a dead run's log
+        reconstructs the final meta (only ResultEntry lines carry "index")."""
+        with open(self.log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(update, ensure_ascii=False) + "\n")
+
+    def cleanup_log(self) -> None:
+        os.remove(self.log_path)
+
     def finish(self) -> dict:
         doc = {"meta": self.meta, "results": self.results}
         tmp = self.json_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=1, ensure_ascii=False)
         os.replace(tmp, self.json_path)
-        os.remove(self.log_path)
         return doc
 
 
@@ -295,7 +306,7 @@ def _fetch_bodies(client: "QdrantClient", source_ids: list[int]) -> tuple[dict[s
         return {}, repr(exc)
 
 
-def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: str, sid: str) -> dict:
+def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: str, sid: str | int) -> dict:
     t0 = time.perf_counter()
     try:
         d = _req(CHAT_BASE + f"/sessions/{sid}/messages", {"content": prompt})
@@ -305,7 +316,8 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
     a = d.get("assistant")
     if not isinstance(a, dict):
         a = {}
-    answer = a.get("content")
+    raw_content = a.get("content")
+    answer = raw_content if isinstance(raw_content, str) else None
     sources = a.get("sources")
     sources = sources if isinstance(sources, list) else []
     source_ids = _citation_ids(sources)
@@ -316,7 +328,7 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
         "prompt": prompt,
         "session_id": sid,
         "ok": answer is not None,
-        "error": None if answer is not None else "assistant message missing from response",
+        "error": None if answer is not None else "assistant content missing or not a string",
         "raw_response": None if answer is not None else d,
         "answer": answer,
         "sources": sources,
@@ -333,9 +345,11 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
 
 
 def _recover_orphan_logs(results_dir: str) -> None:
-    """Consolidate any <ts>.jsonl left behind by a run that died before
-    finish() (SIGKILL, power loss, hard crash) so its completed prompts are not
-    stranded in a log nothing reads. Tolerates a torn final line."""
+    """Consolidate any <ts>.jsonl left behind by a run that died before its
+    report was written (SIGKILL, power loss, hard crash) so its completed
+    prompts are not stranded in a log nothing reads. Logs touched within
+    LOG_ACTIVE_WINDOW_SECONDS are skipped — a live run could be mid-prompt.
+    Tolerates a torn final line."""
     if not os.path.isdir(results_dir):
         return
     for log_name in sorted(os.listdir(results_dir)):
@@ -343,7 +357,12 @@ def _recover_orphan_logs(results_dir: str) -> None:
             continue
         log_path = os.path.join(results_dir, log_name)
         json_path = log_path.removesuffix(".jsonl") + ".json"
-        if os.path.exists(json_path):
+        report_path = json_path.removesuffix(".json") + "_report.md"
+        if os.path.exists(json_path) and os.path.exists(report_path):
+            os.remove(log_path)
+            continue
+        if time.time() - os.path.getmtime(log_path) < LOG_ACTIVE_WINDOW_SECONDS:
+            print(f"skipping {log_path}: modified recently — a run may be active", flush=True)
             continue
         try:
             with open(log_path, encoding="utf-8") as fh:
@@ -357,14 +376,19 @@ def _recover_orphan_logs(results_dir: str) -> None:
         results = []
         for line in rest:
             try:
-                results.append(json.loads(line))
+                record = json.loads(line)
             except ValueError:
                 print(f"WARN: dropped a truncated result line from {log_path}", flush=True)
+                continue
+            if isinstance(record, dict) and "index" not in record:
+                if isinstance(record.get("orphan_session_risk"), int):
+                    meta["orphan_session_risk"] = record["orphan_session_risk"]
+                continue
+            results.append(record)
         tmp = json_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"meta": meta, "results": results}, fh, indent=1, ensure_ascii=False)
         os.replace(tmp, json_path)
-        report_path = json_path.removesuffix(".json") + "_report.md"
         with open(report_path, "w", encoding="utf-8") as fh:
             fh.write(build_report(meta, results))
         os.remove(log_path)
@@ -422,22 +446,24 @@ def run_eval(
             except Exception as exc:
                 entry = _failure_entry(index, group, prompt, f"session create failed: {exc!r}")
             else:
-                if isinstance(sid, str):
+                if sid is None:
+                    entry = _failure_entry(index, group, prompt, "session create response missing id")
+                else:
                     try:
                         entry = run_prompt(qdrant, index, group, prompt, sid)
                     except Exception as exc:
                         entry = _failure_entry(index, group, prompt, f"message phase failed: {exc!r}", session_id=sid)
-                else:
-                    entry = _failure_entry(index, group, prompt, "session create response missing id")
             finally:
-                if isinstance(sid, str):
+                if sid is not None:
                     try:
                         _delete(CHAT_BASE + f"/sessions/{sid}")
                     except Exception:
                         meta["orphan_session_risk"] += 1
+                        store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
                         print("WARN: failed to delete eval chat session (orphan risk)", flush=True)
                     except BaseException:
                         meta["orphan_session_risk"] += 1
+                        store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
                         print("WARN: eval chat session left orphaned by interrupt", flush=True)
                         raise
             store.add(entry)
@@ -604,6 +630,7 @@ def main() -> None:
     report_path = store.json_path.removesuffix(".json") + "_report.md"
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(build_report(doc["meta"], doc["results"]))
+    store.cleanup_log()
     print("results:", store.json_path)
     print("report:", report_path)
 
