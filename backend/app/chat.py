@@ -1422,9 +1422,10 @@ implying the fact still holds today. Never present stale facts as if they were c
 - You MUST only state facts that appear verbatim in the Articles section. Never add any name, number, \
 date, valuation, deal amount, revenue figure, percentage, or entity from your own knowledge, training \
 data, or memory — even if you are confident it is true. A confident guess is still a hallucination.
-- NEVER invent a date. Use only the publication date shown in each article's meta line, e.g. `(2023-05-12)`. \
-Do not write "As of <month year>" or "As of <date>" unless that exact date literally appears in an \
-article. If the articles give no date for a fact, omit the date — do not supply a current or recent one.
+- NEVER invent a date. Use only the publication date shown in an article's meta line, e.g. `(2023-05-12)`. \
+You may anchor a claim to that date (e.g. "As of 2023-05-12..." or "In 2021...", per the Source vintage \
+guidance) because it is taken from the article. Do NOT invent a current or recent date (e.g. "As of June \
+2026") that no article contains; if the articles give no date for a fact, omit the date.
 - NEVER invent a number. If an amount, valuation, percentage, or currency figure is not stated in the \
 articles, write "value not stated" (or "not stated") or omit it entirely. Never substitute a figure from memory.
 - NEVER invent a company, person, investor, fund, or entity name. Only name entities the articles name.
