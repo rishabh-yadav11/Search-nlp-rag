@@ -85,7 +85,14 @@ class Config:
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-    LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    # Answer model. Kept separate from GEMINI_MODEL so the eval judge can be held
+    # constant while the answer model is A/B tested (the judge reads GEMINI_MODEL).
+    # Falls back to GEMINI_MODEL for backwards compatibility.
+    LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"))
+    # Sampling temperature for answer generation. 0.0 is deterministic and
+    # minimizes the stochastic fabrication that drives hallucination on thin
+    # context; raise only if more creative variation is explicitly wanted.
+    LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.0"))
     # Per-call timeout and retry policy for the LLM (see app/llm.py).
     LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
