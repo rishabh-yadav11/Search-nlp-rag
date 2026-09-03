@@ -246,9 +246,14 @@ class ResultStore:
         self.results: list[dict] = []
         os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
         self._log_fh = open(self.log_path, "a", encoding="utf-8")
-        fcntl.flock(self._log_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(self._log_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._log_fh.close()
+            raise SystemExit(f"another eval run holds the lock on {self.log_path}; aborting") from None
         self._log_fh.write(json.dumps({"meta": meta}, ensure_ascii=False) + "\n")
         self._log_fh.flush()
+        os.fsync(self._log_fh.fileno())
 
     def add(self, entry: dict) -> None:
         self.results.append(entry)
@@ -386,7 +391,10 @@ def _recover_orphan_logs(results_dir: str) -> None:
                 continue
             with open(log_path, encoding="utf-8") as fh:
                 first_line, *rest = fh.readlines()
-            meta = json.loads(first_line).get("meta")
+            parsed_meta = json.loads(first_line)
+            if not isinstance(parsed_meta, dict):
+                raise ValueError("first line is not a JSON object")  # noqa: TRY004 — data-shape guard, not a local type bug
+            meta = parsed_meta.get("meta")
             if not isinstance(meta, dict):
                 raise ValueError("first line carries no meta record")  # noqa: TRY004 — data-shape guard, not a local type bug
             results = []
@@ -396,7 +404,10 @@ def _recover_orphan_logs(results_dir: str) -> None:
                 except ValueError:
                     print(f"WARN: dropped a truncated result line from {log_path}", flush=True)
                     continue
-                if isinstance(record, dict) and "index" not in record:
+                if not isinstance(record, dict):
+                    print(f"WARN: dropped a non-object line from {log_path}", flush=True)
+                    continue
+                if "index" not in record:
                     if isinstance(record.get("orphan_session_risk"), int):
                         meta["orphan_session_risk"] = record["orphan_session_risk"]
                     continue
@@ -404,9 +415,13 @@ def _recover_orphan_logs(results_dir: str) -> None:
             tmp = json_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({"meta": meta, "results": results}, fh, indent=1, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, json_path)
             with open(report_path, "w", encoding="utf-8") as fh:
                 fh.write(build_report(meta, results))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.remove(log_path)
             print(f"recovered {len(results)} result(s) from orphaned log {log_path}", flush=True)
         except (OSError, ValueError, IndexError) as exc:
@@ -652,6 +667,8 @@ def main() -> None:
     report_path = store.json_path.removesuffix(".json") + "_report.md"
     with open(report_path, "w", encoding="utf-8") as fh:
         fh.write(build_report(doc["meta"], doc["results"]))
+        fh.flush()
+        os.fsync(fh.fileno())
     store.cleanup_log()
     print("results:", store.json_path)
     print("report:", report_path)
