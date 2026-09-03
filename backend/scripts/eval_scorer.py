@@ -118,6 +118,8 @@ def _retry_after_seconds(exc: Exception) -> float | None:
 def _req(url: str, payload: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
     data = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
+    if GEMINI_API_KEY:
+        headers["Authorization"] = f"Bearer {GEMINI_API_KEY}"
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
