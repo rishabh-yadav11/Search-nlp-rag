@@ -276,11 +276,13 @@ class ResultStore:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, self.json_path)
+        _fsync_dir(os.path.dirname(self.json_path) or ".")
         return doc
 
     def cleanup_log(self) -> None:
         self._log_fh.close()
         os.remove(self.log_path)
+        _fsync_dir(os.path.dirname(self.log_path) or ".")
 
 
 def _failure_entry(index: int, group: str | None, prompt: str, error: str, session_id: str | None = None) -> dict:
@@ -304,7 +306,19 @@ def _failure_entry(index: int, group: str | None, prompt: str, error: str, sessi
     }
 
 
+def _fsync_dir(path: str) -> None:
+    """Make a create/rename/remove in `path` durable across power loss; without
+    this the .jsonl can vanish while the renamed .json never materializes."""
+    fd = os.open(path or ".", os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _citation_ids(sources: list) -> list[int]:
+    if not isinstance(sources, list):
+        return []
     return sorted({s["id"] for s in sources if isinstance(s, dict) and isinstance(s.get("id"), int)})
 
 
@@ -418,11 +432,13 @@ def _recover_orphan_logs(results_dir: str) -> None:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, json_path)
+            _fsync_dir(results_dir)
             with open(report_path, "w", encoding="utf-8") as fh:
                 fh.write(build_report(meta, results))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.remove(log_path)
+            _fsync_dir(results_dir)
             print(f"recovered {len(results)} result(s) from orphaned log {log_path}", flush=True)
         except (OSError, ValueError, IndexError) as exc:
             print(f"WARN: skipping unreadable eval log {log_path}: {exc!r}", flush=True)
@@ -477,10 +493,22 @@ def run_eval(
             sid = None
             try:
                 sid = _req(CHAT_BASE + "/sessions", {"title": "eval-runner"}).get("id")
-            except Exception as exc:
+            except ApiError as exc:
                 entry = _failure_entry(index, group, prompt, f"session create failed: {exc!r}")
+            except Exception as exc:
+                # A timeout/reset may have created the session server-side even
+                # though no id came back — the orphan can never be deleted.
+                meta["orphan_session_risk"] += 1
+                store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
+                entry = _failure_entry(index, group, prompt, f"session create failed (possible orphan): {exc!r}")
+            except BaseException:
+                meta["orphan_session_risk"] += 1
+                store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
+                raise
             else:
                 if sid is None:
+                    meta["orphan_session_risk"] += 1
+                    store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
                     entry = _failure_entry(index, group, prompt, "session create response missing id")
                 else:
                     try:
@@ -537,7 +565,12 @@ def _pairwise_source_jaccard(results: list[dict]) -> float | None:
 
 def build_report(meta: dict, results: list[dict]) -> str:
     ok = [r for r in results if r.get("ok")]
-    latencies = [r["latency_ms"] for r in ok if isinstance(r.get("latency_ms"), (int, float))]
+
+    def _answer_text(r: dict) -> str:
+        text = r.get("answer")
+        return text if isinstance(text, str) else ""
+
+    latencies = [r.get("latency_ms") for r in ok if isinstance(r.get("latency_ms"), (int, float))]
     costs = [r["cost_inr"] for r in ok if isinstance(r.get("cost_inr"), (int, float)) and r["cost_inr"]]
     median_cost = statistics.median(costs) if costs else None
 
@@ -553,17 +586,17 @@ def build_report(meta: dict, results: list[dict]) -> str:
         jac = _pairwise_source_jaccard(members)
         if jac is not None:
             within_jaccards.append(jac)
-        lengths = [len(r.get("answer") or "") for r in members]
+        lengths = [len(_answer_text(r)) for r in members]
         stdev = round(statistics.stdev(lengths), 1) if len(lengths) > 1 else None
         consistency_rows.append((label, len(members), jac, round(statistics.mean(lengths)), stdev))
 
     anomalies = []
     for r in results:
-        label = f"#{r['index']} ({r.get('group')})"
+        label = f"#{r.get('index')} ({r.get('group')})"
         if not r.get("ok"):
             anomalies.append(f"{label}: failed — {r.get('error')}")
             continue
-        if not (r.get("answer") or "").strip():
+        if not _answer_text(r).strip():
             anomalies.append(f"{label}: empty answer")
         if r.get("n_sources") == 0:
             anomalies.append(f"{label}: zero sources")
@@ -588,10 +621,10 @@ def build_report(meta: dict, results: list[dict]) -> str:
         return "n/a" if value is None else f"{value:.3f}" if isinstance(value, float) else str(value)
 
     lines = [
-        f"# Eval report — {meta['started_utc']}",
+        f"# Eval report — {meta.get('started_utc', 'unknown')}",
         "",
         f"- Input: `{meta.get('input')}` | endpoint `{meta.get('endpoint')}`",
-        f"- Prompts run: {len(results)} of {meta['total_prompts']}"
+        f"- Prompts run: {len(results)} of {meta.get('total_prompts', len(results))}"
         + (f" (resumed from {meta['resumed_from']})" if meta.get("resumed_from") else ""),
         f"- Variation groups: {meta.get('n_groups')} | orphan sessions: {meta.get('orphan_session_risk', 0)}",
         "",
