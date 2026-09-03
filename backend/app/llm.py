@@ -92,6 +92,7 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
                 model=model,
                 max_tokens=1200,
                 messages=[{"role": "user", "content": prompt}],
+                temperature=config.LLM_TEMPERATURE,
                 timeout=config.LLM_TIMEOUT_SECONDS,
             )
             usage = response.usage
@@ -142,6 +143,7 @@ async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list 
                 model=model,
                 max_tokens=1200,
                 messages=[{"role": "user", "content": prompt}],
+                temperature=config.LLM_TEMPERATURE,
                 timeout=config.LLM_TIMEOUT_SECONDS,
                 stream=True,
                 stream_options={"include_usage": True},
