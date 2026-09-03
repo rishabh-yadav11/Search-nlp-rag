@@ -254,18 +254,22 @@ class ResultStore:
         self.results.append(entry)
         self._log_fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
         self._log_fh.flush()
+        os.fsync(self._log_fh.fileno())
 
     def log_meta_update(self, update: dict) -> None:
         """Persist a mid-run meta mutation so recovery of a dead run's log
         reconstructs the final meta (only result entries carry "index")."""
         self._log_fh.write(json.dumps(update, ensure_ascii=False) + "\n")
         self._log_fh.flush()
+        os.fsync(self._log_fh.fileno())
 
     def finish(self) -> dict:
         doc = {"meta": self.meta, "results": self.results}
         tmp = self.json_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, indent=1, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, self.json_path)
         return doc
 
@@ -501,10 +505,11 @@ def run_eval(
 
 
 def _p95(values: list[float]) -> float | None:
+    """Nearest-rank p95: the smallest value covering at least 95% of the data."""
     if not values:
         return None
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(0.95 * (len(ordered) - 1)))]
+    return ordered[math.ceil(95 * len(ordered) / 100) - 1]
 
 
 def _pairwise_source_jaccard(results: list[dict]) -> float | None:
