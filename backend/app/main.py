@@ -81,17 +81,20 @@ inference_lock = asyncio.Lock()
 
 logger = logging.getLogger(__name__)
 
-# Live facet vocabularies loaded once at startup from Qdrant (normalized
-# lowercased value -> original-cased value). Category extraction only ever emits
-# a value present in these maps, so a natural-language query like 'funding news'
-# maps to the real 'Venture Capital' facet instead of guessing a label that would
-# match nothing (an unknown filter value returns zero results and breaks the
-# query). The actual labels (e.g. 'Venture Capital', 'M&A', 'Finance') come from
-# the live index, not from hard-coded assumptions.
+# Live facet vocabularies loaded from Qdrant (normalized lowercased value ->
+# original-cased value). Each vocabulary is published by rebinding its module
+# global only after its complete replacement has loaded, so extractors see an
+# old complete map, a new complete map, or the initial empty map—never a map
+# being mutated in place. Category extraction only ever emits a value present in
+# these maps, so a natural-language query like 'funding news' maps to the real
+# 'Venture Capital' facet instead of guessing a label that would match nothing
+# (an unknown filter value returns zero results and breaks the query). The actual
+# labels (e.g. 'Venture Capital', 'M&A', 'Finance') come from the live index, not
+# from hard-coded assumptions.
 _DEALTYPE_FACETS: dict[str, str] = {}
 _INDUSTRY_FACETS: dict[str, str] = {}
-# Live `content_type` vocabulary (article/interview/video in the corpus), populated
-# from Qdrant at startup so content-type intent resolves only to real values.
+# Live `content_type` vocabulary (article/interview/video in the corpus), loaded
+# from Qdrant so content-type intent resolves only to real values.
 _CONTENT_TYPE_FACETS: dict[str, str] = {}
 
 # Natural-language synonyms -> the facet keyword used to resolve against the live
@@ -207,33 +210,42 @@ def extract_content_type(query: str) -> str | None:
     kw = _classify_content_type(query)
     if kw is None:
         return None
-    if kw in _CONTENT_TYPE_FACETS:
-        return _CONTENT_TYPE_FACETS[kw]
+    facets = _CONTENT_TYPE_FACETS
+    if kw in facets:
+        return facets[kw]
     # Substring fallback: prefer the tightest (shortest) normalized facet value
     # containing the keyword so the choice is deterministic, not dict-order bound.
-    candidates = [orig for norm, orig in _CONTENT_TYPE_FACETS.items() if kw in norm]
+    candidates = [orig for norm, orig in facets.items() if kw in norm]
     if candidates:
         return min(candidates, key=lambda o: (len(o), o.lower()))
     return None
 
 
 async def _load_facet_maps() -> None:
-    """Populate the live dealtype/industry facet maps from Qdrant so category
-    extraction emits only real facet values. Failures leave the maps empty, which
-    makes extraction a no-op (current behavior) — startup never depends on this."""
-    for target, key in (
-        (_DEALTYPE_FACETS, "dealtype_names"),
-        (_INDUSTRY_FACETS, "industry_names"),
-        (_CONTENT_TYPE_FACETS, "content_type"),
+    """Load and atomically publish live facet maps from Qdrant.
+
+    A failed load retains the prior complete vocabulary; at startup that prior
+    vocabulary is empty, preserving degraded no-filter behavior.
+    """
+    global _DEALTYPE_FACETS, _INDUSTRY_FACETS, _CONTENT_TYPE_FACETS
+
+    for name, key in (
+        ("_DEALTYPE_FACETS", "dealtype_names"),
+        ("_INDUSTRY_FACETS", "industry_names"),
+        ("_CONTENT_TYPE_FACETS", "content_type"),
     ):
         try:
             values = await _facet_values(key)
+            facets = {value.strip().lower(): value for value in values}
         except Exception:  # noqa: BLE001 - degraded mode, never crash startup
             logger.warning("facet map load failed for %s", key)
             continue
-        target.clear()
-        for v in values:
-            target[v.strip().lower()] = v
+        if name == "_DEALTYPE_FACETS":
+            _DEALTYPE_FACETS = facets
+        elif name == "_INDUSTRY_FACETS":
+            _INDUSTRY_FACETS = facets
+        else:
+            _CONTENT_TYPE_FACETS = facets
 
 
 @asynccontextmanager

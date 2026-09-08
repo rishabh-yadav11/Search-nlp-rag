@@ -90,12 +90,12 @@ def test_set_get_round_trip():
     _run(scenario())
 
 
-def test_ttl_expiry():
-    cache = HybridCache("redis://fake:6379/0", ttl=0.1, maxsize=10)
+def test_degraded_fallback_honors_per_write_ttl_override():
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
     cache._redis = _FakeRedis()
 
     async def scenario():
-        await cache.set("k", "v")
+        await cache.set("k", "v", ttl=0.1)
         assert await cache.get("k") == "v"
         await asyncio.sleep(0.25)
         assert await cache.get("k") is None
