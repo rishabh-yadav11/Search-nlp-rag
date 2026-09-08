@@ -233,7 +233,7 @@ export default function ChatPage() {
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
-  }, [messages, sending])
+  }, [messages, sending, streamingContent])
 
   useEffect(() => {
     const t = setInterval(() => setTick((n) => n + 1), 60000)
@@ -306,6 +306,8 @@ export default function ChatPage() {
       // doesn't leave the UI spinning forever.
       let res: Response | null = null
       let lastErr: Error | null = null
+      // Track if we've received any data to avoid retrying after partial success
+      let receivedData = false
       for (let attempt = 0; attempt <= SSE_MAX_RETRIES; attempt++) {
         // Honor an intentional cancel (unmount / new session / switch) even
         // mid-retry so we don't re-fetch the old session after a clear.
@@ -313,10 +315,14 @@ export default function ChatPage() {
         const ctrl = new AbortController()
         abortRef.current = ctrl
         let timedOut = false
-        const timer = setTimeout(() => {
-          timedOut = true
-          ctrl.abort()
-        }, SSE_TIMEOUT_MS)
+        let lastActivity = Date.now()
+        const IDLE_TIMEOUT_MS = 30000  // 30 seconds idle timeout
+        const timer = setInterval(() => {
+          if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
+            timedOut = true
+            ctrl.abort()
+          }
+        }, 5000)  // Check every 5 seconds
         try {
           res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages/stream`, {
             method: 'POST',
@@ -332,17 +338,29 @@ export default function ChatPage() {
             : e instanceof Error
               ? e
               : new Error('Network error')
-          // Don't retry if the user aborted (unmount / new session).
+          // Don't retry if the user aborted (unmount / new session) or
+          // if we already received some data (would cause duplication).
           if (ctrl.signal.aborted && !timedOut) break
+          if (receivedData) break
           if (attempt < SSE_MAX_RETRIES) {
             await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)))
             if (cancelledRef.current) break
           }
         } finally {
-          clearTimeout(timer)
+          clearInterval(timer)
         }
       }
-      if (!res) throw lastErr ?? new Error('Streaming connection failed')
+      if (!res) {
+        // If we got data but connection failed, don't throw - we have partial content
+        if (receivedData) {
+          if (accumulated) setStreamingContent(accumulated)
+          // Clear streaming state and set an error note
+          setStreaming(false)
+          setNote('Connection ended unexpectedly, but partial response is shown above.')
+          return
+        }
+        throw lastErr ?? new Error('Streaming connection failed')
+      }
       if (res.status === 401) redirectToLogin()
       if (!res.ok) throw new Error(`Request failed (${res.status})`)
       if (!res.body) throw new Error('Streaming not supported')
@@ -368,7 +386,12 @@ export default function ChatPage() {
           let data = ''
           for (const line of lines) {
             if (line.startsWith('event:')) type = line.slice(6).trim()
-            else if (line.startsWith('data:')) data += line.slice(5).trim()
+            else if (line.startsWith('data:')) {
+              // Handle multi-line data: lines after first data: line get a newline prefix
+              const value = line.slice(5)
+              if (data) data += '\n' + value
+              else data = value
+            }
           }
           if (!type || !data) continue
           try {
@@ -379,6 +402,8 @@ export default function ChatPage() {
             } else if (type === 'delta') {
               const text = payload.text as string
               setStreaming(true)
+              receivedData = true  // Mark that we've received data
+              lastActivity = Date.now()  // Reset idle timer
               accumulated += text
               const now = Date.now()
               if (now - lastRender >= STREAM_RENDER_MS) {
