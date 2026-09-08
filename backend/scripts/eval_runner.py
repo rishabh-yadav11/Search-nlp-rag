@@ -16,16 +16,17 @@ LLM calls against the daily budget — use --dry-run to validate loading only.
     ./venv/bin/python scripts/eval_runner.py --start 1 --limit 5
     ./venv/bin/python scripts/eval_runner.py --input /path/to/prompts.json
 
-Results land in eval_results/<timestamp>.json and <timestamp>_report.md,
+Results land in eval_results/<timestamp>_<pid>.json and <timestamp>_<pid>_report.md,
 relative to the working directory (override with EVAL_RESULTS_DIR). Each
 invocation writes its own file covering the slice it ran; a resumed slice's
-report aggregates only that slice. Run one eval at a time — concurrent runs
-would collide on filenames. During the run results are appended one-per-line
-to <timestamp>.jsonl (crash-safe, cheap) under an exclusive advisory lock;
-after the report is written the .jsonl is removed. If a run dies before that
-(SIGKILL, power loss), the OS releases the lock and the next invocation
-consolidates the orphaned .jsonl — including a report — before starting
-fresh. Recovery never touches a live run's log: the lock attempt blocks it.
+report aggregates only that slice. The pid suffix makes filename collisions
+impossible, even when two runs start in the same second. During the run,
+results are appended one-per-line to <timestamp>_<pid>.jsonl (crash-safe,
+cheap) under an exclusive advisory lock; after the report is written the
+.jsonl is removed. If a run dies before that (SIGKILL, power loss), the OS
+releases the lock and the next invocation consolidates the orphaned .jsonl
+— including a report — before starting fresh. Recovery never touches a live
+run's log: the lock attempt blocks it.
 """
 
 import argparse
@@ -400,11 +401,31 @@ def _recover_orphan_logs(results_dir: str) -> None:
             except BlockingIOError:
                 print(f"skipping {log_path}: locked — a run is active", flush=True)
                 continue
-            if os.path.exists(json_path) and os.path.exists(report_path):
-                os.remove(log_path)
-                continue
+            if os.path.exists(json_path):
+                try:
+                    if os.path.exists(report_path) and os.path.getsize(report_path) > 0:
+                        os.remove(log_path)
+                        continue
+                    with open(json_path, encoding="utf-8") as fh:
+                        completed = json.load(fh)
+                    with open(report_path, "w", encoding="utf-8") as fh:
+                        fh.write(build_report(completed["meta"], completed["results"]))
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.remove(log_path)
+                    _fsync_dir(results_dir)
+                    print(f"regenerated report from {json_path}", flush=True)
+                    continue
+                except (OSError, KeyError, TypeError, ValueError) as exc:
+                    print(f"WARN: could not restore report from {json_path}: {exc!r}", flush=True)
             with open(log_path, encoding="utf-8") as fh:
-                first_line, *rest = fh.readlines()
+                lines = fh.readlines()
+            if not lines:
+                os.remove(log_path)
+                _fsync_dir(results_dir)
+                print(f"WARN: removed empty eval log {log_path}", flush=True)
+                continue
+            first_line, *rest = lines
             parsed_meta = json.loads(first_line)
             if not isinstance(parsed_meta, dict):
                 raise ValueError("first line is not a JSON object")  # noqa: TRY004 — data-shape guard, not a local type bug
@@ -461,19 +482,20 @@ def run_eval(
     from qdrant_client import QdrantClient
 
     _recover_orphan_logs(RESULTS_DIR)
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    started_utc = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    run_id = f"{started_utc}_{os.getpid()}"
     group_of = {index: label for label, members in groups.items() for index in members}
     meta = {
         "input": input_path,
         "endpoint": CHAT_BASE,
-        "started_utc": ts,
+        "started_utc": started_utc,
         "total_prompts": len(prompts),
         "resumed_from": start if start > 1 else None,
         "delay_seconds": delay,
         "n_groups": len(groups),
         "orphan_session_risk": 0,
     }
-    store = ResultStore(os.path.join(RESULTS_DIR, f"{ts}.json"), meta)
+    store = ResultStore(os.path.join(RESULTS_DIR, f"{run_id}.json"), meta)
     qdrant = QdrantClient(url=QDRANT_URL, timeout=30)
     index = start
     resume_at = start
@@ -571,7 +593,7 @@ def build_report(meta: dict, results: list[dict]) -> str:
         return text if isinstance(text, str) else ""
 
     latencies = [r.get("latency_ms") for r in ok if isinstance(r.get("latency_ms"), (int, float))]
-    costs = [r["cost_inr"] for r in ok if isinstance(r.get("cost_inr"), (int, float)) and r["cost_inr"]]
+    costs = [r["cost_inr"] for r in ok if isinstance(r.get("cost_inr"), (int, float))]
     median_cost = statistics.median(costs) if costs else None
 
     def _num(value) -> int:
