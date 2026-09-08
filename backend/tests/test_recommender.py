@@ -4,11 +4,13 @@ These are unit tests that test the pure logic functions without requiring
 Qdrant or Redis to be running. Integration tests that require the full stack
 should be added separately.
 """
+import json
 import math
+import sys
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
 
 
 class TestCalculateRecencyScore:
@@ -173,7 +175,10 @@ class TestUserProfileIntegration:
         """Test that recording an interaction returns None (success)."""
         from app.user_profile import record_interaction
         with patch('app.user_profile._redis_client') as mock_redis:
+            pipe = MagicMock()
+            pipe.execute = AsyncMock()
             mock_client = AsyncMock()
+            mock_client.pipeline = MagicMock(return_value=pipe)
             mock_redis.return_value = mock_client
             result = await record_interaction("user1", 42)
             assert result is None
@@ -206,3 +211,47 @@ class TestUserProfileIntegration:
             mock_redis.return_value = mock_client
             result = await invalidate_user_profile("user1")
             assert result is None
+
+    @pytest.mark.asyncio
+    async def test_profile_vector_reads_json_string_as_float_list(self):
+        """Consumers receive the ordered numeric vector stored in Redis."""
+        from app.user_profile import get_user_profile_vector
+
+        with patch("app.user_profile._redis_client") as mock_redis:
+            client = AsyncMock()
+            client.get.return_value = "[1, 2.5, 3]"
+            mock_redis.return_value = client
+
+            assert await get_user_profile_vector("user1") == [1.0, 2.5, 3.0]
+            client.get.assert_awaited_once_with("user:profile_vector:user1")
+
+    @pytest.mark.asyncio
+    async def test_profile_vector_derives_and_persists_recent_interactions(self):
+        """A cache miss derives a vector and category affinities from articles."""
+        from app.user_profile import get_user_profile_vector
+
+        now = datetime.now(UTC).timestamp()
+        article = MagicMock(
+            id=42,
+            vector={"dense": [2.0, 4.0]},
+            payload={"industry_names": ["technology"], "dealtype_names": ["merger"]},
+        )
+        qdrant = MagicMock()
+        qdrant.retrieve = AsyncMock(return_value=[article])
+        pipe = MagicMock()
+        pipe.execute = AsyncMock()
+        client = AsyncMock()
+        client.get.return_value = None
+        client.pipeline = MagicMock(return_value=pipe)
+
+        with (
+            patch("app.user_profile._redis_client", return_value=client),
+            patch("app.user_profile.get_user_interactions", AsyncMock(return_value=[(42, now)])),
+            patch.dict(sys.modules, {"app.main": MagicMock(state={"qdrant": qdrant})}),
+        ):
+            assert await get_user_profile_vector("user1") == [2.0, 4.0]
+
+        qdrant.retrieve.assert_awaited_once()
+        pipe.set.assert_called_once()
+        assert json.loads(pipe.set.call_args.args[1]) == [2.0, 4.0]
+        pipe.zadd.assert_called_once_with("user:categories:user1", {"technology": pytest.approx(1.0), "merger": pytest.approx(1.0)})

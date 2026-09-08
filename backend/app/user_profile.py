@@ -10,8 +10,8 @@ latest top stories across diverse industries.
 """
 import json
 import logging
+import math
 from datetime import UTC, datetime, timedelta
-
 import redis.asyncio as aioredis
 
 from app.config import config
@@ -84,6 +84,13 @@ async def record_interaction(
         pipe.hset(article_key, "last_timestamp", str(now))
         pipe.expire(article_key, config.USER_INTERACTION_TTL_DAYS * 86400)
 
+        # Derived data is only valid for the interaction snapshot it was built
+        # from. Invalidate it in the same Redis transaction as the new signal.
+        pipe.delete(
+            f"user:profile_vector:{user_id}",
+            f"user:categories:{user_id}",
+        )
+
         await pipe.execute()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to record user interaction: %s", exc)
@@ -110,17 +117,99 @@ async def get_user_interactions(user_id: str, limit: int = _PROFILE_MAX_INTERACT
 
 
 async def get_user_profile_vector(user_id: str) -> list[float] | None:
-    """Get the user's aggregated preference vector from Redis cache.
+    """Return the cached or newly-derived preference vector, if available.
 
-    Returns None if no profile exists (cold start).
+    Redis stores the vector as a JSON string so its dimension and ordered
+    values survive round trips. A missing or malformed value is a cold start.
     """
     try:
         client = _redis_client()
-        return await client.smembers(f"user:profile_vector:{user_id}")
+        raw_vector = await client.get(f"user:profile_vector:{user_id}")
+        if raw_vector is None:
+            return await build_user_profile(user_id)
+        if isinstance(raw_vector, bytes):
+            raw_vector = raw_vector.decode("utf-8")
+        values = json.loads(raw_vector)
+        if not isinstance(values, list):
+            raise ValueError("profile vector is not a JSON array")
+        vector = [float(value) for value in values]
+        if not vector or not all(math.isfinite(value) for value in vector):
+            raise ValueError("profile vector contains invalid values")
+        return vector
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to get user profile vector: %s", exc)
+        logger.warning("Failed to get user profile vector; using cold start: %s", exc)
         return None
 
+
+async def build_user_profile(user_id: str) -> list[float] | None:
+    """Build and cache a deterministic profile from recent article interactions.
+
+    Article vectors and category payloads are read together from Qdrant. Any
+    storage or lookup failure leaves the user in the documented cold-start
+    path rather than serving an incomplete personalized profile.
+    """
+    try:
+        interactions = await get_user_interactions(user_id)
+        if not interactions:
+            return None
+
+        from app.main import state  # lazy import avoids a startup cycle
+
+        articles = await state["qdrant"].retrieve(
+            collection_name=config.QDRANT_COLLECTION,
+            ids=[article_id for article_id, _ in interactions],
+            with_payload=["industry_names", "dealtype_names"],
+            with_vectors=["dense"],
+        )
+        by_id = {int(article.id): article for article in articles}
+        now = datetime.now(UTC).timestamp()
+        weighted_values: list[tuple[list[float], float]] = []
+        affinities: dict[str, float] = {}
+
+        for article_id, timestamp in interactions:
+            article = by_id.get(article_id)
+            if article is None:
+                continue
+            raw_vector = article.vector.get("dense") if isinstance(article.vector, dict) else article.vector
+            if not isinstance(raw_vector, (list, tuple)):
+                continue
+            vector = [float(value) for value in raw_vector]
+            if not vector or not all(math.isfinite(value) for value in vector):
+                continue
+            # Newer signals have higher influence while preserving determinism.
+            weight = math.exp(-max(0.0, now - timestamp) / (30 * 86400))
+            weighted_values.append((vector, weight))
+            payload = article.payload or {}
+            for key in ("industry_names", "dealtype_names"):
+                categories = payload.get(key, [])
+                if not isinstance(categories, list):
+                    categories = [categories]
+                for category in categories:
+                    if isinstance(category, str) and category:
+                        affinities[category] = affinities.get(category, 0.0) + weight
+
+        if not weighted_values:
+            return None
+        dimension = len(weighted_values[0][0])
+        if any(len(vector) != dimension for vector, _ in weighted_values):
+            raise ValueError("article vectors have inconsistent dimensions")
+        total_weight = sum(weight for _, weight in weighted_values)
+        profile = [sum(vector[index] * weight for vector, weight in weighted_values) / total_weight for index in range(dimension)]
+
+        client = _redis_client()
+        pipe = client.pipeline()
+        vector_key = f"user:profile_vector:{user_id}"
+        category_key = f"user:categories:{user_id}"
+        pipe.set(vector_key, json.dumps(profile), ex=_PROFILE_VECTOR_TTL_HOURS * 3600)
+        pipe.delete(category_key)
+        if affinities:
+            pipe.zadd(category_key, affinities)
+            pipe.expire(category_key, _CATEGORIES_TTL_HOURS * 3600)
+        await pipe.execute()
+        return profile
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to build user profile; using cold start: %s", exc)
+        return None
 
 async def get_user_profile_categories(user_id: str) -> list[tuple[str, float]]:
     """Get top affinity categories for a user from Redis cache.
