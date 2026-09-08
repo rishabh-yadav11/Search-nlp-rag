@@ -463,6 +463,17 @@ def test_close_quietly_lets_cancellation_propagate(monkeypatch):
     assert client.closed == 1
 
 
+
+def test_close_quietly_propagates_unexpected_close_error():
+    """A programming defect in teardown must not be reported as degraded Redis."""
+
+    class BrokenClose:
+        async def aclose(self):
+            raise ValueError("bad close implementation")
+
+    with pytest.raises(ValueError, match="bad close implementation"):
+        _run(health._close_quietly(BrokenClose()))
+
 def test_drop_redis_client_without_close_method(monkeypatch):
     """Doubles (and bare sentinels) with no close method are dropped cleanly."""
     client = object()

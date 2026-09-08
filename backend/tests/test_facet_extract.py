@@ -4,6 +4,8 @@ facets) and retrieval-query cleanup. The extractors resolve synonyms against the
 vocabulary that mirrors the real index (e.g. funding -> 'Venture Capital',
 not a mythical 'Funding' facet)."""
 
+import asyncio
+
 from app import main
 
 # Mirror the real Qdrant facet labels so the synonym maps resolve as in prod.
@@ -92,6 +94,40 @@ def test_extract_content_type() -> None:
     assert main.extract_content_type("competitors of Zomato") == "Competitor"
     assert main.extract_content_type("appointments in the TCS board") == "Appointment"
     assert main.extract_content_type("a video on fundraising") == "Video"
+
+
+def test_facet_load_publishes_complete_replacements_and_retains_on_failure(monkeypatch) -> None:
+    old_deal = main._DEALTYPE_FACETS
+    old_industry = main._INDUSTRY_FACETS
+    old_content_type = main._CONTENT_TYPE_FACETS
+    replacements = {
+        "dealtype_names": ["New Venture", "New M&A"],
+        "industry_names": ["New Finance", "New Healthcare"],
+        "content_type": ["New Article", "New Interview"],
+    }
+
+    async def replacement_values(key: str) -> list[str]:
+        return replacements[key]
+
+    monkeypatch.setattr(main, "_facet_values", replacement_values)
+    asyncio.run(main._load_facet_maps())
+
+    assert main._DEALTYPE_FACETS == {"new venture": "New Venture", "new m&a": "New M&A"}
+    assert main._INDUSTRY_FACETS == {"new finance": "New Finance", "new healthcare": "New Healthcare"}
+    assert main._CONTENT_TYPE_FACETS == {"new article": "New Article", "new interview": "New Interview"}
+    assert old_deal == {d.lower(): d for d in _DEAL}
+    assert old_industry == {i.lower(): i for i in _IND}
+    assert old_content_type == {c.lower(): c for c in _CT}
+
+    async def failed_values(_: str) -> list[str]:
+        raise RuntimeError("Qdrant unavailable")
+
+    monkeypatch.setattr(main, "_facet_values", failed_values)
+    asyncio.run(main._load_facet_maps())
+
+    assert main._DEALTYPE_FACETS == {"new venture": "New Venture", "new m&a": "New M&A"}
+    assert main._INDUSTRY_FACETS == {"new finance": "New Finance", "new healthcare": "New Healthcare"}
+    assert main._CONTENT_TYPE_FACETS == {"new article": "New Article", "new interview": "New Interview"}
 
 
 def test_extract_content_type_none_when_no_match() -> None:
