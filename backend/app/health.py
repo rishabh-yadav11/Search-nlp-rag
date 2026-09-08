@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-
 import redis
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Response
@@ -43,19 +42,20 @@ async def _close_quietly(client: aioredis.Redis) -> None:
 
     ``aioredis.Redis`` owns a connection pool, so dropping a reference without
     closing leaves the socket to the GC. A client that just failed its ping can
-    also fail to close, so every ``Exception`` raised by the close itself -
-    including the ``TimeoutError`` raised when it exceeds
-    ``_REDIS_CLOSE_TIMEOUT`` - is swallowed: the caller only cares that
-    readiness is degraded, not about teardown.
+    also fail to close due to a Redis or operating-system network failure, and
+    ``asyncio.wait_for`` raises ``TimeoutError`` when it exceeds
+    ``_REDIS_CLOSE_TIMEOUT``. Those expected teardown failures are swallowed:
+    the caller only cares that readiness is degraded, not about teardown.
 
-    ``BaseException`` subclasses are deliberately *not* swallowed, notably
-    ``asyncio.CancelledError``: a cancelled probe (client disconnect, server
-    shutdown) must still unwind instead of being reported as a clean teardown."""
+    Cancellation and unexpected programming errors deliberately propagate: a
+    cancelled probe (client disconnect, server shutdown) must still unwind,
+    and a broken close implementation must not be mistaken for a network
+    failure.
+    """
     close = getattr(client, "aclose", None) or getattr(client, "close", None)
     if close is None:
         return
-    with contextlib.suppress(Exception):
-        # redis.asyncio exposes the awaitable aclose(); the sync close() is the
+    with contextlib.suppress(redis.exceptions.RedisError, OSError, TimeoutError):
         # fallback for test doubles and older redis-py. Either way the call is
         # bounded: a hung close is cancelled and abandoned so /ready and /readyz
         # answer on time regardless of what the dying connection does.
