@@ -1650,11 +1650,16 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     spent_this_turn_inr += nudge.cost()
             if _is_ranking_question(question) and _is_ranking_refusal(answer):
                 # A ranked/numeric list question streamed back as a refusal
-                # ("cannot be generated", "no specific amounts"). Ask once more
-                # to rank the named items with "value not stated" for unknowns.
-                # Same cap re-check as the dataviz nudge: this is a second
-                # billed call, and it counts the spend the stream (and any
-                # dataviz nudge) has already incurred this turn.
+                # ("cannot generate specific numbers") that DOES address the
+                # named items (user's figures exist -> missing values are
+                # recoverable unknowns). Ask once more to rank the named items
+                # with "value not stated" for unknowns.
+                # If the question demands numbers the source lacks and no
+                # fallback (approximation, ranges, rank-only) is set, numbers
+                # are simply not produced, so a retry cannot correct the
+                # refusal -- skip the nudge (billed call) entirely.
+                # Ranked lists of unquantifiable items (e.g. named topics to
+                # order, no numbers ever available) must never nudge.
                 nudge = None
                 if await _nudge_retry_allowed(spent_this_turn_inr):
                     try:
@@ -1676,7 +1681,6 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             await record_cost(result.cost())
             if await request.is_disconnected():
                 return
-            await record_cost(result.cost())
             assistant_msg = await s.append_message(
                 session_id, user_id, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,

@@ -306,19 +306,18 @@ export default function ChatPage() {
       // doesn't leave the UI spinning forever.
       let res: Response | null = null
       let lastErr: Error | null = null
-      // Track if we've received any data to avoid retrying after partial success
+let accumulated = ""
       let receivedData = false
+      let lastActivity = Date.now()
       for (let attempt = 0; attempt <= SSE_MAX_RETRIES; attempt++) {
         // Honor an intentional cancel (unmount / new session / switch) even
         // mid-retry so we don't re-fetch the old session after a clear.
         if (cancelledRef.current) break
         const ctrl = new AbortController()
-        abortRef.current = ctrl
         let timedOut = false
-        let lastActivity = Date.now()
-        const IDLE_TIMEOUT_MS = 30000  // 30 seconds idle timeout
+        lastActivity = Date.now()
         const timer = setInterval(() => {
-          if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
+          if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
             timedOut = true
             ctrl.abort()
           }
@@ -368,7 +367,6 @@ export default function ChatPage() {
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-      let accumulated = ''
       let doneMsg: Message | null = null
       let note = ''
       let streamError = ''
