@@ -185,6 +185,7 @@ function AnswerBody({ content }: { content: string }) {
         ) : (
           <ReactMarkdown
             key={`md-${i}`}
+            className="markdown-body"
             remarkPlugins={[remarkGfm, remarkCitations]}
             rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
           >
