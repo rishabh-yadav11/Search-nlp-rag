@@ -17,17 +17,17 @@ type ContentPart =
   | { type: 'viz'; block: DataVizBlock }
   | { type: 'err' }
 
-// `\n?` before the closing fence tolerates the LLM omitting the trailing
-// newline right before the closing ```; `\s*` after it swallows extra trailing
-// whitespace. Mirrors the backend _DATAVIZ_FENCE_RE so both sides parse the
-// same blocks.
-const FENCE_SRC = '```dataviz\\s*\\n([\\s\\S]*?)\\n?```\\s*'
+// `[^\S\n]*\n?` tolerates the LLM putting no newline (and/or only horizontal
+// whitespace) right after the ```dataviz marker; `\n?` before the closing fence
+// tolerates omitting the trailing newline right before ```; `\s*` after it
+// swallows extra trailing whitespace. Mirrors the backend _DATAVIZ_FENCE_RE.
+const FENCE_SRC = '```dataviz[^\\S\\n]*\\n?([\\s\\S]*?)\\n?```\\s*'
 const KINDS = ['bar', 'line', 'pie'] as const
 const VIEWS = ['table', 'bar', 'line', 'pie', 'picto'] as const
 
 function toNum(v: unknown): number | null {
   if (typeof v === 'boolean') return null
-  if (typeof v === 'number') return v
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null
   if (typeof v === 'string') {
     const n = parseFloat(v.replace(/,/g, ''))
     return Number.isFinite(n) ? n : null
@@ -59,6 +59,16 @@ function firstNumericColumn(rows: (string | number)[][]): number | null {
     if (validValueColumn(rows, j)) return j
   }
   return null
+}
+
+// The column that labels each row in a chart: the first non-value column.
+// Charts must NOT hardcode index 0 — when value_column != 0 the identifying
+// label lives in a different column (e.g. column 0 is the value, column 1 the
+// name). Falls back to 0 only if every column is the value column (1-col data).
+function labelColumnIndex(columns: string[], valueColumn: number | null): number {
+  const v = valueColumn ?? 0
+  const j = columns.findIndex((_, k) => k !== v)
+  return j >= 0 ? j : 0
 }
 
 // A data block is only useful if at least one non-value column carries
@@ -125,7 +135,7 @@ export function splitContent(text: string): ContentPart[] {
     else parts.push({ type: 'err' })
     last = re.lastIndex
   }
-  if (!found) return [{ type: 'md', md: text }]
+  if (!found) return [{ type: 'md', md: stripOpenFence(text) }]
   if (last < text.length) parts.push({ type: 'md', md: text.slice(last) })
   // If the fence is still open mid-stream, drop the trailing raw JSON so it
   // doesn't flash as a code block before the closing fence arrives.
@@ -177,6 +187,7 @@ const COLORS = [
 function BarChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
+  const lc = labelColumnIndex(columns, vc)
   const values = rows.map((r) => toNum(r[v]) ?? 0)
   // Domain spans the actual min/max (anchored at 0) so negatives render below
   // the zero baseline instead of being clipped or drawn the wrong way.
@@ -226,7 +237,7 @@ function BarChart({ block }: { block: DataVizBlock }) {
           const x = padL + i * slot
           const y = barTop
           const valTextY = val >= 0 ? barTop - 5 : barTop + bh + 12
-          const full = String(rows[i][0] ?? '')
+          const full = String(rows[i][lc] ?? '')
           const label = full.length > budget ? `${full.slice(0, budget - 1)}…` : full
           return (
             <g key={i}>
@@ -255,6 +266,7 @@ function BarChart({ block }: { block: DataVizBlock }) {
 function LineChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
+  const lc = labelColumnIndex(columns, vc)
   const values = rows.map((r) => toNum(r[v]) ?? 0)
   // Domain spans the actual min/max (anchored at 0) so negative values map
   // below the zero line instead of being pushed off the top.
@@ -323,7 +335,7 @@ function LineChart({ block }: { block: DataVizBlock }) {
         {rows.map((r, i) =>
           i % step === 0 || i === n - 1 ? (
             <text key={i} x={xs[i]} y={height - padB + 16} textAnchor="middle" className="chat-viz-bar-label">
-              {String(r[0])}
+              {String(r[lc])}
             </text>
           ) : null,
         )}
@@ -335,7 +347,8 @@ function LineChart({ block }: { block: DataVizBlock }) {
 function PieChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
-  const values = rows.map((r) => toNum(r[v]) ?? 0)
+  const lc = labelColumnIndex(columns, vc)
+  const values = rows.map((r) => Math.max(0, toNum(r[v]) ?? 0))
   const total = values.reduce((a, b) => a + b, 0)
   const cx = 110
   const cy = 110
@@ -358,10 +371,10 @@ function PieChart({ block }: { block: DataVizBlock }) {
           <div className="chat-viz-empty">No numeric data to plot.</div>
         ) : (
           <svg viewBox="0 0 220 220" role="img" aria-label={block.title || 'pie chart'}>
-            {values.map((v, i) => {
-              const slice = (v / total) * Math.PI * 2
+            {values.map((sliceVal, i) => {
+              const slice = (sliceVal / total) * Math.PI * 2
               const d = arc(angle, angle + slice)
-              const pct = total ? Math.round((v / total) * 1000) / 10 : 0
+              const pct = total ? Math.round((sliceVal / total) * 1000) / 10 : 0
               const mid = angle + slice / 2
               const lx = cx + (r * 0.62) * Math.cos(mid)
               const ly = cy + (r * 0.62) * Math.sin(mid)
@@ -384,9 +397,9 @@ function PieChart({ block }: { block: DataVizBlock }) {
         {rows.map((row, i) => (
           <li key={i}>
             <span className="chat-viz-swatch" style={{ background: COLORS[i % COLORS.length] }} />
-            <span className="chat-viz-legend-label">{String(row[0])}</span>
+            <span className="chat-viz-legend-label">{String(row[lc])}</span>
             <span className="chat-viz-legend-val">
-              {formatValue(toNum(row[v]) ?? 0, format)} · {total ? Math.round((toNum(row[v])! / total) * 1000) / 10 : 0}%
+              {formatValue(values[i], format)} · {total ? Math.round((values[i] / total) * 1000) / 10 : 0}%
             </span>
           </li>
         ))}
@@ -398,6 +411,7 @@ function PieChart({ block }: { block: DataVizBlock }) {
 function PictogramChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
   const v = vc ?? 0
+  const lc = labelColumnIndex(columns, vc)
   const values = rows.map((r) => toNum(r[v]) ?? 0)
   const maxVal = values.reduce((a, b) => Math.max(a, b), 1)
   const scale = maxVal > 40 ? Math.ceil(maxVal / 40) : 1
@@ -409,7 +423,7 @@ function PictogramChart({ block }: { block: DataVizBlock }) {
         const icons = Math.round(val / scale)
         return (
           <div className="chat-viz-picto-row" key={i}>
-            <span className="chat-viz-picto-label">{String(row[0])}</span>
+            <span className="chat-viz-picto-label">{String(row[lc])}</span>
             <span className="chat-viz-picto-icons">
               {Array.from({ length: Math.max(0, icons) }).map((_, j) => (
                 <span key={j} className="chat-viz-picto-icon" style={{ background: COLORS[i % COLORS.length] }} />
