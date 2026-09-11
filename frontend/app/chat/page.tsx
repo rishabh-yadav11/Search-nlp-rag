@@ -217,6 +217,11 @@ export default function ChatPage() {
   // Distinguishes an intentional cancel (unmount / new session / switch) from a
   // real failure (e.g. timeout), so we don't surface a spurious error on cancel.
   const cancelledRef = useRef(false)
+  // Tracks the live session id independent of the render closure, so the
+  // in-flight stream's done/accumulated guards compare against the *current*
+  // session (a new-chat turn commits, and a stale reply to a switched session
+  // is discarded) instead of the `activeId` captured when `send` was called.
+  const activeIdRef = useRef<string | null>(null)
 
   const loadSessions = useCallback(async () => {
     try {
@@ -235,6 +240,12 @@ export default function ChatPage() {
   useEffect(() => {
     loadSessions()
   }, [loadSessions])
+
+  // Mirror the live session id into a ref so in-flight streams can compare
+  // against the *current* session regardless of which render captured them.
+  useEffect(() => {
+    activeIdRef.current = activeId
+  }, [activeId])
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
@@ -259,6 +270,7 @@ export default function ChatPage() {
       abortRef.current?.abort()
       setActiveId(id)
       setError('')
+      setNote('')
       try {
         const data = await api(`/api/chat/sessions/${id}`)
         const msgs = Array.isArray(data.messages) ? (data.messages as Message[]) : []
@@ -285,6 +297,7 @@ export default function ChatPage() {
     const question = input.trim()
     if (!question || sending) return
     setError('')
+    setNote('')
     cancelledRef.current = false
 
     let sessionId = activeId
@@ -481,14 +494,14 @@ export default function ChatPage() {
         if (doneMsg) {
           // Guard against the stale-session race: a switched session must not
           // receive this old turn's message.
-          if (activeId === sessionId) {
+          if (activeIdRef.current === sessionId) {
             setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
             if (note) setNote(note)
           }
           setStreamingContent('')
           await loadSessions()
         } else if (accumulated) {
-          if (activeId === sessionId) {
+          if (activeIdRef.current === sessionId) {
             setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), { id: -Date.now() + 1, role: 'assistant', content: accumulated, created_at: Date.now() / 1000 }])
           }
           setStreamingContent('')
