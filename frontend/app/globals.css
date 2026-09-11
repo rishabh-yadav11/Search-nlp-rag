@@ -521,6 +521,39 @@ input[type='text']:focus-visible,
   font-weight: 700;
 }
 
+.markdown-body table {
+  width: 100%;
+  max-width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 13px;
+  line-height: 1.5;
+  display: block;
+  overflow-x: auto;
+}
+
+.markdown-body th,
+.markdown-body td {
+  text-align: left;
+  padding: 7px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  white-space: nowrap;
+}
+
+.markdown-body th {
+  background: rgba(0, 0, 0, 0.045);
+  font-weight: 600;
+}
+
+.markdown-body tr:nth-child(even) td {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.markdown-body td {
+  font-variant-numeric: tabular-nums;
+}
+
+
 /* ---- Result cards (VCCircle style: title 16-18px #222, meta 12px #484848) ---- */
 
 .result {
