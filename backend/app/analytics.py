@@ -149,6 +149,9 @@ async def record_click(query: str, position: int, article_id: int | None = None)
         p.incr("analytics:click:total")
         p.incr(f"analytics:click:pos:{pos}")
         p.zincrby("analytics:click_top_queries", 1, query)
+        # Expire the aggregate set too, so distinct-query growth from the
+        # unauthenticated beacon doesn't accumulate forever; refreshed on each click.
+        p.expire("analytics:click_top_queries", config.CLICK_QUERY_TTL_SECONDS)
         if q_article_id is not None:
             qkey = _click_query_key(query)
             p.zincrby(qkey, 1, str(q_article_id))
