@@ -1588,15 +1588,26 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
 
     async def event_stream():
         start = time.perf_counter()
-        try:
+
+        async def aborted() -> bool:
+            # Clean rollback on disconnect: a dropped client must not leave a
+            # dangling user message with no assistant reply, matching what the
+            # error paths below do. Only valid before an assistant reply is
+            # persisted; after that the user message is no longer dangling.
             if await request.is_disconnected():
+                await s.delete_message(session_id, user_id, user_msg.id)
+                return True
+            return False
+
+        try:
+            if await aborted():
                 return
             yield _sse("start", {"user": user_msg.model_dump()})
-            if await request.is_disconnected():
+            if await aborted():
                 return
             turn = await _prepare_turn(question, history)
             if not turn.needs_llm:
-                if await request.is_disconnected():
+                if await aborted():
                     return
                 latency_ms = (time.perf_counter() - start) * 1000
                 assistant_msg = await s.append_message(
@@ -1604,19 +1615,17 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     prompt_tokens=turn.prompt_tokens, completion_tokens=turn.completion_tokens,
                     cost=turn.cost, latency_ms=latency_ms,
                 )
-                if await request.is_disconnected():
-                    return
                 await _auto_title(s, session_id, user_id, question)
                 yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
                 return
 
-            if await request.is_disconnected():
+            if await aborted():
                 return
             await assert_within_budget()
             usage_holder: list = []
             chunks: list[str] = []
             async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
-                if await request.is_disconnected():
+                if await aborted():
                     return
                 chunks.append(piece)
                 yield _sse("delta", {"text": piece})
@@ -1683,7 +1692,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 completion_tokens=completion_tokens,
             )
             await record_cost(result.cost())
-            if await request.is_disconnected():
+            if await aborted():
                 return
             assistant_msg = await s.append_message(
                 session_id, user_id, "assistant", answer, turn.sources,
@@ -1692,8 +1701,6 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 cost=to_usd(result.cost()),
                 latency_ms=latency_ms,
             )
-            if await request.is_disconnected():
-                return
             await _auto_title(s, session_id, user_id, question)
             yield _sse(
                 "done",
