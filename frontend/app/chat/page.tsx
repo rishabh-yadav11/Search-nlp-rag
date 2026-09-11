@@ -178,6 +178,10 @@ function AnswerBody({ content }: { content: string }) {
       {parts.map((part, i) =>
         part.type === 'viz' ? (
           <DataViz key={`viz-${i}`} block={part.block} />
+        ) : part.type === 'err' ? (
+          <p key={`err-${i}`} className="chat-viz-empty" style={{ margin: '12px 0' }}>
+            Chart requested but could not be rendered.
+          </p>
         ) : (
           <ReactMarkdown
             key={`md-${i}`}
