@@ -353,7 +353,7 @@ run_cron() {
     # webhook URL (and a minimal PATH via healthcheck.sh) explicitly. Empty
     # webhook is harmless: healthcheck.sh treats an unset/empty value as "no
     # webhook". Keep the entry stable for idempotent re-runs.
-    local line_hc="*/5 * * * * HEALTHCHECK_WEBHOOK_URL=\"$HEALTHCHECK_WEBHOOK_URL\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
+    local line_hc="*/5 * * * * HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
     # Remove only the exact managed entries this script writes; preserve any
@@ -390,7 +390,18 @@ server {
     location /live { proxy_pass http://127.0.0.1:$API_PORT; }
     location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
     location /facets { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /analytics { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /api {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_read_timeout 300s;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    location /analytics/click { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /analytics/summary { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /analytics/chat { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /analytics { proxy_pass http://127.0.0.1:$NEXT_PORT; }
 
     location / {
         proxy_pass http://127.0.0.1:$NEXT_PORT;
