@@ -70,7 +70,8 @@ function isHttps(url: URL): boolean {
  *  NOT a network cleartext risk — a dev backend like `http://localhost:8000` is
  *  therefore trusted even though it is cross-origin http. */
 function isLoopback(url: URL): boolean {
-  return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+  // `URL.hostname` returns IPv6 loopback without brackets (e.g. `::1`).
+  return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
 }
 
 /** Normalize an allow-list entry or URL host for comparison: strip any leading
