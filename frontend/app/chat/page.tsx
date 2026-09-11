@@ -375,20 +375,35 @@ export default function ChatPage() {
       let note = ''
       let streamError = ''
       let lastRender = 0
+      // Mirrors the retry-branch guard: set when the watchdog decides the
+      // stream has gone silent, so the outer catch surfaces a friendly message
+      // instead of the raw AbortError text.
+      let timedOut = false
 
       // Keep the idle watchdog alive across the whole read loop, not just the
-      // initial fetch. Reset it on every delta so a normally-streaming answer
-      // never trips it; if the server goes silent for SSE_TIMEOUT_MS, abort the
-      // signal (which cancels the body stream) and stop hanging forever.
+      // initial fetch. Refresh it on genuine activity — every chunk the reader
+      // returns and the final 'done' event — so a normally-streaming answer, or
+      // the backend's substantial post-delta work (nudge/ranking retries that
+      // re-invoke the LLM, _auto_title, record_cost) before emitting 'done',
+      // never trips it. Crucially, once any content has streamed we never abort
+      // mid-stream: aborting would discard an otherwise-valid turn. Only a
+      // stream that produced nothing at all for SSE_TIMEOUT_MS (a hung
+      // connection) is aborted; a silent gap after content has started still
+      // flags timedOut so a friendly message is surfaced rather than a raw
+      // AbortError.
       lastActivity = Date.now()
       const streamTimer = setInterval(() => {
-        if (Date.now() - lastActivity > SSE_TIMEOUT_MS) ctrl?.abort()
+        if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
+          timedOut = true
+          if (!receivedData) ctrl?.abort()
+        }
       }, 5000)
 
       try {
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
+          lastActivity = Date.now()  // Any server activity keeps the watchdog alive
           buffer += decoder.decode(value, { stream: true })
           const events = buffer.replace(/\r\n/g, '\n').split('\n\n')
           buffer = events.pop() ?? ''
@@ -423,6 +438,7 @@ export default function ChatPage() {
                   setStreamingContent(accumulated)
                 }
               } else if (type === 'done') {
+                lastActivity = Date.now()  // Post-delta backend work now finished
                 doneMsg = payload.message as Message
                 note = payload.note ?? ''
               } else if (type === 'error') {
@@ -463,6 +479,12 @@ export default function ChatPage() {
       }
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
       setStreamingContent('')
+      // Mirror the retry branch: a watchdog timeout surfaces a friendly
+      // message, not the raw AbortError text ('The user aborted a request.').
+      if (timedOut) {
+        setError('Connection timed out. Please try again.')
+        return
+      }
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setSending(false)
