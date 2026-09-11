@@ -473,7 +473,7 @@ function TableView({ block }: { block: DataVizBlock }) {
             <tr key={effectivePage * TABLE_PAGE_SIZE + i}>
               {row.map((cell, j) => (
                 <td key={j}>
-                  {j === block.value_column && (isMissing(cell) ? '—' : toNum(cell) != null ? formatValue(toNum(cell)!, block.format) : String(cell))}
+                  {j === block.value_column ? (isMissing(cell) ? '—' : toNum(cell) != null ? formatValue(toNum(cell)!, block.format) : String(cell)) : String(cell)}
                 </td>
               ))}
             </tr>
