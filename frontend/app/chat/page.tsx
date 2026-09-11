@@ -554,7 +554,7 @@ let accumulated = ""
           {messages.length === 0 && !sending ? (
             <div className="chat-empty">
               <h1>Ask VCCircle</h1>
-              <p>Ask a question about VCCircle&apos;s news archive. Conversations are saved to your device and kept for 6 months.</p>
+              <p>Ask a question about VCCircle&apos;s news archive. Conversations are saved to your account and kept for 6 months.</p>
             </div>
           ) : (
             messages.map((m) => (
