@@ -54,7 +54,6 @@ backend/
     llm.py             LLM call with timeout, retries, backoff, token-cost calc
     chat.py            per-user chat store (SQLite) + /api/chat router
     analytics.py       Redis-backed search/click analytics aggregates
-    dashboard.py       self-contained HTML analytics dashboard
     config.py          env-driven settings
     query_intent.py    year/top-N intent parsing + Flashback rewriting
     query_expand.py    deterministic synonym query expansion
@@ -232,7 +231,6 @@ cd backend
 | `GET /health`                                   | Liveness                                                      |
 | `GET /ready`                                    | Readiness (503 when Qdrant/models unavailable)                |
 | `GET /live`, `GET /readyz`                      | Liveness / bare readiness                                     |
-| `GET /analytics/dashboard`                      | Self-contained HTML analytics dashboard (incl. chat usage)    |
 
 ```bash
 curl "http://localhost:8001/search?q=fintech%20funding&top_k=3"
@@ -277,8 +275,18 @@ server {
     location /health    { proxy_pass http://127.0.0.1:8001; }
     location /live      { proxy_pass http://127.0.0.1:8001; }
     location /ready     { proxy_pass http://127.0.0.1:8001; }
-    location /api       { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
-    location /analytics { proxy_pass http://127.0.0.1:8001; }
+    location /api {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_read_timeout 300s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location /analytics/click   { proxy_pass http://127.0.0.1:8001; }
+    location /analytics/summary { proxy_pass http://127.0.0.1:8001; }
+    location /analytics/chat    { proxy_pass http://127.0.0.1:8001; }
+    location /analytics { proxy_pass http://127.0.0.1:3000; }
     location /          {
         proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
