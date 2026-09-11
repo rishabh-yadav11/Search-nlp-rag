@@ -81,13 +81,17 @@ function isLoopback(url: URL): boolean {
  *  dropped from allow-list entries too, or an entry like `api.example.com:443`
  *  would never match. Explicit non-default ports (e.g. `:8080`) are preserved,
  *  so matching stays exact `host:port` (`api.example.com:8080` matches only
- *  `api.example.com:8080`, not `api.example.com`). */
+ *  `api.example.com:8080`, not `api.example.com`). Hostnames are also
+ *  lowercased: `url.host` is always lowercased, but allow-list entries are
+ *  only `trim()`-ed, so an entry like `API.Example.COM` would otherwise
+ *  silently fail to match (hostnames are case-insensitive per RFC 4343). */
 export function normalizeHost(host: string): string {
   return host
     .replace(/^https?:\/\//, '')
     .replace(/\/+$/, '')
     .replace(/\.$/, '')
     .replace(/:(?:80|443)$/, '')
+    .toLowerCase()
 }
 
 /** True when `url`'s host is present in NEXT_PUBLIC_TRUSTED_API_HOSTS (compared
