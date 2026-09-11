@@ -533,6 +533,12 @@ def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
     return list(best.values())
 
 
+# The leading 'Flashback <year>' prefix _effective_intent emits for a year-in-
+# review intent ('top N <topic> in <year>'), used to recover that intent when
+# _retrieval_queries is called with the already-rewritten query.
+_FLASHBACK_PREFIX_RE = re.compile(r"^\s*flashback\s+(?:19|20)\d{2}\b\s*", re.IGNORECASE)
+
+
 def _retrieval_queries(q: str) -> list[str]:
     """Queries to run for a user query. For year-in-review intents this is the
     Flashback-rewritten query PLUS the bare topic (year-filtered) so niche
@@ -544,6 +550,17 @@ def _retrieval_queries(q: str) -> list[str]:
     if changed:
         topic = extract_list_topic(q) or q
         return list(dict.fromkeys([flashback, topic]))
+    # In the real pipeline this is called with the query _effective_intent has
+    # already rewritten (e.g. 'Flashback 2025 unicorns created'), so the
+    # 'top N ... in <year>' cue is gone and ``changed`` is False — the bare-topic
+    # leg would be dropped. The 'Flashback <year>' prefix is only emitted for a
+    # year-in-review intent, so re-detect it and re-emit the embedded topic as
+    # the second leg (the prefix rewrite was 'Flashback <year> <topic>').
+    m = _FLASHBACK_PREFIX_RE.match(q)
+    if m:
+        topic = q[m.end():].strip()
+        if topic:
+            return list(dict.fromkeys([q, topic]))
     scoped = range_query_topic(q)
     if scoped:
         return [scoped]
