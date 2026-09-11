@@ -22,7 +22,7 @@ const TRUSTED_API_HOSTS: string[] = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS |
 const WIN_API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
 const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
-const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : ''
+const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:8001' : ''
 
 /**
  * Validate a candidate API base. Rejects anything that is not a proper http(s)
