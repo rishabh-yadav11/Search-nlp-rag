@@ -279,7 +279,13 @@ server {
     location /ready     { proxy_pass http://127.0.0.1:8001; }
     location /api       { proxy_pass http://127.0.0.1:8001; proxy_read_timeout 300s; }
     location /analytics { proxy_pass http://127.0.0.1:8001; }
-    location /          { proxy_pass http://127.0.0.1:3000; }
+    location /          {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 }
 ```
 
@@ -314,7 +320,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `QDRANT_COLLECTION` | `vccircle_articles` | Collection name |
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared query cache (falls back to in-process cache if Redis is down) |
 | `EMBED_MODEL` / `SPARSE_MODEL` | `BAAI/bge-base-en-v1.5` / `Qdrant/bm25` | Dense / sparse embedders (must match index time) |
-| `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `6000` / `6000` | Chars for the dense vector; sparse/lexical vector; body chars kept in the payload |
+| `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `50000` / `50000` | Chars for the dense vector; sparse/lexical vector; body chars kept in the payload |
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `EMBED_DEVICE` | `cpu` | `cuda` for a GPU |
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `12` | Cross-encoder reranker; how many RRF candidates to re-score (12 keeps top-8 quality vs 16, faster on CPU) |
@@ -323,12 +329,12 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `LLM_DAILY_BUDGET_USD` | `0` (disabled) | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value (see `app/cost_budget.py`) |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; chat retrieval threshold |
-| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `120` / `1000` | Query cache TTL; size of the in-process fallback cache |
+| `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | Query cache TTL; size of the in-process fallback cache |
 | `CHAT_DB_PATH` / `CHAT_RETENTION_DAYS` / `CHAT_MAX_HISTORY_TURNS` | `data/chat.db` / `180` / `10` | SQLite chat store; idle-purge window; context turns kept per conversation |
 | `RECENCY_STRENGTH` / `RECENCY_DECAY_DAYS` | `0.25` / `90` | Recency-tempered ranking blend |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
-| `ANALYTICS_REDIS_DB` / `ANALYTICS_VIEW_TOKEN` | `1` / `` | Analytics aggregates live in Redis DB N (cache is DB 0); when set, `/analytics/*` require this bearer token |
-| `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated allowed origins for CORS (production is same-origin through nginx) |
+| `ANALYTICS_REDIS_DB` | `1` | Analytics aggregates live in Redis DB N (cache is DB 0); read endpoints are gated by the auth layer (admin role) |
+| `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8001` | Comma-separated allowed origins for CORS (production is same-origin through nginx) |
 
 ## Testing and CI
 

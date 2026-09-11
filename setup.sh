@@ -343,18 +343,22 @@ run_stop() {
 run_cron() {
     stage "cron"
     local log="$LOGS/update_index.log"
+    local hc_log="$LOGS/healthcheck.log"
     # update_index.py takes its own flock(2) on data/update.lock (LOCK_EX|LOCK_NB)
     # and skips when another run holds it, so no external flock wrapper is needed
     # (wrapping with `flock -n` would conflict with the script's own lock and
     # cause every run to be skipped).
-    local line="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
+    local line_idx="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
+    local line_hc="*/5 * * * * LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
-    crontab -l 2>/dev/null | grep -vF "update_index.py" > "$tmp" || true
-    printf '%s\n' "$line" >> "$tmp"
+    crontab -l 2>/dev/null | grep -vF "update_index.py" | grep -vF "healthcheck.sh" > "$tmp" || true
+    printf '%s\n' "$line_idx" >> "$tmp"
+    printf '%s\n' "$line_hc" >> "$tmp"
     crontab "$tmp"
     rm -f "$tmp"
     echo "cron installed: */15 * * * * update_index.py"
+    echo "cron installed: */5  * * * * healthcheck.sh"
 }
 
 run_nginx() {
