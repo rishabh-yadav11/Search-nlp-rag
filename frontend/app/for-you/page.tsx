@@ -81,16 +81,16 @@ export default function ForYouPage() {
   }, [feedType, limit])
 
   const handleInteraction = async (articleId: number | string, e: MouseEvent) => {
-    const token = getToken()
-    if (!token) return
+    const headers = authHeaders({
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
 
     try {
       await fetch(`${API_BASE}/recommend/interaction`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
+        headers,
         body: JSON.stringify({ article_id: articleId, interaction_type: 'click' }),
       })
     } catch (err) {
