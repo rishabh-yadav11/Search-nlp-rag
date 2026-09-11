@@ -1,7 +1,9 @@
 # VCCircle New Search — API Reference
 
-Base URL: `https://<host>/` (also reachable directly at `http://<host>:8001` on the
-host itself; the public entrypoint is nginx on port 80).
+Base URL: `http://<host>/` — the public entrypoint is nginx on port 80 (plain
+HTTP; the app is not served on an internal port). The FastAPI backend is also
+reachable directly at `http://<host>:8001` on the host itself for internal/dev
+use only, not for public access.
 
 Most endpoints return JSON. Search and analytics are `GET`; chat is JSON or
 Server-Sent-Events (SSE).
@@ -455,36 +457,36 @@ Redis down does not fail readiness (the API degrades to an in-process cache).
 
 ```bash
 # Basic search
-curl "https://<host>/search?q=fintech%20funding&top_k=5"
+curl "http://<host>/search?q=fintech%20funding&top_k=5"
 
 # Filter by industry + date range
-curl "https://<host>/search?q=funding&industry=Fintech,Healthtech&from_date=2024-01-01&to_date=2025-12-31"
+curl "http://<host>/search?q=funding&industry=Fintech,Healthtech&from_date=2024-01-01&to_date=2025-12-31"
 
 # Year-in-review / top-N (auto Flashback handling)
-curl "https://<host>/search?q=top%2010%20fintech%20deals%20in%202025&top_k=10"
+curl "http://<host>/search?q=top%2010%20fintech%20deals%20in%202025&top_k=10"
 
 # Facet values for filter autocomplete
-curl "https://<host>/facets"
+curl "http://<host>/facets"
 
 # Sign up (public; rate-limited per IP)
-curl -X POST "https://<host>/api/auth/signup" -H "Content-Type: application/json" \
+curl -X POST "http://<host>/api/auth/signup" -H "Content-Type: application/json" \
   -d '{"email":"you@example.com","password":"secret12","name":"You"}'
 
 # Log in and capture a bearer token
-TOKEN=$(curl -s -X POST "https://<host>/api/auth/login" -H "Content-Type: application/json" \
+TOKEN=$(curl -s -X POST "http://<host>/api/auth/login" -H "Content-Type: application/json" \
   -d '{"email":"you@example.com","password":"secret12"}' | jq -r .token)
 
 # Create a chat conversation
-curl -X POST "https://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
+curl -X POST "http://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
 
 # List conversations
-curl "https://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
+curl "http://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
 
 # Per-user token/cost usage
-curl "https://<host>/api/chat/usage" -H "Authorization: Bearer $TOKEN"
+curl "http://<host>/api/chat/usage" -H "Authorization: Bearer $TOKEN"
 
 # Stream a chat turn (SSE)
-curl -N -X POST "https://<host>/api/chat/sessions/<id>/messages/stream" \
+curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"content":"who invested in Ola Electric?"}'
 ```
