@@ -13,7 +13,7 @@ set -u
 
 BASE="${BASE:-http://localhost:8001}"
 APP="vccircle-backend"
-LOG="${LOG:-/home/ubuntu/search-nlp-rag/logs/healthcheck.log}"
+LOG="${LOG:-$HOME/search-nlp-rag/logs/healthcheck.log}"
 
 # cron has a minimal PATH, so pm2 may not be found. Include common locations.
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"

@@ -450,11 +450,16 @@ async def token_purge_loop() -> None:
 def _client_ip(request: Request) -> str:
     """Client IP. The X-Forwarded-For header is only honored when the API is
     deployed behind a configured reverse proxy, so a raw client cannot spoof
-    its IP (e.g. for bypassing rate limits). Otherwise the socket peer wins."""
+    its IP (e.g. for bypassing rate limits). Otherwise the socket peer wins.
+
+    nginx ``$proxy_add_x_forwarded_for`` APPENDS ``$remote_addr`` (the real
+    peer) to any client-supplied X-Forwarded-For list, so the *rightmost* hop
+    is the one added by the trusted proxy while the leftmost is attacker
+    controlled; take the rightmost."""
     if config.AUTH_TRUST_X_FORWARDED_FOR:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            return forwarded.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 

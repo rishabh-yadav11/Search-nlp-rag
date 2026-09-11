@@ -167,9 +167,10 @@ class Config:
     CLICK_BOOST_MIN_SHARE = float(os.getenv("CLICK_BOOST_MIN_SHARE", "0.3"))
     CLICK_BOOST_MULT = float(os.getenv("CLICK_BOOST_MULT", "1.3"))
 
-    # Bounds for the anonymous /analytics/click beacon so a hostile client can't
-    # grow Redis without limit: cap the stored query string length and expire the
-    # per-query click sorted sets a few days after the last click.
+    # Bounds on stored query strings so a hostile client can't grow Redis
+    # without limit: cap the stored query length and expire the per-query click
+    # sorted sets (and the /search top_queries aggregate) a few days after the
+    # last write. Shared by the /analytics/click beacon and /search tracking.
     CLICK_QUERY_MAX_LEN = int(os.getenv("CLICK_QUERY_MAX_LEN", "256"))
     CLICK_QUERY_TTL_SECONDS = int(os.getenv("CLICK_QUERY_TTL_SECONDS", str(7 * 24 * 3600)))
 

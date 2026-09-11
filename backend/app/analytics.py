@@ -88,6 +88,11 @@ async def record_search(
 ) -> None:
     """Count one /search event and its outcome. Never raises."""
     try:
+        # Bound the stored query before it becomes a sorted-set member; an
+        # unauthenticated caller could otherwise grow Redis without limit.
+        # Truncate rather than hash to keep it human-readable (mirrors the
+        # click beacon's truncation).
+        query = (query or "").strip()[: config.CLICK_QUERY_MAX_LEN]
         p = _client().pipeline()
         p.incr("analytics:search:total")
         p.incr(f"analytics:search:day:{_today()}")
@@ -95,6 +100,10 @@ async def record_search(
         p.incr("analytics:search:latency:count")
         p.incr("analytics:search:cached" if cached else "analytics:search:uncached")
         p.zincrby("analytics:top_queries", 1, query)
+        # Expire the aggregate so an idle deployment's top_queries key (and its
+        # unbounded distinct-query members) cannot accumulate forever; refreshed
+        # on every search, mirroring the click beacon's per-query TTL.
+        p.expire("analytics:top_queries", config.CLICK_QUERY_TTL_SECONDS)
         if filtered:
             p.incr("analytics:search:filtered")
         if result_count == 0:
