@@ -1454,6 +1454,36 @@ input[type='text']:focus-visible,
   font-variant-numeric: tabular-nums;
 }
 
+.chat-viz-table-nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.chat-viz-table-nav-btn {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #f7f7f8;
+  color: #333;
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.chat-viz-table-nav-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.chat-viz-table-nav-page {
+  font-size: 12px;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .chat-viz-chart {
   overflow-x: auto;
 }
