@@ -677,7 +677,7 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
     return None
 
 
-_DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n?```", re.DOTALL)
+_DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n?```\s*", re.DOTALL)
 
 
 def _as_float(v: object) -> float | None:
@@ -733,8 +733,12 @@ def _first_numeric_column(rows: list[list[object]]) -> int | None:
 
 def _has_label_content(rows: list[list[object]], columns: list[str], value_column: int | None) -> bool:
     """A dataviz block is only useful if at least one non-value column carries
-    identifying text. A 'top deals' table whose Deal cells are all empty shows
-    only numbers and is treated as malformed so the nudge retry rebuilds it."""
+    identifying content — text OR a numeric identifier such as a Year (2024) or
+    a row index. Any non-blank label cell (checked via _missing_cell) counts, so
+    a numeric identifier column passes here just like a name column. A 'top
+    deals' table whose Deal cells are all empty (every label cell blank, no
+    identifying column at all) shows only numbers and is treated as malformed so
+    the nudge retry rebuilds it."""
     label_cols = [j for j in range(len(columns)) if j != value_column]
     if not label_cols:
         return True
