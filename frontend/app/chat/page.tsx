@@ -311,20 +311,25 @@ export default function ChatPage() {
       // doesn't leave the UI spinning forever.
       let res: Response | null = null
       let lastErr: Error | null = null
-let accumulated = ""
+      let accumulated = ""
       let receivedData = false
       let lastActivity = Date.now()
+      // The last attempted controller stays live past the retry loop so the
+      // read-loop watchdog can abort a stream that goes silent mid-flight:
+      // aborting the signal cancels the response body, which rejects an
+      // in-flight reader.read().
+      let ctrl: AbortController | null = null
       for (let attempt = 0; attempt <= SSE_MAX_RETRIES; attempt++) {
         // Honor an intentional cancel (unmount / new session / switch) even
         // mid-retry so we don't re-fetch the old session after a clear.
         if (cancelledRef.current) break
-        const ctrl = new AbortController()
+        ctrl = new AbortController()
         let timedOut = false
         lastActivity = Date.now()
         const timer = setInterval(() => {
           if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
             timedOut = true
-            ctrl.abort()
+            ctrl!.abort()
           }
         }, 5000)  // Check every 5 seconds
         try {
@@ -355,14 +360,9 @@ let accumulated = ""
         }
       }
       if (!res) {
-        // If we got data but connection failed, don't throw - we have partial content
-        if (receivedData) {
-          if (accumulated) setStreamingContent(accumulated)
-          // Clear streaming state and set an error note
-          setStreaming(false)
-          setNote('Connection ended unexpectedly, but partial response is shown above.')
-          return
-        }
+        // No response was obtained (all retries failed or were abandoned).
+        // receivedData can never be true here — data only arrives once a
+        // response body exists — so throw the accumulated error directly.
         throw lastErr ?? new Error('Streaming connection failed')
       }
       if (res.status === 401) redirectToLogin()
@@ -376,71 +376,100 @@ let accumulated = ""
       let note = ''
       let streamError = ''
       let lastRender = 0
+      // Mirrors the retry-branch guard: set when the watchdog decides the
+      // stream has gone silent, so the outer catch surfaces a friendly message
+      // instead of the raw AbortError text.
+      let timedOut = false
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const events = buffer.replace(/\r\n/g, '\n').split('\n\n')
-        buffer = events.pop() ?? ''
-        for (const evt of events) {
-          const lines = evt.split('\n')
-          let type = ''
-          let data = ''
-          for (const line of lines) {
-            if (line.startsWith('event:')) type = line.slice(6).trim()
-            else if (line.startsWith('data:')) {
-              // Handle multi-line data: lines after first data: line get a newline prefix
-              const value = line.slice(5)
-              if (data) data += '\n' + value
-              else data = value
-            }
-          }
-          if (!type || !data) continue
-          try {
-            const payload = JSON.parse(data)
-            if (type === 'start') {
-              const userMsg = payload.user as Message
-              setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), userMsg])
-            } else if (type === 'delta') {
-              const text = payload.text as string
-              setStreaming(true)
-              receivedData = true  // Mark that we've received data
-              lastActivity = Date.now()  // Reset idle timer
-              accumulated += text
-              const now = Date.now()
-              if (now - lastRender >= STREAM_RENDER_MS) {
-                lastRender = now
-                setStreamingContent(accumulated)
+      // Keep the idle watchdog alive across the whole read loop, not just the
+      // initial fetch. Refresh it on genuine activity — every chunk the reader
+      // returns and the final 'done' event — so a normally-streaming answer, or
+      // the backend's substantial post-delta work (nudge/ranking retries that
+      // re-invoke the LLM, _auto_title, record_cost) before emitting 'done',
+      // never trips it. Crucially, once any content has streamed we never abort
+      // mid-stream: aborting would discard an otherwise-valid turn. Only a
+      // stream that produced nothing at all for SSE_TIMEOUT_MS (a hung
+      // connection) is aborted; a silent gap after content has started still
+      // flags timedOut so a friendly message is surfaced rather than a raw
+      // AbortError.
+      lastActivity = Date.now()
+      const streamTimer = setInterval(() => {
+        if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
+          timedOut = true
+          if (!receivedData) ctrl?.abort()
+        }
+      }, 5000)
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          lastActivity = Date.now()  // Any server activity keeps the watchdog alive
+          buffer += decoder.decode(value, { stream: true })
+          const events = buffer.replace(/\r\n/g, '\n').split('\n\n')
+          buffer = events.pop() ?? ''
+          for (const evt of events) {
+            const lines = evt.split('\n')
+            let type = ''
+            let data = ''
+            for (const line of lines) {
+              if (line.startsWith('event:')) type = line.slice(6).trim()
+              else if (line.startsWith('data:')) {
+                // Handle multi-line data: lines after first data: line get a newline prefix
+                const value = line.slice(5)
+                if (data) data += '\n' + value
+                else data = value
               }
-            } else if (type === 'done') {
-              doneMsg = payload.message as Message
-              note = payload.note ?? ''
-            } else if (type === 'error') {
-              streamError = payload.error ?? 'Something went wrong.'
             }
-          } catch {
-            /* skip malformed event */
+            if (!type || !data) continue
+            try {
+              const payload = JSON.parse(data)
+              if (type === 'start') {
+                const userMsg = payload.user as Message
+                setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), userMsg])
+              } else if (type === 'delta') {
+                const text = payload.text as string
+                setStreaming(true)
+                receivedData = true  // Mark that we've received data
+                lastActivity = Date.now()  // Reset idle timer
+                accumulated += text
+                const now = Date.now()
+                if (now - lastRender >= STREAM_RENDER_MS) {
+                  lastRender = now
+                  setStreamingContent(accumulated)
+                }
+              } else if (type === 'done') {
+                lastActivity = Date.now()  // Post-delta backend work now finished
+                doneMsg = payload.message as Message
+                note = payload.note ?? ''
+              } else if (type === 'error') {
+                streamError = payload.error ?? 'Something went wrong.'
+              }
+            } catch {
+              /* skip malformed event */
+            }
           }
         }
-      }
 
-      // Flush the final text so the last chunk renders even if it arrived
-      // inside the throttle window.
-      if (accumulated) setStreamingContent(accumulated)
+        // Flush the final text so the last chunk renders even if it arrived
+        // inside the throttle window.
+        if (accumulated) setStreamingContent(accumulated)
 
-      if (streamError) throw new Error(streamError)
-      if (doneMsg) {
-        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
-        setStreamingContent('')
-        if (note) setNote(note)
-        await loadSessions()
-      } else if (accumulated) {
-        setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), { id: -Date.now() + 1, role: 'assistant', content: accumulated, created_at: Date.now() / 1000 }])
-        setStreamingContent('')
-        await loadSessions()
-      } else {
-        throw new Error('No response received.')
+        if (streamError) throw new Error(streamError)
+        if (doneMsg) {
+          setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
+          setStreamingContent('')
+          if (note) setNote(note)
+          await loadSessions()
+        } else if (accumulated) {
+          setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), { id: -Date.now() + 1, role: 'assistant', content: accumulated, created_at: Date.now() / 1000 }])
+          setStreamingContent('')
+          await loadSessions()
+        } else {
+          throw new Error('No response received.')
+        }
+      } finally {
+        clearInterval(streamTimer)
       }
     } catch (err) {
       // An intentional cancel (unmount / new session / switch) aborts the
@@ -451,6 +480,12 @@ let accumulated = ""
       }
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
       setStreamingContent('')
+      // Mirror the retry branch: a watchdog timeout surfaces a friendly
+      // message, not the raw AbortError text ('The user aborted a request.').
+      if (timedOut) {
+        setError('Connection timed out. Please try again.')
+        return
+      }
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.')
     } finally {
       setSending(false)
