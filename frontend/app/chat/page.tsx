@@ -112,9 +112,9 @@ function relativeTime(ts: number): string {
 
 function formatCost(cost: number): string {
   if (cost <= 0) return ''
-  if (cost >= 1) return `₹${cost.toFixed(2)}`
-  if (cost >= 0.01) return `₹${cost.toFixed(4)}`
-  return `₹${cost.toFixed(6)}`
+  if (cost >= 1) return `$${cost.toFixed(2)}`
+  if (cost >= 0.01) return `$${cost.toFixed(4)}`
+  return `$${cost.toFixed(6)}`
 }
 
 function formatTime(ms: number): string {
@@ -329,6 +329,7 @@ export default function ChatPage() {
         // mid-retry so we don't re-fetch the old session after a clear.
         if (cancelledRef.current) break
         ctrl = new AbortController()
+        abortRef.current = ctrl  // expose the live controller so unmount/session-switch can abort in-flight SSE
         timedOut = false
         lastActivity = Date.now()
         const timer = setInterval(() => {
@@ -387,70 +388,89 @@ export default function ChatPage() {
       // returns and the final 'done' event — so a normally-streaming answer, or
       // the backend's substantial post-delta work (nudge/ranking retries that
       // re-invoke the LLM, _auto_title, record_cost) before emitting 'done',
-      // never trips it. Crucially, once any content has streamed we never abort
-      // mid-stream: aborting would discard an otherwise-valid turn. Only a
-      // stream that produced nothing at all for SSE_TIMEOUT_MS (a hung
-      // connection) is aborted; a silent gap after content has started still
-      // flags timedOut so a friendly message is surfaced rather than a raw
-      // AbortError.
+      // never trips it. A stream that produced nothing at all for SSE_TIMEOUT_MS
+      // (a hung connection) is aborted; a silent gap after content has already
+      // streamed cancels the reader so the turn finalizes with the accumulated
+      // content instead of hanging forever.
       timedOut = false  // Fresh flag for the stream phase (a slow-but-successful fetch may have set it)
       lastActivity = Date.now()
       const streamTimer = setInterval(() => {
         if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
           timedOut = true
-          if (!receivedData) ctrl?.abort()
+          if (!receivedData) {
+            ctrl?.abort()
+          } else {
+            // Content already streamed: don't hang forever on a silent
+            // connection. Cancel the reader so the read loop exits and we
+            // finalize with the accumulated content.
+            reader.cancel().catch(() => {})
+          }
         }
       }, 5000)
 
       try {
+        // Dispatch a single parsed SSE event, updating the streaming state.
+        // Extracted so the final in-buffer 'done' event (flush path) is parsed
+        // with the same logic as the streamed events.
+        const handleEventBlock = (block: string) => {
+          const lines = block.split('\n')
+          let type = ''
+          let data = ''
+          for (const line of lines) {
+            if (line.startsWith('event:')) type = line.slice(6).trim()
+            else if (line.startsWith('data:')) {
+              // Handle multi-line data: lines after first data: line get a newline prefix
+              const value = line.slice(5)
+              if (data) data += '\n' + value
+              else data = value
+            }
+          }
+          if (!type || !data) return
+          try {
+            const payload = JSON.parse(data)
+            if (type === 'start') {
+              const userMsg = payload.user as Message
+              setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), userMsg])
+            } else if (type === 'delta') {
+              const text = payload.text as string
+              setStreaming(true)
+              receivedData = true  // Mark that we've received data
+              lastActivity = Date.now()  // Reset idle timer
+              accumulated += text
+              const now = Date.now()
+              if (now - lastRender >= STREAM_RENDER_MS) {
+                lastRender = now
+                setStreamingContent(accumulated)
+              }
+            } else if (type === 'done') {
+              lastActivity = Date.now()  // Post-delta backend work now finished
+              doneMsg = payload.message as Message
+              note = payload.note ?? ''
+            } else if (type === 'error') {
+              streamError = payload.error ?? 'Something went wrong.'
+            }
+          } catch {
+            /* skip malformed event */
+          }
+        }
+
         while (true) {
           const { done, value } = await reader.read()
-          if (done) break
+          if (done) {
+            // Flush any decoder-internal bytes and parse the remaining buffer,
+            // which may still hold a final 'done' event that arrived without a
+            // trailing blank line — fall back to the synthetic accumulated
+            // message only if no such 'done' event is present.
+            buffer += decoder.decode()
+            const remainder = buffer.replace(/\r\n/g, '\n').trim()
+            if (remainder) handleEventBlock(remainder)
+            break
+          }
           lastActivity = Date.now()  // Any server activity keeps the watchdog alive
           buffer += decoder.decode(value, { stream: true })
           const events = buffer.replace(/\r\n/g, '\n').split('\n\n')
           buffer = events.pop() ?? ''
-          for (const evt of events) {
-            const lines = evt.split('\n')
-            let type = ''
-            let data = ''
-            for (const line of lines) {
-              if (line.startsWith('event:')) type = line.slice(6).trim()
-              else if (line.startsWith('data:')) {
-                // Handle multi-line data: lines after first data: line get a newline prefix
-                const value = line.slice(5)
-                if (data) data += '\n' + value
-                else data = value
-              }
-            }
-            if (!type || !data) continue
-            try {
-              const payload = JSON.parse(data)
-              if (type === 'start') {
-                const userMsg = payload.user as Message
-                setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), userMsg])
-              } else if (type === 'delta') {
-                const text = payload.text as string
-                setStreaming(true)
-                receivedData = true  // Mark that we've received data
-                lastActivity = Date.now()  // Reset idle timer
-                accumulated += text
-                const now = Date.now()
-                if (now - lastRender >= STREAM_RENDER_MS) {
-                  lastRender = now
-                  setStreamingContent(accumulated)
-                }
-              } else if (type === 'done') {
-                lastActivity = Date.now()  // Post-delta backend work now finished
-                doneMsg = payload.message as Message
-                note = payload.note ?? ''
-              } else if (type === 'error') {
-                streamError = payload.error ?? 'Something went wrong.'
-              }
-            } catch {
-              /* skip malformed event */
-            }
-          }
+          for (const evt of events) handleEventBlock(evt)
         }
 
         // Flush the final text so the last chunk renders even if it arrived
@@ -459,12 +479,18 @@ export default function ChatPage() {
 
         if (streamError) throw new Error(streamError)
         if (doneMsg) {
-          setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
+          // Guard against the stale-session race: a switched session must not
+          // receive this old turn's message.
+          if (activeId === sessionId) {
+            setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
+            if (note) setNote(note)
+          }
           setStreamingContent('')
-          if (note) setNote(note)
           await loadSessions()
         } else if (accumulated) {
-          setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), { id: -Date.now() + 1, role: 'assistant', content: accumulated, created_at: Date.now() / 1000 }])
+          if (activeId === sessionId) {
+            setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), { id: -Date.now() + 1, role: 'assistant', content: accumulated, created_at: Date.now() / 1000 }])
+          }
           setStreamingContent('')
           await loadSessions()
         } else {
@@ -472,6 +498,9 @@ export default function ChatPage() {
         }
       } finally {
         clearInterval(streamTimer)
+        // Release the reader lock on every exit path (normal end, abort,
+        // timeout) so the connection is freed instead of left dangling.
+        reader.cancel().catch(() => {})
       }
     } catch (err) {
       // An intentional cancel (unmount / new session / switch) aborts the
