@@ -19,8 +19,6 @@ const TRUSTED_API_HOSTS: string[] = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS |
 // a cross-origin base is trusted only over https AND when allow-listed, or when
 // it is a loopback address (http loopback is not a network cleartext risk). No
 // non-loopback cross-origin http base may ever be trusted.
-const WIN_API_BASE =
-  (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
 const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
 const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:8001' : ''
 
@@ -68,28 +66,32 @@ function isHttps(url: URL): boolean {
 }
 
 /** True when `url` resolves to a loopback address (`localhost`, `127.0.0.1`,
- *  `::1`). Loopback traffic never leaves the machine, so http over loopback is
+ *  `[::1]`). Loopback traffic never leaves the machine, so http over loopback is
  *  NOT a network cleartext risk — a dev backend like `http://localhost:8000` is
  *  therefore trusted even though it is cross-origin http. */
 function isLoopback(url: URL): boolean {
-  return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+  return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
 }
 
 /** Normalize an allow-list entry or URL host for comparison: strip any leading
- *  scheme (`https://` / `http://`), any trailing slash, a port, and any
- *  trailing dot — so `https://api.example.com`, `http://api.example.com/`, and
- *  `api.example.com:443` all normalize to `api.example.com` and match
- *  `url.host` (`api.example.com`). */
-function normalizeHost(host: string): string {
+ *  scheme (`https://` / `http://`), any trailing slash, any trailing dot, and a
+ *  trailing default port (`:80` for http, `:443` for https). A default port is
+ *  not a distinguishing feature — the URL parser already drops it from
+ *  `url.host` (`URL('https://host:443').host === 'host'`) — so it MUST be
+ *  dropped from allow-list entries too, or an entry like `api.example.com:443`
+ *  would never match. Explicit non-default ports (e.g. `:8080`) are preserved,
+ *  so matching stays exact `host:port` (`api.example.com:8080` matches only
+ *  `api.example.com:8080`, not `api.example.com`). */
+export function normalizeHost(host: string): string {
   return host
     .replace(/^https?:\/\//, '')
     .replace(/\/+$/, '')
-    .replace(/:\d+$/, '')
     .replace(/\.$/, '')
+    .replace(/:(?:80|443)$/, '')
 }
 
 /** True when `url`'s host is present in NEXT_PUBLIC_TRUSTED_API_HOSTS (compared
- *  without port, so `host` and `host:443` are equivalent). */
+ *  by exact `host:port`, so `host` and `host:8443` are distinct). */
 function hostInAllowList(url: URL): boolean {
   const h = normalizeHost(url.host)
   return TRUSTED_API_HOSTS.some((entry) => normalizeHost(entry) === h)
@@ -128,16 +130,20 @@ function resolveApiBase(): { base: string; trusted: boolean } {
   // valid http(s) URL that is same-origin OR explicitly allow-listed. A
   // cross-origin override REQUIRES NEXT_PUBLIC_TRUSTED_API_HOSTS to be set at
   // build; otherwise it is ignored and we fall back to the safe same-origin
-  // base (which is itself trusted first-party).
-  if (WIN_API_BASE) {
-    const url = parseApiBase(WIN_API_BASE)
+  // base (which is itself trusted first-party). `window.API_BASE` is read live
+  // here (not captured at import time) so an override set after module load is
+  // still honored.
+  const winApiBase =
+    (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
+  if (winApiBase) {
+    const url = parseApiBase(winApiBase)
     if (!url) {
       console.error(
         '[auth] window.API_BASE is not a valid http(s) URL; ignoring it and using the safe same-origin base.'
       )
       return { base: '', trusted: true }
     }
-    if (isTrustedBase(WIN_API_BASE, url)) {
+    if (isTrustedBase(winApiBase, url)) {
       return { base: baseFromUrl(url), trusted: true }
     }
     console.error(
@@ -261,15 +267,15 @@ let meCacheTs = 0
 
 // Configurable TTL so role/is_active changes are eventually picked up even if
 // the caller forgets to clear the cache. 0 disables the time-based expiry.
-const ME_CACHE_TTL_MS = Number(process.env.NEXT_PUBLIC_ME_CACHE_TTL_MS || 60000)
+const ME_CACHE_TTL_RAW = Number(process.env.NEXT_PUBLIC_ME_CACHE_TTL_MS || 60000)
+const ME_CACHE_TTL_MS = Number.isNaN(ME_CACHE_TTL_RAW) ? 60000 : ME_CACHE_TTL_RAW
 
 /** Fetch the current authenticated user (`/api/auth/me`), cached per token.
- *  Returns null when the token is missing/rejected (401) or when the request
- *  fails (network/transport error or non-2xx). On a network/transport failure
- *  the token is preserved (not cleared) so a later retry can recover — callers
- *  must not treat a null return as a definitive "logged out" without also
- *  checking the token. Network failures are logged, not thrown, so existing
- *  `.catch` handlers don't misinterpret them as auth rejection. Never redirects. */
+ *  Returns null when the token is missing/rejected (401) or on a non-2xx
+ *  response. On a network/transport failure the token is preserved (not
+ *  cleared) so a later retry can recover — the fetch error is rethrown so
+ *  callers can distinguish a transient network failure from a definitive
+ *  "logged out" (null) and MUST NOT treat it as a logout. Never redirects. */
 export async function getMe(force = false): Promise<AuthUser | null> {
   const token = getToken()
   if (!token) {
@@ -283,11 +289,10 @@ export async function getMe(force = false): Promise<AuthUser | null> {
     res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
   } catch (err) {
     // Network/transport failure: do NOT treat as "not authenticated" (preserve
-    // the token so a later retry can succeed), but surface it rather than
-    // swallowing it. Returning null here is graceful; callers that need the
-    // underlying error can inspect console output.
+    // the token so a later retry can succeed). Rethrow rather than return null
+    // so callers can tell this apart from a definitive 401/logged-out null.
     console.error('getMe: failed to reach the auth service', err)
-    return null
+    throw err
   }
   if (res.status === 401) {
     clearToken()
