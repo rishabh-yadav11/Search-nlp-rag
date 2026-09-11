@@ -521,6 +521,15 @@ input[type='text']:focus-visible,
   font-weight: 700;
 }
 
+/* Wide markdown tables scroll horizontally within this wrapper instead of
+ * stretching the bubble. The table itself stays display:table so
+ * border-collapse works; this .markdown-body block is the overflow-x:auto
+ * scroll container (replaces the old display:block/overflow-x on the table,
+ * which cancelled border-collapse and produced nested scrollbars). */
+.markdown-body {
+  overflow-x: auto;
+}
+
 .markdown-body table {
   width: 100%;
   max-width: 100%;
@@ -528,8 +537,6 @@ input[type='text']:focus-visible,
   margin: 10px 0;
   font-size: 13px;
   line-height: 1.5;
-  display: block;
-  overflow-x: auto;
 }
 
 .markdown-body th,
@@ -537,7 +544,6 @@ input[type='text']:focus-visible,
   text-align: left;
   padding: 7px 12px;
   border: 1px solid rgba(0, 0, 0, 0.12);
-  white-space: nowrap;
 }
 
 .markdown-body th {
