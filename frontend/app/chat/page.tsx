@@ -520,6 +520,7 @@ export default function ChatPage() {
       // stream; don't surface a spurious error for that.
       if (cancelledRef.current) {
         cancelledRef.current = false
+        setStreamingContent('')
         return
       }
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
