@@ -1676,9 +1676,24 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # truncation marker rather than dropping it.
                 latency_ms = (time.perf_counter() - start) * 1000
                 answer = _finalize_answer("".join(chunks), question).rstrip() + "\n\n[answer truncated]"
+                # stream_answer() only populates usage_holder once the whole
+                # response has arrived, and a mid-stream failure raises before
+                # that point — so usage_holder is empty here and the partial
+                # (truncated) turn is not billed: tokens/cost stay 0 and are
+                # absent from the daily budget. If a stream backend ever
+                # surfaces usage before raising, bill it here WITHOUT ever
+                # calling record_cost on the completed path below (which
+                # records exactly once at end of turn).
+                usage = usage_holder[0] if usage_holder else None
+                prompt_tokens = usage.prompt_tokens if usage else 0
+                completion_tokens = usage.completion_tokens if usage else 0
+                cost_inr = usage.cost() if usage else 0.0
+                if usage is not None:
+                    await record_cost(cost_inr)
                 assistant_msg = await s.append_message(
                     session_id, user_id, "assistant", answer, turn.sources,
-                    prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=latency_ms,
+                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                    cost=to_usd(cost_inr), latency_ms=latency_ms,
                 )
                 await _auto_title(s, session_id, user_id, question)
                 yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
