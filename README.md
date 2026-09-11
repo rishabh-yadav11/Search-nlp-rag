@@ -275,6 +275,7 @@ server {
     location /health    { proxy_pass http://127.0.0.1:8001; }
     location /live      { proxy_pass http://127.0.0.1:8001; }
     location /ready     { proxy_pass http://127.0.0.1:8001; }
+    location /readyz    { proxy_pass http://127.0.0.1:8001; }
     location /api {
         proxy_pass http://127.0.0.1:8001;
         proxy_read_timeout 300s;
