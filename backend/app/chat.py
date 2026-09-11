@@ -305,13 +305,14 @@ class ChatStore:
             raise HTTPException(status_code=404, detail="conversation not found")
         clean = (title or "").strip()[:200]
         db = self._require_db()
-        await db.execute("UPDATE sessions SET title = ? WHERE id = ?", (clean, session_id))
+        ts = _now()
+        await db.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (clean, ts, session_id))
         await db.commit()
         return SessionOut(
             id=session_id,
             title=clean,
             created_at=session.created_at,
-            updated_at=session.updated_at,
+            updated_at=ts,
         )
 
     async def delete_session(self, session_id: str, user_id: str) -> None:
@@ -348,15 +349,16 @@ class ChatStore:
         return [_row_to_message(r) for r in rows]
 
     async def purge_expired(self) -> int:
-        """Delete conversations idle for CHAT_RETENTION_DAYS or longer."""
+        """Delete conversations idle for CHAT_RETENTION_DAYS or longer.
+
+        A single atomic DELETE (messages cascade via ON DELETE CASCADE) replaces
+        the old SELECT-then-per-id-DELETE, closing a TOCTOU race where a session
+        touched after the SELECT but before its DELETE was wrongly removed."""
         cutoff = _now() - config.CHAT_RETENTION_DAYS * 86400
         db = self._require_db()
-        stale = await db.execute_fetchall("SELECT id FROM sessions WHERE updated_at < ?", (cutoff,))
-        for r in stale:
-            await db.execute("DELETE FROM messages WHERE session_id = ?", (r["id"],))
-            await db.execute("DELETE FROM sessions WHERE id = ?", (r["id"],))
+        cursor = await db.execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
         await db.commit()
-        return len(stale)
+        return cursor.rowcount
 
     async def stats(self, user_id: str) -> SessionStatsOut:
         """Aggregate token/cost usage across the user's conversations."""
@@ -841,6 +843,27 @@ def _append_nudge(answer: str, nudge_content: str) -> str:
     return (answer.rstrip() + "\n\n" + addition).strip()
 
 
+def _llm_unavailable_answer(question: str, sources: list[dict]) -> str:
+    """Graceful fallback when retrieval succeeded but the LLM could not be
+    reached: honest prose (never fabricated facts) that tells the user the
+    matching sources are listed below. Token usage and cost are zero."""
+    n = len(sources)
+    if n == 0:
+        return (
+            f"I found articles matching '{question}', but I couldn't generate an "
+            "answer right now. Please try again shortly."
+        )
+    if n == 1:
+        return (
+            f"I found an article matching '{question}', but I couldn't generate an "
+            "answer right now. The matching source is listed below — please try again shortly."
+        )
+    return (
+        f"I found {n} articles matching '{question}', but I couldn't generate an "
+        "answer right now. The matching sources are listed below — please try again shortly."
+    )
+
+
 def _effective_chat_k(question: str) -> int:
     """How many sources chat should retrieve/cite for a question.
 
@@ -1311,7 +1334,20 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
     await assert_within_budget()
-    result = await _answer_ranked(question, turn.answer)
+    try:
+        result = await _answer_ranked(question, turn.answer)
+    except LLMUnavailableError:
+        # Retrieval succeeded (sources were gathered) but the LLM cannot be
+        # reached: degrade to an honest fallback citing the retrieved sources
+        # instead of surfacing a raw 5xx. Nothing was billed, so no cost.
+        return (
+            _llm_unavailable_answer(question, turn.sources),
+            turn.sources,
+            turn.note,
+            0,
+            0,
+            0.0,
+        )
     await record_cost(result.cost())
     return (
         _finalize_answer(result.content, question),
@@ -1624,11 +1660,29 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             await assert_within_budget()
             usage_holder: list = []
             chunks: list[str] = []
-            async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
-                if await aborted():
-                    return
-                chunks.append(piece)
-                yield _sse("delta", {"text": piece})
+            try:
+                async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
+                    if await aborted():
+                        return
+                    chunks.append(piece)
+                    yield _sse("delta", {"text": piece})
+            except Exception:
+                if not chunks:
+                    raise
+                # Mid-stream failure after content already streamed: persist a
+                # partial (truncated) assistant message so the turn is not left
+                # with a dangling user message and no assistant reply. The user
+                # already saw the streamed prefix; store it with an explicit
+                # truncation marker rather than dropping it.
+                latency_ms = (time.perf_counter() - start) * 1000
+                answer = _finalize_answer("".join(chunks), question).rstrip() + "\n\n[answer truncated]"
+                assistant_msg = await s.append_message(
+                    session_id, user_id, "assistant", answer, turn.sources,
+                    prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=latency_ms,
+                )
+                await _auto_title(s, session_id, user_id, question)
+                yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
+                return
 
             usage = usage_holder[0] if usage_holder else None
             latency_ms = (time.perf_counter() - start) * 1000
@@ -1649,6 +1703,8 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # turn has already incurred.
                 nudge = None
                 if await _nudge_retry_allowed(spent_this_turn_inr):
+                    if await aborted():
+                        return
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
                     except LLMUnavailableError:
@@ -1675,6 +1731,8 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # order, no numbers ever available) must never nudge.
                 nudge = None
                 if await _nudge_retry_allowed(spent_this_turn_inr):
+                    if await aborted():
+                        return
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
                     except LLMUnavailableError:
@@ -1691,9 +1749,9 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
             )
-            await record_cost(result.cost())
             if await aborted():
                 return
+            await record_cost(result.cost())
             assistant_msg = await s.append_message(
                 session_id, user_id, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,
