@@ -343,18 +343,29 @@ run_stop() {
 run_cron() {
     stage "cron"
     local log="$LOGS/update_index.log"
+    local hc_log="$LOGS/healthcheck.log"
     # update_index.py takes its own flock(2) on data/update.lock (LOCK_EX|LOCK_NB)
     # and skips when another run holds it, so no external flock wrapper is needed
     # (wrapping with `flock -n` would conflict with the script's own lock and
     # cause every run to be skipped).
-    local line="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
+    local line_idx="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
+    # cron does not inherit the operator's shell environment, so pass the
+    # webhook URL (and a minimal PATH via healthcheck.sh) explicitly. Empty
+    # webhook is harmless: healthcheck.sh treats an unset/empty value as "no
+    # webhook". Keep the entry stable for idempotent re-runs.
+    local line_hc="*/5 * * * * HEALTHCHECK_WEBHOOK_URL=\"$HEALTHCHECK_WEBHOOK_URL\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
-    crontab -l 2>/dev/null | grep -vF "update_index.py" > "$tmp" || true
-    printf '%s\n' "$line" >> "$tmp"
+    # Remove only the exact managed entries this script writes; preserve any
+    # user-added crontab lines (including manual HEALTHCHECK_WEBHOOK_URL=...
+    # augmentations) that reference the same scripts.
+    crontab -l 2>/dev/null | grep -vFx "$line_idx" | grep -vFx "$line_hc" > "$tmp" || true
+    printf '%s\n' "$line_idx" >> "$tmp"
+    printf '%s\n' "$line_hc" >> "$tmp"
     crontab "$tmp"
     rm -f "$tmp"
     echo "cron installed: */15 * * * * update_index.py"
+    echo "cron installed: */5  * * * * healthcheck.sh"
 }
 
 run_nginx() {
