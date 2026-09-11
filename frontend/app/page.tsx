@@ -64,10 +64,10 @@ const SUGGESTIONS = [
 const RAW_API_BASE =
   (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
   process.env.NEXT_PUBLIC_API_BASE ||
-  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000')
+  (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8001')
 
 const SAFE_DEFAULT_BASE =
-  typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'
+  typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8001'
 
 const TRUSTED_API_HOSTS = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS || '')
   .split(',')
