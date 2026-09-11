@@ -4,12 +4,13 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import SimilarArticles from './components/SimilarArticles'
 import {
+  API_BASE,
+  API_BASE_TRUSTED,
   AuthUser,
   authHeaders,
   clearMeCache,
   getMe,
   getToken,
-  normalizeHost,
   redirectToLogin,
 } from './lib/auth'
 
@@ -61,69 +62,6 @@ const SUGGESTIONS = [
   'Ola Electric IPO',
   'top venture debt providers 2024',
 ]
-
-const SAFE_DEFAULT_BASE =
-  typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8001'
-
-const TRUSTED_API_HOSTS = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS || '')
-  .split(',')
-  .map((h) => h.trim().toLowerCase())
-  .filter(Boolean)
-
-// Validates a candidate API base against the SAME trust rule as lib/auth.ts:
-// same-origin, loopback (dev), or https + explicit allow-list. This also runs
-// server-side (SSR), where there is no `window`, so an arbitrary http(s) URL is
-// NEVER trusted merely for being well-formed — cross-origin hosts require https
-// AND an allow-list entry (exact host:port), or a loopback address; otherwise
-// the caller falls back to SAFE_DEFAULT_BASE.
-function isSafeApiBase(url: string): boolean {
-  if (!url || /\s/.test(url)) return false
-  // Reject protocol-relative URLs (`//evil.com`) before parsing.
-  if (url.trim().startsWith('//')) return false
-  let parsed: URL
-  try {
-    parsed = new URL(url)
-  } catch {
-    return false
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
-  // Reject embedded credentials (`https://user:pass@host`).
-  if (parsed.username || parsed.password) return false
-  // Same-origin is trusted (browser only; SSR has no document origin).
-  if (typeof window !== 'undefined' && parsed.origin.toLowerCase() === window.location.origin.toLowerCase()) {
-    return true
-  }
-  // Loopback (dev backend) is trusted even over http.
-  if (['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)) return true
-  // Cross-origin: https + explicit allow-list (exact host:port match).
-  if (parsed.protocol === 'https:' && TRUSTED_API_HOSTS.some((entry) => normalizeHost(entry) === normalizeHost(parsed.host))) {
-    return true
-  }
-  // Everything else (including arbitrary http(s) hosts server-side) is rejected.
-  return false
-}
-
-// Resolve the request base URL, reading `window.API_BASE` live so a
-// runtime-injected override is always honored (not captured at import time),
-// then falling back to build config / the dev default — all subject to
-// isSafeApiBase's trust rule.
-function resolveApiBase(): { API_BASE: string; API_BASE_ERROR: string } {
-  const raw =
-    (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) ||
-    process.env.NEXT_PUBLIC_API_BASE ||
-    SAFE_DEFAULT_BASE
-  const candidate = String(raw || '')
-  if (isSafeApiBase(candidate)) return { API_BASE: candidate, API_BASE_ERROR: '' }
-  const reason = isSafeUrl(candidate)
-    ? `host "${(() => { try { return new URL(candidate).host } catch { return candidate } })()}" is not same-origin or in NEXT_PUBLIC_TRUSTED_API_HOSTS`
-    : 'schema must be http(s)'
-  return {
-    API_BASE: SAFE_DEFAULT_BASE,
-    API_BASE_ERROR: `Invalid API_BASE "${candidate}" (${reason}); requests will use ${SAFE_DEFAULT_BASE}.`,
-  }
-}
-
-const { API_BASE, API_BASE_ERROR } = resolveApiBase()
 
 const TIMEOUT_MS = 30_000
 
@@ -224,33 +162,13 @@ export default function Page() {
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
   const requestSeqRef = useRef(0)
   const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
-  const [configError, setConfigError] = useState('')
+  const configError = !API_BASE_TRUSTED
+    ? 'API base is configured to an untrusted host. Requests will be sent without the auth Bearer token. If you are using a custom backend, ensure NEXT_PUBLIC_TRUSTED_API_HOSTS includes the host and that NEXT_PUBLIC_API_BASE uses https.'
+    : ''
 
   useEffect(() => {
-    if (!getToken()) {
-      setMe(null)
-      return
-    }
-    let cancelled = false
-    getMe()
-      .then((u) => {
-        if (!cancelled) setMe(u)
-      })
-      .catch(() => {
-        // getMe rethrows only on a network/transport failure, which is
-        // transient: keep the token and leave `me` as `undefined` (unknown)
-        // rather than null (logged-out), so the UI does not drop the session
-        // on a temporary outage.
-      })
-    return () => {
-      cancelled = true
-    }
+    // Keep this component purely client-side and derived from lib/auth.
   }, [])
-
-  useEffect(() => {
-    if (API_BASE_ERROR) setConfigError(API_BASE_ERROR)
-  }, [])
-
   function logout() {
     fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
     clearMeCache()
