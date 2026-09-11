@@ -633,9 +633,11 @@ async def hybrid_search(
             score=p.score,
         )
         for p in result.points
-        # Skip points with a null payload (shouldn't happen, but a malformed
-        # point would otherwise raise AttributeError on p.payload.get).
-        if (payload := p.payload or {}) is not None
+        # Skip points with a null/empty payload (shouldn't happen, but a
+        # malformed point with no title/summary would otherwise surface as an
+        # empty article that displaces real results, and a null payload would
+        # raise AttributeError on p.payload.get).
+        if (payload := p.payload)
     ]
 
 
@@ -808,9 +810,12 @@ async def _attach_bodies(articles: list[SourceArticle]) -> None:
         ids=ids,
         with_payload=["body"],
     )
-    bodies = {p.id: (p.payload or {}).get("body", "") for p in resp}
+    # Qdrant can return points keyed by either int or str ids, while
+    # SourceArticle.id is an int. Normalize both sides to str so a string-id
+    # point doesn't silently drop its body context.
+    bodies = {str(p.id): (p.payload or {}).get("body", "") for p in resp}
     for a in articles:
-        a.body = bodies.get(a.id, "")
+        a.body = bodies.get(str(a.id), "")
 
 
 async def _retrieval_leg(
@@ -926,7 +931,11 @@ async def retrieve_with_auto_facet_fallback(
     eff_content_type = content_type or auto_content_type
     qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to, eff_content_type)
     results = await retrieve_and_rerank(retrieval_q, top_k, qfilter, need_body=need_body)
-    if results or not (auto_industry or auto_dealtype or auto_content_type):
+    # A single below-gate hit (score under the chat relevance gate) left by a
+    # mis-applied auto facet is effectively a dead result set, so relax the auto
+    # facet(s) for it too, not only for a fully empty set (#172).
+    lone_weak_hit = len(results) == 1 and results[0].score < config.ASK_MIN_SCORE
+    if (results and not lone_weak_hit) or not (auto_industry or auto_dealtype or auto_content_type):
         results = await _temporal_date_fallback(
             results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, need_body
         )

@@ -9,6 +9,7 @@ where sim is Jaccard similarity of title word-tokens. Lambda near 1 favours
 pure relevance; lower values trade a little relevance for headline diversity.
 """
 import logging
+import math
 import re
 from typing import Protocol
 
@@ -42,10 +43,12 @@ def diversify(
     are returned in original order. ``sim_thresh`` is a floor on pairwise
     similarity: pairs below it contribute 0 to the diversity penalty.
 
-    Candidates whose ``score`` is NaN are never selected (NaN compares false
-    against everything). If every remaining candidate is NaN the selection
-    stops early, logs a warning and returns a short list rather than raising:
-    /search is a read path, so one bad score must not fail the request.
+    Candidates whose ``score`` is NaN are treated as ``-inf`` (dropped): they
+    never outrank a real score, and the selection continues to the remaining
+    valid candidates instead of silently truncating the list. If every
+    remaining candidate is NaN (or ``-inf``) the selection stops early, logs a
+    warning and returns a short list rather than raising: /search is a read
+    path, so one bad score must not fail the request.
     """
     if len(results) <= n:
         return list(results[:n])
@@ -88,15 +91,17 @@ def diversify(
             score = results[k].score
             if score is None:
                 score = 0.0
+            elif math.isnan(score):
+                score = float("-inf")
             mmr = lam * score - (1 - lam) * sim
             if mmr > best_val:
                 best_val = mmr
                 best_k = k
         if best_k < 0:
-            # Nothing beat -inf: every remaining score is NaN, whose
-            # comparisons are always false. Stop instead of re-picking the
-            # sentinel, and warn -- a short list reaches /search as missing
-            # results, so the cause has to be visible in the logs.
+            # Nothing beat -inf: every remaining score is NaN (treated as
+            # -inf) or -inf. Stop instead of re-picking the sentinel, and warn
+            # -- a short list reaches /search as missing results, so the cause
+            # has to be visible in the logs.
             logger.warning(
                 "diversify: no candidate beat -inf after %d of %d picks; "
                 "remaining scores are NaN, returning %d results",

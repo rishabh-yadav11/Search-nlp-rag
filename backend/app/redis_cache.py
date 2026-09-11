@@ -104,10 +104,15 @@ class HybridCache:
         entry = self._mem.get(key)
         if entry is None:
             return None
-        value, expires_at = entry
-        if expires_at <= time.monotonic():
+        value, expires_at, ttl = entry
+        now = time.monotonic()
+        if expires_at <= now:
             self._mem.pop(key, None)
             return None
+        # Slide the expiry on hit so a hot key doesn't expire mid-traffic: each
+        # read restarts its sliding window, mirroring the Redis TTL semantics the
+        # memory cache stands in for.
+        self._mem[key] = (value, now + ttl, ttl)
         self._mem.move_to_end(key)
         return value
 
@@ -124,7 +129,7 @@ class HybridCache:
             await self._publish(client)
             return
         effective_ttl = self._ttl if ttl is None else ttl
-        self._mem[key] = (value, time.monotonic() + effective_ttl)
+        self._mem[key] = (value, time.monotonic() + effective_ttl, effective_ttl)
         self._mem.move_to_end(key)
         while len(self._mem) > self._maxsize:
             self._mem.popitem(last=False)
