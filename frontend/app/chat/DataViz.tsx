@@ -12,9 +12,16 @@ export type DataVizBlock = {
   view?: 'table' | 'bar' | 'line' | 'pie' | 'picto'
 }
 
-type ContentPart = { type: 'md'; md: string } | { type: 'viz'; block: DataVizBlock }
+type ContentPart =
+  | { type: 'md'; md: string }
+  | { type: 'viz'; block: DataVizBlock }
+  | { type: 'err' }
 
-const FENCE_SRC = '```dataviz\\s*\\n([\\s\\S]*?)\\n```'
+// `\n?` before the closing fence tolerates the LLM omitting the trailing
+// newline right before the closing ```; `\s*` after it swallows extra trailing
+// whitespace. Mirrors the backend _DATAVIZ_FENCE_RE so both sides parse the
+// same blocks.
+const FENCE_SRC = '```dataviz\\s*\\n([\\s\\S]*?)\\n?```\\s*'
 const KINDS = ['bar', 'line', 'pie'] as const
 const VIEWS = ['table', 'bar', 'line', 'pie', 'picto'] as const
 
@@ -55,9 +62,12 @@ function firstNumericColumn(rows: (string | number)[][]): number | null {
 }
 
 // A data block is only useful if at least one non-value column carries
-// identifying text. A table whose label cells are all empty shows only numbers
-// and is treated as malformed (mirrors backend app.chat._has_label_content), so
-// the streamed view drops it instead of rendering a column of blank names.
+// identifying content — text OR a numeric identifier such as a Year (2024) or a
+// row index. Any non-blank label cell (checked via isMissing) counts, so a
+// numeric-identifier column passes just like a name column. A table whose label
+// cells are all empty (every label cell blank, no identifying column at all)
+// shows only numbers and is treated as malformed so it is dropped (mirrors
+// backend app.chat._has_label_content).
 function hasLabelContent(rows: (string | number)[][], columns: string[], valueColumn: number | null): boolean {
   const labelCols = columns.map((_, j) => j).filter((j) => j !== valueColumn)
   if (!labelCols.length) return true
@@ -110,6 +120,9 @@ export function splitContent(text: string): ContentPart[] {
     if (m.index > last) parts.push({ type: 'md', md: text.slice(last, m.index) })
     const block = parseDataViz(m[0])
     if (block) parts.push({ type: 'viz', block })
+    // A dataviz fence was present but unparseable — surface it as an 'err' part
+    // so the consumer can show a subtle notice instead of silently dropping it.
+    else parts.push({ type: 'err' })
     last = re.lastIndex
   }
   if (!found) return [{ type: 'md', md: text }]
@@ -151,7 +164,15 @@ function trim(v: number): string {
   return Number.isInteger(s) ? String(s) : String(s)
 }
 
-const COLORS = ['#1a5fb4', '#26a269', '#e66100', '#c01c28', '#613583', '#2a7bde', '#d67600', '#8f5902', '#4e9a06', '#75507b']
+// 24 distinct, colorblind-friendly colors (Okabe-Ito core + clearly
+// separable light/dark variants). Consumed as COLORS[i % COLORS.length], so
+// expanding here upgrades every chart with no call-site changes.
+const COLORS = [
+  '#0072b2', '#e69f00', '#009e73', '#d55e00', '#cc79a7', '#56b4e9',
+  '#007777', '#e07b00', '#332288', '#44aa99', '#882255', '#88ccee',
+  '#6699cc', '#aa4499', '#117733', '#ddaa33', '#55aa77', '#bb5566',
+  '#336699', '#cc6600', '#2299aa', '#ee7733', '#6b4a99', '#446688',
+]
 
 function BarChart({ block }: { block: DataVizBlock }) {
   const { rows, columns, value_column: vc, format } = block
@@ -176,6 +197,13 @@ function BarChart({ block }: { block: DataVizBlock }) {
   const rotate = n > 6
   const labelY = height - 34
   const angle = rotate ? -20 : 0
+  // Truncation budget scales with slot width: wide slots (few bars) afford
+  // longer names, rotated labels (many bars) share the slot diagonally so they
+  // stay tighter to avoid colliding with neighbors. ~5.6px per char at 10.5px.
+  const CHAR_W = 5.6
+  const budget = rotate
+    ? Math.max(6, Math.floor(((slot - 6) / CHAR_W) * 0.85))
+    : Math.max(8, Math.min(24, Math.floor((slot * 1.8 - 6) / CHAR_W)))
 
   // Map a value to a y pixel; the scale accounts for both positive and
   // negative extents so the zero line sits wherever the data requires.
@@ -199,7 +227,7 @@ function BarChart({ block }: { block: DataVizBlock }) {
           const y = barTop
           const valTextY = val >= 0 ? barTop - 5 : barTop + bh + 12
           const full = String(rows[i][0] ?? '')
-          const label = full.length > 14 ? `${full.slice(0, 13)}…` : full
+          const label = full.length > budget ? `${full.slice(0, budget - 1)}…` : full
           return (
             <g key={i}>
               <title>{full}</title>
@@ -247,9 +275,35 @@ function LineChart({ block }: { block: DataVizBlock }) {
   const pts = rows.map((_, i) => `${xs[i]},${ys[i]}`).join(' ')
   const step = Math.max(1, Math.ceil(n / 8))
 
+  // Subtle horizontal gridlines: pick up to 5 evenly spaced ticks across the
+  // value domain. The zero line acts as a baseline whenever data crosses it.
+  const GRID_MAX = 5
+  const gridCount = Math.min(GRID_MAX, Math.max(2, Math.floor(plotH / 18)))
+  const gridYs: { y: number; label: string }[] = []
+  for (let k = 0; k < gridCount; k++) {
+    const t = gridCount === 1 ? 0.5 : k / (gridCount - 1)
+    const val = minVal + t * domain
+    gridYs.push({ y: padT + plotH - (t * plotH), label: trim(val) })
+  }
+  const crossesZero = minVal < 0 && maxVal > 0
+  const zeroY = crossesZero ? padT + plotH - ((0 - minVal) / domain) * plotH : null
+
   return (
     <div className="chat-viz-chart">
       <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={block.title || 'line chart'}>
+        <g aria-hidden="true">
+          {gridYs.map((g, gi) => (
+            <g key={gi}>
+              <line x1={padL} y1={g.y} x2={width - padR} y2={g.y} stroke="#ececec" strokeWidth={1} />
+              <text x={padL - 5} y={g.y + 3} textAnchor="end" fontSize={9} fill="#999">
+                {g.label}
+              </text>
+            </g>
+          ))}
+          {zeroY != null && (
+            <line x1={padL} y1={zeroY} x2={width - padR} y2={zeroY} stroke="#9a9a9a" strokeWidth={1} strokeDasharray="3 3" />
+          )}
+        </g>
         <polyline
           points={pts}
           fill="none"
@@ -315,7 +369,7 @@ function PieChart({ block }: { block: DataVizBlock }) {
               return (
                 <g key={i}>
                   <path d={d} fill={COLORS[i % COLORS.length]} stroke="#fff" strokeWidth={1} />
-                  {pct >= 4 && (
+                  {pct >= PIE_LABEL_MIN_PCT && (
                     <text x={lx} y={ly} textAnchor="middle" dominantBaseline="central" className="chat-viz-pie-pct">
                       {pct}%
                     </text>
@@ -372,6 +426,75 @@ function PictogramChart({ block }: { block: DataVizBlock }) {
   )
 }
 
+const TABLE_PAGE_SIZE = 25
+// Pagination controls only appear for larger tables (default threshold); small
+// tables render fully without controls.
+const TABLE_PAGINATE_AT = 50
+
+// Inline % labels are only drawn on slices at/above this size; smaller slices
+// would crowd/overlap neighbors, so they rely on the legend (always present).
+const PIE_LABEL_MIN_PCT = 5
+
+function TableView({ block }: { block: DataVizBlock }) {
+  const rows = block.rows
+  const totalPages = Math.max(1, Math.ceil(rows.length / TABLE_PAGE_SIZE))
+  // Local pagination state; reset whenever the underlying data changes length.
+  const [page, setPage] = useState(0)
+  const effectivePage = Math.min(page, totalPages - 1)
+  const paged = rows.slice(effectivePage * TABLE_PAGE_SIZE, (effectivePage + 1) * TABLE_PAGE_SIZE)
+  const hasControls = rows.length > TABLE_PAGINATE_AT
+
+  return (
+    <div className="chat-viz-table-wrap">
+      <table className="chat-viz-table">
+        <thead>
+          <tr>
+            {block.columns.map((c, ci) => (
+              <th key={ci}>{c}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {paged.map((row, i) => (
+            <tr key={effectivePage * TABLE_PAGE_SIZE + i}>
+              {row.map((cell, j) => (
+                <td key={j}>
+                  {j === block.value_column && (isMissing(cell) ? '—' : toNum(cell) != null ? formatValue(toNum(cell)!, block.format) : String(cell))}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {hasControls && (
+        <div className="chat-viz-table-nav">
+          <button
+            type="button"
+            className="chat-viz-table-nav-btn"
+            disabled={effectivePage === 0}
+            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            aria-label="Previous page"
+          >
+            ‹ Prev
+          </button>
+          <span className="chat-viz-table-nav-page" aria-live="polite">
+            Page {effectivePage + 1} of {totalPages}
+          </span>
+          <button
+            type="button"
+            className="chat-viz-table-nav-btn"
+            disabled={effectivePage >= totalPages - 1}
+            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+            aria-label="Next page"
+          >
+            Next ›
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<DataVizBlock['view']> }) {
   switch (view) {
     case 'bar':
@@ -383,30 +506,7 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
     case 'picto':
       return <PictogramChart block={block} />
     default:
-      return (
-        <div className="chat-viz-table-wrap">
-          <table className="chat-viz-table">
-            <thead>
-              <tr>
-                {block.columns.map((c, ci) => (
-                  <th key={ci}>{c}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {block.rows.map((row, i) => (
-                <tr key={i}>
-                  {row.map((cell, j) => (
-                    <td key={j}>
-                      {j === block.value_column && (isMissing(cell) ? '—' : toNum(cell) != null ? formatValue(toNum(cell)!, block.format) : String(cell))}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )
+      return <TableView block={block} />
   }
 }
 
