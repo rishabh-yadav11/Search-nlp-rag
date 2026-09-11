@@ -146,9 +146,10 @@ def test_get_redis_hit_decodes_json():
 
 def test_get_redis_miss_falls_through_to_mem():
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
-    # _mem entries are (value, monotonic expiry) tuples -- the only shape the
-    # cache itself writes (see HybridCache.set) and the shape _get_mem unpacks.
-    cache._mem["k"] = ({"from": "mem"}, time.monotonic() + 60)
+    # _mem entries are (value, monotonic expiry, ttl) tuples -- the only shape
+    # the cache itself writes (see HybridCache.set) and the shape _get_mem
+    # unpacks to slide the expiry on hit.
+    cache._mem["k"] = ({"from": "mem"}, time.monotonic() + 60, 60)
     cache._redis = _RecordingRedis({})
     assert _run(cache.get("k")) == {"from": "mem"}
     assert _run(cache.get("missing")) is None

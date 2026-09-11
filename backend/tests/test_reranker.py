@@ -58,8 +58,8 @@ def _make_onnx_fakes():
             calls["from_pretrained"].append((args, kwargs))
             return cls()
 
-        def __call__(self, pairs, **kwargs):
-            return {"input_ids": pairs}
+        def __call__(self, text, text_pair, **kwargs):
+            return {"input_ids": (text, text_pair)}
 
         def save_pretrained(self, path):
             calls["save"].append(("tokenizer", path))
@@ -131,7 +131,7 @@ def _onnx_model(logits):
 
 
 def _onnx_tokenizer():
-    return type("Tok", (), {"__call__": lambda self, pairs, **kw: {"input_ids": pairs}})()
+    return type("Tok", (), {"__call__": lambda self, text, text_pair, **kw: {"input_ids": (text, text_pair)}})()
 
 
 # --- predict branches ---
