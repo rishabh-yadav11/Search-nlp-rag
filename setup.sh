@@ -389,6 +389,7 @@ server {
     location /health { proxy_pass http://127.0.0.1:$API_PORT; }
     location /live { proxy_pass http://127.0.0.1:$API_PORT; }
     location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /readyz { proxy_pass http://127.0.0.1:$API_PORT; }
     location /facets { proxy_pass http://127.0.0.1:$API_PORT; }
     location /api {
         proxy_pass http://127.0.0.1:$API_PORT;
