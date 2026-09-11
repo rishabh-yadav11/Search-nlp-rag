@@ -199,10 +199,14 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch):
     async def fake_record_search(*args, **kwargs):
         pass
 
+    async def fake_temporal_fallback(results, top_k, from_date, to_date, industry, dealtype, author, need_body):
+        return results
+
     monkeypatch.setattr(main, "cache", _FakeCache())
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
     monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "_temporal_date_fallback", fake_temporal_fallback)
     monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
     monkeypatch.setattr(main, "record_search", fake_record_search)
     monkeypatch.setattr(main.config, "ENABLE_CLICK_BOOST", False)
@@ -327,7 +331,7 @@ def _patch_retrieval_pipeline(monkeypatch, articles):
     monkeypatch.setattr(main, "_retrieval_queries", lambda q: [q])
     monkeypatch.setattr(main, "_retrieval_leg", fake_leg)
     monkeypatch.setattr(main, "rerank", fake_rerank)
-    monkeypatch.setattr(main, "sort_results", lambda r: r)
+    monkeypatch.setattr(main, "sort_results", lambda r, recency_boost=False: r)
     monkeypatch.setattr(main, "apply_entity_boost", lambda q, r: r)
 
 

@@ -97,7 +97,7 @@ def test_effective_intent_auto_year_range():
 def test_effective_intent_no_year_no_dates():
     rq, fd, td, dt, ind = main._effective_intent("latest deals", None, None)
     assert (fd, td) == (None, None)
-    assert rq == "latest deals"
+    assert rq == "deals"
     assert dt is None and ind is None
 
 
@@ -250,7 +250,7 @@ def test_retrieve_and_rerank_caches_without_body(monkeypatch):
     monkeypatch.setattr(main, "_retrieval_queries", lambda q: [q])
     monkeypatch.setattr(main, "_retrieval_leg", fake_leg)
     monkeypatch.setattr(main, "rerank", fake_rerank)
-    monkeypatch.setattr(main, "sort_results", lambda r: r)
+    monkeypatch.setattr(main, "sort_results", lambda r, recency_boost=False: r)
     monkeypatch.setattr(main, "apply_entity_boost", lambda q, r: r)
     monkeypatch.setattr(main, "_attach_bodies", fake_bodies)
     monkeypatch.setattr(main.config, "ENABLE_ENTITY_BOOST", True)

@@ -180,8 +180,9 @@ def test_effective_intent_user_dates_win():
 
 def test_effective_intent_no_intent_passthrough():
     rq, fd, td, dt, ind = main._effective_intent("latest deals", None, None)
-    # No category facet; the natural phrasing is kept (date words would be stripped).
-    assert (rq, fd, td) == ("latest deals", None, None)
+    # No category facet; the recency term 'latest' is stripped for retrieval
+    # (the recency intent still drives ranking weight separately).
+    assert (rq, fd, td) == ("deals", None, None)
     assert dt is None and ind is None
 
 
@@ -317,6 +318,28 @@ def test_hybrid_search_acquires_inference_lock_once_on_miss(monkeypatch):
     assert lock.exits == 1
 
 
+def test_hybrid_search_skips_null_and_empty_payload_points(monkeypatch):
+    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setitem(main.state, "model", _FakeDense([0.1]))
+    monkeypatch.setitem(main.state, "sparse_model", _FakeSparse([0], [0.5]))
+    monkeypatch.setitem(
+        main.state,
+        "qdrant",
+        _FakeQdrant(
+            points=[
+                _Point(1, {"title": "T1", "url": "u1", "summary": "s1"}),
+                _Point(2, None),
+                _Point(3, {}),
+            ]
+        ),
+    )
+    monkeypatch.setattr(main.config, "QDRANT_COLLECTION", "col")
+
+    articles = _run(main.hybrid_search("query", 8))
+
+    assert [a.id for a in articles] == [1]
+
+
 # --- body_rescue ---
 
 
@@ -414,6 +437,20 @@ def test_attach_bodies_none_payload_gets_empty_body(monkeypatch):
     arts = [_article(1, 0.5)]
     _run(main._attach_bodies(arts))
     assert arts[0].body == ""
+
+
+def test_attach_bodies_matches_string_point_id_to_int_article_id(monkeypatch):
+    # Qdrant may return a string point id; it must still attach the body to the
+    # int-id article rather than silently dropping body context.
+    qdrant = _FakeQdrant()
+    qdrant.retrieve_result = [_Point("1", {"body": "body1"}), _Point("3", {"body": "body3"})]
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+    monkeypatch.setattr(main.config, "QDRANT_COLLECTION", "col")
+    arts = [_article(1, 0.5), _article(2, 0.5), _article(3, 0.5)]
+    _run(main._attach_bodies(arts))
+    assert arts[0].body == "body1"
+    assert arts[1].body == ""
+    assert arts[2].body == "body3"
 
 
 def test_attach_bodies_retrieve_error_propagates(monkeypatch):
