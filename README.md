@@ -284,6 +284,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+    location /recommend/ { proxy_pass http://127.0.0.1:8001; }
     location /analytics/click   { proxy_pass http://127.0.0.1:8001; }
     location /analytics/summary { proxy_pass http://127.0.0.1:8001; }
     location /analytics/chat    { proxy_pass http://127.0.0.1:8001; }
@@ -315,7 +316,7 @@ sudo ufw --force enable
 
 - **nginx security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin` on every location. CSP is set by the frontend (`middleware.ts`, per-request nonce), so I don't duplicate it at nginx. Plain HTTP only.
 - **Pinned images** — Qdrant/Redis run from pinned, digest-resolvable tags (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`, `REDIS_IMAGE=redis:7-alpine`). If you override Qdrant, keep it >= the version that wrote any existing collection — older releases can't read newer storage formats.
-- **API note** — CORS is restricted to the origins in `CORS_ORIGINS` (localhost dev origins by default; production is same-origin through nginx). There's **no auth or rate limiting** on the API. It's only reachable via nginx in the reference deployment; if you expose it directly, add auth and rate limits. LLM spend is bounded by `LLM_DAILY_BUDGET_USD` (see `app/cost_budget.py`).
+- **API note** — CORS is restricted to the origins in `CORS_ORIGINS` (localhost dev origins by default; production is same-origin through nginx). **Auth** uses opaque bearer tokens with RBAC roles (see `app/auth.py`), and signup/login endpoints are rate-limited per client IP (Redis-backed). LLM spend is bounded by `LLM_DAILY_BUDGET_USD` (see `app/cost_budget.py`).
 - **Health monitoring** — `deploy/healthcheck.sh` probes `/health` (I run it from cron every few minutes), restarts `vccircle-backend` when unhealthy, and posts an alert to `HEALTHCHECK_WEBHOOK_URL` if a restart doesn't recover the app. Logs to `logs/healthcheck.log`.
 
 ## Supported Settings

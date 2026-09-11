@@ -399,6 +399,7 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+    location /recommend/ { proxy_pass http://127.0.0.1:$API_PORT; }
     location /analytics/click { proxy_pass http://127.0.0.1:$API_PORT; }
     location /analytics/summary { proxy_pass http://127.0.0.1:$API_PORT; }
     location /analytics/chat { proxy_pass http://127.0.0.1:$API_PORT; }
