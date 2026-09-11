@@ -183,14 +183,14 @@ function AnswerBody({ content }: { content: string }) {
             Chart requested but could not be rendered.
           </p>
         ) : (
-          <ReactMarkdown
-            key={`md-${i}`}
-            className="markdown-body"
-            remarkPlugins={[remarkGfm, remarkCitations]}
-            rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
-          >
-            {part.md}
-          </ReactMarkdown>
+          <div key={`md-${i}`} className="markdown-body">
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm, remarkCitations]}
+              rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
+            >
+              {part.md}
+            </ReactMarkdown>
+          </div>
         ),
       )}
     </>
@@ -304,6 +304,11 @@ export default function ChatPage() {
     setMessages((m) => [...m, optimistic])
     setInput('')
     setSending(true)
+    // Stream-loop watchdog flag, declared outside the try so the catch can
+    // read it: set when the read-loop watchdog decides the stream went silent,
+    // so the outer catch surfaces a friendly timeout message instead of the
+    // raw AbortError text.
+    let timedOut = false
 
     try {
       // Open the SSE stream with an AbortController, a per-attempt timeout, and
@@ -324,7 +329,7 @@ export default function ChatPage() {
         // mid-retry so we don't re-fetch the old session after a clear.
         if (cancelledRef.current) break
         ctrl = new AbortController()
-        let timedOut = false
+        timedOut = false
         lastActivity = Date.now()
         const timer = setInterval(() => {
           if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
@@ -376,10 +381,6 @@ export default function ChatPage() {
       let note = ''
       let streamError = ''
       let lastRender = 0
-      // Mirrors the retry-branch guard: set when the watchdog decides the
-      // stream has gone silent, so the outer catch surfaces a friendly message
-      // instead of the raw AbortError text.
-      let timedOut = false
 
       // Keep the idle watchdog alive across the whole read loop, not just the
       // initial fetch. Refresh it on genuine activity — every chunk the reader
@@ -392,6 +393,7 @@ export default function ChatPage() {
       // connection) is aborted; a silent gap after content has started still
       // flags timedOut so a friendly message is surfaced rather than a raw
       // AbortError.
+      timedOut = false  // Fresh flag for the stream phase (a slow-but-successful fetch may have set it)
       lastActivity = Date.now()
       const streamTimer = setInterval(() => {
         if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
