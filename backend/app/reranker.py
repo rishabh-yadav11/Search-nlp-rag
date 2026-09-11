@@ -95,7 +95,11 @@ class Reranker:
     def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Rerank relevance logits for (query, passage) pairs."""
         if self._onnx is not None:
-            inputs = self._tokenizer(pairs, padding=True, truncation=True, return_tensors="pt")
+            # The cross-encoder tokenizer encodes (text, text_pair) batches; a
+            # list of tuples would be treated as a single malformed input. Split
+            # the (query, passage) pairs into parallel query/passage lists.
+            qs, ps = zip(*pairs)
+            inputs = self._tokenizer(qs, ps, padding=True, truncation=True, return_tensors="pt")
             outputs = self._onnx(**inputs)
             logits = outputs.logits
             if logits.ndim == 2:
