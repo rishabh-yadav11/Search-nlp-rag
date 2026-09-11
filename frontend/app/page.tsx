@@ -94,7 +94,7 @@ function isSafeApiBase(url: string): boolean {
     return true
   }
   // Loopback (dev backend) is trusted even over http.
-  if (['localhost', '127.0.0.1', '::1'].includes(parsed.hostname)) return true
+  if (['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)) return true
   // Cross-origin: https + explicit allow-list (exact host:port match).
   if (parsed.protocol === 'https:' && TRUSTED_API_HOSTS.some((entry) => normalizeHost(entry) === normalizeHost(parsed.host))) {
     return true
