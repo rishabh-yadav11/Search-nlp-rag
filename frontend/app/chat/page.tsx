@@ -222,6 +222,11 @@ export default function ChatPage() {
   // session (a new-chat turn commits, and a stale reply to a switched session
   // is discarded) instead of the `activeId` captured when `send` was called.
   const activeIdRef = useRef<string | null>(null)
+  // Synchronous in-flight guard: `setSending(true)` happens only after two
+  // awaited calls on the first turn (session create + loadSessions), leaving a
+  // re-entry window that would duplicate the session/message and double-bill.
+  // This ref flips before any await so a second submit is blocked immediately.
+  const sendingRef = useRef(false)
 
   const loadSessions = useCallback(async () => {
     try {
@@ -295,7 +300,11 @@ export default function ChatPage() {
 
   const send = useCallback(async () => {
     const question = input.trim()
-    if (!question || sending) return
+    if (!question || sending || sendingRef.current) return
+    // Claim the flight synchronously, before the first await, so a second
+    // submit on the first turn can't slip past the (still-false) `sending`
+    // state and create a duplicate session/message.
+    sendingRef.current = true
     setError('')
     setNote('')
     cancelledRef.current = false
@@ -309,6 +318,7 @@ export default function ChatPage() {
         await loadSessions()
       } catch {
         setError('Could not start a new conversation.')
+        sendingRef.current = false
         return
       }
     }
@@ -535,6 +545,7 @@ export default function ChatPage() {
     } finally {
       setSending(false)
       setStreaming(false)
+      sendingRef.current = false
     }
   }, [activeId, input, loadSessions, sending])
 
