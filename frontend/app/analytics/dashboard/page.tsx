@@ -35,9 +35,9 @@ function fmt(n: number | null | undefined): string {
 }
 
 function usd(v: number | null | undefined): string {
-  return v == null
-    ? '$0'
-    : '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 6 })
+  if (v == null) return '$0'
+  if (v === 0) return '$0'
+  return '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 })
 }
 
 function pct(v: number | null | undefined): string {
