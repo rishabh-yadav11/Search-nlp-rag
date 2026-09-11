@@ -66,23 +66,28 @@ function isHttps(url: URL): boolean {
 }
 
 /** True when `url` resolves to a loopback address (`localhost`, `127.0.0.1`,
- *  `::1`). Loopback traffic never leaves the machine, so http over loopback is
+ *  `[::1]`). Loopback traffic never leaves the machine, so http over loopback is
  *  NOT a network cleartext risk — a dev backend like `http://localhost:8000` is
  *  therefore trusted even though it is cross-origin http. */
 function isLoopback(url: URL): boolean {
-  return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+  return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
 }
 
 /** Normalize an allow-list entry or URL host for comparison: strip any leading
- *  scheme (`https://` / `http://`), any trailing slash, and any trailing dot.
- *  The port is intentionally preserved so allow-list matching compares exact
- *  `host:port` (`api.example.com:8443` matches only `api.example.com:8443`, not
- *  `api.example.com`). */
+ *  scheme (`https://` / `http://`), any trailing slash, any trailing dot, and a
+ *  trailing default port (`:80` for http, `:443` for https). A default port is
+ *  not a distinguishing feature — the URL parser already drops it from
+ *  `url.host` (`URL('https://host:443').host === 'host'`) — so it MUST be
+ *  dropped from allow-list entries too, or an entry like `api.example.com:443`
+ *  would never match. Explicit non-default ports (e.g. `:8080`) are preserved,
+ *  so matching stays exact `host:port` (`api.example.com:8080` matches only
+ *  `api.example.com:8080`, not `api.example.com`). */
 export function normalizeHost(host: string): string {
   return host
     .replace(/^https?:\/\//, '')
     .replace(/\/+$/, '')
     .replace(/\.$/, '')
+    .replace(/:(?:80|443)$/, '')
 }
 
 /** True when `url`'s host is present in NEXT_PUBLIC_TRUSTED_API_HOSTS (compared
