@@ -892,6 +892,33 @@ def test_parse_dataviz_rejects_all_empty_label_cells():
     assert chat_module.parse_dataviz(partly) is not None
 
 
+def test_parse_dataviz_accepts_numeric_identifier_labels():
+    """A numeric identifier column (e.g. Year: 2024/2025) is valid identifying
+    content for the label side of a table, so such a block must parse — it is
+    not an all-empty-label malformed block. Checked both with an explicit
+    value_column and on the auto-detect path."""
+    # Explicit value_column: the numeric Year labels count as label content.
+    explicit = (
+        '```dataviz\n{"columns": ["Year", "Revenue"], '
+        '"rows": [[2024, 100], [2025, 150]], "value_column": 1}\n```'
+    )
+    data = chat_module.parse_dataviz(explicit)
+    assert data is not None
+    assert data["value_column"] == 1
+    assert data["rows"] == [[2024, 100], [2025, 150]]
+
+    # Auto-detect: no value_column, so the first numeric column (Year here, since
+    # both columns are numeric) is inferred; the block still parses successfully.
+    auto = (
+        '```dataviz\n{"columns": ["Year", "Revenue"], '
+        '"rows": [[2024, 100], [2025, 150]]}\n```'
+    )
+    data = chat_module.parse_dataviz(auto)
+    assert data is not None
+    assert data["value_column"] == 0  # _first_numeric_column picks Year
+    assert data["rows"] == [[2024, 100], [2025, 150]]
+
+
 def test_finalize_answer_only_keeps_charts_on_explicit_request():
     """Charts must never appear unless the user explicitly asked for one
     (guards non-deterministic model emission of dataviz blocks)."""
