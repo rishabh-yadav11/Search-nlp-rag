@@ -34,8 +34,10 @@ function fmt(n: number | null | undefined): string {
   return n == null || Number.isNaN(n) ? '0' : Number(n).toLocaleString()
 }
 
-function inr(v: number | null | undefined): string {
-  return v == null ? '₹0' : '₹' + Number(v).toLocaleString('en-IN', { maximumFractionDigits: 2 })
+function usd(v: number | null | undefined): string {
+  return v == null
+    ? '$0'
+    : '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 6 })
 }
 
 function pct(v: number | null | undefined): string {
@@ -102,7 +104,7 @@ function ChatTable({
           <tr key={title + ts}>
             <td>{title}</td>
             <td className="num">{fmt(msgs)}</td>
-            <td className="num">{cost ? inr(value) : fmt(value)}</td>
+            <td className="num">{cost ? usd(value) : fmt(value)}</td>
             <td>{new Date(ts * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</td>
           </tr>
         ))}
@@ -317,7 +319,7 @@ export default function AnalyticsDashboardPage() {
               <Card label="Conversations" value={fmt(s.sessions)} hint={`today: ${fmt(s.sessions_today)}`} />
               <Card label="Messages" value={fmt(s.messages)} hint="user + assistant" />
               <Card label="Total tokens" value={fmt(s.total_tokens)} hint="prompt + completion" />
-              <Card label="Total cost" value={inr(s.total_cost)} hint="across all conversations" warn={s.total_cost > 0} />
+              <Card label="Total cost" value={usd(s.total_cost)} hint="across all conversations" warn={s.total_cost > 0} />
               <Card label="Avg latency" value={`${s.avg_latency_ms} ms`} hint="per assistant reply" />
             </div>
             <div className="dash-grid2">
