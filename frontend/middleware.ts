@@ -16,9 +16,25 @@ const buildCsp = (nonce: string, apiBase: string) => {
   ].join('; ')
 }
 
+// Sanitize the connect-src API base to a bare http(s) origin. Rejects anything
+// that could inject an extra CSP source (`'self' https://evil.com`) or an extra
+// directive (a `;`) or that uses a non-http(s) scheme — falling back to '' (no
+// extra connect-src source) rather than emitting an attacker-influenced value.
+function sanitizeApiBase(apiBase: string): string {
+  if (!apiBase || /[\s;]/.test(apiBase)) return ''
+  let url: URL
+  try {
+    url = new URL(apiBase)
+  } catch {
+    return ''
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return ''
+  return url.origin
+}
+
 export function middleware(request: NextRequest) {
   const nonce = crypto.randomUUID()
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE ?? ''
+  const apiBase = sanitizeApiBase(process.env.NEXT_PUBLIC_API_BASE ?? '')
 
   const csp = buildCsp(nonce, apiBase)
 
