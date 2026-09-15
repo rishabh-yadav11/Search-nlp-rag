@@ -652,15 +652,34 @@ _VAGUE_WORDS = frozenset((
     "present", "convert", "format", "chart", "table", "graph", "pie", "bar",
     "line", "column", "area", "pictogram", "pictograph", "diagram", "visual",
     "visualize", "visualise", "visualization", "visualisation",
+    "share", "result", "results", "data", "answer", "summary", "list",
+    "last", "previous", "prior", "earlier", "above", "below", "following",
+    "shown", "provided", "generated", "mentioned", "said", "gave",
 ))
+
+# Phrases that explicitly point back at a prior assistant turn rather than naming
+# a topic: 'share the last result', 'show that data', 'give the previous answer'.
+_PREVIOUS_RESULT_RE = re.compile(
+    r"\b(last|previous|prior|earlier|that|this|preceding|above)\b.{0,20}"
+    r"\b(result|results|answer|response|summary|data|table|chart|list|output|info|information)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_vague_followup(question: str) -> bool:
     """True when ``question`` has no standalone retrieval topic — a pure
-    format/pronoun follow-up like 'make this into a table' or 'plot it' that
-    must inherit the previous turn's topic+date filter to retrieve anything."""
+    format/pronoun follow-up like 'make this into a table', 'share the data in a
+    chart', or 'show me the last result in a chart' that must inherit the
+    previous turn's topic+date filter to retrieve anything.
+
+    A bare reference to the prior result/answer is treated as vague even when it
+    carries generic words ('data', 'result', 'last') that are not themselves
+    topic words, so the turn reuses the previous topic instead of retrieving on
+    those non-topical words (which would find nothing)."""
     from app.query_intent import _strip_noise_words, range_query_topic
 
+    if _PREVIOUS_RESULT_RE.search(question or ""):
+        return True
     topic = range_query_topic(question) or _strip_noise_words(question) or ""
     words = set(re.findall(r"[a-z]+", topic.lower()))
     meaningful = {w for w in words if w not in _VAGUE_WORDS and len(w) > 1}
@@ -668,14 +687,25 @@ def _is_vague_followup(question: str) -> bool:
 
 
 def _previous_user_question(history: list[MessageOut]) -> str | None:
-    """The user's question from the turn before the current one, or None. The
-    history's last message is the just-appended current question."""
+    """The user's question from the most recent PRIOR turn that has an actual
+    topic, or None if none exists. The history's last message is the
+    just-appended current question.
+
+    Earlier vague follow-ups ('share the last result in chart', 'make this into a
+    table') carry no standalone topic themselves, so a chained follow-up must skip
+    past them and inherit the real preceding query (e.g. the 'list of IPO
+    companies' turn) — otherwise a degenerate follow-up inherits another
+    degenerate follow-up and retrieval still finds nothing."""
     seen_current = False
     for m in reversed(history):
-        if m.role == "user":
-            if seen_current:
-                return m.content
+        if m.role != "user":
+            continue
+        if not seen_current:
+            # First user message encountered walking back is the current question.
             seen_current = True
+            continue
+        if not _is_vague_followup(m.content):
+            return m.content
     return None
 
 
