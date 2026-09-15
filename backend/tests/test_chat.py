@@ -720,6 +720,92 @@ def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
     assert "top ipo in 2025" in turn.answer  # history included for the LLM
 
 
+def test_is_vague_followup_treats_prior_result_reference_as_vague():
+    """A follow-up that references the previous result/answer with only generic
+    words ('share the data in chart', 'share the last result data in chart') has
+    no standalone topic and must be treated as vague so retrieval inherits the
+    prior turn's query instead of searching the non-topical words."""
+    from app.chat import _is_vague_followup
+
+    assert _is_vague_followup("share the data in chart") is True
+    assert _is_vague_followup("share the last result data in chart") is True
+    assert _is_vague_followup("show that data as a chart") is True
+    assert _is_vague_followup("give the previous answer in a table") is True
+    # A real topic must NOT be swallowed as vague.
+    assert _is_vague_followup("make a table of top 15 deals in 2024-25") is False
+
+
+def test_previous_user_question_skips_chained_vague_followups():
+    """When the immediately preceding turn is itself a vague follow-up, the prior
+    topic lookup must skip past it and return the real preceding query (the IPO
+    table turn), not the degenerate 'share the last result' question."""
+    from app.chat import MessageOut, _previous_user_question
+
+    def msg(i, role, content):
+        return MessageOut(id=i, role=role, content=content, sources=[], created_at=float(i),
+                          prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=0.0)
+
+    history = [
+        msg(1, "user", "share list of IPO companies in table format"),
+        msg(2, "assistant", "Here are the IPOs."),
+        msg(3, "user", "share the data in chart"),          # vague follow-up
+        msg(4, "assistant", "No relevant articles."),
+        msg(5, "user", "share the last result data in chart"),  # current turn
+    ]
+    assert _previous_user_question(history) == "share list of IPO companies in table format"
+
+
+def test_prepare_turn_prior_result_followup_inherits_real_previous_query(monkeypatch):
+    """'share the last result data in chart' must inherit the real preceding IPO
+    query (not a degenerate earlier follow-up) so retrieval finds the same
+    sources the IPO table was built from (regression for the 'No relevant
+    articles' dead-end)."""
+    from app import main
+    from app.chat import MessageOut
+    from app.main import SourceArticle
+
+    monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", False)
+
+    intents = {
+        "share list of ipo companies in table format": ("IPO companies table", None, None, None, None),
+        "share the data in chart": ("share the data in chart", None, None, None, None),
+        "share the last result data in chart": ("share the last result data in chart", None, None, None, None),
+    }
+    monkeypatch.setattr(main, "_effective_intent", lambda q, f, t: intents[q.lower()])
+
+    captured = {}
+
+    async def fake_retrieve(rq, top_k, qfilter, need_body=False):
+        captured["rq"] = rq
+        return [SourceArticle(id=1, title="t", url="u", published_date="2025-06-01",
+                              summary="s", body="b", score=0.9)]
+
+    async def fake_rescue(q, articles):
+        return articles
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "body_rescue", fake_rescue)
+
+    def msg(i, role, content):
+        return MessageOut(id=i, role=role, content=content, sources=[], created_at=float(i),
+                          prompt_tokens=0, completion_tokens=0, cost=0.0, latency_ms=0.0)
+
+    history = [
+        msg(1, "user", "share list of IPO companies in table format"),
+        msg(2, "assistant", "Here are the IPOs."),
+        msg(3, "user", "share the data in chart"),
+        msg(4, "assistant", "No relevant articles."),
+        msg(5, "user", "share the last result data in chart"),
+    ]
+    turn = _run(chat_module._prepare_turn("share the last result data in chart", history))
+    assert turn.needs_llm
+    assert captured["rq"] == "IPO companies table"
+    assert "share the last result data in chart" in turn.answer
+    assert "share list of IPO companies in table format" in turn.answer
+
+
 def test_prepare_turn_real_question_does_not_inherit_previous_retrieval(monkeypatch):
     """A standalone question (even one that asks for a table) must use its own
     retrieval topic, not the previous turn's."""
