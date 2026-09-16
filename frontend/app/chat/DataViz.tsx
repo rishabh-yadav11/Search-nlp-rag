@@ -1,6 +1,30 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ColumnDef,
+  flexRender,
+  getCoreRowModel,
+  getPaginationRowModel,
+  useReactTable,
+} from '@tanstack/react-table'
+import {
+  Bar,
+  BarChart as ReBarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Line,
+  LineChart as ReLineChart,
+  Pie,
+  PieChart as RePieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
+
+// Types
 
 export type DataVizBlock = {
   title?: string
@@ -9,7 +33,7 @@ export type DataVizBlock = {
   value_column: number | null
   format?: string
   kind?: 'bar' | 'line' | 'pie'
-  view?: 'table' | 'bar' | 'line' | 'pie' | 'picto'
+  view?: 'table' | 'bar' | 'line' | 'pie'
 }
 
 type ContentPart =
@@ -17,13 +41,13 @@ type ContentPart =
   | { type: 'viz'; block: DataVizBlock }
   | { type: 'err' }
 
-// `[^\S\n]*\n?` tolerates the LLM putting no newline (and/or only horizontal
-// whitespace) right after the ```dataviz marker; `\n?` before the closing fence
-// tolerates omitting the trailing newline right before ```; `\s*` after it
-// swallows extra trailing whitespace. Mirrors the backend _DATAVIZ_FENCE_RE.
+// Constants
+
 const FENCE_SRC = '```dataviz[^\\S\\n]*\\n?([\\s\\S]*?)\\n?```\\s*'
 const KINDS = ['bar', 'line', 'pie'] as const
-const VIEWS = ['table', 'bar', 'line', 'pie', 'picto'] as const
+const VIEWS = ['table', 'bar', 'line', 'pie'] as const
+
+// Helpers
 
 function toNum(v: unknown): number | null {
   if (typeof v === 'boolean') return null
@@ -46,8 +70,6 @@ function isMissing(v: unknown): boolean {
   return false
 }
 
-// A value column must hold a number in every non-missing cell and at least one
-// number overall (empty cells are allowed, e.g. 'value not stated').
 function validValueColumn(rows: (string | number)[][], j: number): boolean {
   const present = rows.map((r) => r[j]).filter((v) => !isMissing(v))
   return present.length > 0 && present.every((v) => toNum(v) != null)
@@ -61,23 +83,12 @@ function firstNumericColumn(rows: (string | number)[][]): number | null {
   return null
 }
 
-// The column that labels each row in a chart: the first non-value column.
-// Charts must NOT hardcode index 0 — when value_column != 0 the identifying
-// label lives in a different column (e.g. column 0 is the value, column 1 the
-// name). Falls back to 0 only if every column is the value column (1-col data).
 function labelColumnIndex(columns: string[], valueColumn: number | null): number {
   const v = valueColumn ?? 0
   const j = columns.findIndex((_, k) => k !== v)
   return j >= 0 ? j : 0
 }
 
-// A data block is only useful if at least one non-value column carries
-// identifying content — text OR a numeric identifier such as a Year (2024) or a
-// row index. Any non-blank label cell (checked via isMissing) counts, so a
-// numeric-identifier column passes just like a name column. A table whose label
-// cells are all empty (every label cell blank, no identifying column at all)
-// shows only numbers and is treated as malformed so it is dropped (mirrors
-// backend app.chat._has_label_content).
 function hasLabelContent(rows: (string | number)[][], columns: string[], valueColumn: number | null): boolean {
   const labelCols = columns.map((_, j) => j).filter((j) => j !== valueColumn)
   if (!labelCols.length) return true
@@ -130,15 +141,11 @@ export function splitContent(text: string): ContentPart[] {
     if (m.index > last) parts.push({ type: 'md', md: text.slice(last, m.index) })
     const block = parseDataViz(m[0])
     if (block) parts.push({ type: 'viz', block })
-    // A dataviz fence was present but unparseable — surface it as an 'err' part
-    // so the consumer can show a subtle notice instead of silently dropping it.
     else parts.push({ type: 'err' })
     last = re.lastIndex
   }
   if (!found) return [{ type: 'md', md: stripOpenFence(text) }]
   if (last < text.length) parts.push({ type: 'md', md: text.slice(last) })
-  // If the fence is still open mid-stream, drop the trailing raw JSON so it
-  // doesn't flash as a code block before the closing fence arrives.
   return parts.map((p) =>
     p.type === 'md' ? { type: 'md' as const, md: stripOpenFence(p.md) } : p,
   )
@@ -174,9 +181,22 @@ function trim(v: number): string {
   return Number.isInteger(s) ? String(s) : String(s)
 }
 
-// 24 distinct, colorblind-friendly colors (Okabe-Ito core + clearly
-// separable light/dark variants). Consumed as COLORS[i % COLORS.length], so
-// expanding here upgrades every chart with no call-site changes.
+// Recharts data mapping
+
+function chartData(block: DataVizBlock): { label: string; value: number | null }[] {
+  const { rows, value_column: vc, columns } = block
+  const v = vc ?? 0
+  const lc = labelColumnIndex(columns, vc)
+  const label = (r: (string | number)[]) => (isMissing(r[lc]) ? '' : String(r[lc]))
+  const num = (r: (string | number)[]) => (isMissing(r[v]) ? null : toNum(r[v]))
+  return rows.map((r) => ({ label: label(r), value: num(r) }))
+}
+
+const VALUE_KEY = 'value'
+const LABEL_KEY = 'label'
+
+// Colors
+
 const COLORS = [
   '#0072b2', '#e69f00', '#009e73', '#d55e00', '#cc79a7', '#56b4e9',
   '#007777', '#e07b00', '#332288', '#44aa99', '#882255', '#88ccee',
@@ -184,297 +204,176 @@ const COLORS = [
   '#336699', '#cc6600', '#2299aa', '#ee7733', '#6b4a99', '#446688',
 ]
 
+// Charts
+
 function BarChart({ block }: { block: DataVizBlock }) {
-  const { rows, columns, value_column: vc, format } = block
-  const v = vc ?? 0
-  const lc = labelColumnIndex(columns, vc)
-  const values = rows.map((r) => toNum(r[v]) ?? 0)
-  // Domain spans the actual min/max (anchored at 0) so negatives render below
-  // the zero baseline instead of being clipped or drawn the wrong way.
-  const maxVal = values.reduce((a, b) => Math.max(a, b), 0)
-  const minVal = values.reduce((a, b) => Math.min(a, b), 0)
-  const n = rows.length
-  const slot = 64
-  const padL = 56
-  const width = Math.max(360, n * slot + padL + 20)
-  const height = 244
-  const plotTop = 16
-  const plotBottom = height - 62
-  const plotH = plotBottom - plotTop
-  const barW = Math.min(44, slot - 16)
-  // Rotate labels only when there are enough bars that horizontal ones would
-  // collide; the shallow angle + centered anchor keeps every name inside the
-  // viewBox even at the plot edges.
-  const rotate = n > 6
-  const labelY = height - 34
-  const angle = rotate ? -20 : 0
-  // Truncation budget scales with slot width: wide slots (few bars) afford
-  // longer names, rotated labels (many bars) share the slot diagonally so they
-  // stay tighter to avoid colliding with neighbors. ~5.6px per char at 10.5px.
-  const CHAR_W = 5.6
-  const budget = rotate
-    ? Math.max(6, Math.floor(((slot - 6) / CHAR_W) * 0.85))
-    : Math.max(8, Math.min(24, Math.floor((slot * 1.8 - 6) / CHAR_W)))
-
-  // Map a value to a y pixel; the scale accounts for both positive and
-  // negative extents so the zero line sits wherever the data requires.
-  const domain = maxVal - minVal || 1
-  const yOf = (val: number) => plotBottom - ((val - minVal) / domain) * plotH
-  const zeroY = yOf(0)
-
+  const data = chartData(block)
+  const format = block.format
   return (
     <div className="chat-viz-chart">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={block.title || 'bar chart'}>
-        {/* Zero baseline (only meaningful when data crosses zero). */}
-        {minVal < 0 && (
-          <line x1={padL - 4} y1={zeroY} x2={width - 12} y2={zeroY} stroke="#9a9a9a" strokeWidth={1} strokeDasharray="3 3" />
-        )}
-        {values.map((val, i) => {
-          // Bars grow from the zero baseline: upward for positives, downward
-          // for negatives.
-          const barTop = val >= 0 ? yOf(val) : zeroY
-          const bh = Math.max(2, Math.abs(yOf(val) - zeroY))
-          const x = padL + i * slot
-          const y = barTop
-          const valTextY = val >= 0 ? barTop - 5 : barTop + bh + 12
-          const full = String(rows[i][lc] ?? '')
-          const label = full.length > budget ? `${full.slice(0, budget - 1)}…` : full
-          return (
-            <g key={i}>
-              <title>{full}</title>
-              <rect x={x} y={y} width={barW} height={bh} rx={3} fill={COLORS[i % COLORS.length]} />
-              <text x={x + barW / 2} y={valTextY} textAnchor="middle" className="chat-viz-bar-val">
-                {formatValue(val, format)}
-              </text>
-              <text
-                x={x + barW / 2}
-                y={labelY}
-                textAnchor="middle"
-                transform={`rotate(${angle} ${x + barW / 2} ${labelY})`}
-                className="chat-viz-bar-label"
-              >
-                {label}
-              </text>
-            </g>
-          )
-        })}
-      </svg>
+      <ResponsiveContainer width="100%" height={260} minWidth={300}>
+        <ReBarChart data={data} margin={{ top: 8, right: 8, left: -12, bottom: 4 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#ececec" vertical={false} />
+          <XAxis
+            dataKey={LABEL_KEY}
+            tick={{ fontSize: 10.5, fill: '#444' }}
+            interval={0}
+            angle={data.length > 6 ? -20 : 0}
+            textAnchor={data.length > 6 ? 'end' : 'middle'}
+            height={data.length > 6 ? 52 : 30}
+          />
+          <YAxis tick={{ fontSize: 10, fill: '#888' }} width={48} />
+          <Tooltip
+            formatter={(value) => [formatValue(Number(value), format), '']}
+            labelStyle={{ fontSize: 12, color: '#333' }}
+            contentStyle={{ fontSize: 12 }}
+          />
+          <Bar dataKey={VALUE_KEY} radius={[3, 3, 0, 0]} maxBarSize={44}>
+            {data.map((d, i) => (
+              <Cell key={i} fill={COLORS[i % COLORS.length]} />
+            ))}
+          </Bar>
+        </ReBarChart>
+      </ResponsiveContainer>
     </div>
   )
 }
 
 function LineChart({ block }: { block: DataVizBlock }) {
-  const { rows, columns, value_column: vc, format } = block
-  const v = vc ?? 0
-  const lc = labelColumnIndex(columns, vc)
-  const values = rows.map((r) => toNum(r[v]) ?? 0)
-  // Domain spans the actual min/max (anchored at 0) so negative values map
-  // below the zero line instead of being pushed off the top.
-  const maxVal = values.reduce((a, b) => Math.max(a, b), 0)
-  const minVal = values.reduce((a, b) => Math.min(a, b), 0)
-  const n = rows.length
-  const width = Math.max(340, n * 80 + 60)
-  const height = 240
-  const padL = 40
-  const padR = 20
-  const padT = 18
-  const padB = 40
-  const plotW = width - padL - padR
-  const plotH = height - padT - padB
-  const domain = maxVal - minVal || 1
-  const xs = rows.map((_, i) => padL + (i * plotW) / Math.max(1, n - 1))
-  const ys = values.map((val) => padT + plotH - ((val - minVal) / domain) * plotH)
-  const pts = rows.map((_, i) => `${xs[i]},${ys[i]}`).join(' ')
-  const step = Math.max(1, Math.ceil(n / 8))
-
-  // Subtle horizontal gridlines: pick up to 5 evenly spaced ticks across the
-  // value domain. The zero line acts as a baseline whenever data crosses it.
-  const GRID_MAX = 5
-  const gridCount = Math.min(GRID_MAX, Math.max(2, Math.floor(plotH / 18)))
-  const gridYs: { y: number; label: string }[] = []
-  for (let k = 0; k < gridCount; k++) {
-    const t = gridCount === 1 ? 0.5 : k / (gridCount - 1)
-    const val = minVal + t * domain
-    gridYs.push({ y: padT + plotH - (t * plotH), label: trim(val) })
-  }
-  const crossesZero = minVal < 0 && maxVal > 0
-  const zeroY = crossesZero ? padT + plotH - ((0 - minVal) / domain) * plotH : null
-
+  const data = chartData(block)
+  const format = block.format
   return (
     <div className="chat-viz-chart">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={block.title || 'line chart'}>
-        <g aria-hidden="true">
-          {gridYs.map((g, gi) => (
-            <g key={gi}>
-              <line x1={padL} y1={g.y} x2={width - padR} y2={g.y} stroke="#ececec" strokeWidth={1} />
-              <text x={padL - 5} y={g.y + 3} textAnchor="end" fontSize={9} fill="#999">
-                {g.label}
-              </text>
-            </g>
-          ))}
-          {zeroY != null && (
-            <line x1={padL} y1={zeroY} x2={width - padR} y2={zeroY} stroke="#9a9a9a" strokeWidth={1} strokeDasharray="3 3" />
-          )}
-        </g>
-        <polyline
-          points={pts}
-          fill="none"
-          stroke={COLORS[0]}
-          strokeWidth={2.5}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        {values.map((v, i) => (
-          <g key={i}>
-            <circle cx={xs[i]} cy={ys[i]} r={4} fill={COLORS[0]} stroke="#fff" strokeWidth={1.5} />
-            <text x={xs[i]} y={ys[i] - 8} textAnchor="middle" className="chat-viz-bar-val">
-              {formatValue(v, format)}
-            </text>
-          </g>
-        ))}
-        {rows.map((r, i) =>
-          i % step === 0 || i === n - 1 ? (
-            <text key={i} x={xs[i]} y={height - padB + 16} textAnchor="middle" className="chat-viz-bar-label">
-              {String(r[lc])}
-            </text>
-          ) : null,
-        )}
-      </svg>
+      <ResponsiveContainer width="100%" height={260} minWidth={300}>
+        <ReLineChart data={data} margin={{ top: 8, right: 8, left: -12, bottom: 4 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#ececec" vertical={false} />
+          <XAxis dataKey={LABEL_KEY} tick={{ fontSize: 10.5, fill: '#444' }} interval="preserveStartEnd" height={30} />
+          <YAxis tick={{ fontSize: 10, fill: '#888' }} width={48} />
+          <Tooltip
+            formatter={(value) => [formatValue(Number(value), format), '']}
+            labelStyle={{ fontSize: 12, color: '#333' }}
+            contentStyle={{ fontSize: 12 }}
+          />
+          <Line
+            type="monotone"
+            dataKey={VALUE_KEY}
+            stroke={COLORS[0]}
+            strokeWidth={2.5}
+            dot={{ r: 4, fill: COLORS[0], stroke: '#fff', strokeWidth: 1.5 }}
+            activeDot={{ r: 5 }}
+            connectNulls
+          />
+        </ReLineChart>
+      </ResponsiveContainer>
     </div>
   )
 }
 
 function PieChart({ block }: { block: DataVizBlock }) {
-  const { rows, columns, value_column: vc, format } = block
-  const v = vc ?? 0
-  const lc = labelColumnIndex(columns, vc)
-  const values = rows.map((r) => Math.max(0, toNum(r[v]) ?? 0))
-  const total = values.reduce((a, b) => a + b, 0)
-  const cx = 110
-  const cy = 110
-  const r = 88
-  let angle = -Math.PI / 2
-
-  const arc = (start: number, end: number): string => {
-    const x1 = cx + r * Math.cos(start)
-    const y1 = cy + r * Math.sin(start)
-    const x2 = cx + r * Math.cos(end)
-    const y2 = cy + r * Math.sin(end)
-    const large = end - start > Math.PI ? 1 : 0
-    return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`
-  }
-
+  const data = chartData(block)
+    .map((d) => ({ ...d, value: d.value == null ? 0 : Math.max(0, d.value) }))
+    .filter((d) => d.value > 0)
+  const format = block.format
+  const total = data.reduce((a, d) => a + d.value, 0)
   return (
     <div className="chat-viz-pie">
       <div className="chat-viz-chart">
         {total <= 0 ? (
           <div className="chat-viz-empty">No numeric data to plot.</div>
         ) : (
-          <svg viewBox="0 0 220 220" role="img" aria-label={block.title || 'pie chart'}>
-            {values.map((sliceVal, i) => {
-              const slice = (sliceVal / total) * Math.PI * 2
-              const d = arc(angle, angle + slice)
-              const pct = total ? Math.round((sliceVal / total) * 1000) / 10 : 0
-              const mid = angle + slice / 2
-              const lx = cx + (r * 0.62) * Math.cos(mid)
-              const ly = cy + (r * 0.62) * Math.sin(mid)
-              angle += slice
-              return (
-                <g key={i}>
-                  <path d={d} fill={COLORS[i % COLORS.length]} stroke="#fff" strokeWidth={1} />
-                  {pct >= PIE_LABEL_MIN_PCT && (
-                    <text x={lx} y={ly} textAnchor="middle" dominantBaseline="central" className="chat-viz-pie-pct">
-                      {pct}%
-                    </text>
-                  )}
-                </g>
-              )
-            })}
-          </svg>
+          <ResponsiveContainer width="100%" height={260} minWidth={300}>
+            <RePieChart>
+              <Pie
+                data={data}
+                dataKey={VALUE_KEY}
+                nameKey={LABEL_KEY}
+                cx="50%"
+                cy="50%"
+                outerRadius={88}
+                innerRadius={60}
+                label={({ value }) => {
+                  const pct = total ? Math.round((value / total) * 1000) / 10 : 0
+                  return pct >= PIE_LABEL_MIN_PCT ? `${pct}%` : ''
+                }}
+                labelLine={false}
+                fill="#8884d8"
+              >
+                {data.map((d, i) => (
+                  <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip
+                formatter={(value) => [formatValue(Number(value), format), '']}
+                labelStyle={{ fontSize: 12, color: '#333' }}
+                contentStyle={{ fontSize: 12 }}
+              />
+              <Legend
+                iconType="circle"
+                iconSize={10}
+                layout="vertical"
+                verticalAlign="middle"
+                align="right"
+                wrapperStyle={{ fontSize: 12, paddingLeft: 12 }}
+              />
+            </RePieChart>
+          </ResponsiveContainer>
         )}
       </div>
-      <ol className="chat-viz-legend">
-        {rows.map((row, i) => (
-          <li key={i}>
-            <span className="chat-viz-swatch" style={{ background: COLORS[i % COLORS.length] }} />
-            <span className="chat-viz-legend-label">{String(row[lc])}</span>
-            <span className="chat-viz-legend-val">
-              {formatValue(values[i], format)} · {total ? Math.round((values[i] / total) * 1000) / 10 : 0}%
-            </span>
-          </li>
-        ))}
-      </ol>
     </div>
   )
 }
 
-function PictogramChart({ block }: { block: DataVizBlock }) {
-  const { rows, columns, value_column: vc, format } = block
-  const v = vc ?? 0
-  const lc = labelColumnIndex(columns, vc)
-  const values = rows.map((r) => toNum(r[v]) ?? 0)
-  const maxVal = values.reduce((a, b) => Math.max(a, b), 1)
-  const scale = maxVal > 40 ? Math.ceil(maxVal / 40) : 1
-
-  return (
-    <div className="chat-viz-picto">
-      {rows.map((row, i) => {
-        const val = toNum(row[v]) ?? 0
-        const icons = Math.round(val / scale)
-        return (
-          <div className="chat-viz-picto-row" key={i}>
-            <span className="chat-viz-picto-label">{String(row[lc])}</span>
-            <span className="chat-viz-picto-icons">
-              {Array.from({ length: Math.max(0, icons) }).map((_, j) => (
-                <span key={j} className="chat-viz-picto-icon" style={{ background: COLORS[i % COLORS.length] }} />
-              ))}
-            </span>
-            <span className="chat-viz-picto-val">
-              {formatValue(val, format)}
-              {scale > 1 ? ` (${scale} per icon)` : ''}
-            </span>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
+// Table
 
 const TABLE_PAGE_SIZE = 25
-// Pagination controls only appear for larger tables (default threshold); small
-// tables render fully without controls.
 const TABLE_PAGINATE_AT = 50
-
-// Inline % labels are only drawn on slices at/above this size; smaller slices
-// would crowd/overlap neighbors, so they rely on the legend (always present).
 const PIE_LABEL_MIN_PCT = 5
 
 function TableView({ block }: { block: DataVizBlock }) {
-  const rows = block.rows
-  const totalPages = Math.max(1, Math.ceil(rows.length / TABLE_PAGE_SIZE))
-  // Local pagination state; reset whenever the underlying data changes length.
-  const [page, setPage] = useState(0)
-  const effectivePage = Math.min(page, totalPages - 1)
-  const paged = rows.slice(effectivePage * TABLE_PAGE_SIZE, (effectivePage + 1) * TABLE_PAGE_SIZE)
-  const hasControls = rows.length > TABLE_PAGINATE_AT
+  const columns = useMemo<ColumnDef<(string | number)[], unknown>[]>(() =>
+    block.columns.map((col, ci) => ({
+      accessorKey: String(ci),
+      header: col,
+      cell: (info) => {
+        const cell = (info.row.original as (string | number)[])[ci]
+        if (ci === block.value_column) {
+          if (isMissing(cell)) return '—'
+          const n = toNum(cell)
+          return n != null ? formatValue(n, block.format) : String(cell)
+        }
+        return String(cell)
+      },
+    })),
+    [block],
+  )
+
+  const table = useReactTable({
+    data: block.rows,
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+    initialState: { pagination: { pageSize: TABLE_PAGE_SIZE } },
+  })
+
+  const hasControls = block.rows.length > TABLE_PAGINATE_AT
 
   return (
     <div className="chat-viz-table-wrap">
       <table className="chat-viz-table">
         <thead>
-          <tr>
-            {block.columns.map((c, ci) => (
-              <th key={ci}>{c}</th>
-            ))}
-          </tr>
+          {table.getHeaderGroups().map((hg) => (
+            <tr key={hg.id}>
+              {hg.headers.map((h) => (
+                <th key={h.id}>{flexRender(h.column.columnDef.header, h.getContext())}</th>
+              ))}
+            </tr>
+          ))}
         </thead>
         <tbody>
-          {paged.map((row, i) => (
-            <tr key={effectivePage * TABLE_PAGE_SIZE + i}>
-              {row.map((cell, j) => (
-                <td key={j}>
-                  {j === block.value_column ? (isMissing(cell) ? '—' : toNum(cell) != null ? formatValue(toNum(cell)!, block.format) : String(cell)) : String(cell)}
-                </td>
+          {table.getRowModel().rows.map((row) => (
+            <tr key={row.id}>
+              {row.getVisibleCells().map((cell) => (
+                <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
               ))}
             </tr>
           ))}
@@ -485,20 +384,20 @@ function TableView({ block }: { block: DataVizBlock }) {
           <button
             type="button"
             className="chat-viz-table-nav-btn"
-            disabled={effectivePage === 0}
-            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            disabled={!table.getCanPreviousPage()}
+            onClick={() => table.previousPage()}
             aria-label="Previous page"
           >
             ‹ Prev
           </button>
           <span className="chat-viz-table-nav-page" aria-live="polite">
-            Page {effectivePage + 1} of {totalPages}
+            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
           </span>
           <button
             type="button"
             className="chat-viz-table-nav-btn"
-            disabled={effectivePage >= totalPages - 1}
-            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+            disabled={!table.getCanNextPage()}
+            onClick={() => table.nextPage()}
             aria-label="Next page"
           >
             Next ›
@@ -509,6 +408,8 @@ function TableView({ block }: { block: DataVizBlock }) {
   )
 }
 
+// Main component
+
 function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<DataVizBlock['view']> }) {
   switch (view) {
     case 'bar':
@@ -517,8 +418,6 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
       return <LineChart block={block} />
     case 'pie':
       return <PieChart block={block} />
-    case 'picto':
-      return <PictogramChart block={block} />
     default:
       return <TableView block={block} />
   }
@@ -526,9 +425,6 @@ function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<Da
 
 export default function DataViz({ block }: { block: DataVizBlock }) {
   const [view, setView] = useState<NonNullable<DataVizBlock['view']>>(block.kind ?? 'table')
-  // Reset the selected view only when the block's CONTENT changes, not on every
-  // fresh object reference. Otherwise a parent that re-creates the block each
-  // render would silently discard the user's manual view selection.
   const prevSig = useRef<string>('')
   const sig = `${block.title ?? ''}|${block.rows.length}|${block.value_column ?? ''}|${block.kind ?? ''}`
   useEffect(() => {
@@ -537,28 +433,16 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
     setView(block.kind ?? 'table')
   }, [sig, block.kind])
   const vc = block.value_column
-  // A chart is valid as long as at least one numeric value exists; missing
-  // cells are skipped/zeroed per-series rather than forcing a table-only view.
   const numbers = useMemo(
     () => vc != null && block.rows.some((r) => toNum(r[vc]) != null),
     [block, vc],
   )
-  const pictoOk = useMemo(() => {
-    if (vc == null) return false
-    const present = block.rows.map((r) => toNum(r[vc])).filter((x) => x != null) as number[]
-    // Tolerate missing cells, but every present value must be a non-negative
-    // integer for the pictogram to make sense.
-    return present.length > 0 && present.every((x) => Number.isInteger(x) && x >= 0)
-  }, [block, vc])
-  // When the user explicitly asked for one view (block.view set by the backend),
-  // render ONLY that view; otherwise keep the interactive view toggles.
   const locked = block.view
   const effective: NonNullable<DataVizBlock['view']> = useMemo(() => {
     const target = locked ?? view
-    if (target === 'picto' && !pictoOk) return 'table'
     if ((target === 'bar' || target === 'line' || target === 'pie') && !numbers) return 'table'
     return target
-  }, [locked, view, numbers, pictoOk])
+  }, [locked, view, numbers])
 
   return (
     <div className="chat-viz">
@@ -580,17 +464,11 @@ export default function DataViz({ block }: { block: DataVizBlock }) {
                 <button type="button" aria-pressed={view === 'pie'} className={view === 'pie' ? 'active' : ''} onClick={() => setView('pie')}>
                   Pie
                 </button>
-                {pictoOk && (
-                  <button type="button" aria-pressed={view === 'picto'} className={view === 'picto' ? 'active' : ''} onClick={() => setView('picto')}>
-                    Pictogram
-                  </button>
-                )}
               </>
             )}
           </div>
         </div>
       )}
-
       <RenderView block={block} view={effective} />
     </div>
   )
