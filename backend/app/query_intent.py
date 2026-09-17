@@ -204,7 +204,7 @@ _REV_EVENT_YEAR_RE = re.compile(
 # top 15 deals' would otherwise retrieve on 'make a table' instead of 'deals').
 _CHART_VERB = r"(?:show|draw|make|create|give|build|plot|display|present|share|convert)"
 _CHART_TYPE = r"(?:bar|line|pie|column|area|pictogram|pictograph)?\s*"
-_CHART_NOUN = r"(?:chart|graph|plot|diagram|table|tabular|tabulated|pictogram|pictograph)"
+_CHART_NOUN = r"(?:chart|graph|plot|diagram|tables?|tabular|tabulated|pictogram|pictograph)"
 _CHART_LEAD_RE = re.compile(
     rf"\b(?:{_CHART_VERB})\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?"
     rf"{_CHART_TYPE}{_CHART_NOUN}\b(?:\s+(?:of|for|on|about|regarding)\b)?",

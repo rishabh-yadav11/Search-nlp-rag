@@ -649,8 +649,8 @@ _VAGUE_WORDS = frozenset((
     "now", "again", "also", "then", "next", "about", "further", "more",
     "elaborate", "explain", "detail", "details", "why", "what", "how",
     "make", "create", "show", "draw", "give", "build", "plot", "display",
-    "present", "convert", "format", "formats", "chart", "table", "tabular",
-    "tabulated", "graph", "pie", "bar",
+    "present", "convert", "format", "formats", "chart", "table", "tables",
+    "tabular", "tabulated", "graph", "pie", "bar",
     "line", "column", "area", "pictogram", "pictograph", "diagram", "visual",
     "visualize", "visualise", "visualization", "visualisation",
     "share", "result", "results", "data", "answer", "summary", "list",
@@ -665,7 +665,7 @@ _VAGUE_WORDS = frozenset((
 # keeps its own topic).
 _PREVIOUS_RESULT_RE = re.compile(
     r"\b(last|previous|prior|earlier|that|this|preceding|above)\b.{0,20}"
-    r"\b(result|results|answer|response|summary|data|table|tabular|tabulated|chart|list|output|info|information)\b",
+    r"\b(result|results|answer|response|summary|data|table|tables|tabular|tabulated|chart|list|output|info|information)\b",
     re.IGNORECASE,
 )
 
@@ -910,15 +910,16 @@ def _effective_chat_k(question: str) -> int:
 # Matches only an EXPLICIT request for a chart/graph/plot/visualization/table,
 # so ranked-list and numeric-comparison questions that do NOT mention a visual
 # view get plain prose instead of an automatic chart (see CHAT_PROMPT). 'share'
-# is a request verb ('share this deals in table format'), bare 'table'/'tabular'
-# counts as an explicit view, and the 'in table format' branch needs no article
-# and accepts a format/form/view suffix ('in tabular format').
+# is a request verb ('share this deals in table format'); the 'in table format'
+# branch needs no article and accepts a format/form/view suffix, covering both
+# singular and plural ('in tables', 'in tabular format'). Bare nouns alone do
+# NOT count — a table view still needs a verb or as/in/into context.
 _CHART_INTENT_RE = re.compile(
-    r"\b(charts?|graphs?|tables?|tabular|tabulated|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
+    r"\b(charts?|graphs?|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
     r"|(?:show|draw|make|create|give|build|plot|share|present|display|convert)\s+(?:me\s+)?(?:a\s+|the\s+)?"
-    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|table|tabular)\b"
-    r"|\b(?:as|in|into)\s+(?:a\s+|an\s+|the\s+)?(?:tabular\s+)?(?:chart|graph|plot|table|tabular)\b(?:\s+(?:format|form|view)\b)?"
-    r"|\b(?:chart|graph|plot|table|tabular)\s+(?:it|this|these|them|that|out)\b",
+    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|tables?|tabular|tabulated)\b"
+    r"|\b(?:as|in|into)\s+(?:a\s+|an\s+|the\s+)?(?:tabular\s+)?(?:chart|graph|plot|tables?|tabular|tabulated)\b(?:\s+(?:format|form|view)\b)?"
+    r"|\b(?:chart|graph|plot|tables?|tabular|tabulated)\s+(?:it|this|these|them|that|out)\b",
     re.IGNORECASE,
 )
 
@@ -962,7 +963,9 @@ _VIEW_TERMS: list[tuple[str, str]] = [
     ("column", "bar"),
     ("histogram", "bar"),
     ("table", "table"),
+    ("tables", "table"),
     ("tabular", "table"),
+    ("tabulated", "table"),
     ("graph", "bar"),
 ]
 
