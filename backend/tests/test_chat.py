@@ -731,8 +731,21 @@ def test_is_vague_followup_treats_prior_result_reference_as_vague():
     assert _is_vague_followup("share the last result data in chart") is True
     assert _is_vague_followup("show that data as a chart") is True
     assert _is_vague_followup("give the previous answer in a table") is True
+    # Regression: anaphoric 'this deals' + format words is a follow-up reference
+    # to the prior result, not a new topic ('m&a deals in 2025' -> tabular/table).
+    assert _is_vague_followup("share this deals in tabular format") is True
+    assert _is_vague_followup("share this deals in table format") is True
+    assert chat_module._requested_view("share this deals in tabular format") == "table"
+    assert chat_module._requested_view("share this deals in table format") == "table"
     # A real topic must NOT be swallowed as vague.
+    assert _is_vague_followup("m&a deals in 2025") is False
     assert _is_vague_followup("make a table of top 15 deals in 2024-25") is False
+    # A new predication on the noun is a standalone topic, not a reference.
+    assert _is_vague_followup("this table shows Q3 deals") is False
+    assert _is_vague_followup("this week deals in fintech") is False
+    # Trailing politeness does not make a reference topical.
+    assert _is_vague_followup("share the last result thanks") is True
+    assert _is_vague_followup("share the last result, thanks") is True
 
 
 def test_previous_user_question_skips_chained_vague_followups():
@@ -1037,8 +1050,15 @@ def test_chart_intent_regex():
         "as a table",
         "graph it",
         "visualize the top 10 ipo deals",
+        "share this deals in tabular format",
+        "share this deals in table format",
+        "in tabular format",
     ]:
         assert chat_module._CHART_INTENT_RE.search(q), q
+    # Bare 'in table' is a common-noun phrase, not a view request.
+    assert not chat_module._CHART_INTENT_RE.search("in table tennis"), "in table tennis"
+    assert not chat_module._CHART_INTENT_RE.search("present table tennis scores")
+    assert not chat_module._CHART_INTENT_RE.search("in the plot of the story")
     for q in [
         "top 5 deals in 2025",
         "top 10 ipo deals in 2025",
