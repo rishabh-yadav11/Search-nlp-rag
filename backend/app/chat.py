@@ -662,10 +662,18 @@ _VAGUE_WORDS = frozenset((
 # a topic: 'share the last result', 'show that data', 'give the previous answer',
 # 'share this deals in tabular format' (matched via the tabular/table noun, not
 # via 'deals' — generic topic nouns stay out so 'this week's deals in fintech'
-# keeps its own topic).
+# keeps its own topic). The result noun must be followed by format context (a
+# preposition, another reference noun, a format word, or end of string), so a
+# new predication on the noun ('this table shows Q3 deals') is not mistaken for
+# a reference to the prior result.
+_PREVIOUS_RESULT_FOLLOW_WORDS = (
+    r"in|as|into|of|for|with|format|formats|form|view|result|results|answer|"
+    r"response|summary|data|tables?|tabular|tabulated|chart|list|output|info|information"
+)
 _PREVIOUS_RESULT_RE = re.compile(
     r"\b(last|previous|prior|earlier|that|this|preceding|above)\b.{0,20}"
-    r"\b(result|results|answer|response|summary|data|table|tables|tabular|tabulated|chart|list|output|info|information)\b",
+    r"\b(result|results|answer|response|summary|data|table|tables|tabular|tabulated|chart|list|output|info|information)\b"
+    rf"(?=(?:\s+(?:{_PREVIOUS_RESULT_FOLLOW_WORDS})\b|[?.!,;:\s]*$))",
     re.IGNORECASE,
 )
 
@@ -910,15 +918,16 @@ def _effective_chat_k(question: str) -> int:
 # Matches only an EXPLICIT request for a chart/graph/plot/visualization/table,
 # so ranked-list and numeric-comparison questions that do NOT mention a visual
 # view get plain prose instead of an automatic chart (see CHAT_PROMPT). 'share'
-# is a request verb ('share this deals in table format'); the 'in table format'
-# branch needs no article and accepts a format/form/view suffix, covering both
-# singular and plural ('in tables', 'in tabular format'). Bare nouns alone do
-# NOT count — a table view still needs a verb or as/in/into context.
+# is a request verb ('share this deals in table format'). The table family needs
+# a verb or as/in/into context with an article or format/form/view suffix: bare
+# 'in table' is a common-noun phrase ('in table tennis'), not a view request,
+# while 'as a table' and 'in tabular format' are.
 _CHART_INTENT_RE = re.compile(
     r"\b(charts?|graphs?|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
     r"|(?:show|draw|make|create|give|build|plot|share|present|display|convert)\s+(?:me\s+)?(?:a\s+|the\s+)?"
     r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|tables?|tabular|tabulated)\b"
-    r"|\b(?:as|in|into)\s+(?:a\s+|an\s+|the\s+)?(?:tabular\s+)?(?:chart|graph|plot|tables?|tabular|tabulated)\b(?:\s+(?:format|form|view)\b)?"
+    r"|\b(?:as|in|into)\s+(?:a\s+|an\s+|the\s+)?(?:chart|graph|plot)\b(?:\s+(?:format|form|view)\b)?"
+    r"|\b(?:as|in|into)\s+(?:(?:a|an|the)\s+(?:tabular\s+)?(?:tables?|tabular|tabulated)\b|(?:tabular\s+)?(?:tables?|tabular|tabulated)\b\s+(?:format|form|view)\b)"
     r"|\b(?:chart|graph|plot|tables?|tabular|tabulated)\s+(?:it|this|these|them|that|out)\b",
     re.IGNORECASE,
 )
