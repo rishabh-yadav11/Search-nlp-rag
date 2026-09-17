@@ -649,7 +649,8 @@ _VAGUE_WORDS = frozenset((
     "now", "again", "also", "then", "next", "about", "further", "more",
     "elaborate", "explain", "detail", "details", "why", "what", "how",
     "make", "create", "show", "draw", "give", "build", "plot", "display",
-    "present", "convert", "format", "chart", "table", "graph", "pie", "bar",
+    "present", "convert", "format", "formats", "chart", "table", "tabular",
+    "tabulated", "graph", "pie", "bar",
     "line", "column", "area", "pictogram", "pictograph", "diagram", "visual",
     "visualize", "visualise", "visualization", "visualisation",
     "share", "result", "results", "data", "answer", "summary", "list",
@@ -658,10 +659,13 @@ _VAGUE_WORDS = frozenset((
 ))
 
 # Phrases that explicitly point back at a prior assistant turn rather than naming
-# a topic: 'share the last result', 'show that data', 'give the previous answer'.
+# a topic: 'share the last result', 'show that data', 'give the previous answer',
+# 'share this deals in tabular format'. The second slot includes format nouns
+# (table/tabular/format) and the generic 'deal(s)' so an anaphoric 'this deals'
+# counts as a reference to the prior result, not a new retrieval topic.
 _PREVIOUS_RESULT_RE = re.compile(
     r"\b(last|previous|prior|earlier|that|this|preceding|above)\b.{0,20}"
-    r"\b(result|results|answer|response|summary|data|table|chart|list|output|info|information)\b",
+    r"\b(result|results|answer|response|summary|data|table|tabular|tabulated|format|formats|deal|deals|chart|list|output|info|information)\b",
     re.IGNORECASE,
 )
 
@@ -905,13 +909,16 @@ def _effective_chat_k(question: str) -> int:
 
 # Matches only an EXPLICIT request for a chart/graph/plot/visualization/table,
 # so ranked-list and numeric-comparison questions that do NOT mention a visual
-# view get plain prose instead of an automatic chart (see CHAT_PROMPT).
+# view get plain prose instead of an automatic chart (see CHAT_PROMPT). 'share'
+# is a request verb ('share this deals in table format'), bare 'table'/'tabular'
+# counts as an explicit view, and the 'in table format' branch needs no article
+# and accepts a format/form/view suffix ('in tabular format').
 _CHART_INTENT_RE = re.compile(
-    r"\b(charts?|graphs?|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
-    r"|(?:show|draw|make|create|give|build|plot)\s+(?:me\s+)?(?:a\s+|the\s+)?"
-    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|table)\b"
-    r"|\b(?:as|in|into)\s+a\s+(?:chart|graph|plot|table)\b"
-    r"|\b(?:chart|graph|plot)\s+(?:it|this|these|them|that|out)\b",
+    r"\b(charts?|graphs?|tables?|tabular|tabulated|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
+    r"|(?:show|draw|make|create|give|build|plot|share|present|display|convert)\s+(?:me\s+)?(?:a\s+|the\s+)?"
+    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|table|tabular)\b"
+    r"|\b(?:as|in|into)\s+(?:a\s+|an\s+|the\s+)?(?:tabular\s+)?(?:chart|graph|plot|table|tabular)\b(?:\s+(?:format|form|view)\b)?"
+    r"|\b(?:chart|graph|plot|table|tabular)\s+(?:it|this|these|them|that|out)\b",
     re.IGNORECASE,
 )
 
