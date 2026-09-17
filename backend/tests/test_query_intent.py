@@ -410,6 +410,10 @@ def test_chart_filler_not_stripped_from_real_topic_words():
     """'table' as a real topic word (not part of a chart request) must survive."""
     assert extract_list_topic("top table manufacturing deals in 2025") == "table manufacturing deals"
     assert range_query_topic("top table games funding") is None
+    # The 'table tennis' collocation is a topic, not a view request: the table
+    # noun must survive stripping so retrieval keeps the full topic.
+    assert query_intent._strip_chart_filler("share table tennis news") == "share table tennis news"
+    assert not query_intent._is_chart_request("share table tennis news")
 
 
 def _freeze_utc(monkeypatch, when: dt.datetime) -> None:

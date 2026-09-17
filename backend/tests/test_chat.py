@@ -743,6 +743,9 @@ def test_is_vague_followup_treats_prior_result_reference_as_vague():
     # A new predication on the noun is a standalone topic, not a reference.
     assert _is_vague_followup("this table shows Q3 deals") is False
     assert _is_vague_followup("this week deals in fintech") is False
+    # Trailing politeness does not make a reference topical.
+    assert _is_vague_followup("share the last result thanks") is True
+    assert _is_vague_followup("share the last result, thanks") is True
 
 
 def test_previous_user_question_skips_chained_vague_followups():
@@ -1054,6 +1057,8 @@ def test_chart_intent_regex():
         assert chat_module._CHART_INTENT_RE.search(q), q
     # Bare 'in table' is a common-noun phrase, not a view request.
     assert not chat_module._CHART_INTENT_RE.search("in table tennis"), "in table tennis"
+    assert not chat_module._CHART_INTENT_RE.search("present table tennis scores")
+    assert not chat_module._CHART_INTENT_RE.search("in the plot of the story")
     for q in [
         "top 5 deals in 2025",
         "top 10 ipo deals in 2025",
