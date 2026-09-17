@@ -660,12 +660,12 @@ _VAGUE_WORDS = frozenset((
 
 # Phrases that explicitly point back at a prior assistant turn rather than naming
 # a topic: 'share the last result', 'show that data', 'give the previous answer',
-# 'share this deals in tabular format'. The second slot includes format nouns
-# (table/tabular/format) and the generic 'deal(s)' so an anaphoric 'this deals'
-# counts as a reference to the prior result, not a new retrieval topic.
+# 'share this deals in tabular format' (matched via the tabular/table noun, not
+# via 'deals' — generic topic nouns stay out so 'this week's deals in fintech'
+# keeps its own topic).
 _PREVIOUS_RESULT_RE = re.compile(
     r"\b(last|previous|prior|earlier|that|this|preceding|above)\b.{0,20}"
-    r"\b(result|results|answer|response|summary|data|table|tabular|tabulated|format|formats|deal|deals|chart|list|output|info|information)\b",
+    r"\b(result|results|answer|response|summary|data|table|tabular|tabulated|chart|list|output|info|information)\b",
     re.IGNORECASE,
 )
 
