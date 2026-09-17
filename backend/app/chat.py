@@ -654,6 +654,7 @@ _VAGUE_WORDS = frozenset((
     "line", "column", "area", "pictogram", "pictograph", "diagram", "visual",
     "visualize", "visualise", "visualization", "visualisation",
     "share", "result", "results", "data", "answer", "summary", "list",
+    "thanks", "thank", "thx", "kindly",
     "last", "previous", "prior", "earlier", "above", "below", "following",
     "shown", "provided", "generated", "mentioned", "said", "gave",
 ))
@@ -925,9 +926,9 @@ def _effective_chat_k(question: str) -> int:
 _CHART_INTENT_RE = re.compile(
     r"\b(charts?|graphs?|pictogram|pictograph|diagram|visuali[sz]e|visuali[sz]ation|visual)\b"
     r"|(?:show|draw|make|create|give|build|plot|share|present|display|convert)\s+(?:me\s+)?(?:a\s+|the\s+)?"
-    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|tables?|tabular|tabulated)\b"
-    r"|\b(?:as|in|into)\s+(?:a\s+|an\s+|the\s+)?(?:chart|graph|plot)\b(?:\s+(?:format|form|view)\b)?"
-    r"|\b(?:as|in|into)\s+(?:(?:a|an|the)\s+(?:tabular\s+)?(?:tables?|tabular|tabulated)\b|(?:tabular\s+)?(?:tables?|tabular|tabulated)\b\s+(?:format|form|view)\b)"
+    r"(?:bar|line|pie|column|area)?\s*(?:chart|graph|plot|tables?(?! tennis\b)|tabular|tabulated)\b"
+    r"|\b(?:as|in|into)\s+a\s+(?:chart|graph|plot)\b(?:\s+(?:format|form|view)\b)?"
+    r"|\b(?:as|in|into)\s+(?:(?:a|an|the)\s+(?:tabular\s+)?(?:tables?(?! tennis\b)|tabular|tabulated)\b|(?:tabular\s+)?(?:tables?(?! tennis\b)|tabular|tabulated)\b\s+(?:format|form|view)\b)"
     r"|\b(?:chart|graph|plot|tables?|tabular|tabulated)\s+(?:it|this|these|them|that|out)\b",
     re.IGNORECASE,
 )
