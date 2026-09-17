@@ -740,6 +740,9 @@ def test_is_vague_followup_treats_prior_result_reference_as_vague():
     # A real topic must NOT be swallowed as vague.
     assert _is_vague_followup("m&a deals in 2025") is False
     assert _is_vague_followup("make a table of top 15 deals in 2024-25") is False
+    # A new predication on the noun is a standalone topic, not a reference.
+    assert _is_vague_followup("this table shows Q3 deals") is False
+    assert _is_vague_followup("this week deals in fintech") is False
 
 
 def test_previous_user_question_skips_chained_vague_followups():
@@ -1049,6 +1052,8 @@ def test_chart_intent_regex():
         "in tabular format",
     ]:
         assert chat_module._CHART_INTENT_RE.search(q), q
+    # Bare 'in table' is a common-noun phrase, not a view request.
+    assert not chat_module._CHART_INTENT_RE.search("in table tennis"), "in table tennis"
     for q in [
         "top 5 deals in 2025",
         "top 10 ipo deals in 2025",
