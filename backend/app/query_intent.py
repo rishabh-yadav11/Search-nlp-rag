@@ -202,17 +202,24 @@ _REV_EVENT_YEAR_RE = re.compile(
 # requested OUTPUT format, not the topic, so they must be stripped from the
 # retrieval/rerank query or the embedding match is diluted ('make a table of
 # top 15 deals' would otherwise retrieve on 'make a table' instead of 'deals').
-_CHART_VERB = r"(?:show|draw|make|create|give|build|plot|display|present)"
+# Table nouns exclude the 'table tennis' collocation (a topic, not a view
+# request) and need an article or format/form/view suffix in trailing position:
+# bare 'in table' is a common-noun phrase, not a view request.
+_CHART_VERB = r"(?:show|draw|make|create|give|build|plot|display|present|share|convert)"
 _CHART_TYPE = r"(?:bar|line|pie|column|area|pictogram|pictograph)?\s*"
-_CHART_NOUN = r"(?:chart|graph|plot|diagram|table|pictogram|pictograph)"
+_CHART_NOUN = r"(?:chart|graph|plot|diagram|pictogram|pictograph)"
+_CHART_TABLE_NOUN = r"(?:tables?(?! tennis\b)|tabular|tabulated)"
 _CHART_LEAD_RE = re.compile(
     rf"\b(?:{_CHART_VERB})\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?"
-    rf"{_CHART_TYPE}{_CHART_NOUN}\b(?:\s+(?:of|for|on|about|regarding)\b)?",
+    rf"(?:{_CHART_TYPE}(?:{_CHART_NOUN}|{_CHART_TABLE_NOUN})\b)"
+    rf"(?:\s+(?:of|for|on|about|regarding)\b)?",
     re.IGNORECASE,
 )
 _CHART_TRAIL_RE = re.compile(
     rf"\b(?:as|in|into|using)\s+(?:a\s+|an\s+|the\s+)?"
-    rf"{_CHART_TYPE}{_CHART_NOUN}\b(?:\s+form\b)?",
+    rf"{_CHART_TYPE}{_CHART_NOUN}\b(?:\s+(?:form|format|view)\b)?"
+    rf"|\b(?:as|in|into|using)\s+(?:(?:a|an|the)\s+(?:tabular\s+)?{_CHART_TABLE_NOUN}\b"
+    rf"|(?:tabular\s+)?{_CHART_TABLE_NOUN}\b\s+(?:form|format|view)\b)",
     re.IGNORECASE,
 )
 
