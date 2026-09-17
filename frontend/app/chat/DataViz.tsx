@@ -2,11 +2,12 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  type ColumnDef,
+  createPaginatedRowModel,
   flexRender,
-  getCoreRowModel,
-  getPaginationRowModel,
-  useReactTable,
+  rowPaginationFeature,
+  tableFeatures,
+  type ColumnDef,
+  useTable,
 } from '@tanstack/react-table'
 import {
   Bar,
@@ -329,8 +330,13 @@ const TABLE_PAGE_SIZE = 25
 const TABLE_PAGINATE_AT = 50
 const PIE_LABEL_MIN_PCT = 5
 
+const vizFeatures = tableFeatures({
+  rowPaginationFeature,
+  paginatedRowModel: createPaginatedRowModel(),
+})
+
 function TableView({ block }: { block: DataVizBlock }) {
-  const columns = useMemo<ColumnDef<(string | number)[], unknown>[]>(() =>
+  const columns = useMemo<ColumnDef<typeof vizFeatures, (string | number)[], unknown>[]>(() =>
     block.columns.map((col, ci) => ({
       accessorKey: String(ci),
       header: col,
@@ -347,12 +353,11 @@ function TableView({ block }: { block: DataVizBlock }) {
     [block],
   )
 
-  const table = useReactTable({
+  const table = useTable({
+    features: vizFeatures,
     data: block.rows,
     columns,
-    getCoreRowModel: getCoreRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    initialState: { pagination: { pageSize: TABLE_PAGE_SIZE } },
+    initialState: { pagination: { pageIndex: 0, pageSize: TABLE_PAGE_SIZE } },
   })
 
   const hasControls = block.rows.length > TABLE_PAGINATE_AT
@@ -372,7 +377,7 @@ function TableView({ block }: { block: DataVizBlock }) {
         <tbody>
           {table.getRowModel().rows.map((row) => (
             <tr key={row.id}>
-              {row.getVisibleCells().map((cell) => (
+              {row.getAllCells().map((cell) => (
                 <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
               ))}
             </tr>
@@ -391,7 +396,7 @@ function TableView({ block }: { block: DataVizBlock }) {
             ‹ Prev
           </button>
           <span className="chat-viz-table-nav-page" aria-live="polite">
-            Page {table.getState().pagination.pageIndex + 1} of {table.getPageCount()}
+            Page {table.state.pagination.pageIndex + 1} of {table.getPageCount()}
           </span>
           <button
             type="button"
