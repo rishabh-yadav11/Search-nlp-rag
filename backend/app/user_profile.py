@@ -12,6 +12,7 @@ import json
 import logging
 import math
 from datetime import UTC, datetime, timedelta
+
 import redis.asyncio as aioredis
 
 from app.config import config
@@ -131,7 +132,7 @@ async def get_user_profile_vector(user_id: str) -> list[float] | None:
             raw_vector = raw_vector.decode("utf-8")
         values = json.loads(raw_vector)
         if not isinstance(values, list):
-            raise ValueError("profile vector is not a JSON array")
+            raise TypeError("profile vector is not a JSON array")
         vector = [float(value) for value in values]
         if not vector or not all(math.isfinite(value) for value in vector):
             raise ValueError("profile vector contains invalid values")
