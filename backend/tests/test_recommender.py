@@ -8,9 +8,9 @@ import json
 import math
 import sys
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
 
 
 class TestCalculateRecencyScore:
@@ -136,6 +136,7 @@ class TestRecommenderConfig:
             with patch.dict('os.environ', {'ENABLE_RECOMMENDATIONS': 'false'}):
                 # Re-import to pick up new env
                 import importlib
+
                 import app.config as config_module
                 importlib.reload(config_module)
                 assert config_module.config.ENABLE_RECOMMENDATIONS is False
