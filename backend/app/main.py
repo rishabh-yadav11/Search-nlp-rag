@@ -1163,6 +1163,11 @@ async def search(
                           latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
 
+# Appended to a body excerpt the char cap cut short, so the model can tell the
+# text stops here because of the cap rather than because the article ended.
+BODY_TRUNCATION_NOTE = "\n[... body truncated ...]"
+
+
 def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) -> str:
     """Packs an article's metadata + summary + body into a numbered
     context block for the chat LLM prompt. The body excerpt is capped by
@@ -1183,7 +1188,10 @@ def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) ->
         # (even 0, meaning "no body"), and only when it is None do we fall back
         # to the configured default. Negative values are clamped to 0.
         limit = config.CHAT_BODY_CHAR_LIMIT if body_limit is None else max(0, int(body_limit))
-        parts.append(s.body[: min(limit, len(s.body))])
+        if limit and len(s.body) > limit:
+            parts.append(s.body[:limit] + BODY_TRUNCATION_NOTE)
+        elif limit:
+            parts.append(s.body)
     return "\n".join(parts)
 
 
