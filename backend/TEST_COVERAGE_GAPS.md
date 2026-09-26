@@ -177,20 +177,41 @@ degraded path).
 
 ---
 
-## app/cost_budget.py — 100% (covered by tests/test_cost_budget.py)
+## app/cost_budget.py — 100% (covered by tests/test_cost_budget.py + tests/test_budget_lua.py)
 
-- [x] **`close` resets `_redis`** (lines 48-50): `aclose` called, global set to
-      `None`; `close` no-op when no client.
-- [x] **`spend_today` Redis failure → 0.0** (lines 61-63): fail-open on read,
-      warn once, return `0.0`. **ERROR PATH — Redis down.**
-- [x] **`spend_today` counter read** (line 60): non-empty counter parsed to
-      float; `get` → None → `0.0`.
-- [x] **`record_cost` failure** (lines 87-88): skip recording, warn once, no
-      raise. **ERROR PATH — Redis down.**
-- [x] **`assert_within_budget` over-cap** (lines 75-76): confirmed spend ≥ cap
-      → `BudgetExceeded`; under-cap allowed; Redis-down never blocks.
-- [x] **`_client` lazy init + `_base_url`** (lines 29-43): `from_url` once,
-      DB index swapped to `ANALYTICS_REDIS_DB`, connection reused.
+The cap is RESERVE / SETTLE / RELEASE around every billed call; the whole
+read-modify-write lives in one Lua script (`_BUDGET_LUA`) over four keys
+(day counter, live holds, holds expiry zset, holds-accounted ledger). The
+Python side is covered against `FakeBudgetStore`, a model of that contract;
+the shipped script itself is EXECUTED by `tests/test_budget_lua.py` under
+`lua5.1` (skipped where lua5.1 is absent), so the two cannot drift apart
+without a failure.
+
+- [x] **`reserve` hold + rejection** (lines 335-364): hold written and counted
+      against the cap for the next caller; a rejected reserve leaves no hold
+      behind; cap disabled (`LLM_DAILY_BUDGET_USD <= 0`) touches no store;
+      hold floored at 1 micro-USD so a zero `LLM_CALL_RESERVE_USD` cannot turn
+      the cap into a no-op; first `BudgetExceeded` logs one warning.
+- [x] **`reserve` store down → `BudgetUnavailable`** (lines 308-332): fails
+      closed, is not a `BudgetExceeded`, and drops the cached script handle.
+      **ERROR PATH — Redis down.**
+- [x] **`settle` counter write** (lines 367-389): actual cost recorded whole
+      (hold was never counted), over-reserve recorded and blocking the next
+      call, zero-cost settle records nothing, empty id list still bills,
+      store-down leaves the holds in place. **ERROR PATH — Redis down.**
+- [x] **`settle` idempotency + crash promotion** (Lua sweep/settle arithmetic):
+      settling the same ids twice charges once, duplicate ids within one call
+      charge once, a hold that lapsed is CHARGED to the counter (a crash is
+      not free spend) and its later settle REPLACES the estimate with the real
+      cost rather than adding to it.
+- [x] **`release` drops holds, never refunds** (lines 392-397): live hold
+      dropped with the counter untouched, a promoted (already charged) id not
+      refunded, store-down surfaces. **ERROR PATH — Redis down.**
+- [x] **`_client` lazy init + reuse**: `from_url` once, DB index swapped to
+      `ANALYTICS_REDIS_DB`, connection reused; `close` calls `aclose`, clears
+      the global, and is a no-op when no client.
+- [x] **`to_usd` canonical unit**: INR `LLMResult.cost()` → USD before any
+      accounting; 1.0 fallback rate on a nonsensical configured rate.
 
 ---
 
@@ -309,9 +330,11 @@ degraded path).
       new dates; `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources
       short-circuit; weak fallback answer + note. **ERROR PATH — LLM/Qdrant/
       Redis down during retrieval.**
-- [x] **`_run_turn` cost recording + finalize** (lines 917-920): budget check →
-      `_answer_ranked` → `record_cost(result.cost())` → finalized answer
-      (unrequested dataviz blocks stripped).
+- [x] **`_run_turn` cost recording + finalize** (lines 1478-1490): `reserve`
+      before the billed call → `_answer_ranked` →
+      `settle(holds, to_usd(result.cost()))` (the turn's single counter write;
+      `release(holds)` when no call was made) → finalized answer (unrequested
+      dataviz blocks stripped).
 - [x] **`send_message` `BudgetExceeded` → 429** (lines 1091-1095) and
       **`LLMUnavailableError` → 503** (lines 1096-1100). **ERROR PATH — LLM
       retry exhaustion / daily budget.**
