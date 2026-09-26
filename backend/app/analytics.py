@@ -24,6 +24,12 @@ logger = logging.getLogger("analytics")
 CLICK_POSITION_MIN = 1
 CLICK_POSITION_MAX = 10
 
+# Window sizes for the two "top N" lists in ``summary()``. Redis ``zrevrange``
+# takes an INCLUSIVE end index, so each is read as ``0, N - 1`` at the call site
+# (writing a bare ``0, N`` would silently return N + 1 items).
+TOP_QUERIES_N = 20
+TOP_CLICKED_QUERIES_N = 10
+
 # Sorted-set reads are paginated in batches of this size when we need a true
 # sum of all member scores (the top-50 window otherwise undercounts).
 _ZSUM_BATCH = 200
@@ -261,11 +267,16 @@ async def summary() -> dict:
         ) = vals
         cached = await c.get("analytics:search:cached")
 
-        top_queries = await c.zrevrange("analytics:top_queries", 0, 19, withscores=True)
-        click_positions = await c.zrevrange("analytics:click_top_queries", 0, 9, withscores=True)
+        top_queries = await c.zrevrange("analytics:top_queries", 0, TOP_QUERIES_N - 1, withscores=True)
+        click_top_queries = await c.zrevrange(
+            "analytics:click_top_queries", 0, TOP_CLICKED_QUERIES_N - 1, withscores=True
+        )
 
-        pos_keys = [f"analytics:click:pos:{i}" for i in range(1, 11)]
-        pos_vals = await c.mget(pos_keys)
+        # Read exactly the buckets ``record_click`` can write. Derived from the
+        # same CLICK_POSITION_MIN/MAX the write path clamps to, so raising or
+        # lowering the bound cannot desynchronize recording from reporting.
+        positions = range(CLICK_POSITION_MIN, CLICK_POSITION_MAX + 1)
+        pos_vals = await c.mget([f"analytics:click:pos:{i}" for i in positions])
 
         total = _i(search_total)
         return {
@@ -278,8 +289,8 @@ async def summary() -> dict:
             "avg_latency_ms": round(_f(lat_sum) / _i(lat_count), 1) if _i(lat_count) else 0.0,
             "clicks_total": _i(click_total),
             "top_queries": [[q, _i(s)] for q, s in top_queries],
-            "click_positions": {str(i): _i(v) for i, v in zip(range(1, 11), pos_vals)},
-            "click_top_queries": [[q, _i(s)] for q, s in click_positions],
+            "click_positions": {str(i): _i(v) for i, v in zip(positions, pos_vals)},
+            "click_top_queries": [[q, _i(s)] for q, s in click_top_queries],
         }
     except Exception as exc:
         _degraded(exc)
