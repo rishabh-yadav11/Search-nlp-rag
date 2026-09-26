@@ -57,6 +57,13 @@ class Config:
     CHAT_MAX_SOURCES = int(os.getenv("CHAT_MAX_SOURCES", "20"))
     CHAT_TOTAL_BODY_CHARS = int(os.getenv("CHAT_TOTAL_BODY_CHARS", "400000"))
 
+    # Total characters of prior conversation replayed into the chat prompt.
+    # CHAT_MAX_HISTORY_TURNS bounds the turn COUNT but not their SIZE, and every
+    # replayed turn is untrusted text the model must read as data rather than
+    # instructions (#248), so the replay is also bounded by character budget,
+    # newest turns first. 12000 fits several full question/answer turns.
+    CHAT_HISTORY_CHAR_LIMIT = int(os.getenv("CHAT_HISTORY_CHAR_LIMIT", "12000"))
+
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch
     # must fit in RAM (the pipeline's value is overlapping encode with upsert,
