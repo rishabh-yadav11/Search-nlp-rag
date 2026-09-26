@@ -167,11 +167,21 @@ _QUARTER_WORD_RE = re.compile(
 
 # Fiscal-year references: 'FY25', 'FY 25', "FY'25", 'FY2024-25', 'FY 2024 to 2025',
 # 'fiscal year 2025'. An Indian FY ending in year N spans Apr (N-1) to Mar N.
+# The groups are NAMED so `_fiscal_range` can pick whichever alternative
+# matched by name; this one grammar is shared with `_strip_time_tokens`, so a
+# syntax change cannot drift between resolving a range and stripping the token.
+# The last branch takes `\s*`, so the fused 'fiscal2020' spelling is a fiscal
+# year here too. That spelling used to be recognised ONLY by `_fiscal_range`
+# (whose private copy read `\bfiscal(?:\s+year)?\s*`) while this regex required
+# whitespace, so the date filter fired while the token survived into the
+# retrieval query. Resolving and stripping now share the permissive form, so
+# the token is removed like every other fiscal spelling; the alternative
+# (`\s+`) would instead have silently dropped the resolved range.
 _FY_RE = re.compile(
-    r"\bfy\s*((?:19|20)?\d{2})\s*(?:-|to|through)\s*((?:19|20)?\d{2})\b"
-    r"|\bfy\s*'?((?:19|20)?\d{2})\b"
-    r"|\bfiscal\s+year\s*((?:19|20)?\d{2})\b"
-    r"|\bfiscal\s+((?:19|20)?\d{2})\b",
+    r"\bfy\s*(?P<fy_range_start>(?:19|20)?\d{2})\s*(?:-|to|through)\s*(?P<fy_range_end>(?:19|20)?\d{2})\b"
+    r"|\bfy\s*'?(?P<fy_single>(?:19|20)?\d{2})\b"
+    r"|\bfiscal\s+year\s*(?P<fiscal_year>(?:19|20)?\d{2})\b"
+    r"|\bfiscal\s*(?P<fiscal_bare>(?:19|20)?\d{2})\b",
     re.IGNORECASE,
 )
 
@@ -384,12 +394,16 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
     """(from_date, to_date) for a fiscal-year reference ('FY25', 'FY 2024-25',
     'fiscal year 2025'), or None. FY ending in year N spans Apr (N-1) to Mar N."""
     q = query.lower()
-    m = re.search(
-        r"\bfy\s*((?:19|20)?\d{2})\s*(?:-|to|through)\s*((?:19|20)?\d{2})\b", q
-    )
-    if m:
-        y1 = _full_year(int(m.group(1)), _current_year())
-        y2 = _full_year(int(m.group(2)), y1)
+    # One grammar (`_FY_RE`, also used by `_strip_time_tokens`) in three
+    # priority tiers: an explicit span, then a bare 'fy N', then
+    # 'fiscal year N'/'fiscal N'. A tier wins wherever it appears, so the
+    # matches are scanned in full rather than taking the leftmost one --
+    # otherwise 'fiscal 2025 and fy 2020-2021' would resolve 2025.
+    matches = list(_FY_RE.finditer(q))
+    span = next((m for m in matches if m.group("fy_range_start")), None)
+    if span:
+        y1 = _full_year(int(span.group("fy_range_start")), _current_year())
+        y2 = _full_year(int(span.group("fy_range_end")), y1)
         # An FY span lists the start and end years (e.g. 'FY 2024-25' ->
         # FY2024-2025). When written end-first ('fy 2025-24') the larger
         # number is still the ending year, so take min/max rather than a
@@ -408,13 +422,14 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
         if start == end:
             start = end - 1
         return (f"{start}-04-01", f"{end}-03-31")
-    m = re.search(r"\bfy\s*'?((?:19|20)?\d{2})\b", q)
-    if m:
-        end = _full_year(int(m.group(1)), _current_year())
+    single = next((m for m in matches if m.group("fy_single")), None)
+    if single:
+        end = _full_year(int(single.group("fy_single")), _current_year())
         return (f"{end - 1}-04-01", f"{end}-03-31")
-    m = re.search(r"\bfiscal(?:\s+year)?\s*((?:19|20)?\d{2})\b", q)
-    if m:
-        end = _full_year(int(m.group(1)), _current_year())
+    fiscal = next((m for m in matches if m.group("fiscal_year") or m.group("fiscal_bare")), None)
+    if fiscal:
+        year = fiscal.group("fiscal_year") or fiscal.group("fiscal_bare")
+        end = _full_year(int(year), _current_year())
         return (f"{end - 1}-04-01", f"{end}-03-31")
     return None
 

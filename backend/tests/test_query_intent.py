@@ -352,6 +352,47 @@ def test_extract_year_range_fiscal_single_and_consecutive_unchanged():
     assert extract_year_range("deals fy 2025-24") == ("2024-04-01", "2025-03-31")
 
 
+# `_fiscal_range` resolves a date range from the fiscal-year grammar while
+# `_strip_time_tokens` deletes the same tokens from the retrieval query. Both
+# read one compiled regex (`_FY_RE`, whose groups are named); these cases pin
+# the resolved range AND the stripped text, so the two halves of the grammar
+# cannot drift apart again. Expected values are the pre-refactor behaviour.
+_FY_CASES = (
+    # span forms
+    ("fy 2020-2021", ("2020-04-01", "2021-03-31"), " "),
+    ("fy 2020 to 2021", ("2020-04-01", "2021-03-31"), " "),
+    ("fy 2020 through 2021", ("2020-04-01", "2021-03-31"), " "),
+    # bare fiscal year, all three spellings
+    ("fy 2020", ("2019-04-01", "2020-03-31"), " "),
+    ("fiscal 2025", ("2024-04-01", "2025-03-31"), " "),
+    ("fiscal year 2025", ("2024-04-01", "2025-03-31"), " "),
+    ("deals in fiscal year 2025", ("2024-04-01", "2025-03-31"), "deals    "),
+    # no fiscal reference at all
+    ("latest startup deals", None, "latest startup deals"),
+    ("top 10 companies", None, "top 10 companies"),
+    # a span outranks a bare fiscal year even when the bare one comes first,
+    # and a bare 'fy' outranks 'fiscal' — tier order, not leftmost order
+    ("fiscal 2025 and fy 2020-2021", ("2020-04-01", "2021-03-31"), "  and  "),
+    ("fiscal 2025 plus fy 2020", ("2019-04-01", "2020-03-31"), "  plus  "),
+    ("fy 2020-2021 then fy 2022", ("2020-04-01", "2021-03-31"), "  then  "),
+    # the fused 'fiscal2020' spelling: `_fiscal_range` resolved it before the
+    # two grammars were unified, so the shared regex must keep resolving it —
+    # a regression to the stripping-only `\bfiscal\s+` form would drop the
+    # range here. Stripping it too is the deliberate convergence.
+    ("fiscal2020", ("2019-04-01", "2020-03-31"), " "),
+    ("deals in fiscal2020", ("2019-04-01", "2020-03-31"), "deals    "),
+)
+
+
+@pytest.mark.parametrize(("query", "expected_range", "expected_stripped"), _FY_CASES)
+def test_fiscal_range_and_stripping_share_one_grammar(query, expected_range, expected_stripped):
+    """Both halves of the fiscal-year grammar must agree, for every spelling."""
+    got_range = query_intent._fiscal_range(query)
+    assert got_range == expected_range, f"{query!r}: range {got_range!r} != {expected_range!r}"
+    got_stripped = query_intent._strip_time_tokens(query)
+    assert got_stripped == expected_stripped, f"{query!r}: stripped {got_stripped!r} != {expected_stripped!r}"
+
+
 def test_referenced_year_explicit_flashback_prefix():
     assert _referenced_year("flashback 2025 ipos") == 2025
     assert _referenced_year("what happened in flashback 2020") == 2020
