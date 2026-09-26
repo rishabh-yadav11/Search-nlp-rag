@@ -120,10 +120,25 @@ class Config:
     ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
+    # Byte budget for the in-process fallback cache (the HybridCache degrades to
+    # a per-worker LRU when Redis is unreachable). The entry cap alone cannot
+    # bound memory because the shared cache mixes small search-result payloads
+    # with large embedding vectors (768 floats as JSON, ~15KB each): a handful
+    # of vectors would otherwise consume the whole entry budget and thrash out
+    # the many small entries. Eviction therefore drops the largest entries first
+    # until the total is back under this budget.
+    CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", "33554432"))
     # TTL for cached query (dense+sparse) vectors, keyed by the embedding model
     # so a model change invalidates them automatically. Long is safe: the pair
     # for a given query string is deterministic and stable for a fixed index.
     VECTOR_CACHE_TTL_SECONDS = int(os.getenv("VECTOR_CACHE_TTL_SECONDS", "86400"))
+
+    # Readiness probe (/ready, /readyz). The result is cached for a few seconds
+    # so a load balancer polling every second does not pay for a full Qdrant +
+    # Redis probe on every hit, and each dependency is probed concurrently under
+    # its own explicit timeout so the worst case is one timeout, not their sum.
+    READY_CACHE_TTL_SECONDS = float(os.getenv("READY_CACHE_TTL_SECONDS", "5"))
+    READY_DEP_TIMEOUT_SECONDS = float(os.getenv("READY_DEP_TIMEOUT_SECONDS", "2.0"))
 
     # Recency-tempered ranking: scores are multiplied by
     # 1 - RECENCY_STRENGTH * (1 - exp(-age_days / RECENCY_DECAY_DAYS))
@@ -243,6 +258,17 @@ class Config:
     AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+    # Redis-backed per-IP rate limits on the public search surface: /search,
+    # /facets, /analytics/click and /ready were unauthenticated and unrated,
+    # which allowed full-corpus scraping (top_k=50) and click-analytics
+    # poisoning. 0 disables an individual limit. Unlike the auth limits these
+    # FAIL CLOSED (503) when Redis is unreachable: these endpoints are the
+    # abuse surface, so an unrated request is not an acceptable fallback.
+    PUBLIC_SEARCH_RATE_PER_MIN = int(os.getenv("PUBLIC_SEARCH_RATE_PER_MIN", "60"))
+    PUBLIC_FACETS_RATE_PER_MIN = int(os.getenv("PUBLIC_FACETS_RATE_PER_MIN", "60"))
+    PUBLIC_CLICK_RATE_PER_MIN = int(os.getenv("PUBLIC_CLICK_RATE_PER_MIN", "120"))
+    PUBLIC_READY_RATE_PER_MIN = int(os.getenv("PUBLIC_READY_RATE_PER_MIN", "60"))
+    PUBLIC_RATE_WINDOW_SECONDS = int(os.getenv("PUBLIC_RATE_WINDOW_SECONDS", "60"))
     # Only trust the client-supplied X-Forwarded-For header when this API is
     # deployed behind a known reverse proxy (e.g. nginx). Otherwise the real
     # socket peer is authoritative so a client cannot spoof its IP for

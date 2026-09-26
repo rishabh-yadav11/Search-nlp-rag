@@ -8,12 +8,115 @@ import pytest
 from fastapi.testclient import TestClient
 from qdrant_client.models import Filter
 
-from app import main
+from app import auth, main
+from app.config import config
 from app.main import SourceArticle, SourceSummary
+
+
+async def _noop_async(*args, **kwargs):
+    return None
+
+
 
 _client = TestClient(main.app, raise_server_exceptions=False)
 
 _MISS = object()
+
+
+@pytest.fixture(autouse=True)
+def _public_rate_limiter(monkeypatch):
+    """Install a working in-memory limiter store for the public endpoints.
+
+    /search, /facets and /analytics/click now fail CLOSED (503) when the
+    limiter's Redis is unreachable, so the tests that are about search wiring
+    rather than rate limiting get a counting stub instead of a real Redis. It is
+    rebuilt per test, so no counter leaks between cases.
+    """
+    counters: dict[str, int] = {}
+
+    class _FakeRateRedis:
+        async def set(self, key, value, nx=False, ex=None):
+            return True
+
+        async def incr(self, key):
+            counters[key] = counters.get(key, 0) + 1
+            return counters[key]
+
+    monkeypatch.setattr(auth, "_rate_client", _FakeRateRedis())
+
+    return counters
+
+
+def _cached_search_client(monkeypatch):
+    """Wire /search to a pure cache hit so the limiter is the only variable."""
+    monkeypatch.setattr(main, "cache", _FakeCache(get_result=[_summary_dict(1, 0.9)]))
+    monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
+    monkeypatch.setattr(main, "expand_query", lambda q: q)
+    monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
+
+    async def fake_record_search(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main, "record_search", fake_record_search)
+
+
+def test_search_over_the_limit_is_rejected_with_429(monkeypatch):
+    monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 2)
+    _cached_search_client(monkeypatch)
+
+    assert _client.get("/search", params={"q": "test"}).status_code == 200
+    assert _client.get("/search", params={"q": "test"}).status_code == 200
+    over = _client.get("/search", params={"q": "test"})
+
+    assert over.status_code == 429
+    assert over.headers["Retry-After"] == str(config.PUBLIC_RATE_WINDOW_SECONDS)
+
+
+def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
+    # Trust the proxy header so the two clients below resolve to different IPs,
+    # exactly as they do behind the nginx config in setup.sh.
+    monkeypatch.setattr(config, "AUTH_TRUST_X_FORWARDED_FOR", True)
+    monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
+    _cached_search_client(monkeypatch)
+    client_a = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "1.1.1.1"})
+    client_b = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "2.2.2.2"})
+
+    assert client_a.get("/search", params={"q": "test"}).status_code == 200
+    assert client_a.get("/search", params={"q": "test"}).status_code == 429
+    # A different client IP must still be served: its own first request.
+    assert client_b.get("/search", params={"q": "test"}).status_code == 200
+
+
+def test_search_fails_closed_with_503_when_the_limiter_store_is_down(monkeypatch):
+    """An unrated /search is the scraping vector the limit exists to close."""
+    _cached_search_client(monkeypatch)
+
+    class _BrokenRedis:
+        async def set(self, *args, **kwargs):
+            raise ConnectionError("redis down")
+
+        async def incr(self, *args, **kwargs):
+            raise ConnectionError("redis down")
+
+    monkeypatch.setattr(auth, "_rate_client", _BrokenRedis())
+    assert _client.get("/search", params={"q": "test"}).status_code == 503
+
+
+def test_facets_over_the_limit_is_rejected_with_429(monkeypatch):
+    monkeypatch.setattr(config, "PUBLIC_FACETS_RATE_PER_MIN", 1)
+    monkeypatch.setattr(main, "cache", _FakeCache(get_result={"industry": [], "dealtype": []}))
+
+    assert _client.get("/facets").status_code == 200
+    assert _client.get("/facets").status_code == 429
+
+
+def test_analytics_click_over_the_limit_is_rejected_with_429(monkeypatch):
+    monkeypatch.setattr(config, "PUBLIC_CLICK_RATE_PER_MIN", 1)
+    monkeypatch.setattr(main, "record_click", _noop_async)
+
+    assert _client.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 200
+    assert _client.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 429
 
 
 def _run(coro):
