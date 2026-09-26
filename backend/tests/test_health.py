@@ -102,6 +102,15 @@ def _reset_redis_client(monkeypatch):
     monkeypatch.setattr(health, "_redis_client", None)
 
 
+@pytest.fixture(autouse=True)
+def _reset_readiness_cache():
+    """The module-global readiness cache survives across tests, so a cached
+    report from one test would otherwise answer the next test's poll."""
+    health.reset_readiness_cache()
+    yield
+    health.reset_readiness_cache()
+
+
 @pytest.fixture
 def client():
     app = FastAPI()
@@ -757,3 +766,238 @@ def test_readyz_200_when_ready(client, monkeypatch):
 def test_readyz_503_when_not_ready(client, monkeypatch):
     monkeypatch.setattr(health, "_readiness_report", _async((False, {})))
     assert client.get("/readyz").status_code == 503
+
+
+def _raise_server_errors_client(client):
+    """A TestClient that reports an unhandled endpoint exception as a 500
+    response instead of re-raising it, so the two failure modes the readiness
+    endpoint must distinguish are compared by status code rather than by
+    whether the test itself blew up."""
+    tc = TestClient(client.app, raise_server_exceptions=False)
+    return tc
+
+
+def test_ready_503_when_dependency_down_and_200_when_all_up(client, monkeypatch):
+    """End-to-end status mapping through the real report builder: a failed
+    dependency is a 503 naming the failed check, everything healthy a 200."""
+    qdrant_up = {"ok": False}
+
+    async def qdrant_probe(state):
+        return qdrant_up["ok"]
+
+    monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
+    monkeypatch.setattr(health, "_redis_status", _async((True, "redis")))
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+
+    r = client.get("/ready")
+    assert r.status_code == 503
+    assert r.json()["ready"] is False
+    assert r.json()["checks"]["qdrant"] == {"ok": False}
+
+    qdrant_up["ok"] = True
+    health.reset_readiness_cache()
+    r = client.get("/ready")
+    assert r.status_code == 200
+    assert r.json()["ready"] is True
+    assert r.json()["checks"]["qdrant"] == {"ok": True}
+
+
+def test_ready_503_for_unexpected_qdrant_driver_error(client, monkeypatch):
+    """A driver error the probe never anticipated (here a RuntimeError, like a
+    grpc/httpx transport failure) is a dependency failure, so /ready reports
+    503 -- not the bodiless 500 a probe cannot tell apart from a server bug."""
+    from app import main as app_main
+
+    class DriverError(RuntimeError):
+        """Neither ``TimeoutError`` nor the qdrant ``ApiException``."""
+
+    class BrokenQdrant:
+        async def collection_exists(self, name):
+            raise DriverError("driver transport exploded")
+
+    monkeypatch.setitem(app_main.state, "qdrant", BrokenQdrant())
+    monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+
+    tc = _raise_server_errors_client(client)
+    try:
+        r = tc.get("/ready")
+    finally:
+        tc.close()
+    assert r.status_code == 503
+    assert r.json()["ready"] is False
+    assert r.json()["checks"]["qdrant"] == {"ok": False}
+
+
+def test_readyz_503_for_unexpected_qdrant_driver_error(client, monkeypatch):
+    """/readyz follows the same rule: an unexpected driver error is a degraded
+    dependency (503), not a server error (500)."""
+    from app import main as app_main
+
+    class BrokenQdrant:
+        async def collection_exists(self, name):
+            raise RuntimeError("driver transport exploded")
+
+    monkeypatch.setitem(app_main.state, "qdrant", BrokenQdrant())
+    monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+
+    tc = _raise_server_errors_client(client)
+    try:
+        r = tc.get("/readyz")
+    finally:
+        tc.close()
+    assert r.status_code == 503
+
+
+def test_ready_500_when_probe_machinery_raises(client, monkeypatch):
+    """The counterpart: an error that is not a dependency failure is a bug, and
+    a bug must not be dressed as an outage. A 503 here would pull healthy
+    nodes out of rotation, so both endpoints answer 500 with a body that says so.
+    """
+    async def broken_report(state):
+        raise RuntimeError("readiness report machinery is broken")
+
+    monkeypatch.setattr(health, "_readiness_report", broken_report)
+
+    tc = _raise_server_errors_client(client)
+    try:
+        r = tc.get("/ready")
+        z = tc.get("/readyz")
+    finally:
+        tc.close()
+    assert r.status_code == 500
+    body = r.json()
+    assert body["ready"] is False
+    assert body["checks"] == {}
+    assert body["error"] == "readiness probe failed"
+    assert z.status_code == 500
+    assert z.content == b""
+
+
+def test_ready_second_poll_inside_ttl_is_served_from_cache(client, monkeypatch):
+    """A poll inside READY_CACHE_TTL_SECONDS must not reach either dependency.
+    The probe call count is the assertion: two identical bodies would be
+    produced by two uncached probes too."""
+    calls = {"qdrant": 0, "redis": 0}
+
+    async def qdrant_probe(state):
+        calls["qdrant"] += 1
+        return True
+
+    async def redis_probe():
+        calls["redis"] += 1
+        return True, "redis"
+
+    monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
+    monkeypatch.setattr(health, "_redis_status", redis_probe)
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 30.0)
+
+    first = client.get("/ready")
+    second = client.get("/readyz")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == {"qdrant": 1, "redis": 1}
+
+    # The cache is resettable, so a forced reset re-probes rather than pinning
+    # a readiness verdict for the life of the process.
+    health.reset_readiness_cache()
+    assert client.get("/ready").status_code == 200
+    assert calls == {"qdrant": 2, "redis": 2}
+
+
+def test_ready_reprobes_once_the_cache_ttl_has_passed(client, monkeypatch):
+    """A zero TTL means the cache never answers, so consecutive polls re-probe:
+    the entry expires rather than latching forever."""
+    calls = {"qdrant": 0, "redis": 0}
+
+    async def qdrant_probe(state):
+        calls["qdrant"] += 1
+        return True
+
+    async def redis_probe():
+        calls["redis"] += 1
+        return True, "redis"
+
+    monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
+    monkeypatch.setattr(health, "_redis_status", redis_probe)
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 0.0)
+
+    assert client.get("/ready").status_code == 200
+    assert client.get("/ready").status_code == 200
+    assert calls == {"qdrant": 2, "redis": 2}
+
+
+def test_readiness_report_probes_dependencies_concurrently(monkeypatch):
+    """Both dependency probes are in flight at once. The event log is the
+    assertion: a sequential implementation records enter/exit twice over and
+    cannot satisfy "each probe started before the other finished"."""
+    events: list[str] = []
+
+    def recorder(name, result):
+        async def probe(*args):
+            events.append(f"enter:{name}")
+            await asyncio.sleep(0.05)
+            events.append(f"exit:{name}")
+            return result
+
+        return probe
+
+    monkeypatch.setattr(health, "_qdrant_ok", recorder("qdrant", True))
+    monkeypatch.setattr(health, "_redis_status", recorder("redis", (True, "memory")))
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(config, "READY_DEP_TIMEOUT_SECONDS", 5.0)
+
+    ready, report = _run(health._readiness_report({}))
+    assert ready is True
+    assert report["checks"]["qdrant"] == {"ok": True}
+    assert report["checks"]["redis"] == {"ok": True, "cache": "memory"}
+    assert events.index("enter:redis") < events.index("exit:qdrant")
+    assert events.index("enter:qdrant") < events.index("exit:redis")
+
+
+def test_readiness_report_probe_timeout_is_a_dependency_failure(monkeypatch):
+    """A probe that outlives READY_DEP_TIMEOUT_SECONDS is a dependency failure,
+    not a crash: it must resolve to the degraded value and let the report
+    answer 503 rather than raising out of the endpoint."""
+
+    async def never_returns(state):
+        await asyncio.sleep(30)
+        return True
+
+    async def never_returns_redis():
+        await asyncio.sleep(30)
+        return True, "redis"
+
+    monkeypatch.setattr(health, "_qdrant_ok", never_returns)
+    monkeypatch.setattr(health, "_redis_status", never_returns_redis)
+    monkeypatch.setattr(health, "_models_ok", lambda s: True)
+    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(config, "READY_DEP_TIMEOUT_SECONDS", 0.05)
+
+    ready, report = _run(health._readiness_report({}))
+    assert ready is False
+    assert report["checks"]["qdrant"] == {"ok": False}
+    assert report["checks"]["redis"] == {"ok": False, "cache": "degraded"}
+
+
+def test_readiness_report_surfaces_unexpected_probe_error(monkeypatch):
+    """A probe raising something other than a timeout is not laundered into a
+    dependency verdict: it propagates, which the endpoints turn into a 500."""
+
+    async def exploding_probe(state):
+        raise RuntimeError("probe machinery bug")
+
+    monkeypatch.setattr(health, "_qdrant_ok", exploding_probe)
+    monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
+
+    with pytest.raises(RuntimeError, match="probe machinery bug"):
+        _run(health._readiness_report({}))
