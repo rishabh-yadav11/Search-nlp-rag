@@ -1,13 +1,18 @@
 import asyncio
 import contextlib
+import logging
+import time
 
 import redis
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Response
 from fastapi.responses import JSONResponse
-from qdrant_client.http.exceptions import ApiException
 
+from app.auth import public_rate_limit
 from app.config import config
+
+logger = logging.getLogger("health")
+
 
 router = APIRouter()
 
@@ -106,14 +111,22 @@ async def live() -> dict[str, str]:
 
 
 async def _qdrant_ok(state: dict) -> bool:
-    """Qdrant client present and the collection check succeeds (bounded <3s)."""
+    """Qdrant client present and the collection check succeeds (bounded <3s).
+
+    Every client/driver failure -- the expected ``TimeoutError`` and
+    ``ApiException`` as much as an unexpected transport or driver error -- is a
+    readiness failure, not a crash. Letting one escape turned a Qdrant problem
+    into a bodiless 500, which a probe cannot distinguish from a server bug.
+    Only ``Exception`` is caught, so a cancellation still propagates.
+    """
     client = state.get("qdrant")
     if client is None:
         return False
     try:
         await asyncio.wait_for(client.collection_exists(config.QDRANT_COLLECTION), timeout=2.5)
         return True
-    except (TimeoutError, ApiException):
+    except Exception:
+        logger.warning("qdrant readiness probe failed", exc_info=True)
         return False
 
 
@@ -151,10 +164,63 @@ async def _redis_status() -> tuple[bool, str]:
     return True, "redis"
 
 
+# A load balancer that polls /ready every second would otherwise re-run both
+# dependency probes on every poll, so one slow dependency multiplies into
+# sustained probe load. The cached entry is plain data -- (deadline, ready,
+# report) with a time.monotonic() deadline -- never an event-loop-bound object,
+# so it stays valid across the per-test event loops the endpoint tests run in.
+_readiness_cache: tuple[float, bool, dict] | None = None
+
+
+def reset_readiness_cache() -> None:
+    """Drop the cached readiness report so the next poll re-probes."""
+    global _readiness_cache
+    _readiness_cache = None
+
+
+async def _cached_readiness_report(state: dict) -> tuple[bool, dict]:
+    """Readiness report reused for READY_CACHE_TTL_SECONDS; a hit touches
+    neither Qdrant nor Redis."""
+    global _readiness_cache
+    now = time.monotonic()
+    cached = _readiness_cache
+    if cached is not None and cached[0] > now:
+        return cached[1], cached[2]
+    ready, report = await _readiness_report(state)
+    _readiness_cache = (now + config.READY_CACHE_TTL_SECONDS, ready, report)
+    return ready, report
+
+
+async def _probe_bounded(name: str, coro, default):
+    """Run one dependency probe under its own explicit deadline.
+
+    Probes are launched together and bounded individually, so the worst case is
+    one timeout rather than the sum of both. A timeout is a dependency failure
+    and yields ``default``; any other exception is a defect in the probe
+    machinery, so it propagates and the endpoint answers 500 instead of
+    claiming a dependency is down.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=config.READY_DEP_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning("%s readiness probe timed out after %ss", name, config.READY_DEP_TIMEOUT_SECONDS)
+        return default
+
+
 async def _readiness_report(state: dict) -> tuple[bool, dict]:
-    qdrant_ok = await _qdrant_ok(state)
+    # Both dependency probes are launched together: the report costs one probe
+    # budget, not the sum of both. return_exceptions keeps a raising probe from
+    # orphaning the other one mid-flight; the first real error is re-raised.
+    qdrant_result, redis_result = await asyncio.gather(
+        _probe_bounded("qdrant", _qdrant_ok(state), False),
+        _probe_bounded("redis", _redis_status(), (False, "degraded")),
+        return_exceptions=True,
+    )
+    for result in (qdrant_result, redis_result):
+        if isinstance(result, BaseException):
+            raise result
+    qdrant_ok, (redis_ok, cache_mode) = qdrant_result, redis_result
     models_ok = _models_ok(state)
-    redis_ok, cache_mode = await _redis_status()
     llm_ok = _llm_ok()
     ready = qdrant_ok and models_ok
     report = {
@@ -169,17 +235,38 @@ async def _readiness_report(state: dict) -> tuple[bool, dict]:
     return ready, report
 
 
-@router.get("/ready")
+# fail_closed=False: /ready is polled by load balancers and orchestrators, and a
+# Redis outage is a degraded-but-serving state here (the HybridCache falls back
+# to an in-process cache). Failing this limiter closed would pull healthy nodes
+# out of rotation for a dependency the service does not need to be ready. It
+# still counts every poll and still answers 429; only a broken limiter store is
+# tolerated, which is what stops an unrouted slow-loris.
+@router.get(
+    "/ready",
+    dependencies=[Depends(public_rate_limit("ready", "PUBLIC_READY_RATE_PER_MIN", fail_closed=False))],
+)
 async def ready() -> JSONResponse:
     from app.main import state  # lazy: avoid circular import at startup
 
-    ready, report = await _readiness_report(state)
-    return JSONResponse(status_code=200 if ready else 503, content=report)
+    try:
+        ok, report = await _cached_readiness_report(state)
+    except Exception:
+        # A dependency that is down or timing out is reported as not-ready (503)
+        # inside _readiness_report. Anything escaping it is a defect in the
+        # probe machinery rather than an outage, so it must not be laundered
+        # into a 503 that would tell the load balancer to stop sending traffic.
+        logger.exception("readiness probe raised unexpectedly")
+        return JSONResponse(status_code=500, content={"ready": False, "checks": {}, "error": "readiness probe failed"})
+    return JSONResponse(status_code=200 if ok else 503, content=report)
 
 
 @router.get("/readyz")
 async def readyz() -> Response:
     from app.main import state  # lazy: avoid circular import at startup
 
-    ready, _ = await _readiness_report(state)
-    return Response(status_code=200 if ready else 503)
+    try:
+        ok, _ = await _cached_readiness_report(state)
+    except Exception:
+        logger.exception("readiness probe raised unexpectedly")
+        return Response(status_code=500)
+    return Response(status_code=200 if ok else 503)
