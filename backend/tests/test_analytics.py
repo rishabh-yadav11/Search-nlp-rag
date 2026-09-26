@@ -144,6 +144,92 @@ def test_summary_reads_aggregates(monkeypatch):
     assert s["clicks_total"] == 7
 
 
+# --- summary() read-path ranges are derived, not hardcoded ---
+
+
+class _SummaryRedis:
+    """Redis stand-in with real sorted sets, so summary()'s top-N windows and
+    click-position buckets are exercised for real (zrevrange end index is
+    INCLUSIVE, exactly as Redis treats it)."""
+
+    def __init__(self):
+        self.store: dict = {}
+        self.zsets: dict = {}
+        self.calls: list = []
+
+    async def mget(self, keys):
+        return [str(self.store[k]) if k in self.store else None for k in keys]
+
+    async def get(self, key):
+        return str(self.store[key]) if key in self.store else None
+
+    async def zrevrange(self, key, start, stop, withscores=False):
+        self.calls.append((key, start, stop))
+        items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: (-kv[1], kv[0]))
+        window = items[start:] if stop == -1 else items[start : stop + 1]
+        if withscores:
+            return list(window)
+        return [m for m, _ in window]
+
+
+def test_summary_click_positions_follow_click_position_max(monkeypatch):
+    """Raising CLICK_POSITION_MAX must widen the read path too: every bucket the
+    write path can record has to be reported back, not silently truncated."""
+    fake = _SummaryRedis()
+    for i in range(1, 26):
+        fake.store[f"analytics:click:pos:{i}"] = i
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics, "CLICK_POSITION_MAX", 20)
+
+    s = _run(analytics.summary())
+
+    assert list(s["click_positions"]) == [str(i) for i in range(1, 21)]
+    assert s["click_positions"]["20"] == 20
+    assert "21" not in s["click_positions"]
+
+
+def test_summary_click_positions_shrink_with_click_position_max(monkeypatch):
+    """The read path follows the bound in both directions (no stale buckets)."""
+    fake = _SummaryRedis()
+    for i in range(1, 26):
+        fake.store[f"analytics:click:pos:{i}"] = i
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics, "CLICK_POSITION_MAX", 4)
+
+    s = _run(analytics.summary())
+
+    assert list(s["click_positions"]) == ["1", "2", "3", "4"]
+
+
+def test_summary_default_click_positions_cover_one_to_ten(monkeypatch):
+    """At the shipped default the documented shape is unchanged: ascending 1..10."""
+    fake = _SummaryRedis()
+    for i in range(1, 31):
+        fake.store[f"analytics:click:pos:{i}"] = i
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    assert analytics.CLICK_POSITION_MAX == 10
+
+    s = _run(analytics.summary())
+
+    assert s["click_positions"] == {str(i): i for i in range(1, 11)}
+
+
+def test_summary_top_lists_window_sizes_are_exact(monkeypatch):
+    """Named top-N limits must yield exactly N members, not N or N+1, which is
+    what a mis-transcribed inclusive zrevrange end index would cause."""
+    fake = _SummaryRedis()
+    fake.zsets["analytics:top_queries"] = {f"q{i}": 100 - i for i in range(1, 31)}
+    fake.zsets["analytics:click_top_queries"] = {f"c{i}": 100 - i for i in range(1, 21)}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    s = _run(analytics.summary())
+
+    assert len(s["top_queries"]) == analytics.TOP_QUERIES_N == 20
+    assert [q for q, _ in s["top_queries"]] == [f"q{i}" for i in range(1, 21)]
+    assert len(s["click_top_queries"]) == analytics.TOP_CLICKED_QUERIES_N == 10
+    assert [q for q, _ in s["click_top_queries"]] == [f"c{i}" for i in range(1, 11)]
+
+
 def test_recording_never_raises_when_redis_down(monkeypatch):
     class _BrokenRedis:
         def pipeline(self):
