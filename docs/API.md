@@ -387,10 +387,12 @@ the `analytics:read` permission (`Authorization: Bearer <token>`).
 
 Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`).
 
-`click_positions` is keyed by result position from `1` to `CLICK_POSITION_MAX`
-(default `1`..`10`); a click recorded outside that range is clamped to the
-nearest bound, so every reported bucket is one the backend can record.
-`top_queries` returns at most 20 entries and `click_top_queries` at most 10.
+`click_positions` is keyed by result position from `CLICK_POSITION_MIN` to
+`CLICK_POSITION_MAX` (`1`..`10` in this codebase; both are constants in
+`backend/app/analytics.py`, not environment settings). A click recorded outside
+that range is clamped to the nearest bound, so every reported bucket is one the
+backend can record. `top_queries` returns at most `TOP_QUERIES_N` (20) entries
+and `click_top_queries` at most `TOP_CLICKED_QUERIES_N` (10).
 
 ---
 
