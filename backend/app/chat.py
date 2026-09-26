@@ -27,7 +27,14 @@ from pydantic import BaseModel
 
 from app.auth import require_auth, require_permission
 from app.config import config
-from app.cost_budget import BudgetExceeded, assert_within_budget, record_cost, to_usd
+from app.cost_budget import (
+    BudgetExceeded,
+    BudgetUnavailable,
+    release,
+    reserve,
+    settle,
+    to_usd,
+)
 from app.llm import LLMResult, LLMUnavailableError, generate_answer, stream_answer
 from app.query_intent import (
     MultiEntityQuery,
@@ -72,6 +79,7 @@ class MessageOut(BaseModel):
     completion_tokens: int = 0
     cost: float = 0.0
     latency_ms: float = 0.0
+    aborted: bool = False
 
 
 class SessionDetailOut(SessionOut):
@@ -139,7 +147,8 @@ class ChatStore:
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 cost REAL NOT NULL DEFAULT 0,
-                latency_ms REAL NOT NULL DEFAULT 0
+                latency_ms REAL NOT NULL DEFAULT 0,
+                aborted INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -158,6 +167,11 @@ class ChatStore:
             await self._db.execute("ALTER TABLE messages ADD COLUMN cost REAL NOT NULL DEFAULT 0")
         if "latency_ms" not in col_names:
             await self._db.execute("ALTER TABLE messages ADD COLUMN latency_ms REAL NOT NULL DEFAULT 0")
+        # Migration for databases created before the abort flag existed: a turn
+        # that ended because the client disconnected must stay visible in
+        # history (aborted=1) instead of the user message being silently erased.
+        if "aborted" not in col_names:
+            await self._db.execute("ALTER TABLE messages ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0")
         await self._db.commit()
 
     async def close(self) -> None:
@@ -254,7 +268,7 @@ class ChatStore:
             raise HTTPException(status_code=404, detail="conversation not found")
         rows = await self._require_db().execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted
             FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC
             """,
             (session_id,),
@@ -272,15 +286,16 @@ class ChatStore:
         completion_tokens: int = 0,
         cost: float = 0.0,
         latency_ms: float = 0.0,
+        aborted: bool = False,
     ) -> MessageOut:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
         db = self._require_db()
         ts = _now()
         cur = await db.execute(
-            "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms),
+            "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted)),
         )
         await db.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?",
@@ -297,6 +312,7 @@ class ChatStore:
             completion_tokens=completion_tokens,
             cost=cost,
             latency_ms=latency_ms,
+            aborted=aborted,
         )
 
     async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
@@ -340,7 +356,7 @@ class ChatStore:
         db = self._require_db()
         rows = await db.execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted
             FROM messages WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
             """,
             (session_id, max_turns * 2),
@@ -608,6 +624,7 @@ def _row_to_message(r) -> MessageOut:
         completion_tokens=int(r["completion_tokens"] or 0),
         cost=float(r["cost"] or 0.0),
         latency_ms=float(r["latency_ms"] or 0.0),
+        aborted=bool(r["aborted"] or 0),
     )
 
 
@@ -722,7 +739,42 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
     return None
 
 
-_DATAVIZ_FENCE_RE = re.compile(r"```dataviz\s*\n(.*?)\n?```\s*", re.DOTALL)
+# The ONE dataviz fence grammar, shared verbatim with the frontend renderer
+# (FENCE_SRC in frontend/app/chat/DataViz.tsx). The pattern is written in the
+# JavaScript regex form on purpose: under re.DOTALL the JS class [\s\S] is
+# exactly Python's ".", so the two grammars are provably identical instead of
+# merely similar — a fence the UI strips must never be left in the stored
+# answer, and vice versa (#255). Note the leading newline is OPTIONAL, matching
+# the frontend; the old backend pattern required one and so disagreed with the
+# UI on a fence written as ```dataviz{...}```. Group 1 is the JSON payload.
+DATAVIZ_FENCE_PATTERN = r"```dataviz[^\S\n]*\n?([\s\S]*?)\n?```\s*"
+_DATAVIZ_FENCE_RE = re.compile(DATAVIZ_FENCE_PATTERN, re.DOTALL)
+
+
+# The opening marker of a fence, without its closing ```. Any marker still
+# present AFTER the closed-fence pass is by definition the start of an unclosed
+# block (the model hit its token limit mid-fence, or the stream was cut), and
+# the raw JSON behind it would otherwise be rendered to the user as text. The
+# documented rule is to truncate from the marker to the end of the answer; the
+# frontend applies the identical rule in stripOpenFence.
+_OPEN_DATAVIZ_FENCE_RE = re.compile(r"```dataviz[^\S\n]*\n?")
+
+
+def _strip_unclosed_fence(text: str) -> str:
+    """Drop an UNCLOSED ``dataviz`` fence: everything from its opening marker to
+    the end of the text, so the raw JSON behind a fence the model never
+    finished never reaches the user.
+
+    A marker that falls INSIDE a closed fence is left alone: that block was
+    already accepted (or already dropped) by the closed-fence pass, and
+    truncating at its marker would delete a valid block the frontend renders.
+    Only a marker outside every closed-fence span is unclosed, so those spans
+    are located first and skipped."""
+    closed = [m.span() for m in _DATAVIZ_FENCE_RE.finditer(text)]
+    for m in _OPEN_DATAVIZ_FENCE_RE.finditer(text):
+        if not any(start <= m.start() < end for start, end in closed):
+            return text[: m.start()]
+    return text
 
 
 def _as_float(v: object) -> float | None:
@@ -833,17 +885,20 @@ def parse_dataviz(text: str) -> dict | None:
 
 
 def _sanitize_dataviz(text: str) -> str:
-    """Return ``text`` with any malformed ``dataviz`` fence removed.
+    """Return ``text`` with any malformed or unclosed ``dataviz`` fence removed.
 
     Valid blocks pass through untouched (the frontend renders them); malformed
-    JSON is stripped so users never see raw, unparseable blocks."""
+    JSON is stripped so users never see raw, unparseable blocks. The closed
+    fences are handled first, and any marker surviving that pass is an
+    UNCLOSED fence, so the rest of the answer is truncated away (#255) —
+    without this the raw JSON of a fence the model never finished was shown."""
     if not text or "```dataviz" not in text:
         return text
 
     def _keep(match: re.Match) -> str:
         return match.group(0) if parse_dataviz(match.group(0)) is not None else ""
 
-    return _DATAVIZ_FENCE_RE.sub(_keep, text)
+    return _strip_unclosed_fence(_DATAVIZ_FENCE_RE.sub(_keep, text))
 
 
 def _finalize_answer(text: str, question: str) -> str:
@@ -854,7 +909,8 @@ def _finalize_answer(text: str, question: str) -> str:
     removed (guarding against non-deterministic emission). When a chart IS
     requested, the block is pinned to the requested view and malformed fences
     are stripped. In both cases only malformed/uncapped fences are stripped; a
-    valid appended dataviz block (e.g. from a chart-intent nudge) is preserved."""
+    valid appended dataviz block (e.g. from a chart-intent nudge) is preserved.
+    An UNCLOSED fence is truncated to end-of-text on either path."""
     if _CHART_INTENT_RE.search(question):
         return _sanitize_dataviz(_apply_requested_view(text, question))
     if not text or "```dataviz" not in text:
@@ -863,15 +919,17 @@ def _finalize_answer(text: str, question: str) -> str:
     # block non-deterministically even without a chart ask, so strip every
     # fence (the chart-intent nudge only appends a block for explicit chart
     # requests, which take the branch above).
-    return _DATAVIZ_FENCE_RE.sub("", text).rstrip()
+    return _strip_unclosed_fence(_DATAVIZ_FENCE_RE.sub("", text)).rstrip()
 
 
 def _append_nudge(answer: str, nudge_content: str) -> str:
     """Merge a nudge retry into the already-streamed ``answer`` without ever
     overwriting it. The nudge's prose is always kept; when the nudge also carries
     a dataviz block, that structured block is appended alongside the prose (never
-    dropped, so a corrected list's explanatory text is preserved)."""
-    nudge_content = (nudge_content or "").strip()
+    dropped, so a corrected list's explanatory text is preserved). An UNCLOSED
+    fence in the nudge is dropped here rather than carried into the answer, so
+    the merged text obeys the same grammar the caller finalizes with."""
+    nudge_content = _strip_unclosed_fence((nudge_content or "").strip())
     if not nudge_content:
         return answer
     m = _DATAVIZ_FENCE_RE.search(nudge_content)
@@ -1040,34 +1098,44 @@ def _apply_requested_view(text: str, question: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_rewrite, text)
 
 
-async def _nudge_retry_allowed(spent_this_turn_inr: float = 0.0) -> bool:
+async def _nudge_retry_allowed(holds: list[str]) -> bool:
     """True when the daily LLM spend cap still permits one more nudge call.
 
-    The retry is a second (billed) call, so it re-checks the cap instead of
-    relying on the outer caller's single check. The re-check counts
-    ``spent_this_turn_inr`` (INR, as reported by ``LLMResult.cost()``): that
-    spend is already incurred but only reaches the Redis counter when the turn
-    ends, so reading the counter alone would pass even when this turn's first
-    call already used up the day's budget (#177). The pending figure is a
-    read-only input to the comparison — the end-of-turn ``record_cost`` remains
-    the sole write, so nothing is counted twice. Returns False instead of
-    raising, so a budget-stopped retry degrades to the answer already produced."""
+    The retry is a second (billed) call, so it takes its OWN hold against the
+    cap instead of trusting the outer caller's single check: the first call's
+    hold from this same turn is still outstanding, so the cap comparison
+    already counts this turn's in-flight spend. That closes the #177 hole
+    without a read-only "pending" estimate, which was a check-then-act race —
+    between the read and the billed call a concurrent turn could spend the
+    headroom this call then consumed. A hold also makes a rejected retry
+    impossible to start, rather than started and unreported.
+
+    The reservation is appended to ``holds`` so the turn's end-of-turn settle
+    records the real cost and drops the hold exactly once. Returns False
+    instead of raising, so a budget-stopped retry — or an unreachable counter,
+    which must not admit unbudgeted spend — degrades to the answer already
+    produced."""
     try:
-        await assert_within_budget(pending_usd=to_usd(spent_this_turn_inr))
+        hold = await reserve()
     except BudgetExceeded:
         logger.info("LLM daily budget reached; skipping nudge retry")
         return False
+    except BudgetUnavailable as exc:
+        logger.warning("daily cost counter unavailable; skipping nudge retry: %s", exc)
+        return False
+    if hold:
+        holds.append(hold)
     return True
 
 
-async def _answer_with_dataviz(question: str, prompt: str) -> LLMResult:
+async def _answer_with_dataviz(question: str, prompt: str, holds: list[str]) -> LLMResult:
     """Call the LLM once, nudging it to include a dataviz data block when the
     question explicitly asks for a chart/graph/plot/table and the model skipped
     the block. One extra call at most; token usage is summed. A failed nudge
     retry keeps the first answer instead of erroring the turn."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL)
     if parse_dataviz(result.content) is None and _CHART_INTENT_RE.search(question):
-        if not await _nudge_retry_allowed(result.cost()):
+        if not await _nudge_retry_allowed(holds):
             return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _dataviz_nudge(question), config.LLM_MODEL)
@@ -1115,17 +1183,17 @@ _RANKING_NUDGE = (
 )
 
 
-async def _answer_ranked(question: str, prompt: str) -> LLMResult:
+async def _answer_ranked(question: str, prompt: str, holds: list[str]) -> LLMResult:
     """Call the LLM for a chat answer, applying the dataviz nudge (when a chart
     was asked) and the ranking-refusal nudge (when a ranked list came back as a
     refusal). At most one extra call for each; a failed retry keeps the first
     answer instead of erroring the turn."""
-    result = await _answer_with_dataviz(question, prompt)
+    result = await _answer_with_dataviz(question, prompt, holds)
     if _is_ranking_question(question) and _is_ranking_refusal(result.content):
-        # The retry is a second billed call, so it re-checks the daily cap the
-        # same way the dataviz nudge does, counting this turn's spend (which
-        # only reaches the counter at the end of the turn).
-        if not await _nudge_retry_allowed(result.cost()):
+        # The retry is a second billed call, so it takes its own hold against
+        # the cap the same way the dataviz nudge does — and that hold counts
+        # this turn's already-incurred spend, which is not in the counter yet.
+        if not await _nudge_retry_allowed(holds):
             return result
         try:
             nudge = await generate_answer(state_llm(), prompt + _RANKING_NUDGE, config.LLM_MODEL)
@@ -1378,18 +1446,29 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
     Returns (answer, sources, note, prompt_tokens, completion_tokens, cost).
     Uses the shared retrieval pipeline from app.main; imported lazily to avoid a
     circular import with app.main. Raises BudgetExceeded when the daily LLM
-    spend cap is already exhausted."""
+    spend cap is already exhausted, and BudgetUnavailable when the spend
+    counter cannot be read — both are raised so the caller fails closed
+    instead of running an unbudgeted LLM call.
+
+    Every reservation this turn takes (the gate below plus any nudge retry) is
+    collected in ``holds`` and discharged exactly once: settled with the real
+    cost after a billed call, released when nothing was billed."""
     turn = await _prepare_turn(question, history)
     if not turn.needs_llm:
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
-    await assert_within_budget()
+    holds: list[str] = []
+    gate_hold = await reserve()
+    if gate_hold:
+        holds.append(gate_hold)
     try:
-        result = await _answer_ranked(question, turn.answer)
+        result = await _answer_ranked(question, turn.answer, holds)
     except LLMUnavailableError:
         # Retrieval succeeded (sources were gathered) but the LLM cannot be
         # reached: degrade to an honest fallback citing the retrieved sources
-        # instead of surfacing a raw 5xx. Nothing was billed, so no cost.
+        # instead of surfacing a raw 5xx. Nothing was billed, so the holds are
+        # released without recording anything.
+        await release(holds)
         return (
             _llm_unavailable_answer(question, turn.sources),
             turn.sources,
@@ -1398,14 +1477,18 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
             0,
             0.0,
         )
-    await record_cost(result.cost())
+    cost_usd = to_usd(result.cost())
+    # The turn's single counter write: it drops every hold and records what the
+    # turn actually cost, which may exceed the reserved estimates — already
+    # incurred spend is recorded, never silently dropped.
+    await settle(holds, cost_usd)
     return (
         _finalize_answer(result.content, question),
         turn.sources,
         turn.note,
         result.prompt_tokens,
         result.completion_tokens,
-        to_usd(result.cost()),
+        cost_usd,
     )
 
 
@@ -1553,10 +1636,38 @@ def _validate_question(body: MessageIn) -> str:
     return question
 
 
+def _trim_history(history: list[MessageOut], max_chars: int) -> list[MessageOut]:
+    """Keep the newest messages that fit inside ``max_chars`` in total.
+
+    CHAT_MAX_HISTORY_TURNS bounds the number of prior turns but says nothing
+    about their size, so a session of long answers could still build a
+    ~500K-character prompt (#255). This walks the history oldest-first and
+    drops the oldest messages until the total fits, never splitting a message
+    (a half-sentence of context is worse than none).
+
+    A single message larger than the cap is kept on its own: dropping it would
+    leave the prompt with no context at all, so the cap is a target rather
+    than a hard cut. ``max_chars <= 0`` disables the cap (every message kept)."""
+    if max_chars <= 0:
+        return list(history)
+    kept: list[MessageOut] = []
+    total = 0
+    for msg in reversed(history):
+        size = len(msg.content)
+        if kept and total + size > max_chars:
+            break
+        kept.append(msg)
+        total += size
+    kept.reverse()
+    return kept
+
+
 async def _start_turn(s: ChatStore, session_id: str, user_id: str, question: str) -> tuple[MessageOut, list[MessageOut]]:
     user_msg = await s.append_message(session_id, user_id, "user", question)
     history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
-    return user_msg, history
+    # Both caps apply: turns bound how many messages come back, chars bound how
+    # many of them actually reach the prompt.
+    return user_msg, _trim_history(history, config.CHAT_MAX_HISTORY_CHARS)
 
 
 async def _auto_title(s: ChatStore, session_id: str, user_id: str, question: str) -> None:
@@ -1632,12 +1743,34 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
             status_code=503,
             detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
         )
+    except BudgetUnavailable as exc:
+        # The daily spend counter could not be read. Fail closed with a 503
+        # rather than running an unbudgeted LLM call or returning a silently
+        # empty answer: an unmeasured call is exactly the spend this cap exists
+        # to prevent (#255).
+        await s.delete_message(session_id, user_id, user_msg.id)
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "AI budget service unavailable", "detail": f"The daily chat budget could not be verified; please retry shortly. ({exc})"},
+        ) from exc
     except Exception:
         # Any other failure during the turn (DB error, retrieval error, etc.)
         # must also roll back the dangling user message — the stream path deletes
         # on every error. Re-raise so the caller still surfaces the 500.
         await s.delete_message(session_id, user_id, user_msg.id)
         raise
+
+    # A JSON client receives the whole answer at once, so unlike the SSE path
+    # nothing was ever shown before the disconnect: a dropped connection here
+    # is a clean rollback, not a partial turn to persist. Roll the user message
+    # back and report a non-success status (499, the conventional "client closed
+    # request") so it can never be mistaken for a completed turn (#255).
+    if await request.is_disconnected():
+        await s.delete_message(session_id, user_id, user_msg.id)
+        raise HTTPException(
+            status_code=499,
+            detail={"error": "Client disconnected", "detail": "The request was cancelled before the answer could be delivered."},
+        )
 
     latency_ms = (time.perf_counter() - start) * 1000
 
@@ -1674,16 +1807,121 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
 
     async def event_stream():
         start = time.perf_counter()
+        # Has any answer text already reached the client? This is the single
+        # switch that decides what a disconnect means for the stored turn.
+        streamed = False
+        # Reservations taken for this turn's billed calls, discharged exactly
+        # once by finish_holds().
+        holds: list[str] = []
+        holds_done = False
 
-        async def aborted() -> bool:
-            # Clean rollback on disconnect: a dropped client must not leave a
-            # dangling user message with no assistant reply, matching what the
-            # error paths below do. Only valid before an assistant reply is
-            # persisted; after that the user message is no longer dangling.
-            if await request.is_disconnected():
+        async def finish_holds(charged_usd: float) -> None:
+            """Settle every hold this turn took, recording what it really cost.
+
+            settle() is the turn's only counter write; release() drops the holds
+            without recording when no billed call completed. Either way each
+            reservation leaves `holds` exactly once, and the guard makes a
+            second call a no-op so no path can double-count the day."""
+            nonlocal holds_done
+            if holds_done:
+                return
+            holds_done = True
+            if charged_usd > 0:
+                await settle(holds, charged_usd)
+            else:
+                await release(holds)
+            holds.clear()
+
+        # ONE rule for a dropped client, applied at every check below (#255):
+        #   * No delta has been streamed yet -> clean rollback: the user message
+        #     is deleted, so a turn that produced nothing leaves no dangling row.
+        #   * Any delta HAS been streamed -> the turn is PERSISTED, never
+        #     deleted: the client already rendered that text, so deleting it
+        #     made the server's history disagree with what was on screen. The
+        #     assistant message is stored with the text produced so far plus the
+        #     explicit truncation marker, flagged aborted, and the user message
+        #     is kept.
+        async def persist_truncated_turn(
+            answer: str,
+            sources: list[dict] | None,
+            prompt_tokens: int,
+            completion_tokens: int,
+            cost_usd: float,
+            aborted: bool,
+        ):
+            """Persist a PARTIAL turn: the streamed prefix plus the truncation
+            marker, with the turn's holds discharged for what was billed. Used
+            by both halves of the abort rule and by the mid-stream-failure path.
+            `aborted` records that the client had already gone, so the stored
+            history explains why the answer stops mid-sentence."""
+            latency_ms = (time.perf_counter() - start) * 1000
+            answer = _finalize_answer(answer, question).rstrip() + "\n\n[answer truncated]"
+            await finish_holds(cost_usd)
+            assistant_msg = await s.append_message(
+                session_id, user_id, "assistant", answer, sources,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                cost=cost_usd, latency_ms=latency_ms, aborted=aborted,
+            )
+            await _auto_title(s, session_id, user_id, question)
+            return assistant_msg
+
+        async def aborted(
+            answer: str = "",
+            sources: list[dict] | None = None,
+            prompt_tokens: int = 0,
+            completion_tokens: int = 0,
+            cost_usd: float = 0.0,
+        ) -> bool:
+            """True when the turn must stop because the client disconnected.
+
+            Applies the ONE rule above: rollback when nothing was streamed,
+            persistence when deltas already reached the client. The caller
+            returns in both cases.
+
+            BOTH branches discharge the turn's holds before returning, and
+            every call site returns immediately on True, so no path can return
+            with a reservation still live. That matters in the gate-to-first-
+            delta window: the billed call has happened but `streamed` is still
+            False, so the rollback branch runs — without the release the gate
+            hold would sit in the store for the full reservation TTL, billing
+            the day's budget against a call whose cost was never recorded."""
+            if not await request.is_disconnected():
+                return False
+            if streamed:
+                await persist_truncated_turn(
+                    answer, sources, prompt_tokens, completion_tokens, cost_usd, aborted=True
+                )
+            else:
                 await s.delete_message(session_id, user_id, user_msg.id)
-                return True
-            return False
+                # release() on an empty list is a no-op, so the pre-gate call
+                # sites cost nothing; finish_holds is guarded, so this cannot
+                # double-discharge.
+                await finish_holds(0.0)
+            return True
+
+        async def fail_turn() -> None:
+            """Abandon a turn that failed, under the ONE abort rule.
+
+            Nothing streamed yet -> clean rollback of the user message, matching
+            the pre-stream checks. Deltas already sent -> the turn is persisted
+            as a truncated, aborted message instead of being erased, and the
+            holds are discharged, because the client is still displaying text
+            the server must account for."""
+            if not streamed:
+                await s.delete_message(session_id, user_id, user_msg.id)
+                await finish_holds(0.0)
+                return
+            # Deltas already sent: persist what the client is still showing.
+            # Token usage is only known when the whole response arrived, so a
+            # failed turn normally has none and the hold is released unbilled.
+            usage = usage_holder[0] if usage_holder else None
+            await persist_truncated_turn(
+                "".join(chunks), turn.sources,
+                usage.prompt_tokens if usage else 0,
+                usage.completion_tokens if usage else 0,
+                to_usd(usage.cost()) if usage else 0.0,
+                aborted=True,
+            )
 
         try:
             if await aborted():
@@ -1707,14 +1945,21 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
 
             if await aborted():
                 return
-            await assert_within_budget()
+            # First budget gate: a hold is taken BEFORE the billed call, so a
+            # concurrent turn cannot slip spend into the gap a read-then-call
+            # check would leave. BudgetExceeded and BudgetUnavailable both
+            # propagate to the handlers below, which fail closed.
+            gate_hold = await reserve()
+            if gate_hold:
+                holds.append(gate_hold)
             usage_holder: list = []
             chunks: list[str] = []
             try:
                 async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
-                    if await aborted():
+                    if await aborted("".join(chunks), turn.sources):
                         return
                     chunks.append(piece)
+                    streamed = True
                     yield _sse("delta", {"text": piece})
             except Exception:
                 if not chunks:
@@ -1723,30 +1968,31 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # partial (truncated) assistant message so the turn is not left
                 # with a dangling user message and no assistant reply. The user
                 # already saw the streamed prefix; store it with an explicit
-                # truncation marker rather than dropping it.
-                latency_ms = (time.perf_counter() - start) * 1000
-                answer = _finalize_answer("".join(chunks), question).rstrip() + "\n\n[answer truncated]"
+                # truncation marker rather than dropping it. This is the same
+                # persistence the abort rule uses, so the ONE rule holds here
+                # too: a client that is already gone still gets the partial turn
+                # stored (flagged aborted) and nothing is deleted, because the
+                # bytes were already on the wire.
                 # stream_answer() only populates usage_holder once the whole
                 # response has arrived, and a mid-stream failure raises before
                 # that point — so usage_holder is empty here and the partial
-                # (truncated) turn is not billed: tokens/cost stay 0 and are
-                # absent from the daily budget. If a stream backend ever
-                # surfaces usage before raising, bill it here WITHOUT ever
-                # calling record_cost on the completed path below (which
-                # records exactly once at end of turn).
+                # (truncated) turn is not billed: tokens/cost stay 0 and the
+                # hold is released. If a stream backend ever surfaces usage
+                # before raising, settle the turn for it here instead — the
+                # completed path below settles exactly once, and finish_holds
+                # makes a second settle impossible.
                 usage = usage_holder[0] if usage_holder else None
                 prompt_tokens = usage.prompt_tokens if usage else 0
                 completion_tokens = usage.completion_tokens if usage else 0
                 cost_inr = usage.cost() if usage else 0.0
-                if usage is not None:
-                    await record_cost(cost_inr)
-                assistant_msg = await s.append_message(
-                    session_id, user_id, "assistant", answer, turn.sources,
-                    prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                    cost=to_usd(cost_inr), latency_ms=latency_ms,
+                client_gone = await request.is_disconnected()
+                assistant_msg = await persist_truncated_turn(
+                    "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
+                    to_usd(cost_inr), aborted=client_gone,
                 )
-                await _auto_title(s, session_id, user_id, question)
-                yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
+                if client_gone:
+                    return
+                yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": assistant_msg.latency_ms})
                 return
 
             usage = usage_holder[0] if usage_holder else None
@@ -1754,21 +2000,20 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
-            # Cost already incurred by this turn (the stream plus any nudge
-            # call) but not yet in the daily counter, which is only written at
-            # the end of the turn.
-            spent_this_turn_inr = usage.cost() if usage else 0.0
+            # No pending-spend accumulator is needed: each billed call holds
+            # its own budget up front, and the end-of-turn settle below records
+            # the summed token cost.
             if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
                 # The user explicitly asked for a chart/graph/plot/table but the
                 # answer streamed without one; ask once more so visual requests
                 # reliably carry a dataviz block. A failed retry keeps the
                 # streamed answer instead of erroring the whole turn after the
                 # user already saw it stream in. The retry is a second billed
-                # call, so it re-checks the daily cap, counting the spend this
-                # turn has already incurred.
+                # call, so it takes its own hold against the cap, which also
+                # counts the spend this turn has already incurred.
                 nudge = None
-                if await _nudge_retry_allowed(spent_this_turn_inr):
-                    if await aborted():
+                if await _nudge_retry_allowed(holds):
+                    if await aborted("".join(chunks), turn.sources, prompt_tokens, completion_tokens):
                         return
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
@@ -1781,7 +2026,6 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer = _append_nudge(answer, nudge.content)
                     prompt_tokens += nudge.prompt_tokens
                     completion_tokens += nudge.completion_tokens
-                    spent_this_turn_inr += nudge.cost()
             if _is_ranking_question(question) and _is_ranking_refusal(answer):
                 # A ranked/numeric list question streamed back as a refusal
                 # ("cannot generate specific numbers") that DOES address the
@@ -1795,8 +2039,8 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # Ranked lists of unquantifiable items (e.g. named topics to
                 # order, no numbers ever available) must never nudge.
                 nudge = None
-                if await _nudge_retry_allowed(spent_this_turn_inr):
-                    if await aborted():
+                if await _nudge_retry_allowed(holds):
+                    if await aborted("".join(chunks), turn.sources, prompt_tokens, completion_tokens):
                         return
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
@@ -1814,14 +2058,18 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
             )
-            if await aborted():
+            cost_usd = to_usd(result.cost())
+            if await aborted(answer, turn.sources, result.prompt_tokens, result.completion_tokens, cost_usd):
                 return
-            await record_cost(result.cost())
+            # The turn's single counter write: drops every hold and records what
+            # the stream plus any nudges really cost, which may exceed the
+            # reserved estimates — incurred spend is recorded, never dropped.
+            await finish_holds(cost_usd)
             assistant_msg = await s.append_message(
                 session_id, user_id, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
-                cost=to_usd(result.cost()),
+                cost=cost_usd,
                 latency_ms=latency_ms,
             )
             await _auto_title(s, session_id, user_id, question)
@@ -1834,14 +2082,20 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 },
             )
         except LLMUnavailableError:
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await fail_turn()
             yield _sse("error", {"error": "LLM temporarily unavailable"})
         except BudgetExceeded:
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await fail_turn()
             yield _sse("error", {"error": "Daily AI budget reached"})
+        except BudgetUnavailable as exc:
+            # The spend counter became unreachable mid-turn. Report it as such
+            # rather than as a generic failure, and admit no further spend.
+            logger.warning("daily cost counter unavailable during stream turn: %s", exc)
+            await fail_turn()
+            yield _sse("error", {"error": "AI budget service unavailable"})
         except Exception:
             logger.exception("chat stream turn failed")
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await fail_turn()
             yield _sse("error", {"error": "Something went wrong"})
 
     return StreamingResponse(

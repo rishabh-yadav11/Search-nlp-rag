@@ -241,7 +241,7 @@ Responses use a slim `SourceSummary` DTO (`id`, `title`, `url`, `published_date`
 
 LLM calls are bounded: `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, and `LLM_RETRY_BACKOFF` control the timeout and exponential backoff; when the model is unreachable, chat turns return a clean `503` instead of a raw `500`. Chat conversations require the `X-User-Id` header (min 8 chars) — see `docs/API.md` for the full chat API.
 
-Spend is capped per day via `LLM_DAILY_BUDGET_USD` (0 = disabled): once today's cumulative LLM cost reaches the cap, chat fails closed (refuses further LLM calls) rather than racking up unbilled spend.
+Spend is capped per day via `LLM_DAILY_BUDGET_USD` (default `5.0`; `0` deliberately disables the cap): each turn reserves its share of the cap atomically *before* the billed LLM call, so concurrent turns contend for the same budget rather than all passing a stale read, and once today's cumulative LLM cost (plus every in-flight reservation) reaches the cap, chat fails closed (refuses further LLM calls) rather than racking up unbilled spend.
 
 ## 6. Run the Frontend
 
@@ -336,7 +336,10 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `12` | Cross-encoder reranker; how many RRF candidates to re-score (12 keeps top-8 quality vs 16, faster on CPU) |
 | `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `LLM_MODEL` (`GEMINI_MODEL`) | — | Google Gemini (OpenAI-compatible endpoint) for chat |
 | `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` / `INR_PER_USD` | `0.25` / `1.50` / `95.60` | USD per 1M input/output tokens (for cost display); USD→INR rate |
-| `LLM_DAILY_BUDGET_USD` | `0` (disabled) | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value (see `app/cost_budget.py`) |
+| `LLM_DAILY_BUDGET_USD` | `5.0` | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value. Each turn reserves this cap atomically before a billed call, so concurrent turns contend for the same budget. Set `0` to deliberately disable the cap (see `app/cost_budget.py`) |
+| `LLM_CALL_RESERVE_USD` | `0.05` | Budget a turn holds against the cap before each billed LLM call; the hold is reconciled to the real cost when the turn ends (see `app/cost_budget.py`) |
+| `COST_RESERVATION_TTL_SECONDS` | `900` | Lifetime of an unsettled budget reservation, so a crashed turn's hold lapses instead of eating budget forever |
+| `CHAT_MAX_HISTORY_CHARS` | `24000` | Total character budget for conversation history fed to the LLM; oldest turns are dropped once exceeded (see `CHAT_MAX_HISTORY_TURNS`) |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; chat retrieval threshold |
 | `CACHE_TTL_SECONDS` / `CACHE_MAX_SIZE` | `300` / `1000` | Query cache TTL; size of the in-process fallback cache |
