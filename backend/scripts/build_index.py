@@ -32,7 +32,6 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     Modifier,
-    PayloadSchemaType,
     SparseVectorParams,
     VectorParams,
 )
@@ -42,7 +41,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _common import log, make_point
+from _common import create_payload_indexes, log, make_point
 
 from app.config import config
 from app.index_text import compose_dense_text, compose_sparse_text
@@ -164,11 +163,7 @@ def create_collection(client: QdrantClient):
         sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
         hnsw_config=qmodels.HnswConfigDiff(m=32, ef_construct=256),
     )
-    client.create_payload_index(config.QDRANT_COLLECTION, "category", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(config.QDRANT_COLLECTION, "published_date", PayloadSchemaType.DATETIME)
-    client.create_payload_index(config.QDRANT_COLLECTION, "author_names", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(config.QDRANT_COLLECTION, "industry_names", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(config.QDRANT_COLLECTION, "dealtype_names", PayloadSchemaType.KEYWORD)
+    create_payload_indexes(client)
     print(f"Created collection '{config.QDRANT_COLLECTION}'")
 
 
@@ -184,6 +179,17 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     recreated = ensure_collection(client)
+
+    # Index the payload fields on a resumed collection too. create_collection
+    # only runs when the collection is (re)created, so without this a collection
+    # that predates a new field keeps that field unfilterable until a full
+    # destructive rebuild -- which is why content_type stayed unfilterable even
+    # for points that carry it. create_payload_index is idempotent for a field
+    # that already has an index, so this costs nothing on a re-run.
+    try:
+        create_payload_indexes(client)
+    except Exception as e:
+        log(f"WARNING: could not create payload indexes: {e}")
 
     if recreated:
         save_checkpoint(0, 0)
