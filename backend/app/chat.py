@@ -12,6 +12,7 @@ builds a conversation-aware prompt so the model can follow up on prior turns.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -740,9 +741,11 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
 
 
 # The ONE dataviz fence grammar, shared verbatim with the frontend renderer
-# (FENCE_SRC in frontend/app/chat/DataViz.tsx). The pattern is written in the
-# JavaScript regex form on purpose: under re.DOTALL the JS class [\s\S] is
-# exactly Python's ".", so the two grammars are provably identical instead of
+# (FENCE_SRC in frontend/app/chat/datavizContract.ts, the module that holds the
+# whole browser-side validator and is executed by tests/test_dataviz_contract.py
+# so the two grammars are compared fixture by fixture). The pattern is written
+# in the JavaScript regex form on purpose: under re.DOTALL the JS class [\s\S]
+# is exactly Python's ".", so the two grammars are provably identical instead of
 # merely similar — a fence the UI strips must never be left in the stored
 # answer, and vice versa (#255). Note the leading newline is OPTIONAL, matching
 # the frontend; the old backend pattern required one and so disagreed with the
@@ -777,21 +780,43 @@ def _strip_unclosed_fence(text: str) -> str:
     return text
 
 
+# A plain decimal numeric literal, in FULL. ASCII-only ([0-9], not \d, which
+# also matches non-ASCII digits) so it means the same in Python and in
+# JavaScript, where \d is ASCII-only. Kept as one string so the frontend twin
+# and this one can be asserted equal by the dataviz contract test.
+_NUMERIC_LITERAL_SRC = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+_NUMERIC_LITERAL_RE = re.compile(_NUMERIC_LITERAL_SRC)
+
 def _as_float(v: object) -> float | None:
-    """Coerce a cell to float (ints, floats, or digit strings), else None.
+    """Coerce a cell to a FINITE float, else None.
 
     Bools are rejected first: bool subclasses int, so the int/float branch below
     would otherwise turn True/False into 1.0/0.0 and make a yes/no column look
-    numeric (#176)."""
+    numeric (#176).
+
+    A number must be finite. json.loads accepts the bare literals ``NaN`` and
+    ``Infinity`` and float("inf") accepts the strings, so an unplottable value
+    used to reach the value column and poison the chart's min/max. The frontend
+    already refused both (Number.isFinite, and JSON.parse throws on the bare
+    literals), so the two sides disagreed on such a block (#267).
+
+    A string counts as a stated number only when the whole comma-stripped,
+    trimmed cell is a plain numeric literal. float() alone is too lenient: it
+    reads "1_000" as 1000 and "inf"/"nan" as a float, while the frontend's
+    Number() does not. _NUMERIC_LITERAL_SRC is the character-for-character
+    twin of NUMERIC_LITERAL in frontend/app/chat/datavizContract.ts, so both
+    sides accept the same spellings ("1,200", " 1.5 ", "+3", "1e3") and reject
+    the same impostors ("12abc", "0x10", "1_000", "inf", "nan", "")."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return float(v)
+        return float(v) if math.isfinite(v) else None
     if isinstance(v, str):
-        try:
-            return float(v.replace(",", ""))
-        except ValueError:
+        cleaned = v.replace(",", "").strip()
+        if _NUMERIC_LITERAL_RE.fullmatch(cleaned) is None:
             return None
+        parsed = float(cleaned)
+        return parsed if math.isfinite(parsed) else None
     return None
 
 
@@ -868,7 +893,20 @@ def parse_dataviz(text: str) -> dict | None:
     if any(len(r) != len(columns) for r in rows):
         return None
     vc = data.get("value_column")
-    if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
+    # An explicit index wins when it is a whole number in range — including one
+    # written as a JSON float ("value_column": 2.0), which is what the model
+    # means and what the browser already read as 2. Rejecting it and silently
+    # re-picking the first numeric column made the server validate the Year
+    # column while the browser plotted the Value column (#267). Everything else
+    # (missing, bool, string, fractional, out of range) falls back, exactly as
+    # the frontend's Number.isInteger check does. float('nan').is_integer() and
+    # float('inf').is_integer() are both False, so those fall back too.
+    explicit_index = (isinstance(vc, int) and not isinstance(vc, bool)) or (
+        isinstance(vc, float) and vc.is_integer()
+    )
+    if explicit_index and 0 <= vc < len(columns):
+        vc = int(vc)  # 2.0 and 2 are the same column; keep the index an int
+    else:
         vc = _first_numeric_column(rows)
     # A table (view='table' or explicit table ask) may have no numeric column at
     # all (e.g. every item's value is 'not stated'): value_column stays None and
