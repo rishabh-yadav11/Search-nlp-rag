@@ -144,11 +144,27 @@ def retrieval(monkeypatch):
 
 @pytest.fixture
 def no_billing(monkeypatch):
-    async def noop(*args, **kwargs):
+    """Take the budget cap out of these tests' way.
+
+    The subject here is the prompt shape, not cost accounting, so the gate and
+    its discharge are pinned to no-ops. These are the names the pipeline
+    actually calls (#255 replaced the old read-then-call `assert_within_budget`
+    / `record_cost` pair with a `reserve`-before-the-billed-call hold that is
+    settled or released afterwards). `reserve` returning "" is exactly the
+    cap-disabled path, and it is also what keeps these tests off Redis."""
+
+    async def reserve(estimate_usd: float = 0.0) -> str:
+        return ""
+
+    async def settle(reservation_ids, actual_usd: float) -> None:
         return None
 
-    monkeypatch.setattr(chat_module, "assert_within_budget", noop)
-    monkeypatch.setattr(chat_module, "record_cost", noop)
+    async def release(reservation_ids) -> None:
+        return None
+
+    monkeypatch.setattr(chat_module, "reserve", reserve)
+    monkeypatch.setattr(chat_module, "settle", settle)
+    monkeypatch.setattr(chat_module, "release", release)
 
 
 def _roles(client):
