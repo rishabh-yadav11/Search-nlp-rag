@@ -1,9 +1,24 @@
-"""Token + RBAC authentication for the API.
+"""Session-cookie + RBAC authentication for the API.
+
+Signup issues no cookie and always answers the same thing (see the endpoint);
+login issues an opaque token (hashed with SHA-256 in storage, expiring after
+AUTH_TOKEN_TTL_DAYS, individually revocable, multiple per user) and delivers it
+ONLY as an HttpOnly cookie named ``config.AUTH_COOKIE_NAME``. The token is
+never in a response body and is never read from a header: a token a browser
+has to hold in script-readable storage is one XSS bug away from a durable
+account takeover, and a header path stays reachable from ``fetch()``, so
+keeping one alongside the cookie would leave the exfiltration surface open.
+
+Because the cookie is attached by the browser automatically, every
+cookie-authenticated unsafe request is forgeable by a page the user visits, so
+``enforce_same_origin`` guards them (see its docstring). It runs inside
+``require_auth``, which means coverage cannot be forgotten on a new route.
 
 Signup issues no token and always answers the same thing (see the endpoint);
-login issues opaque bearer tokens (hashed with SHA-256 in storage, expiring
+login issues opaque session tokens (hashed with SHA-256 in storage, expiring
 after AUTH_TOKEN_TTL_DAYS, individually revocable, several per user but capped
-at AUTH_MAX_ACTIVE_TOKENS_PER_USER active ones, oldest revoked past the cap).
+at AUTH_MAX_ACTIVE_TOKENS_PER_USER active ones, oldest revoked past the cap) and
+delivers them ONLY as the HttpOnly cookie described above.
 A role-based access-control layer maps roles to permissions; endpoints assert
 the permission they need via ``require_permission``. A bootstrap admin account
 is seeded from AUTH_ADMIN_EMAIL / AUTH_ADMIN_PASSWORD at startup.
@@ -15,8 +30,9 @@ Roles:
 Machine clients (eval scripts) may authenticate with the AUTH_SERVICE_TOKEN
 header, which is a SCOPED, EXPIRING credential rather than an unconditional
 admin bypass: it carries an explicit permission set, stops working after
-AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS, and can be revoked or rotated. All inputs
-are validated server-side.
+AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS, and can be revoked or rotated. That header
+path is unchanged by the cookie migration: it is not a browser credential, and
+browsers cannot be made to attach it. All inputs are validated server-side.
 """
 
 import asyncio
@@ -33,11 +49,12 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import ClassVar
+from urllib.parse import urlsplit
 
 import aiosqlite
 import bcrypt
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from app.config import config
@@ -130,7 +147,15 @@ class UserOut(BaseModel):
 
 
 class AuthOut(BaseModel):
-    token: str
+    """The body of a successful ``POST /api/auth/login`` / ``/change-password``.
+
+    Carries the user record and deliberately NOT the session token. The token
+    is delivered only in an HttpOnly ``Set-Cookie``, never in a field script
+    can read: publishing it in the body would hand every XSS on the site a
+    durable account takeover, which is the exact exposure the cookie moves the
+    credential out of.
+    """
+
     user: UserOut
 
 
@@ -811,8 +836,9 @@ class AuthStore:
         return cur.rowcount
 
     async def user_for_token(self, raw_token: str) -> StoredUser | None:
-        """Resolve a raw bearer token to an active user, or None when the token
-        is unknown, expired, or the account is disabled."""
+        """Resolve a raw session token (the auth cookie's value) to an active
+        user, or None when the token is unknown, expired, or the account is
+        disabled."""
         row = await self._fetchone(
             "SELECT * FROM auth_tokens WHERE token_hash = ?", (hash_token(raw_token),)
         )
@@ -1310,11 +1336,154 @@ def user_rate_limit(
 
 
 def _token_from_request(request: Request) -> str | None:
-    auth = request.headers.get("authorization") or ""
-    if auth.lower().startswith("bearer "):
-        token = auth[7:].strip()
-        return token or None
-    return None
+    """The session token on this request, read from the auth cookie alone.
+
+    There is deliberately no ``Authorization: Bearer`` branch. A header
+    credential is one the app must hand to script, and that path stays
+    reachable from ``fetch()``; keeping it alongside the cookie would leave
+    the very exfiltration surface this migration closes.
+    """
+    return request.cookies.get(config.AUTH_COOKIE_NAME) or None
+
+
+def _host_only(authority: str) -> str:
+    """Lowercase an authority and drop its port, IPv6 literals included.
+
+    ``host``, ``host:port`` and ``[::1]:8001`` all reduce to their host. A
+    split on the FIRST colon would turn ``[::1]:8001`` into ``[`` and let any
+    bracketed address match any other, so brackets are peeled before the port.
+    Port is not part of the comparison because a port is not a security
+    boundary for a cookie or for CSRF: the dev stack legitimately serves the
+    frontend on :3000 and the API on :8001 under one host.
+    """
+    host = authority.strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[1:end]
+        return host
+    return host.partition(":")[0]
+
+
+def _origin_host(origin: str) -> str | None:
+    """The host an ``Origin`` header names, or None when it names none.
+
+    ``urlsplit(...).hostname`` already lowercases and drops the port and is
+    IPv6-safe. It returns None for the literal ``Origin: null`` that a
+    sandboxed iframe or a privacy browser sends; that is reported as None so
+    the caller rejects it rather than treating "no host" as "same host".
+    """
+    try:
+        return urlsplit(origin.strip()).hostname
+    except ValueError:
+        return None
+
+
+def _request_host(request: Request) -> str | None:
+    """The host the client believes it is talking to.
+
+    Behind the nginx proxy the backend sees the socket peer, so the public
+    host arrives in ``X-Forwarded-Host`` and only the first value of the list
+    is the one the browser actually addressed. Without a proxy this is just
+    the ``Host`` header.
+    """
+    forwarded = request.headers.get("x-forwarded-host")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    host = request.headers.get("host")
+    return host.strip() if host and host.strip() else None
+
+
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+async def enforce_same_origin(request: Request) -> None:
+    """Reject a cross-site unsafe request: 403 when the browser says it is
+    cross-site, or when the request's own headers disagree about the host.
+
+    The auth cookie is attached by the browser whether or not the page means
+    to send it, so a hostile page can make an authenticated state-changing
+    request that rides the user's session. Two independent signals are used
+    so that the loss of either one alone is not fatal:
+
+    - ``Sec-Fetch-Site: cross-site`` is set by the browser and cannot be set
+      by script, so it is the trustworthy signal. It is checked first because
+      it needs no host comparison and stays correct behind any proxy.
+    - ``Origin`` is compared against the request's own effective host. This
+      is a self-consistency check, not an allow-list: a request that omits or
+      lies about ``Sec-Fetch-Site`` still has to name a host matching the one
+      it was addressed to. Hosts are compared with ports stripped because the
+      app sits behind TLS termination and cannot trust ``request.url.scheme``,
+      and because the dev stack serves :3000 and :8001 under one host.
+
+    ``CORS_ORIGINS`` is deliberately NOT used here: it is a localhost-only dev
+    default that does not contain the production host, so an allow-list built
+    from it would 403 every real request.
+
+    The honest limitation: a request with NEITHER header is allowed through.
+    Every browser sends both on an unsafe method, so their absence means a
+    non-browser client (curl, an eval script) which has no ambient cookie to
+    ride in the first place. This is therefore not fail-closed — a
+    hypothetical client able to suppress both headers while still holding the
+    cookie would pass — but the browser is the only thing that attaches
+    cookies unasked, and demanding these headers outright would break every
+    non-browser caller for no added protection.
+
+    Scope: applied to every cookie-authenticated request via ``require_auth``
+    and to ``POST /api/auth/login``. NOT applied to the public unauthenticated
+    routes (``/search``, ``/facets``, ``/analytics/click``,
+    ``/recommend/interaction``, health): they carry no ambient privilege to
+    ride, and nginx does not forward ``Host`` on them, so guarding them would
+    403 them in production.
+    """
+    if request.method.upper() not in _UNSAFE_METHODS:
+        return
+    if (request.headers.get("sec-fetch-site") or "").strip().lower() == "cross-site":
+        raise HTTPException(status_code=403, detail="cross-site request rejected")
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    origin_host = _origin_host(origin)
+    if not origin_host:
+        # Covers the literal "null" from a sandboxed iframe or privacy
+        # browser: it names no host, so it can never be shown to be ours.
+        raise HTTPException(status_code=403, detail="cross-site request rejected")
+    expected = _request_host(request)
+    if expected is None or _host_only(origin_host) != _host_only(expected):
+        raise HTTPException(status_code=403, detail="cross-site request rejected")
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    """Attach the session cookie. No ``domain``: host-only keeps it working
+    on a bare-IP deployment, where any Domain would have to name an address
+    the operator may not control."""
+    response.set_cookie(
+        config.AUTH_COOKIE_NAME,
+        token,
+        max_age=config.AUTH_COOKIE_MAX_AGE_SECONDS,
+        path=config.AUTH_COOKIE_PATH,
+        httponly=True,
+        secure=config.AUTH_COOKIE_SECURE,
+        samesite=config.AUTH_COOKIE_SAMESITE,
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    """Expire the session cookie.
+
+    Every attribute must match ``_set_session_cookie`` exactly: a browser
+    treats a deletion whose name or path differs from the original as a
+    different cookie, and the live one would then be left in place.
+    """
+    response.delete_cookie(
+        config.AUTH_COOKIE_NAME,
+        path=config.AUTH_COOKIE_PATH,
+        httponly=True,
+        secure=config.AUTH_COOKIE_SECURE,
+        samesite=config.AUTH_COOKIE_SAMESITE,
+    )
 
 
 def _service_user() -> StoredUser:
@@ -1376,13 +1545,17 @@ async def _resolve_service_token(raw: str) -> StoredServiceToken | None:
 
 async def require_auth(request: Request) -> None:
     """Validate the request's credentials and stash the user on request.state.
-    Accepts ``Authorization: Bearer <token>`` (user tokens) or
-    ``X-Service-Token`` (a scoped, expiring machine credential).
+    Accepts the auth cookie (user tokens) or ``X-Service-Token`` (a scoped,
+    expiring machine credential).
 
     A service token that is revoked or past its expiry is NOT honoured: it
-    falls through to the bearer path and ends as a 401, rather than being
+    falls through to the cookie path and ends as a 401, rather than being
     granted admin because the environment still mentions it.
     """
+    # Guard FIRST, so a cross-site request is refused whichever credential it
+    # presents. Inside this dependency rather than on each route: a new
+    # cookie-authenticated endpoint then cannot forget the guard.
+    await enforce_same_origin(request)
     service = request.headers.get("x-service-token")
     if service:
         record = await _resolve_service_token(service)
@@ -1443,7 +1616,7 @@ async def signup(body: SignupIn, request: Request):
     The response is one fixed 200 ``{"message": ...}`` whether or not the
     address was already registered, so an unauthenticated caller cannot use
     this endpoint to learn which addresses have accounts here. It therefore
-    carries no token: a token present only for fresh addresses would be the
+    sets no cookie: a session present only for fresh addresses would be the
     oracle all over again, and minting one for an existing account would hand
     an anonymous caller someone else's session. Callers follow up with
     ``POST /api/auth/login``.
@@ -1472,12 +1645,28 @@ async def signup(body: SignupIn, request: Request):
         # and leave the stored row untouched: no re-hash, no rename, no
         # re-activation, no duplicate, no session.
         logger.info("signup for an already-registered address: reported as accepted")
+    # No cookie is set here on purpose (see the docstring): minting a session
+    # on signup is what the anti-enumeration rule forbids. Login-CSRF is
+    # covered by running the same-origin guard on /login instead.
     return SignupOut(message=SIGNUP_ACCEPTED_MESSAGE)
 
 
 @router.post("/login", response_model=AuthOut)
-async def login(body: LoginIn, request: Request):
-    """Exchange email+password for a bearer token.
+async def login(
+    body: LoginIn,
+    request: Request,
+    response: Response,
+    _: None = Depends(enforce_same_origin),
+):
+    """Exchange email+password for a session cookie.
+
+    The opaque token is issued, stored hashed, and handed to the browser only
+    as an HttpOnly cookie; it is deliberately absent from the response body.
+
+    Guarded by ``enforce_same_origin`` even though it is unauthenticated:
+    without it a hostile page could force a login with the *attacker's*
+    credentials, so the victim's subsequent authenticated actions would post
+    into the attacker's account ("login CSRF").
 
     An unknown address and a known address with a wrong password are
     indistinguishable to the caller: the identical 401 status and body, and
@@ -1530,7 +1719,11 @@ async def login(body: LoginIn, request: Request):
         # A real user with a real password is never counted, never gated, and
         # never rate-limited. Only failures consume the account's budget.
         token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
-        return AuthOut(token=token, user=UserOut.from_user(user))
+        # The session is delivered ONLY as the HttpOnly cookie. It is never put
+        # in the response body, so there is nothing for script on the page --
+        # including script injected by an XSS -- to read and exfiltrate.
+        _set_session_cookie(response, token)
+        return AuthOut(user=UserOut.from_user(user))
 
     # Failed. Count it against the address, keyed on the submitted string alone
     # (no lookup feeds this), so a registered and an unregistered address are
@@ -1547,27 +1740,39 @@ async def me(request: Request, _: None = Depends(require_auth)):
 
 
 @router.post("/logout")
-async def logout(request: Request, _: None = Depends(require_auth)):
-    """Revoke the credential this request authenticated with.
+async def logout(request: Request, response: Response, _: None = Depends(require_auth)):
+    """Revoke the credential this request authenticated with, and expire the cookie.
 
     For a service token that revocation is real: the token is marked revoked,
     so it stops working immediately. It used to be a no-op here -- logout only
     ever looked at a bearer token, so a machine credential answered ``ok`` and
-    then went on working for as long as the process did."""
+    then went on working for as long as the process did.
+
+    For a user session the token is read from the cookie, which is the only
+    place it can now be: re-parsing a header here would leave the stored token
+    live and turn logout into a silent no-op that still answers ``{"ok": true}``.
+    """
     service = getattr(request.state, "service_token", None)
     if service is not None:
         await _require_auth_store().revoke_service_token(service)
-        return {"ok": True}
-    token = _token_from_request(request)
-    if token is not None:
-        await _require_auth_store().revoke_token(token)
+    else:
+        token = _token_from_request(request)
+        if token is not None:
+            await _require_auth_store().revoke_token(token)
+    _clear_session_cookie(response)
     return {"ok": True}
 
 
 @router.post("/change-password")
-async def change_password(body: ChangePasswordIn, request: Request, _: None = Depends(require_auth)):
-    """Change the current user's password after verifying the old one. Invalidates
-    every other token the user holds (the current session stays signed in).
+async def change_password(
+    body: ChangePasswordIn,
+    request: Request,
+    response: Response,
+    _: None = Depends(require_auth),
+):
+    """Change the current user's password after verifying the old one. Revokes
+    every other token the user holds and re-issues the session cookie with a
+    fresh token, so this session stays signed in and no other one does.
 
     The new password is judged by the same policy ``signup`` and
     ``bootstrap_admin`` use (see ``_password_rejection``), so an admin seeded
@@ -1576,7 +1781,8 @@ async def change_password(body: ChangePasswordIn, request: Request, _: None = De
 
     "Invalidates" holds even if the worker is killed mid-request: the hash
     write, the revocation and the replacement token commit together or not at
-    all -- see ``AuthStore.change_password``."""
+    all -- see ``AuthStore.change_password``.
+    """
     user = request.state.user
     s = _require_auth_store()
     stored = await s.get_user(user.id)
@@ -1595,7 +1801,11 @@ async def change_password(body: ChangePasswordIn, request: Request, _: None = De
     # leaves a durable new password valid alongside still-authenticating
     # pre-existing tokens whenever the worker dies between them.
     token = await s.change_password(user.id, new_hash, config.AUTH_TOKEN_TTL_DAYS)
-    return AuthOut(token=token, user=UserOut.from_user(stored))
+    # Revocation above killed every token this user held, including the one in
+    # the cookie, so the cookie has to be re-issued with the new token or the
+    # session dies on the user's very next request.
+    _set_session_cookie(response, token)
+    return AuthOut(user=UserOut.from_user(stored))
 
 
 # --- admin user management (users:manage) ---

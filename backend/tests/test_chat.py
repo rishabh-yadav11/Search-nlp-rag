@@ -19,6 +19,7 @@ import httpx
 import openai
 import pytest
 from _support import run_sync as _run
+from conftest import auth_cookie
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -75,15 +76,19 @@ def _auth_store(tmp_path):
     return s
 
 
-def _auth_headers(auth_store, email=EMAIL_A, role="user"):
-    """Create/upgrade the account and return a valid Bearer header for it."""
+def _auth_cookies(auth_store, email=EMAIL_A, role="user"):
+    """Create/upgrade the account and return the auth cookie for it.
+
+    The credential is an HttpOnly cookie, so a test authenticates exactly the
+    way a browser does: by cookie, never by an ``Authorization`` header.
+    """
     user = _run(auth_store.get_user_by_email(email))
     if user is None:
         user = _run(auth_store.create_user(email, "secret1", email.split("@")[0], role))
     elif user.role != role:
         _run(auth_store.update_user(user.id, None, role, None))
     token = _run(auth_store.issue_token(user.id, 7))
-    return {"Authorization": f"Bearer {token}"}
+    return auth_cookie(token)
 
 
 def test_create_and_list_sessions(tmp_path):
@@ -292,7 +297,7 @@ def test_api_requires_auth(tmp_path):
         assert client.get("/api/chat/sessions").status_code == 401
         # A device-id header (X-User-Id) no longer bypasses auth.
         assert client.post("/api/chat/sessions", headers={"X-User-Id": USER_A}).status_code == 401
-        assert client.post("/api/chat/sessions", headers={"Authorization": "Bearer garbage"}).status_code == 401
+        assert client.post("/api/chat/sessions", cookies=auth_cookie("garbage")).status_code == 401
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -301,10 +306,10 @@ def test_api_requires_auth(tmp_path):
 def test_api_create_and_list(tmp_path):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        created = client.post("/api/chat/sessions", headers=h).json()
+        h = _auth_cookies(auth_store)
+        created = client.post("/api/chat/sessions", cookies=h).json()
         assert created["id"]
-        listed = client.get("/api/chat/sessions", headers=h).json()
+        listed = client.get("/api/chat/sessions", cookies=h).json()
         assert [s["id"] for s in listed] == [created["id"]]
     finally:
         _run(auth_store.close())
@@ -314,21 +319,21 @@ def test_api_create_and_list(tmp_path):
 def test_api_get_rename_delete_flow(tmp_path):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        h_b = _auth_headers(auth_store, email=EMAIL_B)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        h_b = _auth_cookies(auth_store, email=EMAIL_B)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["messages"] == []
 
-        renamed = client.patch(f"/api/chat/sessions/{sid}", headers=h, json={"content": "Renamed"}).json()
+        renamed = client.patch(f"/api/chat/sessions/{sid}", cookies=h, json={"content": "Renamed"}).json()
         assert renamed["title"] == "Renamed"
 
         # Other accounts cannot read this conversation.
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h_b).status_code == 404
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h_b).status_code == 404
 
-        assert client.delete(f"/api/chat/sessions/{sid}", headers=h).status_code == 200
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h).status_code == 404
+        assert client.delete(f"/api/chat/sessions/{sid}", cookies=h).status_code == 200
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h).status_code == 404
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -337,8 +342,8 @@ def test_api_get_rename_delete_flow(tmp_path):
 def test_api_send_message_runs_turn(tmp_path, monkeypatch):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_turn(question, history):
             assert question == "Who invested in fintech?"
@@ -347,7 +352,7 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
 
         monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
 
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "Who invested in fintech?"})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "Who invested in fintech?"})
         assert r.status_code == 200
         body = r.json()
         assert body["user"]["content"] == "Who invested in fintech?"
@@ -357,9 +362,9 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
         assert body["assistant"]["completion_tokens"] == 45
         assert body["assistant"]["cost"] == 0.0012
 
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["title"] == "Who invested in fintech?"
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["title"] == "Who invested in fintech?"
 
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert len(detail["messages"]) == 2
         assert detail["messages"][1]["prompt_tokens"] == 120
         assert detail["messages"][1]["cost"] == 0.0012
@@ -785,29 +790,29 @@ def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkey
 def test_api_usage_stats(tmp_path, monkeypatch):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        h_b = _auth_headers(auth_store, email=EMAIL_B)
-        assert client.get("/api/chat/usage", headers=h).json() == {
+        h = _auth_cookies(auth_store)
+        h_b = _auth_cookies(auth_store, email=EMAIL_B)
+        assert client.get("/api/chat/usage", cookies=h).json() == {
             "sessions": 0, "messages": 0, "total_tokens": 0, "total_cost": 0.0
         }
 
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_turn(question, history):
             return "answer", [], None, 100, 50, 0.0005
 
         monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
-        client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "query one"})
-        client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "query two"})
+        client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "query one"})
+        client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "query two"})
 
-        usage = client.get("/api/chat/usage", headers=h).json()
+        usage = client.get("/api/chat/usage", cookies=h).json()
         assert usage["sessions"] == 1
         assert usage["messages"] == 4  # 2 user + 2 assistant
         assert usage["total_tokens"] == 300  # 2 * (100 + 50)
         assert abs(usage["total_cost"] - 0.001) < 1e-9
 
         # Other users see their own usage only.
-        assert client.get("/api/chat/usage", headers=h_b).json()["total_tokens"] == 0
+        assert client.get("/api/chat/usage", cookies=h_b).json()["total_tokens"] == 0
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -816,9 +821,9 @@ def test_api_usage_stats(tmp_path, monkeypatch):
 def test_api_send_message_rejects_empty(tmp_path):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
-        assert client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "   "}).status_code == 400
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
+        assert client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "   "}).status_code == 400
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -854,15 +859,15 @@ def test_api_stream_smalltalk_short_circuits(tmp_path, monkeypatch):
 
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def boom(*args, **kwargs):
             raise AssertionError("retrieval should not run for small talk")
 
         monkeypatch.setattr(main, "retrieve_and_rerank", boom)
 
-        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "good morning"}) as r:
+        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", cookies=h, json={"content": "good morning"}) as r:
             assert r.status_code == 200
             assert r.headers["content-type"].startswith("text/event-stream")
             body = "".join(r.iter_text())
@@ -873,7 +878,7 @@ def test_api_stream_smalltalk_short_circuits(tmp_path, monkeypatch):
         assert "event: error" not in body
 
         # Assistant message persisted.
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert len(detail["messages"]) == 2
         assert detail["messages"][1]["role"] == "assistant"
     finally:
@@ -885,8 +890,8 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
     """SSE stream with a real LLM path emits deltas + a done event with usage."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(
@@ -907,7 +912,7 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
         monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
         _pin_budget_disabled(monkeypatch)
 
-        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "Who invested in fintech?"}) as r:
+        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", cookies=h, json={"content": "Who invested in fintech?"}) as r:
             assert r.status_code == 200
             body = "".join(r.iter_text())
 
@@ -916,7 +921,7 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
         assert "event: done" in body
         assert "prompt_tokens" in body
 
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["messages"][1]["content"] == "Hello world!"
         assert detail["messages"][1]["prompt_tokens"] == 50
         assert detail["messages"][1]["completion_tokens"] == 10
@@ -929,8 +934,8 @@ def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
     """SSE stream fails closed with an error event when the daily budget is hit."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="prompt-text", sources=[{"id": 1}], note=None, needs_llm=True)
@@ -940,7 +945,7 @@ def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
         # refused, so no billed call is ever started.
         _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=10.0)
 
-        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", headers=h, json={"content": "question"}) as r:
+        with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", cookies=h, json={"content": "question"}) as r:
             assert r.status_code == 200
             body = "".join(r.iter_text())
 
@@ -996,17 +1001,17 @@ def test_analytics_chat_endpoint(tmp_path):
     auth_module.store = auth_store
     client = TestClient(main.app)
     try:
-        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
-        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
-        client.post(f"/api/chat/sessions/{sid}/messages", headers=admin_h, json={"content": "hello"})
+        admin_h = _auth_cookies(auth_store, email="admin@example.com", role="admin")
+        sid = client.post("/api/chat/sessions", cookies=admin_h).json()["id"]
+        client.post(f"/api/chat/sessions/{sid}/messages", cookies=admin_h, json={"content": "hello"})
 
         # Regular users are denied analytics.
-        user_h = _auth_headers(auth_store, email=EMAIL_A)
-        assert client.get("/analytics/chat", headers=user_h).status_code == 403
+        user_h = _auth_cookies(auth_store, email=EMAIL_A)
+        assert client.get("/analytics/chat", cookies=user_h).status_code == 403
         # Unauthenticated requests are rejected.
         assert client.get("/analytics/chat").status_code == 401
 
-        res = client.get("/analytics/chat", headers=admin_h)
+        res = client.get("/analytics/chat", cookies=admin_h)
         assert res.status_code == 200
         d = res.json()
         assert d["sessions"] >= 1
@@ -1097,11 +1102,11 @@ def test_analytics_chat_endpoint_omits_titles(tmp_path, monkeypatch):
     auth_module.store = auth_store
     client = TestClient(main.app)
     try:
-        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin_h = _auth_cookies(auth_store, email="admin@example.com", role="admin")
         admin_id = _run(auth_store.get_user_by_email("admin@example.com")).id
-        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=admin_h).json()["id"]
         client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=admin_h,
+            f"/api/chat/sessions/{sid}/messages", cookies=admin_h,
             json={"content": PRIVATE_QUESTION},
         )
         # Precondition: the real turn titled the session from the question, so
@@ -1109,7 +1114,7 @@ def test_analytics_chat_endpoint_omits_titles(tmp_path, monkeypatch):
         title = _run(chat_store.get_session(sid, admin_id)).title
         assert title == PRIVATE_QUESTION[:60]
 
-        res = client.get("/analytics/chat", headers=admin_h)
+        res = client.get("/analytics/chat", cookies=admin_h)
         assert res.status_code == 200
         assert PRIVATE_QUESTION not in res.text
         assert title not in res.text
@@ -1135,12 +1140,12 @@ def test_analytics_chat_records_admin_audit(tmp_path):
     auth_module.store = auth_store
     client = TestClient(main.app)
     try:
-        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin_h = _auth_cookies(auth_store, email="admin@example.com", role="admin")
         admin = _run(auth_store.get_user_by_email("admin@example.com"))
-        user_h = _auth_headers(auth_store, email=EMAIL_A)
+        user_h = _auth_cookies(auth_store, email=EMAIL_A)
 
         assert _run(chat_store.admin_audit_log()) == []
-        assert client.get("/analytics/chat", headers=admin_h).status_code == 200
+        assert client.get("/analytics/chat", cookies=admin_h).status_code == 200
 
         log = _run(chat_store.admin_audit_log())
         assert log[0]["actor_id"] == admin.id
@@ -1149,7 +1154,7 @@ def test_analytics_chat_records_admin_audit(tmp_path):
 
         # A non-admin is denied and leaves no trace of a read it never made.
         before = len(log)
-        assert client.get("/analytics/chat", headers=user_h).status_code == 403
+        assert client.get("/analytics/chat", cookies=user_h).status_code == 403
         after = _run(chat_store.admin_audit_log())
         assert len(after) == before
         assert all(r["actor_id"] == admin.id for r in after)
@@ -1175,14 +1180,14 @@ def test_analytics_chat_survives_a_failing_audit_write(tmp_path, monkeypatch):
         raise RuntimeError("audit table unavailable")
 
     try:
-        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin_h = _auth_cookies(auth_store, email="admin@example.com", role="admin")
         admin = _run(auth_store.get_user_by_email("admin@example.com"))
-        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=admin_h).json()["id"]
         # top_by_* joins messages, so an empty session would not appear at all.
         _run(chat_store.append_message(sid, admin.id, "user", "a question"))
         monkeypatch.setattr(chat_store, "record_admin_audit", exploding_audit)
 
-        res = client.get("/analytics/chat", headers=admin_h)
+        res = client.get("/analytics/chat", cookies=admin_h)
         assert res.status_code == 200
         # The read still returns real data, not a degraded error payload.
         assert res.json()["sessions"] >= 1
@@ -3316,8 +3321,8 @@ def test_api_json_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypat
     cannot disagree."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_generate(client, prompt, model, system_prompt=None):
             # Exactly what generate_answer returns when the response carries no
@@ -3331,7 +3336,7 @@ def test_api_json_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypat
         monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
         r = client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "Who invested in fintech?"}
+            f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "Who invested in fintech?"}
         )
 
         # An ordinary, complete turn: no disconnect, no failure.
@@ -3377,9 +3382,9 @@ def test_api_require_store_uninitialized_503(tmp_path):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         chat_module.store = None
-        h = _auth_headers(auth_store)
-        assert client.get("/api/chat/sessions", headers=h).status_code == 503
-        assert client.post("/api/chat/sessions", headers=h).status_code == 503
+        h = _auth_cookies(auth_store)
+        assert client.get("/api/chat/sessions", cookies=h).status_code == 503
+        assert client.post("/api/chat/sessions", cookies=h).status_code == 503
     finally:
         chat_module.store = chat_store
         _run(auth_store.close())
@@ -3393,10 +3398,10 @@ def test_api_send_message_too_long_422(tmp_path):
     test_chat_content_bound.py."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
         long_msg = "x" * (chat_module.MAX_CONTENT_LEN + 1)
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": long_msg})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": long_msg})
         assert r.status_code == 422
     finally:
         _run(auth_store.close())
@@ -3408,14 +3413,14 @@ def test_api_send_message_budget_exceeded_429(tmp_path, monkeypatch):
     (ERROR PATH — daily budget)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def boom(question, history):
             raise chat_module.BudgetExceeded()
 
         monkeypatch.setattr(chat_module, "_run_turn", boom)
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
         assert r.status_code == 429
         assert "Daily AI budget reached" in r.text
     finally:
@@ -3435,7 +3440,7 @@ def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path,
     """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
+        h = _auth_cookies(auth_store)
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
         llm = _pin_llm_outage(monkeypatch, retries=2, reserve_usd=0.02)
 
@@ -3449,20 +3454,20 @@ def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path,
             "detail": "The language model could not be reached; please retry shortly.",
         }
 
-        json_sid = client.post("/api/chat/sessions", headers=h).json()["id"]
-        r = client.post(f"/api/chat/sessions/{json_sid}/messages", headers=h, json={"content": "Who invested in fintech?"})
+        json_sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
+        r = client.post(f"/api/chat/sessions/{json_sid}/messages", cookies=h, json={"content": "Who invested in fintech?"})
         assert r.status_code == 503
         assert r.json()["detail"] == expected
         # No fabricated answer is stored, and the failed turn leaves no dangling
         # user message behind.
-        assert client.get(f"/api/chat/sessions/{json_sid}", headers=h).json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{json_sid}", cookies=h[,)].json()["messages"] == []
 
-        sse_sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        sse_sid = client.post("/api/chat/sessions", cookies=h[,)].json()["id"]
         body = _stream_body(client, h, sse_sid, "Who invested in fintech?")
         assert "event: error" in body
         assert "event: done" not in body
         assert json.loads(re.search(r"event: error\ndata: (.*)", body).group(1)) == expected
-        assert client.get(f"/api/chat/sessions/{sse_sid}", headers=h).json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{sse_sid}", cookies=h[,)].json()["messages"] == []
 
         # The outage cost money on both paths: 3 billed attempts x $0.02.
         assert llm.calls == 6
@@ -3473,9 +3478,9 @@ def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path,
         _run(chat_store.close())
 
 
-def _stream_body(client, headers, sid, content):
+def _stream_body(client, cookies, sid, content):
     url = f"/api/chat/sessions/{sid}/messages/stream"
-    with client.stream("POST", url, headers=headers, json={"content": content}) as r:
+    with client.stream("POST", url, cookies=cookies, json={"content": content}) as r:
         assert r.status_code == 200
         return "".join(r.iter_text())
 
@@ -3492,8 +3497,8 @@ def test_api_stream_dataviz_nudge_replaces_answer(tmp_path, monkeypatch):
     the nudge answer, summing token usage (lines 1173-1176)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "no block here [1]."
@@ -3531,8 +3536,8 @@ def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
     of erroring the turn (lines 1171-1172)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
@@ -3566,8 +3571,8 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
     and the already-streamed answer is served."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
@@ -3626,8 +3631,8 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
     error event)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
@@ -3677,8 +3682,8 @@ def test_api_stream_ranking_nudge_replaces_answer(tmp_path, monkeypatch):
     (lines 1185-1188)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
@@ -3711,8 +3716,8 @@ def test_api_stream_ranking_nudge_failure_keeps_answer(tmp_path, monkeypatch):
     (lines 1183-1184)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
@@ -3746,8 +3751,8 @@ def test_api_stream_ranking_nudge_skipped_when_budget_exhausted(tmp_path, monkey
     the already-streamed refusal is served (no error event)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
@@ -3802,8 +3807,8 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
     served (no error event)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
@@ -3853,8 +3858,8 @@ def test_api_stream_records_summed_turn_cost_exactly_once(tmp_path, monkeypatch)
     is written exactly once, carrying all three calls' summed cost."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
@@ -3899,8 +3904,8 @@ def test_api_stream_llm_unavailable_sse(tmp_path, monkeypatch):
     (line 1213) instead of a done event (ERROR PATH — LLM retry exhaustion)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def boom(*args, **kwargs):
             raise chat_module.LLMUnavailableError()
@@ -3927,8 +3932,8 @@ def test_api_stream_generic_error_sse(tmp_path, monkeypatch):
     (lines 1216-1218), never a 500 to the client."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def boom(*args, **kwargs):
             raise RuntimeError("boom")
@@ -4034,8 +4039,8 @@ def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
     assistant message flagged aborted."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4053,7 +4058,7 @@ def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
 
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         roles = [m["role"] for m in msgs]
         # The user message survives: the client already saw its answer.
         assert roles == ["user", "assistant"]
@@ -4073,8 +4078,8 @@ def test_stream_abort_before_any_delta_deletes_user_message(tmp_path, monkeypatc
     assistant row is written."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4092,7 +4097,7 @@ def test_stream_abort_before_any_delta_deletes_user_message(tmp_path, monkeypatc
 
         _stream_body(client, h, sid, "Who invested in fintech?")
 
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert msgs == []
     finally:
         _run(auth_store.close())
@@ -4106,8 +4111,8 @@ def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypa
     flagged aborted."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4125,7 +4130,7 @@ def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypa
 
         _stream_body(client, h, sid, "Who invested in fintech?")
 
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["aborted"] is True
         assert "half an answer" in msgs[1]["content"]
@@ -4208,8 +4213,8 @@ def test_send_message_disconnect_rolls_back_without_assistant(tmp_path, monkeypa
     rollback: no assistant message, and the user message is removed."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_run_turn(question, history):
             return "An answer the client never receives.", [], None, 10, 5, 0.0001
@@ -4221,10 +4226,10 @@ def test_send_message_disconnect_rolls_back_without_assistant(tmp_path, monkeypa
         monkeypatch.setattr(chat_module, "_run_turn", fake_run_turn)
         monkeypatch.setattr(chat_module.Request, "is_disconnected", always_gone)
 
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
         # Not a success, and certainly not a 200 TurnOut.
         assert r.status_code >= 400
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -4237,19 +4242,19 @@ def test_send_message_budget_unavailable_is_503_not_empty_answer(tmp_path, monke
     instead would hide it behind a plausible 200."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def boom(question, history):
             raise chat_module.BudgetUnavailable("redis down")
 
         monkeypatch.setattr(chat_module, "_run_turn", boom)
 
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
         assert r.status_code == 503
         assert "budget" in json.dumps(r.json()).lower()
         # The dangling user message is rolled back, not left behind.
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -4260,8 +4265,8 @@ def test_api_stream_budget_unavailable_is_error_event(tmp_path, monkeypatch):
     explicit error event, never a silently served answer."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4581,8 +4586,8 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
     in-loop check — which runs BEFORE `streamed = True`."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4619,7 +4624,7 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
         # handler: an error would emit an 'error' event instead.
         assert "event: error" not in body
         # Rollback branch: nothing reached the client, so the user message is gone.
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
         # ...and the gate hold is NOT refunded: the call was made and billed, so
         # the money is settled, not handed back.
         assert budget.holds == {}
@@ -4642,8 +4647,8 @@ def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch)
     truncation marker (the ONE rule); it is simply also charged."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4660,7 +4665,7 @@ def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch)
 
         _stream_body(client, h, sid, "Who invested in fintech?")
 
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         # The ONE rule still holds: deltas were on the wire, so the turn persists.
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert "half an answer" in msgs[1]["content"]
@@ -4686,8 +4691,8 @@ def test_stream_failure_before_any_delta_charges_every_attempt(tmp_path, monkeyp
     """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
         llm = _pin_llm_outage(monkeypatch, retries=2, reserve_usd=0.02)
@@ -4700,7 +4705,7 @@ def test_stream_failure_before_any_delta_charges_every_attempt(tmp_path, monkeyp
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
         assert "LLM temporarily unavailable" in body
-        assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
         assert llm.calls == 3  # LLM_MAX_RETRIES + 1 requests, every one billed
         # $0.02 held per call, settled once for the whole failed call.
         assert budget.writes == [("settle", 60_000)]
@@ -4727,8 +4732,8 @@ def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, m
     sweep charges it -- so it could only destroy a delivered answer."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4753,7 +4758,7 @@ def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, m
         # in the answer the client already received.
         assert "event: done" in body
         assert "event: error" not in body
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["content"] == "The complete answer."
         assert "[answer truncated]" not in msgs[1]["content"]
@@ -4768,8 +4773,8 @@ def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypat
     message for an answer the LLM had already produced and been billed for."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4785,11 +4790,11 @@ def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypat
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
         monkeypatch.setattr(chat_module, "_answer_ranked", fake_answer_ranked)
 
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
 
         assert r.status_code == 200
         assert r.json()["assistant"]["content"] == "A billed answer [1]."
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert [m["role"] for m in msgs] == ["user", "assistant"]
     finally:
         _run(auth_store.close())
@@ -4832,8 +4837,8 @@ def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
     billed."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4845,11 +4850,11 @@ def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
         monkeypatch.setattr(chat_module, "_answer_ranked", fake_answer_ranked)
 
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
 
         assert r.status_code == 200
         assert r.json()["assistant"]["content"] == "An unmetered answer [1]."
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         # Opting out means opting out: not one command reached the counter.
         assert dead.touched == 0
@@ -4864,8 +4869,8 @@ def test_disabled_cap_never_consults_the_store_on_the_stream_path(tmp_path, monk
     a completed answer into an `error` event (#255)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4883,7 +4888,7 @@ def test_disabled_cap_never_consults_the_store_on_the_stream_path(tmp_path, monk
 
         assert "event: done" in body
         assert "event: error" not in body
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert msgs[1]["content"] == "A streamed, unmetered answer."
         assert dead.touched == 0
     finally:
@@ -4902,8 +4907,8 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
     and its hold RELEASED, so the money was handed back instead of recorded."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
@@ -4926,7 +4931,7 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
         body = _stream_body(client, h, sid, "show me a chart of top deals")
 
         assert "event: error" not in body
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         # Deltas reached the client, so the turn is persisted and flagged.
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["aborted"] is True
@@ -4951,8 +4956,8 @@ def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkey
     than stored at cost 0.0 with its hold released."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             # A refusal, so the RANKING nudge gate is the post-stream check that
@@ -4971,7 +4976,7 @@ def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkey
         body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
 
         assert "event: error" not in body
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["aborted"] is True
         assert msgs[1]["cost"] == pytest.approx(0.1)
@@ -4999,8 +5004,8 @@ def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tm
     covered here -- it cannot be reached through `stream_answer`.)"""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             # A ranking refusal, so the turn reaches the ranking nudge gate
@@ -5027,7 +5032,7 @@ def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tm
         body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
 
         assert "event: error" in body
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         # Deltas reached the client, so the ONE rule persists the turn.
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["aborted"] is True
@@ -5058,8 +5063,8 @@ def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypa
     cannot disagree."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A fully delivered answer [1]."
@@ -5078,7 +5083,7 @@ def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypa
         # An ordinary, complete turn: no disconnect, no failure.
         assert "event: done" in body
         assert "event: error" not in body
-        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert msgs[1]["aborted"] is False
         # Charged, not released, and the stored cost matches what was charged.
         assert msgs[1]["cost"] == pytest.approx(0.02)
@@ -5096,8 +5101,8 @@ def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, m
     would also pass if every turn were blindly charged the reserve."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A fully delivered answer [1]."
@@ -5233,11 +5238,11 @@ def test_api_session_detail_flags_truncation_to_the_client(tmp_path, monkeypatch
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 5)
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h[,)].json()["id"]
         _seed_messages(chat_store, sid, 40, user_id=_run(auth_store.get_user_by_email(EMAIL_A)).id)
 
-        body = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        body = client.get(f"/api/chat/sessions/{sid}", cookies=h[,)].json()
 
         assert len(body["messages"]) == 5
         assert body["truncated"] is True
@@ -5251,11 +5256,11 @@ def test_api_session_detail_under_the_cap_is_not_flagged_truncated(tmp_path, mon
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 200)
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h[,)].json()["id"]
         _seed_messages(chat_store, sid, 12, user_id=_run(auth_store.get_user_by_email(EMAIL_A)).id)
 
-        body = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        body = client.get(f"/api/chat/sessions/{sid}", cookies=h[,)].json()
 
         assert body["truncated"] is False
         assert body["total_messages"] == 12

@@ -8,20 +8,27 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import auth_cookie, session_cookie_value
 from fastapi import Depends, HTTPException
 from rate_limit_fake import RateLimitRedisFake
 
 from app import auth
 from app import config as config_module
 from app.auth import AuthStore, DuplicateEmailError, StoredUser, bootstrap_admin
+from app.config import config
 
 
 def _headers(*pairs) -> dict:
     return {k: v for k, v in pairs}
 
 
-def _req(headers: dict, state=None) -> SimpleNamespace:
-    return SimpleNamespace(headers=headers, client=None, state=state or SimpleNamespace())
+def _req(headers: dict | None = None, state=None, cookies: dict | None = None, method: str = "GET") -> SimpleNamespace:
+    """A stand-in Request. ``cookies``/``method`` are attributes because
+    require_auth reads the session cookie and runs the same-origin guard,
+    which is scoped to unsafe methods."""
+    return SimpleNamespace(
+        headers=headers or {}, client=None, state=state or SimpleNamespace(), cookies=cookies or {}, method=method
+    )
 
 
 @pytest.fixture
@@ -784,24 +791,27 @@ def test_require_permission_without_auth_is_401():
     assert e.value.status_code == 401
 
 
-def test_require_auth_accepts_bearer_and_rejects_missing(store, monkeypatch):
+def test_require_auth_accepts_session_cookie_and_rejects_missing(store, monkeypatch):
     monkeypatch.setattr(auth, "store", store)
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     raw = asyncio.run(store.issue_token(user.id, 7))
 
-    async def with_bearer():
-        req = _req({"authorization": f"Bearer {raw}"})
+    async def with_cookie():
+        req = _req({}, cookies=auth_cookie(raw))
         await auth.require_auth(req)
         return req.state.user_id
 
-    assert asyncio.run(with_bearer()) == user.id
+    assert asyncio.run(with_cookie()) == user.id
 
-    async def expect_401(headers: dict):
-        await auth.require_auth(_req(headers))
+    async def expect_401(**kwargs):
+        await auth.require_auth(_req(**kwargs))
 
-    for bad_headers in ({}, {"authorization": "Bearer garbage"}):
+    # No credential, a garbage cookie, and a genuinely valid token sent in the
+    # old Authorization header are all refused: the header is no longer a
+    # transport, so the header path is gone rather than merely shadowed.
+    for bad_kwargs in ({}, {"cookies": auth_cookie("garbage")}, {"headers": {"authorization": f"Bearer {raw}"}}):
         with pytest.raises(HTTPException) as e:
-            asyncio.run(expect_401(bad_headers))
+            asyncio.run(expect_401(**bad_kwargs))
         assert e.value.status_code == 401
 
 
@@ -985,18 +995,19 @@ def _signup(client, email, password="secret12", name=""):
 
     Signup deliberately returns the same tokenless ``{"message": ...}`` for a
     fresh address and an already-registered one, so tests that need a session
-    must log in afterwards (see ``_token``)."""
+    must log in afterwards (see ``_session``)."""
     r = client.post("/api/auth/signup", json={"email": email, "password": password, "name": name})
     assert r.status_code == 200, r.text
     return r.json()
 
 
-def _token(client, email, password="secret12", name=""):
-    """Register the address, then log in for a bearer token."""
+def _session(client, email, password="secret12", name=""):
+    """Register the address, then log in and return the auth cookie."""
     _signup(client, email, password, name)
     r = client.post("/api/auth/login", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
-    return r.json()["token"]
+    return auth_cookie(session_cookie_value(r))
+
 
 
 def test_signup_login_me_flow(tmp_path):
@@ -1008,15 +1019,17 @@ def test_signup_login_me_flow(tmp_path):
         assert set(data) == {"message"}
         assert data["message"] == auth.SIGNUP_ACCEPTED_MESSAGE
 
-        # login is how a session is obtained, and normalizes the same address
+        # login is how a session is obtained, and normalizes the same address.
+        # The token rides in an HttpOnly cookie and never in the body.
         login = client.post("/api/auth/login", json={"email": "  New@Example.com ", "password": "secret12"})
         assert login.status_code == 200
         assert login.json()["user"]["email"] == "new@example.com"
         assert login.json()["user"]["role"] == "user"
-        token = login.json()["token"]
+        assert "token" not in login.json()
+        cookie = auth_cookie(session_cookie_value(login))
 
-        # me with the issued token
-        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["email"] == "new@example.com"
+        # me with the issued cookie
+        assert client.get("/api/auth/me", cookies=cookie).json()["email"] == "new@example.com"
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -1116,8 +1129,8 @@ def test_signup_role_ignores_env_default_role(tmp_path, monkeypatch):
         assert stored.role == "user"
 
         # a real session for that account reports no privilege either
-        token = client.post("/api/auth/login", json={"email": "env@x.co", "password": "secret12"}).json()["token"]
-        me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+        login = client.post("/api/auth/login", json={"email": "env@x.co", "password": "secret12"})
+        me = client.get("/api/auth/me", cookies=auth_cookie(session_cookie_value(login)))
         assert me.status_code == 200
         assert me.json()["role"] == "user"
         assert me.json()["id"] == stored.id
@@ -1140,8 +1153,8 @@ def test_signup_ignores_role_in_request_payload(tmp_path):
         )
         assert r.status_code == 200
         assert asyncio.run(s.get_user_by_email("sneaky@x.co")).role == "user"
-        token = client.post("/api/auth/login", json={"email": "sneaky@x.co", "password": "secret12"}).json()["token"]
-        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["role"] == "user"
+        login = client.post("/api/auth/login", json={"email": "sneaky@x.co", "password": "secret12"})
+        assert client.get("/api/auth/me", cookies=auth_cookie(session_cookie_value(login))).json()["role"] == "user"
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -1279,11 +1292,13 @@ def test_me_requires_auth_and_logout_revokes(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
         assert client.get("/api/auth/me").status_code == 401
-        token = _token(client, "a@x.co")
-        h = {"Authorization": f"Bearer {token}"}
-        assert client.get("/api/auth/me", headers=h).status_code == 200
-        assert client.post("/api/auth/logout", headers=h).json() == {"ok": True}
-        assert client.get("/api/auth/me", headers=h).status_code == 401  # token revoked
+        cookie = _session(client, "a@x.co")
+        token = cookie[config.AUTH_COOKIE_NAME]
+        assert client.get("/api/auth/me", cookies=cookie).status_code == 200
+        assert client.post("/api/auth/logout", cookies=cookie).json() == {"ok": True}
+        # Replaying the raw token is 401: revocation is server-side, not merely
+        # a cookie the client happened to drop.
+        assert client.get("/api/auth/me", cookies=auth_cookie(token)).status_code == 401
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -1292,18 +1307,19 @@ def test_me_requires_auth_and_logout_revokes(tmp_path):
 def test_change_password_invalidates_other_tokens(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
-        token = _token(client, "a@x.co")
-        h = {"Authorization": f"Bearer {token}"}
+        cookie = _session(client, "a@x.co")
 
-        wrong = client.post("/api/auth/change-password", headers=h, json={"current_password": "nope12", "new_password": "secret21"})
+        wrong = client.post("/api/auth/change-password", cookies=cookie, json={"current_password": "nope12", "new_password": "secret21"})
         assert wrong.status_code == 400
 
-        ok = client.post("/api/auth/change-password", headers=h, json={"current_password": "secret12", "new_password": "secret21"})
+        ok = client.post("/api/auth/change-password", cookies=cookie, json={"current_password": "secret12", "new_password": "secret21"})
         assert ok.status_code == 200
-        new_token = ok.json()["token"]
+        # the rotated session is re-issued as a cookie, never in the body
+        assert "token" not in ok.json()
+        new_cookie = auth_cookie(session_cookie_value(ok))
         # old token was revoked, the new one works
-        assert client.get("/api/auth/me", headers=h).status_code == 401
-        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {new_token}"}).status_code == 200
+        assert client.get("/api/auth/me", cookies=cookie).status_code == 401
+        assert client.get("/api/auth/me", cookies=new_cookie).status_code == 200
         # and the new password logs in
         assert client.post("/api/auth/login", json={"email": "a@x.co", "password": "secret21"}).status_code == 200
     finally:
@@ -1435,29 +1451,29 @@ def test_bootstrap_admin_survives_duplicate_and_lock_races(tmp_path, monkeypatch
 def test_admin_user_management_rbac(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
-        user_token = _token(client, "user@x.co")
-        admin_token = _token(client, "boss@x.co", name="Boss")
+        uh = _session(client, "user@x.co")
+        ah = _session(client, "boss@x.co", name="Boss")
         asyncio.run(s.update_user(asyncio.run(s.get_user_by_email("boss@x.co")).id, None, "admin", None))
 
-        uh = {"Authorization": f"Bearer {user_token}"}
-        ah = {"Authorization": f"Bearer {admin_token}"}
+        
+        
 
         # regular users cannot read or manage users
-        assert client.get("/api/auth/users", headers=uh).status_code == 403
-        assert client.patch("/api/auth/users/some-id", headers=uh, json={"role": "user"}).status_code == 403
+        assert client.get("/api/auth/users", cookies=uh).status_code == 403
+        assert client.patch("/api/auth/users/some-id", cookies=uh, json={"role": "user"}).status_code == 403
         # admins can list; non-existent id -> 404
-        listing = client.get("/api/auth/users", headers=ah)
+        listing = client.get("/api/auth/users", cookies=ah)
         assert listing.status_code == 200 and len(listing.json()) == 2
-        assert client.get("/api/auth/users/nope", headers=ah).status_code == 404
+        assert client.get("/api/auth/users/nope", cookies=ah).status_code == 404
         # invalid role -> 422
         uid = listing.json()[0]["id"]
-        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"role": "superuser"}).status_code == 422
+        assert client.patch(f"/api/auth/users/{uid}", cookies=ah, json={"role": "superuser"}).status_code == 422
         # promote the user
         user_id = asyncio.run(s.get_user_by_email("user@x.co")).id
-        assert client.patch(f"/api/auth/users/{user_id}", headers=ah, json={"role": "admin"}).status_code == 200
+        assert client.patch(f"/api/auth/users/{user_id}", cookies=ah, json={"role": "admin"}).status_code == 200
         # revoke all tokens
-        assert client.post(f"/api/auth/users/{user_id}/tokens/revoke", headers=ah).json() == {"ok": True}
-        assert client.get("/api/auth/me", headers=uh).status_code == 401
+        assert client.post(f"/api/auth/users/{user_id}/tokens/revoke", cookies=ah).json() == {"ok": True}
+        assert client.get("/api/auth/me", cookies=uh).status_code == 401
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -1624,14 +1640,14 @@ def test_get_user_endpoint(tmp_path):
     """GET /api/auth/users/{id} returns the requested user (line 548)."""
     client, s = _auth_app(tmp_path)
     try:
-        token = _token(client, "boss@x.co")
+        ah = _session(client, "boss@x.co")
         uid = _promote_to_admin(client, s, "boss@x.co")
-        ah = {"Authorization": f"Bearer {token}"}
-        r = client.get(f"/api/auth/users/{uid}", headers=ah)
+        
+        r = client.get(f"/api/auth/users/{uid}", cookies=ah)
         assert r.status_code == 200
         assert r.json()["email"] == "boss@x.co"
         assert r.json()["role"] == "admin"
-        assert client.get("/api/auth/users/nope", headers=ah).status_code == 404
+        assert client.get("/api/auth/users/nope", cookies=ah).status_code == 404
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -1642,14 +1658,14 @@ def test_patch_user_last_admin_guard_endpoint(tmp_path):
     ERROR PATH — self-lockout protection."""
     client, s = _auth_app(tmp_path)
     try:
-        token = _token(client, "boss@x.co")
+        ah = _session(client, "boss@x.co")
         uid = _promote_to_admin(client, s, "boss@x.co")
-        ah = {"Authorization": f"Bearer {token}"}
-        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"role": "user"}).status_code == 400
-        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"is_active": False}).status_code == 400
+        
+        assert client.patch(f"/api/auth/users/{uid}", cookies=ah, json={"role": "user"}).status_code == 400
+        assert client.patch(f"/api/auth/users/{uid}", cookies=ah, json={"is_active": False}).status_code == 400
         # once a second admin exists the guard releases
         asyncio.run(s.create_user("other@x.co", "secret12", "O", "admin"))
-        assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"role": "user"}).status_code == 200
+        assert client.patch(f"/api/auth/users/{uid}", cookies=ah, json={"role": "user"}).status_code == 200
         assert asyncio.run(s.get_user(uid)).role == "user"
     finally:
         auth.store = None
@@ -1661,13 +1677,13 @@ def test_delete_user_last_admin_guard_endpoint(tmp_path):
     self-lockout protection."""
     client, s = _auth_app(tmp_path)
     try:
-        token = _token(client, "boss@x.co")
+        ah = _session(client, "boss@x.co")
         uid = _promote_to_admin(client, s, "boss@x.co")
-        ah = {"Authorization": f"Bearer {token}"}
-        assert client.delete(f"/api/auth/users/{uid}", headers=ah).status_code == 400
+        
+        assert client.delete(f"/api/auth/users/{uid}", cookies=ah).status_code == 400
         # a second admin releases the guard
         asyncio.run(s.create_user("other@x.co", "secret12", "O", "admin"))
-        assert client.delete(f"/api/auth/users/{uid}", headers=ah).status_code == 200
+        assert client.delete(f"/api/auth/users/{uid}", cookies=ah).status_code == 200
         assert asyncio.run(s.get_user(uid)) is None
     finally:
         auth.store = None

@@ -80,3 +80,32 @@ def parse_config(monkeypatch):
 
     return _parse
 
+def auth_cookie(token: str) -> dict:
+    """The cookie a real browser attaches for this session token.
+
+    The auth credential is an HttpOnly cookie, so tests authenticate the way the
+    app does in production: by cookie, never by an ``Authorization`` header.
+    """
+    from app.config import config
+
+    return {config.AUTH_COOKIE_NAME: token}
+
+
+def login_cookie(client, email: str, password: str = "secret12") -> dict:
+    """Log in through the real endpoint and return the resulting cookie dict."""
+    r = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    return auth_cookie(session_cookie_value(r))
+
+
+def session_cookie_value(response) -> str:
+    """The token carried by a response's ``Set-Cookie`` for the auth cookie."""
+    from app.config import config
+
+    for header in response.headers.get_list("set-cookie"):
+        name, _, rest = header.partition("=")
+        if name.strip() == config.AUTH_COOKIE_NAME:
+            return rest.split(";")[0]
+    raise AssertionError(
+        f"login set no {config.AUTH_COOKIE_NAME} cookie: {response.headers.get_list('set-cookie')}"
+    )
