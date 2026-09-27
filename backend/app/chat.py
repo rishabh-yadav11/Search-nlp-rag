@@ -1790,7 +1790,12 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
     # message limit -- is the turn's fan-out. Past the cap this is not a
     # comparison anyone can read anyway, so answer it on the ordinary
     # single-query path instead of fanning out one pipeline per entity.
-    if multi is not None and len(multi.entities) <= config.CHAT_MAX_MULTI_ENTITIES:
+    #
+    # Floored at 2: the feature is a comparison over two or more entities, so a
+    # misconfigured 0 or 1 would silently disable it rather than mean anything.
+    # This is a comparison-length cap, not a truncation, so a low value cannot
+    # produce an empty entity list.
+    if multi is not None and len(multi.entities) <= max(2, config.CHAT_MAX_MULTI_ENTITIES):
         return await _prepare_multi_entity_turn(multi, question, history)
 
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
@@ -1935,9 +1940,21 @@ async def _prepare_multi_entity_turn(
         gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
         return [a for a in reranked if a.score >= gate]
 
-    per_entity: list[list[SourceArticle]] = list(
-        await asyncio.gather(*(_leg(entity) for entity in multi.entities))
+    # return_exceptions + an ordered re-raise, so failure behaviour matches the
+    # sequential loop this replaced. Plain gather() would propagate whichever leg
+    # lost the race and leave the others running to completion on a failed turn
+    # -- up to CHAT_MAX_MULTI_ENTITIES extra pipelines still hitting Qdrant and
+    # the encoder lock, their exceptions logged as never retrieved. Here every
+    # leg is awaited, and the error surfaced is the FIRST entity's, which is
+    # what the sequential loop raised.
+    results = await asyncio.gather(
+        *(_leg(entity) for entity in multi.entities), return_exceptions=True
     )
+    per_entity: list[list[SourceArticle]] = []
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+        per_entity.append(result)
 
     by_id: dict[int, SourceArticle] = {}
     id_entities: dict[int, list[str]] = {}

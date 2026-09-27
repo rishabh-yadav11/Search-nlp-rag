@@ -108,8 +108,10 @@ class _Leg:
                 await asyncio.wait_for(arrived.wait(), timeout=2.0)
             # Always yield once, so two legs with no delay can still overlap.
             await asyncio.sleep(self.delay if entity in self._slow_entities else 0)
+            # Copy, don't alias: body_rescue rewrites a.score in place, so a
+            # shared fixture object would carry one test's rescue into the next.
             return (
-                list(self.articles.get(entity, [])),
+                [a.model_copy(deep=True) for a in self.articles.get(entity, [])],
                 self.facts.get(f"{entity}.industry"),
                 None,
                 None,
@@ -160,26 +162,6 @@ def stub_pipeline(monkeypatch):
 
 def _multi(entities: list[str], mode: str = "comparison", scaffold: str = "funding") -> MultiEntityQuery:
     return MultiEntityQuery(mode=mode, entities=entities, scaffold=scaffold)
-
-
-def _turn(entities: list[str], mode: str = "comparison", question: str = "q"):
-    """Run the real multi-entity turn over a fresh stub each time."""
-    leg = _Leg(entity_articles=_ARTICLES)
-    return leg, _run(chat_module._prepare_multi_entity_turn(_multi(entities, mode), question, []))
-
-
-def _run_with(leg: _Leg, entities: list[str], mode: str, question: str = "q"):
-    """Drive the real turn with a caller-supplied stub, so the stub's
-    bookkeeping survives to the assertions."""
-    from app import main
-
-    saved = main.retrieve_with_auto_facet_fallback, main.body_rescue
-    main.retrieve_with_auto_facet_fallback = leg.retrieve
-    main.body_rescue = leg.rescue
-    try:
-        return _run(chat_module._prepare_multi_entity_turn(_multi(entities, mode), question, []))
-    finally:
-        main.retrieve_with_auto_facet_fallback, main.body_rescue = saved
 
 
 # The article set every equivalence test shares: a shared id (3) so the dedupe
@@ -277,36 +259,6 @@ def test_gathered_result_identical_to_sequential(stub_pipeline, monkeypatch, mod
     # The shared article is annotated with both of its entities, in entity order.
     assert "Entities: alpha, bravo" in gathered.answer
     assert "Entities: alpha, charlie" in gathered.answer
-
-
-def test_entity_annotation_and_rank_order_follow_entity_order(stub_pipeline, monkeypatch):
-    """Annotation lists entities in ENTITY order, not completion order.
-
-    bravo finishes last (only it sleeps), so a gather that leaked completion
-    order into the combine step would print "bravo, alpha" here.
-    """
-    entities = ["alpha", "bravo"]
-    # Each entity gets a DISTINCT article plus a shared one. Distinct ids are
-    # what make a mispairing observable: with the same article for both, the
-    # prompt is byte-identical whether the results are paired correctly or
-    # reversed, so the test could not fail. The shared id keeps the annotation
-    # and the rank key in play.
-    leg = stub_pipeline(entity_articles={
-        "alpha": [_article(1, "alpha one", 0.9), _article(3, "shared", 0.7)],
-        "bravo": [_article(2, "bravo two", 0.9), _article(3, "shared", 0.7)],
-    })
-    leg.slow_for("bravo")
-
-    turn = _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
-
-    assert leg.finished == ["alpha", "bravo"], "bravo must have completed last for this to mean anything"
-    # alpha's own article is attributed to alpha, and bravo's to bravo: reversed
-    # pairing would print "Entities: bravo" on article 1.
-    assert "Entities: alpha" in turn.answer
-    assert "Entities: bravo" in turn.answer
-    # The shared article is annotated with both, in entity order.
-    assert "Entities: alpha, bravo" in turn.answer
-    assert "Entities: bravo, alpha" not in turn.answer
 
 
 def _entities_by_article(answer: str) -> dict[str, str]:
@@ -488,3 +440,120 @@ def test_gathered_turn_beats_the_sequential_turn(stub_pipeline, monkeypatch):
     # Never better than one delay plus changeover: the legs cannot overlap
     # more than the slowest one.
     assert gathered >= 0.05
+
+
+# --- failure behaviour matches the sequential loop ---
+
+
+def test_failing_leg_raises_the_first_entities_error(stub_pipeline, monkeypatch):
+    """The error surfaced is the FIRST entity's, as the sequential loop raised.
+
+    Concurrent legs finish in arbitrary order, so propagating whichever raises
+    first would make the surfaced error a race. The turn is also fully awaited,
+    so no leg is left running against Qdrant after it has already failed.
+    """
+    entities = ["alpha", "bravo", "charlie"]
+    leg = stub_pipeline(entity_articles=_ARTICLES)
+
+    async def boom(rq, top_k, **kwargs):
+        entity = rq.split(" ")[0]
+        leg.started.append(entity)
+        await asyncio.sleep(0.01 if entity == "charlie" else 0)
+        if entity == "alpha":
+            raise RuntimeError("alpha failed")
+        if entity == "bravo":
+            raise ValueError("bravo failed")
+        return ([_article(9, "charlie three", 0.9)], None, None, None)
+
+    from app import main
+
+    main.retrieve_with_auto_facet_fallback = boom
+    try:
+        with pytest.raises(RuntimeError, match="alpha failed"):
+            _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
+    finally:
+        main.retrieve_with_auto_facet_fallback = leg.retrieve
+
+    # charlie raises nothing and is the last entity: the first entity's error
+    # wins even though bravo also failed and charlie may finish later.
+    assert sorted(leg.started) == sorted(entities), "every leg must be awaited, none orphaned"
+
+
+def test_error_ordering_is_deterministic_not_a_race(stub_pipeline, monkeypatch):
+    """When several legs fail, the surfaced error is the FIRST entity's.
+
+    Plain gather() raises whichever leg lost the race, so the same question
+    could surface different errors on different runs. Ordering by ENTITY
+    position is what makes the failure deterministic.
+
+    Both alpha and bravo raise, but they are staggered the OTHER way round:
+    alpha is FIRST in entity order yet raises LAST in wall-clock. A race
+    therefore surfaces bravo's error, and only the entity-ordered re-raise
+    surfaces alpha's -- so this test cannot pass vacuously.
+    """
+    entities = ["alpha", "bravo", "charlie"]
+    _Leg(entity_articles=_ARTICLES)  # installs the fixture patch we then replace
+
+    async def flaky(rq, top_k, **kwargs):
+        entity = rq.split(" ")[0]
+        if entity == "alpha":
+            await asyncio.sleep(0.02)
+        elif entity == "bravo":
+            await asyncio.sleep(0)
+        if entity in ("alpha", "bravo"):
+            raise RuntimeError(f"{entity} failed")
+        return ([_article(1, f"{entity} deal", 0.9)], None, None, None)
+
+    from app import main
+
+    saved = main.retrieve_with_auto_facet_fallback
+    main.retrieve_with_auto_facet_fallback = flaky
+    try:
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="alpha failed"):
+                _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
+    finally:
+        main.retrieve_with_auto_facet_fallback = saved
+
+
+# --- the config knobs cannot be misconfigured into a hang or a dead feature ---
+
+
+def test_zero_concurrency_knob_does_not_hang(stub_pipeline, monkeypatch):
+    """CHAT_MULTI_ENTITY_CONCURRENCY=0 would make the semaphore never release.
+
+    asyncio.Semaphore(0) blocks every leg forever, which is strictly worse than
+    the sequential bug being fixed, so the value is floored at 1.
+    """
+    entities = ["alpha", "bravo"]
+    monkeypatch.setattr(chat_module.config, "CHAT_MULTI_ENTITY_CONCURRENCY", 0)
+    leg = stub_pipeline(
+        entity_articles={e: [_article(i + 1, f"{e} deal", 0.9)] for i, e in enumerate(entities)}
+    )
+
+    turn = _run(asyncio.wait_for(
+        chat_module._prepare_multi_entity_turn(_multi(entities), "q", []), timeout=5.0
+    ))
+
+    assert leg.max_in_flight == 1, "0 must floor to 1, not deadlock the turn"
+    assert [s["title"] for s in turn.sources] == ["alpha deal", "bravo deal"]
+
+
+@pytest.mark.parametrize("cap", [0, 1, -5])
+def test_tiny_entity_cap_keeps_the_feature_alive(stub_pipeline, monkeypatch, cap):
+    """A comparison needs at least two entities, so a cap below that floors to 2.
+
+    Otherwise a typo in the env would silently disable multi-entity turns
+    entirely rather than mean anything.
+    """
+    entities = ["alpha", "bravo"]
+    monkeypatch.setattr(chat_module.config, "CHAT_MAX_MULTI_ENTITIES", cap)
+    leg = stub_pipeline(
+        entity_articles={e: [_article(i + 1, f"{e} deal", 0.9)] for i, e in enumerate(entities)}
+    )
+    monkeypatch.setattr(chat_module, "detect_multi_entity", lambda q: _multi(entities))
+
+    turn = _run(chat_module._prepare_turn("compare alpha and bravo funding", []))
+
+    assert sorted(leg.started) == sorted(entities), "a two-entity comparison must still run"
+    assert "## Multi-entity comparison" in (turn.system or "")
