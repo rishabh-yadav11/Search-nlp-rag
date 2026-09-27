@@ -1084,25 +1084,6 @@ def _append_nudge(answer: str, nudge_content: str) -> str:
     return (answer.rstrip() + "\n\n" + addition).strip()
 
 
-def _llm_unavailable_answer(question: str, sources: list[dict]) -> str:
-    """Graceful fallback when retrieval succeeded but the LLM could not be
-    reached: honest prose (never fabricated facts) that tells the user the
-    matching sources are listed below. Token usage and cost are zero."""
-    n = len(sources)
-    if n == 0:
-        return (
-            f"I found articles matching '{question}', but I couldn't generate an "
-            "answer right now. Please try again shortly."
-        )
-    if n == 1:
-        return (
-            f"I found an article matching '{question}', but I couldn't generate an "
-            "answer right now. The matching source is listed below — please try again shortly."
-        )
-    return (
-        f"I found {n} articles matching '{question}', but I couldn't generate an "
-        "answer right now. The matching sources are listed below — please try again shortly."
-    )
 
 
 def _effective_chat_k(question: str) -> int:
@@ -1811,19 +1792,59 @@ async def _prepare_multi_entity_turn(
     )
 
 
+async def _discharge_turn_holds(holds: list[str], charged_usd: float) -> None:
+    """Discharge every hold this turn took, in one best-effort counter write.
+
+    ``charged_usd`` is what the turn's calls cost. A positive amount settles the
+    holds at the real cost -- which may exceed the reserved estimates, because
+    already-incurred spend is recorded rather than dropped; zero releases them,
+    which is only right when no request was ever sent. This is the same
+    settle-or-release rule the streaming turn's finish_holds applies (#255), so
+    both paths account for a turn the same way.
+
+    An EMPTY hold list is the cap being disabled
+    (LLM_DAILY_BUDGET_USD <= 0), where reserve() returned "" without
+    touching the store. Settling there would make the counter a hard
+    dependency of every chat turn for a deployment that deliberately
+    opted out and meters spend elsewhere, and a Redis outage would 503 an
+    answer the LLM had already produced (#255).
+
+    Never raises. Both callers run once the turn's fate is decided -- the answer
+    exists and is billed, or the turn is failing -- so a store that cannot
+    record it must not destroy the turn: failing closed here would return a 503
+    and delete the user message for work that is already paid for, while
+    preventing no spend, since the hold stays live and the sweep charges it
+    either way. The pre-call gate in _run_turn is what fails closed, and it
+    still does.
+    """
+    if not holds:
+        return
+    try:
+        if charged_usd > 0:
+            await settle(holds, charged_usd)
+        else:
+            await release(holds)
+    except BudgetUnavailable as exc:
+        logger.warning("cost accounting unavailable; leaving the hold for the sweep: %s", exc)
+
+
 async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list[dict], str | None, int, int, float]:
     """Retrieve, build a conversation-aware prompt, and call the LLM.
 
     Returns (answer, sources, note, prompt_tokens, completion_tokens, cost).
     Uses the shared retrieval pipeline from app.main; imported lazily to avoid a
     circular import with app.main. Raises BudgetExceeded when the daily LLM
-    spend cap is already exhausted, and BudgetUnavailable when the spend
-    counter cannot be read — both are raised so the caller fails closed
-    instead of running an unbudgeted LLM call.
+    spend cap is already exhausted, BudgetUnavailable when the spend counter
+    cannot be read -- both are raised so the caller fails closed instead of
+    running an unbudgeted LLM call -- and LLMUnavailableError when the model
+    could not be reached, after charging the attempts that were made.
 
     Every reservation this turn takes (the gate below plus any nudge retry) is
-    collected in ``holds`` and discharged exactly once: settled with the real
-    cost after a billed call, released when nothing was billed."""
+    collected in ``holds`` and discharged exactly once: settled with what the
+    turn's calls cost, released when no request was ever sent. A total LLM
+    outage is charged for the attempts that were made and then re-raised, so
+    the caller reports a 5xx instead of storing an answer that was never
+    generated (#280)."""
     turn = await _prepare_turn(question, history)
     if not turn.needs_llm:
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
@@ -1834,20 +1855,22 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         holds.append(gate_hold)
     try:
         result = await _answer_ranked(question, turn.answer, holds, turn.system)
-    except LLMUnavailableError:
-        # Retrieval succeeded (sources were gathered) but the LLM cannot be
-        # reached: degrade to an honest fallback citing the retrieved sources
-        # instead of surfacing a raw 5xx. Nothing was billed, so the holds are
-        # released without recording anything.
-        await release(holds)
-        return (
-            _llm_unavailable_answer(question, turn.sources),
-            turn.sources,
-            turn.note,
-            0,
-            0,
-            0.0,
-        )
+    except LLMUnavailableError as exc:
+        # A total outage is NOT a free call. generate_answer sends up to
+        # LLM_MAX_RETRIES + 1 requests and the provider bills the prompt of
+        # every one of them, retry or not, even though none of them returned
+        # an answer -- so the hold this turn took is settled for the attempts
+        # that were really made, at the per-call estimate the gate held. This
+        # path used to RELEASE the hold on the strength of a comment claiming
+        # nothing had been billed; that made every outage invisible to the
+        # daily cap during exactly the period it most needs to see, and the
+        # fabricated "no answer" it returned came back as a 200 (#280).
+        #
+        # Zero attempts is the one honest exception: LLM_MAX_RETRIES < 0 sends
+        # no request at all, so there is nothing to charge and the hold is
+        # released.
+        await _discharge_turn_holds(holds, exc.attempts * config.LLM_CALL_RESERVE_USD)
+        raise
     cost_usd = to_usd(result.cost())
     if cost_usd <= 0:
         # A zero here means the provider reported no usage, NOT that the call
@@ -1860,28 +1883,7 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         # number so the stored message cost and the budget cannot disagree
         # (#255).
         cost_usd = config.LLM_CALL_RESERVE_USD
-    if holds:
-        # The turn's single counter write: it drops every hold and records what
-        # the turn actually cost, which may exceed the reserved estimates —
-        # already incurred spend is recorded, never silently dropped.
-        #
-        # An EMPTY hold list is the cap being disabled
-        # (LLM_DAILY_BUDGET_USD <= 0), where reserve() returned "" without
-        # touching the store. Settling there would make the counter a hard
-        # dependency of every chat turn for a deployment that deliberately
-        # opted out and meters spend elsewhere, and a Redis outage would 503 an
-        # answer the LLM had already produced (#255).
-        #
-        # Best-effort. The answer exists and has been billed, so a store that
-        # cannot record it must not destroy the turn: failing closed here would
-        # return a 503 and delete the user message for work that is already
-        # paid for, while preventing no spend -- the hold stays live and the
-        # sweep charges it either way (#255). The pre-call gate above is what
-        # fails closed, and it still does.
-        try:
-            await settle(holds, cost_usd)
-        except BudgetUnavailable as exc:
-            logger.warning("cost accounting unavailable after a billed call; leaving the hold for the sweep: %s", exc)
+    await _discharge_turn_holds(holds, cost_usd)
     return (
         _finalize_answer(result.content, question),
         turn.sources,
@@ -2146,6 +2148,14 @@ async def get_usage(request: Request):
     return await _require_store().stats(user_id)
 
 
+# The one payload both chat paths report for a total LLM outage. Shared so the
+# JSON 503 and the SSE `error` event cannot drift apart: an outage must read
+# identically to a client whichever way it asked (#280).
+_LLM_UNAVAILABLE: dict = {
+    "error": "LLM temporarily unavailable",
+    "detail": "The language model could not be reached; please retry shortly.",
+}
+
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
 async def send_message(session_id: str, body: MessageIn, request: Request):
     user_id = request.state.user_id
@@ -2166,10 +2176,11 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
                 status_code=429,
                 detail={"error": "Daily AI budget reached", "detail": "The daily chat budget is exhausted; please try again tomorrow."},
             )
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "LLM temporarily unavailable", "detail": "The language model could not be reached; please retry shortly."},
-        )
+        # A total outage is a 5xx, on BOTH paths: the SSE turn reports the
+        # identical payload as an `error` event, so a client is told the same
+        # thing whichever way it asked and neither path stores a fabricated
+        # answer as if the model had replied (#280).
+        raise HTTPException(status_code=503, detail=dict(_LLM_UNAVAILABLE))
     except BudgetUnavailable as exc:
         # The daily spend counter could not be read. Fail closed with a 503
         # rather than running an unbudgeted LLM call or returning a silently
@@ -2376,8 +2387,16 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 await finish_holds(cost_usd)
             return True
 
-        async def fail_turn() -> None:
+        async def fail_turn(charged_usd: float = 0.0) -> None:
             """Abandon a turn that failed, under the ONE abort rule.
+
+            ``charged_usd`` is what a turn whose LLM call was made but produced
+            no deltas is charged. The provider bills the prompt of every
+            attempt, so a call that burned all its retries and still failed was
+            paid for several times over: discharging its holds as a refund is
+            exactly what makes a billed outage free spend (#280). A failure
+            that happened before any request was sent passes 0.0 and is
+            released, because there is then nothing to charge.
 
             Nothing streamed yet -> clean rollback of the user message, matching
             the pre-stream checks. Deltas already sent -> the turn is persisted
@@ -2386,7 +2405,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             the server must account for."""
             if not streamed:
                 await s.delete_message(session_id, user_id, user_msg.id)
-                await finish_holds(0.0)
+                await finish_holds(charged_usd)
                 return
             # Deltas already sent: persist what the client is still showing.
             # Usage is only known when the whole response arrived, so a failed
@@ -2597,9 +2616,14 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     "latency_ms": latency_ms,
                 },
             )
-        except LLMUnavailableError:
-            await fail_turn()
-            yield _sse("error", {"error": "LLM temporarily unavailable"})
+        except LLMUnavailableError as exc:
+            # The SAME contract the non-streaming path reports as a 503 (#280):
+            # a total outage is an error event, never a stored "no answer".
+            # What it cost is the attempts that were really sent -- the provider
+            # billed the prompt of every one of them -- so the holds are
+            # settled for that rather than refunded into the cap.
+            await fail_turn(exc.attempts * mid_stream_estimate)
+            yield _sse("error", dict(_LLM_UNAVAILABLE))
         except BudgetExceeded:
             await fail_turn()
             yield _sse("error", {"error": "Daily AI budget reached"})

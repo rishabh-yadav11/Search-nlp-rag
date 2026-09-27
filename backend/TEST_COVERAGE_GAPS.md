@@ -353,11 +353,12 @@ accounting is #295's audit. Do not read this section as 100%.
       `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources short-circuit;
       weak fallback answer + note. **ERROR PATH — LLM/Qdrant/Redis down during
       retrieval.**
-- [x] **`_run_turn` cost recording + finalize** (lines 1443-1509): `reserve`
-      before the billed call → `_answer_ranked` → `settle(holds, cost_usd)`
-      (the turn's single counter write; `release(holds)` when no call was made)
-      → finalized answer (unrequested dataviz blocks stripped). Three money
-      rules live here and are tested:
+- [x] **`_run_turn` cost recording + finalize** (lines 1650-1714): `reserve`
+      before the billed call → `_answer_ranked` → `_discharge_turn_holds`
+      (`settle(holds, cost_usd)`, the turn's single counter write;
+      `release(holds)` when no request was ever sent) → finalized answer
+      (unrequested dataviz blocks stripped). Four money rules live here and are
+      tested:
       a zero COMPUTED cost is not evidence that nothing was spent —
       `generate_answer` returns a truthy zero-token `LLMResult` when the
       response carries no usage, so a delivered, billed answer would settle as
@@ -369,21 +370,32 @@ accounting is #295's audit. Do not read this section as 100%.
       (cap disabled) settles nothing at all, so an opted-out
       deployment never depends on the counter; and a settle that cannot reach
       the store is best-effort, because the answer exists and has been billed,
-      while the live hold is charged by the sweep either way. **ERROR PATH —
-      Redis down after a billed call.**
-- [x] **`send_message` `BudgetExceeded` → 429** (lines 1755-1759),
-      **`LLMUnavailableError` → 503** (lines 1760-1763), and
-      **`BudgetUnavailable` → 503** (lines 1764-1773) with the dangling user
+      while the live hold is charged by the sweep either way. A FAILED call
+      is charged, not refunded — the provider bills the prompt of every one of
+      the `LLM_MAX_RETRIES + 1` attempts, so `LLMUnavailableError` settles the
+      turn's holds for `exc.attempts * LLM_CALL_RESERVE_USD` and is then
+      re-raised (#280), while `attempts=0` (the loop never ran, so nothing was
+      sent) releases them. **ERROR PATH — Redis down after a billed call, and a
+      total LLM outage.**
+- [x] **`send_message` `BudgetExceeded` → 429** (lines 1989-1997),
+      **`LLMUnavailableError` → 503** (lines 1998-2002), and
+      **`BudgetUnavailable` → 503** (lines 2003-2012) with the dangling user
       message rolled back, so an unreadable counter is never reported as an
-      empty answer. **ERROR PATH — LLM retry exhaustion / daily budget / Redis
-      down.**
+      empty answer. The 503 is REACHABLE, not just present: a total outage now
+      propagates out of `_run_turn` and is driven end to end through the real
+      `generate_answer` retry loop, and the same outage asserted against the SSE
+      path's `error` event with the identical payload, so neither path can
+      report a 200 with a fabricated "no answer" (#280). **ERROR PATH — LLM
+      retry exhaustion / daily budget / Redis down.**
 - [x] **`_require_store` uninitialized → 503** (line 1644) and
       **`_validate_question` too-long → 400** (line 1653).
 - [x] **`send_message_stream` nudge retry branches** (lines 2091-2100,
       2123-2132): a dataviz/ranking nudge that succeeds appends its block and
       sums tokens; a failed nudge (`LLMUnavailableError`) keeps the streamed
       answer. **`error` SSE handlers**: mid-stream `LLMUnavailableError` →
-      "LLM temporarily unavailable" (line 2181); `BudgetExceeded` → "Daily AI
+      "LLM temporarily unavailable" (line 2440), which settles the failed
+      attempts like the JSON path rather than refunding them (#280);
+      `BudgetExceeded` → "Daily AI
       budget reached" (line 2184); `BudgetUnavailable` → "AI budget service
       unavailable" (line 2190); unexpected exceptions → "Something went wrong"
       (line 2194), never a 500. The `BudgetUnavailable` handler is still
