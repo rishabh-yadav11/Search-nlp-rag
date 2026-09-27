@@ -13,6 +13,18 @@ NEXT_PORT="${NEXT_PORT:-3000}"
 PUBLIC_PORT="${PUBLIC_PORT:-80}"
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
+NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/search-nlp-rag}"
+NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/search-nlp-rag}"
+CERTBOT_WEBROOT="${CERTBOT_WEBROOT:-/var/www/certbot}"
+LE_ROOT="${LE_ROOT:-/etc/letsencrypt}"
+LE_DOMAIN="${LE_DOMAIN:-}"
+LE_EMAIL="${LE_EMAIL:-}"
+# auto|on|off. "auto" means: TLS once a domain is configured and its
+# certificate is actually on disk, plain HTTP otherwise.
+NGINX_TLS="${NGINX_TLS:-auto}"
+LE_LIVE="$LE_ROOT/live/$LE_DOMAIN"
+LE_CERT="$LE_LIVE/fullchain.pem"
+LE_KEY="$LE_LIVE/privkey.pem"
 
 # Pinned docker images with digests for reproducibility. IMPORTANT: the Qdrant
 # version must be >= the version that wrote an existing collection (older
@@ -43,6 +55,7 @@ stages (run in order):
   stop       stop both backend + frontend
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
+  tls        get a Let's Encrypt cert (webroot) and add the :443 server
 
   all        deps backend index frontend services pm2-startup cron nginx
 
@@ -51,6 +64,9 @@ env overrides:
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
+  NGINX_TLS   off | on | auto (default auto: on once LE_DOMAIN has a certificate)
+  LE_DOMAIN LE_EMAIL   required by the tls stage; renewals mail LE_EMAIL
+  LE_ROOT CERTBOT_WEBROOT   override the certificate and ACME challenge paths
 EOF
 }
 
@@ -394,23 +410,38 @@ run_cron() {
     echo "cron installed: */5  * * * * healthcheck.sh"
 }
 
-run_nginx() {
-    stage "nginx"
-    local conf="/etc/nginx/sites-available/search-nlp-rag"
-    local site="/etc/nginx/sites-enabled/search-nlp-rag"
-    if ! have nginx && ! [ -d /etc/nginx ]; then
-        echo "ERROR: nginx not installed." >&2
-        exit 1
+nginx_server_name() {
+    # A certificate is only valid for a named vhost; "_" (the catch-all) is the
+    # right server_name only while there is no domain.
+    if [ -n "$LE_DOMAIN" ]; then
+        echo "$LE_DOMAIN"
+    else
+        echo "_"
     fi
-    sudo tee "$conf" >/dev/null <<NGINX
-server {
-    listen $PUBLIC_PORT;
-    server_name _;
+}
 
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options "DENY" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+# Echoes exactly "on" or "off" so callers can use the result as a boolean
+# instead of re-parsing NGINX_TLS themselves.
+nginx_tls_mode() {
+    case "$NGINX_TLS" in
+        off|0|false|no) echo "off" ;;
+        on|1|true|yes) echo "on" ;;
+        # auto: TLS only once a domain is configured *and* its certificate is
+        # really on disk, so a fresh install keeps serving plain HTTP.
+        *)
+            if [ -n "$LE_DOMAIN" ] && [ -r "$LE_CERT" ]; then
+                echo "on"
+            else
+                echo "off"
+            fi
+            ;;
+    esac
+}
 
+# The proxy locations, shared verbatim by the plain-HTTP :80 server and the
+# TLS :443 server so the two can never drift apart.
+nginx_locations() {
+    cat <<NGINX
     # Every API location must forward the client IP. The per-IP rate limiter on
     # /search, /facets, /analytics/click and /ready keys on this header; without
     # it every proxied request looks like 127.0.0.1 and the whole site shares a
@@ -466,53 +497,260 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
-}
 NGINX
-    sudo ln -sf "$conf" "$site"
-    sudo rm -f /etc/nginx/sites-enabled/default
-    sudo nginx -t
-    sudo systemctl reload nginx
-    echo "nginx configured on port $PUBLIC_PORT"
 }
 
-STAGES=()
-ALL=0
-while [ $# -gt 0 ]; do
-    case "$1" in
-        all) ALL=1 ;;
-        -h|--help) usage; exit 0 ;;
-        deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx) STAGES+=("$1") ;;
-        *) echo "unknown stage: $1"; usage; exit 1 ;;
-    esac
-    shift
-done
+# The emitting half: the resolved mode arrives as a positional parameter and
+# only the path/port knobs are read from the environment. It never consults
+# NGINX_TLS and never probes the certificate store, so either mode can be
+# rendered deterministically.
+render_nginx_config() {
+    local mode="$1"
+    local name
+    name="$(nginx_server_name)"
+    {
+        # Port 80 always serves the ACME challenge, in both modes: Let's Encrypt
+        # validates over plain HTTP, so redirecting it away would break renewal.
+        # certbot's webroot plugin reads the token from CERTBOT_WEBROOT, which
+        # must therefore be PUBLIC_PORT-reachable.
+        cat <<NGINX
+server {
+    listen $PUBLIC_PORT;
+    server_name $name;
 
-if [ $ALL -eq 1 ]; then
-    STAGES=(deps backend index frontend services pm2-startup cron nginx)
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # "^~" makes this prefix location win over the catch-all "location /",
+    # which is what keeps renewals working once that becomes a redirect.
+    location ^~ /.well-known/acme-challenge/ {
+        root $CERTBOT_WEBROOT;
+        default_type text/plain;
+    }
+NGINX
+        if [ "$mode" = "on" ]; then
+            # Everything else goes to https, host and path preserved. Quoted
+            # heredoc so $host/$request_uri stay for nginx to expand.
+            cat <<'NGINX'
+
+    location / { return 301 https://$host$request_uri; }
+NGINX
+        else
+            echo
+            nginx_locations
+        fi
+        echo "}"
+        if [ "$mode" = "on" ]; then
+            # "ssl http2" on the listen line works on both old and new nginx
+            # (the standalone "http2 on;" directive needs nginx >= 1.25).
+            # Mozilla intermediate settings, none of which need a resolver.
+            # No Strict-Transport-Security here on purpose: the Next.js config
+            # emits that header, and two sources of truth for max-age drift.
+            cat <<NGINX
+
+server {
+    listen 443 ssl http2;
+    server_name $name;
+
+    ssl_certificate $LE_CERT;
+    ssl_certificate_key $LE_KEY;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+NGINX
+            echo
+            nginx_locations
+            echo "}"
+        fi
+    }
+}
+
+# The complete site config on stdout. Refuses to emit a config that points at a
+# certificate that cannot be read: nginx -t would reject it and the reload
+# would fail, so the gate is here, before anything is written.
+nginx_site_config() {
+    local mode
+    mode="$(nginx_tls_mode)"
+    if [ "$mode" = "on" ] && [ ! -r "$LE_CERT" ]; then
+        echo "ERROR: TLS is on but no readable certificate at $LE_CERT." >&2
+        echo "       Get one with: LE_DOMAIN=... LE_EMAIL=... ./setup.sh tls" >&2
+        echo "       Or go back to HTTP with: NGINX_TLS=off ./setup.sh nginx" >&2
+        return 1
+    fi
+    render_nginx_config "$mode"
+}
+
+run_nginx() {
+    stage "nginx"
+    if ! have nginx && ! [ -d /etc/nginx ]; then
+        echo "ERROR: nginx not installed." >&2
+        exit 1
+    fi
+    local mode
+    mode="$(nginx_tls_mode)"
+    # A domain configured without a certificate is the silent-plaintext failure
+    # mode this stage exists to prevent, so say so loudly instead of quietly
+    # serving cleartext.
+    if [ "$mode" = "off" ] && [ -n "$LE_DOMAIN" ]; then
+        echo "WARNING: LE_DOMAIN=$LE_DOMAIN is configured but there is no readable" >&2
+        echo "         certificate at $LE_CERT, so this site is being served over" >&2
+        echo "         plain HTTP. Passwords, bearer tokens and chat content will" >&2
+        echo "         cross the wire in cleartext until that file exists." >&2
+        echo "         Fix it with: LE_DOMAIN=$LE_DOMAIN LE_EMAIL=you@example.com ./setup.sh tls" >&2
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    # Render to a temp file first: nothing reaches the live site until nginx has
+    # accepted the config.
+    if ! nginx_site_config > "$tmp"; then
+        echo "ERROR: could not render the nginx config; $NGINX_CONF left untouched." >&2
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ -f "$NGINX_CONF" ]; then
+        sudo cp "$NGINX_CONF" "$NGINX_CONF.bak"
+    fi
+    sudo install -m 644 "$tmp" "$NGINX_CONF"
+    rm -f "$tmp"
+    sudo ln -sf "$NGINX_CONF" "$NGINX_LINK"
+    sudo rm -f /etc/nginx/sites-enabled/default
+    if ! sudo nginx -t; then
+        # Put the previous config back instead of leaving a rejected one behind.
+        echo "ERROR: nginx rejected the new config; rolling back." >&2
+        if [ -f "$NGINX_CONF.bak" ]; then
+            sudo mv -f "$NGINX_CONF.bak" "$NGINX_CONF"
+        else
+            sudo rm -f "$NGINX_CONF"
+        fi
+        return 1
+    fi
+    # reload, not restart: existing connections and in-flight requests survive.
+    sudo systemctl reload nginx
+    if [ "$mode" = "on" ]; then
+        echo "nginx configured on port $PUBLIC_PORT with TLS (https://$LE_DOMAIN/)"
+    else
+        echo "nginx configured on port $PUBLIC_PORT (plain HTTP)"
+    fi
+    echo "roll back to plain HTTP: NGINX_TLS=off ./setup.sh nginx"
+    # Last line on purpose: the operator must be left knowing, in one glance,
+    # whether the site they now serve is encrypted.
+    if [ "$mode" = "on" ]; then
+        echo "serving: https via $LE_DOMAIN"
+    elif [ -n "$LE_DOMAIN" ]; then
+        echo "serving: http only (no certificate at $LE_CERT)"
+    else
+        echo "serving: http only (no domain configured; set LE_DOMAIN and run './setup.sh tls')"
+    fi
+}
+
+run_tls() {
+    stage "tls"
+    if [ -z "$LE_DOMAIN" ]; then
+        echo "ERROR: LE_DOMAIN is not set, e.g. LE_DOMAIN=example.com ./setup.sh tls" >&2
+        return 1
+    fi
+    if [ -z "$LE_EMAIL" ]; then
+        echo "ERROR: LE_EMAIL is not set; Let's Encrypt expiry warnings go there." >&2
+        return 1
+    fi
+    if ! have certbot; then
+        echo "ERROR: certbot is not installed (e.g. sudo apt-get install -y certbot)." >&2
+        return 1
+    fi
+    sudo mkdir -p "$CERTBOT_WEBROOT/.well-known/acme-challenge"
+    # webroot, never --standalone: --standalone needs port 80 free, so on the
+    # live site it would fail with the port taken (or force nginx to stop and
+    # take the site down). webroot only needs the challenge location nginx
+    # already serves. --keep-until-expiring makes a re-run a no-op instead of
+    # burning the Let's Encrypt rate limit.
+    if ! sudo certbot certonly \
+        --webroot -w "$CERTBOT_WEBROOT" \
+        --cert-name "$LE_DOMAIN" -d "$LE_DOMAIN" \
+        --email "$LE_EMAIL" --agree-tos --non-interactive \
+        --keep-until-expiring \
+        --deploy-hook 'systemctl reload nginx'; then
+        echo "ERROR: certbot failed; the plain-HTTP config is untouched and still serving." >&2
+        return 1
+    fi
+    # The certificate is on disk now, so the :443 server can be rendered.
+    NGINX_TLS=on
+    run_nginx
+    if systemctl is-enabled certbot.timer >/dev/null 2>&1; then
+        echo "renewal: handled by the systemd certbot.timer"
+    else
+        # Same idempotent pattern as run_cron: drop only our exact line and keep
+        # the operator's other entries. Root's crontab, because the
+        # certificate lives in LE_ROOT and certbot needs write access there.
+        local line_renew="17 3 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx'"
+        local tmp
+        tmp="$(mktemp)"
+        sudo crontab -l 2>/dev/null | grep -vFx "$line_renew" > "$tmp" || true
+        printf '%s\n' "$line_renew" >> "$tmp"
+        sudo crontab "$tmp"
+        rm -f "$tmp"
+        echo "renewal: certbot.timer is not enabled; installed a daily certbot renew crontab line"
+    fi
+    echo "TLS enabled: https://$LE_DOMAIN/"
+}
+
+main() {
+    STAGES=()
+    local ALL=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            all) ALL=1 ;;
+            -h|--help) usage; return 0 ;;
+            deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx|tls) STAGES+=("$1") ;;
+            *) echo "unknown stage: $1"; usage; return 1 ;;
+        esac
+        shift
+    done
+
+    if [ "$ALL" -eq 1 ]; then
+        # tls is deliberately not part of "all": it needs a domain, an email and
+        # network access that an unattended bootstrap must not require.
+        STAGES=(deps backend index frontend services pm2-startup cron nginx)
+    fi
+    if [ ${#STAGES[@]} -eq 0 ]; then
+        usage
+        return 1
+    fi
+
+    for s in "${STAGES[@]}"; do
+        case "$s" in
+            deps) run_deps ;;
+            backend) run_backend ;;
+            index) run_index ;;
+            frontend) run_frontend ;;
+            services) run_services ;;
+            pm2-startup) run_pm2_startup ;;
+            stop-backend) run_stop_backend ;;
+            stop-frontend) run_stop_frontend ;;
+            stop) run_stop ;;
+            cron) run_cron ;;
+            nginx) run_nginx ;;
+            tls) run_tls ;;
+        esac
+    done
+
+    echo
+    echo "setup complete."
+    echo "app:        http://localhost:$PUBLIC_PORT/"
+    if [ "$(nginx_tls_mode)" = "on" ]; then
+        echo "app:        https://$LE_DOMAIN/"
+    fi
+    echo "api:        http://localhost:$API_PORT/health"
+    echo "qdrant:     http://localhost:$QDRANT_PORT/"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
-if [ ${#STAGES[@]} -eq 0 ]; then
-    usage
-    exit 1
-fi
-
-for s in "${STAGES[@]}"; do
-    case "$s" in
-        deps) run_deps ;;
-        backend) run_backend ;;
-        index) run_index ;;
-        frontend) run_frontend ;;
-        services) run_services ;;
-        pm2-startup) run_pm2_startup ;;
-        stop-backend) run_stop_backend ;;
-        stop-frontend) run_stop_frontend ;;
-        stop) run_stop ;;
-        cron) run_cron ;;
-        nginx) run_nginx ;;
-    esac
-done
-
-echo
-echo "setup complete."
-echo "app:        http://localhost:$PUBLIC_PORT/"
-echo "api:        http://localhost:$API_PORT/health"
-echo "qdrant:     http://localhost:$QDRANT_PORT/"
