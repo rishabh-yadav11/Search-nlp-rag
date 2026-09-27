@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import SafeArticleLink from '../components/SafeArticleLink'
 import { API_BASE, authHeaders, getToken } from '../lib/auth'
 import { formatArticleDate } from '../lib/format'
+import { createDeadline, RECOMMEND_DEADLINE_MS } from '../lib/deadline'
 import type { MouseEvent } from 'react'
 import styles from './page.module.css'
 
@@ -28,9 +29,16 @@ export default function ForYouPage() {
   const [feedType, setFeedType] = useState<FeedType>('personalized')
   const [coldStart, setColdStart] = useState(false)
   const [limit] = useState(20)
+  // Bumped by the error state's Retry button and part of the fetch effect's
+  // deps, so a retry re-runs the request with a fresh deadline.
+  const [retryCount, setRetryCount] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
+
+    // The deadline aborts the socket on its own; `controller` still owns the
+    // unmount path, and only that path suppresses the state updates below.
+    const deadline = createDeadline(RECOMMEND_DEADLINE_MS, controller.signal)
 
     const fetchFeed = async () => {
       setLoading(true)
@@ -53,7 +61,7 @@ export default function ForYouPage() {
         }
 
         const res = await fetch(url, {
-          signal: controller.signal,
+          signal: deadline.signal,
           headers,
         })
 
@@ -70,16 +78,24 @@ export default function ForYouPage() {
         }
       } catch (err) {
         if (!controller.signal.aborted) {
-          setError(err instanceof Error ? err.message : 'Failed to load feed')
+          setError(
+            deadline.timedOut()
+              ? 'The recommendations feed did not respond in time. Please try again.'
+              : err instanceof Error
+                ? err.message
+                : 'Failed to load feed'
+          )
           setLoading(false)
         }
+      } finally {
+        deadline.clear()
       }
     }
 
     fetchFeed()
 
     return () => controller.abort()
-  }, [feedType, limit])
+  }, [feedType, limit, retryCount])
 
   const handleInteraction = async (articleId: number | string, e: MouseEvent) => {
     const headers = authHeaders({
@@ -138,7 +154,14 @@ export default function ForYouPage() {
       {loading ? (
         <div className={styles.loading}>Loading...</div>
       ) : error ? (
-        <div className={styles.error}>{error}</div>
+        <div className={styles.error}>
+          {error}
+          <div>
+            <button type="button" className={styles.retry} onClick={() => setRetryCount((n) => n + 1)}>
+              Retry
+            </button>
+          </div>
+        </div>
       ) : articles.length === 0 ? (
         <div className={styles.empty}>No articles found.</div>
       ) : (

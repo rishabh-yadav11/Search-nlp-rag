@@ -11,6 +11,7 @@ import SimilarArticles from '../components/SimilarArticles'
 import { API_BASE, authHeaders, getToken, logout, redirectToLogin } from '../lib/auth'
 import { isSafeUrl } from '../lib/safe-url'
 import { formatCost, formatEpochRelative } from '../lib/format'
+import { createDeadline, CHAT_API_DEADLINE_MS, RequestTimeoutError } from '../lib/deadline'
 
 type Source = {
   id: number
@@ -98,14 +99,32 @@ function walk(node: any, fn: (node: any, parent: any, index: number) => void) {
   }
 }
 
+// Session CRUD and the non-stream send. The deadline aborts the socket so a
+// hung backend surfaces as a rejection the caller's catch can turn into a
+// message, instead of leaving a send/spinner pending forever. Callers supply
+// their own signal (if any) via `init.signal`; the deadline composes with it.
 async function api(path: string, init?: RequestInit) {
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers: authHeaders(init) })
-  if (!res.ok) {
-    if (res.status === 401) redirectToLogin()
-    const detail = await res.text()
-    throw new Error(detail || `Request failed (${res.status})`)
+  const deadline = createDeadline(CHAT_API_DEADLINE_MS, init?.signal ?? null)
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      signal: deadline.signal,
+      headers: authHeaders(init),
+    })
+    if (!res.ok) {
+      if (res.status === 401) redirectToLogin()
+      const detail = await res.text()
+      throw new Error(detail || `Request failed (${res.status})`)
+    }
+    return (await res.json()) as Record<string, unknown>
+  } catch (err) {
+    if (deadline.timedOut()) {
+      throw new RequestTimeoutError(CHAT_API_DEADLINE_MS)
+    }
+    throw err
+  } finally {
+    deadline.clear()
   }
-  return res.json() as Promise<Record<string, unknown>>
 }
 
 function formatTime(ms: number): string {
@@ -322,8 +341,15 @@ export default function ChatPage() {
         sessionId = String(created.id)
         setActiveId(sessionId)
         await loadSessions()
-      } catch {
-        setError('Could not start a new conversation.')
+      } catch (err) {
+        // A deadline timeout carries its own message; anything else keeps the
+        // caller's generic copy. Either way the user gets a failure to read
+        // and a send box that works again, not a permanent spinner.
+        setError(
+          err instanceof RequestTimeoutError
+            ? err.message
+            : 'Could not start a new conversation.'
+        )
         sendingRef.current = false
         return
       }
