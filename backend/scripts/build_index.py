@@ -36,7 +36,6 @@ from qdrant_client.models import (
     VectorParams,
 )
 from qdrant_client.models import models as qmodels
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -172,6 +171,13 @@ def main():
         print(f"No data file at {DATA_PATH} — run scripts/fetch_data.py first.")
         return
 
+    # Imported here, not at module scope: sentence_transformers pulls in torch,
+    # so importing this module should not require it. That keeps
+    # ensure_collection / create_payload_indexes / the checkpoint helpers
+    # importable and testable in an environment without the model stack. Same
+    # lazy pattern as apply_delta in update_index.py.
+    from sentence_transformers import SentenceTransformer
+
     print(f"Loading dense embedding model {config.EMBED_MODEL} on {config.EMBED_DEVICE}...")
     model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
     print(f"Loading sparse embedding model {config.SPARSE_MODEL}...")
@@ -179,6 +185,10 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     recreated = ensure_collection(client)
+
+    # Index the payload fields on a resumed collection too. create_collection
+    # only runs when the collection is (re)created, so without this a collection
+    # that predates a new field keeps that field unfilterable until a full
 
     # Index the payload fields on a resumed collection too. create_collection
     # only runs when the collection is (re)created, so without this a collection
