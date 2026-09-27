@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from app import config as config_module
 from app import main as main_module
-from app.config import _machine_hosts, _parse_allowed_hosts, config
+from app.config import _default_route_addresses, _machine_hosts, _parse_allowed_hosts, config
 
 # raise_server_exceptions=False so a 400/404 from middleware surfaces as a
 # response instead of propagating.
@@ -114,6 +114,59 @@ def test_box_identity_hosts_are_accepted(host):
     assert r.status_code == 200, f"Host {host!r} is the box's own identity but was rejected"
 
 
+def test_default_allow_list_covers_the_default_route_address(monkeypatch):
+    """A NAT'd box is reached at its public address, not the bound private one.
+
+    nginx forwards the client's `Host` through (`server_name _;` plus
+    `proxy_set_header Host $host`), so on a cloud host the `Host` a real browser
+    sends is the public address — which `getaddrinfo(gethostname())` does not
+    report. Without it in the default allow-list the whole site answers 400.
+    """
+    monkeypatch.setattr(config_module, "_default_route_addresses", lambda: ("203.0.113.7",))
+    assert "203.0.113.7" in _parse_allowed_hosts(None, _machine_hosts())
+
+
+def test_default_route_address_is_read_from_the_routing_table(monkeypatch):
+    """The probe is a real socket, not a guess: it reports what the kernel picks."""
+    seen: list[tuple] = []
+
+    class _Probe:
+        def __init__(self, family, kind):
+            seen.append((family, kind))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def connect(self, peer):
+            seen.append(peer)
+
+        def getsockname(self):
+            return ("203.0.113.7", 53)
+
+    monkeypatch.setattr(config_module.socket, "socket", _Probe)
+    assert _default_route_addresses() == ("203.0.113.7", "203.0.113.7")
+    assert (socket.AF_INET, socket.SOCK_DGRAM) in seen
+    assert ("8.8.8.8", 53) in seen
+
+
+def test_default_route_probe_failure_degrades_instead_of_raising(monkeypatch):
+    """No default route (or a sandboxed import) must not stop the app importing."""
+
+    def boom(*args, **kwargs):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(config_module.socket, "socket", boom)
+    assert _default_route_addresses() == ()
+    assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    )
+
+
 def test_machine_hosts_degrade_instead_of_raising(monkeypatch):
     """This runs at import: a name-resolution failure must not take the app down."""
 
@@ -124,6 +177,36 @@ def test_machine_hosts_degrade_instead_of_raising(monkeypatch):
     hosts = _machine_hosts()
     assert socket.gethostname() in hosts
     assert "" not in hosts
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: OSError("probe failed"),
+        lambda: UnicodeDecodeError("utf-8", b"\xff", 0, 1, "undecodable hostname"),
+        lambda: ValueError("probe failed"),
+    ],
+    ids=["oserror", "unicode", "valueerror"],
+)
+def test_machine_hosts_survive_any_probe_failure(monkeypatch, make_exc):
+    """A hostname probe that fails in any way must not stop the app importing.
+
+    A non-decodable hostname raises UnicodeDecodeError, not OSError; missing it
+    would mean the API refuses to boot over a cosmetic detail.
+    """
+
+    def boom(*args, **kwargs):
+        raise make_exc()
+
+    monkeypatch.setattr(config_module.socket, "getaddrinfo", boom)
+    monkeypatch.setattr(config_module.socket, "gethostname", boom)
+    monkeypatch.setattr(config_module.socket, "getfqdn", boom)
+    # Still produces a closed, usable allow-list rather than raising.
+    assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    )
 
 
 def test_allow_list_entries_are_normalised():
