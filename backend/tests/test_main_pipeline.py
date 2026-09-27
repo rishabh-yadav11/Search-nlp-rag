@@ -2,6 +2,7 @@
 embedding, intent rewrite, retrieval, body rescue/attach, and facet values."""
 
 import asyncio
+import logging
 import math
 
 import pytest
@@ -774,6 +775,50 @@ def test_lifespan_llm_none_without_api_key(monkeypatch):
         _restore_state(orig)
 
     assert deps["chat_store"].closed is True
+
+
+def test_lifespan_logs_a_placeholder_gemini_key_by_name(monkeypatch, caplog):
+    """The startup log is the whole point of not crashing on a bad key: an
+    operator reading a chat-broken deploy finds the cause in one line instead
+    of a per-turn 401, and the process stays up to serve /health and /ready.
+    So the lifespan must actually emit it -- which is what this test holds."""
+    orig = dict(main.state)
+    monkeypatch.setattr(main.config, "GEMINI_API_KEY", "your_key_here")
+    _stub_lifespan_deps(monkeypatch)
+
+    async def scenario():
+        async with main.lifespan(None):
+            pass
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="health"):
+            _run(scenario())
+    finally:
+        _restore_state(orig)
+
+    assert "GEMINI_API_KEY" in caplog.text
+    assert "placeholder" in caplog.text
+    assert "your_key_here" not in caplog.text, "the log must name the fault, never print the key"
+
+
+def test_lifespan_logs_nothing_for_a_usable_gemini_key(monkeypatch, caplog):
+    """The opposite guard: an ERROR line on every healthy boot trains operators
+    to ignore the one that matters."""
+    orig = dict(main.state)
+    monkeypatch.setattr(main.config, "GEMINI_API_KEY", "AIzaSyD-Example_Key0123456789abcdefghij")
+    _stub_lifespan_deps(monkeypatch)
+
+    async def scenario():
+        async with main.lifespan(None):
+            pass
+
+    try:
+        with caplog.at_level(logging.ERROR, logger="health"):
+            _run(scenario())
+    finally:
+        _restore_state(orig)
+
+    assert "GEMINI_API_KEY" not in caplog.text
 
 
 def test_lifespan_startup_failure_propagates(monkeypatch):
