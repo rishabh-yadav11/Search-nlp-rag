@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from qdrant_client.models import MatchAny
 
-from app import auth, main
+from app import analytics, auth, main
 from app.config import config
 from app.input_hygiene import (
     MAX_FACET_VALUE_LEN,
@@ -487,3 +487,23 @@ def test_normalised_filter_values_reach_qdrant_clean(monkeypatch):
     assert "\x00" not in token
     assert "\n" not in token
     assert isinstance(filt.must[0].match, MatchAny)
+
+
+def test_click_analytics_key_carries_no_control_characters():
+    """The click beacon is unauthenticated, so its query is the least trusted
+    string in the app and it lands straight in a Redis key."""
+    key = analytics._click_query_key("test\x00\r\nINJECTED: admin")
+    assert "\x00" not in key
+    assert "\r" not in key and "\n" not in key
+
+
+def test_click_analytics_key_aggregates_equivalent_spellings():
+    assert analytics._click_query_key("ＴＥＳＴ deals") == \
+        analytics._click_query_key("TEST deals")
+
+
+def test_click_analytics_key_stays_length_bounded():
+    """Normalising must not have displaced the existing length bound -- that
+    bound is what stops unbounded key growth from the unauthenticated beacon."""
+    key = analytics._click_query_key("q" * 100_000)
+    assert len(key) < 1000
