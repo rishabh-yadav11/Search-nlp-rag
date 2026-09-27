@@ -567,11 +567,47 @@ class Config:
     # hashed (SHA-256) in storage, expire after AUTH_TOKEN_TTL_DAYS, and can be
     # revoked individually.
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
+    # Redis DB holding the auth rate-limit counters. Pinned explicitly, like
+    # ANALYTICS_REDIS_DB and USER_PROFILE_REDIS_DB, rather than inherited from
+    # any db segment in REDIS_URL. The inherited value was DB 0, which this
+    # repo documents as the query cache and flushes during deploys -- so the
+    # limiter's counters were living in the database a deploy empties, and a
+    # flush silently reset every bucket. These counters are a security
+    # control, so they get their own database: cache 0, analytics 1, profiles
+    # 2, rate limiting 3. The `db` kwarg on from_url overrides whatever the URL
+    # carries, so this is correct regardless of the URL's db segment.
+    AUTH_RATE_LIMIT_REDIS_DB = int(os.getenv("AUTH_RATE_LIMIT_REDIS_DB", "3"))
     AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "7"))
-    # Optional machine-to-machine bypass: any request carrying this exact value
-    # in X-Service-Token acts as an admin user. Leave empty to disable. Used by
-    # the internal eval scripts; never expose it to browsers.
+    # Optional machine-to-machine credential: the value carried in an
+    # X-Service-Token header. Leave empty to disable. Never expose it to
+    # browsers.
+    #
+    # This is a SEED, not a standing grant. The first request presenting it
+    # creates a row in auth_service_tokens with the scope and expiry below;
+    # from then on that row is the only authority on the token's life, so the
+    # credential stops working once it expires or is revoked.
+    #
+    # OPERATIONAL CONSEQUENCE, and it is deliberate: the seeded token expires
+    # AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS after it is first seeded (24h by
+    # default) and a restart does NOT revive it, because a credential that
+    # silently came back would be the permanent grant this replaced. Recovery
+    # is rotation -- change the value here and restart (a different value
+    # hashes to a different row, so it seeds a fresh one), or mint one with
+    # POST /api/auth/service-tokens. A machine client that runs longer than
+    # that must be given a freshly rotated value, not the original.
     AUTH_SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
+    # Lifetime of a service token. Not optional: a value <= 0 falls back to
+    # the default rather than meaning "never expires", because an eternal
+    # machine admin credential is exactly the hole this closes.
+    AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS = int(os.getenv("AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", "86400"))
+    # Permissions a service token may exercise. Defaults to chat:use, the only
+    # permission the in-repo consumer (scripts/eval_runner.py) needs, instead
+    # of every permission an admin holds.
+    AUTH_SERVICE_TOKEN_SCOPE: ClassVar[tuple[str, ...]] = tuple(
+        p.strip()
+        for p in os.getenv("AUTH_SERVICE_TOKEN_SCOPE", "chat:use").split(",")
+        if p.strip()
+    )
     # Bootstrap admin: created once at startup (role=admin) if no account with
     # this email exists. An existing account is never overwritten.
     AUTH_ADMIN_EMAIL = os.getenv("AUTH_ADMIN_EMAIL", "")
@@ -584,6 +620,38 @@ class Config:
     AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+    # Per-ACCOUNT (submitted address) limit on login, counted in addition to
+    # the per-IP one above. Per-IP alone cannot see a botnet hammering ONE
+    # account: every request arrives from a fresh address with a fresh bucket.
+    # The counter is keyed on the normalised submitted address alone, so its
+    # state and its 429 are the same whether or not the address has an account
+    # here, which keeps it from being an account-existence oracle.
+    #
+    # It counts FAILED attempts only, and is applied after the credential
+    # check. That is deliberate: counting every attempt, and gating before the
+    # check, turned the throttle into an account-lockout weapon -- an anonymous
+    # caller could deny a known address access indefinitely by sending the
+    # limit's worth of wrong passwords from rotating source addresses, never
+    # guessing anything. A correct password is never counted, never gated and
+    # never rate-limited.
+    #
+    # WHAT IT BUYS YOU: it caps the RATE of attempts aimed at a single account
+    # and gives a per-account signal the per-IP limit cannot. What it does NOT
+    # buy you is attacker cost -- the check runs after the bcrypt verify, so
+    # being refused is free to the caller (measured: an over-budget request
+    # costs within ~1% of an under-budget one). AUTH_LOGIN_RATE_PER_MIN is the
+    # control that bounds attacker cost. Sizing this knob as a DoS control
+    # would be a mistake; see the login docstring for why the check cannot
+    # simply move before the verify. 0 disables.
+    AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", "20"))
+    # Cap on simultaneously ACTIVE (unexpired) tokens per user. Every login
+    # mints one, and the periodic purge only removes EXPIRED rows, so the
+    # table grew with the number of logins rather than with the number of
+    # users -- an unbounded-growth / DoS vector on the auth store. Logging in
+    # past the cap REVOKES (deletes) the user's oldest active tokens, so the
+    # evicted credential stops working immediately rather than merely
+    # disappearing from a listing. 0 disables the cap.
+    AUTH_MAX_ACTIVE_TOKENS_PER_USER = int(os.getenv("AUTH_MAX_ACTIVE_TOKENS_PER_USER", "10"))
     # Redis-backed per-IP rate limits on the public search surface: /search,
     # /facets, /analytics/click and /ready were unauthenticated and unrated,
     # which allowed full-corpus scraping (top_k=50) and click-analytics
