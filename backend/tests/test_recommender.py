@@ -159,17 +159,6 @@ class TestGetSimilarArticlesDisabled:
             assert result == []
 
 
-class TestGetLatestTopStoriesDisabled:
-    """Test latest stories when recommendations are disabled."""
-
-    @pytest.mark.asyncio
-    async def test_returns_empty_when_disabled(self):
-        from app.recommender import get_latest_top_stories
-        with patch('app.recommender.config') as mock_config:
-            mock_config.ENABLE_RECOMMENDATIONS = False
-            result = await get_latest_top_stories(limit=5)
-            assert result == []
-
 
 class TestUserProfileIntegration:
     """Integration tests for user profile interactions with Redis."""

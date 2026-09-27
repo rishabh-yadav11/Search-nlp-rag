@@ -15,7 +15,6 @@ from app.query_intent import (
     extract_month_range,
     extract_year_range,
     is_aggregation_intent,
-    month_query_topic,
     normalize_word_numbers,
     range_query_topic,
     rewrite_year_in_review,
@@ -223,21 +222,22 @@ def test_rewrite_skipped_for_month_query():
     assert q == "top pharma deals of month january 2025"
 
 
-def test_month_query_topic_top_n_query():
-    assert month_query_topic("top pharma deals of month january 2025") == "pharma deals"
-    assert month_query_topic("deals in feb 2024") == "deals"
+def test_range_query_topic_covers_month_scoped_queries():
+    """Month-scoped topic extraction lives in ``range_query_topic`` (#303).
 
-
-def test_month_query_topic_plain_date_query():
-    assert month_query_topic("january 2025") is None
-    assert month_query_topic("ChrysCapital Intas Pharma deals in january 2025") == (
+    The old public ``month_query_topic`` was reachable only from its own
+    tests, so a change made there would silently not affect search. These
+    cases are pinned against the one path the app actually calls, so deleting
+    the duplicate cannot quietly drop month coverage.
+    """
+    assert range_query_topic("top pharma deals of month january 2025") == "pharma deals"
+    assert range_query_topic("deals in feb 2024") == "deals"
+    assert range_query_topic("january 2025") is None
+    assert range_query_topic("ChrysCapital Intas Pharma deals in january 2025") == (
         "ChrysCapital Intas Pharma deals"
     )
-
-
-def test_month_query_topic_no_month_returns_none():
-    assert month_query_topic("top pharma deals 2025") is None
-    assert month_query_topic("venture funding") is None
+    assert range_query_topic("top pharma deals 2025") is None
+    assert range_query_topic("venture funding") is None
 
 
 def test_extract_list_topic_strips_month_words():
