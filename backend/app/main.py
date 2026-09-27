@@ -47,6 +47,7 @@ from app.encoders import DenseEncoder
 from app.health import close_redis as health_module_close_redis
 from app.health import router as health_router
 from app.health import warn_if_llm_key_unusable
+from app.input_hygiene import build_cache_key, normalize_text, split_facet_values
 from app.logging_config import configure_logging
 from app.observability import (
     RequestIdMiddleware,
@@ -539,27 +540,35 @@ def build_facet_filter(
     to_date: str | None,
     content_type: str | None = None,
 ) -> Filter | None:
-    """Qdrant filter for the faceted search params, or None when unfiltered."""
+    """Qdrant filter for the faceted search params, or None when unfiltered.
+
+    Facet values are normalised and bounded here (see app.input_hygiene) so the
+    MatchAny and the cache key derived from this filter are both built from the
+    same bounded spelling. Every facet path -- /search, the auto-facet fallback
+    and the date-window retrieval -- funnels through this one function, so the
+    caps cannot be sidestepped by arriving through a different caller.
+    """
     conditions = []
-    for key, raw in (
-        ("industry_names", industry),
-        ("dealtype_names", dealtype),
-        ("author_names", author),
-        ("content_type", content_type),
+    for key, field, raw in (
+        ("industry_names", "industry", industry),
+        ("dealtype_names", "dealtype", dealtype),
+        ("author_names", "author", author),
+        ("content_type", "content_type", content_type),
     ):
-        if raw:
-            values = [v.strip() for v in raw.split(",") if v.strip()]
-            if values:
-                conditions.append(FieldCondition(key=key, match=MatchAny(any=values)))
+        values = split_facet_values(field, raw)
+        if values:
+            conditions.append(FieldCondition(key=key, match=MatchAny(any=values)))
     if from_date:
         dt = _parse_date(from_date)
         if dt is None:
-            raise HTTPException(status_code=400, detail=f"invalid from_date: {from_date!r}")
+            # Static message: the rejected value is caller input, so echoing it
+            # would make this 400 a reflection point in the response.
+            raise HTTPException(status_code=400, detail="invalid from_date")
         conditions.append(FieldCondition(key="published_date", range=DatetimeRange(gte=dt.isoformat())))
     if to_date:
         dt = _parse_date(to_date)
         if dt is None:
-            raise HTTPException(status_code=400, detail=f"invalid to_date: {to_date!r}")
+            raise HTTPException(status_code=400, detail="invalid to_date")
         end = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
         conditions.append(FieldCondition(key="published_date", range=DatetimeRange(lte=end.isoformat())))
     if not conditions:
@@ -575,7 +584,19 @@ def facet_cache_token(
     to_date: str | None,
     content_type: str | None = None,
 ) -> str:
-    return f"{industry or ''}|{dealtype or ''}|{author or ''}|{from_date or ''}|{to_date or ''}|{content_type or ''}"
+    """Cache-key fragment for the faceted search params.
+
+    Values are normalised the same way ``build_facet_filter`` normalises them,
+    so the token and the filter it stands for cannot drift apart, and the
+    components are length-prefixed rather than joined with a delimiter: the
+    pipe-join this replaces was ambiguous, and ``industry='a', dealtype='b|c'``
+    and ``industry='a|b', dealtype='c'`` produced one token for two different
+    filters -- a request was then served the other one's cached results.
+    """
+    return build_cache_key(
+        *(normalize_text(value or "") for value in
+          (industry, dealtype, author, from_date, to_date, content_type))
+    )
 
 
 def _effective_intent(
@@ -1143,23 +1164,48 @@ def retrieval_config_fingerprint() -> str:
 def retrieve_cache_key(q: str, top_k: int, qfilter: Filter | None) -> str:
     """Cache key for a ``retrieve_and_rerank`` result set.
 
-    ``q`` goes through :func:`_cache_key_component`, so an over-long query
-    contributes a bounded ``h:`` digest rather than its full text (#241). That
-    helper hashes instead of truncating, so two distinct over-long queries still
-    key apart and neither can be served the other's result.
+    This is the only place the ``retrieve:`` key is composed, and it composes it
+    by handing the parts to :func:`build_cache_key` -- the single constructor for
+    all three retrieval caches (``vec:``, ``retrieve:``, ``search:``), so the
+    three keys cannot drift apart in how they bound or delimit their inputs.
+
+    Two bounds compose here and neither replaces the other. ``q`` goes through
+    :func:`_cache_key_component` first, so an over-long query contributes a
+    bounded ``h:`` digest rather than its full text (#241); that helper hashes
+    instead of truncating, so two distinct over-long queries still key apart and
+    neither can be served the other's result. ``build_cache_key`` then
+    length-prefixes the parts, so the assembled key is injective and bounded as
+    a whole (#252) -- the first bounds one component, the second the key. The
+    filter JSON is exactly why both are needed: it is long, and it can contain
+    the delimiters the old ``:`` join used.
+
+    The config digest comes last so a configuration change that can change what
+    a cached result *contains* invalidates the entry (#266).
     """
-    return (
-        f"retrieve:{_cache_key_component(q)}:{top_k}:"
-        f"{retrieval_config_fingerprint()}:{_filter_token(qfilter)}"
+    return build_cache_key(
+        _cache_key_component(q), top_k,
+        _filter_token(qfilter), retrieval_config_fingerprint(),
+        namespace="retrieve",
     )
 
 
 def search_cache_key(retrieval_q: str, eff_top_k: int, facets: str) -> str:
-    """Cache key for a /search summary page. Bounded by
-    :func:`_cache_key_component` on the query, as above (#241)."""
-    return (
-        f"search:{_cache_key_component(retrieval_q)}:{eff_top_k}:"
-        f"{retrieval_config_fingerprint()}:{facets}"
+    """Cache key for a /search summary page.
+
+    Same composition as :func:`retrieve_cache_key` -- bounded per component by
+    :func:`_cache_key_component` (#241), injective and bounded as a whole by
+    :func:`build_cache_key` (#252), and carrying the config digest (#266) because
+    click boost, diversity and the relevance gate all run after retrieval and so
+    change the ``search:`` entry but not the ``retrieve:`` one.
+
+    ``facets`` is already a length-prefixed token from
+    :func:`facet_cache_token`; it is passed through as one opaque part, so its
+    internal framing is not re-derived here.
+    """
+    return build_cache_key(
+        _cache_key_component(retrieval_q), eff_top_k, facets,
+        retrieval_config_fingerprint(),
+        namespace="search",
     )
 
 
@@ -1226,11 +1272,21 @@ async def retrieve_and_rerank(
     (``None`` meaning "already looked up, and it was a miss"). Supplying it
     saves one Redis round trip; omitting it performs the normal lookup.
     """
-    q = fix_query(q)[0]  # typo-corrected query flows to cache key, legs, boost
+    # Typo-corrected, then normalised. This one string flows to the cache key,
+    # the retrieval legs and the boosts below, so equivalent spellings of a
+    # query share a cache entry instead of embedding and retrieving again, and
+    # no NUL/CRLF from the raw input can reach the key.
+    q = normalize_text(fix_query(q)[0])
     # A recency intent ('latest', 'recent') weights freshness heavily in ranking
     # so new articles outrank old evergreen ones; rolling windows ('this week')
     # are already scoped by the date filter and need no extra ranking boost.
     recency_boost = is_recency_intent(q)
+    # The retrieve: key is assembled in one place, retrieve_cache_key, which
+    # composes both bounds: _cache_key_component digests the query segment once
+    # it passes CACHE_KEY_QUERY_MAX_CHARS (issue #241), and build_cache_key
+    # length-prefixes the parts so the assembled key is injective and bounded as
+    # a whole (issue #252) -- the first bounds one component, the second the
+    # key. The filter JSON is exactly why both are needed.
     cache_key = retrieve_cache_key(q, top_k, qfilter)
     cached = await cache.get(cache_key) if prefetched is _NO_PREFETCH else prefetched
     if cached is not None:
@@ -1486,6 +1542,22 @@ async def search(
     to_date: str | None = Query(None),
 ):
     start = time.perf_counter()
+    # One normalised spelling of the query drives everything below -- the cache
+    # key, the retrieval text, the analytics record and the echoed response --
+    # so equivalent spellings share a cache entry and no control character from
+    # the raw input can reach any of them. Query length is validated by FastAPI
+    # (min_length) before this, so a query built only from control characters
+    # can still normalise away to nothing; reject that rather than retrieving
+    # for an empty query.
+    q = normalize_text(q)
+    if not q:
+        raise HTTPException(status_code=400, detail="empty query")
+    # Bound the facet params up front. build_facet_filter re-checks them further
+    # down, but the cache key below is built from these same values, and it
+    # must not be reachable with an oversized facet.
+    for facet_field, facet_raw in (("industry", industry), ("dealtype", dealtype),
+                                   ("author", author), ("content_type", content_type)):
+        split_facet_values(facet_field, facet_raw)
     q_fixed, _ = fix_query(q)
     retrieval_q, eff_from, eff_to, auto_dealtype, auto_industry = _effective_intent(q_fixed, from_date, to_date)
     auto_content_type = extract_content_type(q_fixed)
@@ -1501,6 +1573,10 @@ async def search(
     # _retrieval_leg (which chat also uses), so we must NOT expand here too,
     # otherwise /search expands twice and diverges from the chat pipeline.
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
+    # Same composition as the retrieve: key above -- the query segment is
+    # digested per CACHE_KEY_QUERY_MAX_CHARS (#241) and the whole key is
+    # length-prefixed so no two (query, top_k, facets) triples can share one
+    # entry (#252).
     cache_key = search_cache_key(
         retrieval_q, eff_top_k,
         facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type),
