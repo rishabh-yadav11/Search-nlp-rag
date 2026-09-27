@@ -10,7 +10,10 @@ caught here rather than in production.
 """
 
 import logging
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -19,8 +22,10 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, field_validator
 from starlette.responses import StreamingResponse
 
+from app.logging_config import configure_logging, installed_handler
 from app.observability import (
     RequestIdMiddleware,
+    attach_request_id_filter,
     unhandled_exception_handler,
     validation_exception_handler,
 )
@@ -62,54 +67,44 @@ class _ListHandler(logging.Handler):
         self.records.append(record)
 
 
-def _stamps_request_id(handler: logging.Handler) -> bool:
-    fmt = getattr(handler.formatter, "_fmt", None)
-    return bool(fmt) and "request_id" in fmt
-
-
-@pytest.fixture(autouse=True)
-def _detach_ambient_root_handler():
-    """Hide the handler app.main installs on the root logger.
-
-    Importing app.main calls install_root_log_handler(), which attaches a stderr
-    handler for the rest of the session. It is detached here so these cases see
-    only the records they asked for and the run's output stays clean, then put
-    back so no sibling test inherits a changed logging setup.
-    """
-    root = logging.getLogger()
-    saved = list(root.handlers)
-    for handler in saved:
-        if _stamps_request_id(handler):
-            root.removeHandler(handler)
-    try:
-        yield
-    finally:
-        for handler in saved:
-            if handler not in root.handlers:
-                root.addHandler(handler)
-
-
 @pytest.fixture
 def log():
     """Capture every record the request produces, stamped exactly as in prod.
 
-    The RequestIdFilter sits on the handler (as it does in production) rather
-    than on a logger, so a record only carries `request_id` because the filter
-    that ships in app.observability put it there.
+    #293's `configure_logging()` is what makes an INFO app record exist at all,
+    so it is called here rather than relied on from whatever a previous test
+    happened to import -- `app` lands at the app level, `app.access` and
+    `app.observability` with it, and the root logger stays at WARNING. It is a
+    process-wide change, so the previous state of every logger and of root is
+    snapshotted and put back afterwards.
 
-    The root logger's level is deliberately NOT lowered here: leaving it at the
-    WARNING it carries under gunicorn/uvicorn is what makes the access-record
-    assertions real rather than self-fulfilling -- the INFO access line has to
-    reach the handler on the strength of `app.access`'s own level alone.
+    The RequestIdFilter is attached to the capture handler exactly as
+    `attach_request_id_filter` attaches it to the app's real one, so a record
+    only carries `request_id` because the filter that ships in
+    app.observability put it there.
     """
+    root = logging.getLogger()
+    root_state = (root.level, list(root.handlers))
+    loggers = {
+        name: (log_.level, log_.propagate)
+        for name, log_ in list(logging.Logger.manager.loggerDict.items())
+        if isinstance(log_, logging.Logger)
+    }
+    configure_logging()
     handler = _ListHandler()
     handler.addFilter(RequestIdFilter())
-    root = logging.getLogger()
     root.addHandler(handler)
     try:
         yield handler.records
     finally:
         root.removeHandler(handler)
+        for stale in [h for h in root.handlers if h not in root_state[1]]:
+            root.removeHandler(stale)
+        root.setLevel(root_state[0])
+        for name, (level, propagate) in loggers.items():
+            log_ = logging.getLogger(name)
+            log_.setLevel(level)
+            log_.propagate = propagate
 
 
 def _errors(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
@@ -448,6 +443,103 @@ def test_streaming_response_keeps_every_chunk_and_the_id(log):
     assert len(access) == 1
     assert "200" in access[0].getMessage()
     assert _errors(log) == []
+
+
+def test_the_request_id_filter_extends_the_app_handler_and_never_stacks_one(log):
+    """#293's `configure_logging()` is the single owner of the root handler.
+
+    Correlation must extend that handler, not install a second one: two root
+    handlers write every record in the process twice, which is exactly the
+    single-write property #293 pins. So the filter goes on the handler
+    `installed_handler()` returns, and calling this twice still attaches one.
+    """
+    before = list(logging.getLogger().handlers)
+
+    handler = attach_request_id_filter()
+    again = attach_request_id_filter()
+
+    assert handler is again is installed_handler()
+    # The root handler list is byte-for-byte what it was: this added a filter,
+    # not a handler, and it is a filter on the one #293 already installed.
+    assert list(logging.getLogger().handlers) == before
+    assert handler in before
+    assert sum(isinstance(f, RequestIdFilter) for f in handler.filters) == 1
+
+
+def test_the_id_survives_into_the_line_the_app_handler_actually_renders(log):
+    """The filter sets a field; #293's format string renders no field.
+
+    What makes the id greppable in a shipped deployment is therefore the message
+    text, so this renders a captured record through the real handler's own
+    formatter and looks for the id in the output -- not on the record.
+    """
+    app = _build_app()
+
+    @app.get("/boom")
+    async def boom():
+        raise _Boom(_OUTAGE)
+
+    resp = TestClient(app, raise_server_exceptions=False).get("/boom")
+
+    rid = resp.headers[REQUEST_ID_HEADER]
+    handler = installed_handler()
+    assert handler is not None
+    rendered = "".join(handler.formatter.format(r) for r in log)
+    assert rid in rendered
+    assert "Traceback" in rendered  # the traceback reaches the same line
+
+# The script the fresh-interpreter ordering check runs: importing app.main is what
+# calls configure_logging() and then the correlation wiring, in that order.
+_PROBE = (
+    "import logging\n"
+    "from app import main  # the real import path: configure_logging, then the wiring\n"
+    "from app.logging_config import installed_handler\n"
+    "from app.request_context import RequestIdFilter\n"
+    "h = installed_handler()\n"
+    "print('HANDLER', h is not None)\n"
+    "print('FILTERS', sum(isinstance(f, RequestIdFilter) for f in h.filters) if h else -1)\n"
+    "print('ON_ROOT', bool(h) and h in logging.getLogger().handlers)\n"
+    "print('APP_HANDLERS', len([x for x in logging.getLogger().handlers\n"
+    "                            if getattr(x, '_vccircle_app_handler', False)]))\n"
+)
+
+
+def test_the_real_import_path_actually_attaches_the_filter():
+    """The ordering constraint, pinned: the attach must happen AFTER #293 runs.
+
+    `configure_logging()` is called from `app.main` near the top of that module
+    and `installed_handler()` returns None before it, so a call site that
+    drifted above it would leave the filter permanently unattached and no app
+    line would carry an id -- silently, because every other case here would
+    still pass. That is the failure this turns into a red test.
+
+    Run in a fresh interpreter, deliberately: whether the filter is attached
+    depends on the ORDER of two module-level calls at import, and this test
+    session's own fixtures (mine and #293's) add and remove root handlers. An
+    in-process assertion would read whatever the previously-run test left
+    behind instead of the real import path. This is the same
+    fresh-interpreter technique `tests/test_api_surface_hardening.py` and
+    `tests/test_logging_config.py` already use for import-time behaviour.
+    """
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _PROBE,
+        ],
+        check=False,
+        cwd=backend_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "HANDLER True" in proc.stdout, proc.stdout
+    assert "FILTERS 1" in proc.stdout, proc.stdout
+    assert "ON_ROOT True" in proc.stdout, proc.stdout
+    # And still exactly one app handler: a second one would double every line.
+    assert "APP_HANDLERS 1" in proc.stdout, proc.stdout
 
 
 def test_real_app_registers_the_middleware_and_stamps_a_response():

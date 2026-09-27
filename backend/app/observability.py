@@ -1,5 +1,18 @@
 """Request-id middleware, access log and the top-level exception handlers.
 
+Where the log lines go is NOT decided here. ``app.logging_config.configure_logging``
+(#293) is the single owner of the app's root handler: it installs one handler,
+leaves the root logger at the WARNING it inherits, and puts the app's loggers at
+the operator's ``LOG_LEVEL``. This module never installs a handler of its own
+(two root handlers means every record is written twice) and never changes a
+logger's level (``"app"`` is already in ``APP_LOGGERS``, so ``app.access`` and
+``app.observability`` inherit the operator's level, and a level set here would
+be undone by the next ``configure_logging()`` call anyway). It adds a *filter*
+to the handler ``configure_logging()`` installed, so that every record that
+handler renders carries the id; and because that handler's format string has no
+``%(request_id)s`` field, every line written here repeats the id in the message
+text, which is the form that is greppable however a deployment formats its logs.
+
 Starlette's stack is ``ServerErrorMiddleware -> user middlewares ->
 ExceptionMiddleware -> router``, and this module's wiring depends on that shape:
 
@@ -20,7 +33,6 @@ which breaks the SSE chat stream.
 """
 
 import logging
-import sys
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -42,20 +54,15 @@ from app.request_context import (
 access_logger = logging.getLogger("app.access")
 logger = logging.getLogger("app.observability")
 
-# The access line is logged at INFO, and this explicit level is what carries it
-# to the root handler: `isEnabledFor` stops walking the hierarchy here, so the
-# root logger's own WARNING default never suppresses the record, while every
-# other module keeps its effective level and does not flood. Handler levels --
-# not ancestor logger levels -- decide what a propagated record is rendered at,
-# and install_root_log_handler's handler is at INFO.
-access_logger.setLevel(logging.INFO)
+# The access line is logged at INFO and deliberately has no level of its own: the
+# `app` logger it inherits from is at the operator's LOG_LEVEL because "app" is
+# in APP_LOGGERS. Pinning it here would be undone by the next
+# configure_logging() call, and a deployment that asks for less output should
+# lose the access line with everything else.
 
 # Raw ASGI header name, pre-lowercased: comparing bytes avoids decoding every
 # header on the way in and on the way out.
 _REQUEST_ID_HEADER_BYTES = REQUEST_ID_HEADER.lower().encode("latin-1")
-
-_LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] [request_id=%(request_id)s] %(message)s"
-
 
 def _inbound_request_id(scope: Scope) -> str | None:
     """The raw inbound ``X-Request-ID`` value, or None.
@@ -212,40 +219,38 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-def _stamps_request_id(handler: logging.Handler) -> bool:
-    """True if this handler's formatter already renders the request id."""
-    fmt = getattr(handler.formatter, "_fmt", None)
-    return bool(fmt) and "request_id" in fmt
+def attach_request_id_filter() -> logging.Handler | None:
+    """Stamp the request id onto every record the app's own handler renders.
 
+    #293's `configure_logging()` is the single owner of the app's root handler
+    and exposes it through `installed_handler()`; that is the extension point
+    used here. The RequestIdFilter goes on THAT handler. Installing a second
+    root handler would write every record in the process twice, and a filter on
+    a *logger* is worse still: `Logger.callHandlers` consults a handler's
+    filters only on the path to that handler, so a logger-level filter never
+    runs for records that merely propagate through it.
 
-def install_root_log_handler() -> None:
-    """Attach the request-id-stamping handler to the ROOT logger, once.
+    A filter rather than a format field, because the format is #293's to change
+    and it renders timestamp/level/name/message only. What the filter guarantees
+    regardless of the format is that ``record.request_id`` exists on every
+    record, for any consumer that reads records rather than rendered text; the
+    rendered line carries the id because every line here repeats it.
 
-    Idempotent: if a handler whose formatter renders ``request_id`` is already
-    attached -- ours, or an operator's own ``dictConfig`` -- nothing is added, so
-    calling this twice cannot duplicate every line in the process.
+    MUST be called after `configure_logging()` has run: `installed_handler()`
+    returns None before that, and this deliberately creates nothing in that
+    case rather than installing a handler of its own. ``app.main`` calls it from
+    the middleware wiring block, which is below the `configure_logging()` call
+    at its top.
 
-    The handler is on the ROOT logger (and the ``RequestIdFilter`` is on the
-    HANDLER, not on a logger) because that is the only way a record from any
-    module -- app code, redis, qdrant, httpx -- is stamped: filters attached to a
-    logger do not run for records that merely propagate up to it. The filter
-    guarantees ``request_id`` is present on every record, so the formatter can
-    never raise ``internal error in logging``.
-
-    The root logger's own level is deliberately left alone. Modules here log at
-    WARNING precisely because INFO is dropped today (see the "TrustedHost allowed
-    hosts" line in app.main), and dropping the root level to make the access line
-    visible would flood production with them. The access line is instead logged
-    at INFO with ``app.access`` pinned to INFO (see above) and the handler set to
-    INFO, so it is still rendered in a default gunicorn/uvicorn deployment, where
-    the root logger stays at WARNING -- and no level is claimed here that the
-    code does not use.
+    Idempotent: a second call finds the filter already attached and returns the
+    same handler. Returns that handler, or None when logging is not configured
+    (an app built without importing `app.main`, i.e. a unit test).
     """
-    root = logging.getLogger()
-    if any(_stamps_request_id(handler) for handler in root.handlers):
-        return
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-    handler.addFilter(RequestIdFilter())
-    handler.setLevel(logging.INFO)
-    root.addHandler(handler)
+    from app.logging_config import installed_handler
+
+    handler = installed_handler()
+    if handler is None:
+        return None
+    if not any(isinstance(existing, RequestIdFilter) for existing in handler.filters):
+        handler.addFilter(RequestIdFilter())
+    return handler

@@ -549,9 +549,15 @@ Added by this change, all exercised end to end through the HTTP handlers:
       afterwards (no leak into the next request); a `StreamingResponse` (the
       SSE chat path) keeps every chunk and still carries the header.
 - [x] **access log**: one INFO record per request with method, path, status,
-      `duration_ms` and user id, at a level the shipped gunicorn/uvicorn
-      deployment actually renders (root stays at WARNING; `app.access` is
-      pinned to INFO).
+      `duration_ms` and user id. It has no level of its own: `app.access`
+      inherits `app`, which `logging_config.APP_LOGGERS` puts at the operator's
+      `LOG_LEVEL` (#293 owns that; this branch installs no handler and sets no
+      level). The line repeats the id in its text, because #293's format
+      renders no `request_id` field.
+- [x] **id stamping**: `attach_request_id_filter()` adds the `RequestIdFilter`
+      to the handler `logging_config.installed_handler()` returns — the single
+      root handler, never a second one — and runs after `configure_logging()`, or
+      there is no handler to attach to. Pinned by a test against the real app.
 - [x] **top-level handler**: an unhandled exception is logged once with the
       traceback and the id, and answered with an opaque 500 whose body is
       `detail` + `request_id` only — never the exception text, class name or
