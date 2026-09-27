@@ -521,7 +521,7 @@ def test_freeze_rejects_naive_datetime(monkeypatch):
 # semantic narrowing, so every change to the live patterns has to be shown not
 # to move the result on realistic input.
 _ORIG_BOTH_AND_RE = re.compile(r"\bboth\b.+?\band\b", re.IGNORECASE)
-_ORIG_ALL_OF_RE = re.compile(r"\all (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
+_ORIG_ALL_OF_RE = re.compile(r"\ball (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
 _ORIG_ACQUIRED_BY_RE = re.compile(
     r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b[^.?!]*?\b(who|whom)\b",
     re.IGNORECASE,
@@ -551,26 +551,28 @@ _SEARCH_PAIRS = (
     (query_intent._BUYER_TRAILING_RE, _ORIG_BUYER_TRAILING_RE),
 )
 
-# Note on `_ALL_OF_RE`: its literal is written `\all`, and in a regex `\a` is
-# BEL, not the start of "all" -- so the alternative can only ever match a BEL
-# character. That is a pre-existing quirk of the pattern, deliberately left
-# alone here (it is a functional bug, not a performance one), but it means a
-# plain-English corpus would exercise that pattern as a no-op and prove
-# nothing. The BEL-prefixed entries below are what actually drive it.
+# `_ALL_OF_RE` is written with a `\b` before "all" -- the literal is the word
+# "all", NOT `\a` + "ll" (a BEL escape, which would make the pattern unable to
+# match ordinary English). `_ORACLE_GAP` below is what mechanically ties each
+# oracle to its live counterpart so a hand-transcription slip in either cannot
+# hide a behaviour change: the equivalence assertions are only meaningful if
+# the two patterns are the same pattern apart from the gap bound.
 _INTERSECTION_CORPUS = (
     # Positives.
     "companies backed by both SoftBank and Tiger Global",
     "funds that have backed both Acme and Beta Capital",
     "deals with all of A, B and C",
     "investments common to all of these funds and their LPs",
-    "\x07ll of Acme, Beta and Gamma",
-    "\x07ll of the seed cohort and their angels",
+    "all of Acme, Beta and Gamma",
+    "all of the seed cohort and their angels",
+    "what do all of these investors have in common and who led them",
     # Negatives: a connective with no closing "and"/"with" after it, or with
     # the closing term only BEFORE it.
     "both companies are large",
     "all of the above",
-    "\x07ll of the above",
     "startups that SoftBank and Tiger Global have both backed",
+    # "all" inside a larger word must not trigger the literal.
+    "small allocations across the portfolio and the follow-on",
 )
 
 _ACQUISITION_CORPUS = (
@@ -614,16 +616,18 @@ def test_acquisition_detection_matches_pre_fix_patterns(new, orig):
 def test_intersection_corpus_exercises_both_polarities():
     """Equivalence alone would pass if every pattern matched nothing, so pin
     that the corpus really does produce hits *and* misses."""
-    hit = "companies backed by both SoftBank and Tiger Global"
-    assert _ORIG_BOTH_AND_RE.search(hit)
-    assert _ORIG_BOTH_AND_RE.sub(" ", hit) != hit
-    bel_hit = "\x07ll of Acme, Beta and Gamma"
-    assert _ORIG_ALL_OF_RE.sub(" ", bel_hit) != bel_hit
+    both_hit = "companies backed by both SoftBank and Tiger Global"
+    assert _ORIG_BOTH_AND_RE.search(both_hit)
+    assert _ORIG_BOTH_AND_RE.sub(" ", both_hit) != both_hit
+    all_hit = "deals with all of A, B and C"
+    assert _ORIG_ALL_OF_RE.search(all_hit)
+    assert _ORIG_ALL_OF_RE.sub(" ", all_hit) != all_hit
     for text in (
         "both companies are large",
         "all of the above",
-        "\x07ll of the above",
         "startups that SoftBank and Tiger Global have both backed",
+        # "all" embedded in a larger word must not fire the `\ball` literal.
+        "small allocations across the portfolio and the follow-on",
     ):
         assert _ORIG_BOTH_AND_RE.sub(" ", text) == text, text
         assert _ORIG_ALL_OF_RE.sub(" ", text) == text, text
@@ -651,7 +655,7 @@ _LONG_BOTH_AND = (
     "bets is the part investors keep asking about in the follow-up calls"
 )
 _LONG_ALL_OF = (
-    "\x07ll of the seed-stage accelerator programmes, the micro-SAT fund and the deep-tech "
+    "all of the seed-stage accelerator programmes, the micro-SAT fund and the deep-tech "
     "fellowship, and the shared pipeline is where the overlap between the three turns out "
     "to be largest once the follow-on rounds from last year are taken out of the picture"
 )
@@ -706,15 +710,44 @@ def test_connective_gaps_are_bounded_and_groups_preserved():
         assert new.groups == orig.groups, new.pattern
 
 
+def test_oracles_are_the_live_patterns_minus_the_gap_bound():
+    """The equivalence assertions above are only meaningful if each frozen
+    oracle really is the live pattern with the gap unbounded again.
+
+    Without this, a hand-transcription slip is invisible: a `\b` dropped from
+    BOTH the live pattern and its oracle leaves the two in perfect agreement
+    while both no longer match the text the pattern was written for -- which
+    is exactly the failure this test exists to make impossible. Deriving the
+    expected oracle text from the live pattern mechanically means the two can
+    only differ by the gap bound.
+    """
+    n = query_intent._MAX_CONNECTIVE_SPAN
+    # The bounded forms, longest/most specific first so `[^.?!]{0,N}?` is not
+    # partially consumed by the bare `.{0,N}?` rule. `{0,N}` is "zero or more",
+    # so a char-class gap unwinds to `*?` and a `.` gap (always >= 1 char in
+    # the originals) to `+?`.
+    unwind = (
+        (f"[^.?!]{{0,{n}}}?", "[^.?!]*?"),
+        (f".{{0,{n}}}?", ".+?"),
+        (f".{{0,{n}}}", ".*"),
+    )
+    for new, orig in _SUB_PAIRS + _SEARCH_PAIRS:
+        unbounded = new.pattern
+        for bounded_form, original_form in unwind:
+            unbounded = unbounded.replace(bounded_form, original_form)
+        assert unbounded == orig.pattern, (
+            f"oracle drifted from the live pattern:\n"
+            f"  live (gap unbounded) = {unbounded!r}\n"
+            f"  frozen oracle         = {orig.pattern!r}"
+        )
+
+
 # Pathological inputs: the repeated connective with the closing term left out,
 # so every one of the k literal start positions has to scan to the end of the
 # string. That is exactly the shape the unbounded gaps made quadratic.
 _PATHOLOGICAL = (
     ("both_and", query_intent._BOTH_AND_RE, lambda n: "both " * n),
-    # `\all` in `_ALL_OF_RE` is BEL + "ll" (see the note above), so this is the
-    # only input shape that actually starts a match there -- and it is also the
-    # shape that made the pre-fix pattern quadratic.
-    ("all_of", query_intent._ALL_OF_RE, lambda n: "\x07ll bbbb " * n),
+    ("all_of", query_intent._ALL_OF_RE, lambda n: "all bbbb " * n),
     ("acquired_by", query_intent._ACQUIRED_BY_RE, lambda n: "acquired " * n),
     ("buyer_aux", query_intent._BUYER_AUX_RE, lambda n: "who " * n),
     ("buyer_trailing", query_intent._BUYER_TRAILING_RE, lambda n: "takeover " * n),
