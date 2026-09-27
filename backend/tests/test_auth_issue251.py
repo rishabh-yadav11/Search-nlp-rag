@@ -720,9 +720,15 @@ def _chat_route_permissions() -> set[str]:
 
 def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch):
     """The one in-repo consumer, backend/scripts/eval_runner.py, sends the raw
-    AUTH_SERVICE_TOKEN and only ever calls /api/chat. So the shipped default
-    scope must cover whatever permission app/chat.py's router really requires
-    -- read from that router, not assumed -- and nothing more."""
+    AUTH_SERVICE_TOKEN and only ever calls /api/chat. The property that keeps it
+    working is that the shipped default scope COVERS what app/chat.py's router
+    requires -- so assert that, reading the requirement off the router rather
+    than restating a literal on both sides, which would only compare a constant
+    with itself.
+
+    Fails if either side drifts: if chat.py starts requiring a permission the
+    default scope lacks, or if the default scope stops covering chat.
+    """
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-from-env")
     # Pin the shipped default explicitly rather than reading whatever
@@ -730,8 +736,13 @@ def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
 
     required = _chat_route_permissions()
-    assert required == {"chat:use"}, f"app/chat.py now requires {sorted(required)}; re-check the default scope"
-    assert auth._service_token_scope() == required
+    scope = auth._service_token_scope()
+    assert required, "app/chat.py's router declares no permission to check"
+    assert scope, "the default service-token scope is empty; nothing would work"
+    assert required <= scope, (
+        f"the default scope {sorted(scope)} does not cover what app/chat.py "
+        f"requires {sorted(required)}; eval_runner.py would get 403 on every chat turn"
+    )
 
     async def scenario():
         req = _req({"x-service-token": "svc-from-env"})
@@ -763,6 +774,46 @@ def test_default_scope_would_not_cover_a_permission_chat_now_requires(store, mon
         return e.value.status_code
 
     assert asyncio.run(scenario()) == 403
+
+
+def test_rate_limiter_pins_its_redis_db(monkeypatch):
+    """The limiter must not inherit the db index from REDIS_URL.
+
+    The shipped REDIS_URL points at DB 0, which this repo documents as the
+    query cache and flushes during deploys. An unpinned limiter therefore kept
+    its security counters in the database a deploy empties, and a flush reset
+    every bucket. Pin it, as analytics.py and cost_budget.py already do."""
+    captured = {}
+
+    def fake_from_url(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return "client"
+
+    # A URL that points somewhere else entirely: the pin must win anyway.
+    monkeypatch.setattr(auth.config, "REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setattr(auth.config, "AUTH_RATE_LIMIT_REDIS_DB", 3)
+    monkeypatch.setattr(auth, "_rate_client", None)
+    monkeypatch.setattr(auth.aioredis, "from_url", fake_from_url)
+
+    assert auth._rate_redis() == "client"
+    assert captured.get("db") == 3, "the limiter's db is not pinned; it will follow REDIS_URL"
+
+
+def test_rate_limiter_db_default_is_not_the_flushed_cache_db():
+    """The shipped default must not be DB 0, or pinning it would be pointless."""
+    # Read the getenv default from the source, not the ambient config, which
+    # load_dotenv() may have overridden.
+    import inspect
+    import re as _re
+
+    from app import config as config_module
+
+    source = inspect.getsource(config_module.Config)
+    match = _re.search(r'AUTH_RATE_LIMIT_REDIS_DB\s*=\s*int\(os\.getenv\([^,]+,\s*"(\d+)"\)', source)
+    assert match, "AUTH_RATE_LIMIT_REDIS_DB must have a numeric default"
+    assert int(match.group(1)) != 0, "the rate limiter must not default to the deploy-flushed cache DB"
+
 
 def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypatch):
     """Revocation must stick even though the value is still in the environment.

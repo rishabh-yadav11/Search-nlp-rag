@@ -694,8 +694,20 @@ _rate_client = None
 def _rate_redis() -> aioredis.Redis:
     global _rate_client
     if _rate_client is None:
+        # Pin the DB explicitly so the rate-limit counters never silently land
+        # in DB 0, which is the query cache and is flushed during deploys --
+        # a flush there would reset every bucket and briefly disable the
+        # throttle. The ``db`` kwarg overrides any db segment in REDIS_URL, so
+        # this is safe whether or not the URL carries a db index. Matches the
+        # convention in analytics.py and cost_budget.py. This client is
+        # module-local to the limiter (closed by close_rate_redis), so pinning
+        # it cannot move anyone else's data.
         _rate_client = aioredis.from_url(
-            config.REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2
+            config.REDIS_URL,
+            db=config.AUTH_RATE_LIMIT_REDIS_DB,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
         )
     return _rate_client
 
@@ -818,14 +830,22 @@ async def _check_account_rate_limit(
 
     The key is the address folded to lower case and stripped, so one account
     cannot be handed a second bucket by changing case or padding -- the
-    invariant is enforced here rather than left to the caller. Nothing about
-    whether that address has an account here feeds into the decision: the
-    counter is incremented and compared for a registered and an unregistered
-    address alike, and no lookup is performed to compute it, so the counter's
-    state, the 429 it yields and the work done to reach that answer are
-    identical either way. A per-account limit that consulted the users table
-    would reintroduce exactly the account-existence oracle that the dummy-hash
-    login path exists to close.
+    invariant is enforced here rather than left to the caller.
+
+    THIS HELPER PERFORMS NO LOOKUP: given the same submitted string it computes
+    the same key, the same counter update and the same answer whether or not
+    the address has an account, which is what keeps it from being an
+    account-existence oracle. Its caller decides WHETHER to call it, and that
+    is where existence enters -- login only counts a failed credential check.
+    That is not an enumeration channel: the only thing that skips the increment
+    is supplying the correct password, which is exactly what the attacker does
+    not have. A registered address and an unregistered address both pay a
+    bcrypt verify, both increment on failure, and both return the identical
+    401 or 429.
+
+    Keep it that way. A version of this that consulted the users table, or one
+    the caller invoked before the credential check, would reintroduce the
+    account-existence oracle the dummy-hash login path exists to close.
     """
     key_account = (account or "").strip().lower()
     if limit_per_min <= 0 or not key_account:
@@ -1198,11 +1218,21 @@ async def login(body: LoginIn, request: Request):
     DoS aimed at anyone whose address the attacker already had. A correct
     password must never be rate-limited, so it never touches the counter.
 
-    Credential stuffing is still bounded, because stuffing is wrong passwords:
-    the twenty-first failed attempt is refused just the same. The cost is that a
-    rotating-IP attacker past the limit still pays one bcrypt verify per
-    request, which is the same cost an unknown address has always paid here
-    (see the dummy-hash note below) and is itself bounded by the per-IP limit.
+    WHAT THIS COUNTER IS AND IS NOT. It bounds the RATE of attempts directed at
+    one account, and gives a per-account signal that a per-IP limit cannot:
+    twenty addresses all failing against the same victim is visible here and
+    invisible per-IP. It does NOT bound an attacker's COST. Because the check
+    runs after the bcrypt verify, being refused is free -- the verify has
+    already been paid. Measured, an over-budget request costs within ~1% of an
+    under-budget one, so the attacker gains nothing from tripping the limit.
+
+    The per-IP limiter is the control that bounds attacker cost. Anything that
+    wants to make this counter do that job has to consult it BEFORE the
+    verify, and that is precisely the change already made and rejected: it
+    reinstates the account-lockout primitive, and it reinstates the existence
+    timing oracle, because a cheap 429 for a known address and an expensive
+    verify for an unknown one is a perfect enumeration signal. The counter is
+    deliberately second-line.
     """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
