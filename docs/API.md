@@ -9,7 +9,7 @@ Most endpoints return JSON. Search and analytics are `GET`; chat is JSON or
 Server-Sent-Events (SSE).
 
 **Authentication:** chat, analytics and user-management endpoints require a
-bearer token issued by `POST /api/auth/signup` or `POST /api/auth/login`
+bearer token issued by `POST /api/auth/login`
 (`Authorization: Bearer <token>`). Tokens are opaque, expire after
 `AUTH_TOKEN_TTL_DAYS` (7) and can be revoked (`POST /api/auth/logout`). Access
 is role-based: `user` (the only role public signup can grant — it is not
@@ -23,7 +23,7 @@ all inputs are validated server-side. Internal machine clients may bypass via
 
 | Method & path | Access | Purpose |
 |---|---|---|
-| `POST /api/auth/signup` | public | Create account → `{token, user}` |
+| `POST /api/auth/signup` | public | Create account → `{message}` (no token; then log in) |
 | `POST /api/auth/login` | public | Exchange email+password → `{token, user}` |
 | `GET /api/auth/me` | auth | Current user profile |
 | `POST /api/auth/logout` | auth | Revoke current token |
@@ -34,9 +34,13 @@ all inputs are validated server-side. Internal machine clients may bypass via
 | `DELETE /api/auth/users/{id}` | `admin` | Delete user + revoke tokens |
 | `POST /api/auth/users/{id}/tokens/revoke` | `admin` | Revoke all of a user's tokens |
 
-Signup validation: `email` (format, ≤254, lowercased, unique → 409),
+Signup validation: `email` (format, ≤254, lowercased),
 `password` (8–128 chars, must contain a letter and a digit), `name` (optional,
-≤60, no control characters). Login returns an identical generic `401` for
+≤60, no control characters). Signup always returns `200`
+`{"message": "If this email is not already registered, your account is ready. Sign in with your email and password to continue; if you already have an account, sign in with your existing password."}`
+and never a token, so a fresh address and an already-registered one (including
+the concurrent-duplicate race) are indistinguishable — no account enumeration.
+Get a token by logging in. Login returns an identical generic `401` for
 unknown email or wrong password (no account enumeration). A disabled account
 (`is_active=false`) is rejected everywhere.
 
@@ -51,8 +55,10 @@ role carries all three.
 
 ### 1. Auth flow
 
-1. **Sign up** (`POST /api/auth/signup`) or **log in** (`POST /api/auth/login`).
-   Both return `{ "token": "<opaque bearer token>", "user": {...} }`.
+1. **Sign up** (`POST /api/auth/signup`), then **log in**
+   (`POST /api/auth/login`) — signup returns only
+   `{ "message": "..." }`, and login returns
+   `{ "token": "<opaque bearer token>", "user": {...} }`.
 2. Send the token on every protected request:
    `Authorization: Bearer <token>`.
 3. Tokens expire after `AUTH_TOKEN_TTL_DAYS` (7). When a call returns `401`,
@@ -476,7 +482,8 @@ curl "http://<host>/search?q=top%2010%20fintech%20deals%20in%202025&top_k=10"
 # Facet values for filter autocomplete
 curl "http://<host>/facets"
 
-# Sign up (public; rate-limited per IP)
+# Sign up (public; rate-limited per IP). Responds 200 {"message": "..."} for a
+# new AND an already-registered address, and issues no token — log in below.
 curl -X POST "http://<host>/api/auth/signup" -H "Content-Type: application/json" \
   -d '{"email":"you@example.com","password":"secret12","name":"You"}'
 
