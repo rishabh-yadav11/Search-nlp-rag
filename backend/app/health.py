@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import ipaddress
 import logging
 import time
@@ -9,7 +8,9 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
+from app import close_guard
 from app.auth import public_rate_limit
+from app.close_guard import close_quietly
 from app.config import classify_gemini_api_key, config
 
 logger = logging.getLogger("health")
@@ -73,17 +74,16 @@ async def _close_quietly(client: aioredis.Redis) -> None:
     cancelled probe (client disconnect, server shutdown) must still unwind,
     and a broken close implementation must not be mistaken for a network
     failure.
+
+    The mechanics live in ``app.close_guard``, shared with the lifespan
+    teardown so both release a client under the same bound.
     """
-    close = getattr(client, "aclose", None) or getattr(client, "close", None)
-    if close is None:
-        return
-    with contextlib.suppress(redis.exceptions.RedisError, OSError, TimeoutError):
-        # fallback for test doubles and older redis-py. Either way the call is
-        # bounded: a hung close is cancelled and abandoned so /ready and /readyz
-        # answer on time regardless of what the dying connection does.
-        outcome = close()
-        if asyncio.iscoroutine(outcome) or isinstance(outcome, asyncio.Future):
-            await asyncio.wait_for(outcome, timeout=_REDIS_CLOSE_TIMEOUT)
+    await close_quietly(
+        "readiness Redis client",
+        client,
+        timeout=_REDIS_CLOSE_TIMEOUT,
+        suppress=(redis.exceptions.RedisError, *close_guard.EXPECTED_CLOSE_ERRORS),
+    )
 
 
 async def _drop_redis_client(client: aioredis.Redis) -> None:
