@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 
 import redis
 import redis.asyncio as aioredis
@@ -169,21 +170,48 @@ class HybridCache:
         self._mem_bytes += cost
         self._evict_mem()
 
-    async def delete_prefix(self, prefix: str) -> None:
-        """Delete every cached key starting with ``prefix`` (Redis + memory).
+    async def delete_keys(self, keys: Iterable[str]) -> None:
+        """Delete an explicitly known set of keys (Redis + memory).
 
-        Used to invalidate per-user recommendation caches (whose keys embed a
-        varying limit component, e.g. ``recommend:for-you:{user}:{limit}``)
-        when a new interaction lands. Scans Redis and also purges any matching
-        in-process entries so the fallback cache does not return stale data.
+        This is THE invalidation primitive, and the one to use whenever a
+        cache's key space is small and knowable -- as it is for every per-user
+        cache in this service, where the caller derives the key set from what
+        it actually wrote rather than asking Redis to find it.
+
+        Redis work is O(len(keys)): a single ``DEL`` for the whole set. The
+        only other cost is the in-process sweep, which iterates ``_mem``. That
+        tier is written at exactly one site -- the fall-through in ``set()``
+        after a Redis failure -- so while Redis is healthy ``_mem`` is empty
+        and the sweep is O(1); when Redis is down the sweep is bounded by
+        ``CACHE_MAX_SIZE`` and is doing the work Redis cannot.
+
+        The in-process purge runs unconditionally and BEFORE the Redis call,
+        so the fallback tier cannot keep serving a pre-invalidation value when
+        Redis is unreachable, and so an early abort part-way through the Redis
+        round trip (a cancelled request) cannot leave the memory tier stale
+        either. The guarantee does not depend on the Redis outcome: the
+        degraded path falls through to the same purge.
+
+        ``_mem`` is snapshotted before it is mutated, so a partially purged
+        set is not possible.
+
+        An empty set is a no-op that never opens a connection.
+
+        This replaced a ``delete_prefix`` helper, which matched keys with
+        ``SCAN``. SCAN walks *every* key in the database and applies ``MATCH``
+        only afterwards, so its cost scaled with the total number of keys
+        rather than the number that match. Nothing needs that; if something
+        ever does again, it belongs in an offline maintenance script, not here.
         """
+        targets = set(keys)
+        if not targets:
+            return
         for key in list(self._mem.keys()):
-            if key.startswith(prefix):
+            if key in targets:
                 self._drop_mem(key)
         client, is_new = self._acquire()
         try:
-            async for key in client.scan_iter(match=f"{prefix}*", count=100):
-                await client.delete(key)
+            await client.delete(*targets)
         except _REDIS_ERRORS as exc:
             if is_new:
                 await self._discard(client)
