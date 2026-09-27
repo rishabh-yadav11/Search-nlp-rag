@@ -11,7 +11,7 @@ import redis
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app import health
+from app import auth, health
 from app.config import config
 
 
@@ -100,6 +100,29 @@ _HUNG_CLOSE_GUARD = health._REDIS_CLOSE_TIMEOUT + 5.0
 @pytest.fixture(autouse=True)
 def _reset_redis_client(monkeypatch):
     monkeypatch.setattr(health, "_redis_client", None)
+
+
+@pytest.fixture(autouse=True)
+def _public_rate_limiter(monkeypatch):
+    """Install a counting in-memory limiter store for /ready.
+
+    /ready is rate-limited per client IP, so the endpoint tests need a working
+    store or every poll would fall through to the fail-open path and the
+    limiter itself would go untested. Rebuilt per test, so no counter leaks
+    between cases.
+    """
+    counters: dict[str, int] = {}
+
+    class _FakeRateRedis:
+        async def set(self, key, value, nx=False, ex=None):
+            return True
+
+        async def incr(self, key):
+            counters[key] = counters.get(key, 0) + 1
+            return counters[key]
+
+    monkeypatch.setattr(auth, "_rate_client", _FakeRateRedis())
+    return counters
 
 
 @pytest.fixture(autouse=True)
@@ -933,6 +956,72 @@ def test_ready_reprobes_once_the_cache_ttl_has_passed(client, monkeypatch):
     assert client.get("/ready").status_code == 200
     assert client.get("/ready").status_code == 200
     assert calls == {"qdrant": 2, "redis": 2}
+
+
+def test_ready_over_the_limit_is_rejected_with_429(client, monkeypatch):
+    """/ready is rate-limited like the rest of the public surface, so a
+    runaway prober is bounded rather than served indefinitely."""
+    monkeypatch.setattr(config, "PUBLIC_READY_RATE_PER_MIN", 2)
+    monkeypatch.setattr(health, "_readiness_report", _async((True, {"ready": True})))
+
+    assert client.get("/ready").status_code == 200
+    assert client.get("/ready").status_code == 200
+    over = client.get("/ready")
+
+    assert over.status_code == 429
+    assert over.headers["Retry-After"] == str(config.PUBLIC_RATE_WINDOW_SECONDS)
+
+
+def test_ready_survives_a_sustained_one_hertz_probe(client, monkeypatch):
+    """The default limit must sit above the poll rate it exists to absorb.
+
+    A load balancer probing /ready once a second makes 60 requests per 60s
+    window, and it treats 429 as unhealthy and pulls the node from rotation --
+    so a limit at exactly the prober rate turns the very traffic the readiness
+    cache was added for into an outage. Piling on a second prober (two full
+    windows back to back) must still not be throttled at the shipped default;
+    nothing here stubs PUBLIC_READY_RATE_PER_MIN, because the default is
+    exactly what is under test.
+    """
+    monkeypatch.setattr(health, "_readiness_report", _async((True, {"ready": True})))
+    polls = 2 * config.PUBLIC_RATE_WINDOW_SECONDS
+
+    statuses = [client.get("/ready").status_code for _ in range(polls)]
+
+    assert set(statuses) == {200}
+
+
+def test_ready_fails_open_when_the_limiter_store_is_down(client, monkeypatch):
+    """/ready deliberately tolerates a broken limiter, unlike /search and the
+    rest of the public surface, which fail closed with 503.
+
+    Failing closed here would pull a healthy node out of rotation for a
+    dependency the service does not need in order to be ready (the HybridCache
+    falls back to in-process). The store is still consulted -- the call count
+    proves the dependency ran and the error was tolerated rather than the
+    limiter having quietly vanished from the route -- and a rate that IS
+    exceeded still answers 429 (test_ready_over_the_limit_is_rejected_with_429).
+    """
+    calls = {"set": 0, "incr": 0}
+
+    class _BrokenRedis:
+        async def set(self, *args, **kwargs):
+            calls["set"] += 1
+            raise ConnectionError("redis down")
+
+        async def incr(self, *args, **kwargs):
+            calls["incr"] += 1
+            raise ConnectionError("redis down")
+
+    monkeypatch.setattr(auth, "_rate_client", _BrokenRedis())
+    monkeypatch.setattr(health, "_readiness_report", _async((True, {"ready": True})))
+
+    r = client.get("/ready")
+
+    assert r.status_code == 200
+    # The store is consulted and its failure swallowed, so the probe is served.
+    # The first counter call raises, so nothing is ever INCRed.
+    assert calls == {"set": 1, "incr": 0}
 
 
 def test_readiness_report_probes_dependencies_concurrently(monkeypatch):
