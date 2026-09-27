@@ -14,6 +14,24 @@ logger = logging.getLogger("llm")
 MAX_BACKOFF_SECONDS = 60
 
 
+def build_messages(prompt: str, system_prompt: str | None = None) -> list[dict]:
+    """Chat messages for one turn, with the system prompt in its own role.
+
+    The system prompt must travel as a real ``system`` message: the OpenAI chat
+    completions API (openai==1.68.2 ``ChatCompletionSystemMessageParam``) treats
+    it as the instruction channel, whereas sending it as a ``user`` message
+    leaves it indistinguishable from the untrusted article and conversation text
+    sharing that role, so attacker-supplied text can read as an instruction
+    (#248). ``system_prompt`` is optional, so a caller with no system text still
+    sends a single user message.
+    """
+    messages: list[dict] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
 class LLMUnavailableError(Exception):
     """Raised when the LLM cannot be reached, after retries are exhausted."""
 
@@ -77,7 +95,7 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
-async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
+async def generate_answer(llm_client, prompt: str, model: str, system_prompt: str | None = None) -> LLMResult:
     """Call the LLM with a timeout and retries on transient errors.
 
     Retries exponential backoff (LLM_RETRY_BACKOFF * 2^attempt) up to
@@ -91,7 +109,7 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
             response = await llm_client.chat.completions.create(
                 model=model,
                 max_tokens=1200,
-                messages=[{"role": "user", "content": prompt}],
+                messages=build_messages(prompt, system_prompt),
                 temperature=config.LLM_TEMPERATURE,
                 timeout=config.LLM_TIMEOUT_SECONDS,
             )
@@ -125,7 +143,13 @@ async def generate_answer(llm_client, prompt: str, model: str) -> LLMResult:
     raise LLMUnavailableError() from last_error
 
 
-async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list | None = None):
+async def stream_answer(
+    llm_client,
+    prompt: str,
+    model: str,
+    usage_holder: list | None = None,
+    system_prompt: str | None = None,
+):
     """Yield answer text chunks as they arrive from the LLM.
 
     Same retry policy as generate_answer, but only retries when the stream
@@ -142,7 +166,7 @@ async def stream_answer(llm_client, prompt: str, model: str, usage_holder: list 
             stream = await llm_client.chat.completions.create(
                 model=model,
                 max_tokens=1200,
-                messages=[{"role": "user", "content": prompt}],
+                messages=build_messages(prompt, system_prompt),
                 temperature=config.LLM_TEMPERATURE,
                 timeout=config.LLM_TIMEOUT_SECONDS,
                 stream=True,
