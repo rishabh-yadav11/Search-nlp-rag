@@ -34,35 +34,18 @@ def log(msg: str):
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
-# The payload keys every index write path stores. Kept as an explicit tuple so
-# the regression test can assert the exact set rather than a subset.
-PAYLOAD_KEYS = (
-    "title",
-    "url",
-    "published_date",
-    "category",
-    "summary",
-    "body",
-    "author_names",
-    "industry_names",
-    "dealtype_names",
-)
-
-
-def make_point(rec: dict, dvec, svec, *, content_type: str | None = None) -> PointStruct:
+def make_point(rec: dict, dvec, svec) -> PointStruct:
     """Build the Qdrant point for one indexed record.
 
     ``rec`` is the canonical record produced by ``app.index_text.record_from_row``
     (or the same dict as read back from ``data/articles.jsonl``); ``dvec`` and
     ``svec`` are the dense and sparse embeddings for it.
 
-    ``content_type`` is an explicit opt-in: it is written to the payload only
-    when a caller passes it. The record dict carries the value (it comes from
-    the same ``record_from_row`` source as every other field), but no write path
-    has ever persisted it, and the read side in ``app/main.py`` reads it from the
-    payload. Callers therefore have to ask for the key by name — a payload can
-    no longer lose a field by accident. See the ``content_type`` payload
-    tracking issue for the end-to-end fix.
+    This is the single definition of the indexed payload, shared by every write
+    path, so two scripts can no longer store a different set of keys for the
+    same article. The key set is deliberately fixed at the nine fields the
+    search read path uses; a field that is not stored here is not stored by any
+    script.
     """
     payload = {
         "title": rec["title"],
@@ -75,8 +58,6 @@ def make_point(rec: dict, dvec, svec, *, content_type: str | None = None) -> Poi
         "industry_names": rec.get("industry_names") or [],
         "dealtype_names": rec.get("dealtype_names") or [],
     }
-    if content_type is not None:
-        payload["content_type"] = content_type
     return PointStruct(
         id=rec["id"],
         vector={

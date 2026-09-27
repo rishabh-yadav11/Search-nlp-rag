@@ -77,6 +77,9 @@ async def fetch_all():
 
     pool = None
     pool = await make_pool(maxsize=5, connect_timeout=10)
+    # Previously also passed read_timeout/write_timeout; aiomysql 0.3.0 rejects
+    # them (TypeError before any socket opens) and exposes no equivalent. Do not
+    # restore them — see make_pool in _common.py.
 
     # Only published content ('article'/'interview'/'video'); the table pk is `feid`.
     query = f"""

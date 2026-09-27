@@ -1,18 +1,17 @@
 """The shared ops-script helpers: one payload builder, one pool factory.
 
-These tests pin the exact payload key set produced by ``_common.make_point``.
-That is the regression this file exists for: the payload used to be built by
-three separate copies (one per write path), so a key present in the record could
-be silently absent from the stored payload without any test noticing — which is
-precisely how ``content_type`` ended up produced by ``record_from_row`` and
-never persisted. Asserting the full dict (not a subset) means a dropped or
-extra key now fails loudly.
+These tests pin the exact payload produced by ``_common.make_point``. That is
+the regression this file exists for: the payload used to be built by three
+separate copies (one per write path), so a key could be silently dropped from
+one path and not another without any test noticing. Asserting the full dict
+rather than a subset means a dropped or added key now fails loudly, and the
+expected dict in the test is the single source of truth for the key set.
 """
 import asyncio
 
 import numpy as np
 import pytest
-from _common import PAYLOAD_KEYS, log, make_point, make_pool
+from _common import log, make_point, make_pool
 
 
 class _FakeSparse:
@@ -63,7 +62,6 @@ def test_make_point_payload_is_exactly_the_expected_dict():
         "dealtype_names": ["Series A", "M&A"],
     }
     assert point.id == 42
-    assert set(point.payload) == set(PAYLOAD_KEYS)
 
 
 def test_make_point_vector_shape_is_preserved():
@@ -99,24 +97,17 @@ def test_make_point_normalises_missing_optional_fields():
     assert payload["dealtype_names"] == []
 
 
-def test_content_type_is_only_written_when_a_caller_asks_for_it():
-    """The opt-in seam for the still-unpersisted content_type field.
+def test_content_type_is_not_in_the_payload():
+    """The record carries content_type; the stored payload deliberately does not.
 
-    The record carries content_type, but no write path has ever stored it, so
-    make_point must not add it to the payload on its own — doing so silently
-    would change every stored point as a side effect of a refactor. Callers opt
-    in by name, which makes the omission a deliberate, visible choice rather
-    than an accident of which copy of the builder a script happened to hold.
+    This is the state every write path has always been in, and it is also the
+    reason the content_type feature reads as broken end to end. Asserting the
+    omission here means the field cannot change by accident: whoever wires it up
+    has to add it to ``make_point`` and this assertion, in the same change.
     """
-    assert "content_type" in _record()  # the record does carry it
+    assert "content_type" in _record()  # record_from_row does supply it
 
-    without = make_point(_record(), DENSE, SPARSE).payload
-    assert "content_type" not in without
-
-    with_it = make_point(_record(), DENSE, SPARSE, content_type="article").payload
-    assert with_it["content_type"] == "article"
-    # Opting in must not disturb the other keys.
-    assert {k: v for k, v in with_it.items() if k != "content_type"} == without
+    assert "content_type" not in make_point(_record(), DENSE, SPARSE).payload
 
 
 def test_make_pool_passes_configured_credentials_and_no_unsupported_kwargs(monkeypatch):
