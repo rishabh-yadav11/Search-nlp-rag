@@ -1,7 +1,10 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (100% overall, 449 passed). This is a checklist
-of functions and branches that have **no test coverage**, grouped by module.
+Measured with `pytest --cov=app`: **650 passed**, 86% overall (3652 statements,
+504 missed). This is a checklist of functions and branches that have **no test
+coverage**, grouped by module. The figures re-measured here are the ones for
+the modules this change rewrote (`app/cost_budget.py`, `app/chat.py`); the rest
+of the document is not re-audited here — issue #295 tracks a full accuracy pass.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
 SQLite rows (the project uses SQLite via aiosqlite, not MySQL — same concept:
@@ -187,15 +190,15 @@ the shipped script itself is EXECUTED by `tests/test_budget_lua.py` under
 `lua5.1` (skipped where lua5.1 is absent), so the two cannot drift apart
 without a failure.
 
-- [x] **`reserve` hold + rejection** (lines 335-364): hold written and counted
+- [x] **`reserve` hold + rejection** (lines 365-394): hold written and counted
       against the cap for the next caller; a rejected reserve leaves no hold
       behind; cap disabled (`LLM_DAILY_BUDGET_USD <= 0`) touches no store;
       hold floored at 1 micro-USD so a zero `LLM_CALL_RESERVE_USD` cannot turn
       the cap into a no-op; first `BudgetExceeded` logs one warning.
-- [x] **`reserve` store down → `BudgetUnavailable`** (lines 308-332): fails
+- [x] **`reserve` store down → `BudgetUnavailable`** (lines 338-350): fails
       closed, is not a `BudgetExceeded`, and drops the cached script handle.
       **ERROR PATH — Redis down.**
-- [x] **`settle` counter write** (lines 367-389): actual cost recorded whole
+- [x] **`settle` counter write** (lines 397-419): actual cost recorded whole
       (hold was never counted), over-reserve recorded and blocking the next
       call, zero-cost settle records nothing, empty id list still bills,
       store-down leaves the holds in place. **ERROR PATH — Redis down.**
@@ -204,14 +207,28 @@ without a failure.
       charge once, a hold that lapsed is CHARGED to the counter (a crash is
       not free spend) and its later settle REPLACES the estimate with the real
       cost rather than adding to it.
-- [x] **`release` drops holds, never refunds** (lines 392-397): live hold
+- [x] **crash promotion is REACHABLE, not just arithmetically correct**: the
+      holds hash and the expiry zset are expired at twice the reservation TTL,
+      because a hold's zset score first satisfies the sweep predicate exactly
+      one TTL after the reserve — expiring the containers at one TTL killed them
+      in the same instant the promotion became observable, and the crash's spend
+      was silently lost. The Lua harness models key expiry (and rejects a
+      non-positive TTL, as Redis does) so this is enforced, not assumed.
+- [x] **`release` drops holds, never refunds** (lines 422-427): live hold
       dropped with the counter untouched, a promoted (already charged) id not
       refunded, store-down surfaces. **ERROR PATH — Redis down.**
 - [x] **`_client` lazy init + reuse**: `from_url` once, DB index swapped to
       `ANALYTICS_REDIS_DB`, connection reused; `close` calls `aclose`, clears
       the global, and is a no-op when no client.
-- [x] **`to_usd` canonical unit**: INR `LLMResult.cost()` → USD before any
-      accounting; 1.0 fallback rate on a nonsensical configured rate.
+- [x] **TTL floors** (`hold_ttl` and `counter_ttl` floored at 1 second, in the
+      Lua): one scenario per floor, each executing that guard with a
+      non-positive value. Both floors used to be deletable with the suite still
+      green — the single scenario that claimed them passed `0` as `hold_ttl`
+      twice, and the harness let `EXPIRE key 0` succeed where Redis rejects it.
+- [x] **`to_usd` canonical unit** (lines 430-447): INR `LLMResult.cost()` → USD
+      before any accounting, and the 1.0 fallback rate on a nonsensical
+      configured rate — which warns once and not on every turn. Both branches
+      are executed; the fallback had none.
 
 ---
 
@@ -284,71 +301,118 @@ without a failure.
 
 ---
 
-## app/chat.py — 100% (covered by tests/test_chat.py)
+## app/chat.py — 91% (covered by tests/test_chat.py)
 
-- [x] **`ChatStore.connect` schema migration** (lines 147-152): legacy DBs
+Measured: 841 statements, 72 missed. The entries below are the branches this
+change added or re-pointed at; the residual is mostly
+`_prepare_multi_entity_turn` (lines 1330-1440) and is tracked in #295.
+
+- [x] **`ChatStore.connect` schema migration** (lines 119-176): legacy DBs
       missing `prompt_tokens`/`completion_tokens`/`cost` and separately missing
-      `latency_ms` get the columns added with `0` defaults. **ERROR PATH —
-      malformed / legacy SQLite schema.**
-- [x] **`ChatStore.close`** (lines 155-158): close an open store and the
+      `latency_ms` get the columns added with `0` defaults, as does the `aborted`
+      column (line 174) that the abort rule needs. **ERROR PATH — malformed /
+      legacy SQLite schema.**
+- [x] **`ChatStore.close`** (lines 177-180): close an open store and the
       idempotent close-when-already-closed no-op.
-- [x] **`rename_session` / `delete_session` when session missing** (lines 269,
-      282) → 404.
-- [x] **`global_stats` exception handler** (lines 387-389): a failing query
+- [x] **`rename_session` / `delete_session` when session missing** (lines 321,
+      336) → 404.
+- [x] **`global_stats` exception handler** (lines 404-450): a failing query
       degrades to `{"error": "chat analytics unavailable"}`, never raises.
-- [x] **`json_loads` malformed JSON** (lines 399-400): bad JSON, `None`, and
+- [x] **`json_loads` malformed JSON** (lines 562-580): bad JSON, `None`, and
       non-string input all → `[]`. **ERROR PATH — malformed stored rows.**
-- [x] **`_row_to_message`** (lines 403-414): malformed/legacy row field
+- [x] **`_row_to_message`** (lines 616-630): malformed/legacy row field
       coercion — bad sources JSON and `NULL`/string token/cost fields fall back
-      to `0` defaults.
-- [x] **`_smalltalk_reply` non-smalltalk fallthrough** (line 436): empty /
+      to `0` defaults, and `aborted` coerces from a legacy `NULL`.
+- [x] **`_smalltalk_reply` non-smalltalk fallthrough** (line 645): empty /
       blank queries and >12-word messages are not small talk.
 - [x] **dataviz helpers edge branches**: `_as_float` non-numeric string, bool,
-      and `None` (line 491); `_missing_cell` token set incl. "not stated"/"—"
-      (line 499); `_valid_value_column` all-missing vs numeric vs non-numeric
-      (line 523); `_first_numeric_column` empty rows / empty first row
-      (line 528); `_has_label_content` no-label-cols vs all-empty labels
-      (line 541); `parse_dataviz` rejection paths — non-dict data, non-string
-      columns, non-list rows (lines 561, 565, 567); `_sanitize_dataviz` empty
-      text and no-fence passthrough (line 593).
-- [x] **`_dataviz_nudge` view pinning** (line 661): a named view appends the
+      and `None` (line 780); `_missing_cell` token set incl. "not stated"/"—"
+      (line 804); `_valid_value_column` all-missing vs numeric vs non-numeric
+      (line 815); `_first_numeric_column` empty rows / empty first row
+      (line 822); `_has_label_content` no-label-cols vs all-empty labels
+      (line 831); `parse_dataviz` rejection paths — non-dict data, non-string
+      columns, non-list rows (lines 845-880); `_sanitize_dataviz` empty
+      text and no-fence passthrough (line 887).
+- [x] **`_dataviz_nudge` view pinning** (line 1012): a named view appends the
       "exact type of data block" instruction; a generic chart ask does not.
-- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 712, 715-716, 718):
+- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 1066, 1070-1072):
       no fence, invalid JSON, and non-dict data → `None`; dict data gets the
       view applied.
-- [x] **`_apply_requested_view` rewrite** (line 734): a block that fails to
+- [x] **`_apply_requested_view` rewrite** (line 1082): a block that fails to
       re-parse is left verbatim.
-- [x] **`_is_ranking_refusal`** (line 776): refusal signatures ("cannot be
+- [x] **`_is_ranking_refusal`** (line 1164): refusal signatures ("cannot be
       generated", "do not contain specific amounts") → True; empty text and
       genuine ranked answers → False.
-- [x] **`_answer_ranked` ranking-nudge retry** (lines 799-808): a refusal is
+- [x] **`_answer_ranked` ranking-nudge retry** (lines 1186-1215): a refusal is
       re-asked once with `_RANKING_NUDGE` and tokens summed; the
       `LLMUnavailableError` guard keeps the first answer; non-refusals make a
       single call.
-- [x] **`_prepare_turn` follow-up inheritance** (lines 856-859, 866, 876, 879):
-      vague-follow-up with a year range keeps the previous topic and pins the
-      new dates; `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources
-      short-circuit; weak fallback answer + note. **ERROR PATH — LLM/Qdrant/
-      Redis down during retrieval.**
-- [x] **`_run_turn` cost recording + finalize** (lines 1478-1490): `reserve`
-      before the billed call → `_answer_ranked` →
-      `settle(holds, to_usd(result.cost()))` (the turn's single counter write;
-      `release(holds)` when no call was made) → finalized answer (unrequested
-      dataviz blocks stripped).
-- [x] **`send_message` `BudgetExceeded` → 429** (lines 1091-1095) and
-      **`LLMUnavailableError` → 503** (lines 1096-1100). **ERROR PATH — LLM
-      retry exhaustion / daily budget.**
-- [x] **`_require_store` uninitialized → 503** (line 1012) and **`_validate_question`
-      too-long → 400** (line 1021).
-- [x] **`send_message_stream` nudge retry branches** (lines 1169-1176,
-      1181-1188): a dataviz/ranking nudge that succeeds swaps the answer and
+- [x] **`_prepare_turn` follow-up inheritance** (lines 1226-1330): vague-follow-up
+      with a year range keeps the previous topic and pins the new dates;
+      `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources short-circuit;
+      weak fallback answer + note. **ERROR PATH — LLM/Qdrant/Redis down during
+      retrieval.**
+- [x] **`_run_turn` cost recording + finalize** (lines 1443-1510): `reserve`
+      before the billed call → `_answer_ranked` → `settle(holds,
+      to_usd(result.cost()))` (the turn's single counter write; `release(holds)`
+      when no call was made) → finalized answer (unrequested dataviz blocks
+      stripped). Two money rules live here and are tested:
+      an EMPTY hold list (cap disabled) settles nothing at all, so an opted-out
+      deployment never depends on the counter; and a settle that cannot reach
+      the store is best-effort, because the answer exists and has been billed,
+      while the live hold is charged by the sweep either way. **ERROR PATH —
+      Redis down after a billed call.**
+- [x] **`send_message` `BudgetExceeded` → 429** (lines 1755-1759),
+      **`LLMUnavailableError` → 503** (lines 1760-1764), and
+      **`BudgetUnavailable` → 503** (lines 1746-1754) with the dangling user
+      message rolled back, so an unreadable counter is never reported as an
+      empty answer. **ERROR PATH — LLM retry exhaustion / daily budget / Redis
+      down.**
+- [x] **`_require_store` uninitialized → 503** (line 1644) and
+      **`_validate_question` too-long → 400** (line 1653).
+- [x] **`send_message_stream` nudge retry branches** (lines 2066-2075,
+      2098-2107): a dataviz/ranking nudge that succeeds appends its block and
       sums tokens; a failed nudge (`LLMUnavailableError`) keeps the streamed
-      answer. **`error` SSE handlers** (lines 1213, 1216-1218): mid-stream
-      `LLMUnavailableError` → "LLM temporarily unavailable" event; unexpected
-      exceptions → "Something went wrong" event, never a 500. **ERROR PATH —
-      LLMUnavailableError / BudgetExceeded mid-stream.**
-- [x] **`retention_loop`** (lines 1225-1233): a failing purge is swallowed and
+      answer. **`error` SSE handlers** (lines 2145, 2148, 2154, 2158):
+      mid-stream `LLMUnavailableError` → "LLM temporarily unavailable";
+      `BudgetExceeded` → "Daily AI budget reached"; `BudgetUnavailable` →
+      "AI budget service unavailable"; unexpected exceptions → "Something went
+      wrong", never a 500. **ERROR PATH — LLMUnavailableError / BudgetExceeded /
+      BudgetUnavailable mid-stream.**
+- [x] **`retention_loop`** (lines 2171-2179): a failing purge is swallowed and
       the loop keeps ticking; the next tick purges expired conversations.
+
+Added by this change, all exercised end to end through the HTTP handlers:
+
+- [x] **the ONE abort rule** (lines 1904-1935): the client's disconnect is
+      checked at every gate, and a turn that streamed nothing is rolled back
+      while a turn that streamed anything is PERSISTED with
+      `[answer truncated]` and `aborted=True` — the server's history can never
+      contradict what is already on the client's screen. `persist_truncated_turn`
+      (lines 1880-1901) is the single writer for every partial turn, including
+      the mid-stream-failure path.
+- [x] **a billed call is charged, never refunded, on a disconnect** (lines
+      2000-2010, 2066-2075, 2098-2107): a disconnect in the gate-to-first-delta
+      window settles the hold at the estimate the gate took it at, and the two
+      post-stream checks pass the finished stream's real cost instead of
+      storing the turn as free. A turn that made no billed call at all still
+      releases.
+- [x] **a delivered answer survives a failed settle** (lines 1835-1859,
+      1481-1501): once deltas are on the wire, or the LLM has already answered,
+      an unreachable counter no longer converts a complete answer into a
+      truncated `aborted` row plus an `error` event.
+- [x] **`send_message` 499 on a client that disconnected** (lines 1782-1791): a
+      JSON client has seen nothing, so the turn is a clean rollback reported as
+      a non-success status rather than a completed `TurnOut`.
+- [x] **`_trim_history` / `CHAT_MAX_HISTORY_CHARS`** (lines 1657-1672, and
+      `_start_turn`): oldest-first, never splitting a message, a single
+      oversized message kept alone, `0`/negative disabling the cap, and the char
+      budget applied to what actually reaches the prompt.
+- [x] **frontend/backend dataviz fence parity** (`DATAVIZ_FENCE_PATTERN` line
+      750): the TSX's own `FENCE_SRC` and `stripOpenFence` are executed under
+      `node` and compared BEHAVIOURALLY with Python's, including the unclosed
+      fence where neither side may render raw JSON. A match-only comparison
+      would have asserted nothing there.
 
 ---
 
@@ -426,7 +490,12 @@ without a failure.
 
 ## Remaining small gaps
 
-None — every `app/*.py` module is at 100% coverage (2174 statements, 0 missed).
+None in `app/cost_budget.py` and `app/chat.py` beyond the entries listed above.
+The modules this change rewrote are measured and current; the document's other
+module sections are NOT re-audited here and several do not in fact sit at 100%
+(`app/recommender.py` 25%, `app/user_profile.py` 62%, `app/main.py` 86%,
+`app/query_intent.py` 86%, `app/redis_cache.py` 82%). Issue #295 is the full
+accuracy pass for this document.
 
 ---
 
@@ -452,9 +521,10 @@ exhaustion/dead-code raises), `app/reranker.py`
 (was 92%) is now 100% via `tests/test_cost_budget.py`, `app/analytics.py`
 (was 74%) is now 100% via `tests/test_analytics.py`, `app/main.py`
 (was 72%) is now 100% via `tests/test_main_pipeline.py` +
-`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 100% via
+`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 91% via
 `tests/test_chat.py` (schema migration, error SSEs, budget/LLM HTTP paths,
-dataviz edge branches, nudge retries, and retention loop), `app/auth.py`
+dataviz edge branches, nudge retries, the abort rule, and the retention loop),
+`app/auth.py`
 (was 91%) is now 100% via `tests/test_auth.py` (malformed-hash handling,
 SQLite rollback paths, last-admin lockout guards, `_client_ip`, and the
 bootstrap write-lock retry loop), and the last three gaps —
