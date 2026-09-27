@@ -381,8 +381,11 @@ async def get_trending_feed(
         client = state["qdrant"]
         exclude_ids = exclude_ids or []
 
-        # Get trending data from Redis
-        trending = await get_trending_articles(_candidate_pool(limit))
+        # 2x, deliberately not _candidate_pool: Redis returns the trending ids
+        # already ranked, and the feed returns result[:limit], so a pool wider
+        # than the page cannot change the response -- it would only retrieve
+        # more full payloads from Qdrant for candidates that get trimmed.
+        trending = await get_trending_articles(limit * 2)
         if not trending:
             # Fallback to latest articles
             return await _get_latest_top_stories(limit, exclude_ids)

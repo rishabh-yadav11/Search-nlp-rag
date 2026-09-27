@@ -80,6 +80,15 @@ def _is_referenced(knob: str, corpus: str) -> bool:
         return True
     # Attribute access through a string, e.g. getattr(config, name) where the
     # caller was handed the knob name as a literal.
+    #
+    # Deliberately loose: any standalone string literal counts, not only one
+    # passed to getattr/public_rate_limit. Narrowing it to those two call shapes
+    # would make the guard fail the moment the rate-limit helpers change how
+    # they receive the attribute name, and a false positive on a real knob is
+    # worse than the narrow false negative this leaves open (a knob name quoted
+    # only in a log message). The knobs that rely on this rule today are
+    # PUBLIC_SEARCH/FACETS/CLICK_RATE_PER_MIN, all resolved by
+    # int(getattr(config, limit_attr)) in app/auth.py.
     return bool(re.search(rf"""(['"]){re.escape(knob)}\1""", corpus))
 
 

@@ -440,49 +440,74 @@ def _point_at(pid: int, published: datetime) -> ScoredPoint:
 
 
 class _PoolQdrant:
-    """Qdrant double that serves a pool exactly as wide as it is asked for.
+    """Qdrant double that serves each leg a pool exactly as wide as it is asked for.
 
-    The vector leg hands out ids from VECTOR_BASE with an age that *shrinks*
-    down the pool, so the deepest candidates are the freshest; the category leg
-    hands out ids from CATEGORY_BASE that are all STALE_DAYS old. Both legs
-    reach final_score through the recency term, so fresh vector candidates
-    outrank stale category ones and a page is filled from whichever candidates
-    the pool actually reached. That is what makes the pool width visible in the
-    response instead of being an internal fetch detail.
+    The leg named by ``fresh_leg`` hands out ids from its own base range with an
+    age that *shrinks* down the pool, so its deepest candidates are the
+    freshest; the other leg hands out ids from its own range that are all
+    STALE_DAYS old. Disjoint id ranges per leg plus recency in the hybrid score
+    mean the page is filled from whichever candidates the pool actually
+    reached, which is what makes the pool width visible in the response instead
+    of being an internal fetch detail.
     """
 
     VECTOR_BASE = 100
     CATEGORY_BASE = 200
     STALE_DAYS = 90
 
-    def __init__(self):
+    def __init__(self, *, fresh_leg="vector"):
         self.now = datetime.now(UTC)
+        self.fresh_leg = fresh_leg
+
+    def _leg_points(self, base, width, fresh):
+        return [
+            _point_at(
+                base + i,
+                self.now - timedelta(days=width - i if fresh else self.STALE_DAYS),
+            )
+            for i in range(width)
+        ]
 
     async def query_points(self, **kwargs):
         width = kwargs["limit"]
         if "query" in kwargs:  # vector leg
-            points = [
-                _point_at(self.VECTOR_BASE + i, self.now - timedelta(days=width - i))
-                for i in range(width)
-            ]
+            points = self._leg_points(self.VECTOR_BASE, width, fresh=self.fresh_leg == "vector")
         else:  # category leg
-            points = [
-                _point_at(self.CATEGORY_BASE + i, self.now - timedelta(days=self.STALE_DAYS))
-                for i in range(width)
-            ]
+            points = self._leg_points(self.CATEGORY_BASE, width, fresh=self.fresh_leg == "category")
         return SimpleNamespace(points=points)
 
     async def scroll(self, **kwargs):
         return ([], None)
 
 
-async def _pooled_page(candidates_limit, *, limit=5):
+class _ScrollQdrant:
+    """Qdrant double for the cold-start path, which only calls ``scroll``.
+
+    Like the vector leg above, the deepest rows of the scroll are the freshest,
+    so scrolling deeper is the only way to reach a fresher article.
+    """
+
+    BASE = 400
+
+    def __init__(self):
+        self.now = datetime.now(UTC)
+
+    async def scroll(self, **kwargs):
+        width = kwargs["limit"]
+        points = [
+            _point_at(self.BASE + i, self.now - timedelta(days=width - i))
+            for i in range(width)
+        ]
+        return (points, None)
+
+
+async def _pooled_page(candidates_limit, *, limit=5, fresh_leg="vector"):
     """Personalized feed for a warm user, with the candidate pool pinned."""
     from app import recommender
 
     now = datetime.now(UTC).timestamp()
     with (
-        patch.object(recommender, "state", {"qdrant": _PoolQdrant()}),
+        patch.object(recommender, "state", {"qdrant": _PoolQdrant(fresh_leg=fresh_leg)}),
         patch.object(recommender.config, "RECOMMEND_CANDIDATES_LIMIT", candidates_limit),
         patch.object(
             recommender, "get_user_interactions",
@@ -501,6 +526,10 @@ async def _pooled_page(candidates_limit, *, limit=5):
 
 def _ids(result) -> set[int]:
     return {article["id"] for article in result}
+
+
+def _of_leg(ids, base):
+    return {i for i in ids if base <= i < base + 100}
 
 
 class TestCandidatePoolWidth:
@@ -522,16 +551,15 @@ class TestCandidatePoolWidth:
         assert len(narrow) == len(wide) == 10
         assert _ids(narrow) != _ids(wide)
 
-        stale = {i for i in _ids(narrow) if i >= _PoolQdrant.CATEGORY_BASE}
-        assert stale, "a 5-wide pool cannot reach a fresher vector candidate, so stale hits remain"
-        assert not {i for i in _ids(wide) if i >= _PoolQdrant.CATEGORY_BASE}, (
+        # A 5-wide pool reaches only 5 fresh vector candidates and fills the rest
+        # of the page with stale category hits; a 25-wide pool fills every slot.
+        assert len(_of_leg(_ids(narrow), _PoolQdrant.VECTOR_BASE)) == 5
+        assert _of_leg(_ids(narrow), _PoolQdrant.CATEGORY_BASE)
+        assert len(_of_leg(_ids(wide), _PoolQdrant.VECTOR_BASE)) == 10
+        assert not _of_leg(_ids(wide), _PoolQdrant.CATEGORY_BASE), (
             "a 25-wide pool reaches vector candidates fresher than the category hits, "
             "so no stale article should reach the page"
         )
-        # A deeper pool spends every slot on a fresh vector candidate; a 5-wide
-        # pool reaches only 5 of them and fills the rest with stale hits.
-        assert len([i for i in _ids(narrow) if i < _PoolQdrant.CATEGORY_BASE]) == 5
-        assert len([i for i in _ids(wide) if i < _PoolQdrant.CATEGORY_BASE]) == 10
 
     @pytest.mark.asyncio
     async def test_page_stays_full_when_the_knob_is_below_the_requested_limit(self):
@@ -544,35 +572,48 @@ class TestCandidatePoolWidth:
         result = await _pooled_page(2, limit=8)
 
         assert len(result) == 16, "a starved pool cannot fill a page of 2 * limit"
-        assert max(i for i in _ids(result) if i < _PoolQdrant.CATEGORY_BASE) == _PoolQdrant.VECTOR_BASE + 7
-        assert max(i for i in _ids(result) if i >= _PoolQdrant.CATEGORY_BASE) == _PoolQdrant.CATEGORY_BASE + 7
+        assert max(_of_leg(_ids(result), _PoolQdrant.VECTOR_BASE)) == _PoolQdrant.VECTOR_BASE + 7
+        assert max(_of_leg(_ids(result), _PoolQdrant.CATEGORY_BASE)) == _PoolQdrant.CATEGORY_BASE + 7
 
     @pytest.mark.asyncio
-    async def test_trending_feed_page_survives_a_narrow_pool_knob(self):
-        """The trending feed over-fetches too, and clamps the same way.
+    async def test_category_leg_pool_width_reaches_the_page(self):
+        """The category leg is wired too, not just the vector one.
 
-        The feed asks Redis for a pool of trending ids and then returns
-        ``result[:limit]``, so a pool narrower than the page would ship a
-        short page. A knob of 2 with limit=6 must still return 6 articles.
+        Here the category leg is the fresh one, so the slots it can fill are
+        bounded by its pool. At limit=5 the narrowest reachable pool is 5 (the
+        clamp raises a knob of 3 to the page size) and fills 5 of the 10
+        slots; a 20-wide pool fills all ten.
+        """
+        narrow = await _pooled_page(3, fresh_leg="category")
+        wide = await _pooled_page(20, fresh_leg="category")
+
+        assert len(narrow) == len(wide) == 10
+        assert len(_of_leg(_ids(narrow), _PoolQdrant.CATEGORY_BASE)) == 5
+        assert _of_leg(_ids(narrow), _PoolQdrant.VECTOR_BASE), "the stale leg fills the rest"
+        assert len(_of_leg(_ids(wide), _PoolQdrant.CATEGORY_BASE)) == 10
+
+    @pytest.mark.asyncio
+    async def test_cold_start_scroll_depth_comes_from_the_knob(self):
+        """The cold-start path is not wired to bare ``limit`` either.
+
+        ``_get_latest_top_stories`` scrolls, recency-sorts and returns
+        ``limit * 2`` articles, so how many rows the scroll reaches bounds the
+        page: the narrowest reachable scroll is 5 wide at limit=5, and a
+        20-wide scroll fills the whole page with the fresher rows it reaches.
         """
         from app import recommender
 
-        class _RedisTrending:
-            """Serves exactly as many trending ids as it is asked for."""
+        async def _top_stories(candidates_limit):
+            with (
+                patch.object(recommender, "state", {"qdrant": _ScrollQdrant()}),
+                patch.object(recommender.config, "RECOMMEND_CANDIDATES_LIMIT", candidates_limit),
+            ):
+                return await recommender._get_latest_top_stories(5)
 
-            async def __call__(self, count):
-                return [{"article_id": 300 + i, "score": 1.0 - i / 100} for i in range(count)]
+        narrow = await _top_stories(3)
+        wide = await _top_stories(20)
 
-        class _RetrieveQdrant:
-            async def retrieve(self, *, ids, **kwargs):
-                return [SimpleNamespace(id=pid, payload={"title": f"article {pid}"}) for pid in ids]
-
-        with (
-            patch.object(recommender, "state", {"qdrant": _RetrieveQdrant()}),
-            patch.object(recommender.config, "RECOMMEND_CANDIDATES_LIMIT", 2),
-            patch.object(recommender, "get_trending_articles", _RedisTrending()),
-        ):
-            result = await recommender.get_trending_feed(limit=6)
-
-        assert len(result) == 6, "a pool narrower than the page ships a short page"
-        assert _ids(result) == {300, 301, 302, 303, 304, 305}
+        assert len(narrow) == 5, "a 5-row scroll cannot fill a page of 2 * limit"
+        assert len(wide) == 10
+        # The deeper scroll reaches rows the shallow one never saw.
+        assert max(_ids(wide)) > max(_ids(narrow))
