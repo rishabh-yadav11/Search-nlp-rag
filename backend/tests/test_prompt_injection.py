@@ -398,8 +398,8 @@ def test_retry_nudge_lands_in_the_system_role_not_the_untrusted_user_message(
 
 
 def test_streaming_retry_nudges_land_in_the_system_role(retrieval, no_billing, poison_client, tmp_path):
-    """The SSE path retries twice over (missing data block, then ranking
-    refusal) and must place both nudges the same way."""
+    """The SSE path's dataviz retry must place its nudge in the system role
+    rather than in the untrusted user turn."""
     client, chat_store, auth_store = _api_client(tmp_path)
     try:
         headers = _auth_headers(auth_store)
@@ -420,6 +420,43 @@ def test_streaming_retry_nudges_land_in_the_system_role(retrieval, no_billing, p
             # our own retry prose ("Your previous answer ...") outside the fences.
             assert "previous answer" not in user
             assert user.rstrip().endswith("<<<END QUESTION>>>")
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_streaming_ranking_retry_nudge_lands_in_the_system_role(
+    retrieval, no_billing, poison_client, monkeypatch, tmp_path
+):
+    """The SSE path's second retry — a ranked-list refusal — must place its
+    nudge in the system role too, with the user turn still nothing but fenced
+    data. A top-N question with no chart request isolates this retry: the
+    dataviz one does not fire."""
+    original = poison_client.completions.create
+
+    async def create(**kwargs):
+        if kwargs.get("stream"):
+
+            async def _refusal():
+                yield _chunk("I cannot generate a ranked list [1].")
+                yield _chunk(None, usage=_Usage())
+
+            return _refusal()
+        return await original(**kwargs)
+
+    monkeypatch.setattr(poison_client.completions, "create", create)
+    client, chat_store, auth_store = _api_client(tmp_path)
+    try:
+        headers = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
+        _stream(client, headers, sid, "top 5 ipo deals in 2025")
+
+        retry = poison_client.completions.calls[-1]["messages"]
+        system = next(m["content"] for m in retry if m["role"] == "system")
+        user = next(m["content"] for m in retry if m["role"] == "user")
+        assert "refused to provide a ranked list" in system
+        assert "previous answer" not in user
+        assert user.rstrip().endswith("<<<END QUESTION>>>")
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
