@@ -112,3 +112,64 @@ describe('isSafeUrl — SSR parity', () => {
     expect(isSafeUrl('/\\evil.com')).toBe(false)
   })
 })
+
+describe('isSafeUrl — server/client parity', () => {
+  // The guard runs during SSR (no `window`) and again after hydration (real
+  // `window`). If those two disagree the server emits markup React throws
+  // away, or worse emits a clickable off-origin link the client then strips.
+  // A parity assertion is the right guard: the defect *is* the divergence.
+  const CLIENT_ORIGIN = 'https://app.vccircle.com/'
+
+  function verdictIn(url: string, client: boolean): boolean {
+    vi.stubGlobal('window', client ? { location: { href: CLIENT_ORIGIN } } : undefined)
+    // Prove the stub landed; a silently-ineffective `vi.stubGlobal` would let
+    // this whole block pass without ever exercising the server branch.
+    expect(typeof window === 'undefined' ? 'server' : 'client').toBe(
+      client ? 'client' : 'server'
+    )
+    return isSafeUrl(url)
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  // `\x00` survives `String.prototype.trim`, so these slip past the
+  // protocol-relative regex; only the origin comparison catches them, and only
+  // if the stand-in base names a host nothing can resolve back to.
+  const NUL_ESCAPES = ['\x00//localhost', '\x00//localhost/x', '\x00//localhost:443']
+
+  it.each(NUL_ESCAPES)('rejects %j on the server and on the client alike', (url) => {
+    expect(verdictIn(url, false)).toBe(false)
+    expect(verdictIn(url, true)).toBe(false)
+  })
+
+  const CORPUS = [
+    '//localhost',
+    '\x00//evil.com',
+    '\x00//localhost',
+    '\x00//localhost:443',
+    '//ssr.invalid/x',
+    '/\\evil.com',
+    '\\/evil.com',
+    '\\\\evil.com',
+    '/rel',
+    'rel/path',
+    '?q=1',
+    '#f',
+    '',
+    '   ',
+    'https://ok.com/a',
+    'http://ok.com/a',
+    'https://ssr.invalid/x',
+    'javascript:alert(1)',
+    'JaVaScRiPt:alert(1)',
+    'java\tscript:alert(1)',
+    ' javascript:alert(1)',
+    'data:text/html,<script>alert(1)</script>',
+  ]
+
+  it.each(CORPUS)('returns the same verdict for %j on the server and the client', (url) => {
+    expect(verdictIn(url, false)).toBe(verdictIn(url, true))
+  })
+})
