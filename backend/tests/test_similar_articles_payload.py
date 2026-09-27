@@ -1,24 +1,27 @@
-"""The similar-articles feed must not ship article bodies (#257).
+"""The recommendation feeds must not ship article bodies (#257).
 
-``/recommend/similar/{id}`` used to ask Qdrant for the whole point
+``/recommend/similar/{id}`` used to ask Qdrant for whole points
 (``with_payload=True``) and copy ``body`` -- up to ``BODY_CHAR_LIMIT`` (50k)
 chars per point -- into every returned dict. The response model is untyped, so
-the bodies went over the wire, into the Redis cache for an hour, and back out
-again on every page view: the search page renders one ``SimilarArticles`` per
-result. Measured with bodies at ``BODY_CHAR_LIMIT`` and the real
-``_format_articles`` -- 9 points fetched per request, 8 returned once the
-source article is filtered out, and 8 requests for a top_k=8 search -- one
-page view went from 3,225,178 B to 24,410 B. The before-figure is robust
-(it is dominated by eight 50k bodies); the after-figure moves with the
-synthetic title/summary text, so the reduction lands between ~132x and
-~150x depending on that fixture. The point either way is >3MB per view.
+nothing stripped it: the bodies went over the wire, into the Redis cache for
+an hour, and back out on every subsequent read. The search page renders one
+``SimilarArticles`` per result, so a single top_k=8 search dragged >3MB per
+page view to display a title and a category.
 
+Measured with bodies at ``BODY_CHAR_LIMIT`` and the real ``_format_articles``
+-- 9 points fetched per request, 8 returned once the source article is
+filtered out, 8 requests for a top_k=8 search -- one page view went from
+3,225,178 B to 24,410 B. The before-figure is robust (it is dominated by
+eight 50k bodies); the after-figure moves with the synthetic title/summary
+text of the measuring fixture, so independent recomputes land between
+~21 kB and ~24 kB. Either way >3MB per view is gone.
 
 Nothing renders the body. ``SimilarArticles.tsx`` reads id/title/url/category,
 summary and published_date; the for-you card reads the same plus
 industry_names. These tests pin that contract from both ends: the wire and the
-cache stay body-free, the display fields survive, and the Qdrant requests
-themselves are narrowed so the bodies are never even transferred.
+cache stay body-free, the display fields survive, the Qdrant requests
+themselves are narrowed so the bodies are never even transferred, and a
+cache entry written by the pre-fix shape is never served.
 """
 
 import asyncio
@@ -46,6 +49,12 @@ UI_FIELDS = {
 # The request shape that used to drag the bodies over the wire.
 WHOLE_PAYLOAD = True
 
+# The article the fixtures query "about". _format_articles excludes it, so a
+# fixture point must NOT use this id if the test needs a returned article.
+SOURCE_ID = 7
+# A second id that survives exclusion.
+OTHER_ID = 8
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -56,8 +65,11 @@ def _body():
     return ("VCCircle deal coverage. " * 4000)[: config.BODY_CHAR_LIMIT]
 
 
-def _point(pid, body="", **overrides):
-    payload = {
+def _point(pid, body=""):
+    point = MagicMock()
+    point.id = pid
+    point.score = 0.9
+    point.payload = {
         "title": f"Acme Corp raises a round ({pid})",
         "url": f"https://www.vccircle.com/deal/{pid}",
         "published_date": "2026-09-01T10:00:00+00:00",
@@ -69,11 +81,6 @@ def _point(pid, body="", **overrides):
         "content_type": "deals",
         "body": body,
     }
-    payload.update(overrides)
-    point = MagicMock()
-    point.id = pid
-    point.score = 0.9
-    point.payload = payload
     return point
 
 
@@ -88,7 +95,7 @@ def _qdrant(points):
 
 
 class _RecordingCache:
-    """Minimal in-memory stand-in for the HybridCache that keeps what was written."""
+    """In-memory stand-in for the HybridCache that keeps what was written."""
 
     def __init__(self):
         self.store: dict = {}
@@ -107,25 +114,51 @@ class _RecordingCache:
             del self.store[key]
 
 
-def _anonymous_request():
-    return SimpleNamespace(state=SimpleNamespace(user_id="unknown"))
+def _legacy_entry():
+    """An entry as the pre-fix shape wrote it: still carrying the body."""
+    return [{"id": SOURCE_ID, "title": "stale", "url": "https://x/y", "body": _body()}]
+
+
+def _user_request(user_id="user-1"):
+    return SimpleNamespace(state=SimpleNamespace(user_id=user_id))
+
+
+def _stale_personalization(monkeypatch):
+    """Give a user one interaction, hermetically.
+
+    ``main`` and ``recommender`` each import ``get_user_interactions``
+    separately, so both namespaces are patched; otherwise the recommender copy
+    reaches a real Redis and the test's outcome depends on whether one happens
+    to be running.
+    """
+    async def fake_interactions(user_id):
+        return [(SOURCE_ID, "click")]
+
+    async def fake_categories(user_id):
+        return [("technology", 1.0)]
+
+    monkeypatch.setattr(main, "get_user_interactions", fake_interactions)
+    monkeypatch.setattr(recommender, "get_user_interactions", fake_interactions)
+    monkeypatch.setattr(recommender, "get_user_profile_categories", fake_categories)
 
 
 @pytest.fixture
 def wired(monkeypatch):
     """Wire a fake Qdrant + cache into the real recommender and endpoints."""
     cache = _RecordingCache()
-    points = [_point(7, body=_body()), _point(8, body=_body())]
+    points = [_point(SOURCE_ID, body=_body()), _point(OTHER_ID, body=_body())]
     client = _qdrant(points)
     monkeypatch.setattr(main, "cache", cache)
     monkeypatch.setattr(recommender, "state", {"qdrant": client})
+
     async def fake_trending(limit, *args, **kwargs):
-        return [{"article_id": 7, "score": 3.0}]
+        return [{"article_id": SOURCE_ID, "score": 3.0}]
+
     monkeypatch.setattr(recommender, "get_trending_articles", fake_trending)
     return cache, client
 
 
-def _call_similar(article_id=7, limit=3, same_category=False):
+def _call_similar(article_id=SOURCE_ID, limit=3, same_category=False):
     return _run(main.get_similar(article_id=article_id, limit=limit, same_category=same_category))
 
 
@@ -152,6 +185,7 @@ class TestSimilarResponseExcludesBody:
     def test_response_still_carries_every_field_the_ui_renders(self, wired):
         """Dropping the body must not take any rendered field with it."""
         response = _call_similar()
+
         assert response.similar_articles
         for article in response.similar_articles:
             assert UI_FIELDS <= set(article), f"UI fields missing: {UI_FIELDS - set(article)}"
@@ -168,15 +202,16 @@ class TestSimilarResponseExcludesBody:
 
         assert second.cached is True, "expected the second call to be served from cache"
         assert first.similar_articles == second.similar_articles
+        assert second.similar_articles
         for article in second.similar_articles:
             assert "body" not in article
 
     def test_body_free_when_the_point_carries_only_a_title_and_url(self, wired):
         """A point with no optional fields must not smuggle a body back in."""
         _cache, client = wired
-        # id 8, not the queried article: 7 is filtered out as the source, which
-        # would leave nothing to assert on.
-        client.query_points.return_value.points = [_point(8, body=_body())]
+        # OTHER_ID, not SOURCE_ID: the source is filtered out, which would
+        # leave nothing to assert on.
+        client.query_points.return_value.points = [_point(OTHER_ID, body=_body())]
         client.query_points.return_value.points[0].payload = {
             "title": "Bare point", "url": "https://example.com/x", "body": _body(),
         }
@@ -187,7 +222,7 @@ class TestSimilarResponseExcludesBody:
         assert "body" not in response.similar_articles[0]
 
 
-class TestSimilarCacheEntryExcludesBody:
+class TestCacheEntriesExcludeBody:
     def test_redis_entry_holds_no_body(self, wired):
         cache, _client = wired
         _call_similar()
@@ -199,23 +234,10 @@ class TestSimilarCacheEntryExcludesBody:
         for article in value:
             assert "body" not in article, f"body persisted to Redis under {key}"
 
-    def test_legacy_body_bearing_cache_entry_is_not_served(self, wired):
-        """A pre-deploy entry still holds the bodies; the endpoint returns cache
-        verbatim, so it must not read a key written by the old shape."""
-        cache, _client = wired
-        legacy = [{"id": 7, "title": "stale", "url": "https://x/y", "body": _body()}]
-        cache.store["recommend:similar:7:3:False"] = legacy
-
-        response = _call_similar()
-
-        assert response.cached is False, "served a cache entry written by the previous shape"
-        assert response.similar_articles, "expected the fresh fetch to return articles"
-        for article in response.similar_articles:
-            assert "body" not in article
-
     def test_cached_entry_keeps_the_rendered_fields(self, wired):
         cache, _client = wired
         _call_similar()
+
         ((_key, value),) = cache.store.items()
         # The source article is filtered out, so the two stored points yield one.
         assert len(value) == 1
@@ -225,21 +247,58 @@ class TestSimilarCacheEntryExcludesBody:
     def test_for_you_cache_entry_holds_no_body(self, wired, monkeypatch):
         """for-you shares the formatter and has its own 30-minute cache."""
         cache, _client = wired
-        async def fake_interactions(user_id):
-            return [(7, "click")]
-        async def fake_categories(user_id):
-            return [("technology", 1.0)]
-        monkeypatch.setattr(main, "get_user_interactions", fake_interactions)
-        monkeypatch.setattr(recommender, "get_user_profile_categories", fake_categories)
-        request = SimpleNamespace(state=SimpleNamespace(user_id="user-1"))
+        _stale_personalization(monkeypatch)
 
-        response = _run(main.get_for_you(limit=3, _auth=None, request=request))
+        response = _run(main.get_for_you(limit=3, _auth=None, request=_user_request()))
 
-        assert response.recommendations
+        assert response.recommendations, "expected for-you to return recommendations"
         assert cache.store, "expected for-you to cache its result"
         for value in cache.store.values():
+            assert value
             for article in value:
                 assert "body" not in article
+
+    def test_legacy_similar_entry_is_not_served(self, wired):
+        """A pre-deploy entry still holds the bodies; the endpoint returns cache
+        verbatim, so it must not read a key written by the old shape."""
+        cache, _client = wired
+        cache.store[f"recommend:similar:{SOURCE_ID}:3:False"] = _legacy_entry()
+
+        response = _call_similar()
+
+        assert response.cached is False, "served a similar entry written by the previous shape"
+        assert response.similar_articles, "expected a fresh fetch instead"
+        for article in response.similar_articles:
+            assert "body" not in article
+
+    def test_legacy_for_you_entry_is_not_served(self, wired, monkeypatch):
+        """for-you returns its cached value verbatim too, so its key is versioned."""
+        cache, _client = wired
+        _stale_personalization(monkeypatch)
+        cache.store["recommend:for-you:user-1:3"] = _legacy_entry()
+
+        response = _run(main.get_for_you(limit=3, _auth=None, request=_user_request()))
+
+        assert response.cached is False, "served a for-you entry written by the previous shape"
+        assert response.recommendations
+        for article in response.recommendations:
+            assert "body" not in article
+            assert article.get("title") != "stale"
+
+    def test_legacy_trending_entry_is_not_served(self, wired):
+        """trending shares the formatter and returns its cached value verbatim."""
+        cache, _client = wired
+        cache.store["recommend:trending:3"] = _legacy_entry()
+
+        response = _run(main.get_trending(limit=3, _auth=None))
+
+        # TrendingResponse carries no `cached` flag, so prove it by what came back.
+        assert response.articles, "expected a fresh trending fetch"
+        for article in response.articles:
+            assert "body" not in article
+            assert article.get("title") != "stale", (
+                "served a trending entry written by the previous shape"
+            )
 
 
 class TestQdrantRequestIsNarrowed:
@@ -262,11 +321,12 @@ class TestQdrantRequestIsNarrowed:
         for field in ("title", "url", "published_date", "category", "summary", "industry_names"):
             assert field in requested, f"{field} is rendered by the UI but not requested"
 
-    def test_all_recommender_payload_requests_stop_asking_for_bodies(self, wired):
+    def test_all_recommender_payload_requests_stop_asking_for_bodies(self, wired, monkeypatch):
         """for-you / trending / latest share the formatter; none renders a body."""
         _cache, client = wired
+        _stale_personalization(monkeypatch)
         _call_similar()
-        _run(main.get_for_you(limit=3, _auth=None, request=_anonymous_request()))
+        _run(main.get_for_you(limit=3, _auth=None, request=_user_request()))
         _run(main.get_trending(limit=3, _auth=None))
 
         selectors = _all_payload_selectors(client)
