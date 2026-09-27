@@ -158,6 +158,49 @@ def validate_email(email: str) -> str:
     return email
 
 
+def _has_letter_and_digit(password: str) -> bool:
+    """The composition rule, in one place so ``validate_password`` and the
+    bootstrap guard cannot drift into disagreeing about what counts."""
+    return bool(re.search(r"[A-Za-z]", password)) and bool(re.search(r"\d", password))
+
+
+def _bootstrap_password_rejection(password: str, effective: str) -> str | None:
+    """Why the configured admin password is refused, or None if it is accepted.
+
+    The two classes of rule are deliberately judged against different values,
+    because they answer different questions:
+
+    - **Length** is a property of the credential that actually authenticates.
+      bcrypt only ever sees the first ``_BCRYPT_MAX_BYTES`` bytes, so nothing
+      beyond them can make a short password long. Judging length on the raw
+      string would reject a long passphrase whose effective form is perfectly
+      serviceable -- and ``bootstrap_admin`` is the only path that can ever
+      create an admin (signup hardcodes ``SIGNUP_ROLE``; a role change needs an
+      admin token that cannot exist yet), so that rejection would leave a fresh
+      deploy permanently unadministrable.
+
+    - **Letter+digit** is a property of the secret the operator configured, not
+      of the truncated prefix. It is a composition rule, not an entropy rule, so
+      there is nothing to gain by applying it to bytes that will never
+      authenticate -- and applying it there refuses credentials that both
+      ``main`` and ``login`` accepted: a passphrase whose only digit was
+      appended past byte 72 is long and usable, yet its 72-byte prefix has no
+      digit.
+
+    The composition class is shared verbatim with ``validate_password`` through
+    ``_has_letter_and_digit``, so the two cannot disagree about what counts. The
+    length class is re-stated here because it is the one rule that must be
+    applied to a different value than ``validate_password`` applies it to, and
+    its message is kept identical so an operator sees the same wording whichever
+    path rejected them.
+    """
+    if len(effective) < config.AUTH_PASSWORD_MIN_LEN:
+        return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
+    if not _has_letter_and_digit(password):
+        return "password must contain a letter and a digit"
+    return None
+
+
 def validate_password(password: str) -> str:
     """Validate a password (length + letter/digit), raising 422 on violation."""
     if not password or len(password) < config.AUTH_PASSWORD_MIN_LEN:
@@ -170,9 +213,23 @@ def validate_password(password: str) -> str:
             status_code=422,
             detail=f"password too long (max {_BCRYPT_MAX_BYTES} bytes)",
         )
-    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+    if not _has_letter_and_digit(password):
         raise HTTPException(status_code=422, detail="password must contain a letter and a digit")
     return password
+
+
+def _validator_rejection(validator, value: str) -> str | None:
+    """Return why ``validator`` rejects ``value``, or None when it accepts it.
+
+    ``validate_email`` / ``validate_password`` are written for the signup
+    endpoints and signal failure by raising ``HTTPException``. Callers that
+    need the reason as text (rather than as a 422 response) use this.
+    """
+    try:
+        validator(value)
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
 
 
 def validate_name(name: str) -> str:
@@ -189,6 +246,35 @@ def _password_bytes(password: str) -> bytes:
     """Normalize a password to exactly the bytes bcrypt will hash, so the
     set and verify paths agree (bcrypt truncates at 72 bytes)."""
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+
+
+def _effective_password(password: str) -> str:
+    """Return the password as it will actually be used: the first
+    ``_BCRYPT_MAX_BYTES`` bytes, decoded back to ``str``.
+
+    ``hash_password`` / ``verify_password`` both go through ``_password_bytes``,
+    so anything past byte 72 is silently dropped and never takes part in
+    authentication. Validating a bootstrap credential must therefore judge the
+    part that is really in effect, not the raw string: a long passphrase is
+    perfectly serviceable, and rejecting it would make a fresh deploy
+    unadministrable (bootstrap_admin is the only path that can ever create an
+    admin, since signup hardcodes SIGNUP_ROLE and role changes need an
+    existing admin token).
+
+    ``decode("utf-8", "ignore")`` matters: a multi-byte character can straddle
+    the 72-byte cut, and a strict decode would raise UnicodeDecodeError during
+    startup -- the fail-dead this check exists to avoid. The result is therefore
+    *at most* ``_BCRYPT_MAX_BYTES`` bytes and a byte-prefix of what
+    ``_password_bytes`` hashes: when the cut splits a character, the partial
+    character is dropped whole, so the decoded string is shorter by the number of
+    that character's bytes that fell inside the truncated buffer (1-3, depending
+    on its width and where the cut landed) rather than by a fixed amount. That
+    only ever drops a non-ASCII tail, so it cannot turn a policy-failing value
+    into a passing one. The min-length rule is decided entirely by the retained
+    prefix; the letter+digit rule is decided on the whole configured value (see
+    ``_bootstrap_password_rejection``).
+    """
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
 
 
 def hash_password(password: str) -> str:
@@ -872,10 +958,72 @@ async def bootstrap_admin() -> None:
     """Seed the bootstrap admin from config (once, at startup). Never overwrites
     an existing account's password. Safe under concurrent worker startups: the
     duplicate / write-lock races are handled instead of failing startup (which
-    would restart-loop the worker)."""
+    would restart-loop the worker).
+
+    The configured credentials go through the same ``validate_email`` /
+    ``validate_password`` guards as every other path into the user table. A
+    config value the validators reject is refused, loudly, and no account is
+    created -- but the process still starts, so a typo in one env var cannot take
+    the whole API (and /health) down and leave nobody able to reach the service
+    to fix it. An operator must correct the config and restart.
+
+    An admin account left behind by an earlier run with weak credentials is
+    deliberately NOT deleted: this runs at startup, unauthenticated, and
+    removing the only admin account would lock every operator out of their own
+    deployment. Such an account is reported instead, so it gets rotated.
+    """
     email = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
     password = config.AUTH_ADMIN_PASSWORD or ""
     if not email or not password:
+        return
+    # The config values are the one remaining path into the user table that does
+    # not go through the validators, so a typo like AUTH_ADMIN_PASSWORD=x used to
+    # provision a full-admin account with a 1-character password that the signup
+    # endpoint would itself have rejected. Run both through those validators.
+    #
+    # The rejection is a permanent, config-level fault: retrying it five times
+    # inside the write-lock loop below would re-log the identical error five
+    # times and change nothing, so it returns before reaching that loop. The loop
+    # still retries genuine transient faults (SQLite write locks) as before.
+    # The password is validated first, and unconditionally, so that the advice
+    # given for an EMAIL fault can still say whether the account sitting behind
+    # it is on a weak password. A deploy that ran pre-validator main can have
+    # both faults at once, and reporting only the address would hide a live
+    # 1-character admin password.
+    #
+    # Length is judged on what will actually authenticate. bcrypt only ever sees
+    # the first _BCRYPT_MAX_BYTES bytes (hash_password and verify_password both
+    # truncate), so those bytes ARE the credential. The original password is
+    # still what gets stored, so the row and its hash are byte-identical to
+    # before. See _bootstrap_password_rejection for why letter+digit is judged
+    # on the whole value instead.
+    effective = _effective_password(password)
+    if effective != password:
+        logger.warning(
+            "AUTH_ADMIN_PASSWORD exceeds bcrypt's %d-byte limit; the trailing bytes are dropped "
+            "and only the first %d bytes will ever authenticate. Shorten it, or accept that the "
+            "tail is not part of the credential.",
+            _BCRYPT_MAX_BYTES,
+            _BCRYPT_MAX_BYTES,
+        )
+    password_error = _bootstrap_password_rejection(password, effective)
+
+    email_error = _validator_rejection(validate_email, email)
+    if email_error:
+        await _reject_bootstrap(
+            "AUTH_ADMIN_EMAIL",
+            email_error,
+            hint=f"set it to a valid address (max {config.AUTH_MAX_EMAIL_LEN} characters) and restart",
+            password_rejected=password_error,
+        )
+        return
+    if password_error:
+        await _reject_bootstrap(
+            "AUTH_ADMIN_PASSWORD",
+            password_error,
+            hint=_password_hint(password_error),
+            password_rejected=password_error,
+        )
         return
     s = _require_auth_store()
     for attempt in range(5):
@@ -893,3 +1041,115 @@ async def bootstrap_admin() -> None:
                 logger.error("bootstrap admin %s could not be created (write lock)", email)
                 return
             await asyncio.sleep(1)
+
+
+async def _reject_bootstrap(
+    variable: str, reason: str, *, hint: str, password_rejected: str | None
+) -> None:
+    """Log that the configured bootstrap admin credentials were refused, and
+    report (never delete) an account a previous run already created from the
+    same bad value.
+
+    Must stay loud and specific: the operator reading the log has to learn that
+    AUTH_ADMIN_PASSWORD -- not the login endpoint -- is the thing to fix, so the
+    message names the variable, the validator that rejected it, the validator's
+    own reason, and the fix.
+    """
+    # A weak admin may already exist from a run that predates the validators.
+    # Removing it here would be an unauthenticated, startup-time way to delete
+    # the only admin account and lock every operator out, so the row is left
+    # alone and surfaced loudly for out-of-band rotation instead.
+    #
+    # "Rotate" is demanded only when the configured value is genuinely the
+    # account's current password. A config value that merely fails validation
+    # says nothing about a healthy admin's password, so demanding rotation of an
+    # unrelated account on every worker restart would be a false alarm.
+    if store is not None:
+        probe = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
+        existing = None
+        try:
+            existing = await store.get_user_by_email(probe) if probe else None
+        except Exception as exc:  # noqa: BLE001 - a probe must never break startup
+            logger.warning(
+                "could not check whether admin %s already exists (%s: %s); reporting the rejected "
+                "bootstrap config on its own merits.",
+                probe, type(exc).__name__, exc,
+            )
+            existing = None
+        if existing is not None and existing.role == "admin":
+            # Rotation is warranted by a conjunction of two facts about the
+            # ACCOUNT, neither of which is "which variable failed": the stored
+            # password must actually be the configured one (proving this account
+            # was provisioned from the bad config), AND the password must itself
+            # have failed validation. Requiring both means an email fault on a
+            # healthy admin never nags, while a pre-validator deploy carrying
+            # both faults is still told to rotate -- a live 1-character admin
+            # password is exactly what an operator must hear about.
+            if password_rejected and verify_password(
+                config.AUTH_ADMIN_PASSWORD or "", existing.password_hash
+            ):
+                # The remedy here is a PASSWORD rotation, so the hint must be the
+                # password one. Passing through `hint` unchanged would pair
+                # "Rotate that account's password" with an email remedy
+                # ("set it to a valid address") on the email axis, sending the
+                # operator to fix the wrong variable.
+                logger.error(
+                    "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
+                    "No account was created, and the pre-existing admin account (id %s) -- whose "
+                    "current password IS the rejected AUTH_ADMIN_PASSWORD, so it was provisioned "
+                    "from this non-compliant value before these checks existed -- was left in place. "
+                    "Rotate that account's password out of band, and also correct %s: %s. "
+                    "To rotate the password: %s.",
+                    probe, _validator_name_for(variable), variable, reason, existing.id, variable,
+                    hint, _password_hint("password must contain a letter and a digit"),
+                )
+            elif _validator_name_for(variable) != "validate_password":
+                # The account is on a different, valid password, so the fault is
+                # purely the configured address: say that, and do not send the
+                # operator to rotate a password that is not the problem.
+                logger.error(
+                    "bootstrap admin NOT created: %s rejected the configured %s: %s. The "
+                    "pre-existing admin account (id %s) was left untouched and keeps its current "
+                    "password, so it needs no rotation -- the fault is the configured address, not "
+                    "the account. %s.",
+                    _validator_name_for(variable), variable, reason, existing.id, hint,
+                )
+            else:
+                logger.error(
+                    "bootstrap admin NOT created: %s rejected the configured %s: %s. An unrelated "
+                    "admin account (id %s) already exists on a different, valid password, so it was "
+                    "left untouched and needs no rotation. %s.",
+                    _validator_name_for(variable), variable, reason, existing.id, hint,
+                )
+            return
+    logger.error(
+        "bootstrap admin NOT created: %s rejected the configured %s: %s. This is a configuration "
+        "error, not a transient fault, so it is not retried. Startup continues with no admin "
+        "account: %s. The service is up, so you can fix the config and restart.",
+        _validator_name_for(variable), variable, reason, hint,
+    )
+
+
+def _password_hint(reason: str) -> str:
+    """The remediation hint for a ``validate_password`` reason.
+
+    Keyed on the reason so the advice can never contradict it -- one fixed hint
+    would tell an operator to lengthen a password that was rejected for being
+    too long. Only the reasons still reachable for an already-truncated value
+    appear here: the too-long branch cannot fire, because ``bootstrap_admin``
+    validates the output of ``_effective_password``.
+    """
+    if "at least" in reason:
+        return (
+            f"set it to a password of at least {config.AUTH_PASSWORD_MIN_LEN} characters "
+            "containing both a letter and a digit, then restart"
+        )
+    if "letter and a digit" in reason:
+        return "set it to a password containing both a letter and a digit, then restart"
+    # A future reason must not fall through to advice that could be wrong, so
+    # the fallback stays reason-agnostic.
+    return "set AUTH_ADMIN_PASSWORD to a password that satisfies the password policy, then restart"
+
+
+def _validator_name_for(variable: str) -> str:
+    return "validate_email" if variable.endswith("EMAIL") else "validate_password"
