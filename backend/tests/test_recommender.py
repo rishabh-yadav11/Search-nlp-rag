@@ -286,14 +286,15 @@ class _FakeQdrant:
 
     OUTAGE = "qdrant unreachable"
 
-    def __init__(self, *, fail_vector=False, fail_category=False, fail_trending=False):
+    def __init__(self, *, fail_vector=False, fail_category=False, fail_trending=False, fail_queries=()):
         self.fail_vector = fail_vector
         self.fail_category = fail_category
         self.fail_trending = fail_trending
+        self.fail_queries = set(fail_queries)
 
     async def query_points(self, **kwargs):
         if "query" in kwargs:
-            if self.fail_vector:
+            if self.fail_vector or kwargs["query"] in self.fail_queries:
                 raise RuntimeError(self.OUTAGE)
             return SimpleNamespace(points=[_scored_point(11, "vector hit")])
         if self.fail_category:
@@ -306,15 +307,16 @@ class _FakeQdrant:
         return ([_scored_point(13, "trending hit")], None)
 
 
-async def _personalized(qdrant):
+async def _personalized(qdrant, *, interactions=(901,)):
     """Drive get_personalized_recommendations with a warm user profile."""
     from app import recommender
 
+    now = datetime.now(UTC).timestamp()
     with (
         patch.object(recommender, "state", {"qdrant": qdrant}),
         patch.object(
             recommender, "get_user_interactions",
-            AsyncMock(return_value=[(901, datetime.now(UTC).timestamp())]),
+            AsyncMock(return_value=[(pid, now) for pid in interactions]),
         ),
         # A category containing "industry" is required for a category filter
         # to be built at all, otherwise the category leg short-circuits.
@@ -401,3 +403,18 @@ class TestCandidateLegObservability:
         assert result == []
         for leg in (_VECTOR_LEG, _CATEGORY_LEG, _TRENDING_LEG):
             assert _leg_warnings(caplog, leg, _FakeQdrant.OUTAGE), (leg, caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_vector_leg_keeps_results_from_interactions_that_worked(self, caplog):
+        """One failed interaction is skipped; the rest of the leg still returns."""
+        qdrant = _FakeQdrant(fail_queries=(901,))
+        with caplog.at_level(logging.WARNING):
+            result = await _personalized(qdrant, interactions=(901, 902))
+
+        # The surviving interaction still contributed, alongside the other legs.
+        assert _titles(result) == {"vector hit", "category hit", "trending hit"}
+        # Exactly one vector warning, naming only the interaction that failed.
+        vector_warnings = _leg_warnings(caplog, _VECTOR_LEG, _FakeQdrant.OUTAGE)
+        assert len(vector_warnings) == 1, caplog.records
+        assert "article 901" in vector_warnings[0].getMessage()
+        assert "article 902" not in vector_warnings[0].getMessage()
