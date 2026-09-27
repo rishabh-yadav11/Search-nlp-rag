@@ -2,7 +2,8 @@
 
 Signup issues no token and always answers the same thing (see the endpoint);
 login issues opaque bearer tokens (hashed with SHA-256 in storage, expiring
-after AUTH_TOKEN_TTL_DAYS, individually revocable, multiple per user).
+after AUTH_TOKEN_TTL_DAYS, individually revocable, several per user but capped
+at AUTH_MAX_ACTIVE_TOKENS_PER_USER active ones, oldest revoked past the cap).
 A role-based access-control layer maps roles to permissions; endpoints assert
 the permission they need via ``require_permission``. A bootstrap admin account
 is seeded from AUTH_ADMIN_EMAIL / AUTH_ADMIN_PASSWORD at startup.
