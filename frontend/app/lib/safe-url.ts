@@ -41,8 +41,16 @@ const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+\-.]*:/
  * server marked it safe and emitted a clickable off-origin link that React
  * then discarded on hydration.
  *
- * Rejecting raw C0 controls removes that whole class. It costs nothing: no
- * legitimate URL contains them, since browsers percent-encode them anyway.
+ * This closes that whole class, at a deliberate cost that is worth stating
+ * precisely rather than glossing: the browser does *not* handle all of these
+ * the same way. It percent-encodes NUL and the other C0 controls
+ * (`https://ok.com/a\x00b` → `…/a%00b`), but it silently *removes* tab, CR
+ * and LF (`https://ok.com/a\tb` → `…/ab`). So a legitimate URL carrying a
+ * stray tab/CR/LF is one the browser would happily navigate; this guard
+ * refuses it and the article renders as inert text. That is a cosmetic,
+ * fail-closed regression with no security impact — and the safe behaviour is
+ * to refuse rather than silently normalise, since which controls a given
+ * browser strips is exactly the ambiguity this guard exists to remove.
  */
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/
 
