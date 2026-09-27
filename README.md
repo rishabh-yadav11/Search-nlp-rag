@@ -399,8 +399,8 @@ Coverage: query-intent/date parsing, facet filter construction, effective intent
 runs are cancelled (concurrency group keyed on workflow + ref) and every job has
 an explicit timeout.
 
-1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest` (790 tests). It installs the *full* `requirements.txt` rather than a slimmed test set because `app/main.py` does `from fastembed import SparseTextEmbedding` at module scope and six test modules import `app.main`, so the suite cannot be collected without the runtime stack. (`app/encoders.py` and `app/reranker.py` import `fastembed`/`sentence_transformers` lazily inside their constructors, and their tests fake those modules in `sys.modules`.) There is deliberately **no `ruff format` gate** — `ruff format --check` already reports 50 files that would be reformatted, so enforcing it would mean reformatting the tree, not CI.
-2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest, 127 tests).
+1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest -rs`, which must report **zero skipped tests** (the job fails otherwise). lua5.1 is installed first: `tests/test_budget_lua.py` runs the real shipped `_BUDGET_LUA` under it and is the only thing that catches drift between that script and the Python spend-cap model, so a silent skip would leave the cap unverified. The job installs the *full* `requirements.txt` rather than a slimmed test set because `app/main.py` does `from fastembed import SparseTextEmbedding` at module scope and several test modules import `app.main`, so the suite cannot be collected without the runtime stack. (`app/encoders.py` and `app/reranker.py` import `fastembed`/`sentence_transformers` lazily inside their constructors, and their tests fake those modules in `sys.modules`.) There is deliberately **no `ruff format` gate** — `ruff format --check` reports files that would be reformatted, so enforcing it would mean reformatting the tree, not CI.
+2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest).
 3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan (binary pinned to 8.28.0, download SHA-256 verified) over the full history of the checked-out ref.
 
 ### Audit policy
@@ -409,10 +409,14 @@ an explicit timeout.
 The only current findings are 7 starlette advisories (14 rows — the resolver
 reports each twice), all transitive: `fastapi==0.115.0` caps starlette below
 0.39, and every fixed starlette release (0.40.0 → 1.3.1) requires raising the
-FastAPI pin. Those 7 IDs are listed by name in the workflow with that comment;
-anything new fails immediately. Remove an ID from the list and the job goes red
-again — the waiver is an enumerated list of 7 advisory IDs, not a blanket
-suppression, and each one disappears as soon as the FastAPI pin is raised.
+FastAPI pin. Those 7 IDs are listed by name in the workflow; anything new fails
+immediately. Remove an ID from the list and the job goes red again — the waiver
+is an enumerated list of 7 advisory IDs, not a blanket suppression, and the
+list is **version-anchored**: every one is reachable only through
+`fastapi==0.115.0`, so raising that pin re-fails the gate by construction and the
+suppression cannot outlive its reason. Owner: whoever bumps the `fastapi` pin.
+Tracked by [#331](https://github.com/rishabh-yadav11/Search-nlp-rag/issues/331),
+review by 2026-12-27.
 
 The `transformers==5.10.1` pin (which fixes CVE-2026-4372 / CVE-2026-5241 /
 CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits
