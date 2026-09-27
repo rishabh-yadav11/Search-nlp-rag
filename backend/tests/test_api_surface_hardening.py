@@ -13,14 +13,16 @@ Two things are asserted here:
 """
 
 import os
+import socket
 import subprocess
 import sys
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app import config as config_module
 from app import main as main_module
-from app.config import _parse_allowed_hosts, config
+from app.config import _machine_hosts, _parse_allowed_hosts, config
 
 # raise_server_exceptions=False so a 400/404 from middleware surfaces as a
 # response instead of propagating.
@@ -92,6 +94,36 @@ def test_default_allow_list_derives_hosts_from_cors_origins():
         "testserver",
         "api.example.com",
     )
+
+
+def test_default_allow_list_covers_this_boxes_own_identity():
+    """The box's own name and IPs must be in the default allow-list.
+
+    Production is same-origin through nginx behind a `server_name _` catch-all
+    vhost, which forwards whatever Host the client used, and the deployed
+    CORS_ORIGINS is left at its localhost default. So for a site reached by IP
+    or by the box's own name, the CORS-derived list covers nothing and every
+    public request would 400.
+    """
+    assert set(_machine_hosts()) <= set(config.ALLOWED_HOSTS)
+
+
+@pytest.mark.parametrize("host", _machine_hosts())
+def test_box_identity_hosts_are_accepted(host):
+    r = _client.get("/live", headers={"Host": host})
+    assert r.status_code == 200, f"Host {host!r} is the box's own identity but was rejected"
+
+
+def test_machine_hosts_degrade_instead_of_raising(monkeypatch):
+    """This runs at import: a name-resolution failure must not take the app down."""
+
+    def boom(*args, **kwargs):
+        raise OSError("name resolution unavailable")
+
+    monkeypatch.setattr(config_module.socket, "getaddrinfo", boom)
+    hosts = _machine_hosts()
+    assert socket.gethostname() in hosts
+    assert "" not in hosts
 
 
 def test_allow_list_entries_are_normalised():

@@ -1,4 +1,5 @@
 import os
+import socket
 from typing import ClassVar
 
 from dotenv import load_dotenv
@@ -28,19 +29,49 @@ def _normalize_host(entry: str) -> str:
     return host.partition(":")[0]
 
 
-def _parse_allowed_hosts(raw: str | None, origins: tuple[str, ...] = ()) -> tuple[str, ...]:
+def _machine_hosts() -> tuple[str, ...]:
+    """Hostnames this box itself answers to: its own name and its IP addresses.
+
+    Production is same-origin through nginx behind a `server_name _` catch-all
+    vhost that forwards whatever `Host` the client used, and the documented
+    posture leaves CORS_ORIGINS at its localhost default — so neither CORS nor
+    a hardcoded domain covers a site reached by IP or by the box's own name.
+    Without these, every public request 400s. A separately registered public
+    domain still has to be added to ALLOWED_HOSTS by the operator.
+
+    Best effort by design: this runs at import, so a name-resolution failure
+    must degrade to "fewer allowed hosts", never take the whole API down.
+    """
+    hosts: list[str] = []
+    for getter in (socket.gethostname, socket.getfqdn):
+        try:
+            name = getter()
+        except OSError:
+            continue
+        if name:
+            hosts.append(name)
+    try:
+        hosts.extend({info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)})
+    except OSError:
+        pass
+    return tuple(h for h in dict.fromkeys(hosts) if h)
+
+
+def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Turn the ALLOWED_HOSTS knob into a de-duplicated tuple of hostnames.
 
-    Unset or blank falls back to the local dev/test hosts plus the hostnames in
-    CORS_ORIGINS, so a missing knob keeps localhost, the dev stack and the test
-    client working without ever opening the check. An explicit value replaces
-    that default wholesale: a bare "*" is rejected outright (it would silently
-    disable the check, which is the exact opposite of the knob's purpose) and a
-    value that contains no usable hostname is rejected too, because it would
-    otherwise match nothing and 400 every request with no clue why.
+    Unset or blank falls back to the local dev/test hosts plus whatever
+    extra_hosts carries (the CORS origins and this box's own identities), so a
+    missing knob keeps localhost, the dev stack, the test client and the real
+    deployment working without ever opening the check. An explicit value
+    replaces that default wholesale: a bare "*" is rejected outright (it would
+    silently disable the check, which is the exact opposite of the knob's
+    purpose) and a value that contains no usable hostname is rejected too,
+    because it would otherwise match nothing and 400 every request with no clue
+    why.
     """
     if raw is None or not raw.strip():
-        derived = _DEFAULT_ALLOWED_HOSTS + tuple(_normalize_host(o) for o in origins)
+        derived = _DEFAULT_ALLOWED_HOSTS + tuple(_normalize_host(h) for h in extra_hosts)
         return tuple(dict.fromkeys(h for h in derived if h))
 
     hosts: list[str] = []
@@ -313,15 +344,17 @@ class Config:
     )
 
     # Hostnames this API answers to, enforced by TrustedHostMiddleware. The
-    # default is derived from CORS_ORIGINS plus the local dev/test hosts, so a
-    # deployment whose public origin is already in CORS_ORIGINS is covered
-    # without any extra configuration. Set ALLOWED_HOSTS explicitly (comma
-    # separated hostnames) when the API is reachable under a hostname that is
-    # not in CORS_ORIGINS; a wrong value here answers 400 to every request.
+    # default is derived from CORS_ORIGINS, this box's own name and IP
+    # addresses, and the local dev/test hosts, so a site reached by IP or by the
+    # box's own name keeps working with no configuration at all. Set
+    # ALLOWED_HOSTS explicitly (comma separated hostnames) when the API is
+    # reachable under a name none of those cover — a separately registered
+    # public domain, for instance. A wrong value here answers 400 to every
+    # request; the effective list is logged at startup.
     # Immutable (tuple), like CORS_ORIGINS, so the allow-list can't be mutated
     # at runtime.
     ALLOWED_HOSTS: ClassVar[tuple[str, ...]] = _parse_allowed_hosts(
-        os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS
+        os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS + _machine_hosts()
     )
 
 
