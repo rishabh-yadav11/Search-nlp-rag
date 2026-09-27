@@ -445,51 +445,22 @@ def test_gathered_turn_beats_the_sequential_turn(stub_pipeline, monkeypatch):
 # --- failure behaviour matches the sequential loop ---
 
 
-def test_failing_leg_raises_the_first_entities_error(stub_pipeline, monkeypatch):
-    """The error surfaced is the FIRST entity's, as the sequential loop raised.
+def test_error_is_the_first_entity_s_not_the_race_winner(stub_pipeline, monkeypatch):
+    """The surfaced error is entity 0's, not whichever leg happened to lose the race.
 
-    Concurrent legs finish in arbitrary order, so propagating whichever raises
-    first would make the surfaced error a race. The turn is also fully awaited,
-    so no leg is left running against Qdrant after it has already failed.
-    """
-    entities = ["alpha", "bravo", "charlie"]
-    leg = stub_pipeline(entity_articles=_ARTICLES)
+    Plain gather() raises whichever leg failed first in wall-clock time; the
+    sequential loop this replaced raised the first ENTITY's. Alpha is first in
+    entity order but raises last in wall-clock, and the two failing legs raise
+    different exception types, so a race surfaces ValueError("bravo failed")
+    where the code must surface RuntimeError("alpha failed"). Repeated three
+    times, since a race could not be relied on to reproduce.
 
-    async def boom(rq, top_k, **kwargs):
-        entity = rq.split(" ")[0]
-        leg.started.append(entity)
-        await asyncio.sleep(0.01 if entity == "charlie" else 0)
-        if entity == "alpha":
-            raise RuntimeError("alpha failed")
-        if entity == "bravo":
-            raise ValueError("bravo failed")
-        return ([_article(9, "charlie three", 0.9)], None, None, None)
-
-    from app import main
-
-    main.retrieve_with_auto_facet_fallback = boom
-    try:
-        with pytest.raises(RuntimeError, match="alpha failed"):
-            _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
-    finally:
-        main.retrieve_with_auto_facet_fallback = leg.retrieve
-
-    # charlie raises nothing and is the last entity: the first entity's error
-    # wins even though bravo also failed and charlie may finish later.
-    assert sorted(leg.started) == sorted(entities), "every leg must be awaited, none orphaned"
-
-
-def test_error_ordering_is_deterministic_not_a_race(stub_pipeline, monkeypatch):
-    """When several legs fail, the surfaced error is the FIRST entity's.
-
-    Plain gather() raises whichever leg lost the race, so the same question
-    could surface different errors on different runs. Ordering by ENTITY
-    position is what makes the failure deterministic.
-
-    Both alpha and bravo raise, but they are staggered the OTHER way round:
-    alpha is FIRST in entity order yet raises LAST in wall-clock. A race
-    therefore surfaces bravo's error, and only the entity-ordered re-raise
-    surfaces alpha's -- so this test cannot pass vacuously.
+    The await-all property -- that no leg keeps running against Qdrant after
+    the turn has already failed -- is NOT asserted here. It was tried and
+    dropped as vacuous: a coroutine's ``finally`` runs during asyncio.run's
+    shutdown cancellation too, so the bookkeeping showed every leg finished
+    under plain gather as well. That property rests on the implementation
+    (return_exceptions=True awaits all legs before the re-raise), not on a test.
     """
     entities = ["alpha", "bravo", "charlie"]
     _Leg(entity_articles=_ARTICLES)  # installs the fixture patch we then replace
@@ -497,11 +468,11 @@ def test_error_ordering_is_deterministic_not_a_race(stub_pipeline, monkeypatch):
     async def flaky(rq, top_k, **kwargs):
         entity = rq.split(" ")[0]
         if entity == "alpha":
-            await asyncio.sleep(0.02)
-        elif entity == "bravo":
-            await asyncio.sleep(0)
-        if entity in ("alpha", "bravo"):
-            raise RuntimeError(f"{entity} failed")
+            await asyncio.sleep(0.02)   # first in entity order, last to fail
+            raise RuntimeError("alpha failed")
+        if entity == "bravo":
+            raise ValueError("bravo failed")
+        await asyncio.sleep(0.01)
         return ([_article(1, f"{entity} deal", 0.9)], None, None, None)
 
     from app import main
