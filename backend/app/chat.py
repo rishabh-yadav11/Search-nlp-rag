@@ -1210,6 +1210,17 @@ def _question_fence(question: str) -> str:
     return _fence("QUESTION", _neutralise_fences(question))
 
 
+# The smallest fenced replay the prompt can carry: a standalone note that the
+# session has nothing to replay. _history_fence falls back to it when no turn
+# fits the budget, and to an empty string when even this does not fit.
+_NO_EARLIER_CONVERSATION = _fence("HISTORY", "(no earlier conversation)")
+
+
+def _omission_note(dropped: int) -> str:
+    """The marker stating how many older turns the character budget discarded."""
+    return f"[{dropped} earlier turn(s) omitted: history character limit reached]"
+
+
 def _history_fence(history: list[MessageOut]) -> str:
     """Render replayed turns as labelled quoted turns inside a character budget.
 
@@ -1220,10 +1231,17 @@ def _history_fence(history: list[MessageOut]) -> str:
     closest to the current question; older turns are dropped with a note rather
     than silently.
 
-    The budget is charged against each turn's *rendered* length — delimiters and
-    truncation note included — so the fence can never push the replay past
-    CHAT_HISTORY_CHAR_LIMIT. A single turn too long to fit is cut to fit instead
-    of being dropped, so the newest context is never lost entirely.
+    The bound is exact and covers the WHOLE rendered string, not just the kept
+    turn bodies: every turn's fence delimiters, the ``"\\n"`` join separators
+    between them and the prepended omission note are charged against
+    CHAT_HISTORY_CHAR_LIMIT, so the replay can never exceed the configured
+    limit. A single turn too long to fit is cut to fit instead of being dropped,
+    so the newest context is never lost entirely.
+
+    When the limit is too small to hold even one fence (below
+    len(_NO_EARLIER_CONVERSATION)) there is no rendering that both carries the
+    session and respects the bound, so the replay is dropped and an empty
+    string is returned — which fits any limit, zero and negative included.
     """
     budget = max(0, config.CHAT_HISTORY_CHAR_LIMIT)
     turns = [m for m in history if m.role in ("user", "assistant")]
@@ -1231,28 +1249,47 @@ def _history_fence(history: list[MessageOut]) -> str:
     labels = [f"TURN {i} {m.role}" for i, m in enumerate(turns, start=1)]
     blocks = [_fence(label, _neutralise_fences(m.content)) for label, m in zip(labels, turns, strict=True)]
 
+    # The note and the "\n" that joins it to the turns below are part of the
+    # rendered replay, so their worst-case cost is reserved up front. Reserving
+    # the count of ALL turns (the most the note can ever have to name) keeps the
+    # real note, which can only be shorter, inside the reservation.
+    reserve = len(_omission_note(len(blocks))) + 1
+    kept = _select_turns(blocks, labels, turns, budget - reserve)
+    if len(kept) == len(blocks):
+        # Everything fits even with the note reserved, so no note is owed: spend
+        # the reservation on content instead of leaving it unspent.
+        kept = _select_turns(blocks, labels, turns, budget)
+    if len(kept) == len(blocks):
+        return "\n".join(reversed(kept))
+    if not kept:
+        return _NO_EARLIER_CONVERSATION if budget >= len(_NO_EARLIER_CONVERSATION) else ""
+    return "\n".join([_omission_note(len(blocks) - len(kept)), *reversed(kept)])
+
+
+def _select_turns(blocks: list[str], labels: list[str], turns: list[MessageOut], budget: int) -> list[str]:
+    """Keep the newest turns whose fences fit ``budget`` exactly, newest first.
+
+    Every turn's delimiters and the ``"\\n"`` that joins it to the next one are
+    charged, so joining the result with ``"\\n"`` can never exceed ``budget``. A
+    newest turn too long to fit on its own is cut to fit instead of dropped, so
+    the newest context is never lost entirely.
+    """
     kept: list[str] = []
     used = 0
-    for i in range(len(blocks) - 1, -1, -1):  # newest turn first
-        if used + len(blocks[i]) <= budget:
+    for i in range(len(blocks) - 1, -1, -1):
+        cost = len(blocks[i]) + (1 if kept else 0)  # + the "\n" joining it
+        if used + cost <= budget:
             kept.append(blocks[i])
-            used += len(blocks[i])
+            used += cost
             continue
         if not kept:
-            # Newest turn on its own blows the budget: cut its text to fit.
             overhead = len(_fence(labels[i], ""))
-            if budget > overhead + len(_TRUNCATION_NOTE):
-                body = _truncate_untrusted(turns[i].content, budget - overhead - len(_TRUNCATION_NOTE))
+            body_budget = budget - overhead
+            if body_budget > len(_TRUNCATION_NOTE):
+                body = _truncate_untrusted(turns[i].content, body_budget - len(_TRUNCATION_NOTE))
                 kept.append(_fence(labels[i], _neutralise_fences(body)))
         break
-
-    dropped = len(blocks) - len(kept)
-    if not kept:
-        return _fence("HISTORY", "(no earlier conversation)")
-    kept.reverse()
-    if dropped:
-        kept.insert(0, f"[{dropped} earlier turn(s) omitted: history character limit reached]")
-    return "\n".join(kept)
+    return kept
 
 
 async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTurn:

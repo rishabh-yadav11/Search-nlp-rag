@@ -310,10 +310,12 @@ def test_oversized_history_is_truncated_to_the_configured_budget(retrieval, no_b
 
     user = _user_text(poison_client)
     history = user[user.index("Conversation so far:") : user.index("Articles:")]
-    # The knob is a real bound: the fenced turns, delimiters and truncation note
-    # together must fit inside it, or it would not bound anything.
-    turns = history[history.index("<<<TURN") :].rstrip("\n")
-    assert len(turns) <= 400
+    # The knob is a real bound on the WHOLE replay the model reads, and what
+    # reaches the transport is exactly the renderer's output. Measuring from
+    # "<<<TURN" onwards would slice the omission note off and hide the overrun.
+    replay = history[history.index("\n") + 1 :].strip("\n")
+    assert replay == chat_module._history_fence(prior)
+    assert len(replay) <= 400
     assert history.count("<<<TURN") == 1
     assert "[... truncated: untrusted content continues beyond this point ...]" in history
     assert "earlier turn(s) omitted: history character limit reached" in history
@@ -321,6 +323,39 @@ def test_oversized_history_is_truncated_to_the_configured_budget(retrieval, no_b
     assert "[msg10]" in history
     assert "[msg1]" not in history
 
+
+@pytest.mark.parametrize("limit", [0, -1, 40, 80, 200, 400, 12000])
+def test_history_replay_never_exceeds_the_configured_budget(monkeypatch, limit):
+    """The limit bounds the entire rendered replay, at every setting: the turn
+    fences, the separators between them and the omission note are all charged
+    against it, so the render can never land above the configured bound."""
+    monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", limit)
+    prior = [_message(i, "user" if i % 2 else "assistant", f"[msg{i}] " + "z" * 500) for i in range(1, 11)]
+
+    replay = chat_module._history_fence(prior)
+
+    assert len(replay) <= max(0, limit)
+    # Whatever survives is well formed: no half-written fence, and every turn
+    # the budget discarded is named in the note (never dropped in silence).
+    assert replay.count("<<<TURN ") == replay.count("<<<END TURN ")
+    quoted = replay.count("<<<TURN ")
+    if 0 < quoted < len(prior):
+        assert f"[{len(prior) - quoted} earlier turn(s) omitted: history character limit reached]" in replay
+        # Newest first: the turns that survive are the ones nearest the question.
+        assert f"[msg{10 - quoted + 1}]" in replay
+
+
+def test_history_budget_too_small_for_one_fence_replays_nothing(monkeypatch):
+    """Below one empty fence there is no rendering that both carries the
+    session and respects the bound, so the replay is empty — which is what
+    makes the bound hold at zero and at a negative setting."""
+    monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", 0)
+    prior = [_message(i, "user" if i % 2 else "assistant", f"[msg{i}] " + "z" * 500) for i in range(1, 11)]
+
+    assert chat_module._history_fence(prior) == ""
+
+    monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", -1)
+    assert chat_module._history_fence(prior) == ""
 
 def test_oversized_article_body_is_truncated_to_the_configured_bound(retrieval, no_billing, poison_client, monkeypatch):
     """A 60K body is cut to the per-article cap and marked inside its fence."""
