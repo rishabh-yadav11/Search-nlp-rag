@@ -38,11 +38,24 @@ def resolve_close(resource: object) -> Callable[[], object] | None:
 async def await_close(close: Callable[[], object], timeout: float) -> None:
     """Invoke ``close`` and bound the wait.
 
-    A coroutine-function close is awaited under ``asyncio.wait_for``: a hung
-    one is cancelled and abandoned, so the caller regains control after
-    ``timeout``. A synchronous close is invoked directly and its return value
-    ignored -- there is nothing to await, so a sync close that blocks the event
-    loop is not made bounded here.
+    A coroutine-function close is awaited under ``asyncio.wait_for``, so a
+    close that is merely SLOW -- the ordinary case, a socket with no answer --
+    is cancelled and abandoned, and the caller regains control after
+    ``timeout``.
+
+    The bound holds only for a close that cooperates with cancellation.
+    ``wait_for`` waits for the cancellation to be delivered before it returns,
+    so a close that swallows ``CancelledError`` keeps the caller blocked
+    indefinitely (verified on this interpreter: a close looping on
+    ``except CancelledError: continue`` had still not returned after 60s
+    against a 0.05s budget). Nothing here defends against that -- a caller
+    whose teardown step may behave that way has to structure the step itself
+    around it, the way ``app.main._cancel_and_wait`` does with
+    ``asyncio.wait``.
+
+    A synchronous close is invoked directly and its return value ignored: there
+    is nothing to await, so a sync close that blocks the event loop is not made
+    bounded here either.
     """
     outcome = close()
     if asyncio.iscoroutine(outcome) or isinstance(outcome, asyncio.Future):
@@ -63,12 +76,14 @@ async def close_quietly(
     resolved) or a zero-argument callable performing the close, for a teardown
     step that is not a single method call.
 
-    A close exceeding ``timeout`` is cancelled and abandoned -- a hung
-    teardown step is expected to be reported, not to abort the rest of
+    A close that merely runs past ``timeout`` is cancelled and abandoned -- a
+    slow teardown step is expected to be reported, not to abort the rest of
     shutdown -- and every failure in ``suppress`` is logged with
-    ``resource_name`` and swallowed. Exceptions outside ``suppress`` propagate,
-    and ``asyncio.CancelledError`` (a ``BaseException``, never in any expected
-    tuple) always propagates, so a cancelled shutdown still unwinds.
+    ``resource_name`` and swallowed. That bound assumes the close cooperates
+    with cancellation; see ``await_close`` for what happens when it does not.
+    Exceptions outside ``suppress`` propagate, and ``asyncio.CancelledError``
+    (a ``BaseException``, never in any expected tuple) always propagates, so a
+    cancelled shutdown still unwinds.
 
     One call releases one resource. Continuing with the remaining releases
     after a failure is the caller's job: loop over this function.
