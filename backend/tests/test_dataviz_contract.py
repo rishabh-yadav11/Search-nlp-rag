@@ -154,13 +154,28 @@ def test_missing_value_tokens_are_identical_on_both_sides(corpus, frontend):
 
 
 def test_corpus_exercises_every_missing_value_token(corpus):
-    """Each token gets a fixture of its own. Dropping a token from the list stops
-    mattering for that cell (it stops being 'missing') and the fixture's verdict
-    flips, so the corpus cannot quietly stop covering one."""
-    covered = {f["name"] for f in corpus["fixtures"]}
-    missing = [
-        f"token_missing:{tok if tok else '<empty>'}"
-        for tok in chat_module._MISSING_VALUE_TOKENS
-        if f"token_missing:{tok if tok else '<empty>'}" not in covered
-    ]
-    assert not missing, "no fixture covers these missing-value tokens: " + ", ".join(missing)
+    """Each token gets a fixture whose ROWS ACTUALLY CONTAIN IT, and both sides
+    read that fixture. A fixture merely *named* after a token would let a token
+    be declared in all three lists while nothing tested it, which is the silent
+    drift this whole corpus exists to prevent; so the token is looked for in the
+    parsed cells, and dropping the token from either list flips the verdict of
+    its own fixture."""
+    by_name = {f["name"]: f["text"] for f in corpus["fixtures"]}
+    problems = []
+    for tok in chat_module._MISSING_VALUE_TOKENS:
+        name = f"token_missing:{tok if tok else '<empty>'}"
+        text = by_name.get(name)
+        if text is None:
+            problems.append(f"{tok!r}: no fixture named {name}")
+            continue
+        match = chat_module._DATAVIZ_FENCE_RE.search(text)
+        cells = []
+        if match is not None:
+            try:
+                payload = json.loads(match.group(1))
+                cells = [cell for row in payload["rows"] for cell in row]
+            except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                cells = []
+        if tok not in cells:
+            problems.append(f"{tok!r}: fixture {name} does not contain it as a cell (cells={cells!r})")
+    assert not problems, "missing-value tokens no fixture really covers:\n" + "\n".join(problems)

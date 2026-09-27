@@ -38,13 +38,24 @@ export type ContentPart =
  * Fence grammar, character-for-character identical to DATAVIZ_FENCE_PATTERN in
  * backend/app/chat.py. It is written in JavaScript regex syntax on purpose:
  * `[\s\S]` is an explicit any-char class, so the pattern means the same thing
- * in both languages, and the paired contract test asserts the two source
- * strings are equal. The newline after the tag is OPTIONAL, and horizontal
- * whitespace (spaces/tabs, never a newline) may sit between the tag and it, so
- * a fence indented inside a list item is recognised identically on both sides
- * of the wire (#255, #267).
+ * in both languages, and the contract test asserts the two source strings are
+ * equal. The newline after the tag is OPTIONAL, so a fence written as
+ * ```dataviz{...}``` is the same grammar (#255).
+ *
+ * The tag may be followed by spaces, tabs and a carriage return — an explicit
+ * ASCII class, NOT `[^\S\n]`. Python's `\s` and JavaScript's `\s` cover
+ * DIFFERENT Unicode whitespace: `\S` matches U+FEFF in JavaScript but not in
+ * Python, and matches U+0085 in Python but not in JavaScript. With `[^\S\n]*`
+ * the two engines consumed different characters, so a fence carrying a BOM
+ * after the tag was kept by the server and dropped by the browser (and the
+ * reverse for U+0085) — the same class of disagreement as the rest of this
+ * contract, invisible to a string-equality check because the strings really
+ * were identical. `[ \t\r]*` says the same thing in both engines. The
+ * carriage return is there for CRLF answers; the newline itself is the
+ * optional `\n?` below, so a fence written as ```dataviz{...}``` is still the
+ * same grammar (#255, #267).
  */
-export const FENCE_SRC = '```dataviz[^\\S\\n]*\\n?([\\s\\S]*?)\\n?```\\s*'
+export const FENCE_SRC = '```dataviz[ \\t\\r]*\\n?([\\s\\S]*?)\\n?```\\s*'
 export const KINDS = ['bar', 'line', 'pie'] as const
 export const VIEWS = ['table', 'bar', 'line', 'pie'] as const
 
