@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -47,6 +48,9 @@ class _FakeClient:
         if self._raises is not None:
             raise self._raises
         return self._snap
+
+    def close(self):
+        pass
 
 
 def _tar_bytes(entries=("collection/meta.json", "collection/0/segment.bin")):
@@ -107,6 +111,12 @@ class _SnapshotServer:
                     self.end_headers()
                     self.wfile.write(outer.body[: len(outer.body) // 2])
                     self.close_connection = True
+                elif self.path.startswith("/stall"):
+                    # Announce a body, then stall without ever sending it.
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(outer.body)))
+                    self.end_headers()
+                    time.sleep(3)
                 elif self.path.startswith("/collections/"):
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(outer.body)))
@@ -333,6 +343,37 @@ def test_make_backup_reports_success_only_with_a_verified_archive(backups_dir, m
     with tarfile.open(snapshot, "r:*") as tf:
         assert len(tf.getnames()) == 2
 
+def test_retention_is_enforced_even_when_every_backup_fails(backups_dir, monkeypatch):
+    """A run of failing backups creates a directory each time; if pruning only
+    ran on success, backend/backups/ would grow without bound on exactly the
+    runs an operator is most likely to be repeating."""
+    for i in range(6):
+        stale = backups_dir / f"c-2026010{i}-000000-000000"
+        stale.mkdir()
+        (stale / "marker").write_text("old")
+    monkeypatch.setattr(qdrant_backup, "RETENTION", 2)
+    monkeypatch.setattr(
+        qdrant_backup,
+        "_download_to",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("connection reset")),
+    )
+
+    for _ in range(3):
+        make_backup(_FakeClient(), "c")
+
+    remaining = sorted(p.name for p in backups_dir.iterdir())
+    assert len(remaining) == 2, remaining
+    assert not (backups_dir / "c-20260100-000000-000000").exists()
+
+
+def test_download_honours_the_timeout(snapshot_server, tmp_path):
+    """A stalled server must not hang a backup forever."""
+    srv = snapshot_server(_tar_bytes())
+    dest = str(tmp_path / "s.snapshot")
+
+    with pytest.raises(TimeoutError):
+        qdrant_backup._download_to(srv.base + "/stall", dest, timeout=0.5)
+
 
 def test_snapshot_creation_failure_is_reported_as_failure(tmp_path):
     client = _FakeClient(raises=RuntimeError("qdrant down"))
@@ -455,6 +496,75 @@ def test_skip_backup_still_deletes(reset_env, monkeypatch, capsys):
     assert rc == 0
 
 
+def test_reset_exits_nonzero_when_qdrant_is_unreachable(reset_env, monkeypatch):
+    """An unreachable Qdrant means the reset did not run; the exit status has to
+    say so, otherwise a wrapper or CI step reads a failure as success."""
+
+    class _Dead:
+        def get_collections(self):
+            raise OSError("connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(reset_index, "QdrantClient", lambda **kw: _Dead())
+
+    assert reset_index.main() == 1
+    assert reset_env == []
+
+
+def test_reset_exits_nonzero_when_the_operator_declines(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["reset_index.py"])
+    monkeypatch.setattr("builtins.input", lambda *a: "no")
+
+    def _boom(*a, **k):
+        raise AssertionError("a declined reset must not touch Qdrant")
+
+    monkeypatch.setattr(reset_index, "QdrantClient", _boom)
+
+    assert reset_index.main() == 1
+
+
+def test_backup_cli_exits_nonzero_when_no_snapshot_landed_on_disk(
+    backups_dir, monkeypatch, capsys
+):
+    """backup_qdrant.py is what cron runs; it must not report success for a
+    backup that wrote no snapshot."""
+    import backup_qdrant
+
+    _write_articles(backups_dir.parent / "data")
+    monkeypatch.setattr(sys, "argv", ["backup_qdrant.py"])
+    monkeypatch.setattr(backup_qdrant, "QdrantClient", lambda **kw: _FakeClient())
+    monkeypatch.setattr(
+        qdrant_backup,
+        "_download_to",
+        lambda *a, **k: (_ for _ in ()).throw(ImportError("No module named 'requests'")),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        backup_qdrant.main()
+
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "backup FAILED" in out
+    assert "backup complete" not in out
+
+
+def test_backup_cli_returns_cleanly_after_a_verified_backup(backups_dir, monkeypatch, capsys):
+    import backup_qdrant
+
+    monkeypatch.setattr(sys, "argv", ["backup_qdrant.py"])
+    monkeypatch.setattr(backup_qdrant, "QdrantClient", lambda **kw: _FakeClient())
+    monkeypatch.setattr(
+        qdrant_backup,
+        "_download_to",
+        lambda url, dest, timeout=None: _write_bytes(dest, _tar_bytes()),
+    )
+
+    assert backup_qdrant.main() is None  # no SystemExit: the script exits 0
+    assert "backup complete" in capsys.readouterr().out
+
+
 # --- the scripts must not need an undeclared dependency ---
 
 
@@ -489,7 +599,6 @@ with tarfile.open(fileobj=buf, mode="w") as tf:
     info = tarfile.TarInfo(name="c/0")
     info.size = 3
     tf.addfile(info, io.BytesIO(b"abc"))
-qdrant_backup._download_to.__module__
 
 # The stdlib download path works with `requests` unimportable.
 import http.server
