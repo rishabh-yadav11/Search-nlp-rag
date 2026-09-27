@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from app import auth
+from app import config as config_module
 from app.auth import AuthStore, DuplicateEmailError, StoredUser, bootstrap_admin
 
 
@@ -660,6 +661,27 @@ def test_client_ip_trust_setting_overrides_the_auto_peer_check(monkeypatch):
     req.client = SimpleNamespace(host="203.0.113.9")
     monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
     assert auth._client_ip(req) == "10.0.0.1"
+
+
+def test_xff_trust_env_parsing_is_three_state(monkeypatch):
+    """'auto' (and an unset var) must resolve to the auto behaviour, so the
+    .env shipped by setup.sh does not force a decision. A forced true/false is
+    honoured, and an unrecognised value falls back to auto rather than
+    silently picking a side."""
+    monkeypatch.delenv("PROBE_FLAG", raising=False)
+    assert config_module._env_tristate("PROBE_FLAG") is None
+    for value in ("auto", "AUTO", "", "  "):
+        monkeypatch.setenv("PROBE_FLAG", value)
+        assert config_module._env_tristate("PROBE_FLAG") is None, value
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("PROBE_FLAG", value)
+        assert config_module._env_tristate("PROBE_FLAG") is True, value
+    for value in ("0", "false", "no", "off"):
+        monkeypatch.setenv("PROBE_FLAG", value)
+        assert config_module._env_tristate("PROBE_FLAG") is False, value
+    # A typo must not resolve to the unsafe (trust-everything) side.
+    monkeypatch.setenv("PROBE_FLAG", "yse")
+    assert config_module._env_tristate("PROBE_FLAG") is None
 
 
 def _promote_to_admin(client, s, email):
