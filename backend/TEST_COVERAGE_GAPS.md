@@ -250,9 +250,11 @@ without a failure.
 - [x] **`_degraded` warn-once** (lines 43-47): only the first failure logs.
 - [x] **`close`** (lines 52-54): `aclose` called, global reset to `None`;
       no-op when no client.
-- [x] **`record_click` with `article_id`** (line 102): per-query per-article
-      `analytics:query_click:{q}` sorted-set tally (repeated clicks stack);
-      without `article_id` the key is never created.
+- [x] **`record_click` with `article_id`**: per-query per-article
+      `analytics:query_click:{q}` sorted-set tally on the canonicalised query
+      (repeated clicks from the *same* client are deduped, see
+      `_claim_click_signal`); without `article_id` the key is never created.
+      Covered by `tests/test_analytics_click_guard.py`.
 - [x] **`click_signals`** (lines 111-129): no raw → None; below
       `CLICK_BOOST_MIN_CLICKS` → None; success dict build (zero-count members
       filtered, `total` = sum of per-article counts). **ERROR PATH —

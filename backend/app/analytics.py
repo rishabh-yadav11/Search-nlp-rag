@@ -108,18 +108,18 @@ def _click_query_key(q: str) -> str:
     return f"analytics:query_click:{_normalise_query(q)}"
 
 
-async def _claim_click_signal(client_ip: str | None, query: str, article_id: int) -> bool:
-    """True the first time ``client_ip`` contributes a click to
-    (query, article_id) within the dedupe window; False for every repeat.
+async def _claim_click_signal(client_ip: str | None, query: str, article_id: int) -> tuple[bool, str | None]:
+    """Whether ``client_ip`` may contribute a click to (query, article_id) now,
+    plus the claim key to release if the tally it unlocks does not land.
 
-    The beacon is anonymous, so the only thing separating a real click from a
-    forged one is where it came from. Counting every beacon verbatim lets a
-    single host cross ``CLICK_BOOST_MIN_ARTICLE_CLICKS`` in a handful of
-    requests and boost an article of its choosing, poisoning the ranking every
-    other user sees. One click per client per (query, article) keeps the signal
-    meaningful -- re-opening the same result carries no new ranking
-    information -- while requiring genuinely distinct clients to reach the
-    threshold.
+    True the first time within the dedupe window, False for every repeat. The
+    beacon is anonymous, so the only thing separating a real click from a forged
+    one is where it came from. Counting every beacon verbatim lets a single host
+    cross ``CLICK_BOOST_MIN_ARTICLE_CLICKS`` in a handful of requests and boost
+    an article of its choosing, poisoning the ranking every other user sees. One
+    click per client per (query, article) keeps the signal meaningful --
+    re-opening the same result carries no new ranking information -- while
+    requiring genuinely distinct clients to reach the threshold.
 
     The claim key is a digest, so no query text or client IP is recoverable
     from it, and it carries a TTL so the dedupe set cannot grow unbounded. Fails
@@ -130,13 +130,26 @@ async def _claim_click_signal(client_ip: str | None, query: str, article_id: int
     if window <= 0 or not client_ip:
         # No window configured, or a caller with no client to attribute the
         # click to: there is nothing to deduplicate against.
-        return True
+        return True, None
     digest = hashlib.sha256(f"{client_ip}\x00{query}\x00{article_id}".encode()).hexdigest()
+    key = f"analytics:click:seen:{digest}"
     try:
-        return bool(await _client().set(f"analytics:click:seen:{digest}", 1, nx=True, ex=window))
+        return bool(await _client().set(key, 1, nx=True, ex=window)), key
     except Exception:
         logger.warning("click-signal dedupe unavailable; dropping ranking signal", exc_info=True)
-        return False
+        return False, None
+
+
+async def _release_click_signal(key: str | None) -> None:
+    """Give a spent claim back when the tally it unlocked never landed, so a
+    transient Redis failure between the claim and the write does not silence a
+    real user's click for the rest of the window. Never raises."""
+    if key is None:
+        return
+    try:
+        await _client().delete(key)
+    except Exception:
+        logger.warning("could not release click-signal claim", exc_info=True)
 
 
 async def record_search(
@@ -196,6 +209,7 @@ async def record_click(
     collection by the caller -- recording an id that is not in the index would
     mint a boost record nothing can ever match.
     """
+    claim_key = None
     try:
         # Defensive: the beacon is unauthenticated, so an attacker could send an
         # arbitrarily long query. Bound it before it becomes a sorted-set member
@@ -230,13 +244,18 @@ async def record_click(
         p.expire("analytics:click_top_queries", config.CLICK_QUERY_TTL_SECONDS)
         if q_article_id is not None:
             qkey = _click_query_key(query)
-            if await _claim_click_signal(client_ip, _normalise_query(query), q_article_id):
+            claimed, claim_key = await _claim_click_signal(client_ip, _normalise_query(query), q_article_id)
+            if claimed:
                 p.zincrby(qkey, 1, str(q_article_id))
                 # Expire the per-query set so distinct-query sets don't accumulate
                 # forever; refreshed on each click.
                 p.expire(qkey, config.CLICK_QUERY_TTL_SECONDS)
         await p.execute()
+        claim_key = None  # the vote landed, so the claim is now genuinely spent
     except Exception as exc:
+        # A claim that unlocked a tally which never landed would otherwise
+        # silence this client for the whole window; give it back.
+        await _release_click_signal(claim_key)
         _degraded(exc)
 
 

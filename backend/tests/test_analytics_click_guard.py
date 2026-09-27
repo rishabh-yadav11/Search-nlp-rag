@@ -59,6 +59,11 @@ class FakeRedis:
         self.counters[key] = value
         return True
 
+    async def delete(self, key):
+        self.nx_keys.discard(key)
+        self.counters.pop(key, None)
+        return 1
+
     async def zrevrange(self, key, start, end, withscores=False):
         self.queried.append(key)
         items = sorted(self.sets.get(key, {}).items(), key=lambda kv: -kv[1])[start : end + 1]
@@ -96,6 +101,19 @@ class BrokenDedupeRedis(FakeRedis):
 
     async def set(self, key, value, nx=False, ex=None):
         raise RuntimeError("redis write failed")
+
+
+class FailingPipelineRedis(FakeRedis):
+    """Redis that accepts the dedupe claim but then fails the write that was
+    supposed to record it, standing in for a failure between the two."""
+
+    def pipeline(self):
+        return _FailingPipeline(self)
+
+
+class _FailingPipeline(_Pipeline):
+    async def execute(self):
+        raise RuntimeError("redis pipeline failed")
 
 
 def _run(coro):
@@ -168,6 +186,7 @@ def test_forged_beacon_burst_does_not_move_ranking(store, index):
     for _ in range(5):
         assert _beacon("ola ipo", 1, 42).status_code == 200
 
+    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0}, "5 beacons, one vote"
     assert _boosted(store) == _results()
     assert index.asked == [[42]] * 5, "the id is looked up in the index on every beacon"
 
@@ -318,10 +337,35 @@ def test_dedupe_claim_keys_carry_a_ttl_and_leak_no_ip_or_query(store, index):
 # --- the beacon is still a public, per-IP rate-limited endpoint ---
 
 
-def test_beacon_remains_public_and_per_ip_rate_limited(store, index):
+def test_beacon_remains_public_and_per_ip_rate_limited(store, index, monkeypatch):
     """No auth header, no cookie, no session: the beacon stays open so anonymous
-    traffic is still measured, and one client cannot flood it."""
-    client = TestClient(main.app, raise_server_exceptions=False)
-    assert client.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 200
-    # No Authorization header was sent and none was demanded.
-    assert client.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 200
+    traffic is still measured. And the per-IP limit still bites -- one client
+    cannot flood it, while a second client is unaffected."""
+    monkeypatch.setattr(config, "PUBLIC_CLICK_RATE_PER_MIN", 2)
+
+    first = _as("10.7.7.7")
+    second = _as("10.7.7.8")
+    for _ in range(2):
+        # No Authorization header was sent and none was demanded.
+        assert first.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 200
+
+    over = first.post("/analytics/click", json={"query": "q", "position": 1})
+    assert over.status_code == 429
+    assert second.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 200
+
+
+def test_a_failed_write_gives_the_click_vote_back(store, index, monkeypatch):
+    """If the write that a claim unlocks never lands, the claim is released, so
+    a transient Redis failure does not silence that user's click for the rest of
+    the dedupe window."""
+    flaky = FailingPipelineRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: flaky)
+
+    assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200
+    assert not flaky.nx_keys, "the claim must not stay spent when the tally failed"
+
+    # The vote is still castable: the same client clicking again records it.
+    healthy = FakeRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: healthy)
+    assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200
+    assert healthy.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
