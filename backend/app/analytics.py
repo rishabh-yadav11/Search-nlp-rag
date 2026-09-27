@@ -214,13 +214,34 @@ async def record_click(
     """
     claim_key = None
     try:
-        # Defensive: the beacon is unauthenticated, so an attacker could send an
-        # arbitrarily long query. Bound it before it becomes a sorted-set member
-        # (unbounded member size = unbounded memory growth). Keep the key stable
-        # by truncating rather than hashing. The human-facing top-queries
-        # aggregate keeps the client's original casing; only the boost key is
-        # canonicalised (see ``_click_query_key``).
-        query = (query or "").strip()[: config.CLICK_QUERY_MAX_LEN]
+        # Two forms of the query, because the two consumers need different things.
+        #
+        # ``canonical`` feeds the click-signal dedupe digest, so every spelling of
+        # one logical query claims the same vote. It must NOT be passed to
+        # ``_click_query_key``: that applies ``_normalise_query`` itself, and
+        # normalising twice is not a no-op -- the length bound can land on a space,
+        # which a second pass strips, so the two results differ. The read path
+        # (``click_signals``) hands a raw query to ``_click_query_key``, so the
+        # write path does too: both keys then come from the same call on the same
+        # input, structurally, rather than from an invariant to be maintained.
+        # (Bounding the raw query first, as this did before, is what made the two
+        # orders disagree for any over-length query containing a whitespace run --
+        # the vote landed on a key the ranking path never reads.)
+        raw_query = query or ""
+        canonical = _normalise_query(raw_query)
+        # KNOWN LIMITATION (pre-existing, #242): /search boosts on the
+        # typo-corrected query (apply_click_boost(q_fixed, ...)), while the beacon
+        # posts the raw one. With no vocab artifact built, fix_query is a
+        # documented no-op and the two agree; an operator who HAS built the
+        # vocab will see typo'd traffic's votes stranded under the raw key. Not
+        # fixed here: it is signal loss, not write amplification, and routing the
+        # beacon through fix_query would put a query-correction dependency (and
+        # its failure modes) in the analytics write path, where a raise costs the
+        # whole click.
+        # The human-facing top-queries aggregate keeps the client's original casing
+        # and is bounded here, because an unauthenticated beacon could otherwise
+        # store an arbitrarily long sorted-set member.
+        query = raw_query.strip()[: config.CLICK_QUERY_MAX_LEN]
         # Clamp position into the valid display range so a poisoned beacon cannot
         # create arbitrary ``analytics:click:pos:{n}`` keys. Position 0 or
         # negative collapses to the first slot; values above the max cap at the
@@ -246,8 +267,8 @@ async def record_click(
         # unauthenticated beacon doesn't accumulate forever; refreshed on each click.
         p.expire("analytics:click_top_queries", config.CLICK_QUERY_TTL_SECONDS)
         if q_article_id is not None:
-            qkey = _click_query_key(query)
-            claimed, claim_key = await _claim_click_signal(client_ip, _normalise_query(query), q_article_id)
+            qkey = _click_query_key(raw_query)
+            claimed, claim_key = await _claim_click_signal(client_ip, canonical, q_article_id)
             if claimed:
                 p.zincrby(qkey, 1, str(q_article_id))
                 # Expire the per-query set so distinct-query sets don't accumulate

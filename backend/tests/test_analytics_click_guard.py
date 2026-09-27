@@ -250,6 +250,39 @@ def test_a_clients_repeat_click_adds_no_second_vote_but_others_still_count(store
     assert store.sets["analytics:query_click:ola ipo"] == {"42": 2.0}
 
 
+def test_raw_click_analytics_are_untouched_by_the_dedupe(store, index):
+    """The dedupe gates the RANKING signal only. Every beacon a client sends is
+    still counted in the raw click analytics exactly as before, so the numbers
+    the product reports do not change."""
+    fired = 8  # every position inside the display range, so no clamping happens
+    for position in range(1, fired + 1):
+        assert _beacon("ola ipo", position, 42, ip="10.5.5.5").status_code == 200
+
+    assert store.counters["analytics:click:total"] == fired
+    # Exact buckets, not a sum: a total alone is blind to WHERE the clicks landed.
+    assert {k: v for k, v in store.counters.items() if k.startswith("analytics:click:pos:")} == {
+        f"analytics:click:pos:{i}": 1 for i in range(1, fired + 1)
+    }
+    assert store.sets["analytics:click_top_queries"] == {"ola ipo": float(fired)}
+    # ...while the ranking vote is one.
+    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+
+
+def test_position_outside_the_display_range_is_clamped_not_a_new_bucket(store, index):
+    """A beacon cannot mint an ``analytics:click:pos:{n}`` key outside the range
+    the summary reads: out-of-range positions collapse onto the first/last
+    tracked slot rather than each creating a new bucket."""
+    for position in (0, -5, 4, 11, 9999):
+        assert _beacon("ola ipo", position, 42, ip="10.5.5.6").status_code == 200
+
+    assert {k: v for k, v in store.counters.items() if k.startswith("analytics:click:pos:")} == {
+        "analytics:click:pos:1": 2,  # 0 and -5
+        "analytics:click:pos:4": 1,
+        "analytics:click:pos:10": 2,  # 11 and 9999
+    }
+    assert store.counters["analytics:click:total"] == 5
+
+
 def test_click_without_an_id_is_still_counted(store, index):
     """A beacon with no id (the frontend may omit it) still records the click."""
     assert _beacon("ola ipo", 3).status_code == 200
@@ -319,6 +352,10 @@ def test_query_spellings_collapse_to_a_single_boost_key(store, index):
     assert [k for k in store.sets if k.startswith("analytics:query_click:")] == [
         "analytics:query_click:ola ipo"
     ]
+    # All five came from ONE client, so the canonicalised claim must collapse
+    # them to a single vote -- a per-spelling claim would let one client buy
+    # five votes just by varying its whitespace and case.
+    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
 
 
 def test_normalisation_is_identical_on_the_read_path(store, index):
@@ -331,6 +368,32 @@ def test_normalisation_is_identical_on_the_read_path(store, index):
     _run(analytics.click_signals("ola ipo"))
 
     assert store.queried == [written]
+
+
+@pytest.mark.parametrize(
+    "label,query",
+    [
+        # Under the cap: the two orders of collapse-then-bound and
+        # bound-then-collapse happen to agree, so this case proves nothing.
+        ("short", "Ola   IPO"),
+        # Over the cap AND containing a whitespace run: bounding the raw string
+        # first throws the tail away, collapsing first keeps it. These two
+        # orders disagree here, which is what stranded the vote.
+        ("long with whitespace run", "a" * 100 + " " * 200 + "b" * 100),
+        ("long trailing run", "a " * 300),
+        ("long unbroken", "x" * 5_000),
+    ],
+)
+def test_a_vote_is_never_written_to_a_key_the_ranking_path_never_reads(store, index, label, query):
+    """The write and the read path must derive the SAME boost key, whatever the
+    query's length and whitespace. A vote stored under any other key is a vote
+    that can never move a ranking."""
+    _beacon(query, 1, 42, ip="10.8.8.8")
+    (written,) = [k for k in store.sets if k.startswith("analytics:query_click:")]
+
+    _run(analytics.click_signals(query))
+
+    assert store.queried == [written], f"read path looked up a different key for {label}"
 
 
 def test_over_long_query_is_stored_bounded_and_expires(store, index):
