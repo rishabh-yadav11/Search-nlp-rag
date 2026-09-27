@@ -1532,6 +1532,81 @@ def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) ->
 
 FACETS_CACHE_KEY = "facets:v1"
 FACETS_LIMIT = 200
+# Scroll page size for a facet scan. The walk ends when the collection is
+# exhausted, not when the cap is hit (the vocabulary is tiny), so the page size
+# -- not FACETS_LIMIT -- is what sets the round-trip count: ceil(M / page) calls
+# per key. 1024 rows of a single keyword payload field is a small response, so a
+# big collection is walked in a quarter of the calls, and the values collected
+# are unchanged: the same offsets are walked and the same set is built.
+FACET_SCROLL_PAGE = 1024
+
+# The in-flight /facets miss. /facets is unauthenticated and the frontend fetches
+# it on every page load, so on a cold cache (first boot, Redis flush, expiry)
+# every caller that arrived while the scan was running used to start its own:
+# `cache.get` then `cache.set` is a check-then-act with nothing covering the gap,
+# and each of those scans walks the whole collection. The first caller starts the
+# task and the rest await that same one, so the scans AND the cache write happen
+# once between all of them. The entry is dropped by the task's own done callback,
+# so a failure or a cancelled request releases it instead of wedging the
+# endpoint, and an entry left behind by a dead loop is replaced, not awaited.
+_facet_scan_task: asyncio.Task | None = None
+
+
+def _release_facet_scan(task: asyncio.Task) -> None:
+    """Drop the in-flight entry once the scan settles.
+
+    Identity-checked, so a scan started after this one keeps its own entry, and
+    the outcome is consumed here: a scan every caller walked away from must not
+    log an unretrieved exception when it is collected.
+    """
+    global _facet_scan_task
+    if _facet_scan_task is task:
+        _facet_scan_task = None
+    if not task.cancelled():
+        task.exception()
+
+
+async def _facets_uncached() -> dict[str, list[str]]:
+    """Both facet vocabularies, scanned concurrently, then cached.
+
+    The two keys are independent, so they are gathered rather than awaited back
+    to back. return_exceptions keeps the sibling outcome retrieved (no orphaned
+    task warning) and stops a late sibling failure from being masked by the first
+    one; the first failure still propagates, and nothing is cached on the way
+    out, so a half-finished scan is never served back as a vocabulary.
+    """
+    industry, dealtype = await asyncio.gather(
+        _facet_values("industry_names"),
+        _facet_values("dealtype_names"),
+        return_exceptions=True,
+    )
+    for outcome in (industry, dealtype):
+        if isinstance(outcome, BaseException):
+            raise outcome
+    result = {"industry": industry, "dealtype": dealtype}
+    await cache.set(FACETS_CACHE_KEY, result)
+    return result
+
+
+async def _facets_single_flight() -> dict[str, list[str]]:
+    """``_facets_uncached`` once, shared by every caller that misses together.
+
+    Waiters await the running task through ``shield``, so a request that goes
+    away (client disconnect, timeout) does not abort the scan the other waiters
+    are still on. The result is shared rather than copied: callers only read it.
+    """
+    global _facet_scan_task
+    running = _facet_scan_task
+    # A task carries its loop and awaiting one from a closed loop raises, so an
+    # entry left over from a dead loop is not reusable. The ASGI app is driven on
+    # a fresh loop per request by the test client, so a scan cut short by a
+    # closed loop is a real shape, not a theoretical one.
+    if running is not None and not running.done() and running.get_loop() is asyncio.get_running_loop():
+        return await asyncio.shield(running)
+    task = asyncio.create_task(_facets_uncached())
+    _facet_scan_task = task
+    task.add_done_callback(_release_facet_scan)
+    return await asyncio.shield(task)
 
 
 async def _facet_values(key: str) -> list[str]:
@@ -1544,6 +1619,10 @@ async def _facet_values(key: str) -> list[str]:
     keyword fields (e.g. industry_names) contribute each element as a distinct
     value.
 
+    The page size is FACET_SCROLL_PAGE rather than a token 256 because the walk
+    runs to the end of the collection: page size is the only lever on round trips
+    that cannot change which values come back.
+
     NOTE: the cap is intentional and is NOT silently dropping data — facet
     vocabularies here are small (well under FACETS_LIMIT); if the cap is ever hit
     a warning is logged so it can be raised deliberately rather than masking a
@@ -1554,7 +1633,7 @@ async def _facet_values(key: str) -> list[str]:
     while len(values) < FACETS_LIMIT:
         pts, next_offset = await state["qdrant"].scroll(
             collection_name=config.QDRANT_COLLECTION,
-            limit=256,
+            limit=FACET_SCROLL_PAGE,
             with_payload=[key],
             with_vectors=False,
             offset=next_offset,
@@ -1586,17 +1665,15 @@ async def _facet_values(key: str) -> list[str]:
 )
 async def facets():
     """Distinct industry_names and dealtype_names values across the collection,
-    used for filter autocomplete. Cached in Redis (small controlled vocab)."""
+    used for filter autocomplete. Cached in Redis (small controlled vocab).
+
+    A miss is single-flight: one pair of scans and one cache write shared by all
+    the callers that miss together, instead of one full-collection walk each.
+    """
     cached = await cache.get(FACETS_CACHE_KEY)
     if cached is not None:
         return cached
-
-    result = {
-        "industry": await _facet_values("industry_names"),
-        "dealtype": await _facet_values("dealtype_names"),
-    }
-    await cache.set(FACETS_CACHE_KEY, result)
-    return result
+    return await _facets_single_flight()
 
 
 class ClickEvent(BaseModel):
