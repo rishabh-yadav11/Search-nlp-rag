@@ -135,6 +135,23 @@ class _FakeReranker:
         return self.logits
 
 
+
+class _RecordingReranker:
+    """Reranker fake that keeps the exact (query, document) pairs it was handed,
+    so a test can assert both how many candidates entered the second pass and
+    which ones they were -- not merely that predict() was called once."""
+
+    def __init__(self, logits):
+        self.logits = logits
+        self.calls = 0
+        self.pairs = []
+
+    def predict(self, pairs):
+        self.calls += 1
+        self.pairs = list(pairs)
+        return self.logits
+
+
 class _FakeFacetClient:
     def __init__(self, result):
         self.result = result
@@ -405,6 +422,59 @@ def test_body_rescue_reranker_error_propagates(monkeypatch):
         _run(main.body_rescue("funding deals", [a]))
 
 
+def test_body_rescue_makes_no_second_pass_when_gate_is_off(monkeypatch):
+    """The gate has to live in body_rescue itself, because body_rescue is what
+    pays for the second cross-encoder pass. With ENABLE_BODY_RESCUE off, weak
+    results that do have bodies must never reach the reranker -- otherwise a
+    caller that forgets the check silently pays the cost again."""
+    monkeypatch.setattr(main.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.2)
+    fake = _RecordingReranker([9.0])
+    monkeypatch.setitem(main.state, "reranker", fake)
+    arts = [
+        _article(1, 0.1, body="funding deals round " * 20),
+        _article(2, 0.05, body="funding deals round " * 20),
+    ]
+    out = _run(main.body_rescue("funding deals", arts))
+    assert fake.calls == 0
+    assert fake.pairs == []
+    assert [a.score for a in out] == [0.1, 0.05]
+
+
+def test_body_rescue_caps_candidates_entering_the_second_pass(monkeypatch):
+    """The rescue costs one cross-encoder prediction per candidate, so chat
+    handing it CHAT_MAX_SOURCES articles must not mean 20 predictions under
+    the global inference lock."""
+    monkeypatch.setattr(main.config, "ENABLE_BODY_RESCUE", True)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.2)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_MAX_CANDIDATES", 3)
+    fake = _RecordingReranker([5.0] * 9)
+    monkeypatch.setitem(main.state, "reranker", fake)
+    arts = [_article(i, 0.1, body="funding deals round " * 20) for i in range(1, 10)]
+    _run(main.body_rescue("funding deals", arts))
+    assert fake.calls == 1
+    assert len(fake.pairs) == 3
+
+
+def test_body_rescue_shortlists_by_body_overlap_not_by_score(monkeypatch):
+    """A weak title+summary score is precisely the reason the rescue exists:
+    the article worth rescoring is the one whose match lives in the body. So
+    the limited budget goes to the highest body-window overlap -- not to the
+    top scorer, and not to the first articles in list order (the buried match
+    here is second)."""
+    monkeypatch.setattr(main.config, "ENABLE_BODY_RESCUE", True)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.95)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_MAX_CANDIDATES", 1)
+    fake = _RecordingReranker([5.0, 5.0])
+    monkeypatch.setitem(main.state, "reranker", fake)
+    top_scored = _article(1, 0.9, title="Strong on title", body="weather and markets " * 100)
+    buried = _article(2, 0.05, title="Buried match", body="lessons 2008 crisis central banks " * 40)
+    _run(main.body_rescue("lessons 2008 crisis central banks", [top_scored, buried]))
+    assert len(fake.pairs) == 1
+    assert "Buried match" in fake.pairs[0][1]
+    assert "Strong on title" not in fake.pairs[0][1]
+
+
 # --- _attach_bodies ---
 
 
@@ -619,6 +689,127 @@ def test_best_body_window_tail_wins_on_tie():
     tokens = {"alpha", "beta", "gamma"}
     out = main._best_body_window(body, tokens, 50, 50)
     assert out == body[-50:]
+
+
+# --- _best_body_window window budget ---
+
+
+def test_effective_step_leaves_the_default_scan_alone():
+    """The default scan must be bit-for-bit unchanged by the budget.
+
+    A full 50,000-char body at win=1500/step=500 is 98 window starts,
+    comfortably inside the default budget of 200, so no operator upgrading
+    this branch sees a different body scan.
+    """
+    positions = 50_000 - 1500 + 1
+    assert main._effective_step(positions, 500, 200) == 500
+    assert -(-positions // main._effective_step(positions, 500, 200)) == 98
+
+
+def test_effective_step_widens_a_legal_but_expensive_stride():
+    """Clamping BODY_RESCUE_STEP alone does not bound the work: step=1 is
+    inside the clamp and still scores 48,501 windows of a 50K body (~117ms,
+    and body_rescue scans every body-bearing article before the candidate cap
+    applies, so 20 articles cost ~2.3s for one chat turn).
+    """
+    positions = 49_700 - 1500 + 1
+    widened = main._effective_step(positions, 1, 200)
+    assert widened > 1
+    assert -(-positions // widened) <= 200
+
+
+def test_effective_step_never_returns_a_zero_stride():
+    """`range(0, n, 0)` raises ValueError. The config clamp already rejects 0,
+    but `_best_body_window` is module-level and directly callable, so it must
+    not depend on every caller having gone through config."""
+    # A zero step is floored to 1 and then still widened to fit the budget;
+    # what matters is that the returned stride is always usable by range().
+    widened = main._effective_step(1000, 0, 200)
+    assert widened >= 1
+    assert -(-1000 // widened) <= 200
+    # A non-positive budget disables widening rather than producing stride 0.
+    assert main._effective_step(1000, 0, 0) == 1
+    out = main._best_body_window("filler " * 3000, {"alpha"}, 1500, 0)
+    assert isinstance(out, str) and out
+
+
+def test_best_body_window_finds_dense_region_at_the_default_budget():
+    """The budget must be free at any value that does not force a widening.
+
+    This is the case operators actually run: win=1500/step=500 over this body
+    is 98 windows against a budget of 200, so the stride never moves and the
+    dense region is still found.
+    """
+    body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
+    out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 500, max_windows=200)
+    low = out.lower()
+    assert "alpha" in low and "gamma" in low
+
+
+def test_best_body_window_a_tight_budget_can_straddle_the_dense_region():
+    """The trade-off, stated rather than papered over: a stride coarse enough
+    to widen can skip a token-dense region. That is the cost of capping the
+    work, and it is only reachable when a budget tighter than the chosen
+    stride needs is configured -- the default budget never widens.
+
+    A budget of 1 forces the single window at start=0, so the result is
+    deterministically `body[:1500]` and cannot depend on window arithmetic.
+    """
+    body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
+    out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1, max_windows=1)
+    assert out == body[:1500]
+    # The same call with no budget scans everything and finds the region,
+    # which is exactly what the budget gives up.
+    unbudgeted = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1)
+    assert "alpha" in unbudgeted.lower()
+
+
+class _IterationCountingTokens(set):
+    """A token set that records how many times the scan loop iterated it.
+
+    `_best_body_window` scores each window with `sum(1 for t in tokens ...)`,
+    so the number of times the set is iterated is the number of windows scored
+    (plus the single tail comparison the helper always makes). This observes
+    the real loop through `_best_body_window` itself, which is the only place
+    the budget is actually applied.
+    """
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+    def windows_scored(self):
+        return self.iterations - 1
+
+
+def test_best_body_window_applies_the_window_budget():
+    """The budget must be enforced by `_best_body_window`, not merely be
+    available on `_effective_step`.
+
+    Asserting only the helper leaves the single line that applies it
+    (`step = _effective_step(...)`) uncovered: deleting that line leaves the
+    whole suite green while the DoS bound silently disappears.
+    """
+    body = "filler " * 7100  # 49,700 chars
+    tokens = _IterationCountingTokens({"alpha", "beta", "gamma"})
+    main._best_body_window(body, tokens, 1500, 1, max_windows=200)
+    # Unbudgeted, step=1 would score 48,201 windows.
+    assert tokens.windows_scored() <= 200, tokens.windows_scored()
+
+
+def test_best_body_window_does_not_widen_a_default_scan():
+    """The default scan already fits the budget, so the stride must not move
+    and the default rescue must score exactly the same windows as before."""
+    body = "filler " * 7100
+    tokens = _IterationCountingTokens({"alpha", "beta", "gamma"})
+    main._best_body_window(body, tokens, 1500, 500, max_windows=200)
+    assert tokens.windows_scored() == 97  # ceil(48201 / 500)
+
+
 
 
 # --- lifespan ---

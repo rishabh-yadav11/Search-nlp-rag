@@ -127,7 +127,7 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 
 | Param       | Type   | Required | Default | Notes |
 |-------------|--------|----------|---------|-------|
-| `q`         | string | yes      | —       | Free-text query (min 1 char) |
+| `q`         | string | yes      | —       | Free-text query (`1..512` chars, `SEARCH_QUERY_MAX_CHARS`; longer → `422`) |
 | `top_k`     | int    | no       | `8`     | Result count, `1..50` |
 | `industry`  | string | no       | —       | Comma-separated industry values (filter) |
 | `dealtype`  | string | no       | —       | Comma-separated deal-type values (filter) |
