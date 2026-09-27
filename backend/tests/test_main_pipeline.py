@@ -1228,8 +1228,9 @@ _STUBBORN_MAX_SECONDS = 2.0
 
 
 class _IgnoresCancellation:
-    """A background task that swallows CancelledError and keeps running: the
-    in-process shape of a teardown step stuck on a socket that never answers.
+    """A real asyncio.Task whose coroutine swallows CancelledError and keeps
+    running: the in-process shape of a teardown step stuck on a socket that
+    never answers.
 
     This is the one hang ``asyncio.wait_for`` does not save you from -- it
     waits for the cancellation to land before returning, so a task that refuses
@@ -1241,13 +1242,20 @@ class _IgnoresCancellation:
         self._task = None
 
     async def start(self):
-        # Started and yielded to, so the coroutine is genuinely inside its
-        # sleep loop before teardown cancels it. A task cancelled before its
-        # first step never runs at all, which would make this fixture a no-op
-        # and the hang case silently vacuous.
+        """Return the Task itself -- the one placed in main.state.
+
+        A wrapper object would not do: ``_cancel_and_wait`` hands the value
+        straight to ``asyncio.wait``, which needs a real Task/Future and
+        raises AttributeError on anything else. That raise is swallowed by the
+        step guard, so a wrapper silently turned the hang case into a copy of
+        the raise case while still going green.
+        """
         self._task = asyncio.get_running_loop().create_task(self._run())
+        # Yielded to, so the coroutine is genuinely inside its sleep loop
+        # before teardown cancels it. A task cancelled before its first step
+        # never runs at all, which would make this fixture a no-op.
         await asyncio.sleep(0)
-        return self
+        return self._task
 
     async def _run(self):
         # Sliced sleeps, not one long one: the deadline has to be re-checked
@@ -1262,9 +1270,6 @@ class _IgnoresCancellation:
             except asyncio.CancelledError:
                 continue
 
-    def cancel(self):
-        self._task.cancel()
-
     async def aclose(self):
         """Force it to stop, on the loop that created it (a task awaited from a
         second asyncio.run() belongs to a closed loop and raises)."""
@@ -1273,12 +1278,13 @@ class _IgnoresCancellation:
         assert self._task in done, "stubborn task outlived its own deadline"
 
 
-class _CancelExplodes:
+async def _cancel_explodes():
     """A background task whose cancel() itself raises, killing the teardown step
     that owns it before it can await anything."""
-
-    def cancel(self):
-        raise RuntimeError("cancel exploded")
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        raise RuntimeError("cancel exploded") from None
 
 
 def _record_teardown(monkeypatch, deps, released, faults):
@@ -1291,6 +1297,7 @@ def _record_teardown(monkeypatch, deps, released, faults):
     makes the ordering assertions below meaningful.
     """
     holdouts = []
+    exploding = []
 
     async def _nothing():
         return None
@@ -1338,10 +1345,20 @@ def _record_teardown(monkeypatch, deps, released, faults):
             await asyncio.gather(original, return_exceptions=True)
 
             if faults.get(name) == "hang":
-                replacement = await _IgnoresCancellation().start()
-                holdouts.append(replacement)
+                holdout = _IgnoresCancellation()
+                replacement = await holdout.start()
+                holdouts.append(holdout)
             elif faults.get(name) == "raise":
-                replacement = _CancelExplodes()
+                # A real Task whose cancel() raises, for the same reason: the
+                # value in main.state is handed to asyncio.wait. Retrieved
+                # below so the raise does not surface as an unretrieved-task
+                # error when the loop closes.
+                replacement = asyncio.get_running_loop().create_task(_cancel_explodes())
+                exploding.append(replacement)
+                # Started, so teardown's cancel() actually reaches it: a task
+                # cancelled before its first step never runs, which would make
+                # this a clean release instead of the raise under test.
+                await asyncio.sleep(0)
             else:
 
                 async def _loop(name=name):
@@ -1357,7 +1374,7 @@ def _record_teardown(monkeypatch, deps, released, faults):
                 await asyncio.sleep(0)
             main.state[state_key] = replacement
 
-    return install_task_recorders, holdouts
+    return install_task_recorders, holdouts, exploding
 
 
 def test_lifespan_teardown_releases_every_resource_in_order(monkeypatch):
@@ -1375,7 +1392,7 @@ def test_lifespan_teardown_releases_every_resource_in_order(monkeypatch):
 
     async def scenario():
         async with main.lifespan(None):
-            install, holdouts = _record_teardown(monkeypatch, deps, released, {})
+            install, holdouts, _exploding = _record_teardown(monkeypatch, deps, released, {})
             await install()
         for holdout in holdouts:
             await holdout.aclose()
@@ -1410,17 +1427,24 @@ def test_lifespan_teardown_survives_a_broken_step(monkeypatch, caplog, faulty, k
 
     async def scenario():
         holdouts = []
+        exploding = []
         try:
             async with main.lifespan(None):
-                install, _h = _record_teardown(monkeypatch, deps, released, {faulty: kind})
+                install, _h, exploding = _record_teardown(monkeypatch, deps, released, {faulty: kind})
                 holdouts.extend(_h)
                 await install()
         finally:
-            # Same loop as the task's creator, and unconditional: leaving an
+            # Same loop as the tasks' creator, and unconditional: leaving an
             # immortal pending task behind would stall asyncio.run()'s own
             # shutdown and hang the suite rather than fail this test.
             for holdout in holdouts:
                 await holdout.aclose()
+            # Retrieve the raises, so they are not reported a second time as
+            # unretrieved task exceptions when the loop closes.
+            for task in exploding:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*exploding, return_exceptions=True)
 
     # Ten steps at 0.05s cannot approach this. It exists so that a genuinely
     # unbounded step fails here instead of hanging the run.
@@ -1435,3 +1459,11 @@ def test_lifespan_teardown_survives_a_broken_step(monkeypatch, caplog, faulty, k
     assert tuple(released) == tuple(step for step in _TEARDOWN_STEPS if step != faulty)
     # The operator can tell which resource leaked, without a debugger.
     assert faulty in caplog.text
+    if kind == "hang" and faulty in _TASK_STEPS:
+        # A hanging background task is abandoned by the inner asyncio.wait
+        # budget inside _cancel_and_wait. If that budget were ever loosened
+        # past the outer one, the outer wait_for would cancel the step first
+        # instead -- and since CancelledError is a BaseException the step
+        # guard does not swallow, every later step would be skipped with no
+        # warning at all. This pins which bound actually fired.
+        assert "ignored cancellation" in caplog.text

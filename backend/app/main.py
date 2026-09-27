@@ -366,7 +366,7 @@ async def _cancel_and_wait(resource_name: str, task: asyncio.Task) -> None:
     reason verified against this interpreter: a task that swallows its
     ``CancelledError`` never completes, and ``wait_for`` -- which waits for
     the cancellation to land before returning -- then blocks forever instead
-    of timing out. ``asyncio.wait`` returns with the task merely *pending``
+    of timing out. ``asyncio.wait`` returns with the task merely *pending*
     once the timeout expires, so a loop that refuses to die delays only this
     one step and every later resource is still released.
 
@@ -382,6 +382,13 @@ async def _cancel_and_wait(resource_name: str, task: asyncio.Task) -> None:
     done, _pending = await asyncio.wait({task}, timeout=_TEARDOWN_CLOSE_TIMEOUT / 2)
     if not done:
         logger.warning("Background task for %s ignored cancellation; abandoning it", resource_name)
+    elif not task.cancelled() and (exc := task.exception()) is not None:
+        # asyncio.wait does not re-raise, so a background loop that died with
+        # an exception would otherwise disappear silently: this is the only
+        # trace that a retention or purge loop failed on its way out. A task
+        # that unwound normally is cancelled() and its .exception() would
+        # raise, so it is excluded first.
+        logger.warning("Background task for %s failed during shutdown", resource_name, exc_info=exc)
 
 
 app = FastAPI(
