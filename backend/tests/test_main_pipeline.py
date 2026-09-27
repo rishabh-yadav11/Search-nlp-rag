@@ -148,6 +148,29 @@ def _with_facet(qdrant: _FakeQdrant, pages):
     return qdrant
 
 
+class _PagingQdrant:
+    """Serves a real point list, one ``limit``-sized page per scroll call.
+
+    Records every call, so a test can count round trips and measure how many
+    points the walk actually consumed.
+    """
+
+    def __init__(self, pts):
+        self.pts = pts
+        self.calls: list[dict] = []
+
+    async def scroll(self, **kwargs):
+        self.calls.append(kwargs)
+        start = kwargs["offset"] or 0
+        page = self.pts[start : start + kwargs["limit"]]
+        nxt = start + len(page)
+        return page, (nxt if nxt < len(self.pts) else None)
+
+    def points_served(self) -> int:
+        """How many points the recorded calls returned, in total."""
+        return sum(len(self.pts[c["offset"] or 0 : (c["offset"] or 0) + c["limit"]]) for c in self.calls)
+
+
 # --- _embed_sparse ---
 
 
@@ -850,26 +873,6 @@ def test_facet_values_match_a_full_scan_of_a_multi_page_collection(monkeypatch):
     points = [_Point(i, {"industry_names": [f"Industry {i % 40}"]}) for i in range(5000)]
     points.append(_Point(5000, {"industry_names": ["Tail Only"]}))
 
-    class _PagingQdrant:
-        """Serves a real point list, one ``limit``-sized page per scroll call."""
-
-        def __init__(self, pts):
-            self.pts = pts
-            self.calls: list[dict] = []
-
-        async def scroll(self, **kwargs):
-            self.calls.append(kwargs)
-            start = kwargs["offset"] or 0
-            page = self.pts[start : start + kwargs["limit"]]
-            nxt = start + len(page)
-            return page, (nxt if nxt < len(self.pts) else None)
-
-    def _served_pages(qdrant) -> int:
-        """How many points the recorded calls actually returned, in total."""
-        return sum(
-            len(qdrant.pts[c["offset"] or 0 : (c["offset"] or 0) + c["limit"]]) for c in qdrant.calls
-        )
-
     qdrant = _PagingQdrant(points)
     monkeypatch.setitem(main.state, "qdrant", qdrant)
 
@@ -883,7 +886,7 @@ def test_facet_values_match_a_full_scan_of_a_multi_page_collection(monkeypatch):
     # Every point is read exactly once, at the shipped page size.
     assert len(qdrant.calls) == math.ceil(len(points) / main.FACET_SCROLL_PAGE)
     assert all(c["limit"] == main.FACET_SCROLL_PAGE for c in qdrant.calls)
-    assert _served_pages(qdrant) == len(points)
+    assert qdrant.points_served() == len(points)
     round_trips = len(qdrant.calls)
 
     old = _PagingQdrant(points)
@@ -892,7 +895,45 @@ def test_facet_values_match_a_full_scan_of_a_multi_page_collection(monkeypatch):
 
     assert _run(main._facet_values("industry_names")) == out
     assert len(old.calls) > round_trips
-    assert _served_pages(old) == len(points)
+    assert old.points_served() == len(points)
+
+
+def test_facet_values_are_the_same_at_both_page_sizes_when_the_cap_trips(monkeypatch):
+    """The page size must not move the payload even when the cap truncates.
+
+    The cap is checked every FACET_CAP_CHECK_EVERY points CONSUMED, not once per
+    page, so a truncated walk stops at the same place in the collection's scroll
+    order at either page size. If the check were per page, the 1024-point page
+    would read four times as many points before checking and would return a
+    different 200 values -- a silent change to what /facets serves.
+
+    Every point here carries a distinct value and the values are not in point
+    order, so any shift in where the walk stops changes the answer.
+    """
+    points = [_Point(i, {"industry_names": [f"V{(i * 7) % 1024:04d}"]}) for i in range(1024)]
+
+    # The independent reference: the cap is reached within the first
+    # FACET_CAP_CHECK_EVERY points (all distinct), so the walk consumes exactly
+    # that many and the answer is the smallest FACETS_LIMIT of them.
+    consumed = main.FACET_CAP_CHECK_EVERY
+    reference = sorted({p.payload["industry_names"][0] for p in points[:consumed]})[: main.FACETS_LIMIT]
+    assert len(reference) == main.FACETS_LIMIT
+
+    qdrant = _PagingQdrant(points)
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+    at_shipped = _run(main._facet_values("industry_names"))
+
+    assert at_shipped == reference
+
+    old = _PagingQdrant(points)
+    monkeypatch.setitem(main.state, "qdrant", old)
+    monkeypatch.setattr(main, "FACET_SCROLL_PAGE", 256)
+
+    assert _run(main._facet_values("industry_names")) == reference
+    # The shipped page size reads the same points in one round trip instead of
+    # one round trip per 256 of them.
+    assert len(qdrant.calls) == 1
+    assert len(old.calls) == consumed // 256
 
 
 # --- _best_body_window tail branch ---
