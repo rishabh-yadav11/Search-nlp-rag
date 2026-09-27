@@ -273,10 +273,11 @@ async def _load_facet_maps() -> None:
             _CONTENT_TYPE_FACETS = facets
 
 
-# Per-resource budget for a lifespan teardown step. The same 2s the readiness
-# probe gives its own client release, applied to all ten of them: uvicorn's
-# graceful-shutdown budget is 30s, so a step stuck on a dead socket is
-# cancelled rather than allowed to eat the whole window.
+# Per-resource budget for one lifespan teardown step: the same 2s the readiness
+# probe gives its own client release. Worst case all ten steps time out, for
+# 20s of the 30s gunicorn graceful_timeout (the deploy's `--timeout 120` is
+# the worker-alive limit, a different knob), so a step stuck on a dead socket
+# costs a bounded slice of the window instead of all of it.
 _TEARDOWN_CLOSE_TIMEOUT = DEFAULT_CLOSE_TIMEOUT
 
 
