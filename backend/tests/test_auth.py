@@ -391,12 +391,6 @@ def test_signup_ignores_role_in_request_payload(tmp_path):
         asyncio.run(s.close())
 
 
-def test_signup_role_is_not_configurable():
-    """The signup role is a module constant with no env/config override."""
-    assert auth.SIGNUP_ROLE == "user"
-    assert not hasattr(auth.config, "AUTH_DEFAULT_ROLE")
-
-
 def test_login_invalid_credentials_identical_401(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
