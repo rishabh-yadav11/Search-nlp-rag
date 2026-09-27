@@ -42,6 +42,11 @@ if [ "$code" = "200" ]; then
 fi
 
 log "backend unhealthy (HTTP $code); restarting $APP"
+# NOTE: this replays the argv pm2 stored at start time — `--update-env`
+# refreshes environment variables, not the argument list. It is correct for
+# recovering a sick process, but it can NEVER apply a change to the process
+# options. Changing the API bind or any other pm2 option requires
+# `./setup.sh services`, which re-registers the process and re-saves the dump.
 pm2 restart "$APP" --update-env >/dev/null 2>&1 || true
 
 sleep 8
