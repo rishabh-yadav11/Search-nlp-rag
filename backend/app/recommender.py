@@ -263,7 +263,9 @@ async def get_personalized_recommendations(
                 # carries no limit and returns the cached depth verbatim, so the
                 # depth this leg gets is decided by whichever caller warmed that
                 # key, not by what was asked for. Widening it here would buy no
-                # reliable recall and would multiply the scroll below by 5.
+                # reliable recall, and the scroll below fetches len(ids) * 5
+                # rows, so the extra ids multiply the Qdrant reads by
+                # pool/limit rather than by a constant.
                 trending = await get_trending_articles(limit)
                 if not trending:
                     return []

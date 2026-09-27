@@ -15,6 +15,11 @@ attribute name out of a string and passes it to ``getattr``).
 To keep a knob that is deliberately inert, add it to INTENTIONALLY_INERT with a
 reason. The reason is required: an allowlist entry with no explanation is just
 the bug again, one level up.
+
+What it does NOT check, deliberately: a knob's *value* (a getenv whose name
+drifted from the attribute, or a hardcoded literal replacing it, is invisible
+here) and the effect a knob has. Proving "changing this changes behaviour" is
+the job of a behavioural test beside the code that reads the knob.
 """
 import ast
 import re
@@ -72,7 +77,9 @@ def _source_files() -> list[Path]:
         path
         for root in ("app", "scripts")
         for path in (BACKEND / root).rglob("*.py")
-        if not _SKIP_DIRS.intersection(path.parts)
+        # Relative parts only: a checkout that happens to live under a
+        # ~/build or /srv/data ancestor must still be scanned.
+        if not _SKIP_DIRS.intersection(path.relative_to(BACKEND).parts)
         and path.resolve() not in (CONFIG_PY.resolve(), THIS_FILE)
     ]
     assert files, "no python files found -- the scan is not looking anywhere"
