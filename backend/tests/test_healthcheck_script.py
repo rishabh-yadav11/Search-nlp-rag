@@ -17,6 +17,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy/healthcheck.sh"
 
 # Both doubles live in $HOME/.local/bin, which the script puts first on PATH
@@ -61,6 +63,7 @@ class WatchdogRun:
     def __init__(self, proc, home, curl_log, pm2_log, log):
         self.returncode = proc.returncode
         self.stdout = proc.stdout
+        self.stderr = proc.stderr
         self.curl_log = curl_log
         self.pm2_log = pm2_log
         self.log = log
@@ -327,3 +330,84 @@ def test_a_healthy_backend_never_uses_the_webhook(tmp_path):
 
     assert healthy.returncode == 0
     assert healthy.webhooks == []
+
+
+# --- the state file is a cache, never a gate -------------------------------
+#
+# Suppressing a repeat alert is only safe if the state can never be the reason
+# an alert is lost. Both of these were patch-introduced and both are worse than
+# a noisy watchdog: a clock that moved backwards silenced the alert for longer
+# than the configured cooldown, and a corrupt stamp aborted the run from inside
+# alert() under `set -u` -- before log, before the webhook, before the alert.
+
+
+def _state(text, tmp_path):
+    state = tmp_path / "state"
+    state.write_text(text)
+    return state
+
+
+def test_a_future_timestamp_does_not_suppress_the_alert(tmp_path):
+    """An ntp/DST slip or a copied state file leaves a stamp ahead of us. That is
+    not a cooldown, so it must not silence a real outage -- the previous
+    arithmetic even reported suppressing for LONGER than the cooldown."""
+    state = _state("live-not-ready:503 4102444800\n", tmp_path)  # 2100-01-01
+
+    run = run_watchdog(tmp_path, health="200", ready="503", state_file=state, cooldown="3600")
+
+    assert "ALERT" in run.stdout
+    assert "suppressed" not in run.log
+    assert run.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    ["live-not-ready:503 notanumber\n", "live-not-ready:503\n", "live-not-ready:503 -5\n", "live-not-ready:503 12.5\n"],
+    ids=["word", "empty-stamp", "negative", "decimal"],
+)
+def test_a_corrupt_state_file_cannot_silence_the_alert(tmp_path, corrupt):
+    """A non-numeric stamp expanded unquoted aborts the run under `set -u` from
+    inside alert(), which killed the watchdog with no log line, no webhook and
+    no alert. Anything that is not a plain non-negative integer means "never
+    alerted"."""
+    state = _state(corrupt, tmp_path)
+
+    run = run_watchdog(tmp_path, health="200", ready="503", state_file=state, webhook="https://hooks.example/x")
+
+    assert run.returncode == 1
+    assert "ALERT" in run.stdout, "a corrupt state file must not swallow the alert"
+    assert "unbound variable" not in run.stdout + run.stderr
+    assert len(run.webhooks) == 1
+    written = state.read_text().split()
+    assert len(written) == 2 and written[1].isdigit(), f"the state was not rewritten with a numeric stamp: {written!r}"
+
+
+def test_an_empty_state_file_is_treated_as_never_alerted(tmp_path):
+    """A torn write leaves an empty file (now also prevented by the atomic
+    write, but an operator can truncate one by hand)."""
+    state = _state("", tmp_path)
+
+    run = run_watchdog(tmp_path, health="200", ready="503", state_file=state)
+
+    assert "ALERT" in run.stdout
+    assert run.returncode == 1
+
+
+def test_a_state_write_failure_still_alerts(tmp_path):
+    """The state is a cache. Losing it must cost a duplicate alert at worst, not
+    a silent one: the state file is made undirectory-uncopyable by pointing it
+    at a path that cannot be created."""
+    run = run_watchdog(
+        tmp_path,
+        health="200",
+        ready="503",
+        state_file=tmp_path / "state" / "nested" / "state",
+        webhook="https://hooks.example/x",
+    )
+
+    assert "ALERT" in run.stdout, "a state write failure must not swallow the alert"
+    assert run.returncode == 1
+    assert len(run.webhooks) == 1
+    # The operator is told deduplication is now broken, rather than the next
+    # run silently re-alerting (or, worse, silently not).
+    assert "will not be deduplicated" in run.log

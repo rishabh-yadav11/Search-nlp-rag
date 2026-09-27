@@ -447,3 +447,140 @@ def test_a_failed_gate_says_so_even_when_the_probe_returns_no_body(tmp_path):
 
     assert "no report body" in proc.stderr
     assert "not ready after" in proc.stderr
+
+
+# --- run_cron must converge on one healthcheck entry (P1) --------------------
+#
+# `run_cron` reconciles the crontab by removing the lines it manages and
+# re-adding its own. When the managed healthcheck line's TEXT changed -- as it
+# did when BASE= was added -- a `grep -vFx` (whole-line) filter stops matching
+# the entry a previous revision wrote, so the stale copy survives every run. On
+# a host with a non-default API_PORT that stale copy carries no BASE=, falls
+# back to the watchdog's :8001 default, gets a refused connection and is read as
+# "not alive": `pm2 restart vccircle-backend` every five minutes against a
+# perfectly healthy backend. run_cron is EXECUTED here against a seeded crontab
+# and a stub `crontab`, so that is caught rather than reasoned about.
+
+CRONTAB_STUB = """\
+#!/usr/bin/env bash
+# `crontab -l` prints; `crontab <file>` installs. Never the real binary.
+if [ "$1" = "-l" ]; then
+    [ -f "$CRONTAB_FILE" ] || exit 1
+    cat "$CRONTAB_FILE"
+    exit 0
+fi
+cp "$1" "$CRONTAB_FILE"
+exit 0
+"""
+
+INDEXER_PATH_MARKER = "update_index.py"
+
+
+def _hc_entries(crontab_text):
+    return [line for line in crontab_text.splitlines() if "deploy/healthcheck.sh" in line]
+
+
+def _indexer_entries(crontab_text):
+    return [line for line in crontab_text.splitlines() if INDEXER_PATH_MARKER in line]
+
+
+def run_cron(tmp_path, seeded_lines, api_port="9001", runs=1):
+    """Run the real run_cron `runs` times against a seeded crontab."""
+    home = tmp_path / "host"
+    (home / "logs").mkdir(parents=True)
+    (home / "bin").mkdir()
+    crontab_file = tmp_path / "crontab.txt"
+    crontab_file.write_text("".join(line + "\n" for line in seeded_lines))
+    stub = home / "bin" / "crontab"
+    stub.write_text(CRONTAB_STUB)
+    stub.chmod(0o755)
+
+    script_dir = home / "app"
+    (script_dir / "deploy").mkdir(parents=True)
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            f"cd {home}",
+            f"LOGS={home}/logs; SCRIPT_DIR={script_dir}; API_PORT={api_port}",
+            f'VENV_PY={home}/bin/python',
+            "stage() { :; }",
+            _extract_function("run_cron"),
+            "\n".join(["run_cron"] * runs),
+        ]
+    )
+    proc = subprocess.run(
+        ["bash", "-c", harness],
+        env={**os.environ, "PATH": f"{home}/bin:{os.environ['PATH']}", "CRONTAB_FILE": str(crontab_file)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    return proc, crontab_file.read_text()
+
+
+def _previous_revision_entry(script_dir, log, api_port="9001"):
+    """The entry main's run_cron writes: same script, NO BASE=. This is the
+    literal that a whole-line filter can no longer match."""
+    return f'*/5 * * * * HEALTHCHECK_WEBHOOK_URL="" LOG={log} {script_dir}/deploy/healthcheck.sh'
+
+
+def test_run_cron_removes_the_entry_a_previous_revision_wrote(tmp_path):
+    """The P1: a stale entry that carries no BASE= would probe :8001 and restart
+    a healthy backend every five minutes. It must be gone, not merely joined by
+    a second copy."""
+    log = tmp_path / "healthcheck.log"
+    script_dir = tmp_path / "host" / "app"
+    proc, crontab = run_cron(
+        tmp_path,
+        seeded_lines=[_previous_revision_entry(script_dir, log)],
+        api_port="9001",
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    entries = _hc_entries(crontab)
+    assert len(entries) == 1, f"expected convergence to one entry, got {entries}"
+    assert 'BASE="http://localhost:9001"' in entries[0], entries[0]
+
+
+def test_run_cron_is_idempotent(tmp_path):
+    proc, crontab = run_cron(tmp_path, seeded_lines=[], api_port="9001", runs=3)
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(_hc_entries(crontab)) == 1
+    assert len(_indexer_entries(crontab)) == 1
+
+
+def test_run_cron_removes_a_duplicate_healthcheck_entry(tmp_path):
+    """Two stale copies and a current one must all collapse to one."""
+    log = tmp_path / "healthcheck.log"
+    script_dir = tmp_path / "host" / "app"
+    current = f'*/5 * * * * BASE="http://localhost:9001" HEALTHCHECK_WEBHOOK_URL="" LOG={log} {script_dir}/deploy/healthcheck.sh'
+    _proc, crontab = run_cron(
+        tmp_path,
+        seeded_lines=[_previous_revision_entry(script_dir, log), current],
+        api_port="9001",
+    )
+
+    assert len(_hc_entries(crontab)) == 1
+
+
+def test_run_cron_preserves_a_users_own_crontab_lines(tmp_path):
+    """The filter removes entries that run OUR script, not the user's crontab."""
+    user_line = "0 3 * * * /usr/local/bin/backup.sh"
+    proc, crontab = run_cron(tmp_path, seeded_lines=[user_line], api_port="9001")
+
+    assert proc.returncode == 0, proc.stderr
+    assert user_line in crontab.splitlines()
+    assert len(_hc_entries(crontab)) == 1
+
+
+def test_run_cron_preserves_a_hand_edited_indexer_entry(tmp_path):
+    """The indexer line is still matched exactly, so a user who tweaked its
+    schedule keeps their version -- the asymmetry is deliberate."""
+    hand_edited = "*/20 * * * * nice -n 5 /venv/bin/python /app/backend/scripts/update_index.py >> /var/log/idx.log 2>&1"
+    proc, crontab = run_cron(tmp_path, seeded_lines=[hand_edited], api_port="9001")
+
+    assert proc.returncode == 0, proc.stderr
+    assert hand_edited in crontab.splitlines()
+    assert len(_indexer_entries(crontab)) == 2, "the hand-edited copy is kept and the managed one is added"

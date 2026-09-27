@@ -449,10 +449,19 @@ run_cron() {
     local line_hc="*/5 * * * * BASE=\"http://localhost:$API_PORT\" HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
-    # Remove only the exact managed entries this script writes; preserve any
-    # user-added crontab lines (including manual HEALTHCHECK_WEBHOOK_URL=...
-    # augmentations) that reference the same scripts.
-    crontab -l 2>/dev/null | grep -vFx "$line_idx" | grep -vFx "$line_hc" > "$tmp" || true
+    # The healthcheck line is removed by SCRIPT PATH, not by exact match. Its
+    # text has changed before (BASE= was added), and `grep -vFx` matches whole
+    # lines, so an entry written by a previous revision of this script could
+    # never be removed: it stayed behind, and on a host with a non-default
+    # API_PORT that stale copy carried no BASE=, fell back to the watchdog's
+    # :8001 default, got a refused connection and restarted a healthy backend
+    # every five minutes. Matching the path removes whatever any revision wrote.
+    #
+    # The indexer line is still matched exactly, because this branch never
+    # changed its text and an exact match keeps a user's hand-edited variant
+    # (a different schedule, a `nice` tweak) from being deleted out from under
+    # them. Any user line that does not run these two scripts is preserved.
+    crontab -l 2>/dev/null | grep -vFx "$line_idx" | grep -vF "$SCRIPT_DIR/deploy/healthcheck.sh" > "$tmp" || true
     printf '%s\n' "$line_idx" >> "$tmp"
     printf '%s\n' "$line_hc" >> "$tmp"
     crontab "$tmp"

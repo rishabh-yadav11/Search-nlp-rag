@@ -82,13 +82,31 @@ alert() {
   last_key=""; last_at=0
   if [ -f "$STATE_FILE" ]; then
     read -r last_key last_at <"$STATE_FILE" 2>/dev/null || true
-    last_at="${last_at:-0}"
+    # The state file is a cache, never a gate: a corrupt, truncated or
+    # hand-edited one must not be able to silence an alert. Everything that is
+    # not a plain non-negative integer is treated as "never alerted" -- an
+    # unquoted expansion of a non-numeric value aborts the whole run under
+    # `set -u` from inside this function, which killed the watchdog outright.
+    case "$last_at" in
+      '' | *[!0-9]*) last_at=0 ;;
+    esac
   fi
-  if [ "$last_key" = "$key" ] && [ $((now - last_at)) -lt "$ALERT_COOLDOWN_SECONDS" ]; then
-    log "still failing ($key); alert suppressed for another $((ALERT_COOLDOWN_SECONDS - (now - last_at)))s"
+  age=$((now - last_at))
+  # A stamp in the future means the clock moved backwards (a DST/ntp slip, a
+  # copied state file). It is not a cooldown, so it must not suppress anything;
+  # a negative age is treated as expired.
+  if [ "$last_key" = "$key" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$ALERT_COOLDOWN_SECONDS" ]; then
+    log "still failing ($key); alert suppressed for another $((ALERT_COOLDOWN_SECONDS - age))s"
     return 0
   fi
-  printf '%s %s\n' "$key" "$now" >"$STATE_FILE"
+  # Written atomically: `>` truncates first, so a crash mid-write would leave an
+  # empty file for the next run to read. The alert matters more than the state,
+  # so a failed write is a warning, not a reason to stay quiet.
+  if printf '%s %s\n' "$key" "$now" >"$STATE_FILE.tmp" 2>/dev/null; then
+    mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null || log "WARNING: could not update $STATE_FILE"
+  else
+    log "WARNING: could not write $STATE_FILE; this alert will not be deduplicated"
+  fi
   log "$msg"
   post_webhook "$msg" || true
   echo "$msg"
