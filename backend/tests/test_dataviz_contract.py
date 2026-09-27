@@ -151,6 +151,38 @@ def test_both_sides_match_the_same_fence_text(corpus, frontend):
     assert not mismatched, "the two sides match the fence differently:\n" + "\n".join(mismatched)
 
 
+def test_deeply_nested_payload_is_dropped_not_raised():
+    """A payload nested deep enough to exhaust the parser must be DROPPED, not
+    raise.
+
+    json.loads raises RecursionError on a deeply nested payload, and it used to
+    escape parse_dataviz, then _sanitize_dataviz and _finalize_answer -- turning
+    one malformed block into a failed chat request instead of a stripped one. The
+    payload walk also caps the depth long before this, so the except clause is the
+    second line of defence; it is pinned here because nothing else reaches it."""
+    deep = "[" * 100_000 + "]" * 100_000
+    text = '```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1, "note": ' + deep + "}\n```"
+    assert chat_module.parse_dataviz(text) is None
+    finalized = chat_module._finalize_answer(f"Prose.\n\n{text}", "show me a table of top deals")
+    assert "```dataviz" not in finalized
+    assert "Prose." in finalized
+
+
+def test_view_pinning_applies_the_same_load_rules():
+    """The view-pinning path re-loads the block itself, and that second load used
+    to be laxer than parse_dataviz's: it let a block through that the
+    re-validation then rejected, so _apply_requested_view returned it unpinned and
+    a user who asked for a bar chart quietly lost the chart."""
+    payload = '{"columns": ["A", "B"], "rows": [["x", 1e999]], "value_column": 1}'
+    assert chat_module._parse_dataviz_with_view(f"```dataviz\n{payload}\n```", "bar") is None
+    bare = '{"columns": ["A", "B"], "rows": [["x", 1]], "value_column": 1, "note": Infinity}'
+    assert chat_module._parse_dataviz_with_view(f"```dataviz\n{bare}\n```", "table") is None
+    # and a well-formed block is still pinned
+    good = '{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}'
+    pinned = chat_module._parse_dataviz_with_view(f"```dataviz\n{good}\n```", "bar")
+    assert pinned is not None and pinned["view"] == "bar"
+
+
 def test_fixture_names_are_unique(corpus):
     """The harness keys its results by fixture name, so two fixtures sharing one
     would leave the first shadowed -- its verdict compared against the second's --
@@ -233,3 +265,10 @@ def test_trim_grammar_is_one_string_on_both_sides(frontend):
     """The trim set is shared as a string, so the character class behind the
     per-codepoint probe above can only be changed in both places at once."""
     assert frontend["trim_src"] == chat_module._TRIM_SRC
+
+
+def test_payload_depth_limit_is_one_number_on_both_sides(frontend):
+    """The nesting depth past which a payload counts as malformed is shared, so
+    the frontend's recursive walk cannot give up where the backend's still
+    succeeds (or overflow V8's stack on a payload json.loads refused)."""
+    assert frontend["max_json_depth"] == chat_module._MAX_JSON_DEPTH

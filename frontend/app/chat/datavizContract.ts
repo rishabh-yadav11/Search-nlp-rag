@@ -69,6 +69,31 @@ export const VIEWS = ['table', 'bar', 'line', 'pie'] as const
 
 // Helpers
 
+export const MAX_JSON_DEPTH = 100
+
+/**
+ * True when ANY number in the payload is not a finite double, or when the
+ * payload nests deeper than MAX_JSON_DEPTH.
+ *
+ * A non-finite number disqualifies the block wherever it sits, not only in the
+ * value column: a LABEL cell reading 1e999 survives every value check but can
+ * never be displayed, and an integer literal too wide for Python's int
+ * conversion makes the backend's json.loads reject the whole payload while
+ * JSON.parse quietly yields Infinity. The backend applies the identical walk
+ * (_has_non_finite in backend/app/chat.py, same depth limit), so both sides
+ * reject the same blocks rather than the server dropping one the browser
+ * renders (#267).
+ */
+export function hasNonFiniteNumber(value: unknown, depth = 0): boolean {
+  if (depth > MAX_JSON_DEPTH) return true
+  if (typeof value === 'number') return !Number.isFinite(value)
+  if (Array.isArray(value)) return value.some((v) => hasNonFiniteNumber(v, depth + 1))
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((v) => hasNonFiniteNumber(v, depth + 1))
+  }
+  return false
+}
+
 /**
  * A cell counts as a number only when it IS one, in full.
  *
@@ -176,6 +201,7 @@ export function parseDataViz(text: string): DataVizBlock | null {
   try {
     const d = JSON.parse(m[1])
     if (!d || typeof d !== 'object') return null
+    if (hasNonFiniteNumber(d)) return null
     const columns: unknown = (d as { columns?: unknown }).columns
     const rows: unknown = (d as { rows?: unknown }).rows
     if (!Array.isArray(columns) || !columns.length || !columns.every((c) => typeof c === 'string')) return null
