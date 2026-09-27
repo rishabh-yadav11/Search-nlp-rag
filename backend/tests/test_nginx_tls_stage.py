@@ -849,6 +849,125 @@ def test_a_corrupt_certificate_is_not_reported_as_expired(tmp_path):
     assert "rolling back" in stderr, f"the rollback must be announced: {stderr}"
 
 
+def _tls_site_installed(tmp_path):
+    """A host already serving :443, as `./setup.sh tls` would have left it."""
+    _existing_pair(tmp_path)
+    code, _, installed, _, stderr = _run_nginx(tmp_path, extra_env={"NGINX_TLS": "on"})
+    assert code == 0, f"the TLS install failed: {stderr}"
+    assert _installed_https_servers(installed) == 1, f"expected a TLS config: {installed}"
+    return installed
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint a certificate")
+def test_tls_stage_can_reissue_when_the_pair_is_gone(tmp_path):
+    """`./setup.sh tls` is the repair tool, so it must work on exactly the hosts
+    that need repairing.
+
+    A live HTTPS site whose certificate was deleted, truncated or replaced used
+    to be unrepairable: the status-quo default resolved the pre-flight to TLS,
+    the gate then refused to render a config naming a certificate that is not
+    there, and the stage returned 1 BEFORE certbot ran -- while telling the
+    operator to run the command they had just run.
+    """
+    _tls_site_installed(tmp_path)
+    live = tmp_path / "letsencrypt" / "live" / "search.example.com"
+    (live / "fullchain.pem").unlink()
+    (live / "privkey.pem").unlink()
+
+    code, calls, _, stderr = _run_tls(tmp_path)
+
+    assert _index_of(calls, "certbot certonly") != -1, (
+        f"the stage must still ask certbot for a certificate: {calls}\n{stderr}"
+    )
+    assert code == 0, f"the stage failed instead of repairing the site: {stderr}"
+    conf = (tmp_path / "nginx" / "sites-available" / "site").read_text()
+    assert _installed_https_servers(conf) == 1, f"TLS was not restored: {conf}"
+    assert "return 301 https://" in conf, f"the redirect was not restored: {conf}"
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint a certificate")
+def test_tls_stage_can_reissue_when_the_certificate_is_corrupt(tmp_path):
+    """The same, for a certificate that is present, non-empty and not one."""
+    _tls_site_installed(tmp_path)
+    (tmp_path / "letsencrypt" / "live" / "search.example.com" / "fullchain.pem").write_text(
+        "-----BEGIN CERTIFICATE-----\nnot a certificate\n"
+    )
+
+    code, calls, _, stderr = _run_tls(tmp_path)
+
+    assert _index_of(calls, "certbot certonly") != -1, (
+        f"the stage must still ask certbot for a certificate: {calls}\n{stderr}"
+    )
+    assert "cannot be read as a" in stderr, f"the corrupt file must be named: {stderr}"
+    assert code == 0, f"the stage failed instead of repairing the site: {stderr}"
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint a certificate")
+def test_tls_stage_can_reissue_after_the_documented_corrupt_remedy(tmp_path):
+    """A remedy the script prints must be one that actually works.
+
+    The corrupt warning tells the operator to `rm` the file and re-run the tls
+    stage. Under the previous behaviour that second line could not succeed:
+    after the `rm` the pre-flight still resolved to TLS (the installed config
+    still said `listen 443 ssl`), the gate refused, and the stage returned 1
+    before certbot. So the script was handing out a two-line recipe whose
+    second line was guaranteed to fail. This executes exactly what is printed.
+    """
+    _tls_site_installed(tmp_path)
+    cert = tmp_path / "letsencrypt" / "live" / "search.example.com" / "fullchain.pem"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nnot a certificate\n")
+
+    _, _, _, stderr = _run_tls(tmp_path)
+    remedy = next((line.split()[-1] for line in stderr.splitlines() if "sudo rm -f" in line), None)
+    assert remedy == str(cert), (
+        f"the corrupt warning must print the path to remove, got {remedy!r}\n{stderr}"
+    )
+
+    # Now do exactly what the script said to do.
+    Path(remedy).unlink()
+    code, calls, _, stderr = _run_tls(tmp_path)
+
+    assert _index_of(calls, "certbot certonly") != -1, f"certbot was never reached: {calls}\n{stderr}"
+    assert code == 0, f"the documented remedy does not work: {stderr}"
+    conf = (tmp_path / "nginx" / "sites-available" / "site").read_text()
+    assert _installed_https_servers(conf) == 1, f"TLS was not restored: {conf}"
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint a certificate")
+def test_the_corrupt_diagnosis_survives_the_tls_preflight(tmp_path):
+    """A file certbot will skip must still be named during the pre-flight.
+
+    TLS_BOOTSTRAP=1 silences "you are being served over plain HTTP", because
+    certbot is genuinely about to make that irrelevant. It must NOT silence
+    this: the tls stage is issued with --keep-until-expiring, so certbot skips
+    a file it cannot parse and leaves it exactly as it is. The pre-flight is
+    often the only run that notices, so suppressing the diagnosis there is
+    suppressing it at the one moment it is needed -- and the operator is left
+    re-running a command that reports success and changes nothing.
+    """
+    _tls_site_installed(tmp_path)
+    (tmp_path / "letsencrypt" / "live" / "search.example.com" / "fullchain.pem").write_text(
+        "-----BEGIN CERTIFICATE-----\nnot a certificate\n"
+    )
+
+    # The pre-flight alone: TLS_BOOTSTRAP=1, and nothing after it.
+    bindir, log = _stubs(tmp_path)
+    proc = subprocess.run(
+        ["/usr/bin/bash", "-c", f'source "{SETUP_SH}"\nTLS_BOOTSTRAP=1 run_nginx\n'],
+        env={**os.environ, **_base_env(tmp_path, bindir, log)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "cannot be read as a" in proc.stderr, (
+        f"the corrupt file must be named even in the pre-flight: {proc.stderr}"
+    )
+    assert "served over plain HTTP" not in proc.stderr, (
+        f"the plain-HTTP advisory is the one thing the pre-flight may silence: {proc.stderr}"
+    )
+
+
 def test_the_nginx_stub_rejects_a_config_naming_a_missing_certificate(tmp_path):
     """The stub must check the certificate as well as the key.
 
@@ -882,3 +1001,112 @@ def test_the_nginx_stub_rejects_a_config_naming_a_missing_certificate(tmp_path):
     assert any("no ssl_certificate at" in line for line in _calls(log)), (
         f"the missing half must be named: {_calls(log)}"
     )
+
+
+# --------------------------------------------------------------------------
+# the class invariant, enumerated
+# --------------------------------------------------------------------------
+#
+# Three separate fixes each closed one downgrade path, which is the signature of
+# a class rather than three coincidences. The rule is short: an ORDINARY
+# invocation must never change what is already serving. This enumerates the
+# states that decide the posture, so a fourth path cannot open unnoticed.
+#
+# The invariant, for a host whose installed config already serves :443: either
+# the :443 server and the 301 are still there afterwards, or the stage failed
+# having written nothing and reloaded nothing. Never: it exited 0 having
+# replaced them with plain HTTP.
+
+_TLS_DOMAIN = "search.example.com"  # the domain _base_env already configures
+
+
+def _install_serving_tls(tmp_path):
+    """Put a :443 config in place and return the bytes that were installed."""
+    _existing_pair(tmp_path)
+    code, _, installed, _, stderr = _run_nginx(tmp_path, extra_env={"NGINX_TLS": "on"})
+    assert code == 0, f"could not stage a TLS host: {stderr}"
+    assert _installed_https_servers(installed) == 1, f"expected a TLS config: {installed}"
+    return installed
+
+
+def _break_pair(tmp_path, how):
+    """Damage the installed pair in one of the enumerated ways."""
+    live = tmp_path / "letsencrypt" / "live" / _TLS_DOMAIN
+    if how == "no_pair":
+        (live / "fullchain.pem").unlink()
+        (live / "privkey.pem").unlink()
+    elif how == "key_only":
+        (live / "fullchain.pem").unlink()
+    elif how == "cert_only":
+        (live / "privkey.pem").unlink()
+    elif how == "corrupt":
+        (live / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\nnope\n")
+    elif how == "empty":
+        (live / "fullchain.pem").write_text("")
+    elif how == "expired":
+        _expired_pair(tmp_path)  # overwrites the pair in place, lapsed
+    else:
+        raise AssertionError(f"unknown breakage {how!r}")
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint certificates")
+@pytest.mark.parametrize(
+    ("pair", "le_domain", "mode", "le_root"),
+    [
+        ("valid", _TLS_DOMAIN, "auto", "normal"),
+        ("valid", "", "auto", "normal"),
+        ("valid", _TLS_DOMAIN, "on", "normal"),
+        ("valid", _TLS_DOMAIN, "auto", "absent"),
+        ("valid", "", "auto", "absent"),
+        ("valid", _TLS_DOMAIN, "auto", "empty"),
+        ("valid", _TLS_DOMAIN, "off", "normal"),
+        ("expired", _TLS_DOMAIN, "auto", "normal"),
+        ("expired", "", "auto", "normal"),
+        ("corrupt", _TLS_DOMAIN, "auto", "normal"),
+        ("corrupt", "", "auto", "normal"),
+        ("empty", _TLS_DOMAIN, "auto", "normal"),
+        ("no_pair", _TLS_DOMAIN, "auto", "normal"),
+        ("no_pair", "", "auto", "normal"),
+        ("key_only", _TLS_DOMAIN, "auto", "normal"),
+        ("cert_only", _TLS_DOMAIN, "auto", "normal"),
+    ],
+)
+def test_an_ordinary_rerun_never_changes_what_is_serving(pair, le_domain, mode, le_root, tmp_path):
+    """A re-run either keeps the site encrypted or fails without touching it.
+
+    `NGINX_TLS=off` is the one row that is expected to move the site, and it is
+    listed so the sweep states the exception rather than leaving it implicit.
+    """
+    before = _install_serving_tls(tmp_path)
+    assert "listen 443 ssl" in before
+    if pair != "valid":
+        _break_pair(tmp_path, pair)
+
+    env = {"NGINX_TLS": mode, "LE_DOMAIN": le_domain}
+    if le_root == "absent":
+        env["LE_ROOT"] = str(tmp_path / "nowhere")
+    elif le_root == "empty":
+        env["LE_ROOT"] = str(tmp_path)
+    code, calls, installed, _, stderr = _run_nginx(tmp_path, extra_env=env)
+    where = f"{pair}/{'domain' if le_domain else 'no-domain'}/{mode}/{le_root}"
+
+    if mode == "off":
+        # The deliberate opt-in, and the only thing that may remove TLS.
+        assert _installed_https_servers(installed) == 0, f"{where}: an explicit off must take effect"
+        return
+
+    if code == 0:
+        assert "listen 443 ssl" in installed, (
+            f"{where}: the re-run exited 0 having taken a live HTTPS site off TLS:\n{installed}\n{stderr}"
+        )
+        assert "return 301 https://" in installed, (
+            f"{where}: the redirect was dropped by a re-run that exited 0:\n{installed}"
+        )
+    else:
+        assert installed == before, (
+            f"{where}: the stage failed but still changed the config that was serving:\n{installed}"
+        )
+        assert not any(c.strip() == "sudo systemctl reload nginx" for c in calls), (
+            f"{where}: the stage failed and reloaded anyway: {calls}"
+        )
+        assert "ERROR" in stderr, f"{where}: a failure must say so: {stderr}"

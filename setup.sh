@@ -31,17 +31,22 @@ LE_KEY="$LE_LIVE/privkey.pem"
 # `./setup.sh nginx` (or the nginx stage inside `./setup.sh all`) in a shell
 # that does not export it used to see no domain at all, resolve "auto" to
 # plain HTTP, and rewrite a live HTTPS site to cleartext -- silently, with
-# exit 0. When it is unset, recover the domain from what is actually
-# installed: first from the certificate the live config already names, and
-# failing that from the only entry under $LE_ROOT/live.
+# exit 0. When it is unset, recover the domain from the certificate the
+# INSTALLED CONFIG already names, and from nowhere else.
 #
-# Recovery is deliberately conservative. A cert-name is only believed when the
-# path really is <LE_ROOT>/live/<name>/fullchain.pem, and an ambiguous
-# $LE_ROOT/live (more than one entry, which a shared host will have) is left
-# alone rather than guessed at, because adopting another service's certificate
-# would point this site at the wrong key. Pure bash on purpose: this runs while
-# the script is sourced, and `test_refuses_when_certbot_is_missing` sources it
-# with almost nothing on PATH.
+# "And from nowhere else" is the whole safety argument. Recovery is only ever
+# justified by evidence that the certificate belongs to this site, and the one
+# piece of that evidence available is the config this site is already serving.
+# Falling back to "the only directory under $LE_ROOT/live" looked equivalent
+# and is not: /etc/letsencrypt is shared, so on a host where this site was
+# never on TLS it would adopt an unrelated service's cert-name and repoint
+# both server_name and ssl_certificate at that other domain -- serving a
+# certificate for a domain this site does not answer for. Guessing is only
+# safe when the guess cannot be acted on, and here it very much can.
+#
+# Pure bash on purpose: this runs while the script is sourced, and
+# `test_refuses_when_certbot_is_missing` sources it with almost nothing on
+# PATH.
 # Forced to 0 here rather than defaulted later: it describes what this block
 # did, so an inherited value from the environment must not leak into it.
 LE_DOMAIN_RECOVERED=0
@@ -69,17 +74,6 @@ if [ -z "$LE_DOMAIN" ]; then
             esac
         done < "$NGINX_CONF"
     fi
-    if [ -z "$_le_name" ] && [ -d "$LE_ROOT/live" ]; then
-        _le_n=0
-        for _le_d in "$LE_ROOT"/live/*/; do
-            [ -d "$_le_d" ] || continue
-            _le_n=$((_le_n + 1))
-            _le_name="${_le_d%/}"
-            _le_name="${_le_name##*/}"
-            [ "$_le_n" -gt 1 ] && _le_name=""
-        done
-        [ "$_le_n" -eq 1 ] || _le_name=""
-    fi
     if [ -n "$_le_name" ]; then
         LE_DOMAIN="$_le_name"
         LE_LIVE="$LE_ROOT/live/$LE_DOMAIN"
@@ -89,7 +83,7 @@ if [ -z "$LE_DOMAIN" ]; then
         # rather than implying the operator configured it in this shell.
         LE_DOMAIN_RECOVERED=1
     fi
-    unset _le_name _le_line _le_path _le_dir _le_parent _le_d _le_n
+    unset _le_name _le_line _le_path _le_dir _le_parent
 fi
 
 # Pinned docker images with digests for reproducibility. IMPORTANT: the Qdrant
@@ -777,53 +771,57 @@ run_nginx() {
     # Gated on the certificate being PRESENT rather than on LE_DOMAIN being
     # set: the interesting case is a pair on disk that is not being served, and
     # a recovered domain would otherwise silence the very warning that matters.
-    # TLS_BOOTSTRAP=1 marks the deliberate pass-through to plain HTTP that
-    # run_tls makes before certbot runs; certbot is about to fix whatever is
-    # wrong, so every warning here is suppressed there.
-    if [ "${TLS_BOOTSTRAP:-0}" != "1" ]; then
-        local state
-        state="$(nginx_tls_cert_state)"
-        if [ "$mode" = "off" ]; then
-            if [ -n "$LE_DOMAIN" ] || [ "$state" != "missing" ]; then
-                # "no readable certificate" was wrong twice over: readability
-                # is not what this mode is decided on, and the certificate is
-                # often there and merely unusable. Name the pair instead.
-                echo "WARNING: this site is being served over plain HTTP." >&2
-                echo "         No certificate and private key were found at" >&2
-                echo "           $LE_CERT" >&2
-                echo "           $LE_KEY" >&2
-                echo "         Passwords, bearer tokens and chat content will cross" >&2
-                echo "         the wire in cleartext until that pair exists." >&2
-                echo "         Fix it with: LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
-            fi
-        elif [ "$state" = "expired" ]; then
-            # Reporting, not a mode change. The site stays on HTTPS: a lapsed
-            # certificate is a browser warning, and removing the :443 server
-            # over one would trade that warning for cleartext -- on a path
-            # (`./setup.sh nginx`, `./setup.sh all`) where nothing renews it.
-            echo "WARNING: the certificate at $LE_CERT has expired." >&2
-            echo "         The site is still being served over HTTPS, but browsers" >&2
-            echo "         will warn and clients may refuse the connection." >&2
-            echo "         Renew it with: LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
-        elif [ "$state" = "corrupt" ]; then
-            # Its own remedy, because re-running the tls stage will NOT fix
-            # this. The stage issues with --keep-until-expiring, which leaves
-            # anything certbot cannot parse exactly as it is -- so the operator
-            # would loop forever on a command that keeps reporting success.
-            echo "WARNING: the certificate at $LE_CERT cannot be read as a" >&2
-            echo "         certificate at all. This is not an expiry problem and" >&2
-            echo "         re-running the tls stage will not fix it: issuance uses" >&2
-            echo "         --keep-until-expiring, so certbot skips a file it cannot" >&2
-            echo "         parse and leaves it untouched. Remove it, then renew:" >&2
-            echo "           sudo rm -f $LE_CERT" >&2
-            echo "           LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
+    local state
+    state="$(nginx_tls_cert_state)"
+    if [ "$mode" = "off" ]; then
+        # TLS_BOOTSTRAP=1 marks the pre-flight run_tls makes before certbot
+        # runs. Only THIS advisory is silenced there: certbot is genuinely
+        # about to make "you are on plain HTTP" irrelevant, so saying it would
+        # be noise. The diagnoses below are not silenced, because a corrupt or
+        # lapsed file is exactly what certbot will NOT fix -- it is issued
+        # with --keep-until-expiring and skips anything it cannot read -- and
+        # the pre-flight is often the first run that notices.
+        # Braces, because `A || B && C` relies on left-associativity to mean
+        # `(A || B) && C` and reads as something else entirely.
+        if { [ -n "$LE_DOMAIN" ] || [ "$state" != "missing" ]; } && [ "${TLS_BOOTSTRAP:-0}" != "1" ]; then
+            # "no readable certificate" was wrong twice over: readability is
+            # not what this mode is decided on, and the certificate is often
+            # there and merely unusable. Name the pair instead.
+            echo "WARNING: this site is being served over plain HTTP." >&2
+            echo "         No certificate and private key were found at" >&2
+            echo "           $LE_CERT" >&2
+            echo "           $LE_KEY" >&2
+            echo "         Passwords, bearer tokens and chat content will cross" >&2
+            echo "         the wire in cleartext until that pair exists." >&2
+            echo "         Fix it with: LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
         fi
-        # "unreadable" and "unknown" are silent on purpose. An unreadable
-        # certificate is normal -- certbot's key is 0600 root:root -- and nginx
-        # runs as root and will have the last word via `nginx -t`, which
-        # triggers the rollback if the certificate really is unusable. Claiming
-        # expiry there would be the false warning this case exists to avoid.
+    elif [ "$state" = "expired" ]; then
+        # Reporting, not a mode change. The site stays on HTTPS: a lapsed
+        # certificate is a browser warning, and removing the :443 server
+        # over one would trade that warning for cleartext -- on a path
+        # (`./setup.sh nginx`, `./setup.sh all`) where nothing renews it.
+        echo "WARNING: the certificate at $LE_CERT has expired." >&2
+        echo "         The site is still being served over HTTPS, but browsers" >&2
+        echo "         will warn and clients may refuse the connection." >&2
+        echo "         Renew it with: LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
+    elif [ "$state" = "corrupt" ]; then
+        # Its own remedy, because re-running the tls stage will NOT fix
+        # this. The stage issues with --keep-until-expiring, which leaves
+        # anything certbot cannot parse exactly as it is -- so the operator
+        # would loop forever on a command that keeps reporting success.
+        echo "WARNING: the certificate at $LE_CERT cannot be read as a" >&2
+        echo "         certificate at all. This is not an expiry problem and" >&2
+        echo "         re-running the tls stage will not fix it: issuance uses" >&2
+        echo "         --keep-until-expiring, so certbot skips a file it cannot" >&2
+        echo "         parse and leaves it untouched. Remove it, then renew:" >&2
+        echo "           sudo rm -f $LE_CERT" >&2
+        echo "           LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
     fi
+    # "unreadable" and "unknown" are silent on purpose. An unreadable
+    # certificate is normal -- certbot's key is 0600 root:root -- and nginx
+    # runs as root and will have the last word via `nginx -t`, which
+    # triggers the rollback if the certificate really is unusable. Claiming
+    # expiry there would be the false warning this case exists to avoid.
     local tmp
     tmp="$(mktemp)"
     # Render to a temp file first: nothing reaches the live site until nginx has
@@ -903,10 +901,30 @@ run_tls() {
     # during a routine re-run left the site in cleartext. Under "auto" an
     # existing, usable certificate is kept and a missing one still falls back
     # to plain HTTP for the challenge.
+    #
+    # This pre-flight is BEST EFFORT, which is a different policy from the one
+    # run_nginx applies to itself, and deliberately so. run_nginx exists to put
+    # a config in front of a live site, so when it cannot render one it stops
+    # and says so. This step does not exist to manage the config -- it exists to
+    # obtain a certificate. It also cannot improve on what is already there:
+    # when the status-quo default resolves to TLS and the pair is gone or
+    # unreadable, the config already installed is a TLS config, and a TLS config
+    # serves the ACME challenge exactly as well as a plain one. So a failure
+    # here means "leave it alone", not "give up" -- and aborting is what made
+    # a live HTTPS site whose certificate had been deleted impossible to
+    # re-provision: the stage died before certbot ran and told the operator to
+    # run the very command they had just run.
     local preflight
     NGINX_TLS=auto
     preflight="$(nginx_tls_mode)"
-    TLS_BOOTSTRAP=1 run_nginx || return 1
+    if ! TLS_BOOTSTRAP=1 run_nginx; then
+        echo "WARNING: the nginx pre-flight could not install a config; the one" >&2
+        echo "         already on disk is untouched and still serving. Continuing" >&2
+        echo "         so certbot can still be attempted. If that config was not" >&2
+        echo "         written by this script, check that it serves" >&2
+        echo "         $CERTBOT_WEBROOT/.well-known/acme-challenge/ before trusting" >&2
+        echo "         the result." >&2
+    fi
     sudo mkdir -p "$CERTBOT_WEBROOT/.well-known/acme-challenge"
     # webroot, never --standalone: --standalone needs port 80 free, so on the
     # live site it would fail with the port taken (or force nginx to stop and
