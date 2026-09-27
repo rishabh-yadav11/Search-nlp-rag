@@ -49,21 +49,19 @@ variants (retry-before-first-chunk, no mid-stream retry, usage capture).
 
 ## app/reranker.py — 100% (covered by tests/test_reranker.py)
 
-All startup/failure/load paths exercised with faked optimum/transformers/
-sentence_transformers imports and a tmp ONNX cache dir.
+The reranker is torch-only: the ONNX/optimum fast path was removed (optimum-onnx
+is not installable alongside the pinned transformers 5.x), so its load/export/
+lock tests went with it. Construction and `predict` are exercised with a faked
+`sentence_transformers` import, plus a working faked `optimum.onnxruntime` that
+proves a default construction never takes an ONNX path.
 
-- [x] **ONNX fast path `predict`** (lines 84-90): 2-D logits → column 0;
-      `logits.ndim != 2` branch.
-- [x] **torch fallback `predict`** (line 91): `self._onnx is None` path.
-- [x] **ONNX load failure fallback** (lines 35-51): `optimum` import/export
-      raises → falls back to torch. **ERROR PATH — model load failure.**
-- [x] **`_load_onnx` cached-load branch** (lines 61-62): `model.onnx` already
-      present → load without lock.
-- [x] **`_load_onnx` export-under-lock branch** (lines 64-78): first run exports
-      and saves; `fcntl` lock acquire/release (lines 66-80).
-- [x] **`_load_onnx` double-checked lock** (line 71): second worker finds the
-      file after acquiring the lock. **ERROR PATH — concurrent gunicorn
-      workers racing the export.**
+- [x] **Default backend** is torch and never attempts the ONNX path, even when
+      `optimum` is importable.
+- [x] **Explicit `backend="torch"`** builds a CPU `CrossEncoder`.
+- [x] **Unsupported backend** (`backend="onnx"`) warns and falls back to torch.
+      **ERROR PATH — stale `RERANK_BACKEND` in the environment.**
+- [x] **`predict`** passes the `(query, passage)` pairs straight through to the
+      torch `CrossEncoder`.
 
 ---
 
