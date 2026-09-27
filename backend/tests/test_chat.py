@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from typing import ClassVar
 
@@ -5320,13 +5321,41 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas):
         "server": ("testserver", 80),
     }
 
-    async def run():
+    async def call_app():
         await asyncio.wait_for(app(scope, receive, send), timeout=10)
         # The turn really streamed, and exactly the deltas expected reached the
         # wire: without this a 404 or an early error would make the rollback
         # assertions below pass for the wrong reason.
         assert any(b"event: start" in body for body in sent["bodies"]), sent["bodies"]
         assert sent["deltas"] == n_deltas, sent["bodies"]
+
+    def run():
+        """Drive the app on its own event loop in a daemon thread.
+
+        A turn whose cancellation rollback is missing does not merely fail: anyio
+        re-raises the cancellation at every await, so the app task can spin
+        without ever yielding long enough for an in-loop timer to fire, and the
+        whole suite wedges instead of reporting. Joining the thread with a
+        timeout turns that stall into a plain test failure.
+        """
+        outcome: dict = {}
+
+        def worker():
+            try:
+                asyncio.run(call_app())
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout=20)
+        if thread.is_alive():
+            raise AssertionError(
+                "the ASGI call never finished: a cancelled turn with no rollback "
+                "can stall the app task rather than fail it"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
 
     return run, chat_store, auth_store, sid, user_id
 
@@ -5338,7 +5367,7 @@ def test_real_disconnect_before_any_delta_rolls_back_the_turn(tmp_path, monkeypa
     interrupt it before the delete lands."""
     run, chat_store, auth_store, sid, user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 0)
     try:
-        _run(run())
+        run()
         assert _turn_rows(chat_store, sid, user_id) == []
     finally:
         _run(auth_store.close())
@@ -5353,7 +5382,7 @@ def test_real_disconnect_after_deltas_persists_the_truncated_turn(tmp_path, monk
     message, instead of erasing what the client is still displaying."""
     run, chat_store, auth_store, sid, user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 1)
     try:
-        _run(run())
+        run()
         rows = _turn_rows(chat_store, sid, user_id)
         assert [role for role, _c, _a in rows] == ["user", "assistant"]
         assert rows[1][2] is True
