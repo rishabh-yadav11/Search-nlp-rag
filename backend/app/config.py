@@ -314,6 +314,14 @@ class Config:
     #     (2) cores, so a large value serialises every other inference in the
     #     process behind one request. 50 already exceeds what any caller can
     #     consume — /search caps top_k at 50 and CHAT_MAX_SOURCES is 20.
+    #     The batch that actually reaches the cross-encoder is NOT this value:
+    #     `_retrieval_leg` fetches `max(top_k, RERANK_CANDIDATES)` PER LEG,
+    #     `_retrieval_queries` returns at most TWO legs (Flashback + bare topic
+    #     for a year-in-review intent), and `_merge_results` unions them, so the
+    #     bound is `2 * max(top_k, RERANK_CANDIDATES)` — at most 100 pairs at
+    #     the ceiling. `rerank()` is deliberately not truncated further: dropping
+    #     merged candidates there would change reranked ordering for
+    #     year-in-review queries, which is a relevance change, not a DoS fix.
     #   * Low end: below 5 there is no ranking left to do. `main.py` does
     #     `max(top_k, RERANK_CANDIDATES)`, so a small value degrades quietly
     #     there, but `scripts/rerank_bench.py` passes this straight through as
@@ -495,6 +503,12 @@ class Config:
     # stride to fit this budget. 200 is above the 98 windows the defaults
     # already scan, so the default scan is bit-for-bit unchanged and the budget
     # only engages for a deliberately expensive stride.
+    # Recall trade-off, stated rather than implied: a budget tighter than the
+    # configured stride needs widens the stride, and a stride coarse enough to
+    # widen can straddle a token-dense region and miss it. That is the price of
+    # capping the work. It is free at any budget >= 98 (the default scan), so
+    # the default rescue is unchanged; only a deliberately tight budget trades
+    # recall, and tightening it is an explicit operator choice.
     BODY_RESCUE_MAX_WINDOWS = _clamped_int("BODY_RESCUE_MAX_WINDOWS", 200, 1, 5000)
     # Most candidates that may enter the second cross-encoder pass. The pass is
     # the dominant cost (one pair per candidate, under `inference_lock`) and
