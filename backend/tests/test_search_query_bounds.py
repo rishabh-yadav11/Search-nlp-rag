@@ -243,12 +243,12 @@ async def _passthrough_rerank(query, results):
 def test_a_short_query_still_names_itself_in_the_key():
     """The bound must not rewrite normal keys: a 5-char query is unchanged, so
     the cache entries already in Redis keep hitting."""
-    assert main._cache_query_component("deals") == "deals"
+    assert main._cache_key_component("deals") == "deals"
 
 
 def test_a_long_query_is_replaced_by_a_digest_not_cut_short():
     long_q = "A" * 10_000
-    component = main._cache_query_component(long_q)
+    component = main._cache_key_component(long_q)
 
     assert len(component) < len(long_q)
     assert component.startswith("h:")
@@ -259,8 +259,8 @@ def test_two_different_long_queries_do_not_share_a_cache_key():
     """Truncating the text instead of digesting it would collide every query
     with the same long prefix onto one key and serve the wrong results."""
     prefix = "A" * (config.CACHE_KEY_QUERY_MAX_CHARS + 1)
-    a = main._cache_query_component(prefix + "one")
-    b = main._cache_query_component(prefix + "two")
+    a = main._cache_key_component(prefix + "one")
+    b = main._cache_key_component(prefix + "two")
 
     assert a != b
 
@@ -268,7 +268,7 @@ def test_two_different_long_queries_do_not_share_a_cache_key():
 def test_the_same_long_query_always_maps_to_the_same_component():
     long_q = "B" * 50_000
 
-    assert main._cache_query_component(long_q) == main._cache_query_component(long_q)
+    assert main._cache_key_component(long_q) == main._cache_key_component(long_q)
 
 
 def test_the_digest_does_not_depend_on_the_process():
@@ -279,7 +279,7 @@ def test_the_digest_does_not_depend_on_the_process():
     long_q = "C" * 20_000
     expected = f"h:{hashlib.sha256(long_q.encode('utf-8')).hexdigest()[:32]}"
 
-    assert main._cache_query_component(long_q) == expected
+    assert main._cache_key_component(long_q) == expected
 
 
 def test_megabyte_query_produces_a_bounded_vec_key(monkeypatch):
@@ -298,7 +298,7 @@ def test_megabyte_query_produces_a_bounded_vec_key(monkeypatch):
         assert key.startswith("vec:dense-model|sparse-model:h:")
     # The key is bounded because the text is digested, not because the text was
     # quietly dropped: the encoder still got a full-length (clamped) query.
-    assert dense.seen and len(dense.seen[0]) == config.SEARCH_QUERY_MAX_CHARS
+    assert dense.seen and len(dense.seen[0]) == config.RETRIEVAL_QUERY_MAX_CHARS
 
 
 def test_megabyte_query_produces_a_bounded_retrieve_key(monkeypatch):
@@ -336,6 +336,66 @@ def test_long_but_accepted_query_produces_a_bounded_search_key(monkeypatch):
     assert key.startswith("search:h:")
 
 
+def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
+    """Scope of this fix, stated honestly.
+
+    The six facet params (`industry`, `dealtype`, `author`, `content_type`,
+    `from_date`, `to_date`) are plain `Query(None)` strings interpolated raw
+    into the same two keys by `facet_cache_token` and `_filter_token`, so a
+    5000-char `author` still yields a ~3 KB `search:` key and a ~5 KB
+    `retrieve:` key. That is a real residual -- and it is NOT fixed here,
+    because #252 already owns it and does it strictly better: its
+    `input_hygiene.split_facet_values` rejects a facet over 10 values of 100
+    chars with a 400, and its `build_cache_key` digests any key body over
+    MAX_KEY_LEN=256, which covers the filter JSON too. Re-deriving a weaker
+    digest here would collide with that PR and would still let a megabyte of
+    facet through to the Qdrant filter.
+
+    What this PR does own, and what this asserts, is the QUERY segment: even
+    with a long facet present, the query must be a digest rather than raw
+    text, so no unbounded query can reach the key on this path either.
+    """
+    cache = _FakeCache()
+    monkeypatch.setattr(main, "cache", cache)
+    monkeypatch.setattr(main, "record_search", _noop_record_search)
+    monkeypatch.setattr(main.config, "ENABLE_CLICK_BOOST", False)
+    monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
+    _wire_encoders(monkeypatch)
+    monkeypatch.setattr(main, "retrieve_with_auto_facet_fallback", _fake_retrieve)
+
+    resp = _client.get("/search", params={"q": "A" * 300, "author": "B" * 5000})
+
+    assert resp.status_code == 200
+    assert cache.gets
+    key = cache.gets[0]
+    # The key must carry the query's digest verbatim, and none of its text.
+    expected = main._cache_key_component("A" * 300)
+    assert expected.startswith("h:") and len(expected) == 34
+    assert expected in key, f"key does not carry the query digest: {key[:80]!r}"
+    assert "A" * 200 not in key, "the raw query reached the key"
+
+
+def test_the_retrieve_key_digests_its_query_segment_under_a_long_filter(monkeypatch):
+    """The retrieve: key is built at a different call site from the search:
+    key, so the query segment needs its own assertion. As above, the filter
+    segment itself remains #252's to bound."""
+    cache = _FakeCache()
+    monkeypatch.setattr(main, "cache", cache)
+    _wire_encoders(monkeypatch)
+    monkeypatch.setattr(main, "rerank", _passthrough_rerank)
+    monkeypatch.setattr(main.config, "ENABLE_ENTITY_BOOST", False)
+    qfilter = main.build_facet_filter(industry=None, dealtype=None, author="B" * 5000,
+                                      from_date=None, to_date=None, content_type=None)
+
+    _run(main.retrieve_and_rerank("A" * 300, 4, qfilter))
+
+    assert cache.gets
+    key = cache.gets[0]
+    expected = main._cache_key_component("A" * 300)
+    assert expected in key, f"key does not carry the query digest: {key[:80]!r}"
+    assert "A" * 200 not in key, "the raw query reached the key"
+
+
 # --- nothing unbounded reaches a tokenizer --------------------------------
 
 
@@ -345,9 +405,9 @@ def test_dense_encode_never_sees_more_than_the_limit(monkeypatch):
 
     _run(main.hybrid_search("A" * 1_000_000, 4))
 
-    assert dense.seen == ["A" * config.SEARCH_QUERY_MAX_CHARS]
+    assert dense.seen == ["A" * config.RETRIEVAL_QUERY_MAX_CHARS]
     # The sparse encoder tokenizes the same text on the same miss.
-    assert sparse.seen[0] == ["A" * config.SEARCH_QUERY_MAX_CHARS]
+    assert sparse.seen[0] == ["A" * config.RETRIEVAL_QUERY_MAX_CHARS]
 
 
 def test_cross_encoder_never_sees_more_than_the_limit(monkeypatch):
@@ -358,7 +418,7 @@ def test_cross_encoder_never_sees_more_than_the_limit(monkeypatch):
 
     assert reranker.pairs
     for query_side, _passage in reranker.pairs:
-        assert len(query_side) == config.SEARCH_QUERY_MAX_CHARS
+        assert len(query_side) == config.RETRIEVAL_QUERY_MAX_CHARS
 
 
 def test_body_rescue_never_sees_more_than_the_limit(monkeypatch):
@@ -376,10 +436,45 @@ def test_body_rescue_never_sees_more_than_the_limit(monkeypatch):
 
     assert reranker.pairs, "body_rescue must actually have reached the reranker"
     for query_side, passage in reranker.pairs:
-        assert len(query_side) <= config.SEARCH_QUERY_MAX_CHARS
+        assert len(query_side) <= config.RETRIEVAL_QUERY_MAX_CHARS
         # The passage side is the article window and is never truncated by this
         # bound — clamping the query must not cost the window its context.
         assert "body" in passage
+
+
+# --- chat's accepted length must reach the encoders in full ---------------
+
+
+def test_chats_accepted_message_length_is_not_silently_cut(monkeypatch):
+    """Chat accepts up to MAX_CONTENT_LEN and puts the WHOLE message in the LLM
+    prompt. If retrieval clamped chat to /search's 512, the model would see
+    terms retrieval never matched -- a relevance bug, not a performance trade.
+    This pins the two limits as separate, agreeing values."""
+    from app.chat import MAX_CONTENT_LEN
+
+    assert config.RETRIEVAL_QUERY_MAX_CHARS == MAX_CONTENT_LEN
+    # The two bounds really are different knobs, not the same number twice.
+    assert config.RETRIEVAL_QUERY_MAX_CHARS != config.SEARCH_QUERY_MAX_CHARS
+
+
+def test_an_8000_char_chat_message_reaches_every_encoder_in_full(monkeypatch):
+    """The end-to-end version of the above: a message chat ACCEPTS must arrive
+    at the dense encoder, the sparse encoder and the cross-encoder unmangled."""
+    from app.chat import MAX_CONTENT_LEN
+
+    dense, sparse = _wire_encoders(monkeypatch)
+    reranker = _RecordingReranker()
+    monkeypatch.setitem(main.state, "reranker", reranker)
+    monkeypatch.setattr(main, "cache", _FakeCache())
+    message = "zeta " * (MAX_CONTENT_LEN // 5)
+    assert len(message) <= MAX_CONTENT_LEN
+
+    _run(main.hybrid_search(message, 4))
+    _run(main.rerank(message, [_article(1, 0.9), _article(2, 0.8)]))
+
+    assert dense.seen == [message]
+    assert sparse.seen[0] == [message]
+    assert [q for q, _ in reranker.pairs] == [message, message]
 
 
 def test_a_normal_query_reaches_the_encoders_unharmed(monkeypatch):

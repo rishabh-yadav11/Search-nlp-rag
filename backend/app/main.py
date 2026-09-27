@@ -662,17 +662,19 @@ async def hybrid_search(
     # independent of the qfilter, so it is cached in Redis keyed by the
     # embedding models (a model change invalidates it). Repeated queries with
     # different facet/date filters skip encoding entirely.
-    # Defence in depth for every caller, not just /search (whose `q` is already
-    # bounded by FastAPI at SEARCH_QUERY_MAX_CHARS). Two things reach here
-    # above that bound: chat allows an 8000-char message
-    # (chat.MAX_CONTENT_LEN), and expand_query only ever grows the string, so
-    # an in-limit input can be over the limit again by the time it gets here.
-    # The clamp happens before the cache key is built so the key and the
-    # embedded text always describe the same string.
-    query = query[: config.SEARCH_QUERY_MAX_CHARS]
+    # Bound the text that reaches the encoders, for EVERY caller. /search is
+    # already refused at the edge beyond SEARCH_QUERY_MAX_CHARS, so this never
+    # binds for it; the bound that matters here is RETRIEVAL_QUERY_MAX_CHARS,
+    # which is chat's own accepted message length (chat.MAX_CONTENT_LEN) so
+    # that the LLM prompt and this retrieval always see the same question.
+    # expand_query only ever grows the string, so even an in-limit input can be
+    # over the limit again by the time it gets here. The clamp happens before
+    # the cache key is built so the key and the embedded text always describe
+    # the same string.
+    query = query[: config.RETRIEVAL_QUERY_MAX_CHARS]
     vec_key = (
         f"vec:{config.EMBED_MODEL}|{config.SPARSE_MODEL}:"
-        f"{_cache_query_component(query)}"
+        f"{_cache_key_component(query)}"
     )
     vec = await cache.get(vec_key)
     if vec is None:
@@ -735,9 +737,9 @@ async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle
         return results
     # Bound the query side of every (query, passage) pair: the cross-encoder
     # tokenizes both sides, so an unbounded query is the same CPU-spike path
-    # the dense encoder has above. /search already rejects an over-long q with
-    # 422; this clamp covers chat's 8000-char message and expanded queries.
-    query = query[: config.SEARCH_QUERY_MAX_CHARS]
+    # the dense encoder has above. See RETRIEVAL_QUERY_MAX_CHARS in config for
+    # why this is chat's limit and not /search's 512.
+    query = query[: config.RETRIEVAL_QUERY_MAX_CHARS]
     pairs = [(query, f"{a.title}. {a.summary or ''}".strip()) for a in results]
     async with inference_lock:
         logits = await asyncio.to_thread(state["reranker"].predict, pairs)
@@ -852,11 +854,11 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
         return articles
     # Same bound as rerank(), and for the same reason: this is the second
     # cross-encoder call site, and the clamp in rerank() is a local that cannot
-    # reach here. Chat drives this with a message of up to MAX_CONTENT_LEN
-    # (8000) plus query expansion, so the query side of each pair here is
-    # genuinely unbounded without it. Clamped before the tokenization below so
-    # the lexical window and the rerank agree on the same string.
-    query = query[: config.SEARCH_QUERY_MAX_CHARS]
+    # reach here. Chat drives this with a message of up to MAX_CONTENT_LEN plus
+    # query expansion, so the query side of each pair here is genuinely
+    # unbounded without it. Clamped before the tokenization below so the
+    # lexical window and the rerank agree on the same string.
+    query = query[: config.RETRIEVAL_QUERY_MAX_CHARS]
     tokens = _query_content_tokens(query)
     if not tokens:
         return articles
@@ -965,26 +967,27 @@ def _filter_token(qfilter: Filter | None) -> str:
     return json.dumps(qfilter.model_dump(), sort_keys=True, default=str)
 
 
-def _cache_query_component(query: str) -> str:
-    """Bounded, deterministic cache-key fragment for a query string.
+def _cache_key_component(value: str) -> str:
+    """Bounded, deterministic cache-key fragment for a request-supplied string.
 
     The retrieval caches (``vec:``, ``retrieve:``, ``search:``) key on the
-    query text itself, which is fine for a normal query but makes the key as
-    long as the request: a megabyte of ``q`` becomes a megabyte-scale Redis
-    key (multi-KB across the key, plus the memory the server copies on every
-    GET/SET). Rather than truncating the text — which would collide distinct
-    long queries onto one key and return another query's results — a long
-    query is replaced by a truncated sha256 of its UTF-8 bytes, prefixed with
-    ``h:`` so a digest can never be confused with a short literal query that
-    happens to look like hex. Short queries keep their exact previous key, so
-    existing cache entries still hit.
+    query text and on the facet values, which is fine for a normal request but
+    makes the key as long as the request: a megabyte of ``q`` becomes a
+    megabyte-scale Redis key (multi-KB across the key, plus the memory the
+    server copies on every GET/SET). Rather than truncating the text — which
+    would collide distinct long values onto one key and serve a different
+    query's or a different facet filter's results — a long value is replaced
+    by a truncated sha256 of its UTF-8 bytes, prefixed with ``h:`` so a digest
+    can never be confused with a short literal value that happens to look like
+    hex. Short values keep their exact previous key, so existing cache entries
+    still hit.
 
-    No caller parses a query back out of a key: every one of these keys is
+    No caller parses a value back out of a key: every one of these keys is
     written and read only through this function's owning call site.
     """
-    if len(query) <= config.CACHE_KEY_QUERY_MAX_CHARS:
-        return query
-    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:32]
+    if len(value) <= config.CACHE_KEY_QUERY_MAX_CHARS:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
     return f"h:{digest}"
 
 
@@ -1042,7 +1045,7 @@ async def retrieve_and_rerank(
     # are already scoped by the date filter and need no extra ranking boost.
     recency_boost = is_recency_intent(q)
     cache_key = (
-        f"retrieve:{_cache_query_component(q)}:{top_k}:{_filter_token(qfilter)}"
+        f"retrieve:{_cache_key_component(q)}:{top_k}:{_filter_token(qfilter)}"
     )
     cached = await cache.get(cache_key)
     if cached is not None:
@@ -1298,7 +1301,7 @@ async def search(
     # otherwise /search expands twice and diverges from the chat pipeline.
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
     cache_key = (
-        f"search:{_cache_query_component(retrieval_q)}:{eff_top_k}:"
+        f"search:{_cache_key_component(retrieval_q)}:{eff_top_k}:"
         f"{facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type)}"
     )
     filtered = any((industry, dealtype, author, content_type, from_date, to_date))

@@ -398,11 +398,26 @@ class Config:
 
     # Ceiling on the raw query embedded in a Redis cache key. A query longer
     # than this is replaced by a truncated sha256 digest (see
-    # main._cache_query_component) so the key stays short and bounded while
+    # main._cache_key_component) so the key stays short and bounded while
     # remaining deterministic — a long query must not silently share a key
     # with a different long query, which is why the digest replaces the text
     # rather than the text being cut.
     CACHE_KEY_QUERY_MAX_CHARS = int(os.getenv("CACHE_KEY_QUERY_MAX_CHARS", "128"))
+
+    # Ceiling on the query text the SHARED retrieval path hands to the
+    # transformers (hybrid_search's dense/sparse encode, rerank's
+    # cross-encoder pairs, body_rescue's second pass). This is deliberately a
+    # different knob from SEARCH_QUERY_MAX_CHARS, and deliberately not equal
+    # to it: /search and chat do not agree on how long a question may be.
+    # /search refuses anything longer than SEARCH_QUERY_MAX_CHARS at the HTTP
+    # edge, so this bound never binds for it. Chat ACCEPTS up to
+    # chat.MAX_CONTENT_LEN (8000) and puts the whole message in the LLM prompt,
+    # so clamping its retrieval to 512 would silently drop the caller's own
+    # words from the search while the model still read them -- a relevance bug,
+    # not a performance trade. The default therefore matches what chat already
+    # accepts, which keeps the prompt and the retrieval query in agreement, and
+    # still bounds every tokenizer against the megabyte input #241 reported.
+    RETRIEVAL_QUERY_MAX_CHARS = int(os.getenv("RETRIEVAL_QUERY_MAX_CHARS", "8000"))
 
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch
