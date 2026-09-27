@@ -236,10 +236,20 @@ def _stubs(tmp_path, *, with_certbot=True, nginx_t_exit=0):
 
 def _base_env(tmp_path, bindir, log, **over):
     """Every knob the nginx and tls stages can write to, redirected into
-    tmp_path; the shipped defaults point at /etc/nginx and /var/www."""
+    tmp_path; the shipped defaults point at /etc/nginx and /var/www.
+
+    Every knob is set explicitly, defaults included: the mode must be decided
+    by what the test asks for, never by a value leaked in from the environment
+    pytest happens to be started in. NGINX_TLS belongs in that list for the
+    same reason as the path knobs -- it is a documented user-facing override
+    (setup.sh, README), so it is the one an operator running the suite is most
+    likely to have exported, and an inherited "off" or "on" would decide the
+    rendered posture for tests that never asked for a mode.
+    """
     for parent in ("sites-available", "sites-enabled"):
         (tmp_path / "nginx" / parent).mkdir(parents=True, exist_ok=True)
     env = {
+        "NGINX_TLS": "auto",
         "LE_DOMAIN": "search.example.com",
         "LE_EMAIL": "ops@example.com",
         "LE_ROOT": str(tmp_path / "letsencrypt"),
