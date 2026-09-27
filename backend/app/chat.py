@@ -440,6 +440,25 @@ class ChatStore:
             updated_at=ts,
         )
 
+    async def _rename_if_untitled(self, session: SessionOut, title: str) -> None:
+        """Name a conversation ONLY while it is still untitled, decided by the
+        UPDATE's own WHERE clause rather than by a title read earlier. That is
+        what makes auto-titling safe while a turn is in flight: a rename the
+        user made in the meantime has already changed the row, so the guard no
+        longer matches and the user's name wins instead of this late write
+        clobbering it. It costs the same single UPDATE + COMMIT that the
+        re-read it replaces was guarding. Titles are always stored stripped
+        (see rename_session), so matching the two untitled spellings exactly
+        covers every reachable value."""
+        clean = (title or "").strip()[:200]
+        db = self._require_db()
+        ts = _now()
+        await db.execute(
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND title IN ('', 'New chat')",
+            (clean, ts, session.id),
+        )
+        await db.commit()
+
     async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
         session = await self.get_session(session_id, user_id)
         if session is None:
@@ -2383,12 +2402,16 @@ async def _start_turn(
 
 
 async def _auto_title(s: ChatStore, session: SessionOut, question: str) -> None:
-    """Name a still-untitled conversation after its first question. `session`
-    is the row _start_turn() already authorised, so this reads nothing; if the
-    session was deleted mid-turn the UPDATE simply matches no row, the same
-    no-op the old re-read produced."""
+    """Name a still-untitled conversation after its first question. Reads
+    nothing: the untitled test that matters is re-evaluated by the UPDATE
+    itself (_rename_if_untitled), so a rename the user made while the turn was
+    in flight is never clobbered, and a conversation deleted mid-turn no-ops."""
+    # A conversation that already had a real name at turn start is left alone
+    # without touching the database. The only way that name could have become
+    # untitled is the user deliberately blanking it mid-turn, which is no
+    # reason to overwrite it with the question.
     if session.title.strip() in ("", "New chat"):
-        await s._rename_authorized(session, question[:60] or "New chat")
+        await s._rename_if_untitled(session, question[:60] or "New chat")
 
 
 @router.post("/sessions", response_model=SessionOut)

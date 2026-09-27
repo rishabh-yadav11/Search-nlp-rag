@@ -532,6 +532,42 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
         _run(chat_store.close())
 
 
+def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, monkeypatch):
+    """#259 stopped re-reading the session before auto-titling, so the untitled
+    test now has to come from the UPDATE itself. A rename that lands while the
+    answer is being produced must survive: the user's chosen name wins, not the
+    question text. Before #259 the pre-write re-read gave this for free; this
+    pins it so the cheap path cannot quietly give it back."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def rename_mid_turn(question, history):
+            # The user renames the conversation while the answer is in flight.
+            await chat_store.rename_session(sid, user_id, "My carefully chosen name")
+            return "An answer [1].", [], None, 1, 1, 0.0
+
+        monkeypatch.setattr(chat_module, "_run_turn", rename_mid_turn)
+
+        r = client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "Who invested in fintech?"},
+        )
+        assert r.status_code == 200
+
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert detail["title"] == "My carefully chosen name"
+        # The turn itself still completed and persisted normally.
+        assert [m["content"] for m in detail["messages"]] == [
+            "Who invested in fintech?", "An answer [1].",
+        ]
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
 def test_api_usage_stats(tmp_path, monkeypatch):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
