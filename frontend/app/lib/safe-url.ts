@@ -15,8 +15,9 @@
  * while a naive `startsWith('javascript:')` sees nothing dangerous.
  *
  * Where the guard is deliberately *stricter* than the browser it says so at the
- * point of difference: raw C0 controls and NBSP/BOM are refused even though the
- * browser would treat some of those as harmless relative paths. Never looser.
+ * point of difference: raw C0 controls, NBSP/BOM and raw backslashes are
+ * refused even though the browser would treat some of those as harmless
+ * relative paths or same-origin navigations. Never looser.
  */
 
 /** Only these two schemes may ever reach an `href`. */
@@ -100,9 +101,10 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   // `trim()` is deliberately left in place. It also strips NBSP (U+00A0) and
   // BOM (U+FEFF), which the URL parser does *not* strip, so a NBSP-prefixed
   // `javascript:` is blocked here but would be a harmless relative path in the
-  // browser. That is one of two places this guard is stricter than the browser
-  // (the other is CONTROL_CHAR_RE below); both err towards blocking, and
-  // loosening `trim()` would reintroduce the risk.
+  // browser. That is one of three places this guard is stricter than the
+  // browser (the others are CONTROL_CHAR_RE and the backslash check below);
+  // all three err towards blocking, and loosening `trim()` would reintroduce
+  // the risk.
   const raw = url.trim()
   if (!raw) return false
 
@@ -111,6 +113,17 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   // `\x00//host` is parsed as a real protocol-relative escape. Rejecting the
   // raw form is what keeps the server verdict equal to the client verdict.
   if (CONTROL_CHAR_RE.test(raw)) return false
+
+  // A raw backslash is a second spelling of `/` to the WHATWG parser for every
+  // special scheme, so `https:/\evil.com`, `https:\\evil.com` and
+  // `https:\/evil.com` all parse to `https://evil.com/`. A scheme-prefixed
+  // escape therefore lands on an off-origin host *with* an `https:` protocol,
+  // which is exactly what SAFE_PROTOCOLS below admits, so no amount of scheme
+  // allowlisting catches it. Refusing backslashes outright is the third place
+  // this guard is stricter than the browser, and the cheapest one: a real
+  // article URL carries no raw backslash, because the parser consumes one as a
+  // separator in a special scheme and percent-encodes one in any other.
+  if (raw.includes('\\')) return false
 
   if (PROTOCOL_RELATIVE_RE.test(raw)) return false
 

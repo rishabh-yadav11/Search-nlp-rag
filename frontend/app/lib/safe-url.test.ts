@@ -50,6 +50,40 @@ describe('isSafeUrl — blocks protocol-relative and backslash escapes', () => {
   })
 })
 
+// The escapes above carry no scheme, so `PROTOCOL_RELATIVE_RE` and the
+// origin comparison catch them. These do: the WHATWG parser reads a backslash
+// as a separator for special schemes, so the backslash spelling still ends up
+// on an `https:` URL and the scheme allowlist alone waves it through. A pinned
+// `false` (not a parity assertion) is the only assertion that catches this.
+describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
+  const SCHEME_ESCAPES = [
+    'https:/\\evil.com',
+    'https:\\\\evil.com',
+    'https:\\/evil.com',
+    'http:/\\evil.com',
+    'HTTPS:/\\evil.com',
+    'https:\\\\evil.com/path?q=1',
+  ]
+
+  it.each(SCHEME_ESCAPES)('rejects %j', (payload) => {
+    expect(isSafeUrl(payload, BASE)).toBe(false)
+  })
+
+  it.each(SCHEME_ESCAPES)('rejects %j on the server and on the client alike', (payload) => {
+    vi.stubGlobal('window', undefined)
+    expect(isSafeUrl(payload)).toBe(false)
+    vi.stubGlobal('window', { location: { href: 'https://app.example.com/chat' } })
+    expect(isSafeUrl(payload)).toBe(false)
+  })
+
+  it('resolves those payloads to an off-origin https URL in a real parser', () => {
+    // Pins *why* the guard has to refuse them: without the backslash check the
+    // URL is a well-formed off-origin https link, so nothing downstream of the
+    // scheme check can object to it.
+    expect(new URL('https:/\\evil.com', BASE).href).toBe('https://evil.com/')
+  })
+})
+
 describe('isSafeUrl — blocks malformed and non-string input', () => {
   const REJECTED = ['', '   ', 'http:', 'https://', undefined, null, 42, {}, ['https://ok.com']]
 
@@ -203,10 +237,27 @@ describe('isSafeUrl — server/client parity', () => {
   // https://app.vccircle.com/) rejects them as off-origin. A parity assertion
   // alone would not catch that, because it only compares the two verdicts; the
   // explicit `false` pins the actual outcome.
-  //
-  // The single-backslash form is deliberately absent: `\ssr.invalid/x` is one
-  // separator, not two, so the browser resolves it to a same-origin path
-  // (…/ssr.invalid/x) and both environments legitimately allow it.
+
+  // The single-backslash form `\ssr.invalid/x` is not in this list because it
+  // is a same-origin path in a browser, not an escape. It is still refused,
+  // by the backslash check rather than by the origin comparison, so it is
+  // pinned separately below instead of being implied by this block.
+  it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
+    'rejects the backslash escape %j aimed at the stand-in origin',
+    (url) => {
+      expect(verdictIn(url, false)).toBe(false)
+      expect(verdictIn(url, true)).toBe(false)
+    }
+  )
+
+  it('refuses the same-origin single-backslash path on both sides', () => {
+    // `\ssr.invalid/x` is one separator, not two, so the browser treats it as
+    // a local path and the guard is deliberately stricter here. Pinning the
+    // outcome is what stops the strictness being lost silently: the CORPUS
+    // parity assertion above still passes either way.
+    expect(verdictIn('\\ssr.invalid/x', false)).toBe(false)
+    expect(verdictIn('\\ssr.invalid/x', true)).toBe(false)
+  })
   it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
     'rejects the backslash escape %j aimed at the stand-in origin',
     (url) => {
