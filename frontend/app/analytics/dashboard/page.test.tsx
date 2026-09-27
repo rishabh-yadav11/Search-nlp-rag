@@ -11,6 +11,7 @@
 import { render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TOKEN_KEY, clearMeCache } from '../../lib/auth'
+import { formatEpochDateTime } from '../../lib/format'
 import AnalyticsDashboardPage from './page'
 
 type StubResponse = {
@@ -90,8 +91,12 @@ function cellsOf(label: string): string[] {
   return Array.from(row.querySelectorAll('td')).map((c) => c.textContent ?? '')
 }
 
+// The shared formatter, imported rather than re-derived, so this expectation
+// cannot drift from what the page actually calls. The point of the assertion
+// is the per-row identity (each row shows ITS timestamp, not the first one's),
+// not a second copy of the date format.
 function renderedAt(ts: number): string {
-  return new Date(ts * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })
+  return formatEpochDateTime(ts)
 }
 
 beforeEach(() => {

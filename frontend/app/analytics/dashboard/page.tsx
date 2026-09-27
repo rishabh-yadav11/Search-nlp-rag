@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
-import { API_BASE, authHeaders, getMe, getToken, redirectToLogin } from '../../lib/auth'
+import { API_BASE, authHeaders, getMe, getToken, logout, redirectToLogin } from '../../lib/auth'
+import { formatClockTime, formatCost, formatEpochDateTime } from '../../lib/format'
 
 interface Summary {
   searches_total: number
@@ -40,12 +41,6 @@ interface ChatStats {
 
 function fmt(n: number | null | undefined): string {
   return n == null || Number.isNaN(n) ? '0' : Number(n).toLocaleString()
-}
-
-function usd(v: number | null | undefined): string {
-  if (v == null) return '$0'
-  if (v === 0) return '$0'
-  return '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 })
 }
 
 function pct(v: number | null | undefined): string {
@@ -147,8 +142,8 @@ function ChatTable({
                 conversation text itself must never reach this table. */}
             <td title={sessionId}>Session {sessionId.slice(0, 8)}</td>
             <td className="num">{fmt(msgs)}</td>
-            <td className="num">{cost ? usd(value) : fmt(value)}</td>
-            <td>{new Date(ts * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</td>
+            <td className="num">{cost ? formatCost(value) : fmt(value)}</td>
+            <td>{formatEpochDateTime(ts)}</td>
           </tr>
         ))}
       </tbody>
@@ -262,7 +257,7 @@ export default function AnalyticsDashboardPage() {
       if ('degraded' in sFeed || 'degraded' in cFeed) {
         setUpdated('Unavailable — live figures are missing, not zero')
       } else {
-        setUpdated(`Updated ${new Date().toLocaleTimeString()}`)
+        setUpdated(`Updated ${formatClockTime(Date.now())}`)
       }
     } catch (e) {
       // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.
@@ -286,10 +281,6 @@ export default function AnalyticsDashboardPage() {
     }
   }, [])
 
-  function logout() {
-    fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
-    redirectToLogin()
-  }
 
   const d = summary
   const s = chat
@@ -402,7 +393,7 @@ export default function AnalyticsDashboardPage() {
               <Card label="Conversations" value={fmt(s.sessions)} hint={`today: ${fmt(s.sessions_today)}`} />
               <Card label="Messages" value={fmt(s.messages)} hint="user + assistant" />
               <Card label="Total tokens" value={fmt(s.total_tokens)} hint="prompt + completion" />
-              <Card label="Total cost" value={usd(s.total_cost)} hint="across all conversations" warn={s.total_cost > 0} />
+              <Card label="Total cost" value={formatCost(s.total_cost)} hint="across all conversations" warn={s.total_cost > 0} />
               <Card label="Avg latency" value={`${s.avg_latency_ms} ms`} hint="per assistant reply" />
             </div>
             <div className="dash-grid2">

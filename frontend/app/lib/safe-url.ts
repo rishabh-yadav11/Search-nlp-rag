@@ -1,20 +1,34 @@
 /**
- * Centralised guard for URLs that come from the backend (article `url`,
- * retrieval source `url`, …) and end up in an `href`.
+ * Centralised guards for the two kinds of untrusted string that can end up
+ * making the browser navigate somewhere:
+  - a URL from the backend (article `url`, retrieval source `url`, …) rendered
+    in an `href` — see `isSafeUrl`;
+  - a `next` path from a query string that is used as a post-auth redirect
+    target — see `isSafeRedirect`.
  *
- * Threat model: a poisoned or attacker-influenced record can put an arbitrary
- * string in `url`. Rendering that string in an `href` lets
+ * Both live here, in one plain (non-`'use client'`) module, because they share
+ * the same primitives (`CONTROL_CHAR_RE`, `PROTOCOL_RELATIVE_RE`,
+ * `SCHEME_RE`) and the same threat model: an attacker-influenced string must
+ * never leave the first party.
+ *
+ * Threat model for `isSafeUrl`: a poisoned or attacker-influenced record can
+ * put an arbitrary string in `url`. Rendering that string in an `href` lets
  * `javascript:` / `data:` execute on click and `//host` (or its backslash
  * spellings) silently navigate off-origin for phishing.
  *
- * The decision is made with the WHATWG `URL` parser — the exact parser the
+ * Threat model for `isSafeRedirect`: `?next=` is read straight off the URL of
+ * `/login` and `/signup` and handed to `router.replace` / `location.replace`.
+ * Anything that resolves to another origin is an open redirect, usable for
+ * phishing with a link on this origin in front of it.
+ *
+ * The decisions are made with the WHATWG `URL` parser — the exact parser the
  * browser uses for `href` — so "what we blocked" and "what the browser does"
  * cannot disagree. A raw-string prefix check cannot do that: browsers strip
  * leading C0 controls and spaces, and strip tab/CR/LF from anywhere in the URL,
  * so `" javascript:x"`, `"\x01javascript:x"` and `"java\tscript:x"` all execute
  * while a naive `startsWith('javascript:')` sees nothing dangerous.
  *
- * Where the guard is deliberately *stricter* than the browser it says so at the
+ * Where a guard is deliberately *stricter* than the browser it says so at the
  * point of difference: raw C0 controls, NBSP/BOM and raw backslashes are
  * refused even though the browser would treat some of those as harmless
  * relative paths or same-origin navigations. Never looser.
@@ -53,7 +67,7 @@ const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+\-.]*:/
  * to refuse rather than silently normalise, since which controls a given
  * browser strips is exactly the ambiguity this guard exists to remove.
  */
-const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/
+export const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/
 
 /**
  * Rejects protocol-relative references (`//host`), including the backslash
@@ -153,6 +167,62 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   // invariant directly and would catch a new escape shape that neither regex
   // anticipated, rather than relying on the parser to normalise it safely.
   if (!SCHEME_RE.test(raw) && parsed.origin !== baseUrl.origin) return false
+
+  return true
+}
+
+/**
+ * True only for a safe, same-origin, root-relative redirect path. A type guard
+ * on purpose: the value is both a test and the thing the caller goes on to
+ * use, so `next` narrows from `string | null` (the `URLSearchParams.get`
+ * result) to `string` in one step, and every post-auth route narrows the same
+ * way.
+ *
+ * A safe target must start with exactly one `/`, and is then refused if it is:
+ *  - a protocol-relative reference, in either the `//` or the backslash
+ *    spelling — browsers normalise `\` to `/` for special schemes, so
+ *    `//evil.com`, `\\evil.com`, `/\evil.com` and `\/evil.com` are one escape;
+ *  - a string carrying a C0 control or DEL. The URL parser REMOVES tab, CR and
+ *    LF, so `/\t/evil.com` reads as a harmless local path here and as
+ *    `//evil.com` in the browser. This is the case the two pre-consolidation
+ *    copies both missed; `CONTROL_CHAR_RE` closes it.
+ *
+ * The leading `/` requirement is what rules out an absolute reference: a value
+ * carrying a scheme (`https:`, `javascript:`, `data:`, …) cannot satisfy
+ * `startsWith('/')` in the first place. The `SCHEME_RE` test at the end of the
+ * function is therefore unreachable, and is kept only as belt-and-braces for a
+ * future refactor of that first check — the same defence-in-depth posture
+ * `isSafeUrl` takes with its own origin comparison above. A sweep of every
+ * two-character input found nothing that reaches it.
+ *
+ * Rejected means "the caller falls back to its default" (`/chat`, `/`), never
+ * "the caller may pass it through".
+ *
+ * This is the ONLY implementation: `app/login/page.tsx`, `app/signup/page.tsx`
+ * and `redirectToLogin` in `app/lib/auth.ts` all use it, so the open-redirect
+ * protection cannot differ between them. A test asserts no frontend module
+ * declares a second one, and that this guard is never more permissive than
+ * either implementation it replaced.
+ */
+export function isSafeRedirect(next: unknown): next is string {
+  if (typeof next !== 'string' || next.length === 0) return false
+
+  // Raw string, not `url.trim()`: `isSafeUrl` trims because a leading space is
+  // something the browser will silently drop, but here a leading space already
+  // fails the `startsWith('/')` test below, and refusing control characters is
+  // the check that actually matters.
+  if (CONTROL_CHAR_RE.test(next)) return false
+
+  if (!next.startsWith('/')) return false
+
+  // Rejects `//evil.com` and every backslash spelling of the same escape.
+  if (PROTOCOL_RELATIVE_RE.test(next)) return false
+
+  // Belt-and-braces only, and unreachable while the `startsWith('/')` check
+  // above stands: a value that starts with `/` can never match a `^[a-zA-Z]`
+  // scheme prefix. Kept so a future loosening of that check cannot silently
+  // let a scheme through.
+  if (SCHEME_RE.test(next)) return false
 
   return true
 }

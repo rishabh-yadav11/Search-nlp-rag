@@ -1,4 +1,6 @@
 'use client'
+import { devApiBase, parseApiBaseUrl, readApiBaseEnv } from './api-base'
+import { isSafeRedirect } from './safe-url'
 
 export const TOKEN_KEY = 'vccircle_auth_token'
 
@@ -19,37 +21,13 @@ const TRUSTED_API_HOSTS: string[] = (process.env.NEXT_PUBLIC_TRUSTED_API_HOSTS |
 // a cross-origin base is trusted only over https AND when allow-listed, or when
 // it is a loopback address (http loopback is not a network cleartext risk). No
 // non-loopback cross-origin http base may ever be trusted.
-const ENV_API_BASE = process.env.NEXT_PUBLIC_API_BASE || ''
-const DEV_API_BASE = process.env.NODE_ENV === 'development' ? 'http://localhost:8001' : ''
+// The configured base and the dev default come from `app/lib/api-base.ts`, the
+// one module that owns the `NEXT_PUBLIC_API_BASE` read, the validation and the
+// dev-loopback constant, so this browser bundle and the edge middleware can
+// never disagree about what a valid base is.
+const ENV_API_BASE = readApiBaseEnv()
+const DEV_API_BASE = devApiBase()
 
-/**
- * Validate a candidate API base. Rejects anything that is not a proper http(s)
- * URL: no `javascript:`/other schemes, no protocol-relative URLs, no embedded
- * credentials, and no whitespace that could cause host confusion. Returns the
- * parsed URL (the trusted flag is derived by the caller via isSameOrigin /
- * TRUSTED_API_HOSTS).
- */
-function parseApiBase(value: string): URL | null {
-  if (!value || /\s/.test(value)) return null
-  // A root-relative path (e.g. "/api") is a same-origin relative base. Resolve
-  // it against the current origin so baseFromUrl keeps the path (and it is
-  // naturally same-origin → trusted). Without a window (SSR) we can't resolve an
-  // origin, so return null and let the caller fall back to a trusted empty base.
-  if (value.startsWith('/')) {
-    if (typeof window === 'undefined') return null
-    return new URL(value, window.location.origin)
-  }
-  let url: URL
-  try {
-    url = new URL(value)
-  } catch {
-    return null
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
-  // Embedded userinfo (e.g. `https://user@host`) is a red flag — reject.
-  if (url.username || url.password) return null
-  return url
-}
 
 /** True when `url` resolves to the same origin as the current document. An
  *  empty/relative base also resolves to same-origin, so callers should treat an
@@ -130,6 +108,10 @@ function isTrustedBase(base: string, url: URL | null): boolean {
 }
 
 function resolveApiBase(): { base: string; trusted: boolean } {
+  // A root-relative base is a same-origin base. It can only be resolved when
+  // there is a current origin, so SSR passes `undefined` and falls back to the
+  // safe empty (same-origin) base.
+  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : undefined
   // Runtime-injected base (`window.API_BASE`): it is the only attacker-reachable
   // vector (XSS / malicious inline script), so it is trusted ONLY when it is a
   // valid http(s) URL that is same-origin OR explicitly allow-listed. A
@@ -141,7 +123,7 @@ function resolveApiBase(): { base: string; trusted: boolean } {
   const winApiBase =
     (typeof window !== 'undefined' && (window as { API_BASE?: string }).API_BASE) || ''
   if (winApiBase) {
-    const url = parseApiBase(winApiBase)
+    const url = parseApiBaseUrl(winApiBase, currentOrigin)
     if (!url) {
       console.error(
         '[auth] window.API_BASE is not a valid http(s) URL; ignoring it and using the safe same-origin base.'
@@ -163,7 +145,7 @@ function resolveApiBase(): { base: string; trusted: boolean } {
   // so the Bearer token is not attached over cleartext.
   const trustedSource = ENV_API_BASE || DEV_API_BASE
   if (trustedSource) {
-    const url = parseApiBase(trustedSource)
+    const url = parseApiBaseUrl(trustedSource, currentOrigin)
     if (!url) {
       console.error(
         `[auth] Configured API base "${trustedSource}" is not a valid http(s) URL; falling back to the safe same-origin base.`
@@ -191,25 +173,6 @@ export const API_BASE = RESOLVED_API_BASE.base
 /** True only when API_BASE is a trusted backend allowed to receive the token. */
 export const API_BASE_TRUSTED = RESOLVED_API_BASE.trusted
 
-/**
- * Returns true only for a safe, same-origin, root-relative redirect path.
- * Safe means the value starts with exactly one `/` and is NOT:
- *  - a protocol-relative URL (e.g. `//evil.com`),
- *  - an absolute URL (e.g. `https://evil.com`),
- *  - an absolute path with an embedded scheme (any `:` before the first `/`
- *    or where the path begins with `//`).
- * Anything else is rejected and callers must fall back to a default like
- * `/chat` or `/`.
- */
-export function isSafeRedirect(next: unknown): next is string {
-  if (typeof next !== 'string' || next.length === 0) return false
-  if (!next.startsWith('/')) return false
-  // Reject protocol-relative URLs (`//evil.com`).
-  if (next.startsWith('//')) return false
-  // Reject any embedded scheme (`http:`, `javascript:`, etc.).
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(next)) return false
-  return true
-}
 
 export function getToken(): string | null {
   try {
@@ -321,6 +284,23 @@ export function clearMeCache(): void {
   meCache = undefined
   meCacheToken = null
   meCacheTs = 0
+}
+
+/**
+ * Sign out: revoke the session server-side and send the user to `/login`. The
+ * single implementation — the search page, the chat sidebar and the analytics
+ * dashboard all call this instead of each open-coding the same POST plus
+ * redirect.
+ *
+ * `redirectToLogin` already clears the stored token and the cached identity,
+ * so neither is repeated here. The logout request is fire-and-forget on
+ * purpose: the local session is dropped whether or not the backend call
+ * succeeds, so a network failure cannot leave the user stuck on an
+ * authenticated page.
+ */
+export function logout(): void {
+  fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
+  redirectToLogin()
 }
 
 /** Redirect to the login page (used when the backend rejects an expired token).

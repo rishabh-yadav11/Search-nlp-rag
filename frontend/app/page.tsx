@@ -7,12 +7,11 @@ import {
   API_BASE,
   API_BASE_TRUSTED,
   AuthUser,
-  authHeaders,
-  clearMeCache,
   getMe,
   getToken,
-  redirectToLogin,
+  logout,
 } from './lib/auth'
+import { formatDate, parseLocalDate } from './lib/format'
 import { isSafeUrl } from './lib/safe-url'
 
 type Result = {
@@ -160,11 +159,6 @@ export default function Page() {
   useEffect(() => {
     // Keep this component purely client-side and derived from lib/auth.
   }, [])
-  function logout() {
-    fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
-    clearMeCache()
-    redirectToLogin()
-  }
 
   useEffect(() => {
     return () => submittedRef.current?.controller.abort()
@@ -534,34 +528,6 @@ function ResultBlock({
         </div>
       )
   }
-}
-
-function parseLocalDate(s: string): number {
-  if (!s) return NaN
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const [y, m, d] = s.split('-').map(Number)
-    return new Date(y, m - 1, d).getTime()
-  }
-  return Date.parse(s)
-}
-
-function formatDate(s: string): string {
-  if (!s) return 'n/a'
-  const d = new Date(parseLocalDate(s))
-  if (isNaN(d.getTime())) return s
-  const now = Date.now()
-  const diff = now - d.getTime()
-  const minute = 60_000
-  const hour = 60 * minute
-  const day = 24 * hour
-  if (diff < minute) return 'just now'
-  if (diff < hour) return `${Math.floor(diff / minute)} minute${Math.floor(diff / minute) > 1 ? 's' : ''} ago`
-  if (diff < day) return `${Math.floor(diff / hour)} hour${Math.floor(diff / hour) > 1 ? 's' : ''} ago`
-  if (diff < 2 * day) return 'yesterday'
-  if (diff < 7 * day) return `${Math.floor(diff / day)} days ago`
-  if (diff < 30 * day) return `${Math.floor(diff / (7 * day))} week${Math.floor(diff / (7 * day)) > 1 ? 's' : ''} ago`
-  if (diff < 365 * day) return `${Math.floor(diff / (30 * day))} month${Math.floor(diff / (30 * day)) > 1 ? 's' : ''} ago`
-  return `${Math.floor(diff / (365 * day))} year${Math.floor(diff / (365 * day)) > 1 ? 's' : ''} ago`
 }
 
 function relevance(score: number): { label: string; cls: string } {
