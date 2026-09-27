@@ -41,6 +41,23 @@ logger = logging.getLogger(__name__)
 SIMILAR_ARTICLES_TTL_SECONDS = 3600  # 1 hour
 USER_RECOMMENDATIONS_TTL_SECONDS = 1800  # 30 minutes
 
+# Payload fields needed for ranking/display of recommendation results. The
+# article `body` is intentionally excluded: it is large (up to
+# BODY_CHAR_LIMIT chars per point) and only used for chat context, which fetches
+# bodies separately for the final sources (main._attach_bodies). Mirrors
+# main._PAYLOAD_FIELDS, minus the fields no recommender output ever reads.
+_RECOMMEND_PAYLOAD_FIELDS = [
+    "title",
+    "url",
+    "published_date",
+    "category",
+    "summary",
+    "author_names",
+    "industry_names",
+    "dealtype_names",
+]
+
+
 
 def _candidate_pool(limit: int, *, over: int = 1) -> int:
     """How many candidates a strategy fetches to fill a page of ``limit``.
@@ -145,7 +162,7 @@ async def get_similar_articles(
             # widening it to the shared pool would change this endpoint's
             # payload size rather than the quality of a selection.
             limit=limit * 3,
-            with_payload=True,
+            with_payload=_RECOMMEND_PAYLOAD_FIELDS,
             with_vectors=False,
         )
 
@@ -235,7 +252,7 @@ async def get_personalized_recommendations(
                         using="dense",  # Collection uses a named 'dense' vector
                         query_filter=qfilter,
                         limit=_candidate_pool(limit),
-                        with_payload=True,
+                        with_payload=_RECOMMEND_PAYLOAD_FIELDS,
                         with_vectors=False,
                     )
                     results.extend(pts.points)
@@ -257,7 +274,7 @@ async def get_personalized_recommendations(
                     collection_name=config.QDRANT_COLLECTION,
                     query_filter=category_filter,
                     limit=_candidate_pool(limit),
-                    with_payload=True,
+                    with_payload=_RECOMMEND_PAYLOAD_FIELDS,
                     with_vectors=False,
                 )
                 return pts.points
@@ -285,7 +302,7 @@ async def get_personalized_recommendations(
                     collection_name=config.QDRANT_COLLECTION,
                     limit=len(ids) * 5,
                     offset=None,
-                    with_payload=True,
+                    with_payload=_RECOMMEND_PAYLOAD_FIELDS,
                     with_vectors=False,
                     scroll_filter=qfilter,
                 )
@@ -415,7 +432,7 @@ async def get_trending_feed(
         points = await client.retrieve(
             collection_name=config.QDRANT_COLLECTION,
             ids=ids,
-            with_payload=True,
+            with_payload=_RECOMMEND_PAYLOAD_FIELDS,
             with_vectors=False,
         )
 
@@ -467,7 +484,7 @@ async def _get_latest_top_stories(
         pts, _ = await client.scroll(
             collection_name=config.QDRANT_COLLECTION,
             limit=_candidate_pool(limit, over=3),
-            with_payload=True,
+            with_payload=_RECOMMEND_PAYLOAD_FIELDS,
             with_vectors=False,
             scroll_filter=qfilter,
         )
@@ -534,7 +551,6 @@ def _format_articles(
             "published_date": payload.get("published_date"),
             "category": payload.get("category"),
             "summary": payload.get("summary", ""),
-            "body": payload.get("body", ""),
             "author_names": payload.get("author_names", []) or [],
             "industry_names": payload.get("industry_names", []) or [],
             "dealtype_names": payload.get("dealtype_names", []) or [],

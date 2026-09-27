@@ -1506,6 +1506,14 @@ class SimilarArticlesResponse(BaseModel):
     cached: bool = False
 
 
+# Bumped when the cached article shape changed. Entries written by the previous
+# shape still carry the full article `body` (up to BODY_CHAR_LIMIT chars per
+# article), and this endpoint returns the cached value verbatim, so a versioned
+# key is what stops those pre-deploy entries from being served for their hour.
+SIMILAR_CACHE_VERSION = "v2"
+
+
+
 class RecommendationsResponse(BaseModel):
     """Response for personalized recommendations."""
     user_id: str
@@ -1610,7 +1618,7 @@ async def get_similar(
 
     Uses dense vector similarity from Qdrant with optional category filtering.
     """
-    cached_key = f"recommend:similar:{article_id}:{limit}:{same_category}"
+    cached_key = f"recommend:similar:{SIMILAR_CACHE_VERSION}:{article_id}:{limit}:{same_category}"
     cached = await cache.get(cached_key)
     if cached:
         return SimilarArticlesResponse(
