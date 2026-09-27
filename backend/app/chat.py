@@ -56,12 +56,18 @@ MAX_CONTENT_LEN = 8000
 PREVIEW_LEN = 140
 MAX_TOKEN_SUM = 2**31 - 1
 AUDIT_LOG_MAX_LIMIT = 1000
-# The admin dashboard polls /analytics/chat every 30s, so the audit trail gains
-# a row on every tick. Rows are pruned here, alongside the conversation
+# The admin dashboard polls /analytics/chat every 30s, so the trail gains a
+# row on every tick. Rows are pruned here, alongside the conversation
 # retention sweep in `purge_expired`, so the hot write path stays a single
-# INSERT. Retention is in weeks rather than days: the trail exists to support
-# noticing a slow browse through other users' conversations, and a few days of
-# history cannot do that.
+# INSERT.
+#
+# What 90 days buys: the trail answers "which admin read cross-user chat
+# analytics, when, and how often". It does NOT support detecting a slow
+# browse through individual conversations — `action` is a constant and no
+# row records which sessions were returned, so a deliberate browse and an
+# idle open tab are indistinguishable. Per-subject attribution was
+# deliberately not added: it would put other users' session ids into the
+# audit table, trading this fix's own privacy goal for a weaker signal.
 AUDIT_RETENTION_DAYS = 90
 
 # Module-level store; set by main.lifespan (and by tests).
