@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { isSafeUrl } from './safe-url'
 
 // A fixed base keeps these tests independent of the jsdom document origin.
@@ -86,7 +86,16 @@ describe('isSafeUrl — relative URLs stay same-origin', () => {
 })
 
 describe('isSafeUrl — SSR parity', () => {
-  it('accepts a relative URL when no window is available (server render)', () => {
+  // jsdom always defines `window`, so the server path has to be forced or
+  // these assertions silently take the client branch and prove nothing.
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('uses the stand-in base when no window is available (server render)', () => {
+    vi.stubGlobal('window', undefined)
+    expect(typeof window).toBe('undefined')
+
     // The old helper passed `undefined` as the base during SSR, so every
     // relative URL threw and was rejected — server HTML then disagreed with
     // the client render after hydration.
@@ -94,6 +103,12 @@ describe('isSafeUrl — SSR parity', () => {
   })
 
   it('still rejects a javascript: URL when no window is available', () => {
+    vi.stubGlobal('window', undefined)
     expect(isSafeUrl('javascript:alert(1)')).toBe(false)
+  })
+
+  it('still blocks backslash escapes when no window is available', () => {
+    vi.stubGlobal('window', undefined)
+    expect(isSafeUrl('/\\evil.com')).toBe(false)
   })
 })
