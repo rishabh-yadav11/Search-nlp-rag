@@ -5,6 +5,7 @@ between tests."""
 
 import asyncio
 import importlib
+import logging
 
 import pytest
 import redis
@@ -1370,3 +1371,260 @@ def test_readiness_report_surfaces_unexpected_probe_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="probe machinery bug"):
         _run(health._readiness_report({}))
+
+
+# --- #279: what each probe is allowed to answer, and for whom ------------
+#
+# The three endpoints answer three different questions, and the bug this file
+# pins down is a consumer asking the wrong one:
+#
+#   /health      liveness.  "Is the process up?" It cannot fail by design, so
+#                it is the correct probe for the only question a restart can
+#                answer -- and the wrong one for "is the service healthy",
+#                because it reports nothing about any dependency.
+#   /ready       readiness. "Can this node serve?" Real answer, short cache,
+#                rate limited: right for a load balancer or orchestrator
+#                polling once per node, wrong for a watchdog (a cached verdict
+#                hides an outage for the rest of the TTL, and a 429 is
+#                indistinguishable from one).
+#   /ready/deep  readiness for host-local monitoring: the same report with no
+#                cache and no rate limit. This is what deploy/healthcheck.sh
+#                and setup.sh's deploy gate must use.
+
+
+class _PeerOverride:
+    """ASGI shim that pins the connection's client address in the scope.
+
+    TestClient always reports the peer as the string "testclient", which the
+    /ready/deep host-local gate correctly refuses. The watchdog and the deploy
+    gate reach the API from 127.0.0.1, so the cases that must be allowed have
+    to be exercised with a loopback peer rather than by weakening the gate.
+    """
+
+    def __init__(self, app, peer):
+        self.app = app
+        self.peer = peer
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            scope = dict(scope, client=self.peer)
+        await self.app(scope, receive, send)
+
+
+@pytest.fixture
+def host_client(client):
+    """A client whose socket peer is loopback, as a local `curl` would be."""
+    return TestClient(_PeerOverride(client.app, ("127.0.0.1", 54321)))
+
+
+@pytest.fixture
+def live_state(monkeypatch):
+    """A fully healthy process state, installed in the real app.main.state.
+
+    Endpoint tests elsewhere mock _readiness_report wholesale, which cannot
+    show that the endpoint and the report agree; these tests drive the real
+    report so the 200/503 a caller sees is the one the dependencies produce.
+    Returns the Qdrant double, whose `ok` flag is the outage switch.
+    """
+    from app import main
+
+    class FakeQdrant:
+        def __init__(self):
+            self.ok = True
+
+        async def collection_exists(self, name):
+            if not self.ok:
+                raise RuntimeError("qdrant is down")
+            return True
+
+    qdrant = FakeQdrant()
+    for key, value in (("model", object()), ("sparse_model", object()), ("reranker", object()), ("qdrant", qdrant)):
+        monkeypatch.setitem(main.state, key, value)
+    # No Redis URL: the report then reports cache "memory" and skips the ping,
+    # so these tests are about Qdrant, the models and the key.
+    monkeypatch.setattr(config, "REDIS_URL", "")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
+    return qdrant
+
+
+def test_health_answers_200_while_readiness_says_503(client, host_client, live_state):
+    """The two probes must disagree about a broken node, or the watchdog is
+    probing the wrong one.
+
+    /health is liveness and is allowed to keep answering 200 while Qdrant is
+    down: that is what tells a supervisor "restarting the process will not
+    help, a dependency is gone". It is NOT an answer about health, so a consumer
+    that needs one must use /ready (load balancer) or /ready/deep (watchdog).
+    """
+    assert host_client.get("/ready/deep").status_code == 200
+    live_state.ok = False
+
+    assert host_client.get("/ready/deep").status_code == 503
+    assert client.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("probe", ["/ready", "/ready/deep"])
+def test_a_placeholder_key_makes_readiness_fail_with_a_named_reason(client, host_client, live_state, probe, monkeypatch):
+    """The shipped .env.example value is 'your_key_here', and with it in place
+    chat answers 100% of questions from the canned fallback. That must be a 503
+    with the fault named, not a 200."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+
+    caller = host_client if probe == "/ready/deep" else client
+    r = caller.get(probe)
+
+    assert r.status_code == 503
+    assert r.json()["checks"]["llm"] == {"ok": False, "reason": "placeholder"}
+
+
+def test_a_real_key_makes_readiness_answer_200(client, live_state):
+    r = client.get("/ready")
+
+    assert r.status_code == 200
+    assert r.json()["checks"]["llm"] == {"ok": True, "reason": "ok"}
+
+
+def test_watchdog_probe_ignores_a_stale_cached_readiness(host_client, live_state):
+    """The cache is what would hide an outage from a watchdog.
+
+    /ready primes its cache with a healthy verdict; Qdrant then dies. /ready
+    still serves the cached 200 for the rest of READY_CACHE_TTL_SECONDS, which
+    is fine for a load balancer and fatal for a prober that acts on the answer
+    -- so /ready/deep must re-probe and report the outage on the same tick.
+    """
+    assert host_client.get("/ready").status_code == 200
+    live_state.ok = False
+
+    cached = host_client.get("/ready")
+    deep = host_client.get("/ready/deep")
+
+    assert cached.status_code == 200, "the cache is meant to serve /ready; that is why the watchdog cannot use it"
+    assert deep.status_code == 503
+    assert deep.json()["checks"]["qdrant"] == {"ok": False}
+
+
+def test_watchdog_probe_does_not_write_the_cache_other_probers_read(host_client, live_state):
+    """A fresh probe must not refresh somebody else's cached entry: the deploy
+    gate re-probing successfully must not extend a stale 200 for the LB."""
+    live_state.ok = False
+    assert host_client.get("/ready").status_code == 503
+    health.reset_readiness_cache()
+
+    live_state.ok = True
+    assert host_client.get("/ready/deep").status_code == 200
+
+    live_state.ok = False
+    assert host_client.get("/ready").status_code == 503, "the deep probe must not have cached the healthy verdict"
+
+
+def test_watchdog_probe_never_spends_the_readiness_rate_limit(host_client, client, live_state, monkeypatch, _public_rate_limiter):
+    """A 429 would be read as "unhealthy" by every caller that restarts on any
+    non-200, so the watchdog's probe must be unrated rather than share the
+    public /ready budget."""
+    monkeypatch.setattr(config, "PUBLIC_READY_RATE_PER_MIN", 1)
+
+    assert client.get("/ready").status_code == 200
+    assert client.get("/ready").status_code == 429
+
+    assert host_client.get("/ready/deep").status_code == 200
+
+    # One key only, from the two /ready polls above: the deep probe answered
+    # without spending a single unit of the shared "ready" budget.
+    assert list(_public_rate_limiter) == ["public:rl:ready:testclient"]
+    assert set(_public_rate_limiter.values()) == {2}
+
+
+def test_a_watchdog_polling_once_a_second_is_never_throttled_and_never_gets_a_stale_answer(
+    client, host_client, live_state, monkeypatch, _public_rate_limiter
+):
+    """One cron-style minute of polling: the shipped 600/60s budget, an outage
+    halfway through, and a probe that answers truthfully on both sides of it.
+
+    The limit is asserted at its shipped default rather than lowered, because
+    the claim under test is that a 1 Hz prober sits far below it -- and the deep
+    probe must be unaffected by the budget being exhausted anyway.
+    """
+    assert config.PUBLIC_READY_RATE_PER_MIN >= 60, "the shipped budget must absorb a 1 Hz prober"
+    monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 3600.0)  # a cache long enough to hide anything
+    assert client.get("/ready").status_code == 200
+    budget_after_priming = dict(_public_rate_limiter)
+
+    before = [host_client.get("/ready/deep") for _ in range(30)]
+    live_state.ok = False
+    after = [host_client.get("/ready/deep") for _ in range(30)]
+
+    assert {r.status_code for r in before} == {200}
+    assert {r.status_code for r in after} == {503}, "an outage must be visible on the very next poll"
+    # 60 polls at the shipped limit: none of them spent readiness budget.
+    assert dict(_public_rate_limiter) == budget_after_priming
+    # /ready is the one that would mislead here -- it is still serving the
+    # verdict from before the outage, which is exactly why the watchdog cannot
+    # be pointed at it.
+    assert client.get("/ready").status_code == 200
+
+
+def test_host_local_probe_is_refused_to_a_non_loopback_caller(client, live_state, monkeypatch):
+    """/ready/deep is uncached and unrated. Exposed to the internet that is an
+    unthrottled dependency-probe amplifier, so anything that is not a direct
+    local connection is refused -- and refused before any probe runs."""
+    probes = []
+
+    async def counting_probe(state):
+        probes.append(state)
+        return True, {"ready": True, "checks": {}}
+
+    monkeypatch.setattr(health, "_readiness_report", counting_probe)
+
+    assert client.get("/ready/deep").status_code == 403
+    assert probes == [], "a refused caller must not be able to make this host probe its dependencies"
+
+
+def test_host_local_probe_is_refused_when_it_arrives_through_the_local_proxy(host_client, live_state):
+    """nginx on this host is a loopback peer, so the peer alone cannot tell a
+    local `curl` from a request proxied in from the internet. X-Forwarded-For is
+    what separates them, and nginx sets it on every proxied request."""
+    r = host_client.get("/ready/deep", headers={"X-Forwarded-For": "203.0.113.7"})
+
+    assert r.status_code == 403
+
+
+def test_host_local_probe_answers_a_plain_loopback_request(host_client, live_state):
+    """The shape of every call deploy/healthcheck.sh and setup.sh make."""
+    r = host_client.get("/ready/deep")
+
+    assert r.status_code == 200
+    assert r.json()["ready"] is True
+
+
+def test_startup_log_names_the_key_fault_without_echoing_the_key(monkeypatch, caplog):
+    """The startup line exists so an operator finds the real cause in the log
+    instead of a per-turn 401. It must name the fault and must not print the
+    secret."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+
+    with caplog.at_level(logging.ERROR, logger="health"):
+        health.warn_if_llm_key_unusable()
+
+    assert "GEMINI_API_KEY" in caplog.text
+    assert "placeholder" in caplog.text
+    assert "your_key_here" not in caplog.text
+
+
+def test_startup_is_silent_for_a_usable_key(monkeypatch, caplog):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
+
+    with caplog.at_level(logging.ERROR, logger="health"):
+        health.warn_if_llm_key_unusable()
+
+    assert caplog.text == ""
+
+
+def test_a_placeholder_key_does_not_stop_the_process_answering_probes(client, live_state, monkeypatch):
+    """The reason startup logs instead of raising: a crash takes /health with
+    it, and the watchdog would then have nothing to probe to diagnose the
+    outage with."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 503
+    assert client.get("/live").status_code == 200

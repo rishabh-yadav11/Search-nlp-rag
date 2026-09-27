@@ -318,7 +318,12 @@ run_services() {
         -k uvicorn.workers.UvicornWorker \
         --workers "$GUNICORN_WORKERS" --bind "127.0.0.1:$API_PORT" \
         --timeout 120 app.main:app)
-    wait_http "http://localhost:$API_PORT/health"
+    # Readiness, not liveness (#279): /health is a stub that answers 200 with a
+    # dead Qdrant client, unloaded models or the placeholder GEMINI_API_KEY, so
+    # gating the deploy on it declared broken backends deployed. /ready/deep is
+    # the uncached, unrated, loopback-only form, so this gate cannot pass on a
+    # warm readiness cache and cannot be throttled into a false "not ready".
+    wait_http "http://localhost:$API_PORT/ready/deep"
 
     (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
         --name vccircle-frontend \

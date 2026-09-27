@@ -159,3 +159,26 @@ def test_missing_key_is_appended_and_an_existing_value_is_never_rewritten():
     ]
     for line in writes:
         assert line == append_line, f"setup.sh must not rewrite the operator's value: {line!r}"
+
+
+# --- the deploy gate must wait on readiness, not on the liveness stub (#279) ---
+
+
+def test_the_backend_deploy_gate_waits_on_readiness_not_on_the_health_stub():
+    """./setup.sh services declares the deploy done from what `wait_http` can
+    reach. It used to wait on /health, which cannot fail: a backend holding the
+    placeholder GEMINI_API_KEY from .env.example, a dead Qdrant client or
+    unloaded models answered 200 there, so the script reported a successful
+    deploy of a backend that could not answer a single chat question.
+
+    /ready/deep is the readiness answer, uncached so a warm cache cannot pass
+    the gate, unrated so the gate cannot be throttled into a false negative,
+    and loopback-only -- which is what a deploy gate on this host is. (The
+    watchdog that consumes the same endpoint is exercised for real, against
+    stub binaries, in test_healthcheck_script.py; this one can only be read,
+    because running setup.sh would build venvs and register pm2 processes.)
+    """
+    source = SETUP_SH.read_text()
+
+    assert 'wait_http "http://localhost:$API_PORT/ready/deep"' in source
+    assert 'wait_http "http://localhost:$API_PORT/health"' not in source

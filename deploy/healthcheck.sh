@@ -2,18 +2,37 @@
 # Health-check the backend and restart it if unhealthy; log if a restart
 # doesn't bring it back. Run from cron every few minutes.
 #
+# Which endpoint answers which question (#279):
+#   /ready/deep -- readiness. Does this node actually serve? Qdrant reachable,
+#                  models loaded, a usable GEMINI_API_KEY. Deliberately
+#                  uncached and unrated (and loopback-only), because a watchdog
+#                  acts on the answer it gets: a cached verdict hides an outage
+#                  for the rest of the TTL, and a 429 is indistinguishable from
+#                  an outage to a caller that restarts on any non-200.
+#   /health     -- liveness. Is the process up at all? It cannot fail by
+#                  design, so it is the RIGHT probe for the one question a
+#                  restart can answer, and the WRONG probe for "is the service
+#                  healthy": it answers 200 with a dead Qdrant client and a
+#                  placeholder GEMINI_API_KEY.
+# This script used to probe /health alone, which made a dependency outage or a
+# placeholder key invisible -- the watchdog exited 0 forever.
+#
 # Behaviour:
-#   1. Probe /health (liveness). Healthy -> exit 0, no output.
-#   2. Unhealthy -> restart vccircle-backend via pm2, wait, re-probe.
-#   3. Still unhealthy -> log, POST to HEALTHCHECK_WEBHOOK_URL (if set),
+#   1. Probe both. Ready -> exit 0, no output.
+#   2. Alive but not ready -> alert WITHOUT restarting. The process is fine; a
+#      restart cannot bring Qdrant back or fix a placeholder key, and restarting
+#      anyway turns a dependency blip into an outage.
+#   3. Not alive -> restart vccircle-backend via pm2, wait, re-probe.
+#   4. Still not alive -> log, POST to HEALTHCHECK_WEBHOOK_URL (if set),
 #      and print (cron mails on output if MAILTO is set).
 #
-# Override (env): BASE, LOG, HEALTHCHECK_WEBHOOK_URL.
+# Override (env): BASE, LOG, HEALTHCHECK_WEBHOOK_URL, RESTART_WAIT_SECONDS.
 set -u
 
 BASE="${BASE:-http://localhost:8001}"
 APP="vccircle-backend"
 LOG="${LOG:-$HOME/search-nlp-rag/logs/healthcheck.log}"
+RESTART_WAIT_SECONDS="${RESTART_WAIT_SECONDS:-8}"
 
 # cron has a minimal PATH, so pm2 may not be found. Include common locations.
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -23,7 +42,7 @@ WEBHOOK="${HEALTHCHECK_WEBHOOK_URL:-}"
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG"; }
 
 probe() {
-  curl -fsS -m 10 -o /dev/null -w '%{http_code}' "$BASE/health" 2>/dev/null
+  curl -fsS -m 10 -o /dev/null -w '%{http_code}' "$BASE$1" 2>/dev/null
 }
 
 post_webhook() {
@@ -34,29 +53,48 @@ post_webhook() {
     -d "{\"text\":\"$msg\"}" >/dev/null 2>&1 || true
 }
 
+restarted=0
+
 mkdir -p "$(dirname "$LOG")"
 
-code=$(probe)
-if [ "$code" = "200" ]; then
+# Liveness first, and on its own: if the process is not up there is no point
+# asking it about its dependencies, and the answer decides whether a restart is
+# attempted at all.
+live_code=$(probe /health)
+if [ "$live_code" = "200" ]; then
+  ready_code=$(probe /ready/deep)
+else
+  ready_code=""
+  log "backend not alive (liveness /health returned HTTP ${live_code:-none}); restarting $APP"
+  # NOTE: this replays the argv pm2 stored at start time — `--update-env`
+  # refreshes environment variables, not the argument list. It is correct for
+  # recovering a sick process, but it can NEVER apply a change to the process
+  # options. Changing the API bind or any other pm2 option requires
+  # `./setup.sh services`, which re-registers the process and re-saves the dump.
+  pm2 restart "$APP" --update-env >/dev/null 2>&1 || true
+  restarted=1
+
+  sleep "$RESTART_WAIT_SECONDS"
+  live_code=$(probe /health)
+  ready_code=$(probe /ready/deep)
+fi
+
+if [ "$live_code" = "200" ] && [ "$ready_code" = "200" ]; then
+  [ "$restarted" = "1" ] && log "backend recovered after restart"
   exit 0
 fi
 
-log "backend unhealthy (HTTP $code); restarting $APP"
-# NOTE: this replays the argv pm2 stored at start time — `--update-env`
-# refreshes environment variables, not the argument list. It is correct for
-# recovering a sick process, but it can NEVER apply a change to the process
-# options. Changing the API bind or any other pm2 option requires
-# `./setup.sh services`, which re-registers the process and re-saves the dump.
-pm2 restart "$APP" --update-env >/dev/null 2>&1 || true
-
-sleep 8
-code=$(probe)
-if [ "$code" = "200" ]; then
-  log "backend recovered after restart"
-  exit 0
+if [ "$live_code" = "200" ]; then
+  # Alive, not ready: a dependency or a configuration fault, not a wedged
+  # process. Restarting is not a remedy, so report what the probe actually said.
+  msg="ALERT: VCCircle backend alive but not ready: /ready/deep returned HTTP ${ready_code:-none} while the process is up ($BASE). Not restarting: check Qdrant, the loaded models, and GEMINI_API_KEY."
+  log "$msg"
+  post_webhook "$msg"
+  echo "$msg"
+  exit 1
 fi
 
-msg="ALERT: VCCircle backend down: /health returned HTTP ${code:-none} after restart ($BASE)"
+msg="ALERT: VCCircle backend down: liveness /health returned HTTP ${live_code:-none} after restart, readiness /ready/deep returned HTTP ${ready_code:-none} ($BASE)"
 log "$msg"
 post_webhook "$msg"
 echo "$msg"
