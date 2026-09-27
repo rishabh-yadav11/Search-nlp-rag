@@ -367,9 +367,12 @@ def test_history_separator_joins_are_charged_against_the_budget(monkeypatch, ext
     every interesting limit, and at the 12000 default the render sits so far
     under the bound that dropping 9 separators changes nothing. A separator only
     pushes the render over the limit once the joined separators outnumber the
-    characters the reserved omission note hands back, which needs far more turns
-    than that fixture has — hence 100 short ones, with the limit set to exactly
-    the size of all their fences plus the reserved note.
+    characters the reserved omission note hands back. At the default
+    CHAT_MAX_HISTORY_TURNS=10 the replay is capped at 20 messages, so at most 19
+    joins exist and the 62-character reservation always wins — this fixture is
+    deliberately past that, because both CHAT_MAX_HISTORY_TURNS and
+    CHAT_HISTORY_CHAR_LIMIT are free env knobs, and the charge has to hold for
+    whatever they are set to rather than only for the defaults.
     """
     prior = [_message(i, "user" if i % 2 else "assistant", f"[msg{i}] zz") for i in range(1, 101)]
     labels = [f"TURN {i} {m.role}" for i, m in enumerate(prior, start=1)]
@@ -387,7 +390,6 @@ def test_history_separator_joins_are_charged_against_the_budget(monkeypatch, ext
     # The bound covers the whole render, joins included.
     assert len(replay) <= max(0, tight + extra)
     assert replay.count("<<<END TURN ") == replay.count("<<<TURN ")
-
 
 
 def test_oversized_article_body_is_truncated_to_the_configured_bound(retrieval, no_billing, poison_client, monkeypatch):
