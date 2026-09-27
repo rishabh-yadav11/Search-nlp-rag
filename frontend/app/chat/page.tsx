@@ -9,6 +9,7 @@ import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
 import SimilarArticles from '../components/SimilarArticles'
 import { API_BASE, authHeaders, getToken, redirectToLogin } from '../lib/auth'
+import { isSafeUrl } from '../lib/safe-url'
 
 type Source = {
   id: number
@@ -166,7 +167,7 @@ const SourceList = memo(function SourceList({ sources, msg }: { sources: Source[
             <ol className="chat-sources-list">
               {sources.map((s) => (
                 <li key={s.id}>
-                  {/^https?:\/\//.test(s.url) ? (
+                  {isSafeUrl(s.url) ? (
                     <a href={s.url} target="_blank" rel="noopener noreferrer">
                       {s.title || `Source ${s.id}`}
                     </a>

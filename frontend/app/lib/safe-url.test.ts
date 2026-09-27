@@ -50,6 +50,60 @@ describe('isSafeUrl — blocks protocol-relative and backslash escapes', () => {
   })
 })
 
+// The escapes above carry no scheme, so `PROTOCOL_RELATIVE_RE` and the
+// origin comparison catch them. These do: the WHATWG parser reads a backslash
+// as a separator for special schemes, so the backslash spelling still ends up
+// on an `https:` URL and the scheme allowlist alone waves it through. A pinned
+// `false` (not a parity assertion) is the only assertion that catches this.
+//
+// The `https://`-prefixed spellings at the end are the sharp end: their first
+// eight characters really are `https://`, so the old inline `/^https?:\/\//`
+// check the chat source list used admitted them as clickable links.
+describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
+  const SCHEME_ESCAPES = [
+    'https:/\\evil.com',
+    'https:\\\\evil.com',
+    'https:\\/evil.com',
+    'http:/\\evil.com',
+    'HTTPS:/\\evil.com',
+    'https:\\\\evil.com/path?q=1',
+    'https://\\evil.com',
+    'https://\\/evil.com',
+    'https://\\\\evil.com',
+  ]
+
+  it.each(SCHEME_ESCAPES)('rejects %j', (payload) => {
+    expect(isSafeUrl(payload, BASE)).toBe(false)
+  })
+
+  it.each(SCHEME_ESCAPES)('rejects %j on the server and on the client alike', (payload) => {
+    vi.stubGlobal('window', undefined)
+    expect(isSafeUrl(payload)).toBe(false)
+    vi.stubGlobal('window', { location: { href: 'https://app.example.com/chat' } })
+    expect(isSafeUrl(payload)).toBe(false)
+  })
+
+  it('resolves those payloads to an off-origin https URL in a real parser', () => {
+    // Pins *why* the guard has to refuse them: without the backslash check the
+    // URL is a well-formed off-origin https link, so nothing downstream of the
+    // scheme check can object to it.
+    expect(new URL('https:/\\evil.com', BASE).href).toBe('https://evil.com/')
+    expect(new URL('https://\\evil.com', BASE).href).toBe('https://evil.com/')
+  })
+
+  it('refuses the spellings the old inline https-prefix check admitted', () => {
+    // The defect this closes, stated as a test: these payloads pass
+    // `/^https?:\/\//`, which is why the chat source list rendered them as
+    // clickable links that navigate to `https://evil.com/`.
+    const OLD_INLINE_RE = /^https?:\/\//
+    const ADMITTED = ['https://\\evil.com', 'https://\\/evil.com', 'https://\\\\evil.com']
+    for (const payload of ADMITTED) {
+      expect(OLD_INLINE_RE.test(payload)).toBe(true)
+      expect(isSafeUrl(payload, BASE)).toBe(false)
+    }
+  })
+})
+
 describe('isSafeUrl — blocks malformed and non-string input', () => {
   const REJECTED = ['', '   ', 'http:', 'https://', undefined, null, 42, {}, ['https://ok.com']]
 
@@ -203,10 +257,6 @@ describe('isSafeUrl — server/client parity', () => {
   // https://app.vccircle.com/) rejects them as off-origin. A parity assertion
   // alone would not catch that, because it only compares the two verdicts; the
   // explicit `false` pins the actual outcome.
-  //
-  // The single-backslash form is deliberately absent: `\ssr.invalid/x` is one
-  // separator, not two, so the browser resolves it to a same-origin path
-  // (…/ssr.invalid/x) and both environments legitimately allow it.
   it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
     'rejects the backslash escape %j aimed at the stand-in origin',
     (url) => {
@@ -214,6 +264,16 @@ describe('isSafeUrl — server/client parity', () => {
       expect(verdictIn(url, true)).toBe(false)
     }
   )
+
+  // The single-backslash form `\ssr.invalid/x` is absent from the list above
+  // because it is a same-origin path in a browser, not an escape. It is still
+  // refused, by the backslash check rather than by the origin comparison, so
+  // it gets its own pin: the CORPUS parity assertion above passes either way,
+  // and this is the assertion that would notice the strictness being lost.
+  it('refuses the same-origin single-backslash path on both sides', () => {
+    expect(verdictIn('\\ssr.invalid/x', false)).toBe(false)
+    expect(verdictIn('\\ssr.invalid/x', true)).toBe(false)
+  })
 })
 
 describe('isSafeUrl — deliberate strictness on control characters', () => {
