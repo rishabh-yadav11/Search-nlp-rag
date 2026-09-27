@@ -73,12 +73,32 @@ fi
 # certbot's privkey.pem is 0600 root:root, so a readability test here would
 # reject a config real nginx loads happily -- the same unprivileged-reader
 # mistake setup.sh's own gate had.
-for f in $(sed -n 's/^ *ssl_certificate_key *//p' "$NGINX_CONF" | tr -d ';'); do
-    if [ ! -f "$f" ] || [ ! -s "$f" ]; then
-        printf 'nginx -t rejected (no private key at %s)\n' "$f" >> "$STUB_LOG"
-        exit 1
-    fi
+#
+# Both halves. Real nginx refuses a config whose ssl_certificate points at
+# nothing, and a stub that only checked the key would let a cert-side gate
+# regression through with the key-side assertion noticing instead. The required
+# space after the directive name is load-bearing: without it, the pattern for
+# ssl_certificate also matches the first 17 characters of ssl_certificate_key.
+for directive in ssl_certificate ssl_certificate_key; do
+    for f in $(sed -n "s/^ *$directive \\+//p" "$NGINX_CONF" | tr -d ';'); do
+        if [ ! -f "$f" ] || [ ! -s "$f" ]; then
+            printf 'nginx -t rejected (no %s at %s)\n' "$directive" "$f" >> "$STUB_LOG"
+            exit 1
+        fi
+    done
 done
+# Real nginx also *parses* the certificate, so a file that is present,
+# non-empty and not a certificate is refused too -- which is the difference
+# between a corrupt cert triggering the rollback and being installed on a live
+# site. Skipped when there is no openssl, where the presence check stands alone.
+if command -v openssl >/dev/null 2>&1; then
+    for f in $(sed -n "s/^ *ssl_certificate \\+//p" "$NGINX_CONF" | tr -d ';'); do
+        if [ -z "$(openssl x509 -noout -enddate -in "$f" 2>/dev/null)" ]; then
+            printf 'nginx -t rejected (unparseable certificate at %s)\n' "$f" >> "$STUB_LOG"
+            exit 1
+        fi
+    done
+fi
 printf 'nginx -t accepted\n' >> "$STUB_LOG"
 exit 0
 """
@@ -195,10 +215,17 @@ def _write_stub(directory, name, body):
 
 
 def _stubs(tmp_path, *, with_certbot=True, nginx_t_exit=0):
-    """Build a stub directory plus the log path the stubs record into."""
+    """Build a stub directory plus the log path the stubs record into.
+
+    The log is cleared here, so it always describes exactly the run that
+    follows. A test that runs a stage twice would otherwise see both runs'
+    commands concatenated, and an assertion like "this run did not reload
+    nginx" would be answered by the previous run's reload.
+    """
     bindir = tmp_path / "stubbin"
     bindir.mkdir(exist_ok=True)
     log = tmp_path / "calls.log"
+    log.unlink(missing_ok=True)
     _write_stub(bindir, "sudo", _SUDO)
     _write_stub(bindir, "nginx", _NGINX)
     _write_stub(bindir, "systemctl", _SYSTEMCTL)
@@ -721,3 +748,137 @@ def test_refuses_when_certbot_is_missing(tmp_path):
     assert proc.returncode == 1
     assert "certbot is not installed" in proc.stderr
     assert not log.exists() or log.read_text().strip() == ""
+
+
+def test_routine_rerun_without_le_domain_keeps_serving_https(tmp_path):
+    """A re-run from an ordinary shell must not undo TLS.
+
+    LE_DOMAIN is read from the environment and written nowhere, so
+    `./setup.sh nginx` -- and the nginx stage inside `./setup.sh all` -- run
+    from a shell that does not export it used to see no domain, resolve "auto"
+    to plain HTTP, rewrite a live HTTPS site to cleartext and exit 0 with
+    nothing on stderr. The certificate was sitting right there.
+
+    Two things make that safe now: the domain is recovered from the installed
+    config, and "auto" prefers what is already serving over what a probe says.
+    """
+    _existing_pair(tmp_path)
+    # First run: bring the site up on TLS, the way ./setup.sh tls would leave it.
+    code, _, installed, _, stderr = _run_nginx(tmp_path, extra_env={"NGINX_TLS": "on"})
+    assert code == 0, f"the TLS install failed: {stderr}"
+    assert _installed_https_servers(installed) == 1, f"expected a TLS config: {installed}"
+
+    # Second run: same shell, LE_DOMAIN not exported, NGINX_TLS back to auto.
+    code, calls, installed, stdout, stderr = _run_nginx(tmp_path, extra_env={"LE_DOMAIN": ""})
+
+    assert code == 0, f"the re-run failed: {stderr}"
+    assert _installed_https_servers(installed) == 1, (
+        f"a routine re-run stripped the live HTTPS server: {calls}"
+    )
+    assert "return 301 https://" in installed, f"the redirect was dropped too: {calls}"
+    assert "serving: https" in stdout, f"the operator must be told it is still encrypted:\n{stdout}"
+    assert "plain HTTP" not in stderr, f"and not told the opposite: {stderr}"
+    # The domain was found, not configured, and saying so is the point.
+    assert "recovered" in stdout, (
+        f"a recovered domain must be reported as recovered, not implied to be configured:\n{stdout}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint a certificate")
+def test_a_lost_certificate_does_not_strip_the_live_https_server(tmp_path):
+    """The case the status-quo default actually exists for.
+
+    The certificate is gone -- cleaned up, restored from a backup, moved -- but
+    nginx is still serving the one it loaded, and the installed config still
+    names `:443`. Nothing here is a reason to take the site off TLS: the
+    operator gets a loud failure and an untouched config, because the stage
+    cannot emit a correct one without the pair. Rewriting to plain HTTP and
+    reloading would be wrong twice over: it discards a working posture, and it
+    does it silently.
+    """
+    _existing_pair(tmp_path)
+    code, _, installed, _, stderr = _run_nginx(tmp_path, extra_env={"NGINX_TLS": "on"})
+    assert code == 0, f"the TLS install failed: {stderr}"
+    live_tls = installed
+
+    # The pair disappears underneath the running site.
+    live = tmp_path / "letsencrypt" / "live" / "search.example.com"
+    (live / "fullchain.pem").unlink()
+    (live / "privkey.pem").unlink()
+
+    code, calls, installed, _, stderr = _run_nginx(tmp_path)
+
+    assert code != 0, f"a config naming a certificate that is gone must fail, not be replaced: {calls}"
+    assert installed == live_tls, (
+        f"the config that was serving must be left exactly as it was:\n{installed}"
+    )
+    assert not any(c.strip() == "sudo systemctl reload nginx" for c in calls), (
+        f"nginx must not be reloaded onto a config that was never written: {calls}"
+    )
+    assert "no certificate at" in stderr, f"the missing pair must be named: {stderr}"
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl to mint a certificate")
+def test_a_corrupt_certificate_is_not_reported_as_expired(tmp_path):
+    """An unparseable certificate needs its own advice.
+
+    `openssl x509 -checkend` exits non-zero for a lapsed notAfter, for text that
+    is not a certificate, and for a file it cannot open. Reporting all three as
+    "expired" sent the operator to re-run a command that could not help: the
+    tls stage issues with --keep-until-expiring, which leaves anything certbot
+    cannot parse exactly as it is, so the loop repeats and reports success
+    forever.
+    """
+    _existing_pair(tmp_path)
+    (tmp_path / "letsencrypt" / "live" / "search.example.com" / "fullchain.pem").write_text(
+        "-----BEGIN CERTIFICATE-----\nnot a certificate\n"
+    )
+
+    code, _, installed, _, stderr = _run_nginx(tmp_path, extra_env={"NGINX_TLS": "on"})
+
+    # The mode is unchanged -- a complete pair still gets a TLS server, and
+    # `nginx -t` is what refuses it -- but the operator is told the real cause.
+    assert "cannot be read as a" in stderr, f"the corrupt file must be named: {stderr}"
+    assert "has expired" not in stderr, f"a corrupt certificate is not an expired one: {stderr}"
+    assert "sudo rm -f" in stderr, f"the remedy has to say what to do about the file: {stderr}"
+    assert "--keep-until-expiring" in stderr, (
+        f"the operator must be told why re-running will not fix it: {stderr}"
+    )
+    # nginx rejects it, so the previous config is restored and the stage fails.
+    assert code != 0, f"a config nginx refuses must fail the stage: {installed}"
+    assert "rolling back" in stderr, f"the rollback must be announced: {stderr}"
+
+
+def test_the_nginx_stub_rejects_a_config_naming_a_missing_certificate(tmp_path):
+    """The stub must check the certificate as well as the key.
+
+    Checking only the key meant a regression in setup.sh's cert-side gate was
+    still caught -- but by the key-side assertion, on which error message came
+    out, not by the gate being absent. A stub that accepts a config nginx
+    refuses is not a stand-in for nginx.
+    """
+    bindir, log = _stubs(tmp_path, with_certbot=False)
+    env = _base_env(tmp_path, bindir, log)
+    conf = Path(env["NGINX_CONF"])
+    good = tmp_path / "letsencrypt" / "live" / "search.example.com"
+    good.mkdir(parents=True)
+    (good / "privkey.pem").write_text("key\n")
+    conf.write_text(
+        "server {\n"
+        f"    ssl_certificate {tmp_path}/nowhere/fullchain.pem;\n"
+        f"    ssl_certificate_key {good / 'privkey.pem'};\n"
+        "}\n"
+    )
+
+    proc = subprocess.run(
+        [str(bindir / "nginx"), "-t"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode != 0, "a config naming a missing certificate must not pass `nginx -t`"
+    assert any("no ssl_certificate at" in line for line in _calls(log)), (
+        f"the missing half must be named: {_calls(log)}"
+    )
