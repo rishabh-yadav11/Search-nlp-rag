@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { API_BASE, getToken, setToken } from '../lib/auth'
+import { API_BASE, getToken } from '../lib/auth'
 
 // Local safe-redirect guard (should be consolidated into lib/auth.ts).
 // A safe target is a root-relative path: it starts with a single "/", is not
@@ -30,6 +30,7 @@ function SignupForm() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [success, setSuccess] = useState('')
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
@@ -53,6 +54,7 @@ function SignupForm() {
     e.preventDefault()
     if (busy) return
     setError('')
+    setSuccess('')
     const problem = validate()
     if (problem) {
       setError(problem)
@@ -74,9 +76,15 @@ function SignupForm() {
         setError((body as { detail?: string }).detail ?? `Sign up failed (${res.status}).`)
         return
       }
-      const data = (await res.json()) as { token: string }
-      setToken(data.token)
-      router.replace(next)
+      // Signup is deliberately indistinguishable for a fresh and an already
+      // registered address: the server always answers 200 with the same
+      // message and never issues a token, so that submitting an existing
+      // email cannot be used to probe which addresses are registered.
+      const data = (await res.json()) as { message?: string }
+      setSuccess(
+        data.message ||
+          'If this email is not already registered, your account is ready. Sign in with your email and password to continue.',
+      )
     } catch (err) {
       if (controller.signal.aborted) {
         setError('Request timed out. Please try again.')
@@ -87,6 +95,22 @@ function SignupForm() {
       clearTimeout(timeout)
       setBusy(false)
     }
+  }
+
+  if (success) {
+    // The login page honors `next` (and re-validates it as a safe redirect).
+    const signInHref = `/login?next=${encodeURIComponent(next)}`
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <h1 className="auth-title">Almost there</h1>
+          <p className="auth-sub">{success}</p>
+          <button type="button" className="auth-btn" onClick={() => router.push(signInHref)}>
+            Sign in
+          </button>
+        </div>
+      </div>
+    )
   }
 
   return (
