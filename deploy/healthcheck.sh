@@ -38,7 +38,13 @@ set -u
 
 BASE="${BASE:-http://localhost:8001}"
 APP="vccircle-backend"
-LOG="${LOG:-$HOME/search-nlp-rag/logs/healthcheck.log}"
+# Derived from this script's own location so the watchdog log and its state file
+# land in the app's real logs/ directory wherever the repo is checked out. This
+# used to pin $HOME/search-nlp-rag, which on any other checkout created a stray
+# ~/search-nlp-rag/logs tree disconnected from the logs logrotate actually
+# rotates. Resolved, never absolute and never CWD-dependent.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG="${LOG:-$SCRIPT_DIR/../logs/healthcheck.log}"
 RESTART_WAIT_SECONDS="${RESTART_WAIT_SECONDS:-8}"
 # Cron runs this every few minutes, so a fault that stays fixed would re-alert
 # forever: a persistent placeholder key is ~288 identical webhook POSTs and

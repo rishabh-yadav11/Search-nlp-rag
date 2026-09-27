@@ -212,13 +212,22 @@ Every 15 minutes via cron, deprioritized with `nice` (installed by `setup.sh cro
 I capped logs so they can't fill the disk long-term:
 
 - **Docker** (Qdrant/Redis) runs with `--log-driver json-file --log-opt max-size=20m --log-opt max-file=3` (set by `setup.sh` via `DOCKER_LOG_OPTS`).
-- **App + PM2 logs** (`~/search-nlp-rag/logs/*.log`, `~/.pm2/logs/*.log`) are rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2), compressed, with `copytruncate` so open file handles keep writing. Deploy it once with:
+- **App + PM2 logs** (`<repo>/logs/*.log`, `~/.pm2/logs/*.log`) are rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2), compressed, with `copytruncate` so open file handles keep writing. The shipped `deploy/logrotate.conf` carries `/path/to/...` placeholders — logrotate does no variable interpolation, so substitute them before installing. Run this from the **repo root** and write to a copy, so the tracked file stays clean and the substitution can't pick up a `backend/` subdirectory:
 
 ```bash
-sudo install -m 644 /etc/logrotate.d/vccircle  # see repo: deploy/logrotate.conf
+cd /path/to/search-nlp-rag            # the repo root
+sed "s|/path/to/search-nlp-rag|$PWD|g; s|/path/to/.pm2|$HOME/.pm2|g" \
+    deploy/logrotate.conf > /tmp/vccircle-logrotate
+sudo install -m 644 /tmp/vccircle-logrotate /etc/logrotate.d/vccircle
 ```
 
+The `su` directive is commented out by default (logrotate then runs as root, which is correct whenever the logs are root-owned); uncomment and set it to your own `<user> <group>` otherwise. The placeholder paths must be substituted — left in place, `missingok` makes logrotate silently rotate nothing.
+
 The config lives in the repo at `deploy/logrotate.conf` for reproducibility.
+
+### Data locations
+
+`CHAT_DB_PATH`, `AUTH_DB_PATH`, `QUERY_FIX_VOCAB_PATH` and `RERANK_ONNX_DIR` are resolved to **absolute** paths at startup. A relative value (what `.env.example` ships) resolves against the backend directory, never against the process working directory, so starting the app from anywhere opens the same database. At boot the API logs the three locations it writes to and refuses to start if one cannot be created or written, rather than silently opening a new empty database and appearing to have lost all history.
 
 ## 4. Backups and Reset
 
