@@ -7,12 +7,16 @@ is still missing) or re-writes every point forever. Both are caught here by
 running the real function twice against a fake collection.
 """
 import asyncio
+import sys
 
+import backfill_content_type as bct
 import numpy as np
 import pytest
-from _common import create_payload_indexes
+from _common import create_payload_indexes, make_point
 from backfill_content_type import scroll_points_missing_content_type, set_content_type
 from qdrant_client.models import PayloadSchemaType
+
+from app.config import config
 
 
 class _Point:
@@ -47,9 +51,10 @@ class _FakeQdrant:
     def create_payload_index(self, collection_name, field, schema):
         self.index_calls.append((field, schema))
 
+    def close(self):
+        self.closed = True
 
-def _records(**by_id) -> dict[int, dict]:
-    return by_id
+
 
 
 def test_backfill_writes_the_value_from_mysql():
@@ -112,8 +117,6 @@ def test_backfill_matches_the_writer_for_a_missing_mysql_value():
     end up with a mixed-type field and the two halves would disagree about what
     an article with no content type looks like.
     """
-    from _common import make_point
-
     client = _FakeQdrant({9: {}})
     records = {9: {}}  # row present, content_type column NULL
 
@@ -133,17 +136,50 @@ def test_backfill_matches_the_writer_for_a_missing_mysql_value():
     assert written == fresh == ""
 
 
-def test_dry_run_writes_nothing_but_reports_the_same_work():
-    """--dry-run is a real rehearsal: identical selection, zero writes."""
+def _async_records(records):
+    async def _fetch(with_body=True, ids=None):
+        assert with_body is False, f"expected with_body=False, got {with_body}"
+        return dict(records)
+
+    return _fetch
+
+
+def test_dry_run_writes_nothing_and_creates_no_index(monkeypatch):
+    """--dry-run is a strictly read-only rehearsal.
+
+    It must not only skip set_payload but also skip create_payload_indexes:
+    creating a payload index mutates the collection schema, so a "rehearsal"
+    that indexes fields is not a rehearsal. The counts and log line would still
+    look right either way, so this asserts the absence of both kinds of write.
+    """
     client = _FakeQdrant({1: {}, 2: {}})
-    records = {1: {"content_type": "Interview"}, 2: {"content_type": "Video"}}
+    monkeypatch.setattr(bct, "QdrantClient", lambda *a, **k: client)
+    monkeypatch.setattr(bct, "fetch_records", _async_records({1: {"content_type": "Interview"}}))
+    monkeypatch.setattr(config, "MYSQL_PASSWORD", "stub")
+    monkeypatch.setattr(sys, "argv", ["backfill_content_type.py", "--dry-run"])
 
-    batch = list(scroll_points_missing_content_type(client))
-    set_content_type(client, records, batch, dry_run=True)
+    assert bct.main() == 0
+    assert client.writes == [], "dry-run must not write payloads"
+    assert client.index_calls == [], "dry-run must not create payload indexes"
+    assert client.payloads == {1: {}, 2: {}}, "dry-run must leave the collection untouched"
 
-    assert len(batch) == 2, "dry-run must select the same points a real run would"
-    assert client.writes == []
-    assert client.payloads[1] == {}, "dry-run must leave the collection untouched"
+
+def test_a_real_run_creates_the_content_type_index(monkeypatch):
+    """The real run indexes the field it just backfilled, so it is filterable.
+
+    A collection built before content_type existed has no index for it, so
+    backfilling the payload alone would leave the values unfiltersable until a
+    separate rebuild. The run creates the index as part of the same step.
+    """
+    client = _FakeQdrant({1: {}})
+    monkeypatch.setattr(bct, "QdrantClient", lambda *a, **k: client)
+    monkeypatch.setattr(bct, "fetch_records", _async_records({1: {"content_type": "Interview"}}))
+    monkeypatch.setattr(config, "MYSQL_PASSWORD", "stub")
+    monkeypatch.setattr(sys, "argv", ["backfill_content_type.py"])
+
+    assert bct.main() == 0
+    assert client.writes == [({"content_type": "Interview"}, [1])]
+    assert ("content_type", PayloadSchemaType.KEYWORD) in client.index_calls
 
 
 def test_points_are_grouped_by_value_into_fewer_writes():
