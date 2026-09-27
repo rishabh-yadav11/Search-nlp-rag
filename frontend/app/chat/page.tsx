@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
@@ -137,7 +137,13 @@ function UsageLine({ msg }: { msg: Message }) {
   )
 }
 
-function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
+// Shared empty array for assistant messages that carry no sources. The hot
+// render path must not build a fresh `[]` on every tick: a new array identity
+// on each render defeats the `memo` below, so every settled answer would be
+// re-rendered — and its markdown re-parsed — on every streaming tick anyway.
+const NO_SOURCES: Source[] = []
+
+const SourceList = memo(function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
   const [open, setOpen] = useState(false)
   if (!sources.length && !((msg.prompt_tokens ?? 0) + (msg.completion_tokens ?? 0))) return null
   return (
@@ -169,9 +175,9 @@ function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
       ) : null}
     </div>
   )
-}
+})
 
-function AnswerBody({ content }: { content: string }) {
+const AnswerBody = memo(function AnswerBody({ content }: { content: string }) {
   const parts = splitContent(content)
   return (
     <>
@@ -195,7 +201,7 @@ function AnswerBody({ content }: { content: string }) {
       )}
     </>
   )
-}
+})
 
 export default function ChatPage() {
   const [sessions, setSessions] = useState<Session[]>([])
@@ -657,7 +663,7 @@ export default function ChatPage() {
                   ) : (
                     <div className="chat-msg-answer">
                       <AnswerBody content={m.content} />
-                      <SourceList sources={m.sources ?? []} msg={m} />
+                      <SourceList sources={m.sources ?? NO_SOURCES} msg={m} />
                     </div>
                   )}
                 </div>
