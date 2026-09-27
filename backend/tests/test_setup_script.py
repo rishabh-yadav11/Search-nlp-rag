@@ -355,9 +355,17 @@ def test_a_ready_deployment_still_succeeds(tmp_path):
 
 
 def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
-    """GEMINI_BASE_URL is configurable, so the pre-flight's shape rule applies
-    only to Google's endpoint -- exactly as app.config.classify_gemini_api_key
-    does. A false rejection here would block a working deploy."""
+    """setup.sh must not judge the key at all, so it cannot refuse a deploy the
+    app considers ready.
+
+    GEMINI_BASE_URL is configurable, so a non-Google-shaped key is a supported
+    configuration. While this script had its own pre-flight, that was one of
+    the ways it could block a working deploy; the verdict now comes from the
+    app (app.config.classify_gemini_api_key, which applies its shape rule only
+    to Google's endpoint), and this pins that setup.sh stays out of it. The
+    mirror image is the parametrized test above, which fails if any shell-side
+    judgement of the key comes back.
+    """
     # Assembled, not written out: a credential-shaped literal on a line naming a
     # key is what a secrets scanner reports (same reason as REAL_KEY above).
     home_key = "gateway-" + "token-0123" + "456789"
