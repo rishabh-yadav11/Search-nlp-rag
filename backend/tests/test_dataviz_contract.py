@@ -23,6 +23,7 @@ half still runs.
 
 import json
 import math
+import os
 import pathlib
 import shutil
 import subprocess
@@ -75,10 +76,25 @@ def corpus():
 
 @pytest.fixture(scope="module")
 def frontend(corpus):
-    """The shipped frontend validator's verdicts, by actually running it."""
+    """The shipped frontend validator's verdicts, by actually running it.
+
+    This module is the ONLY coverage of the browser-side validator — no frontend
+    test file touches it — so a silent skip here is not a small loss, it is the
+    loss of the whole issue's guarantee. Under CI, where node is expected and
+    can be installed, a missing node is therefore a FAILURE rather than a skip;
+    locally it still skips, because a developer without node should not be told
+    their backend is broken. The error names the version that can import a .ts
+    module, which is why the repo's documented Node 18+ is not enough for this."""
     node = shutil.which("node")
     if node is None:
-        pytest.skip("node not on PATH; cannot execute the frontend dataviz validator")
+        message = (
+            "node is not on PATH, so the shipped frontend dataviz validator "
+            "cannot be executed and the cross-language half of #267 is untested. "
+            "It needs node >= 22.6 for the built-in .ts import this harness uses."
+        )
+        if os.environ.get("CI"):
+            pytest.fail(message + " Install node in CI rather than letting the suite pass without it.")
+        pytest.skip(message)
     proc = subprocess.run(
         [node, str(HARNESS_PATH), str(CONTRACT_TS_PATH), str(CORPUS_PATH)],
         capture_output=True,
@@ -87,8 +103,7 @@ def frontend(corpus):
         check=False,
     )
     assert proc.returncode == 0, (
-        f"the frontend dataviz validator did not run (node {node}, exit {proc.returncode}); "
-        f"node >= 22.6 is needed to import a .ts module\n{proc.stderr}"
+        f"the frontend dataviz validator did not run (node {node}, exit {proc.returncode})\n{proc.stderr}"
     )
     return json.loads(proc.stdout)
 
@@ -132,6 +147,18 @@ def test_every_fixture_has_the_verdict_both_sides_agree_on(corpus, frontend):
     assert not wrong, "verdicts the corpus says are wrong:\n" + "\n".join(wrong)
 
 
+def _utf16_units(text: str, index: int) -> int:
+    """``index`` (a Python codepoint offset) as a UTF-16 code-unit offset.
+
+    JavaScript string indices count UTF-16 code units, so a character outside
+    the BMP -- an emoji, say -- counts as TWO there and as ONE here. Comparing
+    the two spans without this conversion fabricates a divergence on any text
+    carrying a supplementary character, even though both sides captured the same
+    payload and agreed on the verdict. surrogatepass so a stray surrogate in a
+    fixture cannot make this helper raise."""
+    return len(text[:index].encode("utf-16-le", "surrogatepass")) // 2
+
+
 def test_both_sides_match_the_same_fence_text(corpus, frontend):
     """Same regex, same match extent, same captured payload — for every fixture.
 
@@ -142,8 +169,13 @@ def test_both_sides_match_the_same_fence_text(corpus, frontend):
     mismatched = []
     for fixture in corpus["fixtures"]:
         result = frontend["results"][fixture["name"]]
-        match = chat_module._DATAVIZ_FENCE_RE.search(fixture["text"])
-        expected = ([list(match.span()), match.group(1)] if match else [None, None])
+        text = fixture["text"]
+        match = chat_module._DATAVIZ_FENCE_RE.search(text)
+        if match is None:
+            expected = [None, None]
+        else:
+            start, end = match.span()
+            expected = [[_utf16_units(text, start), _utf16_units(text, end)], match.group(1)]
         if [result["span"], result["captured"]] != expected:
             mismatched.append(
                 f"{fixture['name']}: backend {expected} frontend {[result['span'], result['captured']]}"

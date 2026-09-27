@@ -607,6 +607,30 @@
       "why": "the same at the front of the cell"
     },
     {
+      "name": "emoji_in_prose_before_fence",
+      "text": "Revenue is up 📈 this year.\n\nProse [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```\n\nTrailing prose.",
+      "expect": "accept",
+      "why": "an emoji (outside the BMP) in the prose before the fence: JavaScript counts string offsets in UTF-16 code units and Python in codepoints, so the match SPAN only agrees once the backend side is converted"
+    },
+    {
+      "name": "emoji_in_label_cell",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"📈 Zepto\",1.0],[\"MUFG\",2.0]],\"value_column\":1}\n```\n\nTrailing prose.",
+      "expect": "accept",
+      "why": "an emoji inside a label cell is just a string, and it also shifts the fence's end offset by one code unit"
+    },
+    {
+      "name": "emoji_only_in_trailing_prose",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```\n\n🧪 after",
+      "expect": "accept",
+      "why": "an emoji after the closing fence: the trailing whitespace class does not swallow it, so the capture and span must both be unaffected"
+    },
+    {
+      "name": "nested_150_in_unused_key",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", 1.0]], \"value_column\": 1, \"note\": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}\n```\n\nTrailing prose.",
+      "expect": "reject",
+      "why": "nesting at 150 levels: shallower than CPython's own recursion limit and shallow enough for V8 to walk, so the shared MAX_JSON_DEPTH cap is the ONLY reason either side rejects this block -- which is what makes the cap load-bearing"
+    },
+    {
       "name": "num_proto_cell",
       "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",\"constructor\"]],\"value_column\":1}\n```\n\nTrailing prose.",
       "expect": "reject",
