@@ -2024,14 +2024,20 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # too: a client that is already gone still gets the partial turn
                 # stored (flagged aborted) and nothing is deleted, because the
                 # bytes were already on the wire.
+                # Reaching here means `chunks` is non-empty (the guard above
+                # re-raises otherwise), so the provider DID generate and bill
+                # those tokens -- whether or not the response finished. That is
+                # not the same question as whether usage has been reported:
                 # stream_answer() only populates usage_holder once the whole
-                # response has arrived, and a mid-stream failure raises before
-                # that point — so usage_holder is empty here and the partial
-                # (truncated) turn is not billed: tokens/cost stay 0 and the
-                # hold is released. If a stream backend ever surfaces usage
-                # before raising, settle the turn for it here instead — the
-                # completed path below settles exactly once, and finish_holds
-                # makes a second settle impossible.
+                # response has arrived, so a mid-stream failure leaves it empty
+                # while the spend is real. Releasing the hold here would make a
+                # billed call free, which is the one outcome the cap's whole
+                # reserve/settle/sweep design exists to prevent (#255). So the
+                # real cost is used when it is known, and the estimate the gate
+                # held is charged when it is not. Tokens stay 0 because the
+                # provider never counted them for us; the completed path below
+                # settles exactly once and finish_holds makes a second settle
+                # impossible.
                 usage = usage_holder[0] if usage_holder else None
                 prompt_tokens = usage.prompt_tokens if usage else 0
                 completion_tokens = usage.completion_tokens if usage else 0
@@ -2039,7 +2045,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 client_gone = await request.is_disconnected()
                 assistant_msg = await persist_truncated_turn(
                     "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
-                    to_usd(cost_inr), aborted=client_gone,
+                    to_usd(cost_inr) if usage else mid_stream_estimate, aborted=client_gone,
                 )
                 if client_gone:
                     return

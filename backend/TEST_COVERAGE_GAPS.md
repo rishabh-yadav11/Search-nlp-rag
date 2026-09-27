@@ -304,10 +304,12 @@ without a failure.
 ## app/chat.py — 91% (covered by tests/test_chat.py)
 
 Measured: 841 statements, 72 missed. The entries below are the branches this
-change added or re-pointed at; the residual is mostly
-`_prepare_multi_entity_turn` (lines 1330-1440) and is tracked in #295.
+change added or re-pointed at. The residual is mostly
+`_prepare_multi_entity_turn` (lines 1330-1440), which this change did not
+touch, and none of the missed lines is new code — the shortfall predates it and
+the full accounting is #295's audit. Do not read this section as 100%.
 
-- [x] **`ChatStore.connect` schema migration** (lines 119-176): legacy DBs
+- [x] **`ChatStore.connect` schema migration** (lines 119-175): legacy DBs
       missing `prompt_tokens`/`completion_tokens`/`cost` and separately missing
       `latency_ms` get the columns added with `0` defaults, as does the `aborted`
       column (line 174) that the abort rule needs. **ERROR PATH — malformed /
@@ -316,11 +318,11 @@ change added or re-pointed at; the residual is mostly
       idempotent close-when-already-closed no-op.
 - [x] **`rename_session` / `delete_session` when session missing** (lines 321,
       336) → 404.
-- [x] **`global_stats` exception handler** (lines 404-450): a failing query
+- [x] **`global_stats` exception handler** (lines 404-464): a failing query
       degrades to `{"error": "chat analytics unavailable"}`, never raises.
-- [x] **`json_loads` malformed JSON** (lines 562-580): bad JSON, `None`, and
+- [x] **`json_loads` malformed JSON** (lines 562-616): bad JSON, `None`, and
       non-string input all → `[]`. **ERROR PATH — malformed stored rows.**
-- [x] **`_row_to_message`** (lines 616-630): malformed/legacy row field
+- [x] **`_row_to_message`** (lines 616-628): malformed/legacy row field
       coercion — bad sources JSON and `NULL`/string token/cost fields fall back
       to `0` defaults, and `aborted` coerces from a legacy `NULL`.
 - [x] **`_smalltalk_reply` non-smalltalk fallthrough** (line 645): empty /
@@ -331,11 +333,11 @@ change added or re-pointed at; the residual is mostly
       (line 815); `_first_numeric_column` empty rows / empty first row
       (line 822); `_has_label_content` no-label-cols vs all-empty labels
       (line 831); `parse_dataviz` rejection paths — non-dict data, non-string
-      columns, non-list rows (lines 845-880); `_sanitize_dataviz` empty
+      columns, non-list rows (lines 845-884); `_sanitize_dataviz` empty
       text and no-fence passthrough (line 887).
 - [x] **`_dataviz_nudge` view pinning** (line 1012): a named view appends the
       "exact type of data block" instruction; a generic chart ask does not.
-- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 1066, 1070-1072):
+- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 1066-1080):
       no fence, invalid JSON, and non-dict data → `None`; dict data gets the
       view applied.
 - [x] **`_apply_requested_view` rewrite** (line 1082): a block that fails to
@@ -343,16 +345,16 @@ change added or re-pointed at; the residual is mostly
 - [x] **`_is_ranking_refusal`** (line 1164): refusal signatures ("cannot be
       generated", "do not contain specific amounts") → True; empty text and
       genuine ranked answers → False.
-- [x] **`_answer_ranked` ranking-nudge retry** (lines 1186-1215): a refusal is
+- [x] **`_answer_ranked` ranking-nudge retry** (lines 1186-1214): a refusal is
       re-asked once with `_RANKING_NUDGE` and tokens summed; the
       `LLMUnavailableError` guard keeps the first answer; non-refusals make a
       single call.
-- [x] **`_prepare_turn` follow-up inheritance** (lines 1226-1330): vague-follow-up
+- [x] **`_prepare_turn` follow-up inheritance** (lines 1226-1329): vague-follow-up
       with a year range keeps the previous topic and pins the new dates;
       `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources short-circuit;
       weak fallback answer + note. **ERROR PATH — LLM/Qdrant/Redis down during
       retrieval.**
-- [x] **`_run_turn` cost recording + finalize** (lines 1443-1510): `reserve`
+- [x] **`_run_turn` cost recording + finalize** (lines 1443-1509): `reserve`
       before the billed call → `_answer_ranked` → `settle(holds,
       to_usd(result.cost()))` (the turn's single counter write; `release(holds)`
       when no call was made) → finalized answer (unrequested dataviz blocks
@@ -363,48 +365,52 @@ change added or re-pointed at; the residual is mostly
       while the live hold is charged by the sweep either way. **ERROR PATH —
       Redis down after a billed call.**
 - [x] **`send_message` `BudgetExceeded` → 429** (lines 1755-1759),
-      **`LLMUnavailableError` → 503** (lines 1760-1764), and
-      **`BudgetUnavailable` → 503** (lines 1746-1754) with the dangling user
+      **`LLMUnavailableError` → 503** (lines 1760-1763), and
+      **`BudgetUnavailable` → 503** (lines 1764-1773) with the dangling user
       message rolled back, so an unreadable counter is never reported as an
       empty answer. **ERROR PATH — LLM retry exhaustion / daily budget / Redis
       down.**
 - [x] **`_require_store` uninitialized → 503** (line 1644) and
       **`_validate_question` too-long → 400** (line 1653).
-- [x] **`send_message_stream` nudge retry branches** (lines 2066-2075,
-      2098-2107): a dataviz/ranking nudge that succeeds appends its block and
+- [x] **`send_message_stream` nudge retry branches** (lines 2072-2083,
+      2104-2113): a dataviz/ranking nudge that succeeds appends its block and
       sums tokens; a failed nudge (`LLMUnavailableError`) keeps the streamed
-      answer. **`error` SSE handlers** (lines 2145, 2148, 2154, 2158):
-      mid-stream `LLMUnavailableError` → "LLM temporarily unavailable";
-      `BudgetExceeded` → "Daily AI budget reached"; `BudgetUnavailable` →
-      "AI budget service unavailable"; unexpected exceptions → "Something went
-      wrong", never a 500. **ERROR PATH — LLMUnavailableError / BudgetExceeded /
-      BudgetUnavailable mid-stream.**
-- [x] **`retention_loop`** (lines 2171-2179): a failing purge is swallowed and
+      answer. **`error` SSE handlers**: mid-stream `LLMUnavailableError` →
+      "LLM temporarily unavailable" (line 2151); `BudgetExceeded` → "Daily AI
+      budget reached" (line 2154); `BudgetUnavailable` → "AI budget service
+      unavailable" (line 2160); unexpected exceptions → "Something went wrong"
+      (line 2164), never a 500. The `BudgetUnavailable` handler is still
+      reachable: `reserve()` is called at the pre-call gate and by each nudge,
+      and a rejection there propagates before a byte is delivered. **ERROR PATH —
+      LLMUnavailableError / BudgetExceeded / BudgetUnavailable mid-stream.**
+- [x] **`retention_loop`** (lines 2177-2185): a failing purge is swallowed and
       the loop keeps ticking; the next tick purges expired conversations.
 
 Added by this change, all exercised end to end through the HTTP handlers:
 
-- [x] **the ONE abort rule** (lines 1904-1935): the client's disconnect is
+- [x] **the ONE abort rule** (lines 1904-1945): the client's disconnect is
       checked at every gate, and a turn that streamed nothing is rolled back
       while a turn that streamed anything is PERSISTED with
       `[answer truncated]` and `aborted=True` — the server's history can never
       contradict what is already on the client's screen. `persist_truncated_turn`
-      (lines 1880-1901) is the single writer for every partial turn, including
+      (lines 1880-1902) is the single writer for every partial turn, including
       the mid-stream-failure path.
 - [x] **a billed call is charged, never refunded, on a disconnect** (lines
-      2000-2010, 2066-2075, 2098-2107): a disconnect in the gate-to-first-delta
+      2000-2014, 2072-2083, 2104-2113): a disconnect in the gate-to-first-delta
       window settles the hold at the estimate the gate took it at, and the two
       post-stream checks pass the finished stream's real cost instead of
-      storing the turn as free. A turn that made no billed call at all still
-      releases.
-- [x] **a delivered answer survives a failed settle** (lines 1835-1859,
-      1481-1501): once deltas are on the wire, or the LLM has already answered,
+      storing the turn as free. A mid-stream FAILURE after deltas is charged
+      too (lines 2027-2053): `chunks` is non-empty there, so the provider billed
+      those tokens even though usage was never reported. A turn that made no
+      billed call at all still releases.
+- [x] **a delivered answer survives a failed settle** (lines 1836-1869,
+      1481-1502): once deltas are on the wire, or the LLM has already answered,
       an unreachable counter no longer converts a complete answer into a
       truncated `aborted` row plus an `error` event.
-- [x] **`send_message` 499 on a client that disconnected** (lines 1782-1791): a
+- [x] **`send_message` 499 on a client that disconnected** (lines 1786-1791): a
       JSON client has seen nothing, so the turn is a clean rollback reported as
       a non-success status rather than a completed `TurnOut`.
-- [x] **`_trim_history` / `CHAT_MAX_HISTORY_CHARS`** (lines 1657-1672, and
+- [x] **`_trim_history` / `CHAT_MAX_HISTORY_CHARS`** (lines 1657-1680, and
       `_start_turn`): oldest-first, never splitting a message, a single
       oversized message kept alone, `0`/negative disabling the cap, and the char
       budget applied to what actually reaches the prompt.

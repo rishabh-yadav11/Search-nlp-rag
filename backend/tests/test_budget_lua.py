@@ -286,13 +286,17 @@ function S.disabled_cap_admits_everything()
 end
 
 -- Acceptance criterion for #255: a CRASH is not free spend -- and the
--- promotion has to be REACHABLE, not just arithmetically correct. Nothing
--- here refreshes the holds containers between the reserve and the sweep: the
--- one later call is the first command the store sees. A hold's score first
+-- promotion has to be REACHABLE, not just arithmetically correct. Nothing here
+-- refreshes the holds containers between the reserve and the sweep: the one
+-- later call is the first command the store sees. A hold's score first
 -- satisfies `score <= now` exactly hold_ttl after the reserve, which is also
 -- when containers expired at hold_ttl are gone (Redis expires lazily, on the
 -- first command after the deadline -- the sweep). The spend then evaporates
 -- and nothing reports it.
+--
+-- All three modes re-arm the container TTL, so a settle or a release in the
+-- gap is as good a way to lose the charge as a second reserve, and each of
+-- them is exercised below.
 function S.crashed_hold_is_charged_without_a_keepalive()
   newstore()
   run('reserve', 1000, 900, 500000, 50000, 'crash')
@@ -306,6 +310,27 @@ function S.crashed_hold_is_charged_without_a_keepalive()
   -- The containers outlived the promotion instead of dying with it, so the
   -- live holds are still being counted against the cap.
   check(holdcount() == 2, 'the two live holds are still held (got ' .. holdcount() .. ')')
+end
+
+-- The SAME reachability property, reached through the settle and release
+-- branches, which also re-arm the container TTL. Under the old
+-- `EXPIRE ... hold_ttl` each of these calls reset the containers' deadline to
+-- now + hold_ttl, so a hold created just before one of them still died the
+-- instant it became sweepable. Sweeping at the boundary `score == now` (1900,
+-- containers exp 2800) pins the near edge; sweeping well past it (2799) pins
+-- the far edge, so a future change cannot pass by luck at one instant.
+function S.crashed_hold_survives_a_settle_or_release_in_the_gap()
+  newstore()
+  run('reserve', 1000, 900, 500000, 50000, 'crash')
+  run('settle', 1000, 900, 500000, 0, '', { 'other' })   -- re-arms the TTLs
+  run('reserve', 1900, 900, 500000, 1000, 'later')
+  check(store.c == 50000, 'a settle in the gap does not lose the charge (got ' .. store.c .. ')')
+
+  newstore()
+  run('reserve', 1000, 900, 500000, 50000, 'crash')
+  run('release', 1000, 900, 500000, 0, '', { 'other' })  -- re-arms the TTLs
+  run('reserve', 2799, 900, 500000, 1000, 'later')
+  check(store.c == 50000, 'a release in the gap does not lose the charge (got ' .. store.c .. ')')
 end
 
 -- The TTL floors, one per scenario. Real Redis REJECTS `EXPIRE key 0` and
@@ -354,6 +379,7 @@ SCENARIOS = [
     "settle_overshoot_is_recorded",
     "crashed_hold_is_charged_when_it_lapses",
     "crashed_hold_is_charged_without_a_keepalive",
+    "crashed_hold_survives_a_settle_or_release_in_the_gap",
     "settle_replaces_the_promoted_estimate",
     "settling_the_same_ids_twice_charges_once",
     "duplicate_ids_within_one_settle_charge_once",
