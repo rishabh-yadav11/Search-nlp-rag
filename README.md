@@ -212,12 +212,16 @@ Every 15 minutes via cron, deprioritized with `nice` (installed by `setup.sh cro
 I capped logs so they can't fill the disk long-term:
 
 - **Docker** (Qdrant/Redis) runs with `--log-driver json-file --log-opt max-size=20m --log-opt max-file=3` (set by `setup.sh` via `DOCKER_LOG_OPTS`).
-- **App + PM2 logs** (`<repo>/logs/*.log`, `~/.pm2/logs/*.log`) are rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2), compressed, with `copytruncate` so open file handles keep writing. The shipped `deploy/logrotate.conf` carries `/path/to/...` placeholders — logrotate does no variable interpolation, so edit them to your real checkout and `~/.pm2` before installing:
+- **App + PM2 logs** (`<repo>/logs/*.log`, `~/.pm2/logs/*.log`) are rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2), compressed, with `copytruncate` so open file handles keep writing. The shipped `deploy/logrotate.conf` carries `/path/to/...` placeholders — logrotate does no variable interpolation, so substitute them before installing. Run this from the **repo root** and write to a copy, so the tracked file stays clean and the substitution can't pick up a `backend/` subdirectory:
 
 ```bash
-sed -i "s|/path/to/search-nlp-rag|$PWD|; s|/path/to/.pm2|$HOME/.pm2|" deploy/logrotate.conf
-sudo install -m 644 deploy/logrotate.conf /etc/logrotate.d/vccircle
+cd /path/to/search-nlp-rag            # the repo root
+sed "s|/path/to/search-nlp-rag|$PWD|g; s|/path/to/.pm2|$HOME/.pm2|g" \
+    deploy/logrotate.conf > /tmp/vccircle-logrotate
+sudo install -m 644 /tmp/vccircle-logrotate /etc/logrotate.d/vccircle
 ```
+
+The `su` directive is commented out by default (logrotate then runs as root, which is correct whenever the logs are root-owned); uncomment and set it to your own `<user> <group>` otherwise. The placeholder paths must be substituted — left in place, `missingok` makes logrotate silently rotate nothing.
 
 The config lives in the repo at `deploy/logrotate.conf` for reproducibility.
 

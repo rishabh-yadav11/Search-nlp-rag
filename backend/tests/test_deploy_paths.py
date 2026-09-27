@@ -34,10 +34,24 @@ APPS = (
 KNOWN_HOME_LITERAL = re.compile(r"home/ubuntu")
 GENERIC_HOME = re.compile(r"/(?:home/[a-z_][a-z0-9_-]*|Users/[A-Za-z0-9_.-]+)/")
 
-# A shipped `su <user> <group>` directive pinning one operator's account. Kept
-# as a separate pattern because, unlike the two above, it names an identity
-# rather than a path and has no leading slash to key off.
-SU_DIRECTIVE = re.compile(r"^\s*su\s+(?!deploy-user\b)\S+")
+# A shipped `su <user> <group>` directive pinning one account. Kept as a
+# separate pattern because, unlike the two above, it names an identity rather
+# than a path and has no leading slash to key off.
+#
+# The shipped placeholders are commented out, so they cannot match `^\s*su\s+`
+# -- and an ACTIVE but unedited `su deploy-user deploy-group` must fail, since
+# that is exactly the state an operator reaches by following the file's own
+# instruction and forgetting to substitute.
+SU_DIRECTIVE = re.compile(r"^\s*su\s+\S+")
+
+# A home-relative path to a `logs/` directory, e.g. `$HOME/search-nlp-rag/logs`.
+# Not the same shape as GENERIC_HOME: it needs no leading `/home/<user>/` to
+# match, so a script defaulting a log path to `$HOME/<fixed-name>/logs` resolves
+# to a different directory on every other checkout -- writing, or rotating,
+# nothing where the operator expects. Scoped to `logs/` deliberately: a plain
+# `$HOME/.local/bin` PATH entry is a legitimate home-relative path, not a
+# checkout pin.
+HOME_RELATIVE_PIN = re.compile(r"\$(?:\{HOME\}|HOME)/[A-Za-z0-9_.-]+/logs/")
 
 # A quoted string starting at the filesystem root, i.e. a path baked into the
 # source instead of derived from the file's own location.
@@ -48,6 +62,23 @@ def _shipped_deploy_files() -> list[Path]:
     """Every file this repo ships for deployment, ecosystem config included."""
     files = [ECOSYSTEM_JS, *(p for p in DEPLOY_DIR.rglob("*") if p.is_file())]
     return sorted(files)
+
+
+def test_the_shipped_deploy_files_the_guard_scans_actually_exist() -> None:
+    """Guard on the guard: the scan must not pass by scanning nothing.
+
+    `_shipped_deploy_files()` is evaluated at import, so deleting or renaming
+    `deploy/logrotate.conf` empties the parametrisation and every home-path test
+    above would go green with the rotation policy simply absent.
+    """
+    expected_files = (
+        ECOSYSTEM_JS,
+        DEPLOY_DIR / "logrotate.conf",
+        DEPLOY_DIR / "healthcheck.sh",
+    )
+    for expected in expected_files:
+        assert expected.is_file(), f"{expected} is missing; the deploy guard is not scanning it"
+    assert len(_shipped_deploy_files()) >= len(expected_files)
 
 
 def _violations(pattern: re.Pattern[str], path: Path) -> list[tuple[int, str]]:
@@ -83,15 +114,18 @@ def _node_apps(node: str) -> list[dict[str, Any]]:
         (KNOWN_HOME_LITERAL, "the previously shipped /home/ubuntu path"),
         (GENERIC_HOME, "an absolute per-user home directory"),
         (SU_DIRECTIVE, "a logrotate `su` directive pinning one operator's account"),
+        (HOME_RELATIVE_PIN, "a $HOME-relative path pinned to one checkout's name"),
     ],
 )
 def test_no_hardcoded_home_directory_in_shipped_deploy_config(
     path: Path, pattern: re.Pattern[str], label: str
 ) -> None:
-    """No shipped deploy file may name any user's home directory.
+    """No shipped deploy file may pin a path to someone's home or checkout name.
 
-    A checkout belonging to anyone else would rotate logs that do not exist or
-    start pm2 processes in a missing directory.
+    A checkout belonging to anyone else would rotate logs that do not exist, or
+    start pm2 processes in a missing directory. The three patterns cover the
+    distinct spellings that defect takes: a literal absolute home, a home
+    written as `$HOME/...`, and a logrotate `su` account.
     """
     found = _violations(pattern, path)
     assert found == [], (
