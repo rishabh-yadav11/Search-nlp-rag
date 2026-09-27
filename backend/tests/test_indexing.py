@@ -229,6 +229,71 @@ def test_init_reseed_clears_the_requeue():
     assert (new, changed, deleted) == (set(), set(), set())
 
 
+def _run_main(monkeypatch, tmp_path, state, records):
+    """Drive update_index.main() with the filesystem, DB and Qdrant faked out."""
+    import asyncio
+
+    monkeypatch.setattr(update_index, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(update_index, "LOCK_PATH", str(tmp_path / "update.lock"))
+    monkeypatch.setattr(update_index, "STATE_PATH", str(tmp_path / "index_state.json"))
+    monkeypatch.setattr(update_index, "reconcile", lambda state, records: True)
+    monkeypatch.setattr(update_index, "load_state", lambda: state)
+    monkeypatch.setattr(update_index.sys, "argv", ["update_index.py"])
+
+    async def _fetch(with_body=True, ids=None):
+        return dict(records)
+
+    monkeypatch.setattr(update_index, "fetch_records", _fetch)
+    applied = {}
+    monkeypatch.setattr(
+        update_index,
+        "apply_delta",
+        lambda recs, new, changed, deleted, state: applied.update(new=new, changed=changed),
+    )
+
+    asyncio.run(update_index.main())
+    return applied
+
+
+def test_main_warns_and_names_init_when_every_row_reads_as_changed(monkeypatch, tmp_path, capsys):
+    """The operator-facing payoff of the re-queue: the run says so in its log.
+
+    A fingerprint-scheme change is indistinguishable from "every row really was
+    edited", and the cost is a full re-embed. Without a log line the operator
+    only finds out from a bill, so main() must name --init when it sees this
+    signature.
+    """
+    records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 4)}
+    legacy = {
+        "updated_at": None,
+        "fingerprints": {str(i): _legacy_fingerprint(r) for i, r in records.items()},
+    }
+
+    applied = _run_main(monkeypatch, tmp_path, legacy, records)
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out, "the all-changed signature must be warned about"
+    assert "--init" in out, "the warning must name the remedy"
+    assert applied["changed"] == set(records), "precondition: the corpus really was re-queued"
+
+
+def test_main_does_not_warn_on_a_normal_partial_delta(monkeypatch, tmp_path, capsys):
+    """The warning must not fire on ordinary incremental work.
+
+    A scheduled run where a few rows changed is the normal case; warning there
+    would train operators to ignore the line that matters.
+    """
+    records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 4)}
+    state = {"updated_at": None, "fingerprints": {str(i): fingerprint(r) for i, r in records.items()}}
+    records[2] = _payload_rec(id=2, title="Article 2 EDITED")
+
+    applied = _run_main(monkeypatch, tmp_path, state, records)
+
+    out = capsys.readouterr().out
+    assert "WARNING: all" not in out, "a partial delta is normal and must not warn"
+    assert applied["changed"] == {2}
+
+
 def test_load_state_default_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(update_index, "STATE_PATH", str(tmp_path / "missing.json"))
     assert load_state() == {"updated_at": None, "fingerprints": {}}
