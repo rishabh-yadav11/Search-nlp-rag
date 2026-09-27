@@ -32,8 +32,8 @@ const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+\-.]*:/
 const PROTOCOL_RELATIVE_RE = /^[/\\]{2}/
 
 /**
- * Base used when there is no `window` (SSR). It is never reachable — it exists
- * only so that a relative URL resolves to *something* instead of throwing, and
+ * Stand-in base for renders with no `window`. Nothing is ever fetched from it;
+ * it only lets a relative URL resolve to *something* instead of throwing, so
  * the origin comparison below stays consistent between server and client.
  */
 const SSR_BASE = 'https://localhost/'
@@ -83,4 +83,3 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   return true
 }
 
-export default isSafeUrl
