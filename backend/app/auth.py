@@ -1,7 +1,8 @@
 """Token + RBAC authentication for the API.
 
-Open signup/login issue opaque bearer tokens (hashed with SHA-256 in storage,
-expiring after AUTH_TOKEN_TTL_DAYS, individually revocable, multiple per user).
+Signup issues no token and always answers the same thing (see the endpoint);
+login issues opaque bearer tokens (hashed with SHA-256 in storage, expiring
+after AUTH_TOKEN_TTL_DAYS, individually revocable, multiple per user).
 A role-based access-control layer maps roles to permissions; endpoints assert
 the permission they need via ``require_permission``. A bootstrap admin account
 is seeded from AUTH_ADMIN_EMAIL / AUTH_ADMIN_PASSWORD at startup.
@@ -113,6 +114,31 @@ class AuthOut(BaseModel):
     user: UserOut
 
 
+class SignupOut(BaseModel):
+    """Response of a successful-looking ``POST /api/auth/signup``.
+
+    Deliberately carries neither a token nor a user record: whether the
+    address was free or already registered, the response is this one fixed
+    message, so the endpoint cannot be used to confirm that an address has
+    an account here. Callers follow up with ``POST /api/auth/login``.
+    """
+
+    message: str
+
+
+# The single response body every accepted signup gets. It must state the two
+# possible outcomes without favouring one: this app has no confirmation-email
+# flow, so a returning user who re-submits a registered address gets no mail
+# and no error -- the message is their recovery route ("just sign in with
+# your existing password"), and it is deliberately the same string a brand new
+# address receives.
+SIGNUP_ACCEPTED_MESSAGE = (
+    "If this email is not already registered, your account is ready. "
+    "Sign in with your email and password to continue; if you already have "
+    "an account, sign in with your existing password."
+)
+
+
 @dataclass
 class StoredUser:
     id: str
@@ -174,6 +200,18 @@ def verify_password(password: str, hashed: str) -> bool:
         return bcrypt.checkpw(_password_bytes(password), hashed.encode("utf-8"))
     except ValueError:
         return False
+
+
+# A bcrypt hash of a per-process random secret, computed once at import by the
+# same ``hash_password`` -- and therefore the same ``gensalt()`` cost factor --
+# that produced every stored hash. Logging in against an address that has no
+# account verifies the supplied password against this constant, so that path
+# costs the same wall-clock time as a wrong-password login. Without it the
+# missing short-circuit is a remote account-existence oracle even though both
+# paths return the identical 401 body. It must never be a cheaper hash: the
+# cost factor is the whole point, so it is derived rather than hard-coded. The
+# secret is discarded immediately and is never a valid password for anyone.
+_DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(32))
 
 
 def hash_token(token: str) -> str:
@@ -650,10 +688,18 @@ def require_permission(permission: str):
 # --- endpoints ---
 
 
-@router.post("/signup", response_model=AuthOut)
+@router.post("/signup", response_model=SignupOut)
 async def signup(body: SignupIn, request: Request):
-    """Create an account (public). Returns a bearer token. Validated server-side:
-    email format + uniqueness, password strength, name limits.
+    """Register an account (public). Validated server-side: email format,
+    password strength, name limits.
+
+    The response is one fixed 200 ``{"message": ...}`` whether or not the
+    address was already registered, so an unauthenticated caller cannot use
+    this endpoint to learn which addresses have accounts here. It therefore
+    carries no token: a token present only for fresh addresses would be the
+    oracle all over again, and minting one for an existing account would hand
+    an anonymous caller someone else's session. Callers follow up with
+    ``POST /api/auth/login``.
 
     The role is hardcoded to 'user': public signups always land with the least
     privilege. There is deliberately no configuration knob here — a role that
@@ -665,29 +711,46 @@ async def signup(body: SignupIn, request: Request):
     password = validate_password(body.password)
     name = validate_name(body.name)
     s = _require_auth_store()
-    if await s.get_user_by_email(email) is not None:
-        raise HTTPException(status_code=409, detail="an account with this email already exists")
+    # No pre-flight "does this address exist" lookup: create_user hashes the
+    # password and attempts the INSERT either way, so a duplicate costs the
+    # same wall-clock time as a fresh registration. A pre-check would skip
+    # that bcrypt work and leak existence through timing, exactly as login
+    # did. The users.email UNIQUE constraint is the single source of truth.
     try:
-        user = await s.create_user(email, password, name, role=SIGNUP_ROLE)
+        await s.create_user(email, password, name, role=SIGNUP_ROLE)
     except DuplicateEmailError:
-        # lost the concurrent-creation race; report it as a plain duplicate
-        raise HTTPException(status_code=409, detail="an account with this email already exists") from None
-    token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
-    return AuthOut(token=token, user=UserOut.from_user(user))
+        # Already registered (including losing a concurrent-creation race).
+        # Swallow it into the same success-shaped answer a fresh address gets
+        # and leave the stored row untouched: no re-hash, no rename, no
+        # re-activation, no duplicate, no session.
+        logger.info("signup for an already-registered address: reported as accepted")
+    return SignupOut(message=SIGNUP_ACCEPTED_MESSAGE)
 
 
 @router.post("/login", response_model=AuthOut)
 async def login(body: LoginIn, request: Request):
-    """Exchange email+password for a bearer token. Invalid credentials always
-    return the same generic 401 (no account enumeration)."""
+    """Exchange email+password for a bearer token.
+
+    An unknown address and a known address with a wrong password are
+    indistinguishable to the caller: the identical 401 status and body, and
+    the identical full bcrypt verify cost, because the unknown-address path
+    verifies the supplied password against a fixed dummy hash at the same
+    cost factor instead of skipping the check. A deactivated account is
+    verified the same way, so it is not distinguishable either.
+    """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
     s = _require_auth_store()
     user = await s.get_user_by_email(email)
-    password_ok = user is not None and await asyncio.to_thread(
-        verify_password, body.password, user.password_hash
+    # Always pay the bcrypt cost, even with no account to compare against:
+    # `user is not None and await ... verify_password(...)` short-circuits, and
+    # that skipped ~100ms was a remote account-existence oracle.
+    password_ok = await asyncio.to_thread(
+        verify_password,
+        body.password,
+        user.password_hash if user is not None else _DUMMY_PASSWORD_HASH,
     )
-    if not password_ok or not user.is_active:
+    if not password_ok or user is None or not user.is_active:
         raise HTTPException(status_code=401, detail="invalid email or password")
     token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
     return AuthOut(token=token, user=UserOut.from_user(user))
