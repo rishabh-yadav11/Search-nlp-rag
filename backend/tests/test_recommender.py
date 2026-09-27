@@ -306,11 +306,10 @@ class _FakeQdrant:
         return ([_scored_point(13, "trending hit")], None)
 
 
-async def _personalized(qdrant, *, trending=None):
+async def _personalized(qdrant):
     """Drive get_personalized_recommendations with a warm user profile."""
     from app import recommender
 
-    trending = [{"article_id": 13}] if trending is None else trending
     with (
         patch.object(recommender, "state", {"qdrant": qdrant}),
         patch.object(
@@ -324,20 +323,31 @@ async def _personalized(qdrant, *, trending=None):
             AsyncMock(return_value=[("software industry", 1.0)]),
         ),
         patch.object(
-            recommender, "get_trending_articles", AsyncMock(return_value=trending),
+            recommender, "get_trending_articles",
+            AsyncMock(return_value=[{"article_id": 13}]),
         ),
     ):
         return await recommender.get_personalized_recommendations("user1", limit=5)
 
 
-def _leg_warnings(caplog, exc_message):
-    """Warning records on the recommender logger that carry the exception."""
+def _leg_warnings(caplog, leg, exc_message):
+    """Warnings from ONE named leg that carry the exception text.
+
+    Matching on the leg name matters: a warning from any other leg would
+    otherwise satisfy the assertion, since they share the same exception.
+    """
     return [
         record for record in caplog.records
         if record.name == "app.recommender"
         and record.levelno == logging.WARNING
+        and leg in record.getMessage()
         and exc_message in record.getMessage()
     ]
+
+
+_VECTOR_LEG = "Vector candidate lookup failed"
+_CATEGORY_LEG = "Category candidate lookup failed"
+_TRENDING_LEG = "Trending candidate lookup failed"
 
 
 def _titles(result):
@@ -361,7 +371,7 @@ class TestCandidateLegObservability:
         with caplog.at_level(logging.WARNING):
             result = await _personalized(_FakeQdrant(fail_vector=True))
 
-        assert _leg_warnings(caplog, _FakeQdrant.OUTAGE), caplog.records
+        assert _leg_warnings(caplog, _VECTOR_LEG, _FakeQdrant.OUTAGE), caplog.records
         # The other two legs still supply the feed.
         assert _titles(result) == {"category hit", "trending hit"}
 
@@ -370,7 +380,7 @@ class TestCandidateLegObservability:
         with caplog.at_level(logging.WARNING):
             result = await _personalized(_FakeQdrant(fail_category=True))
 
-        assert _leg_warnings(caplog, _FakeQdrant.OUTAGE), caplog.records
+        assert _leg_warnings(caplog, _CATEGORY_LEG, _FakeQdrant.OUTAGE), caplog.records
         assert _titles(result) == {"vector hit", "trending hit"}
 
     @pytest.mark.asyncio
@@ -378,16 +388,16 @@ class TestCandidateLegObservability:
         with caplog.at_level(logging.WARNING):
             result = await _personalized(_FakeQdrant(fail_trending=True))
 
-        assert _leg_warnings(caplog, _FakeQdrant.OUTAGE), caplog.records
+        assert _leg_warnings(caplog, _TRENDING_LEG, _FakeQdrant.OUTAGE), caplog.records
         assert _titles(result) == {"vector hit", "category hit"}
 
     @pytest.mark.asyncio
-    async def test_partial_outage_keeps_working_legs(self, caplog):
-        """A full Qdrant outage in every leg still returns a (here empty) feed
-        plus three warnings, rather than raising or logging nothing."""
+    async def test_total_outage_logs_every_leg_once(self, caplog):
+        """With all three legs down the feed is empty, but each leg is named."""
         qdrant = _FakeQdrant(fail_vector=True, fail_category=True, fail_trending=True)
         with caplog.at_level(logging.WARNING):
             result = await _personalized(qdrant)
 
         assert result == []
-        assert len(_leg_warnings(caplog, _FakeQdrant.OUTAGE)) == 3, caplog.records
+        for leg in (_VECTOR_LEG, _CATEGORY_LEG, _TRENDING_LEG):
+            assert _leg_warnings(caplog, leg, _FakeQdrant.OUTAGE), (leg, caplog.records)
