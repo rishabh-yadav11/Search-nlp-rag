@@ -388,9 +388,9 @@ Backend tests (pytest, fully offline — mocked Qdrant/Redis/MySQL/LLM):
 
 ```bash
 cd backend
-pip install -r requirements-dev.txt
-python -m pytest tests -q
-python -m ruff check app scripts tests
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
+ruff check .
 ```
 
 Coverage: query-intent/date parsing, facet filter construction, effective intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, chat store (CRUD, ownership isolation, retention, token/cost stats), SSE streaming (small-talk short-circuit + full-turn deltas), index fingerprinting/delta/reconciliation, and cache TTL and degraded fallback.
