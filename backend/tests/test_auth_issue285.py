@@ -13,6 +13,7 @@ reflects what a process surviving the kill would actually see.
 """
 
 import asyncio
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -62,26 +63,48 @@ class _KillSwitch:
         self.kill_at = kill_at
         self.steps: list[str] = []
 
-    def enter(self, step: str) -> None:
+    async def enter(self, step: str) -> None:
         self.steps.append(step)
         if len(self.steps) == self.kill_at:
             raise _SimulatedKill(step)
 
 
-def _watch(conn, kill: _KillSwitch):
-    """Make ``conn`` report the change's step before each write, and kill there."""
+class _PauseAt:
+    """Holds the change open at one step until the test lets it go.
+
+    Event-driven rather than a sleep, so the test does not depend on how long
+    the surrounding statements take. Every other step passes straight through.
+    """
+
+    def __init__(self, step: str):
+        self.step = step
+        self.reached = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def enter(self, step: str) -> None:
+        if step != self.step or self.resume.is_set():
+            return
+        self.reached.set()
+        await self.resume.wait()
+
+    def release(self) -> None:
+        self.resume.set()
+
+
+def _watch(conn, controller):
+    """Make ``conn`` report the change's step before each write, and act there."""
     real_execute, real_commit = conn.execute, conn.commit
 
     async def execute(sql, *args, **kwargs):
         text = " ".join(sql.split())
         for prefix, step in _SQL_STEP:
             if text.startswith(prefix):
-                kill.enter(step)
+                await controller.enter(step)
                 break
         return await real_execute(sql, *args, **kwargs)
 
     async def commit():
-        kill.enter(_STEP_COMMIT)
+        await controller.enter(_STEP_COMMIT)
         return await real_commit()
 
     conn.execute = execute
@@ -89,32 +112,36 @@ def _watch(conn, kill: _KillSwitch):
     return conn
 
 
-class _KillSwitchAioSqlite:
+class _WatchedAioSqlite:
     """Stands in for the ``aiosqlite`` module, wrapping only ``connect()``."""
 
-    def __init__(self, kill: _KillSwitch):
-        self._kill = kill
+    def __init__(self, controller):
+        self._controller = controller
 
     def connect(self, *args, **kwargs):
         return self._open(_REAL_AIO_SQLITE.connect(*args, **kwargs))
 
     async def _open(self, coro):
-        return _watch(await coro, self._kill)
+        return _watch(await coro, self._controller)
 
     def __getattr__(self, name):
         return getattr(_REAL_AIO_SQLITE, name)
 
 
-def _arm(monkeypatch, store: AuthStore, kill_at: int) -> _KillSwitch:
-    """Kill the worker just as the change reaches step ``kill_at`` (1-based).
+def _attach(monkeypatch, store: AuthStore, controller) -> None:
+    """Watch the store's open connection and every one it opens after this.
 
-    The store's already-open connection is watched as well as every connection
-    it opens later, so the test does not presuppose which one the change runs
-    on -- only that the worker can die between two of its writes.
+    Both are watched so a test does not presuppose which connection the change
+    runs on -- only where in its sequence it can be interrupted or held.
     """
+    _watch(store._db, controller)
+    monkeypatch.setattr(auth, "aiosqlite", _WatchedAioSqlite(controller))
+
+
+def _arm(monkeypatch, store: AuthStore, kill_at: int) -> _KillSwitch:
+    """Kill the worker just as the change reaches step ``kill_at`` (1-based)."""
     kill = _KillSwitch(kill_at)
-    _watch(store._db, kill)
-    monkeypatch.setattr(auth, "aiosqlite", _KillSwitchAioSqlite(kill))
+    _attach(monkeypatch, store, kill)
     return kill
 
 
@@ -305,3 +332,62 @@ def test_change_password_commits_the_hash_the_revocation_and_the_token_together(
             asyncio.run(reader.close())
     finally:
         asyncio.run(store.close())
+
+
+def test_a_concurrent_login_cannot_publish_a_half_finished_change(tmp_path, monkeypatch):
+    """A password change must be invisible to every other writer.
+
+    The change runs on its own connection precisely so ordinary traffic cannot
+    land inside it. This store's shared connection serves every request in the
+    worker, so on a shared-connection design a login committing between the
+    hash write and the revocation publishes a half-finished change -- measured
+    by hand: a separate connection then saw a new password next to two
+    still-live old tokens, which is the harm #285 describes, produced by
+    normal traffic rather than a crash. The docstring claims the dedicated
+    connection prevents that; this is what holds it to the claim.
+    """
+
+    async def main():
+        db_path = str(tmp_path / "auth.db")
+        store = AuthStore(db_path)
+        await store.connect()
+        user = await store.create_user("a@x.co", OLD_PW, "A", "user")
+        tokens = [await store.issue_token(user.id, 7) for _ in range(2)]
+        # Opened before the change starts, so its own schema writes are not
+        # competing for the write lock the change is about to take.
+        reader = AuthStore(db_path)
+        await reader.connect()
+        # Keep the losing writer's wait short: what is asserted is that it
+        # cannot get in, not how long it waits for the lock.
+        await store._db.execute("PRAGMA busy_timeout=200")
+        pause = _PauseAt(_STEP_HASH)
+        _attach(monkeypatch, store, pause)
+        try:
+            change = asyncio.create_task(store.change_password(user.id, auth.hash_password(NEW_PW), 7))
+            await asyncio.wait_for(pause.reached.wait(), 10)
+            # An unrelated request writes through the store's own connection.
+            try:
+                await store.issue_token(user.id, 7)
+            except sqlite3.OperationalError:
+                pass  # refused the write lock, one of the two acceptable outcomes
+            stored = await reader.get_user(user.id)
+            assert not auth.verify_password(NEW_PW, stored.password_hash), (
+                "an unrelated write published the new password before the change committed"
+            )
+            assert all([await reader.user_for_token(t) is not None for t in tokens]), (
+                "an unrelated write published part of the revocation before the change committed"
+            )
+            pause.release()
+            token = await asyncio.wait_for(change, 10)
+            # Once it does commit, the whole change is visible at once.
+            stored = await reader.get_user(user.id)
+            assert auth.verify_password(NEW_PW, stored.password_hash)
+            assert all([await reader.user_for_token(t) is None for t in tokens])
+            assert await reader.user_for_token(token) is not None
+        finally:
+            pause.release()
+            _unarm(monkeypatch)
+            await reader.close()
+            await store.close()
+
+    asyncio.run(main())
