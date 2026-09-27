@@ -119,6 +119,34 @@ def env(monkeypatch):
     )
 
 
+
+@pytest.fixture(autouse=True)
+def _working_interaction_limiter(monkeypatch):
+    """Give the interaction endpoint's rate limiter a working counter store.
+
+    #271 put this endpoint behind both a per-IP and a per-account limit, and
+    those limits fail CLOSED: with no limiter Redis the route answers 503
+    rather than serve an unlimited write path. That is the shipped behaviour
+    these tests must not accidentally paper over -- they are about cache
+    invalidation, not rate limiting -- so they get a counting store here, the
+    same way tests/test_main_http.py does for /search.
+    """
+    from app import auth
+
+    counters: dict[str, int] = {}
+
+    class _FakeRateRedis:
+        async def set(self, key, value, nx=False, ex=None):
+            return True
+
+        async def incr(self, key):
+            counters[key] = counters.get(key, 0) + 1
+            return counters[key]
+
+    monkeypatch.setattr(auth, "_rate_client", _FakeRateRedis())
+    return counters
+
+
 @pytest.fixture
 def client(monkeypatch, env):
     """TestClient authenticated as USER."""

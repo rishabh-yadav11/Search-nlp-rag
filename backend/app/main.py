@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastembed import SparseTextEmbedding
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
     DatetimeRange,
@@ -33,7 +33,7 @@ from app.analytics import close as close_analytics
 from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
-from app.auth import public_rate_limit, require_auth, require_permission
+from app.auth import public_rate_limit, require_auth, require_permission, user_rate_limit
 from app.click_boost import apply_click_boost
 from app.config import config
 from app.cost_budget import close as close_cost_budget
@@ -72,7 +72,13 @@ from app.recommender import (
 from app.redis_cache import cache
 from app.rerank_boost import apply_entity_boost
 from app.reranker import Reranker
-from app.user_profile import get_user_interactions, invalidate_user_profile, record_interaction
+from app.user_profile import (
+    InteractionResult,
+    InteractionType,
+    get_user_interactions,
+    invalidate_user_profile,
+    record_interaction,
+)
 
 state = {}
 
@@ -1404,11 +1410,29 @@ async def get_analytics_chat(
 # Recommendation API
 # =============================================================================
 
+# Dwell time is stored as a Redis hash VALUE, not a field name or a key, so it
+# does not drive key growth -- it is bounded only to keep a single request from
+# writing an arbitrary-length string.
+MAX_DWELL_TIME_MS = 24 * 60 * 60 * 1000
+
+
 class InteractionEvent(BaseModel):
-    """User article interaction event for personalization."""
-    article_id: int
-    interaction_type: str = "click"  # 'view', 'click', 'read'
-    dwell_time_ms: int | None = None
+    """User article interaction event for personalization.
+
+    ``interaction_type`` is a closed enum, not free-form text: it becomes a
+    Redis hash FIELD on ``article:interactions:{id}``, so an unchecked string
+    would mint a new unbounded field per call. ``article_id`` is a positive
+    integer, capped at the signed 64-bit range, and is verified against the
+    article index before any key is written, so a caller cannot mint keys for
+    ids that do not exist.
+    """
+
+    # ge=1 rejects 0/negative; le caps at int64 because Qdrant point ids are
+    # uint64/UUID and a larger value raises a client-side error rather than
+    # returning empty, which would turn a reject into a 500.
+    article_id: int = Field(..., ge=1, le=2**63 - 1, description="Indexed article id")
+    interaction_type: InteractionType = InteractionType.CLICK
+    dwell_time_ms: int | None = Field(None, ge=0, le=MAX_DWELL_TIME_MS)
 
 
 class SimilarArticlesResponse(BaseModel):
@@ -1455,7 +1479,17 @@ def _for_you_cache_keys(user_id: str) -> list[str]:
     ]
 
 
-@app.post("/recommend/interaction")
+@app.post(
+    "/recommend/interaction",
+    dependencies=[
+        # Both axes are required. One shared NAT address defeats the per-IP
+        # bucket; one account rotating addresses defeats nothing once the
+        # per-account bucket is present. Both go through the same
+        # _consume_counter, so neither can drift into weaker enforcement.
+        Depends(public_rate_limit("interaction", "PUBLIC_INTERACTION_RATE_PER_MIN")),
+        Depends(user_rate_limit("interaction", "INTERACTION_USER_RATE_PER_MIN")),
+    ],
+)
 async def record_user_interaction(
     event: InteractionEvent,
     request: Request,
@@ -1465,14 +1499,38 @@ async def record_user_interaction(
 
     Authenticated users only. Logs clicks, views, and reads to build
     user preference profiles for personalized recommendations.
+
+    Outage posture: the limiter is fail-closed, so a limiter-Redis outage
+    answers 503 rather than serving an unbounded write path. This is NOT the
+    /ready exception -- no load balancer probes this endpoint, so there is no
+    health check to protect here. The trade is explicit: a Redis blip stops
+    interaction recording for everyone until it clears, costing personalization
+    signal, whereas failing open re-opens the amplification the limits close.
     """
     user_id = request.state.user_id
-    await record_interaction(
+    result = await record_interaction(
         user_id=user_id,
         article_id=event.article_id,
         interaction_type=event.interaction_type,
         dwell_time_ms=event.dwell_time_ms,
     )
+    if result is InteractionResult.INVALID_TYPE:
+        raise HTTPException(status_code=422, detail="Unknown interaction_type")
+    if result is InteractionResult.UNKNOWN_ARTICLE:
+        # Not in the index, so no key was minted for it.
+        raise HTTPException(status_code=404, detail="Unknown article")
+    if result is InteractionResult.CAP_REACHED:
+        # The article is real; this ACCOUNT has interacted with too many
+        # distinct articles. Reporting 404 here would be false.
+        raise HTTPException(
+            status_code=429,
+            detail="Interaction limit reached for this account",
+            headers={"Retry-After": str(config.PUBLIC_RATE_WINDOW_SECONDS)},
+        )
+    if result is InteractionResult.UNAVAILABLE:
+        # Redis or the index could not answer. Saying "unknown article" would
+        # be a lie about a real article, and the write did not happen.
+        raise HTTPException(status_code=503, detail="Interaction store unavailable")
     await invalidate_user_profile(user_id)
     await cache.delete_keys(_for_you_cache_keys(user_id))
     return {"status": "ok", "article_id": event.article_id}
