@@ -1,6 +1,8 @@
 import asyncio
 import re
 import sqlite3
+import statistics
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -296,23 +298,43 @@ def _auth_app(tmp_path):
     return TestClient(app), s
 
 
+def _signup(client, email, password="secret12", name=""):
+    """POST /signup and return the parsed body, asserting the 200.
+
+    Signup deliberately returns the same tokenless ``{"message": ...}`` for a
+    fresh address and an already-registered one, so tests that need a session
+    must log in afterwards (see ``_token``)."""
+    r = client.post("/api/auth/signup", json={"email": email, "password": password, "name": name})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _token(client, email, password="secret12", name=""):
+    """Register the address, then log in for a bearer token."""
+    _signup(client, email, password, name)
+    r = client.post("/api/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
+
+
 def test_signup_login_me_flow(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
-        r = client.post("/api/auth/signup", json={"email": "  New@Example.com ", "password": "secret12", "name": "Alice"})
-        assert r.status_code == 200
-        data = r.json()
-        assert data["token"]
-        assert data["user"]["email"] == "new@example.com"
-        assert data["user"]["role"] == "user"
+        data = _signup(client, "  New@Example.com ", name="Alice")
+        # Signup is tokenless by design (#276): a token here would tell an
+        # anonymous caller that the address was free.
+        assert set(data) == {"message"}
+        assert data["message"] == auth.SIGNUP_ACCEPTED_MESSAGE
 
-        # me with the issued token
-        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {data['token']}"}).json()["email"] == "new@example.com"
-
-        # login returns a fresh token
-        login = client.post("/api/auth/login", json={"email": "new@example.com", "password": "secret12"})
+        # login is how a session is obtained, and normalizes the same address
+        login = client.post("/api/auth/login", json={"email": "  New@Example.com ", "password": "secret12"})
         assert login.status_code == 200
         assert login.json()["user"]["email"] == "new@example.com"
+        assert login.json()["user"]["role"] == "user"
+        token = login.json()["token"]
+
+        # me with the issued token
+        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["email"] == "new@example.com"
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -336,11 +358,51 @@ def test_signup_validation_errors(tmp_path):
         asyncio.run(s.close())
 
 
-def test_signup_duplicate_email_409(tmp_path):
+def test_signup_duplicate_email_indistinguishable(tmp_path):
+    """A duplicate signup must be indistinguishable from a fresh one (#276).
+
+    It used to answer 409 "an account with this email already exists", a
+    single unauthenticated request that confirmed which addresses are
+    registered here. Now both cases get the same 200 and the same body --
+    including when the attacker varies the case of the address, which the
+    store treats as the same account."""
     client, s = _auth_app(tmp_path)
     try:
-        assert client.post("/api/auth/signup", json={"email": "dup@x.co", "password": "secret12"}).status_code == 200
-        assert client.post("/api/auth/signup", json={"email": "DUP@x.co", "password": "secret12"}).status_code == 409
+        first = _signup(client, "dup@x.co")
+        again = client.post("/api/auth/signup", json={"email": "DUP@x.co", "password": "secret12"})
+        assert again.status_code == 200
+        assert again.json() == first
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_signup_duplicate_leaves_existing_account_untouched(tmp_path):
+    """The generic duplicate answer must not touch, replace or take over the
+    account (#276): the stored row is byte-identical afterwards, no second row
+    appears, and the password the duplicate signup offered never becomes
+    valid -- otherwise a re-registration attempt would be an account takeover
+    wearing a success message."""
+    client, s = _auth_app(tmp_path)
+    try:
+        _signup(client, "dup@x.co", password="secret12", name="Owner")
+        before = asyncio.run(s.get_user_by_email("dup@x.co"))
+        assert before is not None
+
+        # different case, different password, different name
+        dup = client.post(
+            "/api/auth/signup",
+            json={"email": "DUP@x.co", "password": "attacker9", "name": "Attacker"},
+        )
+        assert dup.status_code == 200
+
+        after = asyncio.run(s.get_user_by_email("dup@x.co"))
+        assert after == before  # no re-hash, rename, re-activation or id change
+        assert asyncio.run(s.list_users()) == [auth.UserOut.from_user(before)]
+
+        # the owner's password still works; the offered one never did
+        assert client.post("/api/auth/login", json={"email": "dup@x.co", "password": "secret12"}).status_code == 200
+        assert client.post("/api/auth/login", json={"email": "dup@x.co", "password": "attacker9"}).status_code == 401
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -349,25 +411,26 @@ def test_signup_duplicate_email_409(tmp_path):
 def test_signup_role_ignores_env_default_role(tmp_path, monkeypatch):
     """A hostile AUTH_DEFAULT_ROLE=admin env must not escalate a public signup.
 
-    Asserts all three observable surfaces: the signup response, the row
-    PERSISTED in the auth store, and what the issued session reports via /me.
-    A response-only fix would pass the first assertion and still be a full
-    compromise, so all three are checked.
+    Asserts every observable surface that still exists after #276 made signup
+    tokenless: the row PERSISTED in the auth store, and what a real session
+    for that account reports via /me. A response-only fix would pass a check
+    on the signup body and still be a full compromise, so both are checked.
     """
     monkeypatch.setattr(auth.config, "AUTH_DEFAULT_ROLE", "admin", raising=False)
     client, s = _auth_app(tmp_path)
     try:
-        r = client.post("/api/auth/signup", json={"email": "env@x.co", "password": "secret12", "name": "E"})
-        assert r.status_code == 200
-        assert r.json()["user"]["role"] == "user"
+        body = _signup(client, "env@x.co", name="E")
+        # the response commits to no role at all (it is a fixed string)
+        assert "role" not in body["message"]
 
         # persisted record, read straight back out of the store
         stored = asyncio.run(s.get_user_by_email("env@x.co"))
         assert stored is not None
         assert stored.role == "user"
 
-        # the session minted at signup reports no privilege either
-        me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {r.json()['token']}"})
+        # a real session for that account reports no privilege either
+        token = client.post("/api/auth/login", json={"email": "env@x.co", "password": "secret12"}).json()["token"]
+        me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
         assert me.status_code == 200
         assert me.json()["role"] == "user"
         assert me.json()["id"] == stored.id
@@ -380,13 +443,15 @@ def test_signup_ignores_role_in_request_payload(tmp_path):
     """A self-declared role in the signup body is not honoured."""
     client, s = _auth_app(tmp_path)
     try:
+        _signup(client, "sneaky@x.co", name="S")
         r = client.post(
             "/api/auth/signup",
             json={"email": "sneaky@x.co", "password": "secret12", "name": "S", "role": "admin"},
         )
         assert r.status_code == 200
-        assert r.json()["user"]["role"] == "user"
         assert asyncio.run(s.get_user_by_email("sneaky@x.co")).role == "user"
+        token = client.post("/api/auth/login", json={"email": "sneaky@x.co", "password": "secret12"}).json()["token"]
+        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).json()["role"] == "user"
     finally:
         auth.store = None
         asyncio.run(s.close())
@@ -395,7 +460,7 @@ def test_signup_ignores_role_in_request_payload(tmp_path):
 def test_login_invalid_credentials_identical_401(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
-        client.post("/api/auth/signup", json={"email": "a@x.co", "password": "secret12"})
+        _signup(client, "a@x.co")
         bad1 = client.post("/api/auth/login", json={"email": "a@x.co", "password": "wrong12"})
         bad2 = client.post("/api/auth/login", json={"email": "nobody@x.co", "password": "secret12"})
         assert bad1.status_code == bad2.status_code == 401
@@ -405,11 +470,120 @@ def test_login_invalid_credentials_identical_401(tmp_path):
         asyncio.run(s.close())
 
 
+def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
+    """An unknown address must still pay a full bcrypt verify (#276).
+
+    ``user is not None and await verify_password(...)`` short-circuits, so the
+    unknown-address path skipped the ~100ms bcrypt entirely and answered far
+    faster than a wrong password: a remote account-existence oracle behind an
+    otherwise identical 401. The mechanism is asserted, not a stopwatch --
+    exactly one verify must run, and against the dummy hash, which carries the
+    same cost factor as a stored one (a cheaper dummy would be the same
+    oracle)."""
+    client, s = _auth_app(tmp_path)
+    try:
+        _signup(client, "known@x.co")
+
+        verified = []
+        real_verify = auth.verify_password
+
+        def recording_verify(password, hashed):
+            verified.append(hashed)
+            return real_verify(password, hashed)
+
+        monkeypatch.setattr(auth, "verify_password", recording_verify)
+
+        unknown = client.post("/api/auth/login", json={"email": "nobody@x.co", "password": "secret12"})
+        assert unknown.status_code == 401
+        assert verified == [auth._DUMMY_PASSWORD_HASH]
+        assert not real_verify("secret12", auth._DUMMY_PASSWORD_HASH)  # the dummy is not a back door
+
+        # the dummy hash costs what a real one costs
+        def cost_of(hashed: str) -> str:
+            return hashed.split("$")[2]  # "$2b$<rounds>$..."
+
+        assert re.match(r"^\$2[ab]\$", auth._DUMMY_PASSWORD_HASH)
+        assert cost_of(auth._DUMMY_PASSWORD_HASH) == cost_of(auth.hash_password("secret12"))
+
+        verified.clear()
+        wrong = client.post("/api/auth/login", json={"email": "known@x.co", "password": "wrong12"})
+        assert wrong.status_code == 401
+        # the real path verifies against the stored hash, not the dummy
+        assert len(verified) == 1
+        assert verified[0] != auth._DUMMY_PASSWORD_HASH
+        assert asyncio.run(s.get_user_by_email("known@x.co")).password_hash == verified[0]
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_login_unknown_vs_wrong_password_timing_comparable(tmp_path):
+    """Loose statistical guard on the wall-clock side of #276.
+
+    The mechanism is asserted in the test above; this one samples real bcrypt
+    cost so a future "optimisation" that skips the dummy verify is caught even
+    if the mechanism changes shape. Medians over several iterations, and only
+    one-sided: the bug made the unknown address *faster*, so requiring the
+    unknown path to cost at least half of a real verify fails on the old code
+    (a few ms vs ~100ms) while tolerating a loaded CI box."""
+    client, s = _auth_app(tmp_path)
+    try:
+        _signup(client, "known@x.co")
+
+        def median_ms(email: str) -> float:
+            samples = []
+            for _ in range(7):
+                start = time.perf_counter()
+                r = client.post("/api/auth/login", json={"email": email, "password": "wrong12"})
+                samples.append((time.perf_counter() - start) * 1000)
+                assert r.status_code == 401
+            return statistics.median(samples)
+
+        wrong_password = median_ms("known@x.co")
+        unknown_email = median_ms("nobody@x.co")
+        assert unknown_email >= 0.5 * wrong_password, (
+            f"unknown-address login took {unknown_email:.1f}ms vs {wrong_password:.1f}ms "
+            "for a wrong password: the bcrypt verify was skipped"
+        )
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_login_deactivated_account_pays_a_real_verify(tmp_path, monkeypatch):
+    """A deactivated account must be indistinguishable too (#276): the
+    is_active check comes after the verify, so it cannot become a third,
+    cheaper branch that separates 'exists but disabled' from 'no account'."""
+    client, s = _auth_app(tmp_path)
+    try:
+        _signup(client, "off@x.co")
+        uid = asyncio.run(s.get_user_by_email("off@x.co")).id
+        asyncio.run(s.update_user(uid, None, "user", False))
+
+        verified = []
+        real_verify = auth.verify_password
+
+        def recording_verify(password, hashed):
+            verified.append(hashed)
+            return real_verify(password, hashed)
+
+        monkeypatch.setattr(auth, "verify_password", recording_verify)
+
+        r = client.post("/api/auth/login", json={"email": "off@x.co", "password": "secret12"})
+        assert r.status_code == 401
+        assert r.json() == {"detail": "invalid email or password"}
+        # the correct password was genuinely checked before the rejection
+        assert verified == [asyncio.run(s.get_user_by_email("off@x.co")).password_hash]
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
 def test_me_requires_auth_and_logout_revokes(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
         assert client.get("/api/auth/me").status_code == 401
-        token = client.post("/api/auth/signup", json={"email": "a@x.co", "password": "secret12"}).json()["token"]
+        token = _token(client, "a@x.co")
         h = {"Authorization": f"Bearer {token}"}
         assert client.get("/api/auth/me", headers=h).status_code == 200
         assert client.post("/api/auth/logout", headers=h).json() == {"ok": True}
@@ -422,7 +596,7 @@ def test_me_requires_auth_and_logout_revokes(tmp_path):
 def test_change_password_invalidates_other_tokens(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
-        token = client.post("/api/auth/signup", json={"email": "a@x.co", "password": "secret12"}).json()["token"]
+        token = _token(client, "a@x.co")
         h = {"Authorization": f"Bearer {token}"}
 
         wrong = client.post("/api/auth/change-password", headers=h, json={"current_password": "nope12", "new_password": "secret21"})
@@ -480,8 +654,12 @@ def test_concurrent_create_duplicate_race_no_poison(tmp_path):
     asyncio.run(main())
 
 
-def test_signup_duplicate_race_returns_409(tmp_path):
-    """Two concurrent duplicate signups must yield exactly one 200 and one 409.
+def test_signup_duplicate_race_is_indistinguishable(tmp_path):
+    """Two concurrent signups for one address must both look like a plain
+    success (#276). This is the ``DuplicateEmailError`` site -- the second of
+    the two 409s the old endpoint could emit, and the one a plain second
+    request would never reach -- so a fix applied only to the pre-flight
+    existence check would still fail here.
 
     The race is exercised as two coroutines on a single event loop (via an
     ASGI transport) rather than two OS threads sharing one TestClient — the
@@ -508,7 +686,17 @@ def test_signup_duplicate_race_returns_409(tmp_path):
                     client.post("/api/auth/signup", json={"email": "same@x.co", "password": "secret12"}),
                     client.post("/api/auth/signup", json={"email": "same@x.co", "password": "secret12"}),
                 )
-                assert sorted(r.status_code for r in results) == [200, 409]
+                # both requests are told the same thing ...
+                assert [r.status_code for r in results] == [200, 200]
+                assert results[0].json() == results[1].json() == {
+                    "message": auth.SIGNUP_ACCEPTED_MESSAGE
+                }
+                # ... and the race left exactly one account, which works
+                assert len(await s.list_users()) == 1
+                login = await client.post(
+                    "/api/auth/login", json={"email": "same@x.co", "password": "secret12"}
+                )
+                assert login.status_code == 200
         finally:
             await s.close()
             auth.store = None
@@ -551,8 +739,8 @@ def test_bootstrap_admin_survives_duplicate_and_lock_races(tmp_path, monkeypatch
 def test_admin_user_management_rbac(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
-        user_token = client.post("/api/auth/signup", json={"email": "user@x.co", "password": "secret12"}).json()["token"]
-        admin_token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12", "name": "Boss"}).json()["token"]
+        user_token = _token(client, "user@x.co")
+        admin_token = _token(client, "boss@x.co", name="Boss")
         asyncio.run(s.update_user(asyncio.run(s.get_user_by_email("boss@x.co")).id, None, "admin", None))
 
         uh = {"Authorization": f"Bearer {user_token}"}
@@ -740,7 +928,7 @@ def test_get_user_endpoint(tmp_path):
     """GET /api/auth/users/{id} returns the requested user (line 548)."""
     client, s = _auth_app(tmp_path)
     try:
-        token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12"}).json()["token"]
+        token = _token(client, "boss@x.co")
         uid = _promote_to_admin(client, s, "boss@x.co")
         ah = {"Authorization": f"Bearer {token}"}
         r = client.get(f"/api/auth/users/{uid}", headers=ah)
@@ -758,7 +946,7 @@ def test_patch_user_last_admin_guard_endpoint(tmp_path):
     ERROR PATH — self-lockout protection."""
     client, s = _auth_app(tmp_path)
     try:
-        token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12"}).json()["token"]
+        token = _token(client, "boss@x.co")
         uid = _promote_to_admin(client, s, "boss@x.co")
         ah = {"Authorization": f"Bearer {token}"}
         assert client.patch(f"/api/auth/users/{uid}", headers=ah, json={"role": "user"}).status_code == 400
@@ -777,7 +965,7 @@ def test_delete_user_last_admin_guard_endpoint(tmp_path):
     self-lockout protection."""
     client, s = _auth_app(tmp_path)
     try:
-        token = client.post("/api/auth/signup", json={"email": "boss@x.co", "password": "secret12"}).json()["token"]
+        token = _token(client, "boss@x.co")
         uid = _promote_to_admin(client, s, "boss@x.co")
         ah = {"Authorization": f"Bearer {token}"}
         assert client.delete(f"/api/auth/users/{uid}", headers=ah).status_code == 400
