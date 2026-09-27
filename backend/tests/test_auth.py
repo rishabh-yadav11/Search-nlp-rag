@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import Depends, HTTPException
+from rate_limit_fake import RateLimitRedisFake
 
 from app import auth
 from app import config as config_module
@@ -674,22 +675,10 @@ def test_revoke_service_token_non_ascii_is_not_a_crash(store, monkeypatch):
 
 
 def test_rate_limit_429_and_reset(monkeypatch):
-    calls = {"n": 0}
-
-    class _FakeRedis:
-        async def set(self, key, value, nx=False, ex=None):
-            # First-hit window establishment; for the test we just need it to not
-            # raise so the subsequent incr drives the count.
-            return True
-
-        async def incr(self, key):
-            calls["n"] += 1
-            return calls["n"]
-
-        async def expire(self, key, ttl):
-            return True
-
-    monkeypatch.setattr(auth, "_rate_client", _FakeRedis())
+    # The shared fake models SET NX EX / INCR for real, so this asserts the
+    # production limiter's window bookkeeping rather than a hand-rolled counter.
+    fake = RateLimitRedisFake()
+    monkeypatch.setattr(auth, "_rate_client", fake)
     monkeypatch.setattr(auth, "_client_ip", lambda r: "1.2.3.4")
     monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_MIN", 2)
 
@@ -702,6 +691,14 @@ def test_rate_limit_429_and_reset(monkeypatch):
         asyncio.run(attempt())
     assert e.value.status_code == 429
     assert "Retry-After" in e.value.headers
+    assert fake.violations == [], "the limiter must establish every counter with a window TTL"
+    key = "auth:rl:login:1.2.3.4"
+    assert fake.ttl(key) is not None, "a counter with no TTL would lock this IP out forever"
+
+    # And the counter is reclaimed once the window closes.
+    fake.advance(auth.config.AUTH_RATE_WINDOW_SECONDS + 1)
+    asyncio.run(attempt())
+    assert fake.counters[key] == 1
 
 
 def test_rate_limit_disabled_when_zero(monkeypatch):
