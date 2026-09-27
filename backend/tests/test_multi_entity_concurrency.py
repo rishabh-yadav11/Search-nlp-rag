@@ -286,15 +286,69 @@ def test_entity_annotation_and_rank_order_follow_entity_order(stub_pipeline, mon
     order into the combine step would print "bravo, alpha" here.
     """
     entities = ["alpha", "bravo"]
-    leg = stub_pipeline(entity_articles={"alpha": [_article(1, "shared", 0.9)],
-                                         "bravo": [_article(1, "shared", 0.9)]})
+    # Each entity gets a DISTINCT article plus a shared one. Distinct ids are
+    # what make a mispairing observable: with the same article for both, the
+    # prompt is byte-identical whether the results are paired correctly or
+    # reversed, so the test could not fail. The shared id keeps the annotation
+    # and the rank key in play.
+    leg = stub_pipeline(entity_articles={
+        "alpha": [_article(1, "alpha one", 0.9), _article(3, "shared", 0.7)],
+        "bravo": [_article(2, "bravo two", 0.9), _article(3, "shared", 0.7)],
+    })
     leg.slow_for("bravo")
 
     turn = _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
 
     assert leg.finished == ["alpha", "bravo"], "bravo must have completed last for this to mean anything"
+    # alpha's own article is attributed to alpha, and bravo's to bravo: reversed
+    # pairing would print "Entities: bravo" on article 1.
+    assert "Entities: alpha" in turn.answer
+    assert "Entities: bravo" in turn.answer
+    # The shared article is annotated with both, in entity order.
     assert "Entities: alpha, bravo" in turn.answer
     assert "Entities: bravo, alpha" not in turn.answer
+
+
+def _entities_by_article(answer: str) -> dict[str, str]:
+    """Map each article's title to the entity list annotated on its own block.
+
+    Asserting "Entities: alpha, bravo" appears somewhere is symmetric: a
+    mispairing still produces it, just on the wrong articles. Binding the
+    annotation to the article it names is what actually detects a swap.
+    """
+    # A block is "<<<ARTICLE n>>>\n[n] <title> (<date>)\n<body>\nEntities: <...>",
+    # so the "n>>>" that closes the ARTICLE header is its own line and the
+    # title line follows it.
+    out = {}
+    for block in answer.split("<<<ARTICLE ")[1:]:
+        title = block.splitlines()[1].split("] ", 1)[1].rsplit(" (", 1)[0]
+        ents = block.rsplit("Entities: ", 1)
+        out[title] = ents[1].split("\n", 1)[0].strip() if len(ents) == 2 else ""
+    return out
+
+
+def test_each_article_is_annotated_with_its_own_entities(stub_pipeline, monkeypatch):
+    """A completion-order swap must be visible on the articles themselves.
+
+    Pairing bravo's results to alpha is not detectable by asserting the
+    annotation text exists; it is detectable by checking WHICH article carries
+    WHICH annotation.
+    """
+    entities = ["alpha", "bravo", "charlie"]
+    leg = stub_pipeline(entity_articles={
+        "alpha": [_article(1, "alpha one", 0.9), _article(4, "shared ab", 0.7)],
+        "bravo": [_article(2, "bravo two", 0.9), _article(4, "shared ab", 0.7)],
+        "charlie": [_article(3, "charlie three", 0.9)],
+    })
+    leg.slow_for("charlie")
+
+    turn = _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
+    got = _entities_by_article(turn.answer)
+
+    assert got["alpha one"] == "alpha"
+    assert got["bravo two"] == "bravo"
+    assert got["charlie three"] == "charlie"
+    assert got["shared ab"] == "alpha, bravo", "the shared article lists both, in entity order"
 
 
 def test_repeated_runs_are_byte_identical(stub_pipeline, monkeypatch):
