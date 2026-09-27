@@ -143,20 +143,22 @@ the generated table.
   `_calculate_recency_score` line 516. A wrong `FieldCondition` or a wrong
   scoring weight in any of these returns an empty or mis-ranked feed for every
   user while the suite stays green.
-- `app/user_profile.py` — 63.1% (59/160 statements uncovered). The whole
-  Redis-backed profile path. `_redis_client` lines 41-49 (the lazy
-  `from_url` on `_PROFILE_REDIS_DB`) has no test, so the DB index is unverified.
-  `get_trending_articles` lines 259-294 is entirely untested: the `SCAN` loop
-  over `article:interactions:*`, the per-key `hgetall` sum, the top-`limit` sort
-  and the window-cache write. `get_user_profile_vector` lines 132, 135, 138 and
-  140-142 leave the bytes decode, the non-array `TypeError`, the non-finite
-  `ValueError` and the cold-start catch-all unexercised;
-  `build_user_profile` lines 155, 173, 176, 179, 191, 197, 200, 215-217 leaves
-  its skip guards, the inconsistent-dimension `ValueError` and the failure path
-  untested; `get_user_interactions` lines 108-114 leaves the `zrevrange` read and
-  its `(int, float)` coercion untested; `record_interaction` lines 96-97, the
-  catch-all that swallows a failed write; `get_user_profile_categories` lines
-  224-235; `invalidate_user_profile` lines 246-247.
+- `app/user_profile.py` — 63.1% (59/160 statements uncovered). Most of the
+  Redis-backed profile path. `_redis_client` lines 41-42, 49 — the lazy
+  `from_url` on `_PROFILE_REDIS_DB` — has no test at all, so the DB index is
+  unverified. `get_trending_articles` lines 259-294 leaves the `SCAN` loop over
+  `article:interactions:*`, the per-key `hgetall` sum, the top-`limit` sort and
+  the window-cache write unexercised (only its `except` runs today).
+  `get_user_profile_vector` lines 132, 135, 138, 140-142 leave the bytes decode,
+  the non-array `TypeError`, the non-finite `ValueError` and the cold-start
+  catch-all unexercised; `build_user_profile` lines 155, 173, 176, 179, 191,
+  197, 200, 215-217 leave its skip guards, its no-interactions early return, the
+  inconsistent-dimension `ValueError` and its failure path untested;
+  `get_user_interactions` lines 108, 114 leave the successful `zrevrange` read
+  and its `(int, float)` coercion untested — only the failure path is covered;
+  `get_user_profile_categories` lines 224-226, 232-235;
+  `invalidate_user_profile` lines 246-247; `record_interaction` lines 96-97, the
+  catch-all that swallows a failed write.
 - `app/query_intent.py` — 87.1% (48/371 statements uncovered). The largest
   single gap is `extract_recency_range` lines 490-508, the relative-range
   parsing that turns text like "last 3 quarters" into dates. The
@@ -781,8 +783,8 @@ misleading: the recommendation engine had no test of its own and the module was
 not mentioned at all. The checklist below is short because the measurement
 beside it is short — treat the open-gaps entry as the work list, not this list.
 
-- [x] **`_calculate_recency_score`**: the pure half-life decay, its clamping and
-      the missing/naive/unparseable publication-date inputs.
+- [x] **`_calculate_recency_score`**: the 30-day half-life decay, a recent and
+      an old article, a missing date and an unparseable date.
 - [x] **`_format_articles`**: the payload projection, the id exclusions and the
       drop of points with no payload.
 - [x] **config knobs**: `RECOMMEND_DEFAULT_LIMIT`, `RECOMMEND_CANDIDATES_LIMIT`
@@ -795,10 +797,13 @@ beside it is short — treat the open-gaps entry as the work list, not this list
       double: the candidate legs, the hybrid re-rank and the final-score sort.
 - [x] **one named candidate leg failing**: the warning from the failing leg
       carries the exception text, and the feed still returns the other legs.
-- [x] **cold start** falls back to the latest top stories.
 
 Not covered at all: `get_similar_articles` end to end, `get_trending_feed` end
-to end, the acquisition-relation scoring, and the failure paths of all three.
+to end, the acquisition-relation scoring, the failure paths of all three entry
+points, the cold-start branch of `get_personalized_recommendations` (no
+interactions at all, which is the branch a brand-new user takes), the naive
+timestamp normalisation in `_calculate_recency_score`, and the per-candidate
+`continue` guards.
 
 ## app/request_context.py + app/observability.py (covered by tests/test_request_context.py)
 
@@ -837,17 +842,22 @@ The Redis-backed profile that personalisation depends on. Its Redis plumbing is
 exercised through the recommender's interaction tests; the aggregation half is
 not.
 
-- [x] **recording an interaction** and **reading them back**: the sorted-set
-      write with its TTL, the read-back of recent interactions, and the
+- [x] **recording an interaction**: the sorted-set write with its TTL, and the
       invalidation of the derived vector and category keys in the same
       transaction.
+- [x] **the Redis failure path of `get_user_interactions`**: a failing
+      `zrevrange` returns an empty list rather than raising.
+- [x] **the warm reads**: the cached profile vector (including the miss that
+      rebuilds it) and the category list.
+- [x] **the body of `build_user_profile`** for a user who has interactions.
 - [x] **interaction-driven invalidation** (also asserted from
       `tests/test_recommend_interaction_invalidation.py`): a new signal
       invalidates the cached profile so the next read rebuilds it.
 
-Not covered: the trending scan, the cold-start profile build, the profile
-vector's validation, the category derivation, and the failure paths. See the
-open-gaps entry.
+Not covered: reading interactions back, the no-interactions early return and
+the dimension-mismatch raise in `build_user_profile`, the validation of a bad
+cached profile vector, most of `get_user_profile_categories`, the whole
+trending scan, and the failure paths of the writers. See the open-gaps entry.
 
 ---
 
