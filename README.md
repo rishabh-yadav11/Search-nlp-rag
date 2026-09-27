@@ -395,8 +395,36 @@ python -m ruff check app scripts tests
 
 Coverage: query-intent/date parsing, facet filter construction, effective intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, chat store (CRUD, ownership isolation, retention, token/cost stats), SSE streaming (small-talk short-circuit + full-turn deltas), index fingerprinting/delta/reconciliation, and cache TTL and degraded fallback.
 
-`.github/workflows/ci.yml` runs three gates on push/PR to `main`:
+`.github/workflows/ci.yml` runs three jobs on push/PR to `main`. Superseded
+runs are cancelled (concurrency group keyed on workflow + ref) and every job has
+an explicit timeout.
 
-1. **backend** — pytest + ruff on Python 3.11
-2. **frontend** — eslint, `tsc --noEmit`, production build on Node 22
-3. **security** — `pip-audit`, `npm audit --audit-level=high`, gitleaks secret scan
+1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest` (790 tests). Installs the *full* `requirements.txt`, not a slimmed test set: `app/main.py`, `app/encoders.py` and `app/reranker.py` import `torch`/`transformers`/`fastembed` at module scope, so a reduced set would not import. There is deliberately **no `ruff format` gate** — `ruff format --check` already reports 47 pre-existing offenders, so enforcing it would mean reformatting the tree, not CI.
+2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest, 127 tests).
+3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan over full history (pinned to 8.28.0, download SHA-256 verified).
+
+### Audit policy
+
+**`pip-audit` fails the build on any advisory that is not explicitly ignored.**
+The only current findings are 7 starlette advisories (14 rows — the resolver
+reports each twice), all transitive: `fastapi==0.115.0` caps starlette below
+0.39, and every fixed starlette release (0.40.0 → 1.3.1) requires raising the
+FastAPI pin. Those 7 IDs are listed by name in the workflow with that comment;
+anything new fails immediately. Remove an ID from the list and the job goes red
+again — the waiver is per-advisory and dated, not a blanket suppression.
+
+The `transformers==5.10.1` pin (which fixes CVE-2026-4372 / CVE-2026-5241 /
+CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits
+**clean** — `pip-audit` reports no transformers findings. `requirements-dev.txt`
+also audits clean.
+
+**`npm audit --audit-level=high`** is the high boundary, which is the standard
+CI posture: the current 2 moderate findings (GHSA-82fw-gwwq-j7x9,
+`@vitest/mocker` path traversal; fix is vitest 5, a breaking change) sit below
+it and do not fail the build. A new high/critical advisory does.
+
+**gitleaks** runs the default rule set with one narrow path exclusion for
+`frontend/.next/` — the gitignored Next.js build output, which trips
+`generic-api-key` on hashed build manifests. No tracked file is excluded, and
+the scan is the only thing standing between a committed key and production;
+planting a fake AWS key in `backend/` makes the job fail.

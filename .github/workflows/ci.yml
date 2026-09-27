@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Superseded runs are cancelled so a force-push does not leave stale model
+# downloads and npm installs burning runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend (ruff + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Ruff targets py311 (backend/ruff.toml) and the README documents 3.11.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      # The full runtime stack is required: app/main.py, app/encoders.py and
+      # app/reranker.py import torch/transformers/fastembed at module scope, and
+      # tests/test_encoders.py + tests/test_reranker.py import them directly.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check .
+      - name: Pytest
+        run: python -m pytest
+
+  frontend:
+    name: frontend (lint + typecheck + build + vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: ESLint
+        run: npm run lint
+      - name: TypeScript
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+      - name: Vitest
+        run: npm test
+
+  security:
+    name: security (pip-audit + npm audit + gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Full history: gitleaks scans commits, so a shallow clone would miss
+      # secrets that are already deleted from the tip.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      # pip-audit is pinned in requirements-dev.txt so CI resolves the same
+      # version the project documents.
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements-dev.txt
+
+      # Policy: fail the build on ANY advisory that is not on the explicit
+      # ignore list below. The list exists solely because fastapi==0.115.0 caps
+      # starlette below 0.39, and every fixed starlette release (0.40.0 through
+      # 1.3.1) needs a FastAPI upgrade. These are transitive findings, not
+      # direct pins, and they stay listed until the FastAPI pin is raised --
+      # each one is a real, dated, removable entry rather than a blanket waiver.
+      # A new advisory in any other package fails the job immediately.
+      - name: pip-audit (runtime dependencies)
+        run: |
+          python -m pip_audit -r backend/requirements.txt \
+            --ignore-vuln PYSEC-2026-1943 \
+            --ignore-vuln PYSEC-2026-1941 \
+            --ignore-vuln PYSEC-2026-161 \
+            --ignore-vuln PYSEC-2026-2281 \
+            --ignore-vuln PYSEC-2026-2280 \
+            --ignore-vuln PYSEC-2026-249 \
+            --ignore-vuln PYSEC-2026-248
+      - name: pip-audit (dev dependencies)
+        run: python -m pip_audit -r backend/requirements-dev.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+      # The only current advisory is a moderate vitest/@vitest/mocker
+      # path-traversal issue, which is below --audit-level=high. The gate is
+      # the high boundary, so a new high/critical advisory fails the job.
+      - name: npm audit
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.28.0"
+          GITLEAKS_SHA256: "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
+        run: |
+          curl -sSfLo /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum --check --strict
+          tar xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+      # gitleaks exits non-zero when it finds a leak, so this step fails the job.
+      - name: Secret scan
+        run: gitleaks detect --source . --redact --no-banner
