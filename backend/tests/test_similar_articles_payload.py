@@ -8,13 +8,20 @@ an hour, and back out on every subsequent read. The search page renders one
 ``SimilarArticles`` per result, so a single top_k=8 search dragged >3MB per
 page view to display a title and a category.
 
-Measured with bodies at ``BODY_CHAR_LIMIT`` and the real ``_format_articles``
--- 9 points fetched per request, 8 returned once the source article is
-filtered out, 8 requests for a top_k=8 search -- one page view went from
-3,225,178 B to 24,410 B. The before-figure is robust (it is dominated by
-eight 50k bodies); the after-figure moves with the synthetic title/summary
-text of the measuring fixture, so independent recomputes land between
-~21 kB and ~24 kB. Either way >3MB per view is gone.
+Measured against the real code path with bodies at ``BODY_CHAR_LIMIT``:
+``get_similar_articles`` puts the source article in ``must_not``, so Qdrant
+filters it server-side and returns ``limit*3 = 9`` *other* articles; nothing
+truncates to ``limit``. The search page renders one
+``<SimilarArticles limit={3}>`` per result, so a top_k=8 search fires 8
+requests and serializes 9 x 8 = 72 articles. That page view went from
+3,627,784 B to 26,920 B.
+
+The before-figure is robust -- it is dominated by seventy-two 50k bodies, and
+two independent recomputes landed at 3,627,784 B and 3,644,296 B (0.5% apart),
+matching the ~3.6MB the issue reported. The after-figure scales with the
+synthetic title/summary text of the measuring fixture, so recomputes range
+from ~27 kB to ~44 kB, i.e. a **~84x to ~135x** reduction. Either way the
+3.6MB per page view is gone.
 
 Nothing renders the body. ``SimilarArticles.tsx`` reads id/title/url/category,
 summary and published_date; the for-you card reads the same plus
