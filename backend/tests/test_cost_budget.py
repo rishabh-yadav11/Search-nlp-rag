@@ -10,10 +10,56 @@ The facet helper is tested against a fake Qdrant HTTP layer so the endpoint
 logic is exercised without a live server.
 """
 
+import ast
+import pathlib
+
 import pytest
 
+from app import config as _config_module
 from app import cost_budget
-from app.config import config
+
+
+def _declared_env_default(var):
+    """The literal default shipped in ``os.getenv(var, default)`` inside
+    ``app/config.py``, read from the source rather than from the process.
+
+    ``Config`` evaluates that call in its class body, so ``config.<VAR>`` is
+    whatever the ambient environment says -- a developer's untracked, gitignored
+    ``backend/.env`` included. A developer box that legitimately disables the cap
+    made the shipped default unobservable and turned a source-level guard into
+    an environment assertion. Reading the declaration keeps the guard on the
+    code that ships, and cannot mutate the module 700+ other tests import.
+    """
+    source = pathlib.Path(_config_module.__file__).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "Config":
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Assign) or not isinstance(stmt.value, ast.Call):
+                continue
+            if not any(getattr(t, "id", None) == var for t in stmt.targets):
+                continue
+            call = stmt.value
+            # The shipped form is float(os.getenv(var, default)); unwrap the
+            # conversion so the guard survives dropping or adding it.
+            if isinstance(call.func, ast.Name) and len(call.args) == 1:
+                call = call.args[0]
+            if not isinstance(call, ast.Call):
+                continue
+            if not isinstance(call.func, ast.Attribute) or call.func.attr != "getenv":
+                continue
+            # os.getenv(name, default) -- the default is the second positional arg
+            args = call.args
+            if len(args) < 2 or getattr(args[0], "value", None) != var:
+                continue
+            default = args[1]
+            if isinstance(default, ast.Constant) and isinstance(default.value, str):
+                return default.value
+    raise AssertionError(
+        f"app/config.py no longer declares os.getenv({var!r}, <literal default>) "
+        f"as Config.{var}; point this guard at the new declaration instead of "
+        "letting the shipped default go unchecked"
+    )
 
 
 def test_shipped_default_cap_is_not_disabled():
@@ -24,7 +70,22 @@ def test_shipped_default_cap_is_not_disabled():
     0 (= disabled) left the whole suite green. That default is the live-billing
     decision the issue made deliberately, so it is asserted here rather than
     left to a code comment (#255)."""
-    assert config.LLM_DAILY_BUDGET_USD > 0.0
+    assert float(_declared_env_default("LLM_DAILY_BUDGET_USD")) > 0.0
+
+
+def test_env_example_agrees_with_the_shipped_budget_default():
+    """``backend/.env.example`` is the template operators copy, so a default
+    that survives review in the code but not in the template still ships a
+    disabled cap to every new deployment. Both sides are read from files, so
+    this stays independent of any local ``.env``."""
+    declared = _declared_env_default("LLM_DAILY_BUDGET_USD")
+    example = pathlib.Path(_config_module.__file__).resolve().parent.parent / ".env.example"
+    values = [
+        line.strip().partition("=")[2].strip()
+        for line in example.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("LLM_DAILY_BUDGET_USD=")
+    ]
+    assert values == [declared]
 
 
 def test_disabled_budget_reserve_is_a_noop(monkeypatch):
