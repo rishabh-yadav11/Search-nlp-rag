@@ -2387,11 +2387,12 @@ async def _reconcile_cancelled_turn(action: Callable[[], Awaitable[None]]) -> No
     await until the scope is left, so a plain `await` in a handler is
     interrupted before the row is written. `asyncio.shield` does not help -- its
     own await is re-cancelled exactly the same way -- whereas a shielded anyio
-    scope suspends the re-delivery until the rollback is done. A shield defers
-    an enclosing anyio cancel scope, not an independent second
-    `Task.cancel()`, so this guarantees the write for the disconnect and
-    shutdown paths that actually cancel a turn; it does not survive a caller
-    that cancels the task a second time mid-rollback.
+    scope suspends the re-delivery for as long as the rollback's own awaits
+    take. That is what lets the write land on the disconnect path, which is
+    where a chat turn is cancelled in practice. It is not unconditional: a
+    shield defers an enclosing anyio cancel scope, not a second, independent
+    `Task.cancel()`, and an event loop that is already shutting down can still
+    stop the write. Both are outside what this can promise.
 
     A rollback that itself fails is logged, not raised: the caller is already
     unwinding from a cancellation and re-raises it either way, so letting a
@@ -2402,6 +2403,7 @@ async def _reconcile_cancelled_turn(action: Callable[[], Awaitable[None]]) -> No
             await action()
     except Exception:
         logger.exception("chat turn rollback failed after cancellation")
+
 
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
 async def send_message(session_id: str, body: MessageIn, request: Request):
@@ -2445,9 +2447,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # it. Roll the user message back under the rule the polled-disconnect
         # check below applies (a JSON client is never shown a partial answer),
         # then re-raise so the task still ends cancelled.
-        await _reconcile_cancelled_turn(
-            lambda: s.delete_message(session_id, user_id, user_msg.id)
-        )
+        await _reconcile_cancelled_turn(lambda: s.delete_message(session_id, user_id, user_msg.id))
         raise
     except Exception:
         # Any other failure during the turn (DB error, retrieval error, etc.)
@@ -2492,9 +2492,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
     except asyncio.CancelledError:
         if not reply_stored:
-            await _reconcile_cancelled_turn(
-                lambda: s.delete_message(session_id, user_id, user_msg.id)
-            )
+            await _reconcile_cancelled_turn(lambda: s.delete_message(session_id, user_id, user_msg.id))
         raise
 
 
@@ -2972,9 +2970,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             # one. Re-raised so the task still ends cancelled.
             logger.info("chat stream turn cancelled; reconciling the stored turn")
             if not persisted:
-                await _reconcile_cancelled_turn(
-                    lambda: fail_turn(mid_stream_estimate if gate_passed else 0.0)
-                )
+                await _reconcile_cancelled_turn(lambda: fail_turn(mid_stream_estimate if gate_passed else 0.0))
             raise
         except Exception:
             logger.exception("chat stream turn failed")

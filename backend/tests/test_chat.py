@@ -5146,9 +5146,7 @@ def test_stream_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(tmp
         ready = asyncio.Event()
 
         async def fake_prepare(question, history):
-            return chat_module.PreparedTurn(
-                answer="Hi there.", sources=[], note=None, needs_llm=False
-            )
+            return chat_module.PreparedTurn(answer="Hi there.", sources=[], note=None, needs_llm=False)
 
         async def stuck_auto_title(*args, **kwargs):
             ready.set()
@@ -5158,11 +5156,7 @@ def test_stream_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(tmp
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
         monkeypatch.setattr(chat_module, "_auto_title", stuck_auto_title)
 
-        response = _run(
-            chat_module.send_message_stream(
-                sid, chat_module.MessageIn(content="hello"), _cancel_request()
-            )
-        )
+        response = _run(chat_module.send_message_stream(sid, chat_module.MessageIn(content="hello"), _cancel_request()))
         assert _run(_cancel_while_consuming(response.body_iterator, ready)) is True
 
         rows = _turn_rows(store, sid)
@@ -5189,9 +5183,7 @@ def test_json_turn_cancelled_mid_generation_rolls_back_the_user_message(tmp_path
 
         async def run_it():
             task = asyncio.create_task(
-                chat_module.send_message(
-                    sid, chat_module.MessageIn(content="what deals happened"), _cancel_request()
-                )
+                chat_module.send_message(sid, chat_module.MessageIn(content="what deals happened"), _cancel_request())
             )
             await asyncio.wait_for(ready.wait(), timeout=5)
             task.cancel()
@@ -5227,9 +5219,7 @@ def test_json_turn_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(
 
         async def run_it():
             task = asyncio.create_task(
-                chat_module.send_message(
-                    sid, chat_module.MessageIn(content="what deals happened"), _cancel_request()
-                )
+                chat_module.send_message(sid, chat_module.MessageIn(content="what deals happened"), _cancel_request())
             )
             await asyncio.wait_for(ready.wait(), timeout=5)
             task.cancel()
