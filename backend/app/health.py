@@ -173,11 +173,14 @@ _readiness_cache: tuple[float, bool, dict] | None = None
 # Single-flight for the cache MISS. The entry above bounds the SERIAL probe
 # rate, but the moment it expires every request arriving in the same instant
 # misses together, and each would otherwise fan out its own Qdrant + Redis
-# probe round. The rate limiter above does not prevent that herd either: it
-# bounds arrival rate, not concurrency. Created eagerly at import for the same
-# reason as _redis_init_lock -- a module-level asyncio.Lock is not bound to an
-# event loop at construction on 3.10+, so it is safe to share across the
-# per-test event loops these tests run in.
+# probe round. The rate limiter does not prevent that herd either: it bounds
+# arrival rate, not concurrency.
+#
+# Built eagerly at import, like _redis_init_lock. On 3.10+ an asyncio.Lock is
+# not tied to a loop at construction, so creating one at import is safe; it
+# binds to the running loop only when a caller actually contends for it, and
+# the cache-hit path never takes it. A gunicorn worker runs one event loop for
+# its whole life, so there is one binding in production.
 _readiness_probe_lock: asyncio.Lock = asyncio.Lock()
 
 
