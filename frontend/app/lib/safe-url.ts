@@ -25,9 +25,20 @@ const SAFE_PROTOCOLS: Record<string, true> = {
 const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+\-.]*:/
 
 /**
- * Two or more leading slashes/backslashes: protocol-relative (`//evil.com`).
- * Browsers normalise `\` to `/` for special schemes, so `\\evil.com`,
- * `/\evil.com` and `\/evil.com` are the same escape and must be rejected too.
+ * Rejects protocol-relative references (`//host`), including the backslash
+ * spellings — browsers normalise `\` to `/` for special schemes, so
+ * `\\evil.com`, `/\evil.com` and `\/evil.com` are the same escape.
+ *
+ * For off-origin escapes like `\x00//evil.com` (a NUL prefix survives `trim()`)
+ * this is *not* what does the work — the `parsed.origin !== baseUrl.origin`
+ * check below is, and that check alone is sufficient. What makes this regex
+ * load-bearing is the sentinel `SSR_BASE`: once the stand-in base is
+ * `https://ssr.invalid/`, an input like `//ssr.invalid/x` resolves to exactly
+ * the stand-in origin and would satisfy the origin check on the server while
+ * the client (base `https://app.vccircle.com/`) rejects it. Deleting this
+ * regex makes that input diverge between the two, which the parity tests
+ * catch. It is cheap insurance that keeps the server verdict equal to the
+ * client verdict.
  */
 const PROTOCOL_RELATIVE_RE = /^[/\\]{2}/
 
@@ -35,8 +46,17 @@ const PROTOCOL_RELATIVE_RE = /^[/\\]{2}/
  * Stand-in base for renders with no `window`. Nothing is ever fetched from it;
  * it only lets a relative URL resolve to *something* instead of throwing, so
  * the origin comparison below stays consistent between server and client.
+ *
+ * The host must be one that no input can legitimately resolve *back* to. With
+ * a routable host such as `https://localhost/` the scheme-less origin check
+ * accepts any reference that lands on that exact origin, so `\x00//localhost`
+ * (a NUL prefix survives `trim()`, so it slips past the protocol-relative
+ * regex) was judged safe on the server and unsafe in the browser — the server
+ * emitted a clickable off-origin link that React then discarded on hydration.
+ * `.invalid` is reserved by RFC 2606 and never resolves, so the server verdict
+ * now matches the client verdict for every input.
  */
-const SSR_BASE = 'https://localhost/'
+const SSR_BASE = 'https://ssr.invalid/'
 
 /**
  * True when `url` is safe to place in an `href`.
