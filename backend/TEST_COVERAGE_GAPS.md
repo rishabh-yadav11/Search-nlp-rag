@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app`: **650 passed**, 86% overall (3652 statements,
+Measured with `pytest --cov=app`: **652 passed**, 86% overall (3652 statements,
 504 missed). This is a checklist of functions and branches that have **no test
 coverage**, grouped by module. The figures re-measured here are the ones for
 the modules this change rewrote (`app/cost_budget.py`, `app/chat.py`); the rest
@@ -306,8 +306,9 @@ without a failure.
 Measured: 841 statements, 70 missed. The entries below are the branches this
 change added or re-pointed at. The residual is mostly
 `_prepare_multi_entity_turn` (lines 1330-1440), which this change did not
-touch, and none of the missed lines is new code — the shortfall predates it and
-the full accounting is #295's audit. Do not read this section as 100%.
+touch. The missed lines inside the code this change added or edited are all
+pre-existing lines; the rest of the residual is unattributed here and the full
+accounting is #295's audit. Do not read this section as 100%.
 
 - [x] **`ChatStore.connect` schema migration** (lines 119-175): legacy DBs
       missing `prompt_tokens`/`completion_tokens`/`cost` and separately missing
