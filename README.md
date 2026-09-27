@@ -204,7 +204,9 @@ python scripts/backup_qdrant.py            # snapshot + copy + prune
 python scripts/backup_qdrant.py --prune-only
 ```
 
-`reset_index.py` drops the collection and local artifacts to start from zero. By default it **blocks** unless a fresh backup succeeded (`--skip-backup` overrides; `--keep-data` drops the collection only):
+`backup_qdrant.py` exits non-zero unless a verified local snapshot archive was written, so a cron job or wrapper can detect a backup that wrote nothing.
+
+`reset_index.py` drops the collection and local artifacts to start from zero. By default it **blocks** unless a fresh backup succeeded, and "succeeded" means a snapshot archive was downloaded to `backend/backups/` and verified as a readable tar — a snapshot that exists only inside the Qdrant container does not count, because a container recreate or `docker rm` destroys it (`--skip-backup` overrides; `--keep-data` drops the collection only). It exits non-zero on any abort, so a reset that did not run is never mistaken for one that did:
 
 ```bash
 python scripts/reset_index.py               # backup-gated, interactive
