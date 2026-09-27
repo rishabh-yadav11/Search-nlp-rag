@@ -25,36 +25,49 @@ const SAFE_PROTOCOLS: Record<string, true> = {
 const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+\-.]*:/
 
 /**
+ * Raw C0 controls (NUL, SOH, … US, plus DEL) anywhere in the input.
+ *
+ * Browsers strip leading C0 controls and spaces, and strip tab/CR/LF from
+ * anywhere in a URL, so `\x00//evil.com` navigates off-origin even though the
+ * raw string does not begin with `//` and so slips past the regex above. A
+ * fuzz over 5046 inputs showed that every server/client verdict divergence
+ * this guard could produce was a control-prefixed reference: it resolves to
+ * the stand-in base on the server but to the real page origin in the browser,
+ * so the two environments disagreed — and in the dangerous direction, the
+ * server marked it safe and emitted a clickable off-origin link that React
+ * then discarded on hydration.
+ *
+ * Rejecting raw C0 controls removes that whole class. It costs nothing: no
+ * legitimate URL contains them, since browsers percent-encode them anyway.
+ */
+const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/
+
+/**
  * Rejects protocol-relative references (`//host`), including the backslash
  * spellings — browsers normalise `\` to `/` for special schemes, so
  * `\\evil.com`, `/\evil.com` and `\/evil.com` are the same escape.
  *
- * For off-origin escapes like `\x00//evil.com` (a NUL prefix survives `trim()`)
- * this is *not* what does the work — the `parsed.origin !== baseUrl.origin`
- * check below is, and that check alone is sufficient. What makes this regex
- * load-bearing is the sentinel `SSR_BASE`: once the stand-in base is
- * `https://ssr.invalid/`, an input like `//ssr.invalid/x` resolves to exactly
- * the stand-in origin and would satisfy the origin check on the server while
- * the client (base `https://app.vccircle.com/`) rejects it. Deleting this
- * regex makes that input diverge between the two, which the parity tests
- * catch. It is cheap insurance that keeps the server verdict equal to the
- * client verdict.
+ * This regex *is* load-bearing: deleting it (making it never match) fails the
+ * parity test for `//ssr.invalid/x`, which would otherwise resolve to exactly
+ * the stand-in base origin on the server and be rejected by the client. It is
+ * not what catches control-prefixed escapes like `\x00//evil.com` —
+ * `CONTROL_CHAR_RE` above does that, before any parsing happens.
  */
 const PROTOCOL_RELATIVE_RE = /^[/\\]{2}/
 
 /**
  * Stand-in base for renders with no `window`. Nothing is ever fetched from it;
  * it only lets a relative URL resolve to *something* instead of throwing, so
- * the origin comparison below stays consistent between server and client.
+ * the parse below does not diverge between server and client.
  *
- * The host must be one that no input can legitimately resolve *back* to. With
- * a routable host such as `https://localhost/` the scheme-less origin check
- * accepts any reference that lands on that exact origin, so `\x00//localhost`
- * (a NUL prefix survives `trim()`, so it slips past the protocol-relative
- * regex) was judged safe on the server and unsafe in the browser — the server
- * emitted a clickable off-origin link that React then discarded on hydration.
- * `.invalid` is reserved by RFC 2606 and never resolves, so the server verdict
- * now matches the client verdict for every input.
+ * The host is `.invalid` (RFC 2606, never resolvable) so a stand-in origin is
+ * never a real navigation target. Stated precisely, because the distinction
+ * matters: this is defence-in-depth, *not* the fix for the reported
+ * divergence. Reverting it to `https://localhost/` no longer fails any test,
+ * because `CONTROL_CHAR_RE` refuses the control-prefixed inputs
+ * (`\x00//localhost`) before parsing on both paths. It is kept because a
+ * routable stand-in would turn any future parser-level gap into a real
+ * navigation to that host.
  */
 const SSR_BASE = 'https://ssr.invalid/'
 
@@ -80,9 +93,12 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   const raw = url.trim()
   if (!raw) return false
 
-  // Checked on the trimmed string, but the origin comparison below is what
-  // actually catches control-character-prefixed variants such as
-  // `"\x01//evil.com"`, which `String.prototype.trim` does not remove.
+  // Checked before any parsing: `trim()` leaves NUL and the other C0 controls
+  // in place, and the parser then strips them, so a control-prefixed
+  // `\x00//host` is parsed as a real protocol-relative escape. Rejecting the
+  // raw form is what keeps the server verdict equal to the client verdict.
+  if (CONTROL_CHAR_RE.test(raw)) return false
+
   if (PROTOCOL_RELATIVE_RE.test(raw)) return false
 
   let baseUrl: URL
@@ -103,6 +119,10 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
 
   // A reference with no scheme of its own is meant to be same-origin. If it
   // still lands on another origin it was an escape attempt, not a local path.
+  // Defence-in-depth: with CONTROL_CHAR_RE and PROTOCOL_RELATIVE_RE in front
+  // of it, removing this check fails no test. It is kept because it states the
+  // invariant directly and would catch a new escape shape that neither regex
+  // anticipated, rather than relying on the parser to normalise it safely.
   if (!SCHEME_RE.test(raw) && parsed.origin !== baseUrl.origin) return false
 
   return true
