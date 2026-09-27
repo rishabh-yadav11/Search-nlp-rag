@@ -20,7 +20,8 @@ LE_ROOT="${LE_ROOT:-/etc/letsencrypt}"
 LE_DOMAIN="${LE_DOMAIN:-}"
 LE_EMAIL="${LE_EMAIL:-}"
 # auto|on|off. "auto" means: TLS once a domain is configured and its
-# certificate is actually on disk, plain HTTP otherwise.
+# certificate is actually usable (see nginx_tls_cert_valid), plain HTTP
+# otherwise.
 NGINX_TLS="${NGINX_TLS:-auto}"
 LE_LIVE="$LE_ROOT/live/$LE_DOMAIN"
 LE_CERT="$LE_LIVE/fullchain.pem"
@@ -64,7 +65,8 @@ env overrides:
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
-  NGINX_TLS   off | on | auto (default auto: on once LE_DOMAIN has a certificate)
+  NGINX_TLS   off | on | auto (default auto: on once LE_DOMAIN has a *usable*
+              certificate: non-empty fullchain+privkey, not expired)
   LE_DOMAIN LE_EMAIL   required by the tls stage; renewals mail LE_EMAIL
   LE_ROOT CERTBOT_WEBROOT   override the certificate and ACME challenge paths
 EOF
@@ -420,6 +422,33 @@ nginx_server_name() {
     fi
 }
 
+# True when the certificate pair nginx needs is actually usable. This is the
+# whole meaning of NGINX_TLS=auto, so it has to mean "usable", not "present":
+#
+#   * both halves, as regular non-empty files. certbot writes exactly
+#     fullchain.pem and privkey.pem and nginx reads exactly those; a directory
+#     that exists, or a half-written pair, is not something to point a live
+#     server at. A config naming an unreadable certificate is rejected by
+#     `nginx -t`, which means the rollback path, which means an outage.
+#   * the leaf not expired, so a stale certificate is re-issued rather than
+#     kept. An expired certificate still loads, so this is not a load-time
+#     failure, but serving one is precisely the broken-TLS state this stage
+#     exists to end -- and answering "off" here is only ever a pre-flight
+#     verdict, because certbot runs immediately afterwards and puts TLS back.
+#
+# Without openssl the expiry cannot be established, so the file test stands
+# alone. Guessing "not valid" there would downgrade a working HTTPS site
+# because a tool is missing, which is the failure this whole check prevents.
+nginx_tls_cert_valid() {
+    [ -n "$LE_DOMAIN" ] || return 1
+    [ -f "$LE_CERT" ] && [ -s "$LE_CERT" ] || return 1
+    [ -f "$LE_KEY" ] && [ -s "$LE_KEY" ] || return 1
+    if have openssl; then
+        openssl x509 -checkend 0 -noout -in "$LE_CERT" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
 # Echoes exactly "on" or "off" so callers can use the result as a boolean
 # instead of re-parsing NGINX_TLS themselves.
 nginx_tls_mode() {
@@ -427,9 +456,10 @@ nginx_tls_mode() {
         off|0|false|no) echo "off" ;;
         on|1|true|yes) echo "on" ;;
         # auto: TLS only once a domain is configured *and* its certificate is
-        # really on disk, so a fresh install keeps serving plain HTTP.
+        # really usable, so a fresh install keeps serving plain HTTP and a
+        # re-run never downgrades a site that is already encrypted.
         *)
-            if [ -n "$LE_DOMAIN" ] && [ -r "$LE_CERT" ]; then
+            if nginx_tls_cert_valid; then
                 echo "on"
             else
                 echo "off"
@@ -579,11 +609,23 @@ NGINX
 nginx_site_config() {
     local mode
     mode="$(nginx_tls_mode)"
-    if [ "$mode" = "on" ] && [ ! -r "$LE_CERT" ]; then
-        echo "ERROR: TLS is on but no readable certificate at $LE_CERT." >&2
-        echo "       Get one with: LE_DOMAIN=... LE_EMAIL=... ./setup.sh tls" >&2
-        echo "       Or go back to HTTP with: NGINX_TLS=off ./setup.sh nginx" >&2
-        return 1
+    if [ "$mode" = "on" ]; then
+        # Both halves, not just the certificate: nginx reads privkey.pem from
+        # the very same config, so a missing key fails `nginx -t` exactly like
+        # a missing certificate does. NGINX_TLS=on is the only way to get here
+        # without nginx_tls_cert_valid having already checked both.
+        if [ ! -r "$LE_CERT" ]; then
+            echo "ERROR: TLS is on but no readable certificate at $LE_CERT." >&2
+            echo "       Get one with: LE_DOMAIN=... LE_EMAIL=... ./setup.sh tls" >&2
+            echo "       Or go back to HTTP with: NGINX_TLS=off ./setup.sh nginx" >&2
+            return 1
+        fi
+        if [ ! -r "$LE_KEY" ]; then
+            echo "ERROR: TLS is on but no readable private key at $LE_KEY." >&2
+            echo "       Get one with: LE_DOMAIN=... LE_EMAIL=... ./setup.sh tls" >&2
+            echo "       Or go back to HTTP with: NGINX_TLS=off ./setup.sh nginx" >&2
+            return 1
+        fi
     fi
     render_nginx_config "$mode"
 }
@@ -669,10 +711,20 @@ run_tls() {
     # The challenge must be servable BEFORE certbot asks Let's Encrypt to fetch
     # it. On a host whose nginx config predates the ACME location, the token
     # would fall through "location /" to Next.js, 404, and validation would fail
-    # on the very first run. Installing the plain-HTTP config first is a no-op
-    # for the site (it already serves plain HTTP; this only adds the challenge
-    # location) and it is what makes "./setup.sh tls" work standalone.
-    NGINX_TLS=off
+    # on the very first run. So the config is installed first, and it is what
+    # makes "./setup.sh tls" work standalone.
+    #
+    # "auto", not "off": the mode-80 server serves the ACME challenge in BOTH
+    # modes (only "location /" becomes a redirect, and "^~" outranks it), so
+    # dropping to plain HTTP is only ever needed on a first run. Forcing "off"
+    # here rewrote a live HTTPS site to cleartext and reloaded nginx even when a
+    # perfectly good certificate was already on disk, so a certbot hiccup
+    # during a routine re-run left the site in cleartext. Under "auto" an
+    # existing, usable certificate is kept and a missing one still falls back
+    # to plain HTTP for the challenge.
+    local preflight
+    NGINX_TLS=auto
+    preflight="$(nginx_tls_mode)"
     TLS_BOOTSTRAP=1 run_nginx || return 1
     sudo mkdir -p "$CERTBOT_WEBROOT/.well-known/acme-challenge"
     # webroot, never --standalone: --standalone needs port 80 free, so on the
@@ -686,7 +738,15 @@ run_tls() {
         --email "$LE_EMAIL" --agree-tos --non-interactive \
         --keep-until-expiring \
         --deploy-hook 'systemctl reload nginx'; then
-        echo "ERROR: certbot failed; the plain-HTTP config is still installed and serving." >&2
+        # Report the posture that is actually installed, not a fixed one: on a
+        # re-run the pre-flight above kept the existing TLS config, and telling
+        # the operator the site is on plain HTTP is the one thing they must not
+        # be left believing here.
+        if [ "$preflight" = "on" ]; then
+            echo "ERROR: certbot failed; the existing TLS config is still installed and serving." >&2
+        else
+            echo "ERROR: certbot failed; the plain-HTTP config is still installed and serving." >&2
+        fi
         echo "       The usual cause is that http://$LE_DOMAIN/.well-known/acme-challenge/" >&2
         echo "       is not reaching this host: check that the domain's A/AAAA record" >&2
         echo "       points here and that port 80 is open in the firewall and the" >&2

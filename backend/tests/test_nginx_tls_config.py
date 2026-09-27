@@ -33,18 +33,122 @@ cannot replace nginx's own parser.
 
 import os
 import re
+import shutil
 import subprocess
+import tempfile
+from functools import cache
 from pathlib import Path
 
 import pytest
 
 SETUP_SH = Path(__file__).resolve().parents[2] / "setup.sh"
 
-# Ports are pinned to values that differ from the shipped defaults so a config
-# that hardcodes 80 or 8001 fails here instead of passing by coincidence.
+# Ports are pinned to values that differ from the shipped defaults, so a config
+# that hardcodes them fails here instead of passing by coincidence. That only
+# holds while the pins really are different, which is what
+# test_port_pins_differ_from_the_shipped_defaults guards.
 PUBLIC_PORT = 8080
-API_PORT = 8001
-NEXT_PORT = 3000
+API_PORT = 18001
+NEXT_PORT = 13000
+
+OPENSSL = shutil.which("openssl")
+requires_openssl = pytest.mark.skipif(
+    OPENSSL is None,
+    reason="openssl is what mints, and what validates, the certificate pairs below",
+)
+
+# `openssl ca` is the only way to get a leaf with a notAfter in the past:
+# `req -x509` refuses a non-positive -days. The dates are fixed, so the
+# certificate it produces is expired permanently, not just today.
+_CA_CONF = """\
+[ ca ]
+default_ca = CA_default
+[ CA_default ]
+dir = ./ca
+database = $dir/index.txt
+new_certs_dir = $dir/newcerts
+serial = $dir/serial
+default_md = sha256
+policy = pol
+email_in_dn = no
+unique_subject = no
+[ pol ]
+commonName = supplied
+"""
+
+
+def _openssl(cwd, *args):
+    proc = subprocess.run(["openssl", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"openssl {' '.join(args)} failed:\n{proc.stderr}"
+    return proc.stdout
+
+
+@cache
+def _valid_pair(domain):
+    """(cert, key) PEM text for a real, unexpired self-signed pair.
+
+    Real rather than placeholder text because setup.sh now asks openssl whether
+    the leaf is still in date: a file that merely exists says nothing about
+    whether it can be served. Minted once per session, then copied into each
+    test's own tmp_path.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch = Path(scratch)
+        _openssl(
+            scratch, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(scratch / "key.pem"), "-out", str(scratch / "cert.pem"),
+            "-days", "30", "-subj", f"/CN={domain}",
+        )
+        return (scratch / "cert.pem").read_text(), (scratch / "key.pem").read_text()
+
+
+@cache
+def _expired_pair(domain):
+    """(cert, key) PEM text for a well-formed pair whose leaf has expired."""
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch = Path(scratch)
+        (scratch / "ca" / "newcerts").mkdir(parents=True)
+        (scratch / "ca" / "index.txt").write_text("")
+        (scratch / "ca" / "serial").write_text("1000\n")
+        (scratch / "ca" / "openssl.cnf").write_text(_CA_CONF)
+        _openssl(scratch, "genrsa", "-out", str(scratch / "ca-key.pem"), "2048")
+        _openssl(
+            scratch, "req", "-x509", "-key", str(scratch / "ca-key.pem"),
+            "-out", str(scratch / "ca.pem"), "-days", "3650", "-subj", "/CN=test-ca",
+        )
+        _openssl(
+            scratch, "req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(scratch / "key.pem"),
+            "-out", str(scratch / "req.csr"), "-subj", f"/CN={domain}",
+        )
+        _openssl(
+            scratch, "ca", "-batch", "-config", str(scratch / "ca" / "openssl.cnf"),
+            "-cert", str(scratch / "ca.pem"), "-keyfile", str(scratch / "ca-key.pem"),
+            "-in", str(scratch / "req.csr"), "-out", str(scratch / "cert.pem"),
+            "-startdate", "20200101000000Z", "-enddate", "20200201000000Z", "-notext",
+        )
+        return (scratch / "cert.pem").read_text(), (scratch / "key.pem").read_text()
+
+
+def _shipped_default(name):
+    """The port setup.sh falls back to when the environment says nothing."""
+    match = re.search(rf'^{name}="\$\{{{name}:-(\d+)\}}"$', SETUP_SH.read_text(), re.MULTILINE)
+    assert match, f"setup.sh no longer declares {name} with a default port"
+    return int(match.group(1))
+
+
+def test_port_pins_differ_from_the_shipped_defaults():
+    """The claim every assertion in this module rests on.
+
+    A pin equal to the shipped default makes a template that hardcodes that
+    default indistinguishable from one that interpolates the knob, so the pins
+    have to stay off the defaults for this file to mean anything.
+    """
+    for name, pinned in (("PUBLIC_PORT", PUBLIC_PORT), ("API_PORT", API_PORT), ("NEXT_PORT", NEXT_PORT)):
+        default = _shipped_default(name)
+        assert pinned != default, (
+            f"{name} is pinned to {pinned}, which is also the shipped default, so a template "
+            f"baking in {default} would pass every test here unnoticed"
+        )
 
 # A domain with a cert present, and the ACME path that must keep answering on
 # port 80 for renewals to keep working once the redirect exists.
@@ -85,14 +189,42 @@ def _missing_cert_root(tmp_path):
     return tmp_path / "no-such-letsencrypt"
 
 
-def _certified_root(tmp_path, domain):
-    """A letsencrypt root holding a real cert/key pair for `domain`, under
-    tmp_path so nothing here can touch a real certificate store."""
+def _certified_root(tmp_path, domain, *, pair=None):
+    """A letsencrypt root holding a cert/key pair for `domain`, under tmp_path
+    so nothing here can touch a real certificate store.
+
+    Without openssl there is no way to mint one, and setup.sh's own rule
+    degrades to the file test in that case, so the placeholder it is happy
+    with is written instead. Both paths mean the same thing to the script.
+    """
     root = tmp_path / "letsencrypt"
     live = root / "live" / domain
     live.mkdir(parents=True)
-    (live / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\n")
-    (live / "privkey.pem").write_text("-----BEGIN PRIVATE KEY-----\n")
+    if pair is None and OPENSSL:
+        pair = _valid_pair(domain)
+    cert, key = pair or ("-----BEGIN CERTIFICATE-----\n", "-----BEGIN PRIVATE KEY-----\n")
+    (live / "fullchain.pem").write_text(cert)
+    (live / "privkey.pem").write_text(key)
+    return root
+
+
+def _broken_cert_root(tmp_path, domain, how):
+    """A letsencrypt root holding a pair nginx or certbot could not actually
+    serve, which is the case "auto" has to refuse."""
+    if how == "expired":
+        return _certified_root(tmp_path, domain, pair=_expired_pair(domain))
+    root = _certified_root(tmp_path, domain)
+    live = root / "live" / domain
+    if how == "no_key":
+        (live / "privkey.pem").unlink()
+    elif how == "empty_key":
+        (live / "privkey.pem").write_text("")
+    elif how == "empty_cert":
+        (live / "fullchain.pem").write_text("")
+    elif how == "unparseable_cert":
+        (live / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\nnot base64\n")
+    else:
+        raise AssertionError(f"unknown breakage {how!r}")
     return root
 
 
@@ -325,8 +457,11 @@ def test_plain_mode_serves_the_whole_site_on_the_public_port(tmp_path):
 def test_proxied_ports_come_from_the_env_knobs(tmp_path):
     """The rendered config must interpolate the ports it is given.
 
-    A literal 8001 or 3000 baked into the template would still pass every other
-    test here while proxying to whatever happens to answer on the host.
+    Because API_PORT and NEXT_PORT are pinned away from the shipped defaults,
+    a literal 8001 or 3000 baked into the template fails here instead of
+    quietly proxying to whatever happens to answer on the host. They used to be
+    pinned to the defaults themselves, which made this assertion pass for a
+    template that had hardcoded them.
     """
     config = _rendered(tmp_path, "off")
     assert f"127.0.0.1:{API_PORT}" in config, f"API routes must proxy to $API_PORT:\n{config}"
@@ -444,6 +579,78 @@ def test_tls_mode_refuses_to_render_a_config_for_a_missing_certificate(tmp_path)
     assert proc.returncode != 0, f"NGINX_TLS=on without a certificate must fail, stdout was:\n{proc.stdout}"
     assert proc.stdout == "", f"nothing may reach stdout when the certificate is missing: {proc.stdout!r}"
     assert expected in proc.stderr, f"the error must name the missing certificate {expected}:\n{proc.stderr}"
+
+
+def test_tls_mode_refuses_to_render_a_config_for_a_missing_private_key(tmp_path):
+    """The other half of the pair. `nginx -t` reads privkey.pem from the same
+    config it reads the certificate from, so a config pointing at a missing key
+    fails exactly as hard, and the generator must not write it."""
+    root = _broken_cert_root(tmp_path, DOMAIN, "no_key")
+    proc = _call(_env(tmp_path, NGINX_TLS="on", LE_DOMAIN=DOMAIN, LE_ROOT=str(root)), "nginx_site_config")
+
+    expected = str(root / "live" / DOMAIN / "privkey.pem")
+    assert proc.returncode != 0, f"NGINX_TLS=on without a private key must fail, stdout was:\n{proc.stdout}"
+    assert proc.stdout == "", f"nothing may reach stdout when the key is missing: {proc.stdout!r}"
+    assert expected in proc.stderr, f"the error must name the missing key {expected}:\n{proc.stderr}"
+
+
+@requires_openssl
+@pytest.mark.parametrize(
+    "how",
+    ["no_key", "empty_key", "empty_cert", "unparseable_cert", "expired"],
+)
+def test_auto_mode_refuses_a_certificate_pair_it_cannot_serve(how, tmp_path):
+    """"auto" has to mean usable, not present.
+
+    Every one of these leaves a certificate in place that nginx or certbot
+    cannot actually serve: a half-written pair from an interrupted run, text
+    that is not a certificate, or a leaf that has already expired. Keeping TLS
+    on any of them leaves a site that is broken in a way nobody notices, so
+    the answer has to be plain HTTP -- and because this verdict is only ever a
+    pre-flight, certbot runs next and puts TLS straight back.
+    """
+    root = _broken_cert_root(tmp_path, DOMAIN, how)
+    config = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
+
+    assert 443 not in {port for block in _server_blocks(config) for port in _listen_ports(block)}, (
+        f"a certificate pair that is {how} must not be rendered as a TLS server:\n{config}"
+    )
+    assert "return 301 https://" not in config, f"nothing to redirect to:\n{config}"
+
+
+@requires_openssl
+def test_auto_mode_keeps_tls_for_a_pair_openssl_still_accepts(tmp_path):
+    """The other side of the same rule, so the check cannot pass by always
+    answering "off"."""
+    root = _certified_root(tmp_path, DOMAIN)
+    config = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
+
+    ports = {port for block in _server_blocks(config) for port in _listen_ports(block)}
+    assert 443 in ports, f"a usable certificate must keep serving over TLS:\n{config}"
+
+
+def test_auto_mode_does_not_downgrade_when_openssl_is_missing(tmp_path):
+    """Expiry is the one check that needs a tool, and it is not worth a
+    downgrade: without openssl setup.sh cannot read an expiry verdict, so the
+    file test stands alone rather than assuming the site is broken."""
+    root = _certified_root(tmp_path, DOMAIN)
+    env = _env(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
+    # A PATH holding only what is needed to reach and source the script:
+    # `dirname` for SCRIPT_DIR, `bash` for this call, `env` for the subprocess
+    # lookup. `command -v openssl` then cannot succeed.
+    lean_path = tmp_path / "lean-path"
+    lean_path.mkdir()
+    for tool in ("bash", "dirname", "env"):
+        os.symlink(shutil.which(tool), lean_path / tool)
+    env["PATH"] = str(lean_path)
+
+    proc = _call(env, "nginx_tls_mode")
+
+    assert proc.returncode == 0, f"nginx_tls_mode failed without openssl: {proc.stderr}"
+    assert proc.stdout.strip() == "on", (
+        f"a present, non-empty pair must not be downgraded just because openssl is absent, "
+        f"got {proc.stdout.strip()!r}"
+    )
 
 
 @pytest.mark.parametrize("mode", ["off", "on"])
