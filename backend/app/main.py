@@ -981,6 +981,34 @@ def _cache_key_component(value: str) -> str:
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
     return f"h:{digest}"
+# (digest key, config attribute) for every input that can change what a cached
+# retrieval or /search result contains. Kept as data rather than inline in the
+# digest so the coverage list is inspectable — a test asserts it stays in step
+# with the knobs exercised for key changes. Adding a knob to the pipeline means
+# adding it here; missing one is a stale answer for a whole TTL.
+_RETRIEVAL_CONFIG_INPUTS: tuple[tuple[str, str], ...] = (
+    ("qdrant_collection", "QDRANT_COLLECTION"),
+    ("embed_model", "EMBED_MODEL"),
+    ("sparse_model", "SPARSE_MODEL"),
+    ("rerank_backend", "RERANK_BACKEND"),
+    ("rerank_model", "RERANK_MODEL"),
+    ("rerank_candidates", "RERANK_CANDIDATES"),
+    ("recency_strength", "RECENCY_STRENGTH"),
+    ("recency_decay_days", "RECENCY_DECAY_DAYS"),
+    ("enable_query_expansion", "ENABLE_QUERY_EXPANSION"),
+    ("enable_entity_boost", "ENABLE_ENTITY_BOOST"),
+    ("enable_click_boost", "ENABLE_CLICK_BOOST"),
+    ("click_boost_min_clicks", "CLICK_BOOST_MIN_CLICKS"),
+    ("click_boost_min_article_clicks", "CLICK_BOOST_MIN_ARTICLE_CLICKS"),
+    ("click_boost_min_share", "CLICK_BOOST_MIN_SHARE"),
+    ("click_boost_mult", "CLICK_BOOST_MULT"),
+    ("click_query_max_len", "CLICK_QUERY_MAX_LEN"),
+    ("enable_diversity", "ENABLE_DIVERSITY"),
+    ("diversity_lambda", "DIVERSITY_LAMBDA"),
+    ("diversity_sim_threshold", "DIVERSITY_SIM_THRESHOLD"),
+    ("ask_min_score", "ASK_MIN_SCORE"),
+)
+
 def retrieval_config_fingerprint() -> str:
     """Short, stable digest of every config value that can change what a cached
     retrieval or /search result *contains*.
@@ -1000,11 +1028,12 @@ def retrieval_config_fingerprint() -> str:
       final set) — read by ``retrieve_and_rerank``, ``hybrid_search`` and
       ``sort_results``, and therefore affecting the ``search:`` entry
       transitively as well;
-    * the post-retrieval /search shaping (click boost and its thresholds,
-      diversity and its parameters, and the ``ASK_MIN_SCORE`` relevance gate
-      that decides whether a lone weak hit is relaxed away) — these run after
-      retrieval, so they change the ``search:`` entry but not the
-      ``retrieve:`` one.
+    * the post-retrieval /search shaping (click boost and its thresholds, the
+      click-aggregate key length that decides *which* recorded clicks a long
+      query is matched against, diversity and its parameters, and the
+      ``ASK_MIN_SCORE`` relevance gate that decides whether a lone weak hit is
+      relaxed away) — these run after retrieval, so they change the ``search:``
+      entry but not the ``retrieve:`` one.
 
     It is hashed rather than inlined so the key stays bounded however many knobs
     are listed, and the canonical JSON keeps the value identical across
@@ -1012,27 +1041,7 @@ def retrieval_config_fingerprint() -> str:
     included: they change continuously and are bounded by the TTL, not by the
     key.
     """
-    values = {
-        "qdrant_collection": config.QDRANT_COLLECTION,
-        "embed_model": config.EMBED_MODEL,
-        "sparse_model": config.SPARSE_MODEL,
-        "rerank_backend": config.RERANK_BACKEND,
-        "rerank_model": config.RERANK_MODEL,
-        "rerank_candidates": config.RERANK_CANDIDATES,
-        "recency_strength": config.RECENCY_STRENGTH,
-        "recency_decay_days": config.RECENCY_DECAY_DAYS,
-        "enable_query_expansion": config.ENABLE_QUERY_EXPANSION,
-        "enable_entity_boost": config.ENABLE_ENTITY_BOOST,
-        "enable_click_boost": config.ENABLE_CLICK_BOOST,
-        "click_boost_min_clicks": config.CLICK_BOOST_MIN_CLICKS,
-        "click_boost_min_article_clicks": config.CLICK_BOOST_MIN_ARTICLE_CLICKS,
-        "click_boost_min_share": config.CLICK_BOOST_MIN_SHARE,
-        "click_boost_mult": config.CLICK_BOOST_MULT,
-        "enable_diversity": config.ENABLE_DIVERSITY,
-        "diversity_lambda": config.DIVERSITY_LAMBDA,
-        "diversity_sim_threshold": config.DIVERSITY_SIM_THRESHOLD,
-        "ask_min_score": config.ASK_MIN_SCORE,
-    }
+    values = {name: getattr(config, attr) for name, attr in _RETRIEVAL_CONFIG_INPUTS}
     canonical = json.dumps(values, sort_keys=True, default=str, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 

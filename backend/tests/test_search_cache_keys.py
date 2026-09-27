@@ -38,6 +38,7 @@ SEARCH_KNOBS = [
     "CLICK_BOOST_MIN_ARTICLE_CLICKS",
     "CLICK_BOOST_MIN_SHARE",
     "CLICK_BOOST_MULT",
+    "CLICK_QUERY_MAX_LEN",
     "ENABLE_DIVERSITY",
     "DIVERSITY_LAMBDA",
     "DIVERSITY_SIM_THRESHOLD",
@@ -54,10 +55,11 @@ IRRELEVANT_KNOBS = [
     "PUBLIC_SEARCH_RATE_PER_MIN",
 ]
 
-# Round trips a /search miss cost on one connection before #266:
-# GET(search:...), then GET(retrieve:...) from inside the retrieval leg, then
+# Round trips a /search miss cost on one connection before #266, measured
+# against the real base commit: GET(search:...), GET(retrieve:...) from inside
+# the retrieval leg, GET(vec:...) from inside hybrid_search, then SET(vec:...),
 # SET(retrieve:...) and SET(search:...).
-PRE_FIX_ROUND_TRIPS = 4
+PRE_FIX_ROUND_TRIPS = 6
 
 
 def _flipped(value):
@@ -100,10 +102,16 @@ class _CountingRedis:
         return None
 
 
-def _wire_search(monkeypatch, articles=None, boosted=2.0):
+def _wire_search(monkeypatch, articles=None, boosted=2.0, real_hybrid=False):
     """Run the *real* /search -> retrieve_and_rerank path with only the external
     services (Qdrant, the cross-encoder, analytics) stubbed out, so these tests
-    exercise the production key building and cache plumbing."""
+    exercise the production key building and cache plumbing.
+
+    ``real_hybrid`` leaves the real ``hybrid_search`` in place and wires the
+    encoders/Qdrant it needs instead, so the ``vec:`` cache read/write is
+    counted too — a /search miss really does pay for that lookup, and a count
+    that omits it understates the cost on both sides of the comparison.
+    """
     articles = list(articles) if articles is not None else [_article(1, 0.9), _article(2, 0.5)]
 
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
@@ -129,7 +137,18 @@ def _wire_search(monkeypatch, articles=None, boosted=2.0):
                 r.score = r.score * boosted
         return results
 
-    monkeypatch.setattr(main, "hybrid_search", fake_hybrid_search)
+    if real_hybrid:
+        # Leave the real hybrid_search in place and satisfy its dependencies, so
+        # the vec: cache read/write is counted as part of the request.
+        def fake_embed_sparse(model, q):
+            return _SparseEmbedding()
+
+        monkeypatch.setattr(main, "_embed_sparse", fake_embed_sparse)
+        monkeypatch.setitem(main.state, "model", _FakeDenseEncoder())
+        monkeypatch.setitem(main.state, "sparse_model", object())
+        monkeypatch.setitem(main.state, "qdrant", _FakeQdrant(articles))
+    else:
+        monkeypatch.setattr(main, "hybrid_search", fake_hybrid_search)
     monkeypatch.setattr(main, "record_search", fake_record_search)
     monkeypatch.setattr(main, "apply_click_boost", fake_click_boost)
 
@@ -139,11 +158,97 @@ def _wire_search(monkeypatch, articles=None, boosted=2.0):
     return cache
 
 
+class _FakeQdrant:
+    """Just enough Qdrant for the real hybrid_search to build its result list."""
+
+    def __init__(self, articles):
+        self._articles = articles
+
+    async def query_points(self, **kwargs):
+        class _Point:
+            def __init__(self, a):
+                self.id = a.id
+                self.payload = a.model_dump()
+                self.score = a.score
+
+        class _Response:
+            def __init__(self, points):
+                self.points = points
+
+        return _Response([_Point(a) for a in self._articles])
+
+
+class _FakeDenseEncoder:
+    """Stands in for the ONNX/torch encoder. ``encode`` is called through
+    ``asyncio.to_thread``, so it must be synchronous and return something with
+    ``.tolist()``."""
+
+    class _Vector:
+        @staticmethod
+        def tolist():
+            return [0.1, 0.2, 0.3]
+
+    def encode(self, query):
+        return self._Vector()
+
+
+class _SparseEmbedding:
+    """Stands in for the sparse encoder output; hybrid_search calls .tolist() on
+    both fields, and runs the encoder through ``asyncio.to_thread``."""
+
+    class _Vec:
+        def __init__(self, values):
+            self._values = values
+
+        def tolist(self):
+            return list(self._values)
+
+    def __init__(self):
+        self.indices = self._Vec([1, 4])
+        self.values = self._Vec([0.5, 0.25])
+
+
 def _search(**kwargs):
     params = {"q": "fintech funding", "top_k": 8, "industry": None, "dealtype": None,
               "author": None, "content_type": None, "from_date": None, "to_date": None}
     params.update(kwargs)
     return asyncio.run(main.search(**params))
+
+
+def test_the_fingerprint_covers_exactly_the_knobs_under_test():
+    """Guard against the two lists drifting apart.
+
+    The digest and these test lists are written by hand in different places;
+    nothing but this assertion ties them together, and a knob present in one and
+    missing from the other is exactly the stale-entry bug this file exists to
+    prevent.
+    """
+    covered = {attr for _, attr in main._RETRIEVAL_CONFIG_INPUTS}
+    assert covered == set(RETRIEVAL_KNOBS) | set(SEARCH_KNOBS), (
+        "a config input is in the fingerprint but not exercised here, or is "
+        "exercised here but missing from the fingerprint"
+    )
+    assert not covered & set(IRRELEVANT_KNOBS), (
+        "a knob that cannot change a result is also in the fingerprint"
+    )
+
+
+def test_a_fully_cold_search_miss_costs_fewer_round_trips_than_the_base(monkeypatch):
+    """The end-to-end count, including the vector cache a real miss also pays for.
+
+    With the real ``hybrid_search`` in place the request touches three keys:
+    the vector cache, and the two search-layer entries. Pre-fix that was six
+    sequential round trips; the two search-layer reads now share one MGET.
+    """
+    cache = _wire_search(monkeypatch, real_hybrid=True)
+    _search()
+
+    kinds = [c[0] for c in cache._redis.commands]
+    assert kinds == ["MGET", "GET", "SET", "SET", "SET"], f"unexpected traffic: {kinds}"
+    assert len(cache._redis.commands) < PRE_FIX_ROUND_TRIPS
+    # Exactly one saved round trip, and it is the merged read.
+    assert len(cache._redis.commands) == PRE_FIX_ROUND_TRIPS - 1
+    assert kinds.count("GET") == 1, "the only remaining GET is the vector cache"
 
 
 # --- key completeness -------------------------------------------------------
