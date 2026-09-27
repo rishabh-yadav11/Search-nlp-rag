@@ -70,6 +70,11 @@ function friendlyMessage(status: number): string {
   switch (status) {
     case 400:
       return 'Invalid query. Please check your input.'
+    case 422:
+      // The API caps `q` (SEARCH_QUERY_MAX_CHARS). The input's maxLength stops
+      // most of these, but the server bound is authoritative and an operator
+      // can raise it, so this message has to stand on its own.
+      return 'Query is too long — please shorten it.'
     case 429:
       return 'Too many requests. Please try again shortly.'
     case 503:
