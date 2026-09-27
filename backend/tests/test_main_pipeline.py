@@ -5,6 +5,7 @@ import asyncio
 import math
 
 import pytest
+from _common import make_point
 from qdrant_client.models import Fusion, FusionQuery, SparseVector
 
 from app import main
@@ -356,6 +357,54 @@ def test_hybrid_search_skips_null_and_empty_payload_points(monkeypatch):
 
     assert [a.id for a in articles] == [1]
 
+
+def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch):
+    """A payload written by the real writer reaches SourceArticle.content_type.
+
+    This is the read half of the feature that was dead end to end: the write
+    side (make_point) and the read side (hybrid_search -> SourceArticle) are
+    joined here through a real payload, so a break on either side is caught by
+    one test. An empty stored value must read back as None, matching the
+    `or None` mapping, so articles with no content type stay indistinguishable
+    from articles that were never backfilled.
+    """
+    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setitem(main.state, "model", _FakeDense([0.1, 0.2]))
+    monkeypatch.setitem(main.state, "sparse_model", _FakeSparse([1], [0.5]))
+    monkeypatch.setattr(main.config, "QDRANT_COLLECTION", "col")
+
+    def stored_payload(content_type):
+        return make_point(
+            {
+                "id": 7,
+                "title": "T7",
+                "url": "u7",
+                "summary": "s7",
+                "body": "b7",
+                "published_date": "2025-06-01T00:00:00",
+                "category": "Series A",
+                "content_type": content_type,
+                "author_names": ["A"],
+                "industry_names": ["Fin"],
+                "dealtype_names": ["M&A"],
+            },
+            _Arr([0.1, 0.2]),
+            _SparseEmb([1], [0.5]),
+        ).payload
+
+    qdrant = _FakeQdrant(
+        points=[
+            _Point(7, stored_payload("Interview"), score=0.9),
+            _Point(8, stored_payload(""), score=0.8),
+        ],
+    )
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+
+    articles = _run(main.hybrid_search("query", 8))
+
+    assert [(a.id, a.content_type) for a in articles] == [(7, "Interview"), (8, None)]
+    # The field must actually be requested from Qdrant, not merely mapped.
+    assert "content_type" in qdrant.query_points_calls[0]["with_payload"]
 
 # --- body_rescue ---
 
