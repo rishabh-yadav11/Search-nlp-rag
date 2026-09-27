@@ -3419,13 +3419,24 @@ def test_aborted_flag_round_trips_through_the_store(tmp_path):
         _run(store.close())
 
 
-def test_stream_abort_in_gate_window_releases_the_hold(tmp_path, monkeypatch):
-    """Regression (#255): disconnecting in the window between the gate reserve
-    and the first delta marked `streamed` took the rollback branch, which
-    deleted the user message but never discharged the hold. The billed call's
-    reservation then sat in the store for the full COST_RESERVATION_TTL_SECONDS,
-    so enough ordinary stream-and-disconnect turns would burn the whole day's
-    budget against calls whose cost was never recorded.
+def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
+    """A disconnect between the gate reserve and the first delta must CHARGE
+    the gate hold, not release it (#255).
+
+    The loop's disconnect check runs before `streamed = True`, so the rollback
+    branch is taken and the user message is deleted: nothing reached the
+    client, so that is right. What was wrong was the MONEY. The provider has
+    already billed the call by the time it emits a piece, and releasing the
+    hold is the one option that guarantees free spend -- letting a hold lapse
+    is precisely the mechanism that CHARGES a crashed call, so the alternative
+    to releasing is never "no cost".
+
+    This reverses a previously test-pinned behaviour that asserted the hold was
+    released. Its reasoning weighed only that a live hold would sit in the
+    store for the full COST_RESERVATION_TTL_SECONDS, billing the day against "a
+    call whose cost was never recorded" -- true, and precisely why the call is
+    not free. The hold is settled at the estimate it was taken at, which is the
+    same figure the sweeper would have charged had it been left to lapse.
 
     stream_answer yields one piece, then the client is reported gone at the
     in-loop check — which runs BEFORE `streamed = True`."""
@@ -3466,10 +3477,279 @@ def test_stream_abort_in_gate_window_releases_the_hold(tmp_path, monkeypatch):
         assert "event: error" not in body
         # Rollback branch: nothing reached the client, so the user message is gone.
         assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
-        # ...and the gate hold is NOT orphaned: it was discharged, so it can
-        # never eat budget against a call that was made and charged.
+        # ...and the gate hold is NOT refunded: the call was made and billed, so
+        # the money is settled, not handed back.
         assert budget.holds == {}
-        assert budget.writes == []  # released unbilled, not settled at 0
+        assert budget.writes == [("settle", 50_000)]  # the $0.05 estimate, charged once
+        assert budget.counter == 50_000
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_stream_failure_before_any_delta_releases_the_hold(tmp_path, monkeypatch):
+    """The other side of the gate-window rule (#255): a turn that made NO
+    billed call releases its hold, so the fix above cannot charge for calls
+    that never happened.
+
+    The LLM fails before emitting anything, so the provider billed nothing;
+    the hold is dropped rather than settled, and the day total is untouched."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            raise chat_module.LLMUnavailableError()
+            yield  # pragma: no cover -- an async generator that never runs
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        body = _stream_body(client, h, sid, "Who invested in fintech?")
+
+        assert "LLM temporarily unavailable" in body
+        assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
+        # Nothing was billed, so nothing is charged: the hold is released, and
+        # it is released rather than left eating budget.
+        assert budget.holds == {}
+        assert budget.writes == []
+        assert budget.counter == 0
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, monkeypatch):
+    """A Redis blip while recording the cost of a turn whose answer is ALREADY
+    on the wire must not rewrite that answer (#255).
+
+    The settle is the last thing the completed path does, after the final
+    disconnect check, so a BudgetUnavailable here used to reach the handler,
+    persist the turn through fail_turn() as `<answer>\n\n[answer truncated]`
+    with aborted=True, and emit `error` instead of `done` -- while the client
+    held the complete answer. That is the exact client/server divergence this
+    issue removed, reintroduced through the accounting path, and it is also a
+    regression: the pre-fix cost recording was best-effort and never raised.
+
+    Failing closed here prevents no spend either -- the hold stays live and the
+    sweep charges it -- so it could only destroy a delivered answer."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            for piece in ["The ", "complete ", "answer."]:
+                yield piece
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
+
+        async def dead_settle(ids, actual_usd):
+            raise chat_module.BudgetUnavailable("redis went down mid-turn")
+
+        _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module, "settle", dead_settle)
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        body = _stream_body(client, h, sid, "Who invested in fintech?")
+
+        # The turn completed normally: the failure was in the accounting, not
+        # in the answer the client already received.
+        assert "event: done" in body
+        assert "event: error" not in body
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        assert msgs[1]["content"] == "The complete answer."
+        assert "[answer truncated]" not in msgs[1]["content"]
+        assert msgs[1]["aborted"] is False
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypatch):
+    """The same defect on the non-stream path: a 503 plus deletion of the user
+    message for an answer the LLM had already produced and been billed for."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_answer_ranked(question, prompt, holds):
+            return chat_module.LLMResult(content="A billed answer [1].", prompt_tokens=50, completion_tokens=10)
+
+        async def dead_settle(ids, actual_usd):
+            raise chat_module.BudgetUnavailable("redis went down mid-turn")
+
+        _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module, "settle", dead_settle)
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "_answer_ranked", fake_answer_ranked)
+
+        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+
+        assert r.status_code == 200
+        assert r.json()["assistant"]["content"] == "A billed answer [1]."
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+class _DeadBudgetRedis:
+    """A spend counter that cannot be reached at all.
+
+    Every attempt to run a script on it raises, so a test can assert that a
+    turn never consults the store -- which is what the documented cap opt-out
+    (`LLM_DAILY_BUDGET_USD <= 0`, "a deliberate opt-out for deployments that
+    meter spend elsewhere") has to mean if it is to mean anything (#255)."""
+
+    def __init__(self):
+        self.touched = 0
+
+    def register_script(self, lua):
+        self.touched += 1
+        raise ConnectionError("redis is down")
+
+
+def _pin_budget_disabled_with_dead_store(monkeypatch):
+    """The cap switched off AND its counter unreachable -- the exact
+    combination that used to 503 a chat for a deployment that opted out."""
+    dead = _DeadBudgetRedis()
+    monkeypatch.setattr(cost_budget_module, "_BUDGET_SCRIPT", None)
+    monkeypatch.setattr(cost_budget_module, "_client", lambda: dead)
+    monkeypatch.setattr(cost_budget_module.config, "LLM_DAILY_BUDGET_USD", 0.0)
+    return dead
+
+
+def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
+    """With the cap switched off, a dead spend counter must not affect chat at
+    all (#255). `reserve()` returns "" without touching the store in that mode,
+    but the turn's settle used to run anyway -- and with an empty hold list and
+    a non-zero amount it deliberately does not return early, so a Redis outage
+    503'd the turn and deleted the user message for a deployment that never
+    intended to consult a counter, AFTER the LLM call had been made and
+    billed."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_answer_ranked(question, prompt, holds):
+            return chat_module.LLMResult(content="An unmetered answer [1].", prompt_tokens=50, completion_tokens=10)
+
+        dead = _pin_budget_disabled_with_dead_store(monkeypatch)
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "_answer_ranked", fake_answer_ranked)
+
+        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+
+        assert r.status_code == 200
+        assert r.json()["assistant"]["content"] == "An unmetered answer [1]."
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        # Opting out means opting out: not one command reached the counter.
+        assert dead.touched == 0
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_disabled_cap_never_consults_the_store_on_the_stream_path(tmp_path, monkeypatch):
+    """The same opt-out on the SSE path: `finish_holds` discharged a
+    `charged_usd > 0` turn against an empty hold list, so a dead counter turned
+    a completed answer into an `error` event (#255)."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "A streamed, unmetered answer."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
+
+        dead = _pin_budget_disabled_with_dead_store(monkeypatch)
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        body = _stream_body(client, h, sid, "Who invested in fintech?")
+
+        assert "event: done" in body
+        assert "event: error" not in body
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        assert msgs[1]["content"] == "A streamed, unmetered answer."
+        assert dead.touched == 0
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypatch):
+    """A disconnect at a POST-stream check must be charged for the finished
+    call (#255).
+
+    Both nudge gates re-check the client after the stream has completed and its
+    usage is known, so a client that drops there produced a fully billed turn.
+    Those two checks passed tokens but no cost, which sent the abort down the
+    persist branch with cost 0.0: the turn was stored as though it were free
+    and its hold RELEASED, so the money was handed back instead of recorded."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            # No dataviz block, so the chart-intent nudge gate re-checks the
+            # client after the stream has finished.
+            yield "No chart here [1]."
+            if usage_holder is not None:
+                # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10.
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        # Gone as soon as the single delta is out: connected through the
+        # stream, disconnected at the post-stream check that follows it.
+        _disconnect_after(monkeypatch, 1)
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        body = _stream_body(client, h, sid, "show me a chart of top deals")
+
+        assert "event: error" not in body
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        # Deltas reached the client, so the turn is persisted and flagged.
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        assert msgs[1]["aborted"] is True
+        assert "No chart here" in msgs[1]["content"]
+        # The finished call is billed, exactly once, and not released.
+        assert msgs[1]["cost"] == pytest.approx(0.1)
+        assert budget.writes == [("settle", 100_000)]
+        assert budget.counter == 100_000
+        assert budget.holds == {}
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
