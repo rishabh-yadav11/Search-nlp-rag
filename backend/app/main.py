@@ -662,11 +662,13 @@ async def hybrid_search(
     # independent of the qfilter, so it is cached in Redis keyed by the
     # embedding models (a model change invalidates it). Repeated queries with
     # different facet/date filters skip encoding entirely.
-    # Defence in depth for every caller, not just /search (whose ``q`` is
-    # already bounded by FastAPI): chat passes a free-form message in, and
-    # expand_query only ever grows the string, so nothing downstream of here
-    # can be trusted to have clamped. The clamp happens before the cache key is
-    # built so the key and the embedded text always describe the same string.
+    # Defence in depth for every caller, not just /search (whose `q` is already
+    # bounded by FastAPI at SEARCH_QUERY_MAX_CHARS). Two things reach here
+    # above that bound: chat allows an 8000-char message
+    # (chat.MAX_CONTENT_LEN), and expand_query only ever grows the string, so
+    # an in-limit input can be over the limit again by the time it gets here.
+    # The clamp happens before the cache key is built so the key and the
+    # embedded text always describe the same string.
     query = query[: config.SEARCH_QUERY_MAX_CHARS]
     vec_key = (
         f"vec:{config.EMBED_MODEL}|{config.SPARSE_MODEL}:"
@@ -734,7 +736,7 @@ async def rerank(query: str, results: list[SourceArticle]) -> list[SourceArticle
     # Bound the query side of every (query, passage) pair: the cross-encoder
     # tokenizes both sides, so an unbounded query is the same CPU-spike path
     # the dense encoder has above. /search already rejects an over-long q with
-    # 422; this clamp covers chat's free-form message and expanded queries.
+    # 422; this clamp covers chat's 8000-char message and expanded queries.
     query = query[: config.SEARCH_QUERY_MAX_CHARS]
     pairs = [(query, f"{a.title}. {a.summary or ''}".strip()) for a in results]
     async with inference_lock:
