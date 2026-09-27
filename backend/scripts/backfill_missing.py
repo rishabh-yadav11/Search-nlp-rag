@@ -19,26 +19,20 @@ import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.abspath("."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import aiomysql
+from _common import log, make_point, make_pool
 
 from app.config import config
 from app.index_text import EXTERNAL_URL_SQL, compose_dense_text, compose_sparse_text, record_from_row
 
 
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
-
-
 async def fetch_records() -> dict[int, dict]:
-    pool = await aiomysql.create_pool(
-        host=config.MYSQL_HOST, port=config.MYSQL_PORT,
-        user=config.MYSQL_USER, password=config.MYSQL_PASSWORD,
-        db=config.MYSQL_DATABASE, autocommit=True, minsize=1, maxsize=3,
-    )
+    pool = await make_pool()
     query = f"""
         SELECT feid, title, summary, body, slug, {EXTERNAL_URL_SQL} AS ext_url,
                publish, content_type, author_names, industry_names, dealtype_names
@@ -80,33 +74,12 @@ def qdrant_ids() -> set[int]:
 def backfill(records: dict[int, dict], missing: list[int]):
     from fastembed import SparseTextEmbedding
     from qdrant_client import QdrantClient
-    from qdrant_client.models import PointStruct, SparseVector
     from sentence_transformers import SentenceTransformer
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
     sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
     batch_size = config.EMBED_BATCH_SIZE
-
-    def build_point(rec, dvec, svec):
-        return PointStruct(
-            id=rec["id"],
-            vector={
-                "dense": dvec.tolist(),
-                "sparse": SparseVector(indices=svec.indices.tolist(), values=svec.values.tolist()),
-            },
-            payload={
-                "title": rec["title"],
-                "url": rec["url"],
-                "published_date": rec.get("published_date"),
-                "category": rec.get("category"),
-                "summary": rec.get("summary") or "",
-                "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
-                "author_names": rec.get("author_names") or [],
-                "industry_names": rec.get("industry_names") or [],
-                "dealtype_names": rec.get("dealtype_names") or [],
-            },
-        )
 
     executor = ThreadPoolExecutor(max_workers=config.INDEXER_WORKERS)
     pending: deque = deque()
@@ -124,7 +97,7 @@ def backfill(records: dict[int, dict], missing: list[int]):
         nonlocal done
         batch, future = pending.popleft()
         dense_vecs, sparse_vecs = future.result()
-        points = [build_point(r, d, s) for r, d, s in zip(batch, dense_vecs, sparse_vecs)]
+        points = [make_point(r, d, s) for r, d, s in zip(batch, dense_vecs, sparse_vecs)]
         client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
         done += len(points)
         log(f"upserted {len(points)} points (running total {done})")

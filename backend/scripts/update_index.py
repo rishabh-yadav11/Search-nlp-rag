@@ -36,7 +36,9 @@ from datetime import UTC, datetime
 
 import aiomysql
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _common import log, make_point, make_pool
 
 from app.config import config
 from app.index_text import EXTERNAL_URL_SQL, compose_dense_text, compose_sparse_text, record_from_row
@@ -44,10 +46,6 @@ from app.index_text import EXTERNAL_URL_SQL, compose_dense_text, compose_sparse_
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 STATE_PATH = os.path.join(DATA_DIR, "index_state.json")
 LOCK_PATH = os.path.join(DATA_DIR, "update.lock")
-
-
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def load_state() -> dict:
@@ -93,19 +91,10 @@ async def fetch_records(
     result set to a specific set of article ids (used to fetch full bodies only
     for the rows that actually need (re)indexing).
     """
-    pool = await aiomysql.create_pool(
-        host=config.MYSQL_HOST,
-        port=config.MYSQL_PORT,
-        user=config.MYSQL_USER,
-        password=config.MYSQL_PASSWORD,
-        db=config.MYSQL_DATABASE,
-        autocommit=True,
-        minsize=1,
-        maxsize=3,
-        connect_timeout=10,
-        read_timeout=30,
-        write_timeout=30,
-    )
+    pool = await make_pool(connect_timeout=10)
+    # Previously also passed read_timeout/write_timeout; aiomysql 0.3.0 rejects
+    # them (TypeError before any socket opens) and exposes no equivalent. Do not
+    # restore them — see make_pool in _common.py.
     body_select = "body," if with_body else ""
     where = "WHERE status = 1"
     params: list = []
@@ -167,7 +156,6 @@ def sync_delta(state: dict, records: dict[int, dict], include_body: bool = True)
 def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, state: dict):
     from fastembed import SparseTextEmbedding
     from qdrant_client import QdrantClient
-    from qdrant_client.models import PointStruct, SparseVector
     from sentence_transformers import SentenceTransformer
 
     client = None
@@ -206,29 +194,6 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
             sparse_vecs = list(sparse_model.embed(sparse_texts))
             return dense_vecs, sparse_vecs
 
-        def build_point(rec, dvec, svec):
-            return PointStruct(
-                id=rec["id"],
-                vector={
-                    "dense": dvec.tolist(),
-                    "sparse": SparseVector(
-                        indices=svec.indices.tolist(),
-                        values=svec.values.tolist(),
-                    ),
-                },
-                payload={
-                    "title": rec["title"],
-                    "url": rec["url"],
-                    "published_date": rec.get("published_date"),
-                    "category": rec.get("category"),
-                    "summary": rec.get("summary") or "",
-                    "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
-                    "author_names": rec.get("author_names") or [],
-                    "industry_names": rec.get("industry_names") or [],
-                    "dealtype_names": rec.get("dealtype_names") or [],
-                },
-            )
-
         max_workers = max(1, config.INDEXER_WORKERS)
         executor = ThreadPoolExecutor(max_workers=max_workers)
         pending = deque()
@@ -256,7 +221,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
                 )
                 return
             points = [
-                build_point(r, dvec, svec)
+                make_point(r, dvec, svec)
                 for r, dvec, svec in zip(batch, dense_vecs, sparse_vecs)
             ]
             try:
