@@ -13,6 +13,54 @@ _TORCH_THREADS = int(os.getenv("TORCH_THREADS", "2"))
 os.environ.setdefault("OMP_NUM_THREADS", str(_TORCH_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(_TORCH_THREADS))
 
+# Hostnames the API answers to, enforced by TrustedHostMiddleware (see
+# app/main.py). The allowed entries are compared against the incoming `Host`
+# header with the port already stripped, so every entry is normalised the same
+# way here.
+_DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "testserver")
+
+
+def _normalize_host(entry: str) -> str:
+    """Lowercase a host/origin and drop any scheme and :port suffix."""
+    host = entry.strip().lower().split("://", 1)[-1]
+    if host.startswith("["):  # IPv6 literal, e.g. [::1]:8001
+        return host.partition("]")[0] + "]"
+    return host.partition(":")[0]
+
+
+def _parse_allowed_hosts(raw: str | None, origins: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Turn the ALLOWED_HOSTS knob into a de-duplicated tuple of hostnames.
+
+    Unset or blank falls back to the local dev/test hosts plus the hostnames in
+    CORS_ORIGINS, so a missing knob keeps localhost, the dev stack and the test
+    client working without ever opening the check. An explicit value replaces
+    that default wholesale: a bare "*" is rejected outright (it would silently
+    disable the check, which is the exact opposite of the knob's purpose) and a
+    value that contains no usable hostname is rejected too, because it would
+    otherwise match nothing and 400 every request with no clue why.
+    """
+    if raw is None or not raw.strip():
+        derived = _DEFAULT_ALLOWED_HOSTS + tuple(_normalize_host(o) for o in origins)
+        return tuple(dict.fromkeys(h for h in derived if h))
+
+    hosts: list[str] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry == "*":
+            raise ValueError(
+                "ALLOWED_HOSTS=* would disable the Host header check entirely; "
+                "list the hostnames the API is reachable as instead"
+            )
+        host = _normalize_host(entry)
+        if not host:
+            raise ValueError(f"ALLOWED_HOSTS entry {entry!r} is not a usable hostname")
+        hosts.append(host)
+    if not hosts:
+        raise ValueError("ALLOWED_HOSTS is set but contains no usable hostname")
+    return tuple(dict.fromkeys(hosts))
+
 
 class Config:
     # MySQL
@@ -262,6 +310,18 @@ class Config:
         o.strip()
         for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8001").split(",")
         if o.strip()
+    )
+
+    # Hostnames this API answers to, enforced by TrustedHostMiddleware. The
+    # default is derived from CORS_ORIGINS plus the local dev/test hosts, so a
+    # deployment whose public origin is already in CORS_ORIGINS is covered
+    # without any extra configuration. Set ALLOWED_HOSTS explicitly (comma
+    # separated hostnames) when the API is reachable under a hostname that is
+    # not in CORS_ORIGINS; a wrong value here answers 400 to every request.
+    # Immutable (tuple), like CORS_ORIGINS, so the allow-list can't be mutated
+    # at runtime.
+    ALLOWED_HOSTS: ClassVar[tuple[str, ...]] = _parse_allowed_hosts(
+        os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS
     )
 
 
