@@ -482,9 +482,22 @@ def test_query_of_only_control_characters_is_rejected(monkeypatch):
 def test_search_cache_key_is_bounded(monkeypatch):
     """The /search key is a second, independent key a query reaches. It has to
     be bounded on its own terms -- covering only the retrieve key would leave a
-    long query to build an arbitrarily long /search key."""
+    long query to build an arbitrarily long /search key.
+
+    The length is chosen to sit above MAX_KEY_LEN but below
+    SEARCH_QUERY_MAX_CHARS (issue #241 clamps `q` at request level, so a query
+    past that is a 422 before any key exists). The key bound is the second,
+    independent line of defence and has to hold within the range that actually
+    reaches it, not only past a limit that rejects the request first.
+    """
+    over = MAX_KEY_LEN
+    under_clamp = config.SEARCH_QUERY_MAX_CHARS - 1
+    assert over < under_clamp, (
+        "this test needs a query long enough to trip the key bound but short "
+        "enough to pass the request-level clamp; raise MAX_KEY_LEN or the clamp"
+    )
     cache, _, _ = _wire(monkeypatch)
-    response = _client.get("/search", params={"q": "q" * 1000})
+    response = _client.get("/search", params={"q": "q" * over})
     assert response.status_code == 200
     assert cache.gets, "expected the request to build a cache key"
     for key in cache.gets:
