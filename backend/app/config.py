@@ -1,8 +1,11 @@
+import logging
 import os
 import socket
 from typing import ClassVar
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -74,15 +77,36 @@ def _default_route_addresses() -> tuple[str, ...]:
 
     A connected UDP socket sends no packets: it only asks the routing table
     which source address it would pick. Any failure (no route, no IPv6, a
-    sandboxed import) just means one fewer allowed host.
+    sandboxed import) just means one fewer allowed host, so every step is
+    guarded: this runs at import, and an exception escaping here would take
+    the whole API down, which is strictly worse than a narrower allow-list.
     """
     addresses: list[str] = []
-    for family, peer in ((socket.AF_INET, "8.8.8.8"), (socket.AF_INET6, "2001:4860:4860::8888")):
+    # AF_INET6 is looked up defensively too: it is absent on builds compiled
+    # without IPv6, and a bare attribute access would raise before the guard
+    # below could run.
+    probes = (
+        (getattr(socket, "AF_INET", None), "8.8.8.8"),
+        (getattr(socket, "AF_INET6", None), "2001:4860:4860::8888"),
+    )
+    for family, peer in probes:
+        if family is None:
+            continue
         try:
             with socket.socket(family, socket.SOCK_DGRAM) as probe:
                 probe.connect((peer, 53))
                 addresses.append(probe.getsockname()[0])
-        except (OSError, ValueError):
+        except Exception:
+            # Broad on purpose, and asserted by test so it cannot be narrowed
+            # back: the only contract that matters here is "never raise at
+            # import". A missing family, no route, a sandboxed socket module
+            # and a non-socket TypeError all cost the same one allowed host.
+            # DEBUG, not WARNING: a box with no IPv6 route is the norm on cloud
+            # hosts, so this fires once per worker on every ordinary boot and
+            # a warning traceback would be noise. The operator signal that
+            # matters is the effective allow-list main.py logs at startup,
+            # which already shows a public address missing from it.
+            logger.debug("default-route probe for family %s failed", family, exc_info=True)
             continue
     return tuple(addresses)
 
