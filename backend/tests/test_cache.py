@@ -18,6 +18,12 @@ class _FakeRedis:
     async def set(self, key, value, ex=None):
         raise self.error
 
+    async def delete(self, *keys):
+        # A Redis that is down fails every command, not just reads and writes;
+        # without this the delete paths would raise AttributeError instead of
+        # taking the degraded branch they are meant to exercise.
+        raise self.error
+
 
 class _RecordingRedis:
     """Redis stand-in that records calls for the happy (non-degraded) path."""
@@ -299,13 +305,6 @@ class _FakeClock:
         self.now += seconds
 
 
-class _NoScanRedis(_FakeRedis):
-    """Redis stand-in that also fails the SCAN delete_prefix relies on."""
-
-    def scan_iter(self, match=None, count=None):
-        raise self.error
-
-
 def test_mem_ttl_does_not_slide_when_the_entry_is_read(monkeypatch):
     """A read must not extend the in-process TTL.
 
@@ -374,11 +373,11 @@ def test_byte_budget_evicts_large_vectors_before_small_results():
     _run(scenario())
 
 
-def test_delete_prefix_purge_keeps_byte_total_in_sync():
-    """Purging keys by prefix must give back their bytes, or the budget drifts
+def test_delete_keys_purge_keeps_byte_total_in_sync():
+    """Purging a known key set must give back its bytes, or the budget drifts
     low over time and the cache silently evicts far earlier than configured."""
     cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=100, max_bytes=1 << 20)
-    cache._redis = _NoScanRedis()
+    cache._redis = _FakeRedis()
     purged = {f"recommend:u{i}:10": {"v": "x" * 50} for i in range(5)}
     kept = {f"search:{i}": {"v": "y" * 10} for i in range(5)}
 
@@ -387,7 +386,7 @@ def test_delete_prefix_purge_keeps_byte_total_in_sync():
             await cache.set(key, value)
         before = cache._mem_bytes
 
-        await cache.delete_prefix("recommend:")
+        await cache.delete_keys(purged)
 
         released = sum(len(json.dumps(v).encode()) for v in purged.values())
         assert cache._mem_bytes == before - released
@@ -398,6 +397,29 @@ def test_delete_prefix_purge_keeps_byte_total_in_sync():
             assert await cache.get(key) == value
 
     _run(scenario())
+
+
+def test_delete_keys_with_no_keys_issues_no_redis_command():
+    """An empty invalidation set must be a true no-op: no command, no
+    connection. Asserted structurally by counting the commands a spy Redis
+    sees, so a regression that acquires a client cannot pass."""
+    calls = []
+
+    class _CountingRedis:
+        def __getattr__(self, name):
+            async def _record(*args, **kwargs):
+                calls.append(name)
+            return _record
+
+    cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=10)
+    cache._redis = _CountingRedis()
+
+    async def scenario():
+        await cache.delete_keys([])
+        await cache.delete_keys(iter([]))
+
+    _run(scenario())
+    assert calls == [], f"an empty key set must not talk to Redis, saw {calls}"
 
 
 def test_expired_entry_read_gives_its_bytes_back(monkeypatch):
