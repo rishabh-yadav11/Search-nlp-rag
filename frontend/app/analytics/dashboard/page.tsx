@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders, getMe, getToken, logout, redirectToLogin } from '../../lib/auth'
-import { formatCost } from '../../lib/format'
+import { formatCost, formatEpochDateTime } from '../../lib/format'
 
 interface Summary {
   searches_total: number
@@ -143,7 +143,7 @@ function ChatTable({
             <td title={sessionId}>Session {sessionId.slice(0, 8)}</td>
             <td className="num">{fmt(msgs)}</td>
             <td className="num">{cost ? formatCost(value) : fmt(value)}</td>
-            <td>{new Date(ts * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</td>
+            <td>{formatEpochDateTime(ts)}</td>
           </tr>
         ))}
       </tbody>

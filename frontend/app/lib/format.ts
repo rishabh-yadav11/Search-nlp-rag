@@ -120,13 +120,38 @@ export function formatEpochRelative(ts: number): string {
 }
 
 /**
- * A US-dollar amount. Locale is pinned to `en-US` so the output cannot vary
- * with the viewer's locale, and the fraction is sized to the magnitude: whole
- * cents above $1, sub-cent precision below it.
+ * A US-dollar amount, with the fraction sized to the magnitude: whole cents at
+ * or above $1, enough sub-cent precision below it to show a real per-message
+ * cost, and never padded out with meaningless zeros. This is the rule the chat
+ * usage line already approximated with a magnitude branch, and the analytics
+ * cards already approximated with a fixed 2-to-6 range; the shared rule keeps
+ * the first behaviour for chat's sub-dollar costs and the second for the
+ * dashboard's large totals.
+ *
+ * Grouping and fraction are locale-pinned to `en-US`, which is the whole
+ * reason this lives in one module rather than at each call site.
  */
 export function formatCost(cost: number | null | undefined): string {
   if (cost == null || Number.isNaN(Number(cost))) return '$0'
   const v = Number(cost)
   if (v === 0) return '$0'
-  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 })
+  const maximumFractionDigits = v >= 1 ? 2 : v >= 0.01 ? 4 : 6
+  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits })
+}
+
+/**
+ * A full date-and-time label for a UNIX timestamp in seconds, for the places
+ * that show when something happened rather than how long ago ("Nov 14, 2023,
+ * 10:13 PM"). Fixed locale and zone for the same reason as `formatArticleDate`.
+ *
+ * This is the shared replacement for the analytics dashboard's inline
+ * `toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })`, whose bare
+ * `[]` locale let the server's rendering and the browser's disagree.
+ */
+export function formatEpochDateTime(ts: number): string {
+  return new Date(ts * 1000).toLocaleString('en-US', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: 'UTC',
+  })
 }

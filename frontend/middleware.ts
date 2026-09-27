@@ -5,8 +5,8 @@ import { devApiBase, readApiBaseEnv, sanitizeApiBaseOrigin } from './app/lib/api
 // all come from `app/lib/api-base.ts` — the same module `app/lib/auth.ts`
 // resolves its request base from. This file used to carry its own
 // `sanitizeApiBase`, its own `NEXT_PUBLIC_API_BASE` read and its own
-// `'http://localhost:8001'` literal, and its copy accepted bases (embedded
-// credentials, C0 controls) that the browser-side validator rejected.
+// `'http://localhost:8001'` literal, and its copy accepted a base with
+// embedded credentials that the browser-side validator rejected.
 
 // The base still goes through `sanitizeApiBaseOrigin`, which returns a bare
 // origin and `''` for anything unusable, because a `connect-src` source is an

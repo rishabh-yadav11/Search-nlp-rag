@@ -178,15 +178,22 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
  * result) to `string` in one step, and every post-auth route narrows the same
  * way.
  *
- * A safe target starts with exactly one `/` and is not:
+ * A safe target must start with exactly one `/`, and is then refused if it is:
  *  - a protocol-relative reference, in either the `//` or the backslash
  *    spelling — browsers normalise `\` to `/` for special schemes, so
  *    `//evil.com`, `\\evil.com`, `/\evil.com` and `\/evil.com` are one escape;
- *  - an absolute reference carrying a scheme (`https:`, `javascript:`, …);
  *  - a string carrying a C0 control or DEL. The URL parser REMOVES tab, CR and
  *    LF, so `/\t/evil.com` reads as a harmless local path here and as
  *    `//evil.com` in the browser. This is the case the two pre-consolidation
  *    copies both missed; `CONTROL_CHAR_RE` closes it.
+ *
+ * The leading `/` requirement is what rules out an absolute reference: a value
+ * carrying a scheme (`https:`, `javascript:`, `data:`, …) cannot satisfy
+ * `startsWith('/')` in the first place. The `SCHEME_RE` test at the end of the
+ * function is therefore unreachable, and is kept only as belt-and-braces for a
+ * future refactor of that first check — the same defence-in-depth posture
+ * `isSafeUrl` takes with its own origin comparison above. A sweep of every
+ * two-character input found nothing that reaches it.
  *
  * Rejected means "the caller falls back to its default" (`/chat`, `/`), never
  * "the caller may pass it through".
@@ -211,7 +218,10 @@ export function isSafeRedirect(next: unknown): next is string {
   // Rejects `//evil.com` and every backslash spelling of the same escape.
   if (PROTOCOL_RELATIVE_RE.test(next)) return false
 
-  // Reject an embedded scheme (`https:`, `javascript:`, `data:`, …).
+  // Belt-and-braces only, and unreachable while the `startsWith('/')` check
+  // above stands: a value that starts with `/` can never match a `^[a-zA-Z]`
+  // scheme prefix. Kept so a future loosening of that check cannot silently
+  // let a scheme through.
   if (SCHEME_RE.test(next)) return false
 
   return true

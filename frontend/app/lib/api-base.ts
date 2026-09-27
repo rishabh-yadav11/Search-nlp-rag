@@ -6,9 +6,9 @@
  * runtime (`frontend/middleware.ts`, which cannot import a `'use client'`
  * module) and the browser bundle (`app/lib/auth.ts`) share ONE validator, ONE
  * `NEXT_PUBLIC_API_BASE` read and ONE dev-loopback constant. Before this
- * module existed each side had its own copy of all three, and they disagreed:
- * the middleware's validator accepted `https://user:pw@host` and
- * C0-control-bearing bases, while `auth.ts` rejected both.
+ * module existed each side had its own copy of all three, and they disagreed
+ * in both directions: the middleware's copy accepted `https://user:pw@host`,
+ * which `auth.ts` rejected, while rejecting a `;` that `auth.ts` accepted.
  *
  * The only remaining difference between consumers is what they do with a parsed
  * URL, and that difference is intentional and documented at each call site:
@@ -41,8 +41,9 @@ export const DEV_LOOPBACK = 'http://localhost:8001'
  * browser bundle would silently see `undefined` and fall back to same-origin
  * relative requests while typecheck, tests and the build all stayed green.
  *
- * This is also the only place in the frontend that names
- * `NEXT_PUBLIC_API_BASE`; a test scans the source to keep it that way.
+ * This is also the only place in the frontend that READS the variable (other
+ * modules name it in comments and in the operator-facing warning string);
+ * a test scans the source to keep it that way.
  */
 export function readApiBaseEnv(): string {
   return process.env.NEXT_PUBLIC_API_BASE || ''

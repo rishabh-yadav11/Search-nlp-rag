@@ -36,10 +36,24 @@ const OWNERS: Record<string, string[]> = {
 }
 
 /**
- * Source files to scan: every app module plus the edge middleware. Test files
- * are excluded — they legitimately name these helpers and the env var in order
- * to assert on them, so including them would make the scan assert against
- * itself.
+ * Names this issue deleted, with the module that replaced each. A page that
+ * re-introduces one of these under its old name is the exact regression the
+ * issue reported, and the two shape-based checks below cannot see it: an
+ * `usd()` that returns `'$' + v.toFixed(2)` declares no `formatCost` and
+ * builds no pattern they match.
+ */
+const RETIRED: Record<string, string> = {
+  usd: 'app/lib/format.ts (formatCost)',
+  sanitizeApiBase: 'app/lib/api-base.ts (sanitizeApiBaseOrigin)',
+  safeNext: 'app/lib/safe-url.ts (isSafeRedirect)',
+  relativeTime: 'app/lib/format.ts (formatEpochRelative)',
+}
+
+/**
+ * Source files to scan: every app module, the edge middleware, and the
+ * root-level TypeScript config. Test files are excluded — they legitimately
+ * name these helpers and the env var in order to assert on them, so including
+ * them would make the scan assert against itself.
  */
 function sourceFiles(): string[] {
   const found: string[] = [join(FRONTEND_ROOT, 'middleware.ts')]
@@ -56,6 +70,9 @@ function sourceFiles(): string[] {
   }
 
   walk(APP_DIR)
+  for (const entry of readdirSync(FRONTEND_ROOT)) {
+    if (/^(next|vitest)\.(config\.)?tsx?$/.test(entry)) found.push(join(FRONTEND_ROOT, entry))
+  }
   return found.map((f) => relative(FRONTEND_ROOT, f).split(sep).join('/'))
 }
 
@@ -69,30 +86,46 @@ function codeOf(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1')
 }
 
+/**
+ * True when `code` DECLARES `name` — `function name`, `const name =`, with or
+ * without `export`. A call or an import of the same name is not a
+ * declaration, which is the distinction that lets a page consume a shared
+ * helper without tripping the owner checks.
+ */
+function declares(code: string, name: string): boolean {
+  return new RegExp(
+    `(?:^|\\n)\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\b|(?:^|\\n)\\s*(?:export\\s+)?const\\s+${name}\\b`,
+  ).test(code)
+}
+
 /** Every frontend module, scanned once. */
 const files = sourceFiles()
 
 describe('shared layer — exactly one definition of each helper', () => {
-  it('scans every frontend module, middleware included', () => {
+  it('scans the app tree, the middleware and the root config', () => {
     // A silently-empty scan would make every assertion below vacuously true.
     expect(files).toContain('middleware.ts')
     expect(files).toContain('app/page.tsx')
     expect(files).toContain('app/lib/auth.ts')
+    expect(files).toContain('next.config.ts')
+    expect(files.some((f) => f.endsWith('.test.ts') || f.endsWith('.test.tsx'))).toBe(false)
     expect(files.length).toBeGreaterThan(10)
   })
 
   for (const [helper, owners] of Object.entries(OWNERS)) {
     it(`declares ${helper} in exactly one module`, () => {
-      const declaredIn = files.filter((file) => {
-        const code = codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8'))
-        // A declaration, not a call or an import: `function helper`, or
-        // `const helper =`.
-        return new RegExp(
-          `(?:^|\\n)\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${helper}\\b|(?:^|\\n)\\s*(?:export\\s+)?const\\s+${helper}\\b`,
-        ).test(code)
-      })
-
+      const declaredIn = files.filter((file) => declares(codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8')), helper))
       expect(declaredIn).toEqual(owners)
+    })
+  }
+
+  for (const retired of Object.keys(RETIRED)) {
+    it(`never re-declares the retired ${retired}()`, () => {
+      // The issue's own symptom was a helper that came back under a different
+      // name, which the owner list above cannot see: `usd` is not `formatCost`
+      // and declares nothing that looks like one.
+      const revived = files.filter((file) => declares(codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8')), retired))
+      expect(revived, `${retired}() was replaced by ${RETIRED[retired]}`).toEqual([])
     })
   }
 })
@@ -127,9 +160,19 @@ describe('shared layer — pages consume the shared helpers', () => {
   // reported (signup importing nothing, cards open-coding a date).
   const read = (file: string): string => codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8'))
 
-  it('no page formats an article date with its own toLocaleDateString call', () => {
+  it('no page renders a date or timestamp with its own locale call', () => {
+    // The analytics dashboard's `toLocaleString([], { dateStyle: 'short',
+    // timeStyle: 'short' })` is the duplicate this issue initially left
+    // behind: a bare `[]` locale, so the server and the browser can disagree.
+    // The pattern keys on the DATE options or on a bare locale, not on
+    // `toLocaleString` itself, because grouping a token count or a message
+    // count through that call is number formatting and is not what this
+    // invariant is about — see the call sites in `app/chat/page.tsx` and
+    // `app/analytics/dashboard/page.tsx`.
+    const DATE_RENDERING =
+      /\.toLocale(?:Date|Time)?String\(\s*(?:\[\]|''|"")|dateStyle|timeStyle|timeZone|\byear:|\bmonth:|\bday:|\bhour:/i
     const offenders = files.filter(
-      (file) => !OWNERS.formatDate.includes(file) && /\.toLocaleDateString\(/.test(read(file)),
+      (file) => !OWNERS.formatDate.includes(file) && DATE_RENDERING.test(read(file)),
     )
     expect(offenders).toEqual([])
   })
@@ -153,11 +196,22 @@ describe('shared layer — pages consume the shared helpers', () => {
     expect(offenders).toEqual([])
   })
 
-  it('every page with a log-out button calls the shared logout()', () => {
+  it('wires the shared logout() to the log-out button, not just its name', () => {
+    // Asserting the substring `logout` is worthless on its own: every one of
+    // these files matches it through a CSS class (`topbar-logout`,
+    // `chat-logout`, `dash-logout`) and through the import alone, so it would
+    // stay green with the handler re-pointed at something local. Require the
+    // button to actually be wired to it.
     const pagesWithLogoutButton = files.filter((file) => /Log out|Log Out/.test(read(file)))
-    expect(pagesWithLogoutButton.length).toBeGreaterThan(1)
+    expect(pagesWithLogoutButton.sort()).toEqual([
+      'app/analytics/dashboard/page.tsx',
+      'app/chat/page.tsx',
+      'app/page.tsx',
+    ])
     for (const file of pagesWithLogoutButton) {
-      expect(read(file)).toMatch(/logout/)
+      expect(read(file), `${file} must wire its log-out button to logout()`).toMatch(
+        /onClick=\{logout\}/,
+      )
     }
   })
 

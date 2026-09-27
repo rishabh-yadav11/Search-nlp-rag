@@ -132,21 +132,25 @@ describe('formatEpochRelative — labels a UNIX timestamp in seconds', () => {
 })
 
 describe('formatCost — one US-dollar format for every surface', () => {
-  it('pads to cents and keeps up to six decimals', () => {
+  it('scales the fraction to the magnitude and pins the grouping', () => {
+    // At or above a dollar: whole cents.
     expect(formatCost(1)).toBe('$1.00')
     expect(formatCost(1.5)).toBe('$1.50')
+    expect(formatCost(12.3456)).toBe('$12.35')
+    expect(formatCost(1234.5)).toBe('$1,234.50')
+    // Below a dollar: enough sub-cent precision to show a real per-message
+    // cost, but never padded out with meaningless zeros, and at least two
+    // decimal places so the value still reads as money.
     expect(formatCost(0.5)).toBe('$0.50')
     expect(formatCost(0.0123)).toBe('$0.0123')
     expect(formatCost(0.000001)).toBe('$0.000001')
   })
 
-  it('keeps significant decimals rather than truncating them', () => {
-    expect(formatCost(12.3456)).toBe('$12.3456')
-    expect(formatCost(1234.56789)).toBe('$1,234.56789')
-  })
-
-  it('renders a grouped, locale-pinned amount', () => {
-    expect(formatCost(1234.5)).toBe('$1,234.50')
+  it('never shows a fraction finer than the amount carries', () => {
+    // Guards the rule the consolidation chose: a whole-dollar amount is shown
+    // as dollars and cents, not padded out to six decimals.
+    expect(formatCost(99.999)).toBe('$100.00')
+    expect(formatCost(1234.5678)).toBe('$1,234.57')
   })
 
   it('shows a zero rather than a blank for an absent or zero cost', () => {
