@@ -359,6 +359,12 @@ def _location_body(block, path):
     for at, line in enumerate(lines):
         if opener.match(line):
             depth, body = line.count("{") - line.count("}"), [line]
+            if depth == 0:
+                # A whole location on one line, e.g. the TLS redirect. The
+                # loop below would never see depth return to 0, so without
+                # this it falls through and reports a location that is
+                # plainly there.
+                return line
             for following in lines[at + 1 :]:
                 body.append(following)
                 depth += following.count("{") - following.count("}")
@@ -481,6 +487,56 @@ def test_proxied_ports_come_from_the_env_knobs(tmp_path):
     config = _rendered(tmp_path, "off")
     assert f"127.0.0.1:{API_PORT}" in config, f"API routes must proxy to $API_PORT:\n{config}"
     assert f"127.0.0.1:{NEXT_PORT}" in config, f"frontend routes must proxy to $NEXT_PORT:\n{config}"
+
+
+def _api_location_bodies(block):
+    """(path, body) for every location in `block` that proxies to $API_PORT."""
+    found = []
+    for path in _location_paths(block):
+        body = _location_body(block, path)
+        if f"127.0.0.1:{API_PORT}" in body:
+            found.append((path, body))
+    return sorted(found)
+
+
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_every_api_location_forwards_the_public_host(tmp_path, mode):
+    """Each API location must set `proxy_set_header Host $host`.
+
+    nginx's default proxy Host is `$proxy_host` — the proxy_pass target — so a
+    location that does not override it reaches the backend as
+    `Host: 127.0.0.1:8001` rather than the host the browser addressed. The
+    CSRF guard compares `Origin` against `Host`, and browsers send `Origin` on
+    same-origin unsafe requests too, so every cookie-authenticated POST through
+    such a location is 403 for every user. `/recommend/` shipped that way and
+    took `POST /recommend/interaction` down in production.
+
+    Driven off the RENDERED config, not the template, because the escaping is
+    the other half of the bug: this heredoc is unquoted, so a `\\$host` typo
+    would render a literal `$host` for the shell and never reach these
+    assertions if the test read the source instead.
+    """
+    config = _rendered(tmp_path, mode, LE_DOMAIN=DOMAIN)
+    for block in _server_blocks(config):
+        for path, body in _api_location_bodies(block):
+            assert "proxy_set_header Host $host;" in body, (
+                f"location {path} proxies to the API without forwarding the public "
+                f"Host, so the CSRF guard will 403 it in production:\n{body}"
+            )
+
+
+def test_the_host_header_is_asserted_on_every_api_location_not_just_api(tmp_path):
+    """The regression itself, named: /recommend/ is not special-cased.
+
+    Guards against a fix that adds the header to the one location the bug
+    report named, leaving the same failure waiting for the next location added.
+    """
+    block = _server_on(_rendered(tmp_path, "off"), PUBLIC_PORT)
+    api_paths = {path for path, _ in _api_location_bodies(block)}
+    assert api_paths == set(API_LOCATIONS), (
+        f"the API-location set changed; update API_LOCATIONS so it stays the full list. "
+        f"got {sorted(api_paths)}, expected {sorted(API_LOCATIONS)}"
+    )
 
 
 # --------------------------------------------------------------------------

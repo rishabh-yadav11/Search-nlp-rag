@@ -1349,9 +1349,14 @@ def _token_from_request(request: Request) -> str | None:
 def _host_only(authority: str) -> str:
     """Lowercase an authority and drop its port, IPv6 literals included.
 
-    ``host``, ``host:port`` and ``[::1]:8001`` all reduce to their host. A
-    split on the FIRST colon would turn ``[::1]:8001`` into ``[`` and let any
-    bracketed address match any other, so brackets are peeled before the port.
+    ``host``, ``host:port``, ``[::1]:8001`` and a bare ``::1`` all reduce to
+    their host. A split on the FIRST colon would turn ``[::1]:8001`` into
+    ``[`` and let any bracketed address match any other, so brackets are peeled
+    before the port. The bare form matters too: ``urlsplit(...).hostname``
+    returns an IPv6 address with its brackets already removed, and that value
+    is fed straight back through here for the comparison — without this the
+    two sides of an IPv6 comparison reduce differently (``::1`` vs ``''``) and
+    a legitimate same-origin request is refused.
     Port is not part of the comparison because a port is not a security
     boundary for a cookie or for CSRF: the dev stack legitimately serves the
     frontend on :3000 and the API on :8001 under one host.
@@ -1361,6 +1366,11 @@ def _host_only(authority: str) -> str:
         end = host.find("]")
         if end != -1:
             return host[1:end]
+        return host
+    if host.count(":") > 1:
+        # More than one colon and no brackets: a bare IPv6 literal. It cannot
+        # carry a port (RFC 3986 requires brackets for that), so there is
+        # nothing to drop and splitting would leave the empty string.
         return host
     return host.partition(":")[0]
 
@@ -1380,18 +1390,20 @@ def _origin_host(origin: str) -> str | None:
 
 
 def _request_host(request: Request) -> str | None:
-    """The host the client believes it is talking to.
+    """The host this request was addressed to, from the ``Host`` header alone.
 
-    Behind the nginx proxy the backend sees the socket peer, so the public
-    host arrives in ``X-Forwarded-Host`` and only the first value of the list
-    is the one the browser actually addressed. Without a proxy this is just
-    the ``Host`` header.
+    ``X-Forwarded-Host`` is deliberately NOT consulted. It is not one of the
+    Fetch spec's forbidden header names, so a page can set it, and the shipped
+    nginx config neither overwrites nor strips it — it arrives verbatim. A
+    host the client chooses cannot be the basis of the CSRF comparison, since
+    the client chooses ``Origin`` too: naming the same value in both would
+    defeat the check completely. ``Host`` is the right basis because
+    ``TrustedHostMiddleware`` already constrains it to this deployment's own
+    allow-list, and a cross-site page cannot pick it — the browser sets it to
+    the victim's own domain. Nothing is lost by ignoring the forwarded
+    variant: every location in ``nginx_locations`` (setup.sh) now sets
+    ``proxy_set_header Host $host``, so the backend sees the public host.
     """
-    forwarded = request.headers.get("x-forwarded-host")
-    if forwarded:
-        first = forwarded.split(",")[0].strip()
-        if first:
-            return first
     host = request.headers.get("host")
     return host.strip() if host and host.strip() else None
 
@@ -1405,18 +1417,27 @@ async def enforce_same_origin(request: Request) -> None:
 
     The auth cookie is attached by the browser whether or not the page means
     to send it, so a hostile page can make an authenticated state-changing
-    request that rides the user's session. Two independent signals are used
-    so that the loss of either one alone is not fatal:
+    request that rides the user's session. Two signals are checked, and they
+    are not redundant with one another — neither covers the other's gap:
 
     - ``Sec-Fetch-Site: cross-site`` is set by the browser and cannot be set
-      by script, so it is the trustworthy signal. It is checked first because
-      it needs no host comparison and stays correct behind any proxy.
-    - ``Origin`` is compared against the request's own effective host. This
-      is a self-consistency check, not an allow-list: a request that omits or
-      lies about ``Sec-Fetch-Site`` still has to name a host matching the one
-      it was addressed to. Hosts are compared with ports stripped because the
-      app sits behind TLS termination and cannot trust ``request.url.scheme``,
-      and because the dev stack serves :3000 and :8001 under one host.
+      by script, so on its own it is decisive for every current browser: the
+      browser sends it on any cross-site unsafe request, whatever the page's
+      origin. It says nothing at all about a client that omits it (curl, an
+      eval script, a non-browser agent, a pre-2021 browser), and that is the
+      gap the second signal closes. It is checked first because it needs no
+      host comparison and stays correct behind any proxy.
+    - ``Origin`` is compared against the request's own ``Host``. This is a
+      self-consistency check, not an allow-list, and it is the signal that
+      still stands when ``Sec-Fetch-Site`` is absent or has been tampered
+      with: a foreign ``Origin`` is refused on its own. In turn it catches
+      nothing when the client omits ``Origin`` as well, and it is only as
+      trustworthy as the ``Host`` it is compared to — which is why
+      ``_request_host`` refuses to let a client-settable
+      ``X-Forwarded-Host`` pick that answer. Hosts are compared with ports
+      stripped because the app sits behind TLS termination and cannot trust
+      ``request.url.scheme``, and because the dev stack serves :3000 and
+      :8001 under one host.
 
     ``CORS_ORIGINS`` is deliberately NOT used here: it is a localhost-only dev
     default that does not contain the production host, so an allow-list built
@@ -1432,11 +1453,15 @@ async def enforce_same_origin(request: Request) -> None:
     non-browser caller for no added protection.
 
     Scope: applied to every cookie-authenticated request via ``require_auth``
-    and to ``POST /api/auth/login``. NOT applied to the public unauthenticated
-    routes (``/search``, ``/facets``, ``/analytics/click``,
-    ``/recommend/interaction``, health): they carry no ambient privilege to
-    ride, and nginx does not forward ``Host`` on them, so guarding them would
-    403 them in production.
+    and to ``POST /api/auth/login``. The routes with neither ``require_auth``
+    nor a direct ``enforce_same_origin`` are: the public ``GET /search`` and
+    ``GET /facets``; the health probes ``/health``, ``/live``, ``/ready`` and
+    ``/readyz``; and the two public unsafe routes ``POST /analytics/click``
+    and ``POST /api/auth/signup``. Every other route — including
+    ``POST /recommend/interaction`` and the whole ``/api/chat`` router —
+    carries ``require_auth`` and is therefore guarded. The unguarded ones
+    are all either safe methods, which the guard ignores anyway, or
+    unauthenticated endpoints that have no session to ride.
     """
     if request.method.upper() not in _UNSAFE_METHODS:
         return

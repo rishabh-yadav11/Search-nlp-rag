@@ -1175,20 +1175,38 @@ nginx_locations() {
     # /search, /facets, /analytics/click and /ready keys on this header; without
     # it every proxied request looks like 127.0.0.1 and the whole site shares a
     # single rate-limit bucket.
+    #
+    # Every API location must ALSO forward the public Host, for the same
+    # reason: nginx's default proxy Host is \$proxy_host, i.e. the backend
+    # address, so without this the app sees "Host: 127.0.0.1:8001" instead of
+    # the host the browser addressed. The CSRF guard compares Origin against
+    # Host, and browsers send Origin on same-origin unsafe requests too, so a
+    # missing Host header makes every cookie-authenticated POST 403 -- which
+    # took POST /recommend/interaction down for every user. Set it on all of
+    # them, not just /api, so the next location added cannot repeat it.
     location /search {
         proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
-    location /health { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /live { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /health {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
+    }
+    location /live {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
+    }
     location /ready {
         proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location /readyz {
         proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
@@ -1204,6 +1222,7 @@ nginx_locations() {
     location /ready/deep { return 404; }
     location /facets {
         proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
@@ -1257,16 +1276,24 @@ nginx_locations() {
     }
     location /recommend/ {
         proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
     location /analytics/click {
         proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
-    location /analytics/summary { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /analytics/chat { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /analytics/summary {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
+    }
+    location /analytics/chat {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
+    }
     location /analytics { proxy_pass http://127.0.0.1:$NEXT_PORT; }
 
     location / {
