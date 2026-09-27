@@ -26,13 +26,28 @@
 #   4. Still not alive -> log, POST to HEALTHCHECK_WEBHOOK_URL (if set),
 #      and print (cron mails on output if MAILTO is set).
 #
-# Override (env): BASE, LOG, HEALTHCHECK_WEBHOOK_URL, RESTART_WAIT_SECONDS.
+# An alert is emitted once per fault, not once per run: a fault that stays
+# unfixed is logged as "still failing" and otherwise stays silent until
+# ALERT_COOLDOWN_SECONDS has passed, because the */5 cron cadence would
+# otherwise mail and POST the same news ~288 times a day. The exit code still
+# reports the fault on every run.
+#
+# Override (env): BASE, LOG, HEALTHCHECK_WEBHOOK_URL, RESTART_WAIT_SECONDS,
+#                 STATE_FILE, ALERT_COOLDOWN_SECONDS.
 set -u
 
 BASE="${BASE:-http://localhost:8001}"
 APP="vccircle-backend"
 LOG="${LOG:-$HOME/search-nlp-rag/logs/healthcheck.log}"
 RESTART_WAIT_SECONDS="${RESTART_WAIT_SECONDS:-8}"
+# Cron runs this every few minutes, so a fault that stays fixed would re-alert
+# forever: a persistent placeholder key is ~288 identical webhook POSTs and
+# ~288 cron mails a day, which is how the one alert that matters gets ignored.
+# The state file holds "<key> <epoch>" for the fault currently being reported;
+# an identical fault inside the cooldown is logged once and otherwise silent.
+# A healthy run clears it, so a later fault alerts immediately.
+STATE_FILE="${STATE_FILE:-$LOG.state}"
+ALERT_COOLDOWN_SECONDS="${ALERT_COOLDOWN_SECONDS:-3600}"
 
 # cron has a minimal PATH, so pm2 may not be found. Include common locations.
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
@@ -48,9 +63,35 @@ probe() {
 post_webhook() {
   local msg="$1"
   [ -z "$WEBHOOK" ] && return 0
-  curl -fsS -m 10 -X POST "$WEBHOOK" \
+  if curl -fsS -m 10 -X POST "$WEBHOOK" \
     -H 'Content-Type: application/json' \
-    -d "{\"text\":\"$msg\"}" >/dev/null 2>&1 || true
+    -d "{\"text\":\"$msg\"}" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Best effort, and deliberately not a decision: the alert has already been
+  # logged and printed, so a webhook that is down must not swallow it or change
+  # what this run reports.
+  log "WARNING: webhook delivery failed (best effort; the run's verdict stands)"
+}
+
+# $1 is a stable name for the fault, $2 the message. Re-alerts only when the
+# fault changes or the cooldown has passed.
+alert() {
+  local key="$1" msg="$2" now last_key last_at age
+  now=$(date -u +%s)
+  last_key=""; last_at=0
+  if [ -f "$STATE_FILE" ]; then
+    read -r last_key last_at <"$STATE_FILE" 2>/dev/null || true
+    last_at="${last_at:-0}"
+  fi
+  if [ "$last_key" = "$key" ] && [ $((now - last_at)) -lt "$ALERT_COOLDOWN_SECONDS" ]; then
+    log "still failing ($key); alert suppressed for another $((ALERT_COOLDOWN_SECONDS - (now - last_at)))s"
+    return 0
+  fi
+  printf '%s %s\n' "$key" "$now" >"$STATE_FILE"
+  log "$msg"
+  post_webhook "$msg" || true
+  echo "$msg"
 }
 
 restarted=0
@@ -81,6 +122,9 @@ fi
 
 if [ "$live_code" = "200" ] && [ "$ready_code" = "200" ]; then
   [ "$restarted" = "1" ] && log "backend recovered after restart"
+  # Clear the fault state, so if the backend breaks again the next run alerts
+  # immediately instead of inheriting an unexpired cooldown.
+  rm -f "$STATE_FILE"
   exit 0
 fi
 
@@ -105,14 +149,10 @@ if [ "$live_code" = "200" ]; then
       msg="ALERT: VCCircle backend alive but readiness unreachable: /ready/deep returned HTTP ${ready_code:-none} at $BASE. Not restarting: the process answered liveness."
       ;;
   esac
-  log "$msg"
-  post_webhook "$msg"
-  echo "$msg"
+  alert "live-not-ready:$ready_code" "$msg"
   exit 1
 fi
 
 msg="ALERT: VCCircle backend down: liveness /health returned HTTP ${live_code:-none} after restart, readiness /ready/deep returned HTTP ${ready_code:-none} ($BASE)"
-log "$msg"
-post_webhook "$msg"
-echo "$msg"
+alert "down:$live_code" "$msg"
 exit 1

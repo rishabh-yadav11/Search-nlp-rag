@@ -25,6 +25,16 @@ CURL_STUB = """\
 #!/usr/bin/env bash
 url="${@: -1}"
 printf '%s\\n' "$url" >>"$CURL_LOG"
+for a in "$@"; do
+    if [ "$a" = "-X" ]; then method=1; fi
+done
+if [ "${method:-0}" = "1" ]; then
+    # Record the method, URL and arguments so a webhook delivery is observable.
+    printf 'WEBHOOK %s %s\n' "$url" "$*" >>"$CURL_LOG"
+    if [ -n "$WEBHOOK_FAILS" ]; then exit 7; fi
+    printf 'ok'
+    exit 0
+fi
 case "$url" in
 */health)
     if [ -f "$RESTARTED_MARKER" ]; then code="$HEALTH_AFTER_RESTART"; else code="$HEALTH_CODE"; fi
@@ -56,6 +66,10 @@ class WatchdogRun:
         self.log = log
 
     @property
+    def webhooks(self):
+        return [line for line in self.curl_log.splitlines() if line.startswith("WEBHOOK ")]
+
+    @property
     def probes(self):
         return [line for line in self.curl_log.splitlines() if line]
 
@@ -64,8 +78,22 @@ class WatchdogRun:
         return [line for line in self.pm2_log.splitlines() if line]
 
 
-def run_watchdog(tmp_path, *, health="200", health_after_restart="200", ready="200"):
-    home = tmp_path / "home"
+_RUN_COUNTER = [0]
+
+
+def run_watchdog(
+    tmp_path,
+    *,
+    health="200",
+    health_after_restart="200",
+    ready="200",
+    webhook="",
+    state_file=None,
+    cooldown="3600",
+    webhook_fails="",
+):
+    _RUN_COUNTER[0] += 1
+    home = tmp_path / f"run{_RUN_COUNTER[0]}" / "home"
     bin_dir = home / ".local" / "bin"
     bin_dir.mkdir(parents=True)
     for name, body in (("curl", CURL_STUB), ("pm2", PM2_STUB)):
@@ -90,6 +118,10 @@ def run_watchdog(tmp_path, *, health="200", health_after_restart="200", ready="2
         "READY_CODE": str(ready),
         # The script's real default is 8s; a test must not spend it.
         "RESTART_WAIT_SECONDS": "0",
+        "HEALTHCHECK_WEBHOOK_URL": webhook,
+        "STATE_FILE": str(state_file) if state_file else str(tmp_path / "state"),
+        "ALERT_COOLDOWN_SECONDS": str(cooldown),
+        "WEBHOOK_FAILS": webhook_fails,
     }
     proc = subprocess.run(
         ["bash", str(SCRIPT)],
@@ -201,3 +233,97 @@ def test_a_broken_probe_says_so_instead_of_guessing(tmp_path):
     assert run.returncode == 1
     assert "failed internally" in run.stdout
     assert "GEMINI_API_KEY" not in run.stdout
+
+
+# --- alerting once per fault, not once per run (the */5 cron cadence) ---
+
+
+def test_a_persistent_fault_alerts_once_and_then_stays_quiet(tmp_path):
+    """At the shipped */5 cadence a fault that is never fixed is ~288 identical
+    webhook POSTs and ~288 cron mails a day. That is how the one alert that
+    matters gets ignored, so the repeat is logged once and otherwise silent --
+    while the exit code still reports the fault on every single run."""
+    state = tmp_path / "state"
+    first = run_watchdog(tmp_path, health="200", ready="503", state_file=state)
+    second = run_watchdog(tmp_path, health="200", ready="503", state_file=state)
+
+    assert "ALERT" in first.stdout
+    assert "still failing" in second.log
+    assert "ALERT" not in second.stdout, "a repeat fault must not re-alert inside the cooldown"
+    assert second.returncode == 1, "the run must still report the fault on its exit code"
+
+
+def test_the_cooldown_expires_and_the_fault_is_reported_again(tmp_path):
+    state = tmp_path / "state"
+    run_watchdog(tmp_path, health="200", ready="503", state_file=state, cooldown="3600")
+    again = run_watchdog(tmp_path, health="200", ready="503", state_file=state, cooldown="0")
+
+    assert "ALERT" in again.stdout
+
+
+def test_a_different_fault_always_re_alerts(tmp_path):
+    """Suppression is per fault, not a blanket mute: a Qdrant outage that
+    becomes a dead process is new information and must get through."""
+    state = tmp_path / "state"
+    run_watchdog(tmp_path, health="200", ready="503", state_file=state)
+    # The process now does not come back at all: a different fault, and one the
+    # restart path has to report.
+    other = run_watchdog(tmp_path, health="000", health_after_restart="000", ready="000", state_file=state)
+
+    assert "ALERT" in other.stdout
+    assert "down" in other.stdout or "ALERT: VCCircle backend down" in other.stdout
+
+
+def test_a_healthy_run_clears_the_fault_state(tmp_path):
+    """Otherwise the cooldown would mute the NEXT outage as well, which is the
+    failure mode a naive "don't spam the webhook" fix always introduces."""
+    state = tmp_path / "state"
+    run_watchdog(tmp_path, health="200", ready="503", state_file=state)
+    assert state.exists()
+
+    run_watchdog(tmp_path, health="200", ready="200", state_file=state)
+
+    assert not state.exists()
+    after_recovery = run_watchdog(tmp_path, health="200", ready="503", state_file=state)
+    assert "ALERT" in after_recovery.stdout, "a fault after a healthy run must alert immediately"
+
+
+# --- the webhook path ---
+
+
+def test_a_fault_is_posted_to_the_webhook_with_the_alert_text(tmp_path):
+    run = run_watchdog(tmp_path, health="200", ready="503", webhook="https://hooks.example/abc")
+
+    assert len(run.webhooks) == 1
+    assert "https://hooks.example/abc" in run.webhooks[0]
+    assert "POST" in run.webhooks[0]
+    assert "GEMINI_API_KEY" in run.webhooks[0], "the alert body must be what the operator reads"
+
+
+def test_a_healthy_backend_posts_nothing(tmp_path):
+    run = run_watchdog(tmp_path, health="200", ready="200", webhook="https://hooks.example/abc")
+
+    assert run.webhooks == []
+
+
+def test_a_failing_webhook_never_swallows_the_alert(tmp_path):
+    """The webhook is best effort and cannot decide anything: it is only ever
+    posted on a path that has already failed, so the failure has to be visible
+    in the log and the alert still has to reach the operator's terminal. An
+    alerting service that is down must not turn a real outage into a silent one.
+    """
+    faulted = run_watchdog(tmp_path, health="200", ready="503", webhook="https://hooks.example/x", webhook_fails="1")
+
+    assert faulted.returncode == 1
+    assert "ALERT" in faulted.stdout, "a failed webhook must not swallow the alert"
+    assert "webhook delivery failed" in faulted.log
+    assert len(faulted.webhooks) == 1, "the delivery must have been attempted, not skipped"
+
+
+def test_a_healthy_backend_never_uses_the_webhook(tmp_path):
+    """So the webhook cannot fail a run that is passing, whatever the
+    alerting service is doing."""
+    healthy = run_watchdog(tmp_path, health="200", ready="200", webhook="https://hooks.example/x", webhook_fails="1")
+
+    assert healthy.returncode == 0
+    assert healthy.webhooks == []
