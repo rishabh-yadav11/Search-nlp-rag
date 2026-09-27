@@ -568,6 +568,39 @@ def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, mon
         _run(chat_store.close())
 
 
+def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkeypatch):
+    """The `get_session` a turn used to re-run was doing double duty: not only
+    authorisation, but existence. If the owner deletes the conversation while
+    the answer is in flight, the assistant INSERT must still fail the way it
+    always did -- a 404, not an unhandled FOREIGN KEY error from the
+    messages.session_id constraint. The existence test now lives in the
+    INSERT's own WHERE clause so this costs no extra round trip."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def delete_mid_turn(question, history):
+            await chat_store.delete_session(sid, user_id)
+            return "An answer [1].", [], None, 1, 1, 0.0
+
+        monkeypatch.setattr(chat_module, "_run_turn", delete_mid_turn)
+
+        r = client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "Who invested in fintech?"},
+        )
+        assert r.status_code == 404
+        assert "conversation not found" in r.text
+        # The cascade really did remove the user message written this turn;
+        # nothing was resurrected by the failed assistant write.
+        assert _run(chat_store.get_session(sid, user_id)) is None
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
 def test_api_usage_stats(tmp_path, monkeypatch):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:

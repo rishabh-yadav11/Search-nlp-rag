@@ -370,14 +370,31 @@ class ChatStore:
         Writes the message and the sessions.updated_at bump as one transaction,
         exactly as before; it just does not re-run the authorisation SELECT.
         Any entry point that has not proven ownership must go through
-        append_message(), which does."""
+        append_message(), which does.
+
+        The INSERT is guarded by WHERE EXISTS rather than preceded by a
+        re-read: a conversation deleted between the turn's authorisation and
+        this write must still fail as a clean 404, and folding the test into
+        the statement keeps that at zero extra round trips. It also stays
+        atomic, so no SELECT-then-INSERT window opens up.
+
+        The INSERT, the updated_at UPDATE and the COMMIT are deliberately NOT
+        merged into fewer statements (#259). aiosqlite runs one statement per
+        call, and the COMMIT is what makes the message and the bump atomic and
+        visible together; the INSERT's lastrowid is also returned to the
+        caller. Merging would trade a durability guarantee for one await."""
         db = self._require_db()
         ts = _now()
         cur = await db.execute(
             "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session.id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted)),
+            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+            " WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
+            (session.id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted), session.id),
         )
+        if cur.rowcount == 0:
+            # The conversation went away mid-turn (the user deleted it). The
+            # guarded INSERT wrote nothing, so there is nothing to roll back.
+            raise HTTPException(status_code=404, detail="conversation not found")
         await db.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?",
             (ts, session.id),
