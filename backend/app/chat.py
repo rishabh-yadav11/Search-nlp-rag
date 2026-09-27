@@ -1252,9 +1252,10 @@ def _history_fence(history: list[MessageOut]) -> str:
     between them and the prepended omission note are charged against
     CHAT_HISTORY_CHAR_LIMIT, so the replay can never exceed the configured
     limit. A newest turn too long to fit on its own is cut to fit rather than
-    dropped, so it survives whenever the budget can hold one fence at all.
-    Otherwise the omission note still names how many turns were dropped, so no
-    turn is ever discarded silently.
+    dropped, but only where the budget — after the reserved omission note — still
+    covers that turn's fence, its in-fence truncation mark and at least one
+    character of its text. Below that no turn is kept and the reserved note
+    stands alone; either way the turns left out are declared, never silent.
 
     When the limit is too small to hold that note there is no rendering that
     both reports the session and respects the bound, so the replay is empty —
@@ -1301,8 +1302,10 @@ def _select_turns(blocks: list[str], labels: list[str], turns: list[MessageOut],
 
     Every turn's delimiters and the ``"\\n"`` that joins it to the next one are
     charged, so joining the result with ``"\\n"`` can never exceed ``budget``. A
-    newest turn too long to fit on its own is cut to fit instead of dropped, so
-    the newest context is never lost entirely.
+    newest turn too long to fit on its own is cut to fit instead of dropped,
+    provided ``budget`` covers its fence, the in-fence truncation mark and at
+    least one character of its text; below that it returns nothing at all, which
+    the caller reports as a drop.
     """
     kept: list[str] = []
     used = 0
