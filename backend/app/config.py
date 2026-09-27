@@ -25,11 +25,34 @@ _DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "testserver")
 
 
 def _normalize_host(entry: str) -> str:
-    """Lowercase a host/origin and drop any scheme and :port suffix."""
+    """Lowercase a host/origin and drop any scheme and :port suffix.
+
+    Only IPv4 and names. Starlette compares the Host authority as
+    ``headers.get("host", "").split(":")[0]`` — everything before the FIRST
+    colon — so an IPv6 literal cannot be expressed in this allow-list at all: a
+    bracketed ``[::1]`` arrives already split to ``[``, and an unbracketed
+    ``2001:db8::5`` arrives as ``2001``. Keeping the brackets would silently
+    admit an entry that can never match, and truncating to the first hextet
+    would be worse: ``2001`` matches ANY ``2001:*`` Host, turning the check
+    into a fail-open on a guessable header. So IPv6 is excluded by
+    ``_is_ipv6_literal`` at every source instead, and serving an IPv6-only
+    deployment needs a middleware that parses the authority properly.
+    """
     host = entry.strip().lower().split("://", 1)[-1]
-    if host.startswith("["):  # IPv6 literal, e.g. [::1]:8001
-        return host.partition("]")[0] + "]"
     return host.partition(":")[0]
+
+
+def _is_ipv6_literal(entry: str) -> bool:
+    """True for an address that a split-on-first-colon Host can never match.
+
+    Both spellings occur in the wild: ``getaddrinfo`` and ``getsockname`` hand
+    back unbracketed literals, while an operator writing ``CORS_ORIGINS`` is
+    likely to bracket them.
+    """
+    host = entry.strip().lower().split("://", 1)[-1]
+    if host.startswith("["):
+        return True
+    return host.count(":") > 1
 
 
 def _machine_hosts() -> tuple[str, ...]:
@@ -63,7 +86,10 @@ def _machine_hosts() -> tuple[str, ...]:
     except (OSError, ValueError):
         pass
     hosts.extend(_default_route_addresses())
-    return tuple(h for h in dict.fromkeys(hosts) if h)
+    # IPv6 literals are dropped here rather than in _normalize_host: a hextet
+    # left behind by a later truncation is a silently fail-open entry, so the
+    # literal must never travel as far as normalisation. See _normalize_host.
+    return tuple(h for h in dict.fromkeys(hosts) if h and not _is_ipv6_literal(h))
 
 
 def _default_route_addresses() -> tuple[str, ...]:
@@ -76,39 +102,32 @@ def _default_route_addresses() -> tuple[str, ...]:
     public address in the allow-list, every public request answers 400.
 
     A connected UDP socket sends no packets: it only asks the routing table
-    which source address it would pick. Any failure (no route, no IPv6, a
-    sandboxed import) just means one fewer allowed host, so every step is
-    guarded: this runs at import, and an exception escaping here would take
-    the whole API down, which is strictly worse than a narrower allow-list.
+    which source address it would pick. Any failure (no route, a sandboxed
+    import, a missing address family) just means one fewer allowed host, so
+    every step is guarded: this runs at import, and an exception escaping here
+    would take the whole API down, which is strictly worse than a narrower
+    allow-list.
+
+    IPv4 only. An IPv6 source address cannot be put in the allow-list at all
+    (see _normalize_host), so probing for one would only add an entry that
+    could never match.
     """
-    addresses: list[str] = []
-    # AF_INET6 is looked up defensively too: it is absent on builds compiled
-    # without IPv6, and a bare attribute access would raise before the guard
-    # below could run.
-    probes = (
-        (getattr(socket, "AF_INET", None), "8.8.8.8"),
-        (getattr(socket, "AF_INET6", None), "2001:4860:4860::8888"),
-    )
-    for family, peer in probes:
-        if family is None:
-            continue
-        try:
-            with socket.socket(family, socket.SOCK_DGRAM) as probe:
-                probe.connect((peer, 53))
-                addresses.append(probe.getsockname()[0])
-        except Exception:
-            # Broad on purpose, and asserted by test so it cannot be narrowed
-            # back: the only contract that matters here is "never raise at
-            # import". A missing family, no route, a sandboxed socket module
-            # and a non-socket TypeError all cost the same one allowed host.
-            # DEBUG, not WARNING: a box with no IPv6 route is the norm on cloud
-            # hosts, so this fires once per worker on every ordinary boot and
-            # a warning traceback would be noise. The operator signal that
-            # matters is the effective allow-list main.py logs at startup,
-            # which already shows a public address missing from it.
-            logger.debug("default-route probe for family %s failed", family, exc_info=True)
-            continue
-    return tuple(addresses)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 53))
+            return (probe.getsockname()[0],)
+    except Exception:
+        # Broad on purpose, and asserted by test so it cannot be narrowed
+        # back: the only contract that matters here is "never raise at
+        # import". No route, a sandboxed socket module and an unusable
+        # address family all cost the same one allowed host.
+        # DEBUG, not WARNING: a box with no default route is unremarkable, so
+        # this would fire once per worker on an ordinary boot and a warning
+        # traceback would be noise. The operator signal that matters is the
+        # effective allow-list main.py logs at startup, which already shows a
+        # public address missing from it.
+        logger.debug("default-route probe failed", exc_info=True)
+        return ()
 
 
 def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> tuple[str, ...]:
@@ -123,9 +142,21 @@ def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> 
     purpose) and a value that contains no usable hostname is rejected too,
     because it would otherwise match nothing and 400 every request with no clue
     why.
+
+    A wildcard is only accepted in the one shape TrustedHostMiddleware itself
+    supports, a leading ``*.``. Any other placement is rejected HERE rather
+    than left to the middleware, because ``add_middleware`` defers building the
+    middleware stack to the first request: a malformed pattern such as
+    ``a.*.com`` would otherwise boot cleanly, log a healthy-looking allow-list
+    and then turn every single request into a 500 from the middleware's own
+    ``assert``. Failing at config load turns that into a clear message.
     """
     if raw is None or not raw.strip():
-        derived = _DEFAULT_ALLOWED_HOSTS + tuple(_normalize_host(h) for h in extra_hosts)
+        # IPv6 literals are dropped for the same reason as in _machine_hosts: a
+        # truncated hextet would silently widen the allow-list, and a bracketed
+        # one can never match.
+        usable = [h for h in extra_hosts if not _is_ipv6_literal(h)]
+        derived = _DEFAULT_ALLOWED_HOSTS + tuple(_normalize_host(h) for h in usable)
         return tuple(dict.fromkeys(h for h in derived if h))
 
     hosts: list[str] = []
@@ -137,6 +168,22 @@ def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> 
             raise ValueError(
                 "ALLOWED_HOSTS=* would disable the Host header check entirely; "
                 "list the hostnames the API is reachable as instead"
+            )
+        if "*" in entry and not (entry.startswith("*.") and "*" not in entry[2:]):
+            raise ValueError(
+                f"ALLOWED_HOSTS entry {entry!r} is not a valid wildcard pattern; "
+                "only a leading '*.' (as in '*.example.com') is supported"
+            )
+        if _is_ipv6_literal(entry):
+            # Rejected rather than normalised: a bracketed literal would sit in
+            # the list as dead weight, and a bare one would truncate to its
+            # first hextet and match any Host under that prefix. See
+            # _normalize_host.
+            raise ValueError(
+                f"ALLOWED_HOSTS entry {entry!r} is an IPv6 literal, which this Host "
+                "check cannot match; TrustedHostMiddleware compares the authority "
+                "up to its first colon, so serving an IPv6-only name needs a "
+                "different middleware"
             )
         host = _normalize_host(entry)
         if not host:
