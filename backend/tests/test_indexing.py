@@ -51,10 +51,8 @@ def test_fingerprint_sensitive_to_each_field(field):
 
 
 def _payload_rec(**overrides) -> dict:
-    """A record shaped like the one make_point actually stores."""
-    rec = _rec(**overrides)
-    rec.setdefault("content_type", "Interview")
-    return rec
+    """A record shaped like the one make_point stores (i.e. _rec plus content_type)."""
+    return _rec(**overrides)
 
 
 def test_fingerprint_sensitive_to_a_content_type_only_change():
