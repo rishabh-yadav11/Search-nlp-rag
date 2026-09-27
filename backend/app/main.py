@@ -981,6 +981,83 @@ def _cache_key_component(value: str) -> str:
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
     return f"h:{digest}"
+def retrieval_config_fingerprint() -> str:
+    """Short, stable digest of every config value that can change what a cached
+    retrieval or /search result *contains*.
+
+    A cached entry is only correct for the configuration that produced it. These
+    values are read from the environment at process start, so a redeploy that
+    flips a toggle (query expansion, entity boost, ...) would otherwise keep
+    replaying the previous configuration's results for the whole
+    CACHE_TTL_SECONDS window — a stale answer, not just a slow one. Keying on
+    them makes a configuration change invalidate its own entries.
+
+    The digest covers two groups:
+
+    * the retrieval/rerank pipeline (query expansion, candidate depth, rerank
+      model/backend, collection, entity boost) — read by
+      ``retrieve_and_rerank``, and therefore affecting the ``search:`` entry
+      transitively as well;
+    * the post-retrieval /search shaping (click boost and its thresholds,
+      diversity and its parameters, and the ``ASK_MIN_SCORE`` relevance gate
+      that decides whether a lone weak hit is relaxed away) — these run after
+      retrieval, so they change the ``search:`` entry but not the
+      ``retrieve:`` one.
+
+    It is hashed rather than inlined so the key stays bounded however many knobs
+    are listed, and the canonical JSON keeps the value identical across
+    processes and key orderings. Corpus contents and click counters are *not*
+    included: they change continuously and are bounded by the TTL, not by the
+    key.
+    """
+    values = {
+        "qdrant_collection": config.QDRANT_COLLECTION,
+        "rerank_backend": config.RERANK_BACKEND,
+        "rerank_model": config.RERANK_MODEL,
+        "rerank_candidates": config.RERANK_CANDIDATES,
+        "enable_query_expansion": config.ENABLE_QUERY_EXPANSION,
+        "enable_entity_boost": config.ENABLE_ENTITY_BOOST,
+        "enable_click_boost": config.ENABLE_CLICK_BOOST,
+        "click_boost_min_clicks": config.CLICK_BOOST_MIN_CLICKS,
+        "click_boost_min_article_clicks": config.CLICK_BOOST_MIN_ARTICLE_CLICKS,
+        "click_boost_min_share": config.CLICK_BOOST_MIN_SHARE,
+        "click_boost_mult": config.CLICK_BOOST_MULT,
+        "enable_diversity": config.ENABLE_DIVERSITY,
+        "diversity_lambda": config.DIVERSITY_LAMBDA,
+        "diversity_sim_threshold": config.DIVERSITY_SIM_THRESHOLD,
+        "ask_min_score": config.ASK_MIN_SCORE,
+    }
+    canonical = json.dumps(values, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def retrieve_cache_key(q: str, top_k: int, qfilter: Filter | None) -> str:
+    """Cache key for a ``retrieve_and_rerank`` result set.
+
+    ``q`` goes through :func:`_cache_key_component`, so an over-long query
+    contributes a bounded ``h:`` digest rather than its full text (#241). That
+    helper hashes instead of truncating, so two distinct over-long queries still
+    key apart and neither can be served the other's result.
+    """
+    return (
+        f"retrieve:{_cache_key_component(q)}:{top_k}:"
+        f"{retrieval_config_fingerprint()}:{_filter_token(qfilter)}"
+    )
+
+
+def search_cache_key(retrieval_q: str, eff_top_k: int, facets: str) -> str:
+    """Cache key for a /search summary page. Bounded by
+    :func:`_cache_key_component` on the query, as above (#241)."""
+    return (
+        f"search:{_cache_key_component(retrieval_q)}:{eff_top_k}:"
+        f"{retrieval_config_fingerprint()}:{facets}"
+    )
+
+
+# Sentinel for "this caller did not prefetch this key", so a prefetched *miss*
+# (None) is distinguishable from "no prefetch happened" and never turns into a
+# second Redis lookup.
+_NO_PREFETCH = object()
 
 
 async def _attach_bodies(articles: list[SourceArticle]) -> None:
@@ -1019,27 +1096,34 @@ async def retrieve_and_rerank(
     top_k: int,
     qfilter: Filter | None,
     need_body: bool = False,
+    prefetched: object = _NO_PREFETCH,
 ) -> list[SourceArticle]:
     """Run every retrieval leg, merge RRF candidates, cross-encode rerank, and
     apply the entity-mention boost. Returns the recency-sorted articles.
 
     Shared by /search and /chat so the two pipelines stay consistent. A
     non-empty reranked article set is cached in Redis (same TTL as /search)
-    because it is deterministic for a (query, filter) pair; chat follow-ups
-    re-run the same retrieval on every turn, and this cache makes those turns
-    skip embedding + rerank entirely. Empty sets are never cached (see the
-    guard comment by ``cache.set``). Bodies are not cached (they are large);
-    when ``need_body`` is set they are fetched from Qdrant for the returned set.
+    because it is deterministic for a (query, filter) pair *under a given
+    configuration* — the key carries a digest of every config value that can
+    change the result (see :func:`retrieval_config_fingerprint`), so a redeploy
+    that flips a toggle cannot replay the previous configuration's entries.
+    Chat follow-ups re-run the same retrieval on every turn, and this cache
+    makes those turns skip embedding + rerank entirely. Empty sets are never
+    cached (see the guard comment by ``cache.set``). Bodies are not cached
+    (they are large); when ``need_body`` is set they are fetched from Qdrant
+    for the returned set.
+
+    ``prefetched`` carries the value a caller already read for this exact key
+    (``None`` meaning "already looked up, and it was a miss"). Supplying it
+    saves one Redis round trip; omitting it performs the normal lookup.
     """
     q = fix_query(q)[0]  # typo-corrected query flows to cache key, legs, boost
     # A recency intent ('latest', 'recent') weights freshness heavily in ranking
     # so new articles outrank old evergreen ones; rolling windows ('this week')
     # are already scoped by the date filter and need no extra ranking boost.
     recency_boost = is_recency_intent(q)
-    cache_key = (
-        f"retrieve:{_cache_key_component(q)}:{top_k}:{_filter_token(qfilter)}"
-    )
-    cached = await cache.get(cache_key)
+    cache_key = retrieve_cache_key(q, top_k, qfilter)
+    cached = await cache.get(cache_key) if prefetched is _NO_PREFETCH else prefetched
     if cached is not None:
         articles = [SourceArticle.model_validate(d) for d in cached]
         if need_body and articles:
@@ -1086,6 +1170,7 @@ async def retrieve_with_auto_facet_fallback(
     auto_dealtype: str | None,
     auto_content_type: str | None = None,
     need_body: bool = False,
+    prefetched: object = _NO_PREFETCH,
 ) -> tuple[list[SourceArticle], str | None, str | None, str | None]:
     """Retrieve with the effective (explicit-or-auto) category facets applied,
     and fall back to dropping an *auto* facet when it zeroes out an otherwise
@@ -1113,12 +1198,27 @@ async def retrieve_with_auto_facet_fallback(
     each alone): dropping any one of them is a relaxation of the same semantic
     guess, and the broader set is the safer answer for a query that otherwise
     would have returned nothing.
+
+    ``prefetched`` is the already-read cache value for the *primary* (effective)
+    facet filter, forwarded to :func:`retrieve_and_rerank` so a caller that
+    already had to read that key does not pay for it twice.
     """
+
     eff_industry = industry or auto_industry
     eff_dealtype = dealtype or auto_dealtype
     eff_content_type = content_type or auto_content_type
     qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to, eff_content_type)
-    results = await retrieve_and_rerank(retrieval_q, top_k, qfilter, need_body=need_body)
+    # The prefetch belongs to *this* (effective, pre-relaxation) filter only; the
+    # relaxed retry below keys on a different filter and does its own lookup.
+    if prefetched is _NO_PREFETCH:
+        # No prefetch to forward (chat, and any caller that did not already read
+        # this key): keep the historical call shape, so the retrieval path's
+        # signature stays unchanged for every existing caller.
+        results = await retrieve_and_rerank(retrieval_q, top_k, qfilter, need_body=need_body)
+    else:
+        results = await retrieve_and_rerank(
+            retrieval_q, top_k, qfilter, need_body=need_body, prefetched=prefetched
+        )
     # A single below-gate hit (score under the chat relevance gate) left by a
     # mis-applied auto facet is effectively a dead result set, so relax the auto
     # facet(s) for it too, not only for a fully empty set (#172).
@@ -1292,12 +1392,30 @@ async def search(
     # _retrieval_leg (which chat also uses), so we must NOT expand here too,
     # otherwise /search expands twice and diverges from the chat pipeline.
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
-    cache_key = (
-        f"search:{_cache_key_component(retrieval_q)}:{eff_top_k}:"
-        f"{facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type)}"
+    cache_key = search_cache_key(
+        retrieval_q, eff_top_k,
+        facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type),
     )
     filtered = any((industry, dealtype, author, content_type, from_date, to_date))
-    cached_results = await cache.get(cache_key)
+    # This request needs two cache entries: its own summary page, and the
+    # retrieval result set underneath it (retrieve_with_auto_facet_fallback ->
+    # retrieve_and_rerank reads the retrieve: key for the same query and the
+    # same effective facet filter). Reading them with one MGET costs a single
+    # round trip instead of two sequential ones on a miss, and the retrieval
+    # value is handed down so the inner lookup is not repeated. The two entries
+    # hold different payloads — the inner one is the full reranked article set
+    # (body excluded), the outer one the post-click-boost/diversity summary
+    # slice — so they are read together, not merged into one key.
+    #
+    # The filter and fixed query are derived exactly as the retrieval path
+    # derives them (retrieve_with_auto_facet_fallback applies
+    # build_facet_filter to the same effective facets; retrieve_and_rerank
+    # applies the same fix_query), so the prefetched key is the real one.
+    prefetch_key = retrieve_cache_key(
+        fix_query(retrieval_q)[0], eff_top_k,
+        build_facet_filter(industry, dealtype, author, eff_from, eff_to, content_type),
+    )
+    cached_results, cached_articles = await cache.get_many([cache_key, prefetch_key])
     if cached_results is not None:
         summaries = [SourceSummary.model_validate(d) for d in cached_results]
         note = weak_results_note([s.score for s in summaries], date_label(eff_from, eff_to))
@@ -1317,7 +1435,7 @@ async def search(
         content_type=explicit_content_type,
         eff_from=eff_from, eff_to=eff_to,
         auto_industry=auto_industry, auto_dealtype=auto_dealtype,
-        auto_content_type=auto_content_type,
+        auto_content_type=auto_content_type, prefetched=cached_articles,
     )
     if config.ENABLE_CLICK_BOOST:
         reranked = await apply_click_boost(q_fixed, reranked)
