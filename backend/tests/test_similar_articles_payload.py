@@ -131,6 +131,7 @@ def _stale_personalization(monkeypatch):
     reaches a real Redis and the test's outcome depends on whether one happens
     to be running.
     """
+
     async def fake_interactions(user_id):
         return [(SOURCE_ID, "click")]
 
@@ -213,7 +214,9 @@ class TestSimilarResponseExcludesBody:
         # leave nothing to assert on.
         client.query_points.return_value.points = [_point(OTHER_ID, body=_body())]
         client.query_points.return_value.points[0].payload = {
-            "title": "Bare point", "url": "https://example.com/x", "body": _body(),
+            "title": "Bare point",
+            "url": "https://example.com/x",
+            "body": _body(),
         }
 
         response = _call_similar()
@@ -296,9 +299,7 @@ class TestCacheEntriesExcludeBody:
         assert response.articles, "expected a fresh trending fetch"
         for article in response.articles:
             assert "body" not in article
-            assert article.get("title") != "stale", (
-                "served a trending entry written by the previous shape"
-            )
+            assert article.get("title") != "stale", "served a trending entry written by the previous shape"
 
 
 class TestQdrantRequestIsNarrowed:

@@ -58,7 +58,6 @@ _RECOMMEND_PAYLOAD_FIELDS = [
 ]
 
 
-
 def _candidate_pool(limit: int, *, over: int = 1) -> int:
     """How many candidates a strategy fetches to fill a page of ``limit``.
 
