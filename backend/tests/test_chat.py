@@ -2364,6 +2364,79 @@ def test_run_turn_settles_summed_turn_cost_exactly_once(monkeypatch):
     assert budget.holds == {}  # gate hold + both nudge holds all discharged
 
 
+def test_api_json_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypatch):
+    """The NON-STREAMING half of the rule the streaming path already has (#255).
+
+    `generate_answer` fills token counts from `response.usage`, so a provider
+    that sends no usage yields a TRUTHY LLMResult carrying ZERO tokens and
+    `LLMResult.cost()` is 0.0. _run_turn then settles 0.0 and the turn's hold
+    is dropped: the delivered, billed answer is recorded as FREE, and the cap
+    is silently inert against every such provider on the JSON path.
+
+    A zero is not evidence that nothing was spent, it is evidence that the cost
+    is unknown, so the estimate the gate held is charged instead -- the same
+    figure the streaming path's mid_stream_estimate uses -- and the stored
+    message cost is that same number, so the budget and the reported cost
+    cannot disagree."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_generate(client, prompt, model, system_prompt=None):
+            # Exactly what generate_answer returns when the response carries no
+            # usage: a delivered answer whose cost() is 0.0.
+            return chat_module.LLMResult(content="A fully delivered answer [1].", prompt_tokens=0, completion_tokens=0)
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+        monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+        r = client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "Who invested in fintech?"}
+        )
+
+        # An ordinary, complete turn: no disconnect, no failure.
+        assert r.status_code == 200
+        # Charged, not released, and the stored cost is the figure charged.
+        assert budget.writes == [("settle", 20_000)]
+        assert budget.counter == 20_000
+        assert budget.holds == {}
+        assert r.json()["assistant"]["cost"] == pytest.approx(0.02)
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_run_turn_with_reported_usage_still_uses_the_real_cost(monkeypatch):
+    """The other side of that rule, on the non-streaming path: a provider that
+    DOES report usage must be charged its real cost, not the estimate.
+    Without this the previous test would also pass if every turn were blindly
+    charged the reserve."""
+    budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+    async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
+        # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10, five
+        # times the $0.02 estimate -- the two must not be confused.
+        return chat_module.LLMResult(content="A fully delivered answer [1].", prompt_tokens=100_000, completion_tokens=0)
+
+    monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+    monkeypatch.setattr(chat_module, "_answer_ranked", fake_answer_ranked)
+
+    _answer, _sources, _note, _pt, _ct, cost = _run(chat_module._run_turn("Who invested in fintech?", []))
+
+    assert budget.writes == [("settle", 100_000)]
+    assert budget.counter == 100_000
+    # The reported cost, and the figure handed back to be stored on the message.
+    assert cost == pytest.approx(0.1)
+
+
 def test_api_require_store_uninitialized_503(tmp_path):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:

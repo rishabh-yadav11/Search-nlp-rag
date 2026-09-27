@@ -356,11 +356,19 @@ accounting is #295's audit. Do not read this section as 100%.
       weak fallback answer + note. **ERROR PATH — LLM/Qdrant/Redis down during
       retrieval.**
 - [x] **`_run_turn` cost recording + finalize** (lines 1443-1509): `reserve`
-      before the billed call → `_answer_ranked` → `settle(holds,
-      to_usd(result.cost()))` (the turn's single counter write; `release(holds)`
-      when no call was made) → finalized answer (unrequested dataviz blocks
-      stripped). Two money rules live here and are tested:
-      an EMPTY hold list (cap disabled) settles nothing at all, so an opted-out
+      before the billed call → `_answer_ranked` → `settle(holds, cost_usd)`
+      (the turn's single counter write; `release(holds)` when no call was made)
+      → finalized answer (unrequested dataviz blocks stripped). Three money
+      rules live here and are tested:
+      a zero COMPUTED cost is not evidence that nothing was spent —
+      `generate_answer` returns a truthy zero-token `LLMResult` when the
+      response carries no usage, so a delivered, billed answer would settle as
+      free and leave the cap inert against such a provider — so the figure is
+      floored at `LLM_CALL_RESERVE_USD` (the same estimate the streaming path's
+      `mid_stream_estimate` uses), and that ONE figure is both settled and
+      returned for storage, so the reported cost and the budget cannot
+      disagree; an EMPTY hold list
+      (cap disabled) settles nothing at all, so an opted-out
       deployment never depends on the counter; and a settle that cannot reach
       the store is best-effort, because the answer exists and has been billed,
       while the live hold is charged by the sweep either way. **ERROR PATH —
@@ -406,10 +414,15 @@ Added by this change, all exercised end to end through the HTTP handlers:
       `fail_turn` (lines 1970-1997) applies the same rule. A zero COMPUTED
       cost is not evidence that nothing was spent — `stream_answer` appends a
       truthy zero-token result when a provider sends no usage chunk — so every
-      abandon site routes through `billed_usd` (lines 1841-1857) and the
-      completed path floors at the estimate (lines 2145-2156); otherwise a
-      provider that never reports usage would leave the cap inert and every
-      turn free. A turn that made no billed call at all still releases.
+      abandon site ON THE STREAMING PATH routes through `billed_usd` (lines
+      1841-1857) and the completed streaming path floors at the estimate (lines
+      2145-2156); otherwise a provider that never reports usage would leave the
+      cap inert and every turn free. The non-streaming half of the same rule is
+      `_run_turn`'s cost floor above, which the streaming test pair
+      (`test_completed_turn_with_{no_usage_report,reported_usage}`) is mirrored
+      by at `tests/test_chat.py::test_api_json_turn_with_no_usage_report_is_still_charged`
+      and `::test_run_turn_with_reported_usage_still_uses_the_real_cost`. A turn
+      that made no billed call at all still releases.
 - [x] **a delivered answer survives a failed settle** (lines 1859-1892,
       1481-1502): once deltas are on the wire, or the LLM has already answered,
       an unreachable counter no longer converts a complete answer into a
