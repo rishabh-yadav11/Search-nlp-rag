@@ -18,9 +18,11 @@ from app.redis_cache import HybridCache
 # Config values read by the retrieval/rerank pipeline. Each one changes the
 # cached article set, so each one must be part of the cache key.
 RETRIEVAL_KNOBS = [
+    "QDRANT_URL",
     "QDRANT_COLLECTION",
     "EMBED_MODEL",
     "SPARSE_MODEL",
+    "EMBED_DEVICE",
     "RERANK_BACKEND",
     "RERANK_MODEL",
     "RERANK_CANDIDATES",
@@ -28,6 +30,8 @@ RETRIEVAL_KNOBS = [
     "RECENCY_DECAY_DAYS",
     "ENABLE_QUERY_EXPANSION",
     "ENABLE_ENTITY_BOOST",
+    "REDIS_URL",
+    "ANALYTICS_REDIS_DB",
 ]
 
 # Config values read after retrieval, by /search itself. They change the summary
@@ -50,8 +54,10 @@ SEARCH_KNOBS = [
 IRRELEVANT_KNOBS = [
     "CACHE_TTL_SECONDS",
     "VECTOR_CACHE_TTL_SECONDS",
-    "REDIS_URL",
+    "CACHE_MAX_SIZE",
     "AUTH_DB_PATH",
+    "CHAT_DB_PATH",
+    "CORS_ORIGINS",
     "PUBLIC_SEARCH_RATE_PER_MIN",
 ]
 
@@ -63,14 +69,22 @@ PRE_FIX_ROUND_TRIPS = 6
 
 
 def _flipped(value):
-    """A different value of the same shape as ``value``."""
+    """A different value of the same shape as ``value``.
+
+    Sequences and sets are replaced wholesale rather than mutated, so the
+    fingerprint sees a genuinely different value for the knob's type.
+    """
     if isinstance(value, bool):
         return not value
     if isinstance(value, str):
         return value + "-other"
     if isinstance(value, int):
         return value + 1
-    return value + 0.5
+    if isinstance(value, float):
+        return value + 0.5
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return type(value)([*value, "extra"])
+    return "changed"
 
 
 def _article(id_, score=0.9):

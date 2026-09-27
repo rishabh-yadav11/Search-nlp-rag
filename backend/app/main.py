@@ -987,9 +987,16 @@ def _cache_key_component(value: str) -> str:
 # with the knobs exercised for key changes. Adding a knob to the pipeline means
 # adding it here; missing one is a stale answer for a whole TTL.
 _RETRIEVAL_CONFIG_INPUTS: tuple[tuple[str, str], ...] = (
+    ("qdrant_url", "QDRANT_URL"),
     ("qdrant_collection", "QDRANT_COLLECTION"),
     ("embed_model", "EMBED_MODEL"),
     ("sparse_model", "SPARSE_MODEL"),
+    # A different device yields marginally different dense floats, which can
+    # reorder the RRF fusion. The weakest input here, kept anyway.
+    ("embed_device", "EMBED_DEVICE"),
+    # Kept although only "torch" is implemented today (reranker.py falls back to
+    # it for any other value): if a second backend ever ships it must change the
+    # key, and over-invalidating for one deploy is the cheap direction.
     ("rerank_backend", "RERANK_BACKEND"),
     ("rerank_model", "RERANK_MODEL"),
     ("rerank_candidates", "RERANK_CANDIDATES"),
@@ -1003,6 +1010,10 @@ _RETRIEVAL_CONFIG_INPUTS: tuple[tuple[str, str], ...] = (
     ("click_boost_min_share", "CLICK_BOOST_MIN_SHARE"),
     ("click_boost_mult", "CLICK_BOOST_MULT"),
     ("click_query_max_len", "CLICK_QUERY_MAX_LEN"),
+    # Which click zset click_signals reads, and on which Redis, decides which
+    # recorded clicks a query can be boosted by at all.
+    ("redis_url", "REDIS_URL"),
+    ("analytics_redis_db", "ANALYTICS_REDIS_DB"),
     ("enable_diversity", "ENABLE_DIVERSITY"),
     ("diversity_lambda", "DIVERSITY_LAMBDA"),
     ("diversity_sim_threshold", "DIVERSITY_SIM_THRESHOLD"),
