@@ -397,7 +397,7 @@ Added by this change, all exercised end to end through the HTTP handlers:
       (lines 1903-1924) is the single writer for every partial turn, including
       the mid-stream-failure path.
 - [x] **a billed call is charged, never refunded, on a disconnect** (lines
-      2049-2064, 2091-2100, 2123-2132): a disconnect in the gate-to-first-delta
+      2030, 2091-2100, 2123-2132): a disconnect in the gate-to-first-delta
       window settles the hold at the estimate the gate took it at, and the two
       post-stream checks pass the finished stream's real cost instead of
       storing the turn as free. A mid-stream FAILURE after deltas is charged

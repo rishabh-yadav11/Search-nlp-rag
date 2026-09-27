@@ -2027,6 +2027,9 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             chunks: list[str] = []
             try:
                 async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
+                    # Usage is not reported until the whole response arrives, so
+                    # a disconnect here is charged the estimate it held --
+                    # never released, which would make a billed call free.
                     if await aborted("".join(chunks), turn.sources, cost_usd=billed_usd(usage_holder)):
                         return
                     chunks.append(piece)
