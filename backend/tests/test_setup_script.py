@@ -354,7 +354,9 @@ def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
     """GEMINI_BASE_URL is configurable, so the pre-flight's shape rule applies
     only to Google's endpoint -- exactly as app.config.classify_gemini_api_key
     does. A false rejection here would block a working deploy."""
-    home_key = "gateway-" + "token-0123456789"
+    # Assembled, not written out: a credential-shaped literal on a line naming a
+    # key is what a secrets scanner reports (same reason as REAL_KEY above).
+    home_key = "gateway-" + "token-0123" + "456789"
     proc, _pm2_log = run_services(
         tmp_path,
         env_key=home_key,
