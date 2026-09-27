@@ -312,6 +312,11 @@ export default function Page() {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            // Mirrors the API's SEARCH_QUERY_MAX_CHARS so an over-long paste is
+            // cut off in the browser instead of coming back as a 422 the user
+            // would only see as "Something went wrong". The server bound stays
+            // authoritative — this is a courtesy, not the control.
+            maxLength={512}
             placeholder="e.g. fintech startups that raised Series A"
             aria-label="Search query"
             autoComplete="off"
