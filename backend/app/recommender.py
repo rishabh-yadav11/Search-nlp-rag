@@ -42,17 +42,25 @@ SIMILAR_ARTICLES_TTL_SECONDS = 3600  # 1 hour
 USER_RECOMMENDATIONS_TTL_SECONDS = 1800  # 30 minutes
 
 
-def _candidate_pool(limit: int) -> int:
+def _candidate_pool(limit: int, *, over: int = 1) -> int:
     """How many candidates a strategy fetches to fill a page of ``limit``.
 
     The pool is wider than the page on purpose: the hybrid scorer keeps only the
     best ``limit * 2`` candidates and ``_format_articles`` drops the excluded
     ids and empty payloads, so a pool of exactly ``limit`` would return a short
-    page. ``RECOMMEND_CANDIDATES_LIMIT`` sets that width; a caller asking for
+    page.
+
+    ``over`` is the strategy's own over-fetch factor and
+    ``RECOMMEND_CANDIDATES_LIMIT`` is a floor on top of it, never a
+    replacement. That ordering matters at the cold-start scroll, which is called
+    with ``over=3`` because it returns ``limit * 2`` articles after dropping
+    already-seen ids: capping it at the knob would shrink it below the headroom
+    the largest permitted ``limit`` needs, and lowering the knob would make the
+    scroll fetch less than it did before this knob existed. A request asking for
     more than the pool (the API caps ``limit`` at 20) still gets at least
     ``limit`` candidates.
     """
-    return max(limit, config.RECOMMEND_CANDIDATES_LIMIT)
+    return max(limit * over, config.RECOMMEND_CANDIDATES_LIMIT)
 
 
 async def get_similar_articles(
@@ -130,9 +138,12 @@ async def get_similar_articles(
             query=int(article_id),  # Use point ID as query for nearest neighbors
             using="dense",  # Collection uses a named 'dense' vector
             query_filter=qfilter,
-            # 3x for filters/post-processing, deliberately not _candidate_pool:
-            # nothing selects or scores below, so the over-fetch IS the response
-            # and widening it would change this endpoint's payload size.
+            # 3x, deliberately not _candidate_pool: there is no scoring or
+            # truncation step below, only _format_articles' exclusion of ids
+            # with no payload. The response is therefore the whole fetch minus
+            # those few rows, so the fetch width is the response width and
+            # widening it to the shared pool would change this endpoint's
+            # payload size rather than the quality of a selection.
             limit=limit * 3,
             with_payload=True,
             with_vectors=False,
@@ -466,7 +477,7 @@ async def _get_latest_top_stories(
         # Get recent articles (last 30 days)
         pts, _ = await client.scroll(
             collection_name=config.QDRANT_COLLECTION,
-            limit=_candidate_pool(limit),
+            limit=_candidate_pool(limit, over=3),
             with_payload=True,
             with_vectors=False,
             scroll_filter=qfilter,

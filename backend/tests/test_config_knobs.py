@@ -121,10 +121,13 @@ def test_every_config_knob_is_read_somewhere():
 
 
 def test_inert_allowlist_is_still_accurate():
-    """An allowlist entry must name a real knob and justify itself.
+    """An allowlist entry must name a real, genuinely unread knob, with a reason.
 
-    Without this, deleting a knob would leave its allowlist entry behind and
-    the entry would silently outlive the reason for it.
+    Three ways an entry goes stale, all of them hiding a live knob from the
+    guard: deleting the knob leaves the entry behind, wiring the knob later
+    leaves the entry behind, and an entry with no reason is just the bug again.
+    An entry therefore has to PROVE it is inert, not merely claim to be -- a
+    wired knob parked here would otherwise silence this test forever.
     """
     knobs = _config_knobs()
     missing = sorted(set(INTENTIONALLY_INERT) - set(knobs))
@@ -132,6 +135,13 @@ def test_inert_allowlist_is_still_accurate():
 
     unjustified = sorted(name for name, reason in INTENTIONALLY_INERT.items() if not reason.strip())
     assert not unjustified, f"INTENTIONALLY_INERT entries need a reason: {unjustified}"
+
+    corpus = "\n".join(path.read_text() for path in _source_files())
+    wired = sorted(name for name in INTENTIONALLY_INERT if _is_referenced(name, corpus))
+    assert not wired, (
+        f"these allowlisted knobs are read by runtime code, so they are no longer "
+        f"inert: remove the entry (and, if the reader is a test, wire the knob): {wired}"
+    )
 
 
 def test_scan_actually_sees_knob_references():

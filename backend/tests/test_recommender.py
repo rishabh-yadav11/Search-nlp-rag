@@ -490,9 +490,10 @@ class _ScrollQdrant:
 
     def __init__(self):
         self.now = datetime.now(UTC)
+        self.scrolled = 0
 
     async def scroll(self, **kwargs):
-        width = kwargs["limit"]
+        width = self.scrolled = kwargs["limit"]
         points = [
             _point_at(self.BASE + i, self.now - timedelta(days=width - i))
             for i in range(width)
@@ -592,13 +593,13 @@ class TestCandidatePoolWidth:
         assert len(_of_leg(_ids(wide), _PoolQdrant.CATEGORY_BASE)) == 10
 
     @pytest.mark.asyncio
-    async def test_cold_start_scroll_depth_comes_from_the_knob(self):
-        """The cold-start path is not wired to bare ``limit`` either.
+    async def test_cold_start_knob_deepens_the_scroll_below_the_3x_floor(self):
+        """The cold-start scroll honours the knob, on top of its own 3x.
 
-        ``_get_latest_top_stories`` scrolls, recency-sorts and returns
-        ``limit * 2`` articles, so how many rows the scroll reaches bounds the
-        page: the narrowest reachable scroll is 5 wide at limit=5, and a
-        20-wide scroll fills the whole page with the fresher rows it reaches.
+        The scroll is called with ``over=3`` because the page is ``limit * 2``,
+        and the knob is a floor on that rather than a cap: at limit=5 the floor
+        is 15, so a knob of 3 cannot shrink it, while a knob of 20 deepens the
+        scroll to 20 rows and the page is drawn from fresher rows instead.
         """
         from app import recommender
 
@@ -609,10 +610,36 @@ class TestCandidatePoolWidth:
             ):
                 return await recommender._get_latest_top_stories(5)
 
-        narrow = await _top_stories(3)
-        wide = await _top_stories(20)
+        floor = await _top_stories(3)
+        deepened = await _top_stories(20)
 
-        assert len(narrow) == 5, "a 5-row scroll cannot fill a page of 2 * limit"
-        assert len(wide) == 10
-        # The deeper scroll reaches rows the shallow one never saw.
-        assert max(_ids(wide)) > max(_ids(narrow))
+        assert len(floor) == len(deepened) == 10
+        assert _ids(floor) != _ids(deepened), "a deeper scroll must change which rows the page comes from"
+        # The 15-row floor builds the page out to row 14; a 20-row scroll
+        # reaches ten rows further down.
+        assert max(_ids(floor)) - _ScrollQdrant.BASE == 14
+        assert max(_ids(deepened)) - _ScrollQdrant.BASE == 19
+
+    @pytest.mark.asyncio
+    async def test_cold_start_pool_never_narrows_below_the_page_headroom(self):
+        """A knob below 3x must not shrink the cold-start scroll.
+
+        The API accepts limit up to 20 and this path returns ``limit * 2``
+        articles after dropping already-seen ids, so a scroll capped at the
+        knob (50) instead of floored at it would fetch fewer rows than it did
+        before this knob existed, and a page that comes up short once enough
+        ids are excluded.
+        """
+        from app import recommender
+
+        qdrant = _ScrollQdrant()
+        excluded = [qdrant.BASE + i for i in range(11)]
+        with (
+            patch.object(recommender, "state", {"qdrant": qdrant}),
+            # The shipped default, which is below 3 * 20 = 60.
+            patch.object(recommender.config, "RECOMMEND_CANDIDATES_LIMIT", 50),
+        ):
+            result = await recommender._get_latest_top_stories(20, excluded)
+
+        assert qdrant.scrolled == 60, "the 3x headroom must survive a knob below it"
+        assert len(result) == 40, "a page of 2 * limit must not come up short after exclusions"
