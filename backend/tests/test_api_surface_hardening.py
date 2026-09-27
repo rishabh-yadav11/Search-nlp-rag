@@ -167,6 +167,74 @@ def test_default_route_probe_failure_degrades_instead_of_raising(monkeypatch):
     )
 
 
+def test_default_route_probe_never_raises_at_import(monkeypatch):
+    """No probe failure may escape: this runs while the module is imported.
+
+    The route probe is a best-effort nicety, so *any* failure has to cost one
+    allowed host and nothing more. Two paths are pinned here because neither is
+    an OSError, so a narrow ``except OSError`` misses both and the API refuses
+    to boot over a cosmetic detail:
+
+    * a build without IPv6 has no ``socket.AF_INET6`` at all, and reading the
+      attribute outside the guard raises AttributeError;
+    * an unusable address family raises TypeError from ``socket.socket()``.
+    """
+
+    class NoIPv6:
+        """A socket module without AF_INET6, as on an IPv6-less build.
+
+        Delegates every other attribute to the real socket module, so only the
+        missing constant is simulated and the name probes still work.
+        """
+
+        AF_INET = socket.AF_INET
+        SOCK_DGRAM = socket.SOCK_DGRAM
+
+        def __getattr__(self, name):
+            if name == "AF_INET6":
+                # The one simulated absence. Must raise rather than fall
+                # through, or the fake would hand back the real constant and
+                # the test would pass without exercising anything.
+                raise AttributeError(name)
+            return getattr(socket, name)
+
+        @staticmethod
+        def socket(family, socktype):
+            return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    monkeypatch.setattr(config_module, "socket", NoIPv6())
+    assert _default_route_addresses()  # the IPv4 probe still worked
+    assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    )
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: TypeError("AF_INET unavailable in this build"),
+        lambda: AttributeError("socket module has no attribute 'AF_INET6'"),
+        lambda: RuntimeError("sandboxed socket module"),
+    ],
+    ids=["typeerror", "attributeerror", "runtimeerror"],
+)
+def test_route_probe_survives_non_oserror_failures(monkeypatch, make_exc):
+    """Only the "never raise" contract matters, so the guard is broad."""
+
+    def boom(*args, **kwargs):
+        raise make_exc()
+
+    monkeypatch.setattr(config_module.socket, "socket", boom)
+    assert _default_route_addresses() == ()
+    assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
+        "localhost",
+        "127.0.0.1",
+        "testserver",
+    )
+
+
 def test_machine_hosts_degrade_instead_of_raising(monkeypatch):
     """This runs at import: a name-resolution failure must not take the app down."""
 
