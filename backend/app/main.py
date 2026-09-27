@@ -392,23 +392,6 @@ def to_summary(a: SourceArticle) -> SourceSummary:
     )
 
 
-def _article_to_dict(a: SourceArticle) -> dict:
-    """Convert a SourceArticle to a plain dict for recommendation responses."""
-    return {
-        "id": a.id,
-        "title": a.title,
-        "url": a.url,
-        "published_date": a.published_date,
-        "category": a.category,
-        "summary": a.summary,
-        "author_names": a.author_names,
-        "industry_names": a.industry_names,
-        "dealtype_names": a.dealtype_names,
-        "content_type": a.content_type,
-        "score": a.score,
-    }
-
-
 def _parse_date(s: str) -> datetime | None:
     """'YYYY-MM-DD', 'YYYY-MM-DD HH:MM:SS', or RFC3339 -> aware datetime (UTC)."""
     if not s:
