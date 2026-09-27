@@ -395,14 +395,18 @@ class TestCandidateLegObservability:
 
     @pytest.mark.asyncio
     async def test_total_outage_logs_every_leg_once(self, caplog):
-        """With all three legs down the feed is empty, but each leg is named."""
+        """All three legs down: empty feed, and each leg warns exactly once.
+
+        Once per leg because this user has a single interaction, and the
+        vector handler logs per failing interaction rather than per request.
+        """
         qdrant = _FakeQdrant(fail_vector=True, fail_category=True, fail_trending=True)
         with caplog.at_level(logging.WARNING):
             result = await _personalized(qdrant)
 
         assert result == []
         for leg in (_VECTOR_LEG, _CATEGORY_LEG, _TRENDING_LEG):
-            assert _leg_warnings(caplog, leg, _FakeQdrant.OUTAGE), (leg, caplog.records)
+            assert len(_leg_warnings(caplog, leg, _FakeQdrant.OUTAGE)) == 1, (leg, caplog.records)
 
     @pytest.mark.asyncio
     async def test_vector_leg_keeps_results_from_interactions_that_worked(self, caplog):
