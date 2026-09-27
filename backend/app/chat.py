@@ -55,6 +55,11 @@ router = APIRouter(
 MAX_CONTENT_LEN = 8000
 PREVIEW_LEN = 140
 MAX_TOKEN_SUM = 2**31 - 1
+AUDIT_LOG_MAX_LIMIT = 1000
+# The admin dashboard polls /analytics/chat every 30s, so the audit trail
+# gains a row on every tick. Pruning by age on write keeps it bounded on a
+# long-lived install instead of growing without limit.
+AUDIT_RETENTION_DAYS = 30
 
 # Module-level store; set by main.lifespan (and by tests).
 store: "ChatStore | None" = None
@@ -151,6 +156,19 @@ class ChatStore:
                 aborted INTEGER NOT NULL DEFAULT 0
             )
             """
+        )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at)"
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_user_updated ON sessions(user_id, updated_at DESC)"
@@ -402,8 +420,18 @@ class ChatStore:
         )
 
     async def global_stats(self) -> dict:
-        """Cross-user analytics across the whole chat DB (privacy-safe: no
-        message contents, only counts/aggregates). Never raises."""
+        """Cross-user analytics across the whole chat DB. Never raises.
+
+        This response is NOT content-free: it exposes global totals plus
+        per-session rows (opaque session id, message count, cost or tokens,
+        updated_at) for every user's conversations.
+
+        What keeps it free of user-authored text is that no session title,
+        message body, or any other user-written string is ever selected or
+        returned here — the top-N queries project `sessions.id` only. Every
+        read of this data is written to the admin audit trail by
+        `record_admin_audit` (readable via `admin_audit_log`).
+        """
         try:
             sessions_row = await self._fetchone(
                 "SELECT COUNT(*) AS n FROM sessions"
@@ -421,7 +449,7 @@ class ChatStore:
             )
             top_cost = await self._fetchall(
                 """
-                SELECT s.title, s.updated_at,
+                SELECT s.id AS session_id, s.updated_at,
                        COUNT(m.id) AS messages,
                        COALESCE(SUM(m.cost), 0) AS cost
                 FROM sessions s JOIN messages m ON m.session_id = s.id
@@ -430,7 +458,7 @@ class ChatStore:
             )
             top_messages = await self._fetchall(
                 """
-                SELECT s.title, s.updated_at,
+                SELECT s.id AS session_id, s.updated_at,
                        COUNT(m.id) AS messages,
                        COALESCE(SUM(m.prompt_tokens + m.completion_tokens), 0) AS tokens
                 FROM sessions s JOIN messages m ON m.session_id = s.id
@@ -454,14 +482,47 @@ class ChatStore:
                 ),
                 "total_cost": float(msgs_row["cost"] if msgs_row else 0.0),
                 "avg_latency_ms": round(float(msgs_row["latency"] if msgs_row else 0.0), 1),
-                "top_by_cost": [[r["title"], int(r["messages"]), round(float(r["cost"]), 4), r["updated_at"]] for r in top_cost],
-                "top_by_tokens": [[r["title"], int(r["messages"]), int(r["tokens"]), r["updated_at"]] for r in top_messages],
+                "top_by_cost": [[r["session_id"], int(r["messages"]), round(float(r["cost"]), 4), r["updated_at"]] for r in top_cost],
+                "top_by_tokens": [[r["session_id"], int(r["messages"]), int(r["tokens"]), r["updated_at"]] for r in top_messages],
                 "sessions_today": sum(int(r["n"]) for r in day_rows if r["d"] == today),
                 "daily_sessions": [[r["d"], int(r["n"])] for r in day_rows],
             }
         except Exception:
             logger.exception("chat global_stats failed")
             return {"error": "chat analytics unavailable"}
+
+    async def record_admin_audit(self, actor_id: str, action: str) -> None:
+        """Append one row to the durable admin audit trail, pruning rows older
+        than AUDIT_RETENTION_DAYS in the same transaction.
+
+        Pruning rides along with the write because the read being audited
+        happens on a 30s dashboard poll; an unpruned trail would grow by
+        ~2.9k rows a day for every open dashboard. ``idx_admin_audit_created``
+        keeps the range delete off a full table scan."""
+        db = self._require_db()
+        now = _now()
+        await db.execute(
+            "INSERT INTO admin_audit (actor_id, action, created_at) VALUES (?, ?, ?)",
+            (actor_id, action, now),
+        )
+        await db.execute(
+            "DELETE FROM admin_audit WHERE created_at < ?",
+            (now - AUDIT_RETENTION_DAYS * 86400,),
+        )
+        await db.commit()
+
+    async def admin_audit_log(self, limit: int = 100) -> list[dict]:
+        """Return the most recent admin audit rows, newest first."""
+        capped = max(1, min(int(limit), AUDIT_LOG_MAX_LIMIT))
+        rows = await self._fetchall(
+            "SELECT actor_id, action, created_at FROM admin_audit"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (capped,),
+        )
+        return [
+            {"actor_id": r["actor_id"], "action": r["action"], "created_at": r["created_at"]}
+            for r in rows
+        ]
 
 
 def json_dumps(v) -> str:
