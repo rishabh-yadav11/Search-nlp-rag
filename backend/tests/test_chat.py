@@ -4596,19 +4596,33 @@ def test_session_cap_does_not_touch_the_prompt_history_path(tmp_path, monkeypatc
 
 def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
     """The knobs must be settable per deployment, not hard-coded constants.
+
     The class body reads the environment at import time, so this loads a
     STANDALONE copy of app/config.py under a throwaway module name: a plain
     importlib.reload of `app.config` would rebind `app.config.config` to a new
     object, so every module that already did `from app.config import config`
-    would silently keep the old one for the rest of the session."""
+    would silently keep the old one for the rest of the session.
+
+    Nothing here asserts against the live `app.config.config` singleton:
+    `app/config.py` calls `load_dotenv()` at import, so that object's values
+    come from whatever `backend/.env` a developer or deployment happens to
+    have. Asserting "== 200" on it would mean a deployment that legitimately
+    sets CHAT_SESSION_MESSAGE_LIMIT (the knob this adds) fails the suite. The
+    default is therefore proved from the source in a clean process, with
+    `load_dotenv` neutralised so the real .env cannot be picked up.
+    """
     import importlib.util
+
+    import dotenv
 
     from app import config as config_module
 
-    assert config_module.config.CHAT_SESSION_MESSAGE_LIMIT == 200
-    assert config_module.config.CHAT_MESSAGE_SOURCE_LIMIT == 20
-
     src = pathlib.Path(config_module.__file__)
+    # `app.config` does `from dotenv import load_dotenv` at import, so patching
+    # the attribute before exec_module keeps the real .env out. Patching the
+    # CWD is not enough: load_dotenv() searches upward from the *calling
+    # file*, which is inside the repo.
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
 
     def load(name: str):
         spec = importlib.util.spec_from_file_location(name, src)
@@ -4616,15 +4630,21 @@ def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
         spec.loader.exec_module(mod)
         return mod.config
 
+    monkeypatch.delenv("CHAT_SESSION_MESSAGE_LIMIT", raising=False)
+    monkeypatch.delenv("CHAT_MESSAGE_SOURCE_LIMIT", raising=False)
+
+    defaults = load("config_default_probe")
+    assert defaults.CHAT_SESSION_MESSAGE_LIMIT == 200
+    assert defaults.CHAT_MESSAGE_SOURCE_LIMIT == 20
+
     monkeypatch.setenv("CHAT_SESSION_MESSAGE_LIMIT", "25")
     monkeypatch.setenv("CHAT_MESSAGE_SOURCE_LIMIT", "4")
     overridden = load("config_env_override_probe")
     assert overridden.CHAT_SESSION_MESSAGE_LIMIT == 25
     assert overridden.CHAT_MESSAGE_SOURCE_LIMIT == 4
 
-    # The real module is untouched, and the same source without the env vars
-    # reproduces the documented defaults.
-    monkeypatch.delenv("CHAT_SESSION_MESSAGE_LIMIT")
-    monkeypatch.delenv("CHAT_MESSAGE_SOURCE_LIMIT")
-    assert load("config_default_probe").CHAT_SESSION_MESSAGE_LIMIT == 200
-    assert config_module.config.CHAT_SESSION_MESSAGE_LIMIT == 200
+    # Both knobs are documented where an operator will actually set them
+    # (backend/.env.example, one level up from app/).
+    example = (src.parent.parent / ".env.example").read_text()
+    assert "CHAT_SESSION_MESSAGE_LIMIT=200" in example
+    assert "CHAT_MESSAGE_SOURCE_LIMIT=20" in example
