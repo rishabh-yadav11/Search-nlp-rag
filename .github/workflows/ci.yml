@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Superseded runs are cancelled so a force-push does not leave stale model
+# downloads and npm installs burning runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend (ruff + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # Ruff targets py311 (backend/ruff.toml) and the README documents 3.11.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      # node is not a backend dependency, but tests/test_dataviz_contract.py is the
+      # only coverage of the frontend's dataviz validator (#267): it imports
+      # frontend/app/chat/datavizContract.ts under node to run one shared corpus
+      # through both implementations. That needs node >= 22.6, so the backend job
+      # needs the same "22" pin the frontend and security jobs already use, or the
+      # suite is red on a runner's default node. No npm cache: this job installs
+      # no node packages.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      # The runtime stack is required, not just the dev tools. app/main.py does
+      # `from fastembed import SparseTextEmbedding` at module scope and six test
+      # modules import app.main, so the suite cannot even be collected without
+      # it. (app/encoders.py and app/reranker.py import fastembed and
+      # sentence_transformers lazily inside their constructors, and the tests
+      # for those fake them in sys.modules -- so the collection-time dependency
+      # is specifically app.main's module-scope import.)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check .
+      # tests/test_budget_lua.py runs the real shipped _BUDGET_LUA source
+      # under lua5.1 and is the only thing that catches drift between that
+      # script and the Python model. It skips itself when the interpreter is
+      # absent, so without this step CI would report success while leaving the
+      # spend cap unverified. lua5.1 is in Ubuntu noble universe, which
+      # GitHub-hosted runners enable.
+      - name: Install lua5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.1
+          lua5.1 -v
+      # -rs prints the skip reasons, and the assertion turns a silent skip
+      # into a red build. `set -o pipefail` is load-bearing: without it `tee`
+      # would swallow a pytest failure. Developers running the suite locally
+      # without lua5.1 are unaffected -- this lives in CI only.
+      - name: Pytest (no skipped tests)
+        run: |
+          set -o pipefail
+          python -m pytest -rs | tee /tmp/pytest.log
+          if grep -qE '[0-9]+ skipped' /tmp/pytest.log; then
+            echo "::error::pytest skipped tests in CI. The suite must be fully covered; see the SKIPPED lines above."
+            exit 1
+          fi
+
+  frontend:
+    name: frontend (lint + typecheck + build + vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: ESLint
+        run: npm run lint
+      - name: TypeScript
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+      - name: Vitest
+        run: npm test
+
+  security:
+    name: security (pip-audit + npm audit + gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Full history: gitleaks scans commits, so a shallow clone would miss
+      # secrets that are already deleted from the tip.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      # pip-audit is pinned in requirements-dev.txt so CI resolves the same
+      # version the project documents.
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements-dev.txt
+
+      # Policy: fail the build on ANY advisory that is not on the explicit
+      # ignore list below. The list exists solely because fastapi==0.115.0 caps
+      # starlette below 0.39, and every fixed starlette release (0.40.0 through
+      # 1.3.1) needs a FastAPI upgrade. These are transitive findings, not
+      # direct pins. A new advisory in any other package fails the job
+      # immediately.
+      #
+      # OWNER: the maintainer who bumps `fastapi` in backend/requirements.txt.
+      # TRACKED BY: issue #331. REVIEW BY: 2026-12-27 (90 days from #245).
+      #
+      # The list is version-anchored, not time-anchored: every ID below is a
+      # starlette advisory reachable only through fastapi==0.115.0. Raising
+      # that pin re-fails this gate by construction, so the suppression cannot
+      # silently outlive the reason for it. When #331 lands, delete all seven
+      # entries and this comment together.
+      - name: pip-audit (runtime dependencies)
+        run: |
+          python -m pip_audit -r backend/requirements.txt \
+            --ignore-vuln PYSEC-2026-1943 \
+            --ignore-vuln PYSEC-2026-1941 \
+            --ignore-vuln PYSEC-2026-161 \
+            --ignore-vuln PYSEC-2026-2281 \
+            --ignore-vuln PYSEC-2026-2280 \
+            --ignore-vuln PYSEC-2026-249 \
+            --ignore-vuln PYSEC-2026-248
+      - name: pip-audit (dev dependencies)
+        run: python -m pip_audit -r backend/requirements-dev.txt
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+      # The only current advisory is a moderate vitest/@vitest/mocker
+      # path-traversal issue, which is below --audit-level=high. The gate is
+      # the high boundary, so a new high/critical advisory fails the job.
+      - name: npm audit
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.28.0"
+          GITLEAKS_SHA256: "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
+        run: |
+          curl -sSfLo /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum --check --strict
+          tar xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+      # gitleaks exits non-zero when it finds a leak, so this step fails the job.
+      # The scan is pinned to HEAD instead of gitleaks' default `--all`: a
+      # fetch-depth-0 checkout has every branch in the object store, and
+      # `--all` would report secrets committed on unrelated branches, turning
+      # this job red for code the PR never touched. HEAD's history is complete
+      # for this purpose -- a pull_request checkout is the merge commit, so it
+      # contains both the PR branch and every commit it branched off from.
+      - name: Secret scan
+        run: gitleaks detect --source . --redact --no-banner --log-opts="-p -U0 --full-history HEAD"
