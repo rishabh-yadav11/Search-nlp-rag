@@ -11,8 +11,11 @@ Roles:
 - ``admin`` — everything (chat, analytics, user management)
 - ``user``  — chat only (the public-signup default)
 
-Machine clients (eval scripts) may bypass via the AUTH_SERVICE_TOKEN header,
-which acts as an admin user. All inputs are validated server-side.
+Machine clients (eval scripts) may authenticate with the AUTH_SERVICE_TOKEN
+header, which is a SCOPED, EXPIRING credential rather than an unconditional
+admin bypass: it carries an explicit permission set, stops working after
+AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS, and can be revoked or rotated. All inputs
+are validated server-side.
 """
 
 import asyncio
@@ -23,6 +26,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -150,6 +154,31 @@ class StoredUser:
     created_at: float
 
 
+@dataclass
+class StoredServiceToken:
+    """A machine credential (X-Service-Token) as stored.
+
+    ``scope`` is the explicit set of permissions the token may exercise --
+    it is NOT the full admin permission set, and it is enforced per route by
+    ``require_permission``. ``expires_at`` bounds the credential's life, so a
+    leaked service token stops working on its own instead of forever.
+    """
+
+    token_hash: str
+    scope: frozenset[str]
+    created_at: float
+    expires_at: float
+
+
+class ServiceTokenOut(BaseModel):
+    """Response of a service-token mint. The plaintext value is returned
+    exactly once, at mint time; only its SHA-256 is ever stored."""
+
+    token: str
+    scope: list[str]
+    expires_at: float
+
+
 def validate_email(email: str) -> str:
     """Normalize + validate an email address, raising 422 on any violation."""
     email = (email or "").strip().lower()
@@ -268,6 +297,17 @@ class AuthStore:
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)"
+        )
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_service_tokens (
+                token_hash TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                revoked_at REAL
+            )
+            """
         )
         await self._db.commit()
 
@@ -402,6 +442,10 @@ class AuthStore:
         return int(row["n"]) if row else 0
 
     async def issue_token(self, user_id: str, ttl_days: int) -> str:
+        """Mint a bearer token and return it in plaintext (only its SHA-256 is
+        stored). Enforces the per-user active-token cap, so a caller cannot
+        grow the table by logging in repeatedly -- see ``_enforce_token_cap``.
+        """
         raw = secrets.token_urlsafe(32)
         created = _now()
         expires = created + ttl_days * 86400
@@ -414,7 +458,125 @@ class AuthStore:
         except Exception:
             await self._db.rollback()
             raise
+        await self._enforce_token_cap(user_id)
         return raw
+
+    async def _enforce_token_cap(self, user_id: str) -> int:
+        """Keep at most ``config.AUTH_MAX_ACTIVE_TOKENS_PER_USER`` unexpired
+        tokens per user, revoking the oldest surplus. Returns how many were
+        revoked.
+
+        The surplus rows are DELETED, not just hidden: ``user_for_token``
+        resolves a token by looking its hash up in this very table, so a
+        deleted row means the credential no longer authenticates (401) the
+        moment it is evicted. Leaving the row in place and merely not listing
+        it would keep a live credential alive, which is the opposite of what a
+        cap is for.
+
+        Only unexpired rows count toward the cap and are candidates for
+        eviction, so already-dead rows (the purge loop's job) neither occupy a
+        slot nor get churned by this.
+        """
+        cap = int(getattr(config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 0))
+        if cap <= 0:
+            return 0
+        now = _now()
+        # rowid breaks ties between rows minted in the same clock tick so the
+        # eviction order is deterministic rather than storage-dependent.
+        rows = await self._fetchall(
+            "SELECT token_hash FROM auth_tokens"
+            " WHERE user_id = ? AND expires_at >= ?"
+            " ORDER BY created_at ASC, rowid ASC",
+            (user_id, now),
+        )
+        surplus = len(rows) - cap
+        if surplus <= 0:
+            return 0
+        victims = [r["token_hash"] for r in rows[:surplus]]
+        for token_hash in victims:
+            await self._db.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,))
+        await self._db.commit()
+        logger.info("auth: revoked %d token(s) over the per-user active-token cap", len(victims))
+        return len(victims)
+
+    async def active_token_count(self, user_id: str) -> int:
+        """Number of the user's unexpired tokens. Exposed for the admin surface
+        and for tests; not used to make an access decision."""
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM auth_tokens WHERE user_id = ? AND expires_at >= ?",
+            (user_id, _now()),
+        )
+        return int(row["n"]) if row else 0
+
+    # --- service tokens (machine credentials, X-Service-Token) ---
+
+    async def issue_service_token(self, scope: set[str], ttl_seconds: float) -> tuple[str, StoredServiceToken]:
+        """Mint a scoped, expiring machine credential. Returns the plaintext
+        alongside its stored record; only the hash is persisted, so the caller
+        gets exactly one chance to keep it."""
+        raw = secrets.token_urlsafe(32)
+        created = _now()
+        record = StoredServiceToken(
+            token_hash=hash_token(raw),
+            scope=frozenset(scope),
+            created_at=created,
+            expires_at=created + ttl_seconds,
+        )
+        await self._db.execute(
+            "INSERT INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
+            " VALUES (?, ?, ?, ?, NULL)",
+            (record.token_hash, ",".join(sorted(record.scope)), record.created_at, record.expires_at),
+        )
+        await self._db.commit()
+        return raw, record
+
+    async def ensure_bootstrap_service_token(self, raw: str, scope: set[str], ttl_seconds: float) -> None:
+        """Seed the record for the env-configured ``AUTH_SERVICE_TOKEN``.
+
+        INSERT OR IGNORE, and deliberately so: re-running this on every worker
+        restart must NOT push the expiry out, or the credential would be
+        eternal in practice and the expiry would be theatre. Rotating means
+        revoking the row (or changing the env value, which hashes differently
+        and seeds a new row) so the next call seeds a fresh lifetime.
+        """
+        await self._db.execute(
+            "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
+            " VALUES (?, ?, ?, ?, NULL)",
+            (hash_token(raw), ",".join(sorted(scope)), _now(), _now() + ttl_seconds),
+        )
+        await self._db.commit()
+
+    async def service_token_for(self, raw: str) -> StoredServiceToken | None:
+        """Resolve a machine credential, or None when it is unknown, revoked or
+        expired. A revoked or expired token is a hard no: there is no
+        'but the env still says so' path back in."""
+        row = await self._fetchone(
+            "SELECT token_hash, scope, created_at, expires_at FROM auth_service_tokens"
+            " WHERE token_hash = ? AND revoked_at IS NULL",
+            (hash_token(raw),),
+        )
+        if row is None or float(row["expires_at"]) < _now():
+            return None
+        return StoredServiceToken(
+            token_hash=row["token_hash"],
+            scope=frozenset(p for p in (row["scope"] or "").split(",") if p),
+            created_at=float(row["created_at"]),
+            expires_at=float(row["expires_at"]),
+        )
+
+    async def revoke_service_token(self, raw: str) -> None:
+        await self._db.execute(
+            "UPDATE auth_service_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+            (_now(), hash_token(raw)),
+        )
+        await self._db.commit()
+
+    async def revoke_all_service_tokens(self) -> int:
+        cur = await self._db.execute(
+            "UPDATE auth_service_tokens SET revoked_at = ? WHERE revoked_at IS NULL", (_now(),)
+        )
+        await self._db.commit()
+        return cur.rowcount
 
     async def user_for_token(self, raw_token: str) -> StoredUser | None:
         """Resolve a raw bearer token to an active user, or None when the token
@@ -550,9 +712,8 @@ async def _check_rate_limit(
     """Enforce a per-IP rate limit with Redis INCR+EXPIRE.
 
     ``fail_closed`` selects what happens when the limiter's Redis is
-    unreachable. The auth endpoints keep the historical fail-OPEN behaviour
-    (the default): login and signup availability must not depend on the limiter
-    being up, and a caller merely gets an unrated attempt. The public search
+    unreachable. The auth endpoints keep the default (False) and fall back to
+    a bounded in-process limiter -- see ``_consume_counter``; the public search
     surface passes ``fail_closed=True`` and is answered 503 instead, because an
     unrated request against ``/search`` or ``/analytics/click`` is precisely
     the full-corpus scraping and analytics-poisoning vector these limits exist
@@ -565,6 +726,77 @@ async def _check_rate_limit(
         return
     window = config.AUTH_RATE_WINDOW_SECONDS if window_seconds is None else window_seconds
     key = f"{key_prefix}:{action}:{_client_ip(request)}"
+    await _consume_counter(key, limit_per_min, window, action=action, fail_closed=fail_closed)
+
+
+async def _check_account_rate_limit(
+    request: Request,
+    action: str,
+    limit_per_min: int,
+    account: str,
+) -> None:
+    """Enforce a rate limit keyed on the submitted account rather than the
+    source address, so rotating IPs cannot buy an attacker a fresh bucket.
+
+    The key is the address folded to lower case and stripped, so one account
+    cannot be handed a second bucket by changing case or padding -- the
+    invariant is enforced here rather than left to the caller. Nothing about
+    whether that address has an account here feeds into the decision: the
+    counter is incremented and compared for a registered and an unregistered
+    address alike, and no lookup is performed to compute it, so the counter's
+    state, the 429 it yields and the work done to reach that answer are
+    identical either way. A per-account limit that consulted the users table
+    would reintroduce exactly the account-existence oracle that the dummy-hash
+    login path exists to close.
+    """
+    key_account = (account or "").strip().lower()
+    if limit_per_min <= 0 or not key_account:
+        return
+    await _consume_counter(
+        f"auth:rl:acct:{action}:{key_account}",
+        limit_per_min,
+        config.AUTH_RATE_WINDOW_SECONDS,
+        action=action,
+        fail_closed=False,
+    )
+
+
+async def _consume_counter(
+    key: str,
+    limit: int,
+    window: int,
+    *,
+    action: str,
+    fail_closed: bool,
+) -> None:
+    """Count one hit against ``key`` and reject past ``limit``.
+
+    Redis is the shared counter, so the limit is global across every worker
+    process. When it is unreachable the choice is between three behaviours and
+    the two obvious ones are both wrong on their own:
+
+    * admit the request (the historical behaviour here) makes a Redis outage
+      -- which an attacker can often induce, and which lasts exactly as long
+      as they want -- into an unlimited credential-stuffing window on the
+      login and signup endpoints. That is the hole this function exists to
+      close.
+    * reject every request turns the same outage into a total login outage.
+      Credential stuffing is an attacker's problem; a Redis blip locking every
+      legitimate user out of their own account is the defender's, and it hands
+      a denial-of-service to whoever can disturb Redis without helping anyone
+      guess a password.
+
+    So the fallback is a third option: a bounded in-process limiter with the
+    SAME limit. The degraded posture is "single-process limiting" rather than
+    "no limiting" or "no service". It stays bounded under an unbounded key
+    flood (see ``_local_rate_hit``), and it is not a hidden fail-open: past the
+    limit the caller still gets 429, exactly as it would from Redis.
+
+    The per-worker weakening is inherent to an in-process fallback and is
+    accepted deliberately: a gunicorn deployment multiplies the effective limit
+    by its worker count during a Redis outage, which is still a finite bound
+    rather than none.
+    """
     try:
         rc = _rate_redis()
         # Establish the sliding window atomically on the first hit: SET NX EX sets
@@ -574,24 +806,71 @@ async def _check_rate_limit(
         # INCR + separate EXPIRE). Subsequent hits just increment.
         await rc.set(key, 0, nx=True, ex=window)
         n = await rc.incr(key)
-        if n > limit_per_min:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many attempts. Please try again shortly.",
-                headers={"Retry-After": str(window)},
-            )
     except HTTPException:
         raise
     except Exception:
-        if not fail_closed:
-            logger.warning("auth rate limiter unavailable for %s", action, exc_info=True)
-            return
-        logger.exception("rate limiter unavailable for %s; failing closed", action)
+        if fail_closed:
+            logger.exception("rate limiter unavailable for %s; failing closed", action)
+            raise HTTPException(
+                status_code=503,
+                detail="Rate limiter unavailable",
+                headers={"Retry-After": str(window)},
+            ) from None
+        logger.warning("rate limiter unavailable for %s; using the in-process fallback limiter", action, exc_info=True)
+        n = _local_rate_hit(key, window)
+    if n > limit:
         raise HTTPException(
-            status_code=503,
-            detail="Rate limiter unavailable",
+            status_code=429,
+            detail="Too many attempts. Please try again shortly.",
             headers={"Retry-After": str(window)},
-        ) from None
+        )
+
+
+# --- in-process fallback limiter ---
+
+# Guarded by a plain lock rather than asyncio primitives: the critical section
+# is a dict lookup and two integer comparisons, it must also be safe against
+# the shutdown-time calls that may arrive off-loop, and it never awaits.
+_local_rate_lock = threading.Lock()
+# key -> (count, window_expiry)
+_local_rate_counters: dict[str, tuple[int, float]] = {}
+
+# Hard bound on the fallback's memory. An attacker who can make us fail over to
+# the fallback can also mint unlimited distinct keys (one per source address,
+# one per submitted address), so an unbounded dict would be a memory-exhaustion
+# DoS in place of the rate-limit DoS it replaced. Past the cap the oldest
+# entries are dropped, which is a deliberate trade: those buckets forget
+# themselves, but the process stays inside its memory budget.
+_LOCAL_RATE_MAX_KEYS = 20_000
+
+
+def _local_rate_hit(key: str, window: int) -> int:
+    """Count one hit against ``key`` in memory and return the running count.
+
+    Fixed window, matching the Redis path: the first hit opens a window of
+    ``window`` seconds and the count resets when it closes.
+    """
+    now = time.monotonic()
+    with _local_rate_lock:
+        count, expiry = _local_rate_counters.get(key, (0, now + window))
+        if now >= expiry:
+            count, expiry = 0, now + window
+        count += 1
+        _local_rate_counters[key] = (count, expiry)
+        if len(_local_rate_counters) > _LOCAL_RATE_MAX_KEYS:
+            # Insertion-ordered dict: the head is the oldest key opened. Drop
+            # from the head until back under the cap.
+            for stale in list(_local_rate_counters)[: len(_local_rate_counters) - _LOCAL_RATE_MAX_KEYS]:
+                del _local_rate_counters[stale]
+        return count
+
+
+def reset_local_rate_limits() -> None:
+    """Forget every in-process counter. Used by tests, which share one process
+    (and therefore one fallback limiter) across every case; nothing in the
+    service calls it."""
+    with _local_rate_lock:
+        _local_rate_counters.clear()
 
 
 def public_rate_limit(
@@ -653,15 +932,73 @@ def _service_user() -> StoredUser:
     )
 
 
+def _service_token_ttl_seconds() -> float:
+    """Lifetime of a freshly minted service token. A non-positive configured
+    value falls back to the shipped default instead of meaning 'never
+    expires' -- an immortal machine admin credential is the hole, so there is
+    deliberately no way to configure one back into existence."""
+    configured = int(getattr(config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 0) or 0)
+    return float(configured if configured > 0 else 86400)
+
+
+def _service_token_scope() -> frozenset[str]:
+    """Permissions a service token gets, from ``config.AUTH_SERVICE_TOKEN_SCOPE``.
+
+    Unknown permission names are dropped with a warning rather than passed
+    through: a typo in the operator's .env then yields a token that can do
+    less than intended and is logged, instead of a token whose scope silently
+    does not match what anyone reading the .env believes.
+    """
+    known = {p for role in ROLE_PERMISSIONS.values() for p in role}
+    requested = tuple(getattr(config, "AUTH_SERVICE_TOKEN_SCOPE", ()) or ())
+    scope = {p for p in requested if p in known}
+    if len(scope) != len(set(requested)):
+        logger.warning("AUTH_SERVICE_TOKEN_SCOPE names unknown permissions; ignoring them")
+    return frozenset(scope)
+
+
+async def _resolve_service_token(raw: str) -> StoredServiceToken | None:
+    """Resolve a machine credential, seeding the env-configured one on first
+    use. Returns None when the credential is unknown, revoked or expired.
+
+    Every service token -- the one in the environment and any minted through
+    the admin surface -- is resolved from the table by its hash. The
+    environment value is only the SEED: it creates the record once, and from
+    then on the stored row is the sole authority on the token's life, so
+    revoking or expiring it actually takes effect.
+    """
+    s = _require_auth_store()
+    record = await s.service_token_for(raw)
+    if record is not None:
+        return record
+    if config.AUTH_SERVICE_TOKEN and secrets.compare_digest(raw, config.AUTH_SERVICE_TOKEN):
+        await s.ensure_bootstrap_service_token(raw, set(_service_token_scope()), _service_token_ttl_seconds())
+        return await s.service_token_for(raw)
+    return None
+
+
 async def require_auth(request: Request) -> None:
     """Validate the request's credentials and stash the user on request.state.
     Accepts ``Authorization: Bearer <token>`` (user tokens) or
-    ``X-Service-Token`` (machine bypass, acts as admin)."""
+    ``X-Service-Token`` (a scoped, expiring machine credential).
+
+    A service token that is revoked or past its expiry is NOT honoured: it
+    falls through to the bearer path and ends as a 401, rather than being
+    granted admin because the environment still mentions it.
+    """
     service = request.headers.get("x-service-token")
-    if service and config.AUTH_SERVICE_TOKEN and secrets.compare_digest(service, config.AUTH_SERVICE_TOKEN):
-        request.state.user = _service_user()
-        request.state.user_id = SERVICE_USER_ID
-        return
+    if service:
+        record = await _resolve_service_token(service)
+        if record is not None:
+            request.state.user = _service_user()
+            request.state.user_id = SERVICE_USER_ID
+            # The scope narrows this below the role's full permission set; a
+            # token minted with an empty scope can authenticate but reach
+            # nothing.
+            request.state.scope = record.scope
+            request.state.service_token = service
+            return
+        logger.warning("auth: a service token was presented but is unknown, revoked or expired")
     token = _token_from_request(request)
     if token is None:
         raise HTTPException(status_code=401, detail="authentication required")
@@ -673,7 +1010,13 @@ async def require_auth(request: Request) -> None:
 
 
 def require_permission(permission: str):
-    """Dependency factory: require ``permission`` (see ROLE_PERMISSIONS)."""
+    """Dependency factory: require ``permission`` (see ROLE_PERMISSIONS).
+
+    A service-token request is additionally checked against that token's own
+    scope: its role is admin so it can reach admin routes at all, but the scope
+    is what decides which of them. Human users carry no scope and are decided
+    by their role alone, as before.
+    """
 
     async def checker(request: Request) -> None:
         user = getattr(request.state, "user", None)
@@ -681,6 +1024,9 @@ def require_permission(permission: str):
             raise HTTPException(status_code=401, detail="authentication required")
         if permission not in ROLE_PERMISSIONS.get(user.role, ()):
             raise HTTPException(status_code=403, detail="forbidden")
+        scope = getattr(request.state, "scope", None)
+        if scope is not None and permission not in scope:
+            raise HTTPException(status_code=403, detail="service token is not scoped for this permission")
 
     return checker
 
@@ -737,9 +1083,18 @@ async def login(body: LoginIn, request: Request):
     verifies the supplied password against a fixed dummy hash at the same
     cost factor instead of skipping the check. A deactivated account is
     verified the same way, so it is not distinguishable either.
+    The per-account rate limit below is held to the same rule: it is keyed on the
+    submitted address alone, so a registered and an unregistered address reach
+    the same counter, the same 429 and the same amount of work.
     """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
+    # Second, IP-independent bucket. Placed after normalisation (so
+    # "A@B.co" and "a@b.co" share one bucket) and before any account lookup,
+    # which is what keeps it from being an existence oracle.
+    await _check_account_rate_limit(
+        request, "login", config.AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN, email
+    )
     s = _require_auth_store()
     user = await s.get_user_by_email(email)
     # Always pay the bcrypt cost, even with no account to compare against:
@@ -763,7 +1118,16 @@ async def me(request: Request, _: None = Depends(require_auth)):
 
 @router.post("/logout")
 async def logout(request: Request, _: None = Depends(require_auth)):
-    """Revoke the current token (server-side)."""
+    """Revoke the credential this request authenticated with.
+
+    For a service token that revocation is real: the token is marked revoked,
+    so it stops working immediately. It used to be a no-op here -- logout only
+    ever looked at a bearer token, so a machine credential answered ``ok`` and
+    then went on working for as long as the process did."""
+    service = getattr(request.state, "service_token", None)
+    if service is not None:
+        await _require_auth_store().revoke_service_token(service)
+        return {"ok": True}
     token = _token_from_request(request)
     if token is not None:
         await _require_auth_store().revoke_token(token)
@@ -866,6 +1230,41 @@ async def revoke_user_tokens(
     """Revoke every token a user holds (forces re-login)."""
     await _require_auth_store().revoke_all_tokens(user_id)
     return {"ok": True}
+
+
+@router.post("/service-tokens", response_model=ServiceTokenOut)
+async def mint_service_token(
+    request: Request,
+    _auth: None = Depends(require_auth),
+    _perm: None = Depends(require_permission("users:manage")),
+):
+    """Mint a scoped, expiring machine credential (rotation).
+
+    The plaintext value is in the response and nowhere else -- only its
+    SHA-256 is stored -- so this is the only chance to record it. It is scoped
+    to ``config.AUTH_SERVICE_TOKEN_SCOPE`` and expires after
+    ``AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS``; neither can be widened per request.
+
+    Requires ``users:manage``, which a service token scoped to the shipped
+    default (``chat:use``) does not hold, so a leaked machine credential cannot
+    mint itself a successor.
+    """
+    raw, record = await _require_auth_store().issue_service_token(
+        set(_service_token_scope()), _service_token_ttl_seconds()
+    )
+    return ServiceTokenOut(token=raw, scope=sorted(record.scope), expires_at=record.expires_at)
+
+
+@router.post("/service-tokens/revoke")
+async def revoke_service_tokens(
+    request: Request,
+    _auth: None = Depends(require_auth),
+    _perm: None = Depends(require_permission("users:manage")),
+):
+    """Revoke every live service token, the other half of rotation. Returns the
+    number revoked."""
+    n = await _require_auth_store().revoke_all_service_tokens()
+    return {"revoked": n}
 
 
 async def bootstrap_admin() -> None:
