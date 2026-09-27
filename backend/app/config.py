@@ -225,8 +225,6 @@ class Config:
     # revoked individually.
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
     AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "7"))
-    # Default role granted to new accounts (public signups land in 'user').
-    AUTH_DEFAULT_ROLE = os.getenv("AUTH_DEFAULT_ROLE", "user")
     # Optional machine-to-machine bypass: any request carrying this exact value
     # in X-Service-Token acts as an admin user. Leave empty to disable. Used by
     # the internal eval scripts; never expose it to browsers.

@@ -43,6 +43,10 @@ store: "AuthStore | None" = None
 
 VALID_ROLES = ("admin", "user")
 
+# The only role public self-service signup can ever grant. Not configurable:
+# see the signup docstring.
+SIGNUP_ROLE = "user"
+
 # Role -> permissions. Single source of truth for access control; add a
 # resource-scoped permission here and assert it on the route that needs it.
 ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
@@ -551,7 +555,13 @@ def require_permission(permission: str):
 @router.post("/signup", response_model=AuthOut)
 async def signup(body: SignupIn, request: Request):
     """Create an account (public). Returns a bearer token. Validated server-side:
-    email format + uniqueness, password strength, name limits."""
+    email format + uniqueness, password strength, name limits.
+
+    The role is hardcoded to 'user': public signups always land with the least
+    privilege. There is deliberately no configuration knob here — a role that
+    can be flipped by an env var (or a request field) turns a config mistake
+    into a full account compromise. Privilege is granted only by an
+    authenticated admin via PATCH /api/auth/users/{id}."""
     await _check_rate_limit(request, "signup", config.AUTH_SIGNUP_RATE_PER_MIN)
     email = validate_email(body.email)
     password = validate_password(body.password)
@@ -560,7 +570,7 @@ async def signup(body: SignupIn, request: Request):
     if await s.get_user_by_email(email) is not None:
         raise HTTPException(status_code=409, detail="an account with this email already exists")
     try:
-        user = await s.create_user(email, password, name, role=config.AUTH_DEFAULT_ROLE)
+        user = await s.create_user(email, password, name, role=SIGNUP_ROLE)
     except DuplicateEmailError:
         # lost the concurrent-creation race; report it as a plain duplicate
         raise HTTPException(status_code=409, detail="an account with this email already exists") from None
