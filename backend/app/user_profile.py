@@ -291,20 +291,3 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to get trending articles: %s", exc)
         return []
-
-
-async def get_interaction_history(user_id: str) -> list[dict]:
-    """Get user's interaction history for profile building.
-
-    Returns list of interaction records with article metadata.
-    """
-    interactions = await get_user_interactions(user_id)
-    if not interactions:
-        return []
-
-    # Build a lookup of article metadata from Redis or Qdrant
-    # For now, return basic interaction data; metadata can be enriched later
-    return [
-        {"article_id": aid, "timestamp": ts, "recency": (datetime.now(UTC).timestamp() - ts)}
-        for aid, ts in interactions
-    ]
