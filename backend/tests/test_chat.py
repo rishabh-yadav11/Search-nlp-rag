@@ -4443,6 +4443,29 @@ def test_session_read_returns_only_the_most_recent_messages(tmp_path, monkeypatc
         _run(store.close())
 
 
+def test_session_read_is_deterministic_when_timestamps_tie(tmp_path, monkeypatch):
+    """`ORDER BY created_at DESC` alone leaves the tail of a thread undefined
+    when rows share a timestamp — which happens whenever the clock resolution
+    is coarser than the write rate, or a backfill stamps whole seconds. The
+    `id` tiebreak is what makes the selection stable, so it is asserted here
+    rather than left resting on timestamps that never actually tie."""
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 5)
+    store = _store(tmp_path)
+    try:
+        sid = _run(store.create_session(USER_A)).id
+        _seed_messages(store, sid, 30)
+        _run(store._db.execute("UPDATE messages SET created_at = 1000.0 WHERE session_id = ?", (sid,)))
+        _run(store._db.commit())
+
+        msgs, total = _run(store.messages_page(sid, USER_A))
+
+        assert total == 30
+        assert [m.content for m in msgs] == [f"msg-{i:04d}-c" for i in range(25, 30)]
+        assert [m.id for m in msgs] == sorted(m.id for m in msgs)
+    finally:
+        _run(store.close())
+
+
 def test_session_read_under_the_cap_is_returned_completely_and_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 50)
     store = _store(tmp_path)
@@ -4571,7 +4594,7 @@ def test_session_cap_does_not_touch_the_prompt_history_path(tmp_path, monkeypatc
         _run(store.close())
 
 
-def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch, tmp_path):
+def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
     """The knobs must be settable per deployment, not hard-coded constants.
     The class body reads the environment at import time, so this loads a
     STANDALONE copy of app/config.py under a throwaway module name: a plain

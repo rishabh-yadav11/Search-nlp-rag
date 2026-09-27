@@ -530,6 +530,10 @@ export default function ChatPage() {
           if (activeIdRef.current === sessionId) {
             setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
             if (note) setNote(note)
+            // Each committed turn adds two messages to the stored thread, and
+            // the loaded window is a fixed-size tail, so the number of hidden
+            // messages grows by the same amount (#258).
+            setHistoryTruncated((h) => (h ? { hidden: h.hidden + 2 } : h))
           }
           setStreamingContent('')
           await loadSessions()
