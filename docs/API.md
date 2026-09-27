@@ -16,7 +16,8 @@ is role-based: `user` (the only role public signup can grant — it is not
 configurable) may use chat; `admin` also has
 analytics read + user management. `/search`, `/facets`, `/analytics/click` and
 the auth endpoints are public. Signup/login are rate-limited per IP and, for
-login, per submitted address (Redis); all inputs are validated server-side.
+login, per submitted address counting failed attempts only (a correct password
+is never rate-limited); all inputs are validated server-side.
 Internal machine clients may authenticate with `X-Service-Token` (config
 `AUTH_SERVICE_TOKEN`) — a scoped, expiring credential, not an open admin grant.
 
@@ -524,9 +525,12 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
   user management; `/search`, `/facets`, `/analytics/click` and the auth
   endpoints are public. Signup/login are rate-limited per IP via Redis and login
   additionally per submitted address, counting failed logins only so the
-  per-address limit cannot be used to lock a known account out; when Redis is
-  unreachable these limits fall back to a bounded in-process limiter rather
-  than switching off. A user
+  per-address limit cannot be used to lock a known account out. The
+  per-address limit caps the *rate* of attempts on one account, not an
+  attacker's cost — it is checked after the password verify, so being refused
+  is free; the per-IP limit is what bounds cost. When Redis is unreachable
+  these limits fall back to a bounded in-process limiter rather than switching
+  off. A user
   holds at most `AUTH_MAX_ACTIVE_TOKENS_PER_USER` active tokens; logging in
   past that revokes the oldest. `AUTH_SERVICE_TOKEN` lets internal scripts
   authenticate as a scoped, expiring machine user.

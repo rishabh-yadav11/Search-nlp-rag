@@ -279,6 +279,16 @@ class Config:
     # hashed (SHA-256) in storage, expire after AUTH_TOKEN_TTL_DAYS, and can be
     # revoked individually.
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
+    # Redis DB holding the auth rate-limit counters. Pinned explicitly, like
+    # ANALYTICS_REDIS_DB and USER_PROFILE_REDIS_DB, rather than inherited from
+    # any db segment in REDIS_URL. The inherited value was DB 0, which this
+    # repo documents as the query cache and flushes during deploys -- so the
+    # limiter's counters were living in the database a deploy empties, and a
+    # flush silently reset every bucket. These counters are a security
+    # control, so they get their own database: cache 0, analytics 1, profiles
+    # 2, rate limiting 3. The `db` kwarg on from_url overrides whatever the URL
+    # carries, so this is correct regardless of the URL's db segment.
+    AUTH_RATE_LIMIT_REDIS_DB = int(os.getenv("AUTH_RATE_LIMIT_REDIS_DB", "3"))
     AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "7"))
     # Optional machine-to-machine credential: the value carried in an
     # X-Service-Token header. Leave empty to disable. Never expose it to
@@ -323,21 +333,28 @@ class Config:
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
     # Per-ACCOUNT (submitted address) limit on login, counted in addition to
-    # the per-IP one above. Per-IP alone cannot bound credential stuffing from
-    # a botnet: every request arrives from a fresh address with a fresh bucket.
-    # The counter is keyed on the normalised submitted address alone -- no
-    # account lookup feeds it -- so its state, its 429 and its cost are the
-    # same whether or not the address has an account here, which is what keeps
-    # it from becoming an account-existence oracle (see the login docstring).
+    # the per-IP one above. Per-IP alone cannot see a botnet hammering ONE
+    # account: every request arrives from a fresh address with a fresh bucket.
+    # The counter is keyed on the normalised submitted address alone, so its
+    # state and its 429 are the same whether or not the address has an account
+    # here, which keeps it from being an account-existence oracle.
     #
     # It counts FAILED attempts only, and is applied after the credential
-    # check. That is deliberate: counting every attempt, and gating on the
-    # counter before the check, turned the throttle into an account-lockout
-    # weapon -- an anonymous caller could deny a known address access
-    # indefinitely by sending the limit's worth of wrong passwords from
-    # rotating source addresses, never guessing anything. A correct password
-    # is never counted and never rate-limited. Credential stuffing is still
-    # bounded, because stuffing is wrong passwords. 0 disables.
+    # check. That is deliberate: counting every attempt, and gating before the
+    # check, turned the throttle into an account-lockout weapon -- an anonymous
+    # caller could deny a known address access indefinitely by sending the
+    # limit's worth of wrong passwords from rotating source addresses, never
+    # guessing anything. A correct password is never counted, never gated and
+    # never rate-limited.
+    #
+    # WHAT IT BUYS YOU: it caps the RATE of attempts aimed at a single account
+    # and gives a per-account signal the per-IP limit cannot. What it does NOT
+    # buy you is attacker cost -- the check runs after the bcrypt verify, so
+    # being refused is free to the caller (measured: an over-budget request
+    # costs within ~1% of an under-budget one). AUTH_LOGIN_RATE_PER_MIN is the
+    # control that bounds attacker cost. Sizing this knob as a DoS control
+    # would be a mistake; see the login docstring for why the check cannot
+    # simply move before the verify. 0 disables.
     AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", "20"))
     # Cap on simultaneously ACTIVE (unexpired) tokens per user. Every login
     # mints one, and the periodic purge only removes EXPIRED rows, so the
