@@ -449,18 +449,37 @@ run_cron() {
     local line_hc="*/5 * * * * BASE=\"http://localhost:$API_PORT\" HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
-    # The healthcheck line is removed by SCRIPT PATH, not by exact match. Its
-    # text has changed before (BASE= was added), and `grep -vFx` matches whole
-    # lines, so an entry written by a previous revision of this script could
-    # never be removed: it stayed behind, and on a host with a non-default
-    # API_PORT that stale copy carried no BASE=, fell back to the watchdog's
-    # :8001 default, got a refused connection and restarted a healthy backend
-    # every five minutes. Matching the path removes whatever any revision wrote.
+    # The healthcheck line is removed by SCRIPT PATH, not by exact match.
+    # `grep -vFx` matches whole lines, and this line's text has already changed
+    # once (BASE= was added), so an entry written by a previous revision stopped
+    # matching the literal it had to be deleted by: it survived every run, and
+    # on a host with a non-default API_PORT that stale copy carried no BASE=,
+    # fell back to the watchdog's :8001 default, got a refused connection and
+    # was read as "not alive" -- pm2 restart against a healthy backend every
+    # five minutes.
     #
-    # The indexer line is still matched exactly, because this branch never
-    # changed its text and an exact match keeps a user's hand-edited variant
-    # (a different schedule, a `nice` tweak) from being deleted out from under
-    # them. Any user line that does not run these two scripts is preserved.
+    # Two reasons to filter on the path rather than on the line text:
+    #   1. The P1 comes straight back the moment a future revision edits the
+    #      schedule, because the stale line stops matching on that too. Anchoring
+    #      on schedule AND path would work today and silently break then.
+    #   2. `./setup.sh cron` is an explicit operator action, and reclaiming lines
+    #      that run a script this script manages is the contract. A stale entry
+    #      is not something an operator asked for.
+    #
+    # ACCEPTED COST, named so it is a decision and not an accident: a user's own
+    # crontab line that runs healthcheck.sh on a CUSTOM schedule is replaced by
+    # the managed one. Put the webhook or LOG overrides on the managed entry
+    # instead. Any line that does not run these two scripts is untouched.
+    #
+    # A MANAGED_BY=<tag> env prefix would let us keep such a line, but it cannot
+    # be the filter: an entry written before the tag existed carries no tag, so
+    # filtering on the tag alone would leave precisely the stale entry this P1 is
+    # about.
+    #
+    # The indexer line is still matched exactly -- this branch never changed its
+    # text, and an exact match keeps a user's hand-edited variant (a different
+    # schedule, a `nice` tweak) from being deleted out from under them. That
+    # asymmetry is the cost of not wanting the same P1 there.
     crontab -l 2>/dev/null | grep -vFx "$line_idx" | grep -vF "$SCRIPT_DIR/deploy/healthcheck.sh" > "$tmp" || true
     printf '%s\n' "$line_idx" >> "$tmp"
     printf '%s\n' "$line_hc" >> "$tmp"

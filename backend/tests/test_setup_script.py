@@ -584,3 +584,27 @@ def test_run_cron_preserves_a_hand_edited_indexer_entry(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert hand_edited in crontab.splitlines()
     assert len(_indexer_entries(crontab)) == 2, "the hand-edited copy is kept and the managed one is added"
+
+
+def test_run_cron_reclaims_a_users_own_healthcheck_line_by_design(tmp_path):
+    """The accepted cost of filtering on the script path, pinned so it stays a
+    decision.
+
+    A user who added their own healthcheck.sh entry on a custom schedule has it
+    replaced by the managed one. That is deliberate: `./setup.sh cron` is an
+    explicit operator action and reclaims lines running a script it manages --
+    a stale entry from a previous revision is exactly what caused the P1, and a
+    MANAGED_BY env tag cannot fix that, because the stale entry predates the
+    tag and carries none. If this test ever needs to go, the filter has to change
+    with it, deliberately.
+    """
+    log = tmp_path / "healthcheck.log"
+    script_dir = tmp_path / "host" / "app"
+    custom = f"0 * * * * LOG={log} {script_dir}/deploy/healthcheck.sh"
+    proc, crontab = run_cron(tmp_path, seeded_lines=[custom], api_port="9001")
+
+    assert proc.returncode == 0, proc.stderr
+    assert custom not in crontab.splitlines(), "the custom entry is expected to be reclaimed"
+    entries = _hc_entries(crontab)
+    assert len(entries) == 1
+    assert entries[0].startswith("*/5 * * * *"), entries[0]
