@@ -34,7 +34,31 @@
       "name": "trailing_spaces_after_tag",
       "text": "```dataviz  \n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```",
       "expect": "accept",
-      "why": "horizontal whitespace may sit between the tag and its newline"
+      "why": "spaces may sit between the tag and its newline"
+    },
+    {
+      "name": "fence_bom_after_tag",
+      "text": "Prose.\n```dataviz﻿\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```",
+      "expect": "reject",
+      "why": "U+FEFF after the tag: JavaScript's \\S matches it and Python's does not, so the old [^\\S\\n]* class gave the two regex engines different captures"
+    },
+    {
+      "name": "fence_nel_after_tag",
+      "text": "Prose.\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```",
+      "expect": "reject",
+      "why": "U+0085 after the tag: Python's \\S matches it and JavaScript's does not, the mirror image of the BOM case"
+    },
+    {
+      "name": "fence_nbsp_after_tag",
+      "text": "Prose.\n```dataviz \n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```",
+      "expect": "reject",
+      "why": "a non-breaking space after the tag is not part of the fence grammar on either side"
+    },
+    {
+      "name": "fence_ideographic_after_tag",
+      "text": "Prose.\n```dataviz　\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```",
+      "expect": "reject",
+      "why": "an ideographic space after the tag is likewise not part of the grammar"
     },
     {
       "name": "tab_after_tag",

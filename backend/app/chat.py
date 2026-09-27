@@ -747,10 +747,18 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
 # in the JavaScript regex form on purpose: under re.DOTALL the JS class [\s\S]
 # is exactly Python's ".", so the two grammars are provably identical instead of
 # merely similar — a fence the UI strips must never be left in the stored
-# answer, and vice versa (#255). Note the leading newline is OPTIONAL, matching
-# the frontend; the old backend pattern required one and so disagreed with the
-# UI on a fence written as ```dataviz{...}```. Group 1 is the JSON payload.
-DATAVIZ_FENCE_PATTERN = r"```dataviz[^\S\n]*\n?([\s\S]*?)\n?```\s*"
+# answer, and vice versa (#255). Group 1 is the JSON payload.
+#
+# The whitespace the tag may be followed by is an explicit ASCII class, spaces,
+# tabs and a carriage return, and NOT the ``[^\S\n]`` this used to use. Python's
+# \s and JavaScript's \s cover DIFFERENT Unicode whitespace — \S matches U+FEFF in
+# JavaScript but not in Python, and U+0085 in Python but not in JavaScript — so
+# the identical pattern strings consumed different characters: a fence carrying a
+# BOM after the tag was stripped by the server and kept by the browser, and one
+# carrying U+0085 was the other way round. Equal strings, unequal grammars. The
+# carriage return keeps a CRLF answer working, and the newline is the OPTIONAL
+# \n? below, so a fence written as ```dataviz{...}``` is still the same grammar.
+DATAVIZ_FENCE_PATTERN = r"```dataviz[ \t\r]*\n?([\s\S]*?)\n?```\s*"
 _DATAVIZ_FENCE_RE = re.compile(DATAVIZ_FENCE_PATTERN, re.DOTALL)
 
 
@@ -760,7 +768,7 @@ _DATAVIZ_FENCE_RE = re.compile(DATAVIZ_FENCE_PATTERN, re.DOTALL)
 # the raw JSON behind it would otherwise be rendered to the user as text. The
 # documented rule is to truncate from the marker to the end of the answer; the
 # frontend applies the identical rule in stripOpenFence.
-_OPEN_DATAVIZ_FENCE_RE = re.compile(r"```dataviz[^\S\n]*\n?")
+_OPEN_DATAVIZ_FENCE_RE = re.compile(r"```dataviz[ \t\r]*\n?")
 
 
 def _strip_unclosed_fence(text: str) -> str:
