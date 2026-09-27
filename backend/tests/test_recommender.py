@@ -175,18 +175,71 @@ class TestUserProfileIntegration:
     """Integration tests for user profile interactions with Redis."""
 
     @pytest.mark.asyncio
-    async def test_record_interaction_returns_none(self):
-        """Test that recording an interaction returns None (success)."""
-        from app.user_profile import record_interaction
-        with patch('app.user_profile._redis_client') as mock_redis:
-            pipe = MagicMock()
-            pipe.execute = AsyncMock()
-            mock_client = AsyncMock()
-            mock_client.pipeline = MagicMock(return_value=pipe)
-            mock_redis.return_value = mock_client
-            result = await record_interaction("user1", 42)
-            assert result is None
-            mock_client.pipeline.assert_called_once()
+    async def test_record_interaction_reports_recorded(self):
+        """A successful record reports RECORDED, and the guards run first.
+
+        Replaces a mock-echo test that asserted the function returned None and
+        that a MagicMock's pipeline was called once. The contract is now an
+        explicit InteractionResult, and an article_id must clear the index
+        check before any pipeline exists -- so this drives the real code with a
+        fake that would raise on an unlisted command, and asserts both the
+        result and that the counter was actually written.
+        """
+        from app.user_profile import InteractionResult, record_interaction
+
+        written: dict[str, str] = {}
+
+        class _FakeRedis:
+            async def get(self, key):
+                return None
+
+            async def set(self, key, value, ex=None):
+                written[key] = value
+                return True
+
+            def pipeline(self):
+                # redis-py's pipeline() is SYNC-returning; the commands are then
+                # executed with await. A coroutine here would never be awaited.
+                class _Pipe:
+                    def zcard(self, key):
+                        return 0
+
+                    def zscore(self, key, member):
+                        return None
+
+                    def zadd(self, *a, **k):
+                        pass
+
+                    def expire(self, *a, **k):
+                        pass
+
+                    def hset(self, *a, **k):
+                        pass
+
+                    def hincrby(self, key, field, amount):
+                        written[f"{key}:{field}"] = str(amount)
+
+                    def delete(self, *a, **k):
+                        pass
+
+                    async def execute(self):
+                        return [0, None]
+
+                return _Pipe()
+
+        class _Qdrant:
+            async def retrieve(self, **kwargs):
+                return [SimpleNamespace(id=42)]
+
+        with (
+            patch("app.user_profile._redis_client", return_value=_FakeRedis()),
+            patch.dict("app.main.state", {"qdrant": _Qdrant()}),
+        ):
+            result = await record_interaction("user1", 42, "click")
+
+        assert result is InteractionResult.RECORDED
+        # The article counter was genuinely written, by the legal field name.
+        assert written["article:interactions:42:click"] == "1"
 
     @pytest.mark.asyncio
     async def test_get_user_interactions_returns_empty_on_error(self):

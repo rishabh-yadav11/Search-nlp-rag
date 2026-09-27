@@ -884,8 +884,9 @@ async def _check_rate_limit(
     key_prefix: str = "auth:rl",
     window_seconds: int | None = None,
     fail_closed: bool = False,
+    subject: str | None = None,
 ) -> None:
-    """Enforce a per-IP rate limit with Redis INCR+EXPIRE.
+    """Enforce a rate limit with Redis INCR+EXPIRE.
 
     ``fail_closed`` selects what happens when the limiter's Redis is
     unreachable. The auth endpoints keep the default (False) and fall back to
@@ -897,11 +898,19 @@ async def _check_rate_limit(
 
     ``window_seconds`` defaults to the auth window so the existing auth call
     sites keep their current 60s window; the public limits pass their own.
+
+    ``subject`` overrides the bucket identity from the client IP to a caller
+    supplied one, typically an authenticated user id. A per-IP bucket cannot
+    bound one account sitting behind a shared NAT or proxy address, which is
+    the shape a deliberate flood takes, so an endpoint that mints per-account
+    state is limited on both axes. It changes ONLY which string is counted --
+    the counter, window, Redis path and in-process fallback are identical, so
+    the two axes cannot drift apart in enforcement.
     """
     if limit_per_min <= 0:
         return
     window = config.AUTH_RATE_WINDOW_SECONDS if window_seconds is None else window_seconds
-    key = f"{key_prefix}:{action}:{_client_ip(request)}"
+    key = f"{key_prefix}:{action}:{subject or _client_ip(request)}"
     await _consume_counter(key, limit_per_min, window, action=action, fail_closed=fail_closed)
 
 
@@ -1108,6 +1117,46 @@ def public_rate_limit(
             key_prefix="public:rl",
             window_seconds=config.PUBLIC_RATE_WINDOW_SECONDS,
             fail_closed=fail_closed,
+        )
+
+    return dependency
+
+
+def user_rate_limit(
+    action: str,
+    limit_attr: str,
+    *,
+    fail_closed: bool = True,
+) -> Callable[[Request], Awaitable[None]]:
+    """Build the FastAPI dependency that rate-limits one endpoint per ACCOUNT.
+
+    Same counter, window, Redis path and in-process fallback as
+    ``public_rate_limit`` -- both go through ``_check_rate_limit`` and
+    ``_consume_counter``, so neither axis can drift into weaker enforcement
+    than the other. Only the bucket identity and the key prefix differ: this
+    one counts the authenticated user id, under ``user:rl`` so it can never
+    collide with the per-IP bucket even when the action name matches.
+
+    Compose this WITH ``public_rate_limit`` on an endpoint that mints
+    per-account persistent state: a per-IP bucket alone cannot bound one
+    account behind a shared address, and a per-account bucket alone cannot
+    bound one account rotating addresses.
+
+    Depends on ``require_auth`` rather than reading ``request.state`` blindly,
+    so the user id is guaranteed resolved before the counter is keyed. It is
+    declared in the signature so FastAPI resolves it in dependency order even
+    though the endpoint body has its own ``Depends(require_auth)``.
+    """
+
+    async def dependency(request: Request, _auth: None = Depends(require_auth)) -> None:
+        await _check_rate_limit(
+            request,
+            action,
+            int(getattr(config, limit_attr)),
+            key_prefix="user:rl",
+            window_seconds=config.PUBLIC_RATE_WINDOW_SECONDS,
+            fail_closed=fail_closed,
+            subject=getattr(request.state, "user_id", None) or _client_ip(request),
         )
 
     return dependency

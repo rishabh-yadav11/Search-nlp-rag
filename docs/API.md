@@ -89,6 +89,23 @@ valid but the role is not allowed; `401` means missing/expired/revoked token.
 - Login: `AUTH_LOGIN_RATE_PER_MIN` (10) — exceed → `429`.
 - `/search` and chat are not IP-rate-limited (chat is bounded by the global LLM
   daily budget instead).
+- `POST /recommend/interaction` is limited on **both** axes:
+  `PUBLIC_INTERACTION_RATE_PER_MIN` (60) per client IP and
+  `INTERACTION_USER_RATE_PER_MIN` (60) per authenticated account — exceed →
+  `429`. Both are required: a per-IP bucket alone cannot bound one account
+  behind a shared NAT/proxy address, and a per-account bucket alone cannot
+  bound one account rotating addresses.
+
+  `interaction_type` is a closed enum — `view`, `click`, `read`. Anything else
+  → `422`. An `article_id` absent from the index → `404`, and **no key is
+  written for it**. Other decline statuses: `429` when the account has already
+  interacted with `USER_MAX_DISTINCT_INTERACTIONS` (500) distinct articles, and
+  `503` when the article index or Redis is unreachable.
+
+  **Outage posture:** this limiter fails CLOSED — during a Redis outage the
+  endpoint answers `503` rather than serving an unlimited write path. This is
+  deliberately *not* the `/ready` exception: no load balancer probes this
+  endpoint, so there is no health check to protect here.
 
 ### 4. Consuming the chat SSE stream
 

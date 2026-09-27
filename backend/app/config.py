@@ -569,6 +569,12 @@ class Config:
     RECOMMEND_RECENCY_WEIGHT = float(os.getenv("RECOMMEND_RECENCY_WEIGHT", "0.2"))
     RECOMMEND_POPULARITY_WEIGHT = float(os.getenv("RECOMMEND_POPULARITY_WEIGHT", "0.1"))
     USER_INTERACTION_TTL_DAYS = int(os.getenv("USER_INTERACTION_TTL_DAYS", "90"))
+    # Per-user cap on DISTINCT articles an account may record an interaction
+    # with. Every distinct article_id mints an ``article:interactions:{id}``
+    # hash plus a ``user:interaction_detail:{user_id}:{id}`` key, both held for
+    # USER_INTERACTION_TTL_DAYS, so without a cap any self-signup'd account can
+    # grow the profile keyspace without bound. 0 disables the cap.
+    USER_MAX_DISTINCT_INTERACTIONS = int(os.getenv("USER_MAX_DISTINCT_INTERACTIONS", "500"))
     RECOMMEND_DEFAULT_LIMIT = int(os.getenv("RECOMMEND_DEFAULT_LIMIT", "10"))
     # Width of the candidate pool the personalized recommendation legs and the
     # cold-start fallback fetch, deliberately wider than the result page so
@@ -690,6 +696,14 @@ class Config:
     PUBLIC_SEARCH_RATE_PER_MIN = int(os.getenv("PUBLIC_SEARCH_RATE_PER_MIN", "60"))
     PUBLIC_FACETS_RATE_PER_MIN = int(os.getenv("PUBLIC_FACETS_RATE_PER_MIN", "60"))
     PUBLIC_CLICK_RATE_PER_MIN = int(os.getenv("PUBLIC_CLICK_RATE_PER_MIN", "120"))
+    # POST /recommend/interaction is reachable by ANY self-signup'd account
+    # (require_auth only) and mints Redis keys per call, so it is limited on
+    # BOTH axes: per client IP here, and per account via
+    # INTERACTION_USER_RATE_PER_MIN. A per-IP bucket alone cannot bound one
+    # account behind a shared NAT/proxy address, which is the shape a
+    # deliberate flood takes.
+    PUBLIC_INTERACTION_RATE_PER_MIN = int(os.getenv("PUBLIC_INTERACTION_RATE_PER_MIN", "60"))
+    INTERACTION_USER_RATE_PER_MIN = int(os.getenv("INTERACTION_USER_RATE_PER_MIN", "60"))
     # /ready is polled by load balancers and orchestrators, typically once a
     # second, and a 429 makes an LB treat the node as unhealthy and pull it
     # from rotation -- the exact outage the /ready limiter must not cause. The
