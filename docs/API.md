@@ -335,6 +335,16 @@ Notes:
 - Malformed blocks (invalid JSON, ragged rows, non-numeric value column) are
   stripped by `_sanitize_dataviz` before storage, so `content` never exposes
   unparseable JSON to clients.
+- The block is judged by ONE rule shared with the frontend — `parse_dataviz` in
+  `backend/app/chat.py` and `parseDataViz` in
+  `frontend/app/chat/datavizContract.ts`, compared fixture by fixture by
+  `backend/tests/test_dataviz_contract.py` — so a block the server keeps is
+  always a block the client can render, and one it strips never reaches either.
+  Two consequences: `value_column` may be written as a whole number in float
+  form (`2.0` is column 2), and a value-less block is kept only for a pinned
+  `table` view. A value cell counts as a number only when the whole cell is a
+  plain numeric literal (`"1,200"` yes, `"12abc"` no), and never when it is
+  infinite or NaN.
 - Consumers should treat the block as optional and never fail to render the
   prose when it is absent.
 

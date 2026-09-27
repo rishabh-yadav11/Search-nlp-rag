@@ -33,6 +33,16 @@ jobs:
           cache-dependency-path: |
             backend/requirements.txt
             backend/requirements-dev.txt
+      # node is not a backend dependency, but tests/test_dataviz_contract.py is the
+      # only coverage of the frontend's dataviz validator (#267): it imports
+      # frontend/app/chat/datavizContract.ts under node to run one shared corpus
+      # through both implementations. That needs node >= 22.6, so the backend job
+      # needs the same "22" pin the frontend and security jobs already use, or the
+      # suite is red on a runner's default node. No npm cache: this job installs
+      # no node packages.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
       # The runtime stack is required, not just the dev tools. app/main.py does
       # `from fastembed import SparseTextEmbedding` at module scope and six test
       # modules import app.main, so the suite cannot even be collected without
