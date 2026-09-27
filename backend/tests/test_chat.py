@@ -3464,6 +3464,10 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
         async def is_disconnected(self):
             return entered["v"]
 
+        # Pinned so the assertion below reads as "charged at the estimate this
+        # call reserved" rather than tracking an unrelated config default.
+        monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
         monkeypatch.setattr(chat_module.Request, "is_disconnected", is_disconnected)
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
         monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
@@ -3480,8 +3484,52 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
         # ...and the gate hold is NOT refunded: the call was made and billed, so
         # the money is settled, not handed back.
         assert budget.holds == {}
-        assert budget.writes == [("settle", 50_000)]  # the $0.05 estimate, charged once
-        assert budget.counter == 50_000
+        assert budget.writes == [("settle", 20_000)]  # the $0.02 estimate, charged once
+        assert budget.counter == 20_000
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch):
+    """A mid-stream failure AFTER deltas were sent is a billed call, not a free
+    one (#255).
+
+    `stream_answer` only reports usage once the whole response has arrived, so
+    here usage_holder is empty -- but the provider generated and billed the
+    tokens that were already on the wire. The turn used to release the gate
+    hold on the strength of that empty usage_holder, which is a different
+    question from the one that matters. The turn is still persisted with its
+    truncation marker (the ONE rule); it is simply also charged."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "half an answer"
+            raise RuntimeError("provider dropped the connection")
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        _stream_body(client, h, sid, "Who invested in fintech?")
+
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        # The ONE rule still holds: deltas were on the wire, so the turn persists.
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        assert "half an answer" in msgs[1]["content"]
+        assert "[answer truncated]" in msgs[1]["content"]
+        # ...and the billed call is charged at the estimate it held, not refunded.
+        assert budget.writes == [("settle", 20_000)]
+        assert budget.counter == 20_000
+        assert budget.holds == {}
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
