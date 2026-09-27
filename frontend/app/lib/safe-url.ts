@@ -13,6 +13,10 @@
  * leading C0 controls and spaces, and strip tab/CR/LF from anywhere in the URL,
  * so `" javascript:x"`, `"\x01javascript:x"` and `"java\tscript:x"` all execute
  * while a naive `startsWith('javascript:')` sees nothing dangerous.
+ *
+ * Where the guard is deliberately *stricter* than the browser it says so at the
+ * point of difference: raw C0 controls and NBSP/BOM are refused even though the
+ * browser would treat some of those as harmless relative paths. Never looser.
  */
 
 /** Only these two schemes may ever reach an `href`. */
