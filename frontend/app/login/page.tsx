@@ -3,7 +3,8 @@
 import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { API_BASE, getToken, isSafeRedirect, setToken } from '../lib/auth'
+import { API_BASE, getToken, setToken } from '../lib/auth'
+import { isSafeRedirect } from '../lib/safe-url'
 
 function LoginForm() {
   const router = useRouter()

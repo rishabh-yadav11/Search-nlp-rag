@@ -4,27 +4,17 @@ import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { API_BASE, getToken } from '../lib/auth'
-
-// Local safe-redirect guard (should be consolidated into lib/auth.ts).
-// A safe target is a root-relative path: it starts with a single "/", is not
-// protocol-relative ("//"), and is not an absolute URL (no scheme/hostname).
-function isSafeRedirect(target: string): boolean {
-  if (typeof target !== 'string' || target.length === 0) return false
-  if (!target.startsWith('/')) return false
-  if (target.startsWith('//')) return false
-  // Reject absolute URLs (e.g. "http://", "https://", "javascript:").
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/i.test(target)) return false
-  return true
-}
-
-function safeNext(target: string | null): string {
-  return target && isSafeRedirect(target) ? target : '/chat'
-}
+import { isSafeRedirect } from '../lib/safe-url'
 
 function SignupForm() {
   const router = useRouter()
   const params = useSearchParams()
-  const next = safeNext(params.get('next'))
+  // Same shape as app/login/page.tsx: the shared guard narrows the raw param
+  // to `string`, and anything it refuses falls back to /chat. The guard used to
+  // be re-implemented here, as a `boolean`-returning copy that could drift
+  // from the one login used.
+  const rawNext = params.get('next')
+  const next = isSafeRedirect(rawNext) ? rawNext : '/chat'
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')

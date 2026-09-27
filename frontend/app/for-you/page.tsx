@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import SafeArticleLink from '../components/SafeArticleLink'
 import { API_BASE, authHeaders, getToken } from '../lib/auth'
+import { formatArticleDate } from '../lib/format'
 import type { MouseEvent } from 'react'
 import styles from './page.module.css'
 
@@ -181,7 +182,7 @@ function ArticleCard({
             )}
             {article.published_date && (
               <span>
-                {new Date(article.published_date).toLocaleDateString()}
+                {formatArticleDate(article.published_date)}
               </span>
             )}
           </div>

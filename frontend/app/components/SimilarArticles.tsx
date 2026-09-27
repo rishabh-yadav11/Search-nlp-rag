@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import SafeArticleLink from './SafeArticleLink'
 import { API_BASE, authHeaders } from '../lib/auth'
+import { formatArticleDate } from '../lib/format'
 import styles from './SimilarArticles.module.css'
 
 interface Article {
@@ -126,7 +127,7 @@ export default function SimilarArticles({
                 )}
                 {article.published_date && (
                   <span className="similar-card-date">
-                    {new Date(article.published_date).toLocaleDateString()}
+                    {formatArticleDate(article.published_date)}
                   </span>
                 )}
               </div>
