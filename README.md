@@ -51,7 +51,7 @@ Browsers ◀── nginx ───▶ Next.js app ◀──(same origin)──�
 backend/
   app/
     main.py            FastAPI app: /search, /chat, /health, /analytics
-    health.py          /live, /ready, /readyz dependency checks
+    health.py          /health, /live, /ready, /ready/deep, /readyz dependency checks
     llm.py             LLM call with timeout, retries, backoff, token-cost calc
     chat.py            per-user chat store (SQLite) + /api/chat router
     analytics.py       Redis-backed search/click analytics aggregates
@@ -101,10 +101,26 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
 | --------- | ------------------------------------------ | ----------------------------------------- |
 | `/health` | Liveness (always 200 if the process is up) | —                                         |
 | `/live`   | Liveness alias                             | —                                         |
-| `/ready`  | Readiness, JSON report                     | Qdrant down or models not loaded → `503`  |
+| `/ready`  | Readiness, JSON report                     | Qdrant down, models not loaded, or no usable `GEMINI_API_KEY` → `503` |
 | `/readyz` | Readiness, bare status code                | same as `/ready`                          |
+| `/ready/deep` | Readiness, uncached and unrated         | same as `/ready`; loopback callers only   |
 
-`/ready` checks the Qdrant collection and model/reranker loading, and reports Redis and LLM (Gemini) status non-fatally (Redis failures degrade to the in-process cache, so they don't flip readiness).
+`/ready` checks the Qdrant collection, model/reranker loading and the Gemini
+key, and reports Redis non-fatally (a Redis failure degrades to the in-process
+cache, so it does not flip readiness). An **absent or placeholder**
+`GEMINI_API_KEY` is fatal to readiness: chat answers every question from the
+canned fallback, so the deployment is not fit to serve. `checks.llm.reason` is
+`ok`, `missing`, `placeholder` or `malformed` and never contains the key.
+
+`/health` and `/live` check nothing at all — that is what makes them valid
+liveness probes, and also why they must never gate a deploy or an alert. Anything
+needing a real answer uses `/ready` (load balancer, cached and rate limited) or
+`/ready/deep` (the deploy gate and the cron watchdog, uncached and unrated so
+they cannot read a stale verdict or be throttled into a false outage).
+`/ready/deep` answers only a direct loopback request with no
+`X-Forwarded-For`, and the vhost below additionally returns `404` for it, so the
+unrated, uncached probe has two independent layers in front of it rather than
+depending on one line of application check.
 
 ## Prerequisites
 
@@ -240,9 +256,10 @@ cd backend
 | `GET /facets`                                   | Distinct industry/dealtype values for filter autocomplete    |
 | `POST /api/chat/sessions`                       | Create a chat conversation                                   |
 | `POST /api/chat/sessions/{id}/messages/stream`  | SSE-streamed chat turn                                       |
-| `GET /health`                                   | Liveness                                                      |
-| `GET /ready`                                    | Readiness (503 when Qdrant/models unavailable)                |
-| `GET /live`, `GET /readyz`                      | Liveness / bare readiness                                     |
+| `GET /health`                                   | Liveness (checks nothing; never gates anything)               |
+| `GET /ready`                                    | Readiness (503 on Qdrant/models/Gemini-key failure)            |
+| `GET /live`, `GET /readyz`                      | Liveness alias / bare readiness                                |
+| `GET /ready/deep`                               | Readiness for local monitoring: no cache, no rate limit, `403` from non-loopback |
 
 ```bash
 curl "http://localhost:8001/search?q=fintech%20funding&top_k=3"
@@ -320,6 +337,12 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
+    # `location /ready` is a PREFIX match, so a public GET /ready/deep would
+    # otherwise be proxied here and refused only by the API's own host-local
+    # check. /ready/deep is uncached and unrated (it is the watchdog's probe), so
+    # it gets a second, independent layer and simply does not exist on the public
+    # surface. setup.sh and deploy/healthcheck.sh reach it on 127.0.0.1 directly.
+    location /ready/deep { return 404; }
     location /api {
         proxy_pass http://127.0.0.1:8001;
         proxy_read_timeout 300s;
@@ -419,7 +442,7 @@ sudo ufw --force enable
 - **nginx security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin` on every location. CSP is set by the frontend (`middleware.ts`, per-request nonce), so I don't duplicate it at nginx. Transport security is opt-in: plain HTTP by default, `./setup.sh tls` to switch (see [TLS](#tls-https) above). HSTS is deliberately **not** set at nginx level — `next.config.ts` is the single source for that header, and two `max-age` values drift.
 - **Pinned images** — Qdrant/Redis run from pinned, digest-resolvable tags (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`, `REDIS_IMAGE=redis:7-alpine`). If you override Qdrant, keep it >= the version that wrote any existing collection — older releases can't read newer storage formats.
 - **API note** — CORS is restricted to the origins in `CORS_ORIGINS` (localhost dev origins by default; production is same-origin through nginx). **Auth** uses opaque bearer tokens with RBAC roles (see `app/auth.py`), and signup/login endpoints are rate-limited per client IP (Redis-backed). LLM spend is bounded by `LLM_DAILY_BUDGET_USD` (see `app/cost_budget.py`).
-- **Health monitoring** — `deploy/healthcheck.sh` probes `/health` (I run it from cron every few minutes), restarts `vccircle-backend` when unhealthy, and posts an alert to `HEALTHCHECK_WEBHOOK_URL` if a restart doesn't recover the app. Logs to `logs/healthcheck.log`. That recovery uses `pm2 restart`, which replays the stored argv — correct for reviving a sick process, but it cannot apply a changed bind or any other process option. Anything that changes the pm2 process definition (the API bind, the OOM auto-restart limits) needs `./setup.sh services`.
+- **Health monitoring** — `deploy/healthcheck.sh` (I run it from cron every few minutes) probes `/ready/deep` for readiness and `/health` for liveness. Not ready while the process is alive → alert, but **no** restart, because a restart cannot bring Qdrant back or fix a placeholder `GEMINI_API_KEY` (the alert says so). It also says which probe was refused if the answer was 403/404/429/500 rather than 503, because none of those is a verdict about your dependencies. Not alive → `pm2 restart vccircle-backend`, then re-probe, then post an alert to `HEALTHCHECK_WEBHOOK_URL` if it has still not recovered. A fault alerts **once**: a repeat is logged as `still failing (live-not-ready:503)` and is otherwise silent until `ALERT_COOLDOWN_SECONDS` (default 3600) has passed — at `*/5` an unfixed fault would otherwise POST and mail the same news ~288 times a day, which is how the one alert that matters gets ignored. The dedup state lives beside the log in `logs/healthcheck.log.state` (override with `STATE_FILE`) and is written atomically; a corrupt, truncated or clock-skewed one is treated as "never alerted" rather than being allowed to silence anything. A healthy run clears it, so the next fault alerts immediately. The webhook is **best effort**: a failing POST is logged as a warning and never changes the run's exit code. Logs to `logs/healthcheck.log`. That recovery uses `pm2 restart`, which replays the stored argv — correct for reviving a sick process, but it cannot apply a changed bind or any other process option. Anything that changes the pm2 process definition (the API bind, the OOM auto-restart limits) needs `./setup.sh services`.
 
 ## Supported Settings
 

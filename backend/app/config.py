@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import socket
 from typing import ClassVar
 
@@ -351,6 +352,12 @@ class Config:
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
+    # An absent key and a placeholder key are both "chat cannot work", but they
+    # are not the same fault and must be told apart: a placeholder makes 100% of
+    # answers the canned fallback while the process still looks healthy, so
+    # classify_gemini_api_key below is the single place that decides whether the
+    # configured value can actually reach the LLM, and both the readiness report
+    # and the startup log report through it.
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
     # Answer model. Kept separate from GEMINI_MODEL so the eval judge can be held
@@ -713,6 +720,107 @@ class Config:
     ALLOWED_HOSTS: ClassVar[tuple[str, ...]] = _parse_allowed_hosts(
         os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS + _machine_hosts()
     )
+
+
+# A real Google API key is "AIza" followed by 35 URL-safe characters. That shape
+# is only required against Google's own endpoint: GEMINI_BASE_URL is
+# configurable, so a deployment pointing at an OpenAI-compatible gateway
+# legitimately holds a differently shaped key, and rejecting that would report a
+# working configuration as broken.
+_GOOGLE_KEY_RE = re.compile(r"^AIza[0-9A-Za-z_-]{35}$")
+_GOOGLE_API_HOST = "generativelanguage.googleapis.com"
+_GOOGLE_KEY_PREFIX = "AIza"
+
+# Filler spellings that turn up in templates, docs and copy-pasted examples,
+# compared in normalised form: lowercased with every non-alphanumeric character
+# removed, so "your_key_here", "YOUR-KEY-HERE" and "<your key here>" all reduce
+# to the same token.
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "0",
+        "changeme",
+        "changethis",
+        "dummy",
+        "empty",
+        "example",
+        "insertkeyhere",
+        "key",
+        "na",
+        "nil",
+        "none",
+        "null",
+        "pastekeyhere",
+        "placeholder",
+        "putkeyhere",
+        "replaceme",
+        "sample",
+        "secret",
+        "tbd",
+        "test",
+        "todo",
+        "unset",
+        "yourapikey",
+        "yourapikeyhere",
+        "yourgeminiapikey",
+        "yourkey",
+        "yourkeyhere",
+        "yoursecret",
+    }
+)
+
+# A run of one repeated character ("xxxx", "aaaaaa") is filler, never a key.
+# Checked against the normalised form, so "x-x-x-x" is caught as well.
+_REPEATED_FILLER_RE = re.compile(r"(.)\1{3,}")
+
+# ...but that check cannot see inside a correctly shaped key: a MASKED key keeps
+# its real prefix and its real length and fills the rest with filler, which is
+# how documentation writes an example ("AIza" + "Sy" + a run of X's) and how an
+# operator redacts a key they are not sure about. That is precisely a key whose
+# shape is right and whose content is filler. So the tail after the prefix is
+# also required to look random: a real 35-character tail drawn from a 64-symbol
+# alphabet has ~27 distinct characters, and the chance of a genuine key having
+# fewer than _MIN_DISTINCT_KEY_CHARS of them is vanishingly small, while every
+# masking style (all X, all digits, all dashes, a padded word) lands far below.
+# NB: the example above is described, never written out -- a contiguous
+# 39-character "AIza..." string anywhere in this repository, comment included,
+# is indistinguishable from a leaked credential to a secrets scanner.
+_MIN_DISTINCT_KEY_CHARS = 12
+
+
+def classify_gemini_api_key(value: str | None) -> str:
+    """Classify a configured GEMINI_API_KEY for readiness reporting.
+
+    Returns one of:
+      "ok"          -- a key that can plausibly be sent to the configured
+                       LLM endpoint.
+      "missing"     -- unset, empty, or whitespace only.
+      "placeholder" -- a known filler value ("your_key_here" and friends), or
+                       a correctly shaped key whose body is masked filler.
+      "malformed"   -- neither missing nor filler, but the wrong shape for the
+                       configured GEMINI_BASE_URL (a typo, or a truncated key).
+
+    A truthiness test cannot do this job: every non-empty string is truthy and
+    the value shipped in .env.example is the literal "your_key_here", so
+    ``bool(key)`` reported a chat-broken deployment as a healthy one. The value
+    itself is never returned or logged, only its classification, so a readiness
+    report or a log line can name the fault without leaking the secret.
+    """
+    if value is None or not value.strip():
+        return "missing"
+    stripped = value.strip()
+    normalised = re.sub(r"[^0-9a-z]+", "", stripped.lower())
+    if normalised in _PLACEHOLDER_API_KEYS or _REPEATED_FILLER_RE.fullmatch(normalised):
+        return "placeholder"
+    # Host names are case-insensitive, and a blank base URL is an operator who
+    # cleared the variable rather than one who pointed it elsewhere: both keep
+    # the structural check, so re-spelling the variable cannot switch it off.
+    base_url = config.GEMINI_BASE_URL.strip().lower()
+    if not base_url or _GOOGLE_API_HOST in base_url:
+        if not _GOOGLE_KEY_RE.fullmatch(stripped):
+            return "malformed"
+        if len(set(stripped[len(_GOOGLE_KEY_PREFIX) :])) < _MIN_DISTINCT_KEY_CHARS:
+            return "placeholder"
+    return "ok"
 
 
 config = Config()

@@ -378,6 +378,25 @@ start_service() {
     echo "'$name' started (pid $(cat "$pidfile"))"
 }
 
+# Name the reason the readiness gate rejected the deploy, so a 30-second
+# timeout does not end in a bare "not ready".
+#
+# No -f here, deliberately. This only ever runs when the probe answered >= 400
+# (or the connection failed), and `curl -f` suppresses the body on exactly those
+# responses -- which made this function dead code and left the operator with the
+# bare "not ready after 30s" it exists to prevent. The report body, including
+# checks.llm.reason, is the app's own answer and is what gets printed.
+report_readiness_reason() {
+    local body
+    body="$(curl -sS -m 5 "http://localhost:$API_PORT/ready/deep" 2>/dev/null || true)"
+    if [ -n "$body" ]; then
+        echo "       readiness report:" >&2
+        printf '%s\n' "$body" | sed 's/^/         /' >&2
+    else
+        echo "       (no report body; the probe did not answer)" >&2
+    fi
+}
+
 run_services() {
     stage "services"
     mkdir -p "$LOGS" "$PID_DIR"
@@ -395,8 +414,6 @@ run_services() {
         -k uvicorn.workers.UvicornWorker \
         --workers "$GUNICORN_WORKERS" --bind "127.0.0.1:$API_PORT" \
         --timeout 120 app.main:app)
-    wait_http "http://localhost:$API_PORT/health"
-
     (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
         --name vccircle-frontend \
         --max-memory-restart "$FRONTEND_MAX_MEMORY" \
@@ -405,6 +422,31 @@ run_services() {
         -- start -p "$NEXT_PORT")
     pm2 save >/dev/null 2>&1
     wait_http "http://localhost:$NEXT_PORT/"
+
+    # Readiness, not liveness (#279): /health is a stub that answers 200 with a
+    # dead Qdrant client, unloaded models or the placeholder GEMINI_API_KEY, so
+    # gating the deploy on it declared broken backends deployed. /ready/deep is
+    # the uncached, unrated, loopback-only form, so this gate cannot pass on a
+    # warm readiness cache and cannot be throttled into a false "not ready".
+    #
+    # Placed LAST on purpose. This gate can legitimately fail, and `set -e`
+    # aborts on it, so running it before the frontend was started turned a
+    # misconfigured key into a torn-down deployment with the frontend never
+    # coming back. Here both services are up and the pm2 dump is saved, so the
+    # operator is told the deploy is not ready with everything still running,
+    # and can fix the key and re-run.
+    #
+    # There is deliberately NO shell-side check of GEMINI_API_KEY before the
+    # teardown. app.config.classify_gemini_api_key is the only classifier, and
+    # a shell copy of its sentinel list is a second one that silently drifts:
+    # a shorter copy misses placeholders, a longer one refuses deploys the app
+    # would accept. The verdict here is the app's own -- report_readiness_reason
+    # prints checks.llm.reason from the response -- so it cannot disagree with
+    # what /ready will actually say.
+    if ! wait_http "http://localhost:$API_PORT/ready/deep"; then
+        report_readiness_reason
+        return 1
+    fi
 }
 
 stop_service() {
@@ -477,13 +519,57 @@ run_cron() {
     # webhook URL (and a minimal PATH via healthcheck.sh) explicitly. Empty
     # webhook is harmless: healthcheck.sh treats an unset/empty value as "no
     # webhook". Keep the entry stable for idempotent re-runs.
-    local line_hc="*/5 * * * * HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
+    # BASE is passed explicitly because the API is bound to 127.0.0.1:$API_PORT
+    # and the watchdog defaults to 8001: an operator who overrides API_PORT
+    # would otherwise have the watchdog probe a closed port and restart a
+    # perfectly healthy backend every five minutes.
+    local line_hc="*/5 * * * * BASE=\"http://localhost:$API_PORT\" HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
-    # Remove only the exact managed entries this script writes; preserve any
-    # user-added crontab lines (including manual HEALTHCHECK_WEBHOOK_URL=...
-    # augmentations) that reference the same scripts.
-    crontab -l 2>/dev/null | grep -vFx "$line_idx" | grep -vFx "$line_hc" > "$tmp" || true
+    # The healthcheck line is removed by SCRIPT PATH, not by exact match.
+    # `grep -vFx` matches whole lines, and this line's text has already changed
+    # once (BASE= was added), so an entry written by a previous revision stopped
+    # matching the literal it had to be deleted by: it survived every run, and
+    # on a host with a non-default API_PORT that stale copy carried no BASE=,
+    # fell back to the watchdog's :8001 default, got a refused connection and
+    # was read as "not alive" -- pm2 restart against a healthy backend every
+    # five minutes.
+    #
+    # Two reasons to filter on the path rather than on the line text:
+    #   1. The P1 comes straight back the moment a future revision edits the
+    #      schedule, because the stale line stops matching on that too. Anchoring
+    #      on schedule AND path would work today and silently break then.
+    #   2. `./setup.sh cron` is an explicit operator action, and reclaiming lines
+    #      that run a script this script manages is the contract. A stale entry
+    #      is not something an operator asked for.
+    #
+    # ACCEPTED COST, named so it is a decision and not an accident: a user's own
+    # crontab line that runs healthcheck.sh on a CUSTOM schedule is replaced by
+    # the managed one. Put the webhook or LOG overrides on the managed entry
+    # instead. Two things are NOT touched: a line that does not run these two
+    # scripts, and a COMMENTED line that merely mentions healthcheck.sh -- a
+    # commented-out entry is how an operator disables the watchdog, and deleting
+    # it would silently re-arm one they believe is off.
+    #
+    # A MANAGED_BY=<tag> env prefix would let us keep such a line, but it cannot
+    # be the filter: an entry written before the tag existed carries no tag, so
+    # filtering on the tag alone would leave precisely the stale entry this P1 is
+    # about.
+    #
+    # The indexer line is still matched exactly -- this branch never changed its
+    # text, and an exact match keeps a user's hand-edited variant (a different
+    # schedule, a `nice` tweak) from being deleted out from under them. That
+    # asymmetry is the cost of not wanting the same P1 there.
+    #
+    # The healthcheck filter matches on the path but skips COMMENTED lines, so a
+    # user who disabled the watchdog by commenting its entry out keeps that
+    # marker. A plain substring `grep -vF` deleted it, which would silently
+    # re-arm a watchdog the operator believes they had switched off.
+    crontab -l 2>/dev/null \
+        | grep -vFx "$line_idx" \
+        | awk -v p="$SCRIPT_DIR/deploy/healthcheck.sh" \
+            'index($0, p) && $0 !~ /^[[:space:]]*#/ { next } { print }' > "$tmp" \
+        || true
     printf '%s\n' "$line_idx" >> "$tmp"
     printf '%s\n' "$line_hc" >> "$tmp"
     crontab "$tmp"
@@ -636,6 +722,16 @@ nginx_locations() {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
+    # The "location /ready" block above is a PREFIX match, so without this block
+    # a public GET /ready/deep would be proxied to the API and held dark only by
+    # its in-process host-local check. That check refuses everything arriving
+    # through this vhost (nginx always sets X-Forwarded-For), but the endpoint is
+    # deliberately uncached and unrated, so it gets a second, independent layer:
+    # 404 at the proxy. The deploy gate in this script and the watchdog in
+    # deploy/healthcheck.sh reach it on 127.0.0.1 directly and never come here.
+    # NB: no backticks in this comment -- the heredoc is unquoted, so they would
+    # be run as a command substitution.
+    location /ready/deep { return 404; }
     location /facets {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_set_header X-Real-IP \$remote_addr;

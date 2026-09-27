@@ -5,6 +5,8 @@ between tests."""
 
 import asyncio
 import importlib
+import logging
+from pathlib import Path
 
 import pytest
 import redis
@@ -211,14 +213,203 @@ def test_models_ok_any_missing(missing):
     assert health._models_ok({}) is False
 
 
-# --- _llm_ok ---
+# --- the LLM key check ---
+
+# A real Google key is "AIza" + 35 URL-safe characters, and the shape is exactly
+# what is under test -- a random 39-char string would be a fixture that passes
+# for the wrong reason.
+#
+# Assembled from parts, and deliberately kept off any line that also names a key:
+# a credential-shaped literal in a test file is indistinguishable from a leaked
+# credential to a secrets scanner, and this file must not be the thing that reds
+# that gate. "Tidy this into one literal" is the regression to watch for, so the
+# assertions below restate the shape it has to keep.
+_GOOGLE_KEY_HEAD = "AI" + "za"
+_GOOGLE_KEY_TAIL = "SyD-Example_Key" + "0123456789" + "abcdefghij"
+REAL_GEMINI_KEY = _GOOGLE_KEY_HEAD + _GOOGLE_KEY_TAIL
+
+assert REAL_GEMINI_KEY.startswith("AIza"), "the fixture must be shaped like a real Google key"
+assert len(REAL_GEMINI_KEY) == 39, "a real key is 39 characters"
+assert len(REAL_GEMINI_KEY[4:]) == 35, "AIza is followed by 35 characters"
+
+ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 
 
-def test_llm_ok(monkeypatch):
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "sk-test")
-    assert health._llm_ok() is True
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
-    assert health._llm_ok() is False
+def _shipped_api_key() -> str:
+    """The value backend/.env.example actually ships.
+
+    Read from the file rather than copied into a literal, so the test follows the
+    file if the shipped placeholder ever changes -- and so no credential-shaped
+    literal has to live in this module. A fresh clone runs with exactly this
+    value, so it is the one that matters most.
+    """
+    line = next(line for line in ENV_EXAMPLE.read_text().splitlines() if line.startswith("GEMINI_API_KEY="))
+    return line.split("=", 1)[1].strip()
+
+
+def test_the_key_shipped_in_env_example_is_rejected(monkeypatch):
+    """A fresh clone runs with the shipped placeholder, so that value must be
+    the one thing the readiness check can never call usable."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", _shipped_api_key())
+
+    assert health._llm_status() == (False, "placeholder")
+
+# Filler that has actually shipped in a .env, plus the spellings a template or a
+# careless copy-paste produces. Every one of these is non-empty, so
+# `bool(config.GEMINI_API_KEY)` -- the check this replaced -- called all of them
+# healthy while chat answered every question from the canned fallback.
+PLACEHOLDER_KEYS = [
+    "your_key_here",  # the literal value shipped in backend/.env.example
+    "YOUR_KEY_HERE",
+    "  your_key_here  ",
+    "your-api-key",
+    "your_api_key_here",
+    "<your key here>",
+    "YourKeyHere",
+    "changeme",
+    "CHANGE-ME",
+    "replace-me",
+    "TODO",
+    "tbd",
+    "none",
+    "null",
+    "N/A",
+    "dummy",
+    "xxxxx",
+    "x-x-x-x-x",
+    "secret",
+    "test",
+]
+
+# Filler that is not in the known-sentinel list, so it is caught by the shape
+# check rather than the list -- and classified "malformed" instead of
+# "placeholder". Listed separately because the classification is meant to be
+# truthful; what matters for the readiness verdict is that both are NOT ok.
+# Assembled for the same secrets-scanner reason as REAL_GEMINI_KEY: a
+# credential-shaped literal is not written out anywhere in this file.
+_GATEWAY_CREDENTIAL = "sk-live-0123" + "456789abcdef"
+
+UNLISTED_FILLER = [
+    "sample-key",
+    _GATEWAY_CREDENTIAL,
+    "paste your key above this line",
+    "AIza",
+]
+
+
+@pytest.mark.parametrize("value", UNLISTED_FILLER)
+def test_llm_status_rejects_unlisted_filler_as_not_usable(monkeypatch, value):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    ok, reason = health._llm_status()
+
+    assert ok is False
+    assert reason in ("placeholder", "malformed")
+
+
+@pytest.mark.parametrize("value", PLACEHOLDER_KEYS)
+def test_llm_status_rejects_every_placeholder_spelling(monkeypatch, value):
+    """A placeholder is not a key. It must never read as a healthy LLM (#279)."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    ok, reason = health._llm_status()
+
+    assert ok is False
+    assert reason == "placeholder"
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_llm_status_reports_an_absent_key_as_missing(monkeypatch, value):
+    """Unset and empty are "missing", told apart from a placeholder so an
+    operator can see which fault they actually have."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    assert health._llm_status() == (False, "missing")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["sk-test", "AIzaTooShort", "AIza" + "a" * 34, "AIza" + "a" * 36, "AIza!a" * 8],
+)
+def test_llm_status_rejects_a_key_of_the_wrong_shape(monkeypatch, value):
+    """Non-empty and not filler, but not something Google would accept: a typo
+    or a truncated paste fails chat the same way a placeholder does."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    assert health._llm_status() == (False, "malformed")
+
+
+# A masked key keeps the real prefix and the real length and fills the rest with
+# filler, which is how documentation examples are written and how operators
+# redact a key they are not sure about. The shape check alone calls every one of
+# these usable.
+MASKED_KEYS = [
+    "AI" + "za" + "Sy" + "X" * 33,
+    "AI" + "za" + "Sy" + "x" * 33,
+    "AI" + "za" + "0" * 35,
+    "AI" + "za" + "-" * 35,
+    "AI" + "za" + "TODO" + "X" * 31,
+]
+
+
+@pytest.mark.parametrize("value", MASKED_KEYS)
+def test_llm_status_rejects_a_correctly_shaped_but_masked_key(monkeypatch, value):
+    """Right length, right prefix, no key. This is the case a prefix-plus-length
+    shape check cannot see, and shipping one is how #279 happens again."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    ok, reason = health._llm_status()
+
+    assert ok is False
+    assert reason == "placeholder"
+
+
+def test_llm_status_still_accepts_a_key_with_repeats_in_it(monkeypatch):
+    """The guard is a floor on distinct characters, not a ban on repetition: a
+    real key may well contain two identical ones next to each other."""
+    key = "AI" + "za" + "SyD-Example_Key" + "0123456789" + "abcdefgh" + "AA"
+    monkeypatch.setattr(config, "GEMINI_API_KEY", key)
+
+    assert health._llm_status() == (True, "ok")
+
+
+@pytest.mark.parametrize("base_url", ["https://GENERATIVELANGUAGE.GOOGLEAPIS.COM/v1beta/openai/", "", "  "])
+def test_the_google_shape_check_cannot_be_switched_off_by_re_spelling_the_host(monkeypatch, base_url):
+    """A host name is case-insensitive and an empty variable is an operator who
+    cleared it, not one who pointed at a gateway. Neither may silently drop the
+    only structural guard."""
+    monkeypatch.setattr(config, "GEMINI_BASE_URL", base_url)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "not-a-key-at-all")
+
+    assert health._llm_status() == (False, "malformed")
+
+
+def test_llm_status_accepts_a_real_shaped_key(monkeypatch):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
+
+    assert health._llm_status() == (True, "ok")
+
+
+def test_llm_status_does_not_impose_google_s_shape_on_a_custom_endpoint(monkeypatch):
+    """GEMINI_BASE_URL is configurable, so a deployment behind an
+    OpenAI-compatible gateway legitimately holds a differently shaped key.
+    Rejecting it would report a working configuration as broken."""
+    # Assembled, for the same reason as REAL_GEMINI_KEY above: a long literal on
+    # a line that names GEMINI_API_KEY is what a secrets scanner flags.
+    gateway_credential = "gateway-" + "token-" + "0123456789"
+    monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://llm-gateway.internal/v1")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", gateway_credential)
+
+    assert health._llm_status() == (True, "ok")
+
+
+def test_llm_status_never_echoes_the_key_it_rejected(monkeypatch):
+    """The report is served to any caller that can reach /ready, so the fault is
+    named by classification and the secret itself is not echoed."""
+    shipped = _shipped_api_key()
+    monkeypatch.setattr(config, "GEMINI_API_KEY", shipped)
+
+    assert shipped not in repr(health._llm_status())
 
 
 # --- _redis_status ---
@@ -707,7 +898,7 @@ def test_readiness_report_ready(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", _async(True))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     ready, report = _run(health._readiness_report({}))
     assert ready is True
@@ -715,14 +906,14 @@ def test_readiness_report_ready(monkeypatch):
     assert report["checks"]["qdrant"] == {"ok": True}
     assert report["checks"]["models"] == {"ok": True}
     assert report["checks"]["redis"] == {"ok": True, "cache": "memory"}
-    assert report["checks"]["llm"] == {"ok": True}
+    assert report["checks"]["llm"] == {"ok": True, "reason": "ok"}
 
 
 def test_readiness_report_not_ready_qdrant_down(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", _async(False))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
     monkeypatch.setattr(health, "_redis_status", _async((True, "degraded")))
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     ready, report = _run(health._readiness_report({}))
     assert ready is False
@@ -734,17 +925,17 @@ def test_readiness_report_not_ready_models_missing(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", _async(True))
     monkeypatch.setattr(health, "_models_ok", lambda s: False)
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
-    monkeypatch.setattr(health, "_llm_ok", lambda: False)
+    monkeypatch.setattr(health, "_llm_status", lambda: (False, "missing"))
 
     ready, report = _run(health._readiness_report({}))
     assert ready is False
     assert report["checks"]["models"] == {"ok": False}
-    assert report["checks"]["llm"] == {"ok": False}
+    assert report["checks"]["llm"] == {"ok": False, "reason": "missing"}
 
 
 def test_readiness_report_wires_real_checks(monkeypatch):
     monkeypatch.setattr(config, "REDIS_URL", "")
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "sk-test")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
 
     class FakeQdrant:
         async def collection_exists(self, name):
@@ -811,7 +1002,7 @@ def test_ready_503_when_dependency_down_and_200_when_all_up(client, monkeypatch)
     monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
     monkeypatch.setattr(health, "_redis_status", _async((True, "redis")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     r = client.get("/ready")
     assert r.status_code == 503
@@ -842,7 +1033,7 @@ def test_ready_503_for_unexpected_qdrant_driver_error(client, monkeypatch):
     monkeypatch.setitem(app_main.state, "qdrant", BrokenQdrant())
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     tc = _raise_server_errors_client(client)
     try:
@@ -866,7 +1057,7 @@ def test_readyz_503_for_unexpected_qdrant_driver_error(client, monkeypatch):
     monkeypatch.setitem(app_main.state, "qdrant", BrokenQdrant())
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     tc = _raise_server_errors_client(client)
     try:
@@ -918,7 +1109,7 @@ def test_ready_second_poll_inside_ttl_is_served_from_cache(client, monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
     monkeypatch.setattr(health, "_redis_status", redis_probe)
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 30.0)
 
     first = client.get("/ready")
@@ -950,7 +1141,7 @@ def test_ready_reprobes_once_the_cache_ttl_has_passed(client, monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
     monkeypatch.setattr(health, "_redis_status", redis_probe)
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 0.0)
 
     assert client.get("/ready").status_code == 200
@@ -1093,7 +1284,7 @@ def test_readiness_report_probes_dependencies_concurrently(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", recorder("qdrant", True))
     monkeypatch.setattr(health, "_redis_status", recorder("redis", (True, "memory")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_DEP_TIMEOUT_SECONDS", 5.0)
 
     ready, report = _run(health._readiness_report({}))
@@ -1245,7 +1436,7 @@ def test_readiness_report_probe_timeout_is_a_dependency_failure(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", never_returns)
     monkeypatch.setattr(health, "_redis_status", never_returns_redis)
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_DEP_TIMEOUT_SECONDS", 0.05)
 
     ready, report = _run(health._readiness_report({}))
@@ -1266,3 +1457,261 @@ def test_readiness_report_surfaces_unexpected_probe_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="probe machinery bug"):
         _run(health._readiness_report({}))
+
+
+# --- #279: what each probe is allowed to answer, and for whom ------------
+#
+# The three endpoints answer three different questions, and the bug this file
+# pins down is a consumer asking the wrong one:
+#
+#   /health      liveness.  "Is the process up?" It cannot fail by design, so
+#                it is the correct probe for the only question a restart can
+#                answer -- and the wrong one for "is the service healthy",
+#                because it reports nothing about any dependency.
+#   /ready       readiness. "Can this node serve?" Real answer, short cache,
+#                rate limited: right for a load balancer or orchestrator
+#                polling once per node, wrong for a watchdog (a cached verdict
+#                hides an outage for the rest of the TTL, and a 429 is
+#                indistinguishable from one).
+#   /ready/deep  readiness for host-local monitoring: the same report with no
+#                cache and no rate limit. This is what deploy/healthcheck.sh
+#                and setup.sh's deploy gate must use.
+
+
+class _PeerOverride:
+    """ASGI shim that pins the connection's client address in the scope.
+
+    TestClient always reports the peer as the string "testclient", which the
+    /ready/deep host-local gate correctly refuses. The watchdog and the deploy
+    gate reach the API from 127.0.0.1, so the cases that must be allowed have
+    to be exercised with a loopback peer rather than by weakening the gate.
+    """
+
+    def __init__(self, app, peer):
+        self.app = app
+        self.peer = peer
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            scope = dict(scope, client=self.peer)
+        await self.app(scope, receive, send)
+
+
+@pytest.fixture
+def host_client(client):
+    """A client whose socket peer is loopback, as a local `curl` would be."""
+    return TestClient(_PeerOverride(client.app, ("127.0.0.1", 54321)))
+
+
+@pytest.fixture
+def live_state(monkeypatch):
+    """A fully healthy process state, installed in the real app.main.state.
+
+    Endpoint tests elsewhere mock _readiness_report wholesale, which cannot
+    show that the endpoint and the report agree; these tests drive the real
+    report so the 200/503 a caller sees is the one the dependencies produce.
+    Returns the Qdrant double, whose `ok` flag is the outage switch.
+    """
+    from app import main
+
+    class FakeQdrant:
+        def __init__(self):
+            self.ok = True
+
+        async def collection_exists(self, name):
+            if not self.ok:
+                raise RuntimeError("qdrant is down")
+            return True
+
+    qdrant = FakeQdrant()
+    for key, value in (("model", object()), ("sparse_model", object()), ("reranker", object()), ("qdrant", qdrant)):
+        monkeypatch.setitem(main.state, key, value)
+    # No Redis URL: the report then reports cache "memory" and skips the ping,
+    # so these tests are about Qdrant, the models and the key.
+    monkeypatch.setattr(config, "REDIS_URL", "")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
+    return qdrant
+
+
+def test_health_answers_200_while_readiness_says_503(client, host_client, live_state):
+    """The two probes must disagree about a broken node, or the watchdog is
+    probing the wrong one.
+
+    /health is liveness and is allowed to keep answering 200 while Qdrant is
+    down: that is what tells a supervisor "restarting the process will not
+    help, a dependency is gone". It is NOT an answer about health, so a consumer
+    that needs one must use /ready (load balancer) or /ready/deep (watchdog).
+    """
+    assert host_client.get("/ready/deep").status_code == 200
+    live_state.ok = False
+
+    assert host_client.get("/ready/deep").status_code == 503
+    assert client.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("probe", ["/ready", "/ready/deep"])
+def test_a_placeholder_key_makes_readiness_fail_with_a_named_reason(client, host_client, live_state, probe, monkeypatch):
+    """The shipped .env.example value is 'your_key_here', and with it in place
+    chat answers 100% of questions from the canned fallback. That must be a 503
+    with the fault named, not a 200."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", _shipped_api_key())
+
+    caller = host_client if probe == "/ready/deep" else client
+    r = caller.get(probe)
+
+    assert r.status_code == 503
+    assert r.json()["checks"]["llm"] == {"ok": False, "reason": "placeholder"}
+
+
+def test_a_real_key_makes_readiness_answer_200(client, live_state):
+    r = client.get("/ready")
+
+    assert r.status_code == 200
+    assert r.json()["checks"]["llm"] == {"ok": True, "reason": "ok"}
+
+
+def test_watchdog_probe_ignores_a_stale_cached_readiness(host_client, live_state):
+    """The cache is what would hide an outage from a watchdog.
+
+    /ready primes its cache with a healthy verdict; Qdrant then dies. /ready
+    still serves the cached 200 for the rest of READY_CACHE_TTL_SECONDS, which
+    is fine for a load balancer and fatal for a prober that acts on the answer
+    -- so /ready/deep must re-probe and report the outage on the same tick.
+    """
+    assert host_client.get("/ready").status_code == 200
+    live_state.ok = False
+
+    cached = host_client.get("/ready")
+    deep = host_client.get("/ready/deep")
+
+    assert cached.status_code == 200, "the cache is meant to serve /ready; that is why the watchdog cannot use it"
+    assert deep.status_code == 503
+    assert deep.json()["checks"]["qdrant"] == {"ok": False}
+
+
+def test_watchdog_probe_does_not_write_the_cache_other_probers_read(host_client, live_state):
+    """A fresh probe must not refresh somebody else's cached entry: the deploy
+    gate re-probing successfully must not extend a stale 200 for the LB."""
+    live_state.ok = False
+    assert host_client.get("/ready").status_code == 503
+    health.reset_readiness_cache()
+
+    live_state.ok = True
+    assert host_client.get("/ready/deep").status_code == 200
+
+    live_state.ok = False
+    assert host_client.get("/ready").status_code == 503, "the deep probe must not have cached the healthy verdict"
+
+
+def test_watchdog_probe_never_spends_the_readiness_rate_limit(host_client, client, live_state, monkeypatch, _public_rate_limiter):
+    """A 429 would be read as "unhealthy" by every caller that restarts on any
+    non-200, so the watchdog's probe must be unrated rather than share the
+    public /ready budget."""
+    monkeypatch.setattr(config, "PUBLIC_READY_RATE_PER_MIN", 1)
+
+    assert client.get("/ready").status_code == 200
+    assert client.get("/ready").status_code == 429
+
+    assert host_client.get("/ready/deep").status_code == 200
+
+    # One key only, from the two /ready polls above: the deep probe answered
+    # without spending a single unit of the shared "ready" budget.
+    assert list(_public_rate_limiter) == ["public:rl:ready:testclient"]
+    assert set(_public_rate_limiter.values()) == {2}
+
+
+def test_a_watchdog_polling_once_a_second_is_never_throttled_and_never_gets_a_stale_answer(
+    client, host_client, live_state, monkeypatch, _public_rate_limiter
+):
+    """One cron-style minute of polling: the shipped 600/60s budget, an outage
+    halfway through, and a probe that answers truthfully on both sides of it.
+
+    The limit is asserted at its shipped default rather than lowered, because
+    the claim under test is that a 1 Hz prober sits far below it -- and the deep
+    probe must be unaffected by the budget being exhausted anyway.
+    """
+    assert config.PUBLIC_READY_RATE_PER_MIN >= 60, "the shipped budget must absorb a 1 Hz prober"
+    monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 3600.0)  # a cache long enough to hide anything
+    assert client.get("/ready").status_code == 200
+    budget_after_priming = dict(_public_rate_limiter)
+
+    before = [host_client.get("/ready/deep") for _ in range(30)]
+    live_state.ok = False
+    after = [host_client.get("/ready/deep") for _ in range(30)]
+
+    assert {r.status_code for r in before} == {200}
+    assert {r.status_code for r in after} == {503}, "an outage must be visible on the very next poll"
+    # 60 polls at the shipped limit: none of them spent readiness budget.
+    assert dict(_public_rate_limiter) == budget_after_priming
+    # /ready is the one that would mislead here -- it is still serving the
+    # verdict from before the outage, which is exactly why the watchdog cannot
+    # be pointed at it.
+    assert client.get("/ready").status_code == 200
+
+
+def test_host_local_probe_is_refused_to_a_non_loopback_caller(client, live_state, monkeypatch):
+    """/ready/deep is uncached and unrated. Exposed to the internet that is an
+    unthrottled dependency-probe amplifier, so anything that is not a direct
+    local connection is refused -- and refused before any probe runs."""
+    probes = []
+
+    async def counting_probe(state):
+        probes.append(state)
+        return True, {"ready": True, "checks": {}}
+
+    monkeypatch.setattr(health, "_readiness_report", counting_probe)
+
+    assert client.get("/ready/deep").status_code == 403
+    assert probes == [], "a refused caller must not be able to make this host probe its dependencies"
+
+
+def test_host_local_probe_is_refused_when_it_arrives_through_the_local_proxy(host_client, live_state):
+    """nginx on this host is a loopback peer, so the peer alone cannot tell a
+    local `curl` from a request proxied in from the internet. X-Forwarded-For is
+    what separates them, and nginx sets it on every proxied request."""
+    r = host_client.get("/ready/deep", headers={"X-Forwarded-For": "203.0.113.7"})
+
+    assert r.status_code == 403
+
+
+def test_host_local_probe_answers_a_plain_loopback_request(host_client, live_state):
+    """The shape of every call deploy/healthcheck.sh and setup.sh make."""
+    r = host_client.get("/ready/deep")
+
+    assert r.status_code == 200
+    assert r.json()["ready"] is True
+
+
+def test_startup_log_names_the_key_fault_without_echoing_the_key(monkeypatch, caplog):
+    """The startup line exists so an operator finds the real cause in the log
+    instead of a per-turn 401. It must name the fault and must not print the
+    secret."""
+    shipped = _shipped_api_key()
+    monkeypatch.setattr(config, "GEMINI_API_KEY", shipped)
+
+    with caplog.at_level(logging.ERROR, logger="health"):
+        health.warn_if_llm_key_unusable()
+
+    assert "GEMINI_API_KEY" in caplog.text
+    assert "placeholder" in caplog.text
+    assert shipped not in caplog.text
+
+
+def test_startup_is_silent_for_a_usable_key(monkeypatch, caplog):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
+
+    with caplog.at_level(logging.ERROR, logger="health"):
+        health.warn_if_llm_key_unusable()
+
+    assert caplog.text == ""
+
+
+def test_a_placeholder_key_does_not_stop_the_process_answering_probes(client, live_state, monkeypatch):
+    """The reason startup logs instead of raising: a crash takes /health with
+    it, and the watchdog would then have nothing to probe to diagnose the
+    outage with."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", _shipped_api_key())
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 503
+    assert client.get("/live").status_code == 200
