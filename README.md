@@ -389,15 +389,59 @@ Backend tests (pytest, fully offline — mocked Qdrant/Redis/MySQL/LLM):
 
 ```bash
 cd backend
-pip install -r requirements-dev.txt
-python -m pytest tests -q
-python -m ruff check app scripts tests
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
+ruff check .
 ```
 
 Coverage: query-intent/date parsing, facet filter construction, effective intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, chat store (CRUD, ownership isolation, retention, token/cost stats), SSE streaming (small-talk short-circuit + full-turn deltas), index fingerprinting/delta/reconciliation, and cache TTL and degraded fallback.
 
-`.github/workflows/ci.yml` runs three gates on push/PR to `main`:
+`.github/workflows/ci.yml` runs three jobs on push/PR to `main`. Superseded
+runs are cancelled (concurrency group keyed on workflow + ref) and every job has
+an explicit timeout.
 
-1. **backend** — pytest + ruff on Python 3.11
-2. **frontend** — eslint, `tsc --noEmit`, production build on Node 22
-3. **security** — `pip-audit`, `npm audit --audit-level=high`, gitleaks secret scan
+1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest -rs`, which must report **zero skipped tests** (the job fails otherwise). lua5.1 is installed first: `tests/test_budget_lua.py` runs the real shipped `_BUDGET_LUA` under it and is the only thing that catches drift between that script and the Python spend-cap model, so a silent skip would leave the cap unverified. The job installs the *full* `requirements.txt` rather than a slimmed test set because `app/main.py` does `from fastembed import SparseTextEmbedding` at module scope and several test modules import `app.main`, so the suite cannot be collected without the runtime stack. (`app/encoders.py` and `app/reranker.py` import `fastembed`/`sentence_transformers` lazily inside their constructors, and their tests fake those modules in `sys.modules`.) There is deliberately **no `ruff format` gate** — `ruff format --check` reports files that would be reformatted, so enforcing it would mean reformatting the tree, not CI.
+2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest).
+3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan (binary pinned to 8.28.0, download SHA-256 verified) over the full history of the checked-out ref.
+
+### Audit policy
+
+**`pip-audit` fails the build on any advisory that is not explicitly ignored.**
+The only current findings are 7 starlette advisories (14 rows — the resolver
+reports each twice), all transitive: `fastapi==0.115.0` caps starlette below
+0.39, and every fixed starlette release (0.40.0 → 1.3.1) requires raising the
+FastAPI pin. Those 7 IDs are listed by name in the workflow; anything new fails
+immediately. Remove an ID from the list and the job goes red again — the waiver
+is an enumerated list of 7 advisory IDs, not a blanket suppression, and the
+list is **version-anchored**: every one is reachable only through
+`fastapi==0.115.0`, so raising that pin re-fails the gate by construction and the
+suppression cannot outlive its reason. Owner: whoever bumps the `fastapi` pin.
+Tracked by [#331](https://github.com/rishabh-yadav11/Search-nlp-rag/issues/331),
+review by 2026-12-27.
+
+The `transformers==5.10.1` pin (which fixes CVE-2026-4372 / CVE-2026-5241 /
+CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits
+**clean** — `pip-audit` reports no transformers findings. `requirements-dev.txt`
+also audits clean.
+
+**`npm audit --audit-level=high`** is the high boundary, which is the standard
+CI posture: the current 2 moderate findings (GHSA-82fw-gwwq-j7x9,
+`@vitest/mocker` path traversal; fix is vitest 5, a breaking change) sit below
+it and do not fail the build. A new high/critical advisory does.
+
+**gitleaks** runs the default rule set with **no allow-list and no
+`.gitleaks.toml`** — nothing is excluded, so a real key in any tracked file
+fails the job. The scan is pinned to `HEAD` rather than gitleaks' default
+`--all`: a `fetch-depth: 0` checkout has every branch in the object store, and
+`--all` reports secrets committed on unrelated branches, which would fail this
+job for code a PR never touched. `HEAD` loses nothing — a `pull_request`
+checkout is the merge commit, so its history contains both the branch and
+everything it branched off from. This branch scans clean (0 leaks).
+
+The scan reads committed history, not the working tree, so the gate was proved
+by committing a throwaway RSA private key on a scratch clone: gitleaks reported
+the leak and exited 1, and the identical command exits 0 without it. Note that
+a bare `aws_access_key_id = AKIA...` line — placeholder *or* realistic — and a
+synthetic `ghp_` token are both **not** flagged by the default 8.28.0 rules in
+this shape, so neither is a valid probe for "the gate can fail". Only the
+private-key block actually flipped it.
