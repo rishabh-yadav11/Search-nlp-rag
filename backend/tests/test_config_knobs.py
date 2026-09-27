@@ -159,3 +159,30 @@ def test_scan_actually_sees_knob_references():
         "the reference scan is broken and test_every_config_knob_is_read_somewhere "
         "is passing vacuously"
     )
+
+
+def test_ranking_tuning_knobs_agree_with_the_shipped_env_template(parse_config):
+    """A knob the template quotes at a value the code does not default to is a
+    promise to the operator that does not hold on a fresh deploy: copying
+    .env.example sets the knob to something other than the shipped default,
+    silently. Same convention as the cost-budget default in
+    test_cost_budget.py.
+
+    The five knobs below are the ones issue #300 moved out of module scope;
+    the module-level recency weights and the weak-result threshold had no
+    template entry at all before, so there was nothing to disagree with.
+    """
+    shipped = parse_config()
+    example = (BACKEND / ".env.example").read_text()
+    drifted = [
+        name
+        for name in (
+            "RECENCY_BOOST_STRENGTH",
+            "RECENCY_BOOST_DECAY_DAYS",
+            "WEAK_RESULT_SCORE",
+            "WEAK_RESULT_MIN_STRONG",
+            "DATE_FILLER_SCORE",
+        )
+        if f"{name}={getattr(shipped, name)}" not in example
+    ]
+    assert not drifted, f".env.example disagrees with the shipped default of: {drifted}"

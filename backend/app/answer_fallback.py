@@ -41,14 +41,16 @@ def results_are_weak(scores: list[float], limit: int | None = None) -> bool:
     config.WEAK_RESULT_SCORE, i.e. retrieval is too weak to answer the query.
 
     ``limit`` defaults to config.WEAK_RESULT_MIN_STRONG and is capped at the
-    number of available scores (min 1): a topic with only 1-2 strong matches
-    in the corpus is NOT treated as weak — refusing to answer then would
-    suppress every narrow/niche question. An empty scores list still counts
-    as weak."""
+    number of available scores, never below 1: a topic with only 1-2 strong
+    matches in the corpus is NOT treated as weak — refusing to answer then
+    would suppress every narrow/niche question. The floor of 1 also keeps a
+    nonsensical WEAK_RESULT_MIN_STRONG (<= 0) from opening the gate on
+    everything. An empty scores list still counts as weak."""
     if not scores:
         return True
     strong = sum(1 for s in scores if s > config.WEAK_RESULT_SCORE)
-    return strong < min(config.WEAK_RESULT_MIN_STRONG if limit is None else limit, len(scores))
+    needed = max(1, min(config.WEAK_RESULT_MIN_STRONG if limit is None else limit, len(scores)))
+    return strong < needed
 
 
 def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:

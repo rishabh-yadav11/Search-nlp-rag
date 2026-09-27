@@ -410,69 +410,57 @@ def _date_window_articles():
 
 
 def test_date_fillers_take_their_own_knob(monkeypatch):
-    """The relevance floor handed to date-only fillers is its own knob: an
-    operator retuning it must move the fillers, and nothing else."""
+    """The relevance floor handed to date-only fillers is its own knob, read
+    where the articles are built: retuning it must move the fillers, and
+    nothing else. Pinned to the shipped 0.2 first so a developer .env cannot
+    decide the starting expectation (the default itself is asserted against a
+    clean parse below)."""
     _date_window_qdrant(monkeypatch)
+    monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.2)
     assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
 
     monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.05)
     assert [a.score for a in _date_window_articles()] == [0.05, 0.05]
 
 
-def test_date_filler_score_is_not_aliased_to_the_inclusion_gate(monkeypatch):
-    """Regression (issue #300): _DATE_FILLER_SCORE was `config.ASK_MIN_SCORE`
-    captured at import, so the filler floor and the chat inclusion gate were
-    one knob with two names -- retuning either silently moved the other. A
-    fresh read of the gate must leave the fillers where they are."""
+def test_date_fillers_do_not_follow_the_inclusion_gate_at_the_call_site(monkeypatch):
+    """Regression (issue #300), call-site half: the floor must not be
+    re-derived from config.ASK_MIN_SCORE where the articles are built, which
+    would drag every date-only filler up the moment an operator retuned the
+    gate. The import-time capture the issue found is what
+    test_date_fillers_take_their_own_knob pins (a module-level constant bound
+    before the test runs cannot follow a monkeypatched knob at all)."""
     _date_window_qdrant(monkeypatch)
+    monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.2)
     monkeypatch.setattr(main.config, "ASK_MIN_SCORE", 0.9)
     assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
 
 
-def test_date_filler_default_equals_the_gate_it_used_to_alias(monkeypatch):
+def test_date_filler_knob_ships_the_value_the_alias_resolved_to(parse_config):
     """Default configuration must be byte-identical to the pre-#300 behaviour:
-    the alias resolved to ASK_MIN_SCORE's own 0.2 default out of the box."""
-    assert main.config.ASK_MIN_SCORE == 0.2
-    assert main.config.DATE_FILLER_SCORE == main.config.ASK_MIN_SCORE
+    _DATE_FILLER_SCORE = config.ASK_MIN_SCORE resolved to ASK_MIN_SCORE's own
+    0.2 default out of the box, and the two shipped defaults stay equal."""
+    shipped = parse_config()
+    assert shipped.ASK_MIN_SCORE == 0.2
+    assert shipped.DATE_FILLER_SCORE == 0.2
 
 
-def _config_parsed_with(monkeypatch, **env):
-    """The config class app would build from `env`, from a private load of
-    config.py under a controlled environment.
-
-    The knobs named in `env` are cleared from the ambient environment first:
-    an operator's shell export or a developer's .env must not decide what
-    this test concludes. The load is private, so no other module's config
-    object is disturbed.
-    """
-    import importlib.util
-    from pathlib import Path
-
-    for name, value in env.items():
-        monkeypatch.delenv(name, raising=False)
-        monkeypatch.setenv(name, value)
-    path = Path(main.__file__).with_name("config.py")
-    spec = importlib.util.spec_from_file_location("config_probe_date_filler", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.config
-
-
-def test_retuning_the_inclusion_gate_does_not_move_the_date_filler_floor(monkeypatch):
+def test_retuning_the_inclusion_gate_does_not_move_the_date_filler_floor(parse_config):
     """The deployment-level half of the #300 regression. A shipped .env that
     raises ASK_MIN_SCORE to 0.9 must not drag the date-only fillers up with
     it: with the old import-time alias the filler floor followed the gate into
-    every window query."""
-    parsed = _config_parsed_with(monkeypatch, ASK_MIN_SCORE="0.9")
+    every window query. Parsed from `ASK_MIN_SCORE=0.9` and nothing else, so
+    the result cannot be an echo of this machine's own .env."""
+    parsed = parse_config(ASK_MIN_SCORE="0.9")
     assert parsed.ASK_MIN_SCORE == 0.9
     assert parsed.DATE_FILLER_SCORE == 0.2
 
 
-def test_date_filler_floor_is_tunable_from_the_environment(monkeypatch):
+def test_date_filler_floor_is_tunable_from_the_environment(parse_config):
     """...and it is a real knob, not a constant with a new name: the shipped
     template's value is what the app parses when an operator sets it."""
-    parsed = _config_parsed_with(monkeypatch, DATE_FILLER_SCORE="0.45")
-    assert parsed.DATE_FILLER_SCORE == 0.45
+    assert parse_config(DATE_FILLER_SCORE="0.45").DATE_FILLER_SCORE == 0.45
+
 
 # --- body_rescue ---
 

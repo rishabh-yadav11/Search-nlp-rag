@@ -503,10 +503,17 @@ class Config:
     ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
     # Answerability gates (app/answer_fallback.py). WEAK_RESULT_SCORE is the
     # score a reranked hit must exceed to count as "strong", and
-    # WEAK_RESULT_MIN_STRONG is how many strong hits the head of the list needs
-    # before chat answers instead of falling back. Deliberately separate knobs
+    # WEAK_RESULT_MIN_STRONG is how many strong hits a result list must hold
+    # before it is reported as weakly answered. Deliberately separate knobs
     # from ASK_MIN_SCORE above: that gate decides *inclusion*, this pair decides
     # whether what survived inclusion is strong enough to answer.
+    #
+    # The count is capped at the length of the list and floored at 1
+    # (app/answer_fallback.py:results_are_weak), so a deployment that raises
+    # this above the number of results a caller passes sees no change -- the
+    # /search weak note passes the whole result list and is the caller this
+    # knob actually moves; chat's fallback passes at most one source, where
+    # the count is always 1. A value of 0 or less behaves as 1.
     WEAK_RESULT_SCORE = float(os.getenv("WEAK_RESULT_SCORE", "0.3"))
     WEAK_RESULT_MIN_STRONG = int(os.getenv("WEAK_RESULT_MIN_STRONG", "3"))
     # Score handed to every date-only fallback filler
@@ -516,6 +523,10 @@ class Config:
     # ASK_MIN_SCORE, so retuning the gate silently moved the filler floor too.
     # The default reproduces the value the alias resolved to out of the box
     # (ASK_MIN_SCORE's own 0.2 default), so the shipped ranking is unchanged.
+    # The two are now independent, which means this floor must be kept at or
+    # above ASK_MIN_SCORE for fillers to survive the chat gate that filters
+    # sources by score; raise the gate without raising this and the temporal
+    # fallback stops reaching the model.
     DATE_FILLER_SCORE = float(os.getenv("DATE_FILLER_SCORE", "0.2"))
 
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
