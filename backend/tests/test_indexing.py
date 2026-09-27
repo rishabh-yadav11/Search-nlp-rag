@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 import update_index
 from update_index import fingerprint, load_state, save_state, sync_delta
@@ -150,6 +152,83 @@ def test_sync_delta_empty_state_is_all_new():
     assert new == {1, 2}
     assert changed == set()
     assert deleted == set()
+
+
+def _legacy_fingerprint(rec: dict) -> str:
+    """The fingerprint as the PREVIOUS 9-field version computed it.
+
+    Spelled out field by field rather than derived from ``fingerprint`` so this
+    stays a genuine reconstruction of the old state file: deriving it from the
+    current function would make the test pass no matter what the code does.
+    """
+    raw = "|".join(
+        [
+            rec.get("title") or "",
+            rec.get("summary") or "",
+            rec.get("url") or "",
+            rec.get("published_date") or "",
+            rec.get("category") or "",
+            rec.get("body") or "",
+            ",".join(rec.get("author_names") or []),
+            ",".join(rec.get("industry_names") or []),
+            ",".join(rec.get("dealtype_names") or []),
+        ]
+    )
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def test_adding_content_type_to_the_fingerprint_requeues_the_whole_corpus():
+    """Pin the one-time consequence instead of leaving it to a comment.
+
+    Adding a term to fingerprint() re-hashes every record, so a state file
+    written by the previous version matches NOTHING and the first sync after
+    this ships re-embeds the entire corpus. This is the behaviour the operator
+    note and the start-up WARNING describe; asserting it here is what stops the
+    note from quietly becoming false.
+    """
+    records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 6)}
+    legacy_state = {
+        "updated_at": "2026-08-13T00:00:00+00:00",
+        "fingerprints": {str(i): _legacy_fingerprint(r) for i, r in records.items()},
+    }
+
+    # Sanity: the legacy hash is genuinely the old scheme, not the current one.
+    assert legacy_state["fingerprints"]["1"] != fingerprint(records[1])
+
+    new, changed, deleted = sync_delta(legacy_state, records)
+
+    assert new == set(), "no rows were added, so nothing should be 'new'"
+    assert deleted == set(), "no rows were removed, so nothing should be 'deleted'"
+    assert changed == set(records), (
+        "every stored fingerprint predates the content_type term, so the whole "
+        "corpus is re-queued for re-embedding; this is the one-time cost the "
+        "operator note and --init remedy exist to avoid"
+    )
+
+
+def test_init_reseed_clears_the_requeue():
+    """The --init remedy: re-seeding from current rows leaves nothing to embed.
+
+    --init stores fingerprints computed by the CURRENT function, so after it the
+    corpus is no longer re-queued. This is the whole reason the operator remedy
+    works, so it is asserted rather than assumed.
+    """
+    records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 6)}
+    legacy_state = {
+        "updated_at": None,
+        "fingerprints": {str(i): _legacy_fingerprint(r) for i, r in records.items()},
+    }
+
+    # What --init writes.
+    reseeded = {"updated_at": None, "fingerprints": {str(i): fingerprint(r) for i, r in records.items()}}
+
+    # Contrast: the legacy state re-queues, the re-seeded one does not. That
+    # difference is the entire value of the --init remedy.
+    assert sync_delta(legacy_state, records)[1] == set(records)
+
+    new, changed, deleted = sync_delta(reseeded, records)
+
+    assert (new, changed, deleted) == (set(), set(), set())
 
 
 def test_load_state_default_when_missing(tmp_path, monkeypatch):

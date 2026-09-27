@@ -10,12 +10,17 @@ This script fixes the points that are ALREADY in the collection, in place, with
 no re-embedding and no collection rebuild — dense/sparse vectors are untouched
 because the payload is metadata only.
 
-Idempotent by key presence, not by value: a point is skipped when its payload
-already has a `content_type` key at all, including the empty string an article
-with no content type in MySQL legitimately gets. Key presence (not truthiness)
-is the marker, so a second run after a complete first run writes nothing.
+Idempotent by stored VALUE, not key presence: a point is skipped when its
+payload's `content_type` is not None. So the empty string an article with no
+content type in MySQL legitimately gets is left alone and never rewritten, and a
+second run after a complete first run writes nothing. A stored JSON `null` is
+treated as missing and re-written to "" — that is deliberate, since make_point
+never stores null and normalising it is what keeps the KEYWORD-indexed field
+single-typed.
 
-Safe to rehearse: `--dry-run` reports what would change and writes nothing.
+Safe to rehearse: `--dry-run` reports what would change and touches nothing —
+it writes no payload AND creates no payload index (indexing is a schema change,
+so a rehearsal that indexes fields would not be a rehearsal).
 
 Usage:
     python scripts/backfill_content_type.py --dry-run   # rehearse
