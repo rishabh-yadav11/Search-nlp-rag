@@ -873,14 +873,6 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
     return articles
 
 
-# Stronger recency weighting applied when the query expresses a recency intent
-# ('latest', 'recent', 'fresh'), so old evergreen articles are pushed below
-# newer ones instead of surfacing on relevance alone. Hard-window phrases
-# ('this week') are filtered separately and are not part of this boost.
-RECENCY_BOOST_STRENGTH = 0.85
-RECENCY_BOOST_DECAY_DAYS = 30.0
-
-
 def _recency_multiplier(
     published_date: str | None,
     recency_strength: float = config.RECENCY_STRENGTH,
@@ -922,8 +914,8 @@ def sort_results(
     then published_date desc (missing dates last). When ``recency_boost`` is set
     (a recency intent like 'latest'/'recent'), freshness is weighted far more
     heavily so old evergreen articles rank below recent ones."""
-    strength = RECENCY_BOOST_STRENGTH if recency_boost else config.RECENCY_STRENGTH
-    decay = RECENCY_BOOST_DECAY_DAYS if recency_boost else config.RECENCY_DECAY_DAYS
+    strength = config.RECENCY_BOOST_STRENGTH if recency_boost else config.RECENCY_STRENGTH
+    decay = config.RECENCY_BOOST_DECAY_DAYS if recency_boost else config.RECENCY_DECAY_DAYS
     results.sort(
         key=lambda a: (
             a.score * _recency_multiplier(a.published_date, strength, decay),
@@ -1108,13 +1100,6 @@ async def retrieve_with_auto_facet_fallback(
 # a date window, the window's own recency-sorted articles are used to fill it.
 _TEMPORAL_FALLBACK_MIN = 3
 
-# Date-only fallback fillers score at a modest floor: at/below the chat relevance
-# gate but strictly below the typical lexical/cross-encoder relevance band (real
-# relevant hits sigmoid-score well above the gate). This lets fillers still clear
-# the chat gate and surface in context without ever outranking a genuine lexical
-# match, and (via _merge_results' body preference) never drops an article body.
-_DATE_FILLER_SCORE = config.ASK_MIN_SCORE
-
 
 async def _temporal_date_fallback(
     results: list[SourceArticle],
@@ -1199,8 +1184,13 @@ async def retrieve_by_date_window(
             # Score on a recency-agnostic base; the recency multiplier is applied
             # exactly once in sort_results so merged results share one scale with
             # lexical (cross-encoder) hits instead of double-counting recency.
-            # _DATE_FILLER_SCORE keeps these below genuine lexical hits.
-            score=_DATE_FILLER_SCORE,
+            # config.DATE_FILLER_SCORE keeps these below genuine lexical hits.
+            # Date-only fillers sit at a modest floor: at/below the chat
+            # relevance gate but strictly below the typical lexical
+            # (cross-encoder) band, so they still clear the gate and surface in
+            # context without ever outranking a genuine lexical match (and, via
+            # _merge_results' body preference, never drop an article body).
+            score=config.DATE_FILLER_SCORE,
         )
         for p in points
     ]

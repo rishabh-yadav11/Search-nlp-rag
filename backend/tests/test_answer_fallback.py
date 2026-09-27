@@ -2,12 +2,12 @@
 import pytest
 
 from app.answer_fallback import (
-    TOP_WEAK_THRESHOLD,
     date_label,
     fallback_answer,
     results_are_weak,
     weak_results_note,
 )
+from app.config import config
 
 
 def test_results_are_weak_all_low_scores():
@@ -43,9 +43,44 @@ def test_results_are_weak_custom_limit():
 
 
 def test_results_are_weak_edge_near_threshold():
-    assert results_are_weak([TOP_WEAK_THRESHOLD] * 3) is True
-    assert results_are_weak([TOP_WEAK_THRESHOLD + 0.001] * 3) is False
+    assert results_are_weak([config.WEAK_RESULT_SCORE] * 3) is True
+    assert results_are_weak([config.WEAK_RESULT_SCORE + 0.001] * 3) is False
     assert results_are_weak([0.31, 0.31, 0.29]) is True
+
+
+def test_weak_result_knob_defaults_match_the_pre_knob_constants():
+    """Issue #300 moved the answerability gate out of answer_fallback.py's
+    module scope. The defaults must be exactly the literals that lived there
+    (0.3 and 3), or every chat refusal moves the moment the branch lands."""
+    assert config.WEAK_RESULT_SCORE == 0.3
+    assert config.WEAK_RESULT_MIN_STRONG == 3
+    # 0.3 exclusive-above and limit 3: the shipped decision on a fixed input.
+    assert results_are_weak([0.31, 0.31, 0.31]) is False
+    assert results_are_weak([0.31, 0.31, 0.29]) is True
+
+
+def test_weak_result_score_knob_moves_the_answerability_decision(monkeypatch):
+    """Raising the score a hit must clear must start refusing hits it used to
+    accept -- otherwise the knob is a promise no code keeps."""
+    assert results_are_weak([0.4, 0.4, 0.4]) is False
+    monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.5)
+    assert results_are_weak([0.4, 0.4, 0.4]) is True
+    monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.1)
+    assert results_are_weak([0.15, 0.15, 0.15]) is False
+
+
+def test_weak_result_min_strong_knob_moves_the_answerability_decision(monkeypatch):
+    """The default ``limit`` must come from the knob, not a literal baked into
+    the signature: a deployment that wants two strong hits must get them."""
+    scores = [0.9, 0.9, 0.05]
+    assert results_are_weak(scores) is True
+    monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", 2)
+    assert results_are_weak(scores) is False
+    # An explicit limit still wins over the knob (chat/tests pass their own).
+    assert results_are_weak(scores, limit=3) is True
+    # ...and the knob cannot make a short list look strong: 1 available score
+    # is always enough for itself.
+    assert results_are_weak([0.9], limit=None) is False
 
 
 def test_fallback_answer_contains_query_and_is_nonempty():

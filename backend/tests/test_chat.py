@@ -2488,7 +2488,7 @@ def test_prepare_turn_faceted_low_score_surfaces(monkeypatch):
 
 def test_prepare_turn_multiple_moderate_sources_not_weak(monkeypatch):
     """Regression (issue #196): a query whose several on-topic sources each
-    score only modestly above the inclusion gate (but below TOP_WEAK_THRESHOLD)
+    score only modestly above the inclusion gate (but below WEAK_RESULT_SCORE)
     must still be answered, not refused as 'weakly related'. Retrieval with
     several relevant sources is genuinely sufficient."""
     from app import main

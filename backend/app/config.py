@@ -501,6 +501,23 @@ class Config:
     # category queries (e.g. 'funding news in jun 2025') surface their matches
     # instead of being rejected as "weakly related".
     ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
+    # Answerability gates (app/answer_fallback.py). WEAK_RESULT_SCORE is the
+    # score a reranked hit must exceed to count as "strong", and
+    # WEAK_RESULT_MIN_STRONG is how many strong hits the head of the list needs
+    # before chat answers instead of falling back. Deliberately separate knobs
+    # from ASK_MIN_SCORE above: that gate decides *inclusion*, this pair decides
+    # whether what survived inclusion is strong enough to answer.
+    WEAK_RESULT_SCORE = float(os.getenv("WEAK_RESULT_SCORE", "0.3"))
+    WEAK_RESULT_MIN_STRONG = int(os.getenv("WEAK_RESULT_MIN_STRONG", "3"))
+    # Score handed to every date-only fallback filler
+    # (app/main.py:retrieve_by_date_window) when a temporal query's lexical
+    # signal is too weak to fill the window. Its own knob rather than a shared
+    # one with the inclusion gate above: it used to be an import-time alias of
+    # ASK_MIN_SCORE, so retuning the gate silently moved the filler floor too.
+    # The default reproduces the value the alias resolved to out of the box
+    # (ASK_MIN_SCORE's own 0.2 default), so the shipped ranking is unchanged.
+    DATE_FILLER_SCORE = float(os.getenv("DATE_FILLER_SCORE", "0.2"))
+
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
     # Byte budget for the in-process fallback cache (the HybridCache degrades to
@@ -528,6 +545,15 @@ class Config:
     # so fresher news ranks higher; missing dates get no boost.
     RECENCY_STRENGTH = float(os.getenv("RECENCY_STRENGTH", "0.25"))
     RECENCY_DECAY_DAYS = float(os.getenv("RECENCY_DECAY_DAYS", "90"))
+    # Stronger recency weighting applied when the query itself expresses a
+    # recency intent ('latest', 'recent', 'fresh'), so old evergreen articles
+    # drop below newer ones instead of surfacing on relevance alone. Hard-window
+    # phrases ('this week') are filtered separately and get no boost. This is
+    # the branch that decides whether a "latest" query surfaces new news, so it
+    # is a tuning knob beside the baseline pair above rather than a literal in
+    # app/main.py. The defaults are the values that were hardcoded there.
+    RECENCY_BOOST_STRENGTH = float(os.getenv("RECENCY_BOOST_STRENGTH", "0.85"))
+    RECENCY_BOOST_DECAY_DAYS = float(os.getenv("RECENCY_BOOST_DECAY_DAYS", "30.0"))
 
     # Retrieval-quality tuning (see app/query_expand.py, app/rerank_boost.py,
     # app/answer_fallback.py, app/query_fix.py). Toggles can be disabled per-deployment.

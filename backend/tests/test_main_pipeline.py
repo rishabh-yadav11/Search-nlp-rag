@@ -384,6 +384,96 @@ def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch, fake_cache)
     # The field must actually be requested from Qdrant, not merely mapped.
     assert "content_type" in qdrant.query_points_calls[0]["with_payload"]
 
+
+# --- retrieve_by_date_window (date-only fallback fillers) ---
+
+
+def _date_window_qdrant(monkeypatch):
+    """A scroll page of two window articles, newest first, as Qdrant returns
+    them under the published_date order_by."""
+    page = (
+        [
+            _Point(11, {"title": "Newer", "published_date": "2025-06-02T00:00:00"}),
+            _Point(12, {"title": "Older", "published_date": "2025-05-02T00:00:00"}),
+        ],
+        None,
+    )
+    # Two copies: the knob tests call the real retrieval twice, and the fake
+    # hands out one page per call.
+    qdrant = _FakeQdrant(scroll_pages=[page, page])
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+    return qdrant
+
+
+def _date_window_articles():
+    return _run(main.retrieve_by_date_window(top_k=5, from_date="2025-05-01", to_date="2025-06-30"))
+
+
+def test_date_fillers_take_their_own_knob(monkeypatch):
+    """The relevance floor handed to date-only fillers is its own knob: an
+    operator retuning it must move the fillers, and nothing else."""
+    _date_window_qdrant(monkeypatch)
+    assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
+
+    monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.05)
+    assert [a.score for a in _date_window_articles()] == [0.05, 0.05]
+
+
+def test_date_filler_score_is_not_aliased_to_the_inclusion_gate(monkeypatch):
+    """Regression (issue #300): _DATE_FILLER_SCORE was `config.ASK_MIN_SCORE`
+    captured at import, so the filler floor and the chat inclusion gate were
+    one knob with two names -- retuning either silently moved the other. A
+    fresh read of the gate must leave the fillers where they are."""
+    _date_window_qdrant(monkeypatch)
+    monkeypatch.setattr(main.config, "ASK_MIN_SCORE", 0.9)
+    assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
+
+
+def test_date_filler_default_equals_the_gate_it_used_to_alias(monkeypatch):
+    """Default configuration must be byte-identical to the pre-#300 behaviour:
+    the alias resolved to ASK_MIN_SCORE's own 0.2 default out of the box."""
+    assert main.config.ASK_MIN_SCORE == 0.2
+    assert main.config.DATE_FILLER_SCORE == main.config.ASK_MIN_SCORE
+
+
+def _config_parsed_with(monkeypatch, **env):
+    """The config class app would build from `env`, from a private load of
+    config.py under a controlled environment.
+
+    The knobs named in `env` are cleared from the ambient environment first:
+    an operator's shell export or a developer's .env must not decide what
+    this test concludes. The load is private, so no other module's config
+    object is disturbed.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    for name, value in env.items():
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, value)
+    path = Path(main.__file__).with_name("config.py")
+    spec = importlib.util.spec_from_file_location("config_probe_date_filler", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.config
+
+
+def test_retuning_the_inclusion_gate_does_not_move_the_date_filler_floor(monkeypatch):
+    """The deployment-level half of the #300 regression. A shipped .env that
+    raises ASK_MIN_SCORE to 0.9 must not drag the date-only fillers up with
+    it: with the old import-time alias the filler floor followed the gate into
+    every window query."""
+    parsed = _config_parsed_with(monkeypatch, ASK_MIN_SCORE="0.9")
+    assert parsed.ASK_MIN_SCORE == 0.9
+    assert parsed.DATE_FILLER_SCORE == 0.2
+
+
+def test_date_filler_floor_is_tunable_from_the_environment(monkeypatch):
+    """...and it is a real knob, not a constant with a new name: the shipped
+    template's value is what the app parses when an operator sets it."""
+    parsed = _config_parsed_with(monkeypatch, DATE_FILLER_SCORE="0.45")
+    assert parsed.DATE_FILLER_SCORE == 0.45
+
 # --- body_rescue ---
 
 

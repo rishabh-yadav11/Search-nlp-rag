@@ -1,7 +1,7 @@
 import calendar
 import re
 
-TOP_WEAK_THRESHOLD = 0.3
+from app.config import config
 
 _MONTH_NAMES = {
     1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
@@ -36,18 +36,19 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
     return None
 
 
-def results_are_weak(scores: list[float], limit: int = 3) -> bool:
+def results_are_weak(scores: list[float], limit: int | None = None) -> bool:
     """True when fewer than `limit` of the top reranked scores exceed
-    TOP_WEAK_THRESHOLD, i.e. retrieval is too weak to answer the query.
+    config.WEAK_RESULT_SCORE, i.e. retrieval is too weak to answer the query.
 
-    ``limit`` is capped at the number of available scores (min 1): a topic with
-    only 1-2 strong matches in the corpus is NOT treated as weak — refusing to
-    answer then would suppress every narrow/niche question. An empty scores
-    list still counts as weak."""
+    ``limit`` defaults to config.WEAK_RESULT_MIN_STRONG and is capped at the
+    number of available scores (min 1): a topic with only 1-2 strong matches
+    in the corpus is NOT treated as weak — refusing to answer then would
+    suppress every narrow/niche question. An empty scores list still counts
+    as weak."""
     if not scores:
         return True
-    strong = sum(1 for s in scores if s > TOP_WEAK_THRESHOLD)
-    return strong < min(limit, len(scores))
+    strong = sum(1 for s in scores if s > config.WEAK_RESULT_SCORE)
+    return strong < min(config.WEAK_RESULT_MIN_STRONG if limit is None else limit, len(scores))
 
 
 def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:

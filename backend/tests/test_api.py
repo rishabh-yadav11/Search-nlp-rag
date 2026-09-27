@@ -124,6 +124,66 @@ def test_sort_results_full_ordering(monkeypatch):
     assert [a.id for a in out] == [1, 2, 3]
 
 
+def _blend_key(article: SourceArticle, strength: float, decay: float) -> tuple[float, str]:
+    """The exact key sort_results ranks on, recomputed from literals."""
+    dt = _dt.fromisoformat(article.published_date).replace(tzinfo=UTC)
+    age_days = (_dt(2026, 8, 13, tzinfo=UTC) - dt).total_seconds() / 86400.0
+    return (
+        article.score * (1.0 - strength * (1.0 - math.exp(-age_days / decay))),
+        article.published_date,
+    )
+
+
+def test_recency_boost_defaults_reproduce_the_pre_knob_ranking(monkeypatch):
+    """Issue #300 moved the recency-boost weights out of app/main.py's module
+    scope into config. The shipped ranking must be unchanged: with no env
+    override, sort_results must produce exactly the order the hardcoded
+    RECENCY_BOOST_STRENGTH=0.85 / RECENCY_BOOST_DECAY_DAYS=30.0 produced."""
+    monkeypatch.setattr(main, "datetime", _FrozenNow)
+    assert main.config.RECENCY_BOOST_STRENGTH == 0.85
+    assert main.config.RECENCY_BOOST_DECAY_DAYS == 30.0
+
+    articles = [
+        _article(1, 0.25, "2026-08-01"),
+        _article(2, 1.0, "2025-01-01"),
+        _article(3, 0.9, "2015-01-01"),
+        _article(4, 0.1, "2026-08-10"),
+    ]
+    expected = sorted(articles, key=lambda a: _blend_key(a, 0.85, 30.0), reverse=True)
+    out = sort_results(articles, recency_boost=True)
+    assert [a.id for a in out] == [a.id for a in expected]
+    # A boost that only ever produced relevance order would pass the same
+    # comparison, so pin that it really is re-ordering relative to no boost.
+    assert [a.id for a in out] != [
+        a.id for a in sorted(articles, key=lambda a: (a.score, a.published_date), reverse=True)
+    ]
+
+
+def test_recency_boost_strength_knob_moves_the_ranking(monkeypatch):
+    """Strength is what decides whether a 'latest' query surfaces new news, so
+    turning it off must hand ranking back to raw relevance."""
+    monkeypatch.setattr(main, "datetime", _FrozenNow)
+    recent = _article(1, 0.25, "2026-08-01")
+    old = _article(2, 1.0, "2025-01-01")
+    assert [a.id for a in sort_results([old, recent], recency_boost=True)] == [1, 2]
+
+    monkeypatch.setattr(main.config, "RECENCY_BOOST_STRENGTH", 0.0)
+    assert [a.id for a in sort_results([old, recent], recency_boost=True)] == [2, 1]
+
+
+def test_recency_boost_decay_knob_moves_the_ranking(monkeypatch):
+    """Decay sets how fast the boost ages an article out. A longer decay keeps
+    a moderately old hit competitive with a much older, higher-scoring one;
+    the default decay does not. Both knobs must reach sort_results."""
+    monkeypatch.setattr(main, "datetime", _FrozenNow)
+    recent = _article(1, 0.2, "2026-08-01")
+    old = _article(2, 1.0, "2025-01-01")
+    assert [a.id for a in sort_results([old, recent], recency_boost=True)] == [2, 1]
+
+    monkeypatch.setattr(main.config, "RECENCY_BOOST_DECAY_DAYS", 90.0)
+    assert [a.id for a in sort_results([old, recent], recency_boost=True)] == [1, 2]
+
+
 class _FakeReranker:
     def __init__(self, logits):
         self.logits = logits
