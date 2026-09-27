@@ -270,12 +270,36 @@ server {
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-    location /search    { proxy_pass http://127.0.0.1:8001; }
-    location /facets    { proxy_pass http://127.0.0.1:8001; }
+    # The per-IP rate limiter on /search, /facets, /analytics/click and /ready
+    # keys on the client IP these headers carry. Without them every proxied
+    # request looks like 127.0.0.1 and the whole site shares one rate-limit bucket.
+    # These headers are trusted by default here: with the peer being loopback
+    # the API reads the forwarded client IP (AUTH_TRUST_X_FORWARDED_FOR=auto,
+    # the shipped default). A client hitting :8001 directly is its own
+    # non-loopback peer, so the same header is ignored for it and cannot be
+    # used to dodge a rate limit.
+    location /search {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /facets {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
     location /health    { proxy_pass http://127.0.0.1:8001; }
     location /live      { proxy_pass http://127.0.0.1:8001; }
-    location /ready     { proxy_pass http://127.0.0.1:8001; }
-    location /readyz    { proxy_pass http://127.0.0.1:8001; }
+    location /ready {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /readyz {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
     location /api {
         proxy_pass http://127.0.0.1:8001;
         proxy_read_timeout 300s;
@@ -284,8 +308,16 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
-    location /recommend/ { proxy_pass http://127.0.0.1:8001; }
-    location /analytics/click   { proxy_pass http://127.0.0.1:8001; }
+    location /recommend/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /analytics/click {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
     location /analytics/summary { proxy_pass http://127.0.0.1:8001; }
     location /analytics/chat    { proxy_pass http://127.0.0.1:8001; }
     location /analytics { proxy_pass http://127.0.0.1:3000; }

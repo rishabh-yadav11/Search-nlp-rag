@@ -14,6 +14,21 @@ os.environ.setdefault("OMP_NUM_THREADS", str(_TORCH_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(_TORCH_THREADS))
 
 
+def _env_tristate(name: str) -> bool | None:
+    """Read a three-state boolean env var: True/False force a behaviour, None
+    means "auto" (the variable is unset, or says so explicitly).
+
+    An unrecognised value falls back to None rather than to a forced side, so
+    a typo in an operator's .env can never silently pick the unsafe one.
+    """
+    raw = os.getenv(name, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
 class Config:
     # MySQL
     MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
@@ -127,10 +142,25 @@ class Config:
     ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
+    # Byte budget for the in-process fallback cache (the HybridCache degrades to
+    # a per-worker LRU when Redis is unreachable). The entry cap alone cannot
+    # bound memory because the shared cache mixes small search-result payloads
+    # with large embedding vectors (768 floats as JSON, ~15KB each): a handful
+    # of vectors would otherwise consume the whole entry budget and thrash out
+    # the many small entries. Eviction therefore drops the largest entries first
+    # until the total is back under this budget.
+    CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", "33554432"))
     # TTL for cached query (dense+sparse) vectors, keyed by the embedding model
     # so a model change invalidates them automatically. Long is safe: the pair
     # for a given query string is deterministic and stable for a fixed index.
     VECTOR_CACHE_TTL_SECONDS = int(os.getenv("VECTOR_CACHE_TTL_SECONDS", "86400"))
+
+    # Readiness probe (/ready, /readyz). The result is cached for a few seconds
+    # so a load balancer polling every second does not pay for a full Qdrant +
+    # Redis probe on every hit, and each dependency is probed concurrently under
+    # its own explicit timeout so the worst case is one timeout, not their sum.
+    READY_CACHE_TTL_SECONDS = float(os.getenv("READY_CACHE_TTL_SECONDS", "5"))
+    READY_DEP_TIMEOUT_SECONDS = float(os.getenv("READY_DEP_TIMEOUT_SECONDS", "2.0"))
 
     # Recency-tempered ranking: scores are multiplied by
     # 1 - RECENCY_STRENGTH * (1 - exp(-age_days / RECENCY_DECAY_DAYS))
@@ -248,15 +278,39 @@ class Config:
     AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+    # Redis-backed per-IP rate limits on the public search surface: /search,
+    # /facets, /analytics/click and /ready were unauthenticated and unrated,
+    # which allowed full-corpus scraping (top_k=50) and click-analytics
+    # poisoning. 0 disables an individual limit. Unlike the auth limits these
+    # FAIL CLOSED (503) when Redis is unreachable: these endpoints are the
+    # abuse surface, so an unrated request is not an acceptable fallback.
+    # /ready is the one deliberate exception and fails open instead -- see
+    # health.py and auth.public_rate_limit.
+    PUBLIC_SEARCH_RATE_PER_MIN = int(os.getenv("PUBLIC_SEARCH_RATE_PER_MIN", "60"))
+    PUBLIC_FACETS_RATE_PER_MIN = int(os.getenv("PUBLIC_FACETS_RATE_PER_MIN", "60"))
+    PUBLIC_CLICK_RATE_PER_MIN = int(os.getenv("PUBLIC_CLICK_RATE_PER_MIN", "120"))
+    # /ready is polled by load balancers and orchestrators, typically once a
+    # second, and a 429 makes an LB treat the node as unhealthy and pull it
+    # from rotation -- the exact outage the /ready limiter must not cause. The
+    # default is therefore an order of magnitude above a 1 Hz prober (600 per
+    # 60s window) rather than at it, while still bounding a runaway prober.
+    PUBLIC_READY_RATE_PER_MIN = int(os.getenv("PUBLIC_READY_RATE_PER_MIN", "600"))
+    PUBLIC_RATE_WINDOW_SECONDS = int(os.getenv("PUBLIC_RATE_WINDOW_SECONDS", "60"))
     # Only trust the client-supplied X-Forwarded-For header when this API is
-    # deployed behind a known reverse proxy (e.g. nginx). Otherwise the real
-    # socket peer is authoritative so a client cannot spoof its IP for
-    # rate-limiting. Local/dev should leave this off.
-    AUTH_TRUST_X_FORWARDED_FOR = os.getenv("AUTH_TRUST_X_FORWARDED_FOR", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    # reached through a reverse proxy. Otherwise the real socket peer is
+    # authoritative so a client cannot spoof its IP for rate-limiting.
+    #
+    # Unset (the shipped default) means AUTO, resolved in auth._client_ip
+    # against the actual socket peer: X-Forwarded-For is honoured only when
+    # the immediate peer is loopback, i.e. a proxy on this same host (the
+    # nginx config in setup.sh forwards from 127.0.0.1). That gives the
+    # deployed topology per-client-IP rate limits with no .env edit, while a
+    # client hitting the API directly still sees its own routable address as
+    # the peer and cannot forge a header to escape its bucket.
+    #
+    # Set the variable to true/false to force one behaviour regardless of peer
+    # (true when the proxy runs on another host, false for local/direct-only).
+    AUTH_TRUST_X_FORWARDED_FOR: bool | None = _env_tristate("AUTH_TRUST_X_FORWARDED_FOR")
     # Background purge interval for expired auth_tokens rows (0 disables the loop).
     AUTH_TOKEN_PURGE_INTERVAL_SECONDS = int(os.getenv("AUTH_TOKEN_PURGE_INTERVAL_SECONDS", "3600"))
 
