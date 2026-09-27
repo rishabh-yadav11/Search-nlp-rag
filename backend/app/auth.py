@@ -222,12 +222,12 @@ def _effective_password(password: str) -> str:
     startup -- the fail-dead this check exists to avoid. The result is therefore
     *at most* ``_BCRYPT_MAX_BYTES`` bytes and a byte-prefix of what
     ``_password_bytes`` hashes: when the cut splits a character, the partial
-    character AND its orphaned lead bytes are both dropped, so the decoded
-    string is shorter by that character's full encoded length (1 byte for a
-    2-byte character, 2 for a 3-byte one, 3 for a 4-byte one). That only ever
-    drops a non-ASCII tail, so it cannot turn a policy-failing value into a
-    passing one; the min-length and letter+digit rules are decided entirely by
-    the retained prefix.
+    character is dropped whole, so the decoded string is shorter by the number of
+    that character's bytes that fell inside the truncated buffer (1-3, depending
+    on its width and where the cut landed) rather than by a fixed amount. That
+    only ever drops a non-ASCII tail, so it cannot turn a policy-failing value
+    into a passing one; the min-length and letter+digit rules are decided
+    entirely by the retained prefix.
     """
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
 
