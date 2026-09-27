@@ -193,3 +193,26 @@ describe('isSafeUrl — server/client parity', () => {
     expect(verdictIn(url, false)).toBe(verdictIn(url, true))
   })
 })
+
+describe('isSafeUrl — deliberate strictness on control characters', () => {
+  // The browser is not uniform here: it percent-encodes NUL and the other C0
+  // controls, but silently REMOVES tab/CR/LF. These assertions pin the fact
+  // that the guard refuses all of them anyway. The tab case is the one that
+  // costs something — a real URL with a stray tab renders as inert text — and
+  // that is an accepted fail-closed trade-off, not an accident. If someone
+  // relaxes CONTROL_CHAR_RE, this block is the thing that should complain.
+  it.each([
+    ['NUL is percent-encoded by the browser but still refused', 'https://ok.com/a\x00b'],
+    ['tab is removed by the browser but still refused', 'https://ok.com/a\tb'],
+    ['CR is removed by the browser but still refused', 'https://ok.com/a\rb'],
+    ['LF is removed by the browser but still refused', 'https://ok.com/a\nb'],
+  ])('%s', (_label, url) => {
+    expect(isSafeUrl(url, BASE)).toBe(false)
+  })
+
+  it('still allows an ordinary URL with a percent-encoded space', () => {
+    // A literal space is not a C0 control, so it is not caught by this guard;
+    // the parser encodes it and the link stays usable.
+    expect(isSafeUrl('https://ok.com/a b', BASE)).toBe(true)
+  })
+})
