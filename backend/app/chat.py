@@ -1832,6 +1832,29 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
         # once by finish_holds().
         holds: list[str] = []
         holds_done = False
+        # What a call that was started but never reported its usage is charged.
+        # Declared out here rather than next to the stream loop because
+        # fail_turn() reads it, and fail_turn() can run for a failure that
+        # happened before the loop was ever entered.
+        mid_stream_estimate = config.LLM_CALL_RESERVE_USD
+
+        def billed_usd(usage: list) -> float:
+            """What a turn whose LLM call has already been made is charged.
+
+            A zero is NOT evidence that nothing was spent. `stream_answer`
+            fills usage_holder whenever a stream completes, and a provider that
+            sends no usage chunk yields a TRUTHY LLMResult carrying zero
+            tokens -- so testing `usage` for truthiness would record a
+            delivered, billed call as free and RELEASE its hold, which is the
+            one outcome the reserve/settle/sweep design exists to prevent.
+            The reported cost is used when there is one; otherwise the estimate
+            the gate held is charged. Over-counting a call whose cost cannot be
+            read is recoverable; under-counting it is free spend (#255)."""
+            if usage:
+                reported = to_usd(usage[0].cost())
+                if reported > 0:
+                    return reported
+            return mid_stream_estimate
 
         async def finish_holds(charged_usd: float) -> None:
             """Settle every hold this turn took, recording what it really cost.
@@ -1957,14 +1980,17 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 await finish_holds(0.0)
                 return
             # Deltas already sent: persist what the client is still showing.
-            # Token usage is only known when the whole response arrived, so a
-            # failed turn normally has none and the hold is released unbilled.
+            # Usage is only known when the whole response arrived, so a failed
+            # turn usually has none -- but deltas on the wire mean the provider
+            # generated and billed those tokens, so the turn is charged the
+            # estimate it held rather than refunded. Same rule as the
+            # mid-stream-failure path below, and the reason it exists (#255).
             usage = usage_holder[0] if usage_holder else None
             await persist_truncated_turn(
                 "".join(chunks), turn.sources,
                 usage.prompt_tokens if usage else 0,
                 usage.completion_tokens if usage else 0,
-                to_usd(usage.cost()) if usage else 0.0,
+                billed_usd(usage_holder),
                 aborted=True,
             )
 
@@ -1999,15 +2025,9 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 holds.append(gate_hold)
             usage_holder: list = []
             chunks: list[str] = []
-            # The provider bills a call from the moment it starts emitting, and
-            # usage is only reported once the whole response has arrived. So
-            # while the stream runs, the best known figure for a call already
-            # made is the estimate the gate hold was taken at — the same figure
-            # the sweeper would charge if the hold were simply left to lapse.
-            mid_stream_estimate = config.LLM_CALL_RESERVE_USD
             try:
                 async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
-                    if await aborted("".join(chunks), turn.sources, cost_usd=mid_stream_estimate):
+                    if await aborted("".join(chunks), turn.sources, cost_usd=billed_usd(usage_holder)):
                         return
                     chunks.append(piece)
                     streamed = True
@@ -2041,11 +2061,10 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 usage = usage_holder[0] if usage_holder else None
                 prompt_tokens = usage.prompt_tokens if usage else 0
                 completion_tokens = usage.completion_tokens if usage else 0
-                cost_inr = usage.cost() if usage else 0.0
                 client_gone = await request.is_disconnected()
                 assistant_msg = await persist_truncated_turn(
                     "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
-                    to_usd(cost_inr) if usage else mid_stream_estimate, aborted=client_gone,
+                    billed_usd(usage_holder), aborted=client_gone,
                 )
                 if client_gone:
                     return
@@ -2072,9 +2091,9 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 if await _nudge_retry_allowed(holds):
                     if await aborted(
                         "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
-                        # The stream is finished and its usage is known, so a
-                        # disconnect here must still be charged for it.
-                        to_usd(usage.cost()) if usage else 0.0,
+                        # The stream has finished, so a disconnect here must
+                        # still be charged for the call it made.
+                        billed_usd(usage_holder),
                     ):
                         return
                     try:
@@ -2104,7 +2123,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 if await _nudge_retry_allowed(holds):
                     if await aborted(
                         "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
-                        to_usd(usage.cost()) if usage else 0.0,
+                        billed_usd(usage_holder),
                     ):
                         return
                     try:
@@ -2124,6 +2143,17 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 completion_tokens=completion_tokens,
             )
             cost_usd = to_usd(result.cost())
+            if cost_usd <= 0:
+                # A zero here means the provider reported no usage, NOT that the
+                # call was free. `LLMResult.cost()` is an estimate built from
+                # token counts, and stream_answer reports zero tokens when no
+                # usage chunk arrives -- so charging 0 here would RELEASE the
+                # hold for an answer already delivered and already billed, and
+                # would leave the cap inert against such a provider. Charge the
+                # estimate the gate held, the same rule the abandon paths use,
+                # and store the same figure so the reported cost and the
+                # budget cannot disagree (#255).
+                cost_usd = mid_stream_estimate
             if await aborted(answer, turn.sources, result.prompt_tokens, result.completion_tokens, cost_usd):
                 return
             # The turn's single counter write: drops every hold and records what

@@ -3801,3 +3801,182 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
+
+
+def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkeypatch):
+    """The SECOND post-stream disconnect check, which is a different call site
+    from the dataviz one and needs its own coverage (#255).
+
+    A ranked-list question whose streamed answer is a refusal reaches the
+    ranking nudge gate after the stream has completed. A client that drops
+    there produced a fully billed answer, and it must be charged for it rather
+    than stored at cost 0.0 with its hold released."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            # A refusal, so the RANKING nudge gate is the post-stream check that
+            # runs -- the dataviz gate is skipped because there is no chart ask.
+            yield "I cannot generate a ranked list because amounts are missing."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        # Gone as soon as the single delta is out: disconnected at the
+        # post-stream check that follows it.
+        _disconnect_after(monkeypatch, 1)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
+
+        assert "event: error" not in body
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        assert msgs[1]["aborted"] is True
+        assert msgs[1]["cost"] == pytest.approx(0.1)
+        assert budget.writes == [("settle", 100_000)]
+        assert budget.counter == 100_000
+        assert budget.holds == {}
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_fail_turn_after_deltas_settles_the_actual_cost(tmp_path, monkeypatch):
+    """A failure raised OUTSIDE the stream loop must still CHARGE the turn
+    (#255) -- this is the `fail_turn` sibling of the mid-stream-failure path.
+
+    A ranked-list question whose answer is a refusal reaches the ranking nudge
+    gate after the stream completed; a nudge that raises a non-LLM error lands
+    in `fail_turn` with `streamed` True. Passing a flat 0.0 there would release
+    the gate hold for an answer already on the wire and already billed.
+
+    `stream_answer` fills usage_holder whenever a stream completes, so this
+    branch always has the real cost; the assertion pins that it is charged and
+    not released. (The `else` arm on that line is defence in depth for a
+    backend that reports no usage at all, and is deliberately not claimed as
+    covered here -- it cannot be reached through `stream_answer`.)"""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            # A ranking refusal, so the turn reaches the ranking nudge gate
+            # after the stream; the nudge below then raises, which lands the
+            # turn in fail_turn with its answer already delivered.
+            yield "I cannot generate a ranked list because amounts are missing."
+            if usage_holder is not None:
+                # Exactly what stream_answer does when a provider sends no
+                # usage chunk: a TRUTHY LLMResult carrying ZERO tokens. Its
+                # cost is 0.0, so anything testing `usage` for truthiness
+                # would settle 0.0 -- and finish_holds(0.0) RELEASES the hold,
+                # making a delivered, billed call free.
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=0, completion_tokens=0))
+
+        async def exploding_nudge(client, prompt, model):
+            raise RuntimeError("the provider died on the retry")
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+        monkeypatch.setattr(chat_module, "generate_answer", exploding_nudge)
+
+        body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
+
+        assert "event: error" in body
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        # Deltas reached the client, so the ONE rule persists the turn.
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        assert msgs[1]["aborted"] is True
+        assert "I cannot generate a ranked list" in msgs[1]["content"]
+        # ...and the billed call is CHARGED at the estimate it held, because a
+        # zero-token usage report means the cost is unknown, not zero.
+        assert budget.writes == [("settle", 20_000)]
+        assert budget.counter == 20_000
+        assert budget.holds == {}
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypatch):
+    """The SUCCESS path must charge too, and this is where the trap hides (#255).
+
+    `stream_answer` fills usage_holder whenever a stream completes, but a
+    provider that sends no usage chunk produces an LLMResult with zero tokens.
+    `LLMResult.cost()` is then 0.0, so the turn's cost computed to zero --
+    and `finish_holds(0.0)` RELEASES the hold. For a provider that never
+    reports usage that makes the cap silently inert: every turn is free, and
+    the answer was delivered and billed the whole time.
+
+    A zero is not evidence that nothing was spent, it is evidence that the cost
+    is unknown, so the estimate the gate held is charged instead. The stored
+    message cost is the same figure, so the budget and the reported cost
+    cannot disagree."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "A fully delivered answer [1]."
+            if usage_holder is not None:
+                # Exactly what stream_answer does with no usage chunk: a truthy
+                # result carrying zero tokens.
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=0, completion_tokens=0))
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        body = _stream_body(client, h, sid, "Who invested in fintech?")
+
+        # An ordinary, complete turn: no disconnect, no failure.
+        assert "event: done" in body
+        assert "event: error" not in body
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
+        assert msgs[1]["aborted"] is False
+        # Charged, not released, and the stored cost matches what was charged.
+        assert msgs[1]["cost"] == pytest.approx(0.02)
+        assert budget.writes == [("settle", 20_000)]
+        assert budget.counter == 20_000
+        assert budget.holds == {}
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, monkeypatch):
+    """The other side of that rule: a provider that DOES report usage must be
+    charged its real cost, not the estimate. Without this the previous test
+    would also pass if every turn were blindly charged the reserve."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def fake_stream(client, prompt, model, usage_holder=None):
+            yield "A fully delivered answer [1]."
+            if usage_holder is not None:
+                # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10,
+                # five times the $0.02 estimate -- the two must not be confused.
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
+
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        _stream_body(client, h, sid, "Who invested in fintech?")
+
+        assert budget.writes == [("settle", 100_000)]
+        assert budget.counter == 100_000
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
