@@ -469,6 +469,23 @@ def test_entity_names_from_the_question_are_fenced_in_the_system_prompt(
     assert "anywhere below" not in system
 
 
+def test_empty_history_says_so_explicitly(monkeypatch):
+    """The first turn of every session replays nothing, and the prompt must still
+    tell the model that explicitly instead of leaving a bare
+    "Conversation so far:" label with nothing under it."""
+    monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", 12000)
+
+    replay = chat_module._history_fence([])
+
+    assert replay == chat_module._NO_EARLIER_CONVERSATION
+    assert "<<<HISTORY>>>" in replay and "<<<END HISTORY>>>" in replay
+    assert "no earlier conversation" in replay
+    # It is a well-formed fence, not loose prose, and it still respects a limit
+    # too small to hold it.
+    monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", 0)
+    assert chat_module._history_fence([]) == ""
+
+
 # --- API helpers (local copies; this file declares no shared fixtures) ---
 
 
