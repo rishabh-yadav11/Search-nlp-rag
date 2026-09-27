@@ -1,275 +1,139 @@
-"""Reranker tests: ONNX fast-path predict, torch fallback, and the ONNX
-load/export/lock branches. optimum / sentence_transformers / transformers are
-faked in sys.modules so nothing downloads or runs real inference; the ONNX cache
-dir is redirected to a tmp path."""
+"""Reranker tests: the torch-only construction and predict path.
 
-import fcntl
-import os
+The ONNX/optimum fast path and its load/export/lock tests were removed together
+with the code they covered (optimum-onnx is not installable alongside the pinned
+transformers 5.x, so that path could never run — see app/reranker.py).
+
+``sentence_transformers`` is faked in ``sys.modules`` so nothing downloads a
+model or runs real inference. A working ``optimum`` fake is installed in the
+default-backend test to prove construction does not take an ONNX path even when
+optimum *is* importable.
+"""
+
+import inspect
+import logging
 import sys
 import types
 
-import numpy as np
-
-from app.config import config
 from app.reranker import Reranker
 
 
-class _RaisingModule:
-    """A module-like object whose every attribute access raises (simulates an
-    import failing, e.g. ``from optimum.onnxruntime import ...``)."""
+def _fake_torch(monkeypatch):
+    """Install a fake sentence_transformers.CrossEncoder; returns (cls, calls)."""
+    calls = []
 
-    def __getattr__(self, name):
-        raise AttributeError(name)
-
-
-def _install(monkeypatch, name, module):
-    monkeypatch.setitem(sys.modules, name, module)
-
-
-def _make_onnx_fakes():
-    """Fresh ORT + tokenizer fake classes plus a shared call recorder."""
-    calls = {"from_pretrained": [], "save": []}
-
-    class _Out:
-        def __init__(self, logits):
-            self.logits = logits
-
-    class _FakeORT:
-        def __init__(self, logits=None):
-            self.logits = logits
-
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            calls["from_pretrained"].append((args, kwargs))
-            return cls()
-
-        def __call__(self, **inputs):
-            return _Out(self.logits)
-
-        def save_pretrained(self, path):
-            calls["save"].append(("model", path))
-            os.makedirs(path, exist_ok=True)
-            with open(os.path.join(path, "model.onnx"), "w") as f:
-                f.write("x")
-
-    class _FakeTokenizer:
-        @classmethod
-        def from_pretrained(cls, *args, **kwargs):
-            calls["from_pretrained"].append((args, kwargs))
-            return cls()
-
-        def __call__(self, text, text_pair, **kwargs):
-            return {"input_ids": (text, text_pair)}
-
-        def save_pretrained(self, path):
-            calls["save"].append(("tokenizer", path))
-            os.makedirs(path, exist_ok=True)
-
-    return _FakeORT, _FakeTokenizer, calls
-
-
-def _fake_onnx_modules(monkeypatch, orm_cls, tokenizer_cls):
-    """Install working optimum + transformers fakes."""
-    optimum = types.ModuleType("optimum")
-    optimum_ort = types.ModuleType("optimum.onnxruntime")
-    optimum_ort.ORTModelForSequenceClassification = orm_cls
-    optimum.onnxruntime = optimum_ort
-    transformers = types.ModuleType("transformers")
-    transformers.AutoTokenizer = tokenizer_cls
-    _install(monkeypatch, "optimum", optimum)
-    _install(monkeypatch, "optimum.onnxruntime", optimum_ort)
-    _install(monkeypatch, "transformers", transformers)
-
-
-def _fake_onnx_import_failure(monkeypatch):
-    """optimum.onnxruntime import raises -> __init__ must fall back to torch."""
-    _install(monkeypatch, "optimum", _RaisingModule())
-    _install(monkeypatch, "optimum.onnxruntime", _RaisingModule())
-
-
-def _fake_torch(monkeypatch, cross_encoder_cls):
-    sentence_transformers = types.ModuleType("sentence_transformers")
-    sentence_transformers.CrossEncoder = cross_encoder_cls
-    _install(monkeypatch, "sentence_transformers", sentence_transformers)
-
-
-def _fake_cross_encoder(predict_result=(0.9, 0.1)):
     class _FakeCrossEncoder:
         def __init__(self, model_name, device="cpu"):
+            calls.append({"model_name": model_name, "device": device})
             self.model_name = model_name
             self.device = device
 
         def predict(self, pairs):
-            return list(predict_result)
+            return [0.9 for _ in pairs]
 
-    return _FakeCrossEncoder
+    module = types.ModuleType("sentence_transformers")
+    module.CrossEncoder = _FakeCrossEncoder
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+    return _FakeCrossEncoder, calls
 
 
-def _record_flock(monkeypatch):
-    """Patch fcntl.flock to record the ops; returns the recorder."""
+def _fake_onnx_importable(monkeypatch):
+    """Install a *working* optimum.onnxruntime/transformers pair, recording any
+    attempt to use the ONNX path, so a default construction can be shown not to
+    take it. Returns the recorder."""
     calls = []
 
-    def fake_flock(fd, op):
-        calls.append(op)
+    class _RecordingORT:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append(("ort.from_pretrained", args, kwargs))
+            return cls()
 
-    monkeypatch.setattr(fcntl, "flock", fake_flock)
+        def save_pretrained(self, path):
+            calls.append(("ort.save_pretrained", (path,), {}))
+
+        def __call__(self, **inputs):
+            raise AssertionError("predict must not use the ONNX path")
+
+    class _RecordingTokenizer:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            calls.append(("tokenizer.from_pretrained", args, kwargs))
+            return cls()
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("predict must not use the ONNX path")
+
+    optimum = types.ModuleType("optimum")
+    optimum_ort = types.ModuleType("optimum.onnxruntime")
+    optimum_ort.ORTModelForSequenceClassification = _RecordingORT
+    optimum.onnxruntime = optimum_ort
+    transformers = types.ModuleType("transformers")
+    transformers.AutoTokenizer = _RecordingTokenizer
+    monkeypatch.setitem(sys.modules, "optimum", optimum)
+    monkeypatch.setitem(sys.modules, "optimum.onnxruntime", optimum_ort)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
     return calls
 
 
-def _cache_dir(tmp_path):
-    return str(tmp_path / "reranker_onnx")
+def test_backend_parameter_defaults_to_torch():
+    # Pins the signature default itself: flipping it back to "onnx" (with the
+    # ONNX branch gone) must fail here rather than silently degrading to torch.
+    assert inspect.signature(Reranker.__init__).parameters["backend"].default == "torch"
 
 
-def _reranker_instance():
-    return Reranker.__new__(Reranker)
+def test_default_backend_is_torch_even_when_optimum_is_importable(monkeypatch, caplog):
+    onnx_calls = _fake_onnx_importable(monkeypatch)
+    _cls, calls = _fake_torch(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG, logger="reranker"):
+        rer = Reranker("model-x")
+
+    # No ONNX export/load attempt of any kind, and no fallback warning: a
+    # default construction goes straight to the torch CrossEncoder.
+    assert onnx_calls == []
+    assert not [rec for rec in caplog.records if "ONNX" in rec.getMessage()]
+    assert rer.backend == "torch"
+    assert calls == [{"model_name": "model-x", "device": "cpu"}]
 
 
-def _onnx_model(logits):
-    """A minimal ORT-like object with a fixed logits array."""
-    outputs = type("Out", (), {"logits": logits})()
-    return type("ONNX", (), {"__call__": lambda self, **kw: outputs})()
+def test_explicit_torch_backend_builds_cpu_cross_encoder(monkeypatch):
+    _cls, calls = _fake_torch(monkeypatch)
+
+    rer = Reranker("model-x", backend="torch")
+
+    assert rer.backend == "torch"
+    assert calls == [{"model_name": "model-x", "device": "cpu"}]
 
 
-def _onnx_tokenizer():
-    return type("Tok", (), {"__call__": lambda self, text, text_pair, **kw: {"input_ids": (text, text_pair)}})()
+def test_unsupported_backend_warns_and_falls_back_to_torch(monkeypatch, caplog):
+    _cls, calls = _fake_torch(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="reranker"):
+        rer = Reranker("model-x", backend="onnx")
+
+    assert rer.backend == "torch"
+    assert calls == [{"model_name": "model-x", "device": "cpu"}]
+    assert any("onnx" in rec.getMessage() for rec in caplog.records)
 
 
-# --- predict branches ---
+def test_predict_delegates_pairs_to_torch_cross_encoder(monkeypatch):
+    seen = []
 
+    class _RecordingCrossEncoder:
+        def __init__(self, model_name, device="cpu"):
+            self.model_name = model_name
 
-def test_onnx_predict_2d_logits_returns_first_column():
-    rer = _reranker_instance()
-    rer._onnx = _onnx_model(np.array([[0.5], [0.7]]))
-    rer._tokenizer = _onnx_tokenizer()
-    rer._torch = None
+        def predict(self, pairs):
+            seen.append(pairs)
+            return [0.25, 0.75]
 
-    assert rer.predict([("q", "a"), ("q", "b")]) == [0.5, 0.7]
-
-
-def test_onnx_predict_flat_logits_returns_tolist():
-    rer = _reranker_instance()
-    rer._onnx = _onnx_model(np.array([0.5, 0.7]))
-    rer._tokenizer = _onnx_tokenizer()
-    rer._torch = None
-
-    assert rer.predict([("q", "a"), ("q", "b")]) == [0.5, 0.7]
-
-
-def test_torch_fallback_predict():
-    rer = _reranker_instance()
-    rer._onnx = None
-    rer._tokenizer = None
-    rer._torch = _fake_cross_encoder()("model-x")
-
-    assert rer.predict([("q", "a")]) == [0.9, 0.1]
-
-
-# --- __init__ failure/fallback branches ---
-
-
-def test_init_onnx_import_failure_falls_back_to_torch(monkeypatch, tmp_path):
-    monkeypatch.setattr(config, "RERANK_ONNX_DIR", str(tmp_path))
-    _fake_onnx_import_failure(monkeypatch)
-    _fake_torch(monkeypatch, _fake_cross_encoder())
-
-    rer = Reranker("model-x")
-
-    assert rer._onnx is None
-    assert rer._torch is not None
-    assert rer.predict([("q", "a")]) == [0.9, 0.1]
-
-
-def test_init_onnx_export_failure_falls_back_to_torch(monkeypatch, tmp_path):
-    monkeypatch.setattr(config, "RERANK_ONNX_DIR", str(tmp_path))
-    orm_cls, tokenizer_cls, calls = _make_onnx_fakes()
-
-    def boom_from_pretrained(*args, **kwargs):
-        calls["from_pretrained"].append((args, kwargs))
-        raise RuntimeError("export failed")
-
-    orm_cls.from_pretrained = classmethod(boom_from_pretrained)
-    _fake_onnx_modules(monkeypatch, orm_cls, tokenizer_cls)
-    _fake_torch(monkeypatch, _fake_cross_encoder())
+    module = types.ModuleType("sentence_transformers")
+    module.CrossEncoder = _RecordingCrossEncoder
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
 
     rer = Reranker("model-x")
+    pairs = [("q", "a"), ("q", "b")]
 
-    assert rer._onnx is None
-    assert rer._torch is not None
-    assert rer.predict([("q", "a")]) == [0.9, 0.1]
-
-
-def test_init_onnx_success_sets_onnx_backend(monkeypatch, tmp_path):
-    monkeypatch.setattr(config, "RERANK_ONNX_DIR", str(tmp_path))
-    orm_cls, tokenizer_cls, _calls = _make_onnx_fakes()
-    _fake_onnx_modules(monkeypatch, orm_cls, tokenizer_cls)
-    _fake_torch(monkeypatch, _fake_cross_encoder())
-
-    rer = Reranker("model-x")
-
-    assert rer._onnx is not None
-    assert rer._tokenizer is not None
-    assert rer._torch is None
-
-
-# --- _load_onnx cache/export/lock branches ---
-
-
-def test_load_onnx_cached_branch_skips_lock(monkeypatch, tmp_path):
-    cache_dir = _cache_dir(tmp_path)
-    os.makedirs(cache_dir, exist_ok=True)
-    with open(os.path.join(cache_dir, "model.onnx"), "w") as f:
-        f.write("x")
-    monkeypatch.setattr(config, "RERANK_ONNX_DIR", str(tmp_path))
-    flock_calls = _record_flock(monkeypatch)
-
-    orm_cls, tokenizer_cls, calls = _make_onnx_fakes()
-    rer = _reranker_instance()
-    model, tokenizer = rer._load_onnx("model-x", orm_cls, tokenizer_cls)
-
-    assert model is not None and tokenizer is not None
-    assert calls["from_pretrained"] == [((cache_dir,), {}), ((cache_dir,), {})]
-    assert calls["save"] == []
-    assert flock_calls == []
-
-
-def test_load_onnx_export_under_lock(monkeypatch, tmp_path):
-    monkeypatch.setattr(config, "RERANK_ONNX_DIR", str(tmp_path))
-    flock_calls = _record_flock(monkeypatch)
-    cache_dir = _cache_dir(tmp_path)
-
-    orm_cls, tokenizer_cls, calls = _make_onnx_fakes()
-    rer = _reranker_instance()
-    model, tokenizer = rer._load_onnx("model-x", orm_cls, tokenizer_cls)
-
-    assert model is not None and tokenizer is not None
-    assert calls["from_pretrained"] == [
-        (("model-x",), {"export": True, "timeout": 300}),
-        (("model-x",), {"timeout": 300}),
-    ]
-    assert calls["save"] == [("model", cache_dir), ("tokenizer", cache_dir)]
-    assert os.path.isfile(os.path.join(cache_dir, "model.onnx"))
-    assert flock_calls == [fcntl.LOCK_EX, fcntl.LOCK_UN]
-
-
-def test_load_onnx_double_checked_lock_returns_cached(monkeypatch, tmp_path):
-    monkeypatch.setattr(config, "RERANK_ONNX_DIR", str(tmp_path))
-    cache_dir = _cache_dir(tmp_path)
-    ready = os.path.join(cache_dir, "model.onnx")
-
-    # While the second worker holds the lock, the first worker finishes the
-    # export; the post-lock isfile() check then loads the cache instead.
-    def flock_creates_model(fd, op):
-        if op == fcntl.LOCK_EX:
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(ready, "w") as f:
-                f.write("x")
-
-    monkeypatch.setattr(fcntl, "flock", flock_creates_model)
-
-    orm_cls, tokenizer_cls, calls = _make_onnx_fakes()
-    rer = _reranker_instance()
-    model, tokenizer = rer._load_onnx("model-x", orm_cls, tokenizer_cls)
-
-    assert model is not None and tokenizer is not None
-    assert calls["from_pretrained"] == [((cache_dir,), {}), ((cache_dir,), {})]
-    assert calls["save"] == []
+    assert rer.predict(pairs) == [0.25, 0.75]
+    assert seen == [pairs]
