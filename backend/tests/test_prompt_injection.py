@@ -357,6 +357,8 @@ def test_history_budget_too_small_for_one_fence_replays_nothing(monkeypatch):
     monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", -1)
     assert chat_module._history_fence(prior) == ""
 
+
+
 def test_oversized_article_body_is_truncated_to_the_configured_bound(retrieval, no_billing, poison_client, monkeypatch):
     """A 60K body is cut to the per-article cap and marked inside its fence."""
     monkeypatch.setattr(chat_module.config, "CHAT_BODY_CHAR_LIMIT", 1000)
@@ -368,6 +370,59 @@ def test_oversized_article_body_is_truncated_to_the_configured_bound(retrieval, 
     assert "y" * 1000 in block
     assert "y" * 1001 not in block
     assert "[... body truncated ...]" in block
+
+
+# --- retry nudges ---
+
+
+def test_retry_nudge_lands_in_the_system_role_not_the_untrusted_user_message(
+    retrieval, no_billing, poison_client
+):
+    """A nudge retry re-sends our own instruction. That prose is ours, so it
+    belongs in the system role: the user message is the one channel the system
+    prompt declares entirely untrusted, and instruction text sitting outside
+    every fence there undercuts the retry's own authority."""
+    _run(chat_module._run_turn("show me a chart of top 5 ipo deals", []))
+
+    # The stubbed model answers every call with prose and no data block, so the
+    # dataviz retry fires and becomes the last recorded call.
+    retry = poison_client.completions.calls[-1]["messages"]
+    assert [m["role"] for m in retry] == ["system", "user"]
+    system = next(m["content"] for m in retry if m["role"] == "system")
+    user = next(m["content"] for m in retry if m["role"] == "user")
+    assert "VALID JSON data block" in system
+    # No trusted prose anywhere in the message the prompt calls untrusted: the
+    # user turn is still nothing but fenced data, ending at the question fence.
+    assert "VALID JSON data block" not in user
+    assert user.rstrip().endswith("<<<END QUESTION>>>")
+
+
+def test_streaming_retry_nudges_land_in_the_system_role(retrieval, no_billing, poison_client, tmp_path):
+    """The SSE path retries twice over (missing data block, then ranking
+    refusal) and must place both nudges the same way."""
+    client, chat_store, auth_store = _api_client(tmp_path)
+    try:
+        headers = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
+        _stream(client, headers, sid, "show me a chart of the top 5 ipo deals")
+
+        retries = [
+            (next(m["content"] for m in call["messages"] if m["role"] == "system"),
+             next(m["content"] for m in call["messages"] if m["role"] == "user"))
+            for call in poison_client.completions.calls
+            if not call.get("stream")
+        ]
+        assert retries, "expected the streaming turn to retry"
+        # The nudge rides in the system role ...
+        assert any("VALID JSON data block" in system for system, _user in retries)
+        for _system, user in retries:
+            # ... and the user turn is still nothing but fenced data: no trace of
+            # our own retry prose ("Your previous answer ...") outside the fences.
+            assert "previous answer" not in user
+            assert user.rstrip().endswith("<<<END QUESTION>>>")
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
 
 
 # --- multi-entity entity names ---
