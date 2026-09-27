@@ -212,13 +212,18 @@ Every 15 minutes via cron, deprioritized with `nice` (installed by `setup.sh cro
 I capped logs so they can't fill the disk long-term:
 
 - **Docker** (Qdrant/Redis) runs with `--log-driver json-file --log-opt max-size=20m --log-opt max-file=3` (set by `setup.sh` via `DOCKER_LOG_OPTS`).
-- **App + PM2 logs** (`~/search-nlp-rag/logs/*.log`, `~/.pm2/logs/*.log`) are rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2), compressed, with `copytruncate` so open file handles keep writing. Deploy it once with:
+- **App + PM2 logs** (`<repo>/logs/*.log`, `~/.pm2/logs/*.log`) are rotated daily by `/etc/logrotate.d/vccircle`: 14 rotations (7 for PM2), compressed, with `copytruncate` so open file handles keep writing. The shipped `deploy/logrotate.conf` carries `/path/to/...` placeholders — logrotate does no variable interpolation, so edit them to your real checkout and `~/.pm2` before installing:
 
 ```bash
-sudo install -m 644 /etc/logrotate.d/vccircle  # see repo: deploy/logrotate.conf
+sed -i "s|/path/to/search-nlp-rag|$PWD|; s|/path/to/.pm2|$HOME/.pm2|" deploy/logrotate.conf
+sudo install -m 644 deploy/logrotate.conf /etc/logrotate.d/vccircle
 ```
 
 The config lives in the repo at `deploy/logrotate.conf` for reproducibility.
+
+### Data locations
+
+`CHAT_DB_PATH`, `AUTH_DB_PATH`, `QUERY_FIX_VOCAB_PATH` and `RERANK_ONNX_DIR` are resolved to **absolute** paths at startup. A relative value (what `.env.example` ships) resolves against the backend directory, never against the process working directory, so starting the app from anywhere opens the same database. At boot the API logs the three locations it writes to and refuses to start if one cannot be created or written, rather than silently opening a new empty database and appearing to have lost all history.
 
 ## 4. Backups and Reset
 

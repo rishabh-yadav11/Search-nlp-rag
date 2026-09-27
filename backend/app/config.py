@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import socket
+from pathlib import Path
 from typing import ClassVar
 
 from dotenv import load_dotenv
@@ -9,6 +10,80 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# The backend package's parent directory: the stable anchor for every data
+# path. Resolved from this file's own location, never from the process working
+# directory -- gunicorn, pm2, systemd, a shell and a test runner can each start
+# the same app from a different CWD, and a CWD-relative data path turns that
+# into a brand-new empty SQLite file created in the wrong place.
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _data_path(name: str, default: str) -> str:
+    """Read a data-path knob and return it as an absolute path.
+
+    A relative value (what ``.env.example`` ships, and what an operator copies)
+    is resolved against :data:`BACKEND_ROOT`, so ``data/chat.db`` always means
+    ``<repo>/backend/data/chat.db`` no matter where the process was started.
+    An absolute value is kept as given, so a deployment that mounts its data on
+    a separate volume is unaffected. ``~`` is expanded, because an operator
+    writing ``~/data/chat.db`` means their home, not a literal ``~`` directory.
+
+    Every result is absolute, so a caller can compare, log or stat it without
+    re-deriving the same guess about the CWD.
+    """
+    raw = os.getenv(name, default).strip().strip("\"'").strip()
+    if not raw:
+        raise ValueError(
+            f"{name} is set but empty; it must be a filesystem path "
+            f"(relative paths resolve against {BACKEND_ROOT})"
+        )
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BACKEND_ROOT / path
+    return str(path)
+
+
+# Spellings accepted for a boolean env knob. Deliberately shared with
+# _env_tristate so there is one answer to "what does `yes` mean" in this module.
+_TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on", "t"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "n", "off", "f"})
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env knob, normalising spelling and rejecting nonsense.
+
+    The knobs this guards are feature toggles: a typo does not fail, it
+    silently turns a feature OFF and the deployment looks healthy while
+    behaving as if the operator had never asked for it. So the value is
+    normalised (whitespace and one layer of surrounding quotes stripped,
+    case-folded, ``on``/``yes``/``1`` all meaning true) and anything
+    unrecognised RAISES at import with the accepted spellings, instead of
+    defaulting to False.
+
+    Unset or blank keeps ``default`` -- an absent variable is a legitimate
+    way to say "not configured", which is not the same as a mistyped one.
+
+    Raising here is deliberate and differs from ``_clamped_int``, which
+    clamps a bad *throughput* value because its failure mode is expensive CPU
+    and a boot failure is worse. A feature toggle has the opposite profile:
+    guessing wrong makes the app answer every request as if the feature did
+    not exist, which is the silent-defect class this rejects.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().strip("\"'").strip().lower()
+    if not value:
+        return default
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"{name}={raw!r} is not a boolean; use one of "
+        f"{sorted(_TRUE_VALUES)} (true) or {sorted(_FALSE_VALUES)} (false)"
+    )
 
 # Cap the number of CPU threads torch/onnxruntime use per process BEFORE any
 # inference library is imported. With GUNICORN_WORKERS processes sharing the
@@ -244,12 +319,72 @@ def _env_tristate(name: str) -> bool | None:
     An unrecognised value falls back to None rather than to a forced side, so
     a typo in an operator's .env can never silently pick the unsafe one.
     """
-    raw = os.getenv(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
+    raw = os.getenv(name, "").strip().strip("\"'").strip().lower()
+    if raw in _TRUE_VALUES:
         return True
-    if raw in ("0", "false", "no", "off"):
+    if raw in _FALSE_VALUES:
         return False
     return None
+
+
+def _ensure_data_dir(path: str, env_var: str) -> None:
+    """Create ``path``'s parent directory, or fail with an actionable message.
+
+    The two failure modes this refuses to swallow:
+
+    - the parent cannot be created at all (a path component is a regular file,
+      or the volume is read-only). `os.makedirs` in the store would raise, but
+      deep inside `ChatStore.connect`, with the exception buried in a
+      traceback that names no knob and no path.
+    - the parent exists but is not writable. Here `os.makedirs(exist_ok=True)`
+      SUCCEEDS and `sqlite3.connect` then succeeds too, creating a fresh EMPTY
+      database that the app serves as if it simply had no history. That is the
+      silent-data-loss failure this function exists for.
+
+    Raises RuntimeError naming the env var, the absolute path and the reason, so
+    the operator sees the fix in the first lines of the startup log instead of
+    discovering it as "all my conversations are gone" days later.
+    """
+    parent = Path(path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"{env_var}={path!r} cannot be used: its directory {parent} could not be "
+            f"created ({exc.strerror or exc}). Point {env_var} at a writable location."
+        ) from exc
+    if not parent.is_dir():  # pragma: no cover - mkdir(exist_ok=True) raises first
+        raise RuntimeError(
+            f"{env_var}={path!r} cannot be used: {parent} is not a directory."
+        )
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise RuntimeError(
+            f"{env_var}={path!r} cannot be used: directory {parent} is not writable. "
+            f"Starting anyway would create an EMPTY database there and silently lose "
+            f"every existing row, so the app refuses to start."
+        )
+
+
+def ensure_data_paths_ready(cfg: "Config") -> None:
+    """Validate every configured data location before the app serves traffic.
+
+    Called from the FastAPI lifespan ahead of the store connections, so a
+    misconfigured data location is a loud boot failure rather than a running
+    process that answers every request as if the deployment were brand new.
+
+    Only the paths the app WRITES are checked. A missing
+    ``QUERY_FIX_VOCAB_PATH`` file is a legitimate no-op (typo correction
+    degrades by design, see QUERY_FIX_VOCAB_PATH), so only its directory has
+    to be usable. ``RERANK_ONNX_DIR`` is inert and is deliberately not
+    validated: nothing reads it, so requiring the directory would fail a
+    perfectly healthy deploy.
+    """
+    for env_var, path in (
+        ("CHAT_DB_PATH", cfg.CHAT_DB_PATH),
+        ("AUTH_DB_PATH", cfg.AUTH_DB_PATH),
+        ("QUERY_FIX_VOCAB_PATH", cfg.QUERY_FIX_VOCAB_PATH),
+    ):
+        _ensure_data_dir(path, env_var)
 
 
 class Config:
@@ -348,7 +483,7 @@ class Config:
     # ONNX backend existed. Nothing reads it now; kept as a documented
     # placeholder (it is still listed in .env.example) rather than an env var
     # that silently disappears from deployed setups.
-    RERANK_ONNX_DIR = os.getenv("RERANK_ONNX_DIR", "data/reranker_onnx")
+    RERANK_ONNX_DIR = _data_path("RERANK_ONNX_DIR", "data/reranker_onnx")
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
@@ -437,17 +572,17 @@ class Config:
 
     # Retrieval-quality tuning (see app/query_expand.py, app/rerank_boost.py,
     # app/answer_fallback.py, app/query_fix.py). Toggles can be disabled per-deployment.
-    ENABLE_QUERY_EXPANSION = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() in ("1", "true", "yes")
-    ENABLE_ENTITY_BOOST = os.getenv("ENABLE_ENTITY_BOOST", "true").lower() in ("1", "true", "yes")
-    ENABLE_WEAK_FALLBACK = os.getenv("ENABLE_WEAK_FALLBACK", "true").lower() in ("1", "true", "yes")
+    ENABLE_QUERY_EXPANSION = _env_bool("ENABLE_QUERY_EXPANSION", True)
+    ENABLE_ENTITY_BOOST = _env_bool("ENABLE_ENTITY_BOOST", True)
+    ENABLE_WEAK_FALLBACK = _env_bool("ENABLE_WEAK_FALLBACK", True)
 
     # Query-string typo correction (app/query_fix.py): symspellpy over a
     # corpus-derived vocabulary + curated entities, applied before embedding.
     # The vocab is generated by scripts/build_query_vocab.py; when absent the
     # fixer is a no-op. Corrected strings also normalize the cache keys, so
     # repeated typos of the same query reuse the same cached results.
-    ENABLE_QUERY_FIX = os.getenv("ENABLE_QUERY_FIX", "true").lower() in ("1", "true", "yes")
-    QUERY_FIX_VOCAB_PATH = os.getenv("QUERY_FIX_VOCAB_PATH", "data/query_vocab.json.gz")
+    ENABLE_QUERY_FIX = _env_bool("ENABLE_QUERY_FIX", True)
+    QUERY_FIX_VOCAB_PATH = _data_path("QUERY_FIX_VOCAB_PATH", "data/query_vocab.json.gz")
     QUERY_FIX_MAX_EDIT = int(os.getenv("QUERY_FIX_MAX_EDIT", "2"))
     QUERY_FIX_MIN_COUNT = int(os.getenv("QUERY_FIX_MIN_COUNT", "5"))
     QUERY_FIX_MIN_TOKEN_LEN = int(os.getenv("QUERY_FIX_MIN_TOKEN_LEN", "3"))
@@ -456,7 +591,7 @@ class Config:
     # avoid near-duplicate headlines filling the top-k. LAMBDA near 1 favours
     # pure relevance; lower trades relevance for headline diversity. Applied in
     # /search before the final top-k slice.
-    ENABLE_DIVERSITY = os.getenv("ENABLE_DIVERSITY", "true").lower() in ("1", "true", "yes")
+    ENABLE_DIVERSITY = _env_bool("ENABLE_DIVERSITY", True)
     DIVERSITY_LAMBDA = float(os.getenv("DIVERSITY_LAMBDA", "0.7"))
     DIVERSITY_SIM_THRESHOLD = float(os.getenv("DIVERSITY_SIM_THRESHOLD", "0.4"))
 
@@ -465,7 +600,7 @@ class Config:
     # a query accumulates >= CLICK_BOOST_MIN_CLICKS clicks and an article holds
     # >= CLICK_BOOST_MIN_ARTICLE_CLICKS clicks (>= CLICK_BOOST_MIN_SHARE of the
     # query's total), so it never fires on sparse/noisy traffic.
-    ENABLE_CLICK_BOOST = os.getenv("ENABLE_CLICK_BOOST", "true").lower() in ("1", "true", "yes")
+    ENABLE_CLICK_BOOST = _env_bool("ENABLE_CLICK_BOOST", True)
     CLICK_BOOST_MIN_CLICKS = int(os.getenv("CLICK_BOOST_MIN_CLICKS", "5"))
     CLICK_BOOST_MIN_ARTICLE_CLICKS = int(os.getenv("CLICK_BOOST_MIN_ARTICLE_CLICKS", "3"))
     CLICK_BOOST_MIN_SHARE = float(os.getenv("CLICK_BOOST_MIN_SHARE", "0.3"))
@@ -495,7 +630,7 @@ class Config:
     # three clamped knobs below instead — the expensive part is the second
     # cross-encoder pass, not the body scan (a 50K body scans in ~0.25ms at
     # these defaults), so that is what BODY_RESCUE_MAX_CANDIDATES bounds.
-    ENABLE_BODY_RESCUE = os.getenv("ENABLE_BODY_RESCUE", "true").lower() in ("1", "true", "yes")
+    ENABLE_BODY_RESCUE = _env_bool("ENABLE_BODY_RESCUE", True)
     BODY_RESCUE_THRESHOLD = float(os.getenv("BODY_RESCUE_THRESHOLD", "0.3"))
     # WINDOW is the size of the excerpt handed to the cross-encoder. Below 200
     # the excerpt is too small to carry a useful passage (and a 0 window makes
@@ -540,9 +675,11 @@ class Config:
     SEARCH_QUERY_MAX_CHARS = _clamped_int("SEARCH_QUERY_MAX_CHARS", 512, 32, 4000)
 
     # Chat history (SQLite on the host; survives restarts, unlike Redis without AOF)
-    # Relative CHAT_DB_PATH resolves against the backend working dir (where
-    # gunicorn runs). Retention purges conversations idle for CHAT_RETENTION_DAYS.
-    CHAT_DB_PATH = os.getenv("CHAT_DB_PATH", "data/chat.db")
+    # Resolved to an absolute path against the backend root, never the process
+    # working directory (see _data_path): a CWD-relative path made a wrong CWD
+    # open a brand-new empty chat DB with no error anywhere.
+    # Retention purges conversations idle for CHAT_RETENTION_DAYS.
+    CHAT_DB_PATH = _data_path("CHAT_DB_PATH", "data/chat.db")
     CHAT_RETENTION_DAYS = int(os.getenv("CHAT_RETENTION_DAYS", "180"))
     CHAT_MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "10"))
     CHAT_PURGE_INTERVAL_SECONDS = int(os.getenv("CHAT_PURGE_INTERVAL_SECONDS", "86400"))
@@ -562,7 +699,7 @@ class Config:
     CHAT_MESSAGE_SOURCE_LIMIT = int(os.getenv("CHAT_MESSAGE_SOURCE_LIMIT", "20"))
 
     # Recommendation engine
-    ENABLE_RECOMMENDATIONS = os.getenv("ENABLE_RECOMMENDATIONS", "true").lower() in ("1", "true", "yes")
+    ENABLE_RECOMMENDATIONS = _env_bool("ENABLE_RECOMMENDATIONS", True)
     # Hybrid scoring weights
     RECOMMEND_SIMILARITY_WEIGHT = float(os.getenv("RECOMMEND_SIMILARITY_WEIGHT", "0.4"))
     RECOMMEND_CATEGORY_WEIGHT = float(os.getenv("RECOMMEND_CATEGORY_WEIGHT", "0.3"))
@@ -599,7 +736,7 @@ class Config:
     # layer maps roles to permissions (see app/auth.py). Tokens are opaque,
     # hashed (SHA-256) in storage, expire after AUTH_TOKEN_TTL_DAYS, and can be
     # revoked individually.
-    AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
+    AUTH_DB_PATH = _data_path("AUTH_DB_PATH", "data/auth.db")
     # Redis DB holding the auth rate-limit counters. Pinned explicitly, like
     # ANALYTICS_REDIS_DB and USER_PROFILE_REDIS_DB, rather than inherited from
     # any db segment in REDIS_URL. The inherited value was DB 0, which this

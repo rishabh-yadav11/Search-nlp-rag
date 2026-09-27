@@ -37,7 +37,7 @@ from app.answer_fallback import date_label, weak_results_note
 from app.auth import public_rate_limit, require_auth, require_permission, user_rate_limit
 from app.chat import ChatAnalyticsUnavailableError
 from app.click_boost import apply_click_boost
-from app.config import config
+from app.config import config, ensure_data_paths_ready
 from app.cost_budget import close as close_cost_budget
 from app.diversity import diversify
 from app.encoders import DenseEncoder
@@ -260,6 +260,18 @@ async def _load_facet_maps() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # First, before any store is opened or any request can be served: prove the
+    # configured data locations are real and writable. Without this, an
+    # unreachable or read-only data directory yields a running app backed by a
+    # BRAND-NEW empty SQLite file, and every session 404s with no error logged.
+    ensure_data_paths_ready(config)
+    logger.info(
+        "data locations: CHAT_DB_PATH=%s AUTH_DB_PATH=%s QUERY_FIX_VOCAB_PATH=%s",
+        config.CHAT_DB_PATH,
+        config.AUTH_DB_PATH,
+        config.QUERY_FIX_VOCAB_PATH,
+    )
+
     state["model"] = DenseEncoder(config.EMBED_MODEL, config.EMBED_DEVICE, config.TORCH_THREADS)
     state["sparse_model"] = SparseTextEmbedding(config.SPARSE_MODEL)
     state["reranker"] = Reranker(config.RERANK_MODEL, backend=config.RERANK_BACKEND)
