@@ -1269,7 +1269,6 @@ def _history_fence(history: list[MessageOut]) -> str:
         # "Conversation so far:" label with nothing under it.
         return _NO_EARLIER_CONVERSATION if budget >= len(_NO_EARLIER_CONVERSATION) else ""
 
-
     # The note and the "\n" that joins it to the turns below are part of the
     # rendered replay, so their worst-case cost is reserved up front. Reserving
     # the count of ALL turns (the most the note can ever have to name) keeps the
