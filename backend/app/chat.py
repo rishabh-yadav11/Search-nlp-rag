@@ -1251,13 +1251,18 @@ def _history_fence(history: list[MessageOut]) -> str:
     turn bodies: every turn's fence delimiters, the ``"\\n"`` join separators
     between them and the prepended omission note are charged against
     CHAT_HISTORY_CHAR_LIMIT, so the replay can never exceed the configured
-    limit. A single turn too long to fit is cut to fit instead of being dropped,
-    so the newest context is never lost entirely.
+    limit. A newest turn too long to fit on its own is cut to fit rather than
+    dropped, so it survives whenever the budget can hold one fence at all.
+    Otherwise the omission note still names how many turns were dropped, so no
+    turn is ever discarded silently.
 
-    When the limit is too small to hold even one fence (below
-    len(_NO_EARLIER_CONVERSATION)) there is no rendering that both carries the
-    session and respects the bound, so the replay is dropped and an empty
-    string is returned — which fits any limit, zero and negative included.
+    When the limit is too small to hold that note there is no rendering that
+    both reports the session and respects the bound, so the replay is empty —
+    which fits any limit, zero and negative included. It is empty rather than
+    the no-earlier-conversation fence because turns did exist here and saying
+    otherwise would be false; that fence is emitted only for a session that
+    genuinely has no earlier turns, and is dropped in turn if even it does not
+    fit.
     """
     budget = max(0, config.CHAT_HISTORY_CHAR_LIMIT)
     turns = [m for m in history if m.role in ("user", "assistant")]
@@ -1282,7 +1287,12 @@ def _history_fence(history: list[MessageOut]) -> str:
     if len(kept) == len(blocks):
         return "\n".join(reversed(kept))
     if not kept:
-        return _NO_EARLIER_CONVERSATION if budget >= len(_NO_EARLIER_CONVERSATION) else ""
+        # There WERE earlier turns, so report them as dropped rather than
+        # claiming the session had no earlier conversation. If even the note
+        # does not fit there is no honest rendering at all, so say nothing:
+        # _NO_EARLIER_CONVERSATION is reserved for a session that truly has none.
+        note = _omission_note(len(blocks))
+        return note if budget >= len(note) else ""
     return "\n".join([_omission_note(len(blocks) - len(kept)), *reversed(kept)])
 
 
