@@ -504,9 +504,13 @@ class Config:
     # Answerability gates (app/answer_fallback.py). WEAK_RESULT_SCORE is the
     # score a reranked hit must exceed to count as "strong", and
     # WEAK_RESULT_MIN_STRONG is how many strong hits a result list must hold
-    # before it is reported as weakly answered. Deliberately separate knobs
-    # from ASK_MIN_SCORE above: that gate decides *inclusion*, this pair decides
-    # whether what survived inclusion is strong enough to answer.
+    # before it is reported as weakly answered. These are deliberately separate
+    # from ASK_MIN_SCORE above because they answer different questions: that
+    # gate is chat's inclusion filter (it drops a source before anything else
+    # looks at it), while this pair judges the whole list the caller hands over
+    # and decides whether the answer is reported as weakly supported. /search
+    # applies no inclusion gate at all, so the pair is the only relevance bar
+    # its weak note sees.
     #
     # The count is capped at the length of the list and floored at 1
     # (app/answer_fallback.py:results_are_weak), so a deployment that raises

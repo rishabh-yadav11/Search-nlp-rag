@@ -439,10 +439,20 @@ def test_date_fillers_do_not_follow_the_inclusion_gate_at_the_call_site(monkeypa
 def test_date_filler_knob_ships_the_value_the_alias_resolved_to(parse_config):
     """Default configuration must be byte-identical to the pre-#300 behaviour:
     _DATE_FILLER_SCORE = config.ASK_MIN_SCORE resolved to ASK_MIN_SCORE's own
-    0.2 default out of the box, and the two shipped defaults stay equal."""
+    0.2 default out of the box, and the two shipped defaults stay equal.
+
+    The ordering assertion is about the shipped PAIR, not about a coupling
+    between the knobs: chat filters sources with `score >= ASK_MIN_SCORE`, so a
+    filler floor below the gate would be dropped before the model ever saw it
+    and the temporal fallback would silently stop working. The two are
+    independent now, which means raising one in a deployment's .env without
+    raising the other is a real (documented) way to break that -- but the
+    defaults this branch ships must not start out broken.
+    """
     shipped = parse_config()
     assert shipped.ASK_MIN_SCORE == 0.2
     assert shipped.DATE_FILLER_SCORE == 0.2
+    assert shipped.DATE_FILLER_SCORE >= shipped.ASK_MIN_SCORE
 
 
 def test_retuning_the_inclusion_gate_does_not_move_the_date_filler_floor(parse_config):

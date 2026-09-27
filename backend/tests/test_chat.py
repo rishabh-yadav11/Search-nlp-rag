@@ -45,6 +45,21 @@ def _stub_temporal_date_window(monkeypatch):
     monkeypatch.setattr(_main, "retrieve_by_date_window", _noop)
 
 
+@pytest.fixture(autouse=True)
+def _shipped_weak_gate(monkeypatch):
+    """Pin the answerability knobs chat's weak-fallback path reads.
+
+    They used to be module constants in app/answer_fallback.py, unreachable
+    from the environment; #300 made them deployment settings, so a machine
+    whose .env retunes them would otherwise decide whether the tests below
+    still take the weak-fallback branch. Mirrors the pin in
+    test_answer_fallback.py; the shipped values themselves are asserted there
+    against a clean parse of config.py.
+    """
+    monkeypatch.setattr(chat_module.config, "WEAK_RESULT_SCORE", 0.3)
+    monkeypatch.setattr(chat_module.config, "WEAK_RESULT_MIN_STRONG", 3)
+
+
 def _store(tmp_path):
     s = ChatStore(str(tmp_path / "chat.db"))
     _run(s.connect())

@@ -37,15 +37,20 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
 
 
 def results_are_weak(scores: list[float], limit: int | None = None) -> bool:
-    """True when fewer than `limit` of the top reranked scores exceed
-    config.WEAK_RESULT_SCORE, i.e. retrieval is too weak to answer the query.
+    """True when fewer than `limit` of the top reranked scores exceed the
+    WEAK_RESULT_SCORE knob, i.e. retrieval is too weak to answer the query.
 
-    ``limit`` defaults to config.WEAK_RESULT_MIN_STRONG and is capped at the
+    ``limit`` defaults to the WEAK_RESULT_MIN_STRONG knob and is capped at the
     number of available scores, never below 1: a topic with only 1-2 strong
     matches in the corpus is NOT treated as weak — refusing to answer then
     would suppress every narrow/niche question. The floor of 1 also keeps a
     nonsensical WEAK_RESULT_MIN_STRONG (<= 0) from opening the gate on
-    everything. An empty scores list still counts as weak."""
+    everything. An empty scores list still counts as weak.
+
+    The knob names are spelled without their ``config.`` prefix on purpose:
+    tests/test_config_knobs.py counts a ``config.KNOB`` mention anywhere in the
+    source as a reader, so naming them in dotted form here would let this
+    docstring vouch for a knob whose live read had been deleted."""
     if not scores:
         return True
     strong = sum(1 for s in scores if s > config.WEAK_RESULT_SCORE)

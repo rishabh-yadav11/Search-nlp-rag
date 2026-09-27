@@ -1184,13 +1184,14 @@ async def retrieve_by_date_window(
             # Score on a recency-agnostic base; the recency multiplier is applied
             # exactly once in sort_results so merged results share one scale with
             # lexical (cross-encoder) hits instead of double-counting recency.
-            # Date-only fillers sit at a modest floor: below the typical
-            # lexical (cross-encoder) band, so they never outrank a genuine
-            # lexical match (and, via _merge_results' body preference, never
-            # drop an article body). The floor is independent of the chat
-            # inclusion gate now, so it clears that gate only while it is kept
-            # at or above config.ASK_MIN_SCORE -- which the shipped defaults
-            # (both 0.2) do.
+            # Date-only fillers sit at a modest floor: at/below the chat
+            # relevance gate but strictly below the typical lexical
+            # (cross-encoder) band -- real relevant hits sigmoid-score well
+            # above it -- so they surface without outranking a genuine lexical
+            # match (and, via _merge_results' body preference, never drop an
+            # article body). The floor is now independent of the chat gate, so
+            # it clears that gate only while it is kept at or above
+            # config.ASK_MIN_SCORE, which the shipped defaults (both 0.2) do.
             score=config.DATE_FILLER_SCORE,
         )
         for p in points

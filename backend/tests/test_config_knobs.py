@@ -173,9 +173,17 @@ def test_ranking_tuning_knobs_agree_with_the_shipped_env_template(parse_config):
     template entry at all before, so there was nothing to disagree with.
     """
     shipped = parse_config()
-    example = (BACKEND / ".env.example").read_text()
+    # Exact `NAME=value` assignments, compared as whole entries: a substring
+    # match would accept WEAK_RESULT_SCORE=0.35 as the shipped 0.3, which is
+    # the decimal drift this is here to catch.
+    template = {}
+    for line in (BACKEND / ".env.example").read_text().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            name, _, value = stripped.partition("=")
+            template[name] = value
     drifted = [
-        name
+        f"{name} (code {getattr(shipped, name)!r}, template {template.get(name)!r})"
         for name in (
             "RECENCY_BOOST_STRENGTH",
             "RECENCY_BOOST_DECAY_DAYS",
@@ -183,6 +191,6 @@ def test_ranking_tuning_knobs_agree_with_the_shipped_env_template(parse_config):
             "WEAK_RESULT_MIN_STRONG",
             "DATE_FILLER_SCORE",
         )
-        if f"{name}={getattr(shipped, name)}" not in example
+        if template.get(name) != str(getattr(shipped, name))
     ]
     assert not drifted, f".env.example disagrees with the shipped default of: {drifted}"
