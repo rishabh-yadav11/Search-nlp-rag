@@ -1,108 +1,41 @@
-"""Cross-encoder reranker with an ONNX (optimum/onnxruntime) fast path and a
-torch sentence-transformers fallback.
+"""Cross-encoder reranker backed by a torch ``CrossEncoder``.
 
-The ONNX path runs the MiniLM cross-encoder roughly 2-3x faster on CPU than
-torch. The model is exported to ONNX once and cached in RERANK_ONNX_DIR
-(default ``data/reranker_onnx``); later startups load the cached ONNX directly
-so only the first-ever startup pays the export cost. A cross-process file lock
-guards the export so the four gunicorn workers don't race to write it.
+This module used to try an ONNX fast path (optimum/onnxruntime) first and fall
+back to torch. That branch was removed: ``optimum-onnx`` pins
+``transformers<4.58`` while this project pins ``transformers==5.10.1`` for the
+CVE-2026-4372 / CVE-2026-5241 / CVE-2026-1839 fixes, so ``optimum`` is not
+installable here (see backend/requirements.txt). With optimum absent the branch
+could only ever raise a caught ``ImportError`` and log a fallback warning on
+every gunicorn worker at startup, so it was dead code that cost startup time
+and hid the real backend. The ONNX path may be reinstated if the transformers
+pin is ever relaxed enough for ``optimum-onnx`` to install.
 
-When ``optimum`` is not installed or the export/load fails, the torch
-``CrossEncoder`` is used instead so startup never fails.
-
-Both backends expose the same ``predict(pairs) -> list[float]`` interface, so
-callers (app.main.rerank) are unaffected by which backend is active.
+``backend`` is accepted so callers can keep passing ``config.RERANK_BACKEND``;
+only ``"torch"`` is implemented. Any other value logs a warning and uses torch,
+so a stale ``RERANK_BACKEND=onnx`` in a deployment's environment degrades the
+same way the old fallback did instead of breaking startup.
 """
 
 import logging
-import os
-
-from app.config import config
 
 logger = logging.getLogger("reranker")
-
-# Flatten the model name into a safe local directory name (e.g. swap '/').
-_ONNX_SUBDIR = "reranker_onnx"
 
 
 class Reranker:
     """Cross-encoder reranker behind a single ``predict()`` interface."""
 
-    def __init__(self, model_name: str, backend: str = "onnx"):
-        self._onnx = None
-        self._tokenizer = None
-        self._torch = None
-        if backend == "onnx":
-            try:
-                from optimum.onnxruntime import ORTModelForSequenceClassification
-                from transformers import AutoTokenizer
+    def __init__(self, model_name: str, backend: str = "torch"):
+        if backend != "torch":
+            logger.warning(
+                "reranker: backend %r is not available (only 'torch' is supported); using torch",
+                backend,
+            )
+        from sentence_transformers import CrossEncoder
 
-                self._onnx, self._tokenizer = self._load_onnx(
-                    model_name, ORTModelForSequenceClassification, AutoTokenizer
-                )
-                logger.info("reranker: using ONNX backend (%s)", model_name)
-            except Exception as exc:
-                logger.warning("reranker: ONNX backend unavailable (%s); falling back to torch", exc)
-                self._onnx = None
-        if self._onnx is None:
-            from sentence_transformers import CrossEncoder
-
-            self._torch = CrossEncoder(model_name, device="cpu")
-            logger.info("reranker: using torch backend (%s)", model_name)
-
-    def _load_onnx(self, model_name: str, orm_cls, tokenizer_cls):
-        """Load the cached ONNX reranker, exporting it once on first use.
-
-        Returns (model, tokenizer). Concurrent gunicorn workers are
-        synchronized with an exclusive file lock around the export so exactly
-        one worker writes the cache; the others wait and load it."""
-        cache_dir = os.path.join(config.RERANK_ONNX_DIR, _ONNX_SUBDIR)
-        ready = os.path.join(cache_dir, "model.onnx")
-        if os.path.isfile(ready):
-            return orm_cls.from_pretrained(cache_dir), tokenizer_cls.from_pretrained(cache_dir)
-
-        os.makedirs(config.RERANK_ONNX_DIR, exist_ok=True)
-        lock_path = os.path.join(config.RERANK_ONNX_DIR, ".reranker_onnx.lock")
-        with open(lock_path, "w") as lock:
-            import fcntl
-
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                if os.path.isfile(ready):
-                    return orm_cls.from_pretrained(cache_dir), tokenizer_cls.from_pretrained(cache_dir)
-                model = orm_cls.from_pretrained(model_name, export=True, timeout=300)
-                tokenizer = tokenizer_cls.from_pretrained(model_name, timeout=300)
-                # Persist into a dedicated subdir of the base cache so we never
-                # clobber a shared/read-only base cache. Skip the write if the
-                # artifacts already exist to avoid an unintentional overwrite,
-                # and tolerate a read-only cache by keeping the in-memory model
-                # for this process rather than failing startup.
-                if not os.path.isfile(ready):
-                    try:
-                        os.makedirs(cache_dir, exist_ok=True)
-                        model.save_pretrained(cache_dir)
-                        tokenizer.save_pretrained(cache_dir)
-                    except OSError as exc:
-                        logger.warning(
-                            "reranker: could not persist ONNX cache to %s (%s); "
-                            "using in-memory model for this process",
-                            cache_dir, exc,
-                        )
-                return model, tokenizer
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        self.backend = "torch"
+        self._torch = CrossEncoder(model_name, device="cpu")
+        logger.info("reranker: using torch backend (%s)", model_name)
 
     def predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Rerank relevance logits for (query, passage) pairs."""
-        if self._onnx is not None:
-            # The cross-encoder tokenizer encodes (text, text_pair) batches; a
-            # list of tuples would be treated as a single malformed input. Split
-            # the (query, passage) pairs into parallel query/passage lists.
-            qs, ps = zip(*pairs)
-            inputs = self._tokenizer(qs, ps, padding=True, truncation=True, return_tensors="pt")
-            outputs = self._onnx(**inputs)
-            logits = outputs.logits
-            if logits.ndim == 2:
-                return logits[:, 0].tolist()
-            return logits.tolist()
         return self._torch.predict(pairs)

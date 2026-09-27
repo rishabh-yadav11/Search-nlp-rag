@@ -12,8 +12,9 @@ onnxruntime==1.28.0
 # ONNX cross-encoder (optimum[onnxruntime]) is intentionally NOT installed:
 # optimum-onnx pins transformers<4.58, which conflicts with the pinned
 # transformers 5.10.1 (required to fix CVE-2026-4372 / CVE-2026-5241 /
-# CVE-2026-1839). The reranker falls back to the torch CrossEncoder
-# automatically (app/reranker.py).
+# CVE-2026-1839). The reranker's ONNX path was therefore removed; it runs on
+# the torch CrossEncoder (app/reranker.py). onnxruntime stays pinned for
+# fastembed, which uses it for dense embeddings.
 openai==1.68.2
 python-dotenv==1.2.2
 cachetools==5.5.0
