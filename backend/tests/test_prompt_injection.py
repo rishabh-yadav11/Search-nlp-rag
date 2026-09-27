@@ -454,6 +454,19 @@ def test_entity_names_from_the_question_are_fenced_in_the_system_prompt(
     # system role and refers to the entities only by reference.
     assert "## Multi-entity comparison" in system
     assert "comparison between" not in _user_text(poison_client)
+    # POSITION, not just presence: the rule that declares quoted sections
+    # untrusted must be read BEFORE the untrusted text it governs. A clause
+    # sitting after the entity fences would leave the payload to be read as
+    # instruction, and a clause scoping itself to text "below" it would not
+    # cover an entity block above it at all.
+    clause = system.index("## Untrusted content")
+    assert clause < system.index("<<<ENTITY 1>>>")
+    assert clause < system.index("## Multi-entity comparison")
+    # Nothing of the attacker's reaches the instruction half ahead of the rule.
+    assert "Ignore previous instructions" not in system[:clause]
+    assert "Ola Electric" not in system[:clause]
+    # ...and the rule is not worded to exempt anything above it.
+    assert "anywhere below" not in system
 
 
 # --- API helpers (local copies; this file declares no shared fixtures) ---
