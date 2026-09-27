@@ -360,10 +360,12 @@ LE_DOMAIN=search.example.com LE_EMAIL=you@example.com ./setup.sh tls
 
 The stage is written to be safe to re-run and safe to interrupt:
 
+- It installs the plain-HTTP config **before** asking certbot for anything, because the challenge has to be reachable at `http://<domain>/.well-known/acme-challenge/<token>` for validation to succeed. On a host whose nginx config predates that location, skipping this step makes the token fall through to Next.js, 404, and issuance fail on the very first run. Installing the plain config first changes nothing the site is already serving — it only adds the challenge location — which is why `./setup.sh tls` works as a standalone command on an already-running host.
+
 - It issues with certbot's **webroot** plugin against `CERTBOT_WEBROOT` (default `/var/www/certbot`) and never `--standalone`. `--standalone` needs port 80 to be free, so on a live site it would either fail outright or force nginx to stop and take the site down.
 - `--keep-until-expiring` makes a re-run a no-op instead of consuming Let's Encrypt's rate limits.
 - The config is installed only after `nginx -t` accepts it; if nginx rejects it, the previous config is restored. nginx is then **reloaded**, not restarted, so in-flight requests survive.
-- If certbot fails, the plain-HTTP config is left in place and still serving, and the stage exits non-zero.
+- If certbot fails, the plain-HTTP config stays installed and serving, the stage exits non-zero, and it names the likely cause (DNS not pointing here, or port 80 closed) and where certbot's own log is.
 - nginx is never handed a config that references a certificate which does not exist: the `443` server block is only rendered once `/etc/letsencrypt/live/<domain>/fullchain.pem` is readable, and the generator refuses to emit a config at all otherwise.
 
 Once it runs, port 80 keeps serving `/.well-known/acme-challenge/` and redirects everything else to `https://$host$request_uri`, and a matching `listen 443 ssl http2` server (TLSv1.2/1.3) is added. Both servers share one location body, so they cannot drift apart.
