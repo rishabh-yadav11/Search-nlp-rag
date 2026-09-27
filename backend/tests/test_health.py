@@ -1188,6 +1188,47 @@ def test_readiness_single_flight_lock_does_not_outlive_the_cache_entry():
     assert after_reset is None
 
 
+def test_readiness_single_flight_survives_a_change_of_event_loop(monkeypatch):
+    """Two contended probe rounds in two different event loops must both work.
+
+    This is the regression the loop-aware lock exists for. A contended
+    asyncio.Lock binds itself to the loop that contended it and then refuses to
+    be used from any other, raising "is bound to a different event loop" -- so
+    a single module-level lock breaks as soon as a second loop contends it, and
+    these tests run a fresh loop apiece. Expiring only the cache entry, and
+    deliberately keeping the lock, is what forces the second loop down the
+    contended path.
+    """
+    probes = {"n": 0}
+
+    async def counting_report(state):
+        probes["n"] += 1
+        await asyncio.sleep(0.01)
+        return True, {"ready": True, "probes": probes["n"]}
+
+    monkeypatch.setattr(health, "_readiness_report", counting_report)
+
+    async def burst():
+        return await asyncio.gather(*(health._cached_readiness_report({}) for _ in range(4)))
+
+    first = _run(burst())
+    assert probes["n"] == 1
+    assert all(result == first[0] for result in first), "all four callers share one round"
+    first_lock = health._readiness_probe_lock
+
+    # Expire the entry but keep the lock, exactly as a later loop would find it.
+    monkeypatch.setattr(health, "_readiness_cache", None)
+    second = _run(burst())
+
+    # What must hold is that each round ran exactly one probe and that every
+    # caller in it shared that verdict. The two rounds' payloads differ only in
+    # the counter this fake stamps into the report.
+    assert probes["n"] == 2, "each loop runs its own single probe round"
+    assert all(result == second[0] for result in second), "all four callers share one round"
+    assert second[0][0] is True
+    assert health._readiness_probe_lock is not first_lock, "a dead loop's lock must be rebuilt"
+
+
 def test_readiness_report_probe_timeout_is_a_dependency_failure(monkeypatch):
     """A probe that outlives READY_DEP_TIMEOUT_SECONDS is a dependency failure,
     not a crash: it must resolve to the degraded value and let the report
