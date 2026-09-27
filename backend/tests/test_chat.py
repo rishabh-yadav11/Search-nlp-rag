@@ -15,6 +15,7 @@ from typing import ClassVar
 import httpx
 import openai
 import pytest
+from _support import run_sync as _run
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
@@ -28,10 +29,6 @@ USER_A = "user-a-device-id-0001"
 USER_B = "user-b-device-id-0002"
 EMAIL_A = "user-a@example.com"
 EMAIL_B = "user-b@example.com"
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 @pytest.fixture(autouse=True)

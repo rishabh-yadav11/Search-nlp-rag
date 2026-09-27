@@ -3,17 +3,13 @@
 gating, score multiply + re-sort, and the no-change ordering guarantee.
 click_signals is faked on the module so no Redis client is needed."""
 
-import asyncio
 from types import SimpleNamespace
 
 import pytest
+from _support import run_sync as _run
 
 from app import click_boost
 from app.config import config
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _res(id_, score):
