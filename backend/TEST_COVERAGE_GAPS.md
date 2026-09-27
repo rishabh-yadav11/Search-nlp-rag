@@ -371,7 +371,7 @@ accounting is #295's audit. Do not read this section as 100%.
       deployment never depends on the counter; and a settle that cannot reach
       the store is best-effort, because the answer exists and has been billed,
       while the live hold is charged by the sweep either way. A FAILED call
-      is charged, not refunded —
+      is charged, not refunded — the provider bills the prompt of every one of
       the `LLM_MAX_RETRIES + 1` attempts, so `LLMUnavailableError` settles the
       turn's holds for `exc.attempts * LLM_CALL_RESERVE_USD` and is then
       re-raised (#280), while `attempts=0` (the loop never ran, so nothing was
