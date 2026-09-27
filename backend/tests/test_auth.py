@@ -210,7 +210,10 @@ def test_require_auth_accepts_bearer_and_rejects_missing(store, monkeypatch):
         assert e.value.status_code == 401
 
 
-def test_service_token_acts_as_admin(monkeypatch):
+def test_service_token_acts_as_admin(store, monkeypatch):
+    # A service token is a stored, scoped, expiring credential now (#251), so
+    # unlike the old compare-only bypass it needs the auth store to resolve.
+    monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-tok-123")
     req = _req({"x-service-token": "svc-tok-123"})
     asyncio.run(auth.require_auth(req))
@@ -340,7 +343,12 @@ def test_signup_login_me_flow(tmp_path):
         asyncio.run(s.close())
 
 
-def test_signup_validation_errors(tmp_path):
+def test_signup_validation_errors(tmp_path, monkeypatch):
+    # This case hammers signup more times than AUTH_SIGNUP_RATE_PER_MIN allows.
+    # The limit is real and now enforced even with the limiter's Redis down
+    # (see test_auth_issue251.py), so the limit -- not the validation rules --
+    # is what the loop below would otherwise be measuring.
+    monkeypatch.setattr(auth.config, "AUTH_SIGNUP_RATE_PER_MIN", 100)
     client, s = _auth_app(tmp_path)
     try:
         cases = [
