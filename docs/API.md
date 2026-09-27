@@ -12,7 +12,8 @@ Server-Sent-Events (SSE).
 bearer token issued by `POST /api/auth/signup` or `POST /api/auth/login`
 (`Authorization: Bearer <token>`). Tokens are opaque, expire after
 `AUTH_TOKEN_TTL_DAYS` (7) and can be revoked (`POST /api/auth/logout`). Access
-is role-based: `user` (public-signup default) may use chat; `admin` also has
+is role-based: `user` (the only role public signup can grant — it is not
+configurable) may use chat; `admin` also has
 analytics read + user management. `/search`, `/facets`, `/analytics/click` and
 the auth endpoints are public. Signup/login are rate-limited per IP (Redis);
 all inputs are validated server-side. Internal machine clients may bypass via

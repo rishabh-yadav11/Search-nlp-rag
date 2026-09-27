@@ -345,6 +345,52 @@ def test_signup_duplicate_email_409(tmp_path):
         asyncio.run(s.close())
 
 
+def test_signup_role_ignores_env_default_role(tmp_path, monkeypatch):
+    """A hostile AUTH_DEFAULT_ROLE=admin env must not escalate a public signup.
+
+    Asserts all three observable surfaces: the signup response, the row
+    PERSISTED in the auth store, and what the issued session reports via /me.
+    A response-only fix would pass the first assertion and still be a full
+    compromise, so all three are checked.
+    """
+    monkeypatch.setattr(auth.config, "AUTH_DEFAULT_ROLE", "admin", raising=False)
+    client, s = _auth_app(tmp_path)
+    try:
+        r = client.post("/api/auth/signup", json={"email": "env@x.co", "password": "secret12", "name": "E"})
+        assert r.status_code == 200
+        assert r.json()["user"]["role"] == "user"
+
+        # persisted record, read straight back out of the store
+        stored = asyncio.run(s.get_user_by_email("env@x.co"))
+        assert stored is not None
+        assert stored.role == "user"
+
+        # the session minted at signup reports no privilege either
+        me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {r.json()['token']}"})
+        assert me.status_code == 200
+        assert me.json()["role"] == "user"
+        assert me.json()["id"] == stored.id
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_signup_ignores_role_in_request_payload(tmp_path):
+    """A self-declared role in the signup body is not honoured."""
+    client, s = _auth_app(tmp_path)
+    try:
+        r = client.post(
+            "/api/auth/signup",
+            json={"email": "sneaky@x.co", "password": "secret12", "name": "S", "role": "admin"},
+        )
+        assert r.status_code == 200
+        assert r.json()["user"]["role"] == "user"
+        assert asyncio.run(s.get_user_by_email("sneaky@x.co")).role == "user"
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
 def test_login_invalid_credentials_identical_401(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
