@@ -588,6 +588,231 @@ def test_analytics_chat_endpoint(tmp_path):
         _run(chat_store.close())
 
 
+# A distinctive, non-generic user question. global_stats is cross-user, so if a
+# session title can appear in it, one user's private text leaks to every admin.
+PRIVATE_QUESTION = "my doctor prescribed 40mg of sertraline for my bipolar, should i stop"
+
+
+def _seeded_titled_sessions(store):
+    """Create one session per user, titled through the real _auto_title path.
+    Returns (session_ids, titles)."""
+    ids, titles = [], []
+    for user in (USER_A, USER_B):
+        sid = _run(store.create_session(user)).id
+        _run(chat_module._auto_title(store, sid, user, PRIVATE_QUESTION))
+        _run(store.append_message(sid, user, "user", PRIVATE_QUESTION))
+        _run(store.append_message(
+            sid, user, "assistant", "here is a generic answer",
+            prompt_tokens=120, completion_tokens=60, cost=0.02, latency_ms=200.0,
+        ))
+        ids.append(sid)
+        titles.append(_run(store.get_session(sid, user)).title)
+    return ids, titles
+
+
+def test_global_stats_omits_user_question_text(tmp_path):
+    """global_stats is cross-user, so it must never carry session titles —
+    the first 60 chars of the user's own question (regression: it did)."""
+    store = _store(tmp_path)
+    try:
+        _ids, titles = _seeded_titled_sessions(store)
+        # Precondition: _auto_title really did set a title derived from the
+        # question, so this test covers the real path rather than a stub.
+        assert titles == [PRIVATE_QUESTION[:60], PRIVATE_QUESTION[:60]]
+
+        blob = json.dumps(_run(store.global_stats()))
+        assert PRIVATE_QUESTION not in blob
+        for title in titles:
+            assert title not in blob
+            for row in _run(store.global_stats())["top_by_cost"]:
+                assert title not in row
+            for row in _run(store.global_stats())["top_by_tokens"]:
+                assert title not in row
+    finally:
+        _run(store.close())
+
+
+def test_global_stats_top_rows_use_session_ids(tmp_path):
+    """The replacement for the title is the opaque session id, not a hash or
+    a prefix of the user's text — rows stay a usable 4-list."""
+    store = _store(tmp_path)
+    try:
+        ids, titles = _seeded_titled_sessions(store)
+        g = _run(store.global_stats())
+        for key in ("top_by_cost", "top_by_tokens"):
+            assert g[key], f"{key} unexpectedly empty"
+            for row in g[key]:
+                assert isinstance(row, list) and len(row) == 4
+                assert row[0] in ids
+                assert row[0] not in titles
+    finally:
+        _run(store.close())
+
+
+def test_analytics_chat_endpoint_omits_titles(tmp_path, monkeypatch):
+    """The admin-facing /analytics/chat payload carries no user-authored text."""
+    from app import main
+
+    async def fake_turn(question, history):
+        return "a generic reply", [], None, 120, 45, 0.0012
+
+    monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
+
+    chat_store = _store(tmp_path)
+    auth_store = _auth_store(tmp_path)
+    chat_module.store = chat_store
+    auth_module.store = auth_store
+    client = TestClient(main.app)
+    try:
+        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin_id = _run(auth_store.get_user_by_email("admin@example.com")).id
+        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
+        client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=admin_h,
+            json={"content": PRIVATE_QUESTION},
+        )
+        # Precondition: the real turn titled the session from the question, so
+        # a title leak would actually be observable below.
+        title = _run(chat_store.get_session(sid, admin_id)).title
+        assert title == PRIVATE_QUESTION[:60]
+
+        res = client.get("/analytics/chat", headers=admin_h)
+        assert res.status_code == 200
+        assert PRIVATE_QUESTION not in res.text
+        assert title not in res.text
+        payload = res.json()
+        for key in ("top_by_cost", "top_by_tokens"):
+            assert json.dumps(payload[key]).count('"title"') == 0
+            assert [row[0] for row in payload[key]] == [sid]
+    finally:
+        chat_module.store = None
+        auth_module.store = None
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_analytics_chat_records_admin_audit(tmp_path):
+    """Every admin read of the cross-user payload lands in the audit trail;
+    a denied request writes nothing."""
+    from app import main
+
+    chat_store = _store(tmp_path)
+    auth_store = _auth_store(tmp_path)
+    chat_module.store = chat_store
+    auth_module.store = auth_store
+    client = TestClient(main.app)
+    try:
+        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin = _run(auth_store.get_user_by_email("admin@example.com"))
+        user_h = _auth_headers(auth_store, email=EMAIL_A)
+
+        assert _run(chat_store.admin_audit_log()) == []
+        assert client.get("/analytics/chat", headers=admin_h).status_code == 200
+
+        log = _run(chat_store.admin_audit_log())
+        assert log[0]["actor_id"] == admin.id
+        assert log[0]["action"] == "analytics.chat.read"
+        assert log[0]["created_at"] > 0
+
+        # A non-admin is denied and leaves no trace of a read it never made.
+        before = len(log)
+        assert client.get("/analytics/chat", headers=user_h).status_code == 403
+        after = _run(chat_store.admin_audit_log())
+        assert len(after) == before
+        assert all(r["actor_id"] == admin.id for r in after)
+    finally:
+        chat_module.store = None
+        auth_module.store = None
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_analytics_chat_survives_a_failing_audit_write(tmp_path, monkeypatch):
+    """The audit write is best-effort by design — a broken trail must not take
+    the admin dashboard down with it. Pins the try/except at the call site."""
+    from app import main
+
+    chat_store = _store(tmp_path)
+    auth_store = _auth_store(tmp_path)
+    chat_module.store = chat_store
+    auth_module.store = auth_store
+    client = TestClient(main.app)
+
+    async def exploding_audit(actor_id, action):
+        raise RuntimeError("audit table unavailable")
+
+    try:
+        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin = _run(auth_store.get_user_by_email("admin@example.com"))
+        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
+        # top_by_* joins messages, so an empty session would not appear at all.
+        _run(chat_store.append_message(sid, admin.id, "user", "a question"))
+        monkeypatch.setattr(chat_store, "record_admin_audit", exploding_audit)
+
+        res = client.get("/analytics/chat", headers=admin_h)
+        assert res.status_code == 200
+        # The read still returns real data, not a degraded error payload.
+        assert res.json()["sessions"] >= 1
+        assert [row[0] for row in res.json()["top_by_cost"]] == [sid]
+    finally:
+        chat_module.store = None
+        auth_module.store = None
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_admin_audit_expires_via_retention_sweep(tmp_path):
+    """The trail gains a row on every 30s dashboard poll, so it must stay
+    bounded. Expiry rides on the existing retention sweep rather than the hot
+    write path: a row past AUDIT_RETENTION_DAYS is dropped by `purge_expired`,
+    and a row inside the window survives it."""
+    store = _store(tmp_path)
+    try:
+        stale = time.time() - (chat_module.AUDIT_RETENTION_DAYS + 1) * 86400
+        _run(store._db.execute(
+            "INSERT INTO admin_audit (actor_id, action, created_at) VALUES (?, ?, ?)",
+            ("old-admin", "analytics.chat.read", stale),
+        ))
+        _run(store._db.execute(
+            "INSERT INTO admin_audit (actor_id, action, created_at) VALUES (?, ?, ?)",
+            ("recent-admin", "analytics.chat.read", time.time() - 60),
+        ))
+        _run(store._db.commit())
+        assert len(_run(store.admin_audit_log())) == 2
+
+        # Recording a read must not prune: the hot path is one INSERT.
+        _run(store.record_admin_audit("current-admin", "analytics.chat.read"))
+        assert len(_run(store.admin_audit_log())) == 3
+
+        _run(store.purge_expired())
+
+        actors = {r["actor_id"] for r in _run(store.admin_audit_log())}
+        assert "old-admin" not in actors, "expired audit row was never pruned"
+        assert actors == {"recent-admin", "current-admin"}
+    finally:
+        _run(store.close())
+
+
+def test_global_stats_docstring_makes_no_false_safety_claim():
+    """Guard against re-introducing the specific false claim that let the
+    title leak through review.
+
+    Deliberately only negative assertions. Pinning the *replacement* wording
+    would fail on any harmless rewording, creating pressure against editing
+    the docs — the opposite of the intent, since the original defect was a
+    documentation problem. The real behavioural guard is
+    `test_analytics_chat_endpoint_omits_titles`, which drives the live
+    endpoint and fails against the pre-fix code.
+    """
+    doc = ChatStore.global_stats.__doc__
+    assert doc is not None
+    low = doc.lower()
+    assert "privacy-safe" not in low
+    assert "privacy safe" not in low
+    assert "only counts/aggregates" not in low
+    assert "no message contents" not in low
+
+
 def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
     """Chat must apply the auto date filter derived by _effective_intent,
     matching /search (regression: chat passed qfilter=None)."""

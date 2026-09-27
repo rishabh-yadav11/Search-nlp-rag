@@ -439,15 +439,55 @@ Cross-user chat usage, read from the SQLite chat store. Admin-only
   "total_tokens": 61397,
   "total_cost": 2.1901243,
   "avg_latency_ms": 1797.1,
-  "top_by_cost": [ ["Who invested in Ola Electric?", 4, 0.3017, 1786954406.95], ... ],
-  "top_by_tokens": [ ["top deals of 2025", 6, 8432, 1786956978.24], ... ],
+  "top_by_cost": [ ["<session-id>", 4, 0.3017, 1786954406.95], ... ],
+  "top_by_tokens": [ ["<session-id>", 6, 8432, 1786956978.24], ... ],
   "sessions_today": 3,
   "daily_sessions": [ ["2026-08-17", 3], ... ]
 }
 ```
 
-No message contents are exposed — only counts, totals and per-conversation
-aggregates (privacy-safe).
+This is a cross-user response and it is **not** content-free: it exposes
+global totals plus per-session rows for every user's conversations. What keeps
+it free of user-authored text is that no session title, message body or any
+other user-written string is ever selected — the top-N queries project
+`sessions.id` only, so a session is identified by its opaque id and nothing
+else. (A session title is the first 60 characters of the user's own question,
+so returning one here would hand every admin the opening of other people's
+private conversations.)
+
+Each `top_by_*` row is `[session_id, messages, cost | tokens, updated_at]`.
+
+Every read is recorded in the durable `admin_audit` table (`actor_id`,
+`action`, `created_at`), written by `ChatStore.record_admin_audit` before the
+response is returned. Rows older than `AUDIT_RETENTION_DAYS` (90) are dropped by
+the existing retention sweep, `ChatStore.purge_expired`, so recording a read
+stays a single INSERT despite this endpoint being polled every 30s.
+
+**Reading the trail.** `ChatStore.admin_audit_log` is the reader, and it is a
+store method with no HTTP surface — recovering the trail means querying the
+chat SQLite database directly (or calling the method from a Python shell),
+which needs filesystem access. There is no admin UI or endpoint for it. That
+is a deliberate position, not an oversight: publishing cross-user read history
+over the API would create a second cross-user disclosure, in the endpoint
+this issue exists to harden. Be aware of the cost — a control nobody can
+easily read deters less than it appears to.
+
+**What the trail does and does not establish.** It answers "which admin read
+cross-user chat analytics, when, and how often". It does *not* support
+detecting a slow browse through individual conversations: `action` is a
+constant and no row records which sessions were returned, so a deliberate
+browse and an idle open dashboard tab look identical. Per-subject attribution
+was deliberately omitted rather than overlooked — it would put other users'
+session ids into the audit table, trading this fix's own privacy goal for a
+weaker signal.
+
+`actor_id` is the authenticated account's id, so human admin logins are
+attributed individually. A request authenticated with the shared
+`X-Service-Token` bypass is recorded under the single `SERVICE_USER_ID`
+constant instead — the trail cannot distinguish callers that present the same
+shared secret, and no code change can recover a per-caller identity from one
+secret. Treat machine-bypass reads as attributable to "the service token",
+not to a person.
 
 ---
 
