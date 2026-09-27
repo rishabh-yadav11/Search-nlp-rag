@@ -14,6 +14,17 @@ PUBLIC_PORT="${PUBLIC_PORT:-80}"
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 
+# pm2 process tuning. These MUST stay equal to the values in
+# ecosystem.config.js — backend/tests/test_deploy_config.py fails if the two
+# process definitions disagree, because `./setup.sh services` re-registers
+# pm2 from this file and would otherwise silently drop the OOM auto-restart
+# guard that ecosystem.config.js declares.
+API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"
+API_MAX_RESTARTS="${API_MAX_RESTARTS:-10}"
+FRONTEND_MAX_MEMORY="${FRONTEND_MAX_MEMORY:-1G}"
+RESTART_BACKOFF_MS="${RESTART_BACKOFF_MS:-100}"
+
+
 # Pinned docker images with digests for reproducibility. IMPORTANT: the Qdrant
 # version must be >= the version that wrote an existing collection (older
 # versions cannot deserialize newer storage formats). Current default matches
@@ -48,6 +59,8 @@ stages (run in order):
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
+  API_MAX_MEMORY API_MAX_RESTARTS FRONTEND_MAX_MEMORY RESTART_BACKOFF_MS
+     pm2 process tuning; must match ecosystem.config.js (tests enforce it)
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
@@ -297,14 +310,22 @@ run_services() {
     sleep 2
 
     (cd backend && pm2 start "$VENV_PY" \
-        --name vccircle-backend -- -m gunicorn \
+        --name vccircle-backend \
+        --max-memory-restart "$API_MAX_MEMORY" \
+        --max-restarts "$API_MAX_RESTARTS" \
+        --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
+        -- -m gunicorn \
         -k uvicorn.workers.UvicornWorker \
-        --workers "$GUNICORN_WORKERS" --bind "0.0.0.0:$API_PORT" \
+        --workers "$GUNICORN_WORKERS" --bind "127.0.0.1:$API_PORT" \
         --timeout 120 app.main:app)
     wait_http "http://localhost:$API_PORT/health"
 
     (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
-        --name vccircle-frontend -- start -p "$NEXT_PORT")
+        --name vccircle-frontend \
+        --max-memory-restart "$FRONTEND_MAX_MEMORY" \
+        --max-restarts "$API_MAX_RESTARTS" \
+        --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
+        -- start -p "$NEXT_PORT")
     pm2 save >/dev/null 2>&1
     wait_http "http://localhost:$NEXT_PORT/"
 }

@@ -4,7 +4,7 @@ module.exports = {
       name: "vccircle-backend",
       cwd: "/home/ubuntu/search-nlp-rag/backend",
       script: "venv/bin/python",
-      args: "-m gunicorn -k uvicorn.workers.UvicornWorker --workers 4 --bind 0.0.0.0:8001 --timeout 120 app.main:app",
+      args: "-m gunicorn -k uvicorn.workers.UvicornWorker --workers 4 --bind 127.0.0.1:8001 --timeout 120 app.main:app",
       env: {
         NODE_ENV: "production",
       },
