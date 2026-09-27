@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastembed import SparseTextEmbedding
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -29,11 +30,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 # any inference library (torch/onnxruntime) is imported below.
 from app import auth as auth_module
 from app import chat as chat_module
+from app.analytics import AnalyticsUnavailableError, record_click, record_search
 from app.analytics import close as close_analytics
-from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
 from app.auth import public_rate_limit, require_auth, require_permission, user_rate_limit
+from app.chat import ChatAnalyticsUnavailableError
 from app.click_boost import apply_click_boost
 from app.config import config
 from app.cost_budget import close as close_cost_budget
@@ -1376,13 +1378,35 @@ async def analytics_click(event: ClickEvent):
     return {"ok": True}
 
 
+def _analytics_unavailable(message: str) -> JSONResponse:
+    """503 for an analytics feed whose store could not be read.
+
+    The status line and the body must agree: a 200 carrying
+    ``{"error": ...}`` is indistinguishable from a report whose counters are
+    genuinely all zero, which is how a dead analytics store turned into an
+    all-zero dashboard behind a healthy-looking status. The ``error`` key is
+    kept so a client that only inspects the body can still detect this.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"error": message, "detail": "the analytics store could not be read"},
+    )
+
+
 @app.get("/analytics/summary")
 async def get_analytics_summary(
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("analytics:read")),
 ):
-    """Aggregated search/click metrics. Admin-only (analytics:read)."""
-    return await analytics_data()
+    """Aggregated search/click metrics. Admin-only (analytics:read).
+
+    Answers 503 when the analytics Redis is unreachable, so a degraded read is
+    never served as a 200 all-zero report.
+    """
+    try:
+        return await analytics_data()
+    except AnalyticsUnavailableError as exc:
+        return _analytics_unavailable(str(exc))
 
 
 @app.get("/analytics/chat")
@@ -1396,14 +1420,18 @@ async def get_analytics_chat(
     Returns cross-user aggregates and per-session rows (opaque session id,
     message count, cost/tokens, updated_at) — no user-authored text is ever
     included. Each read is recorded in the durable admin audit trail; a failure
-    to record must not break the read itself.
+    to record must not break the read itself. A chat store that cannot be read
+    answers 503 rather than a 200 body that looks like an empty store.
     """
     store = chat_module._require_store()
     try:
         await store.record_admin_audit(request.state.user_id, "analytics.chat.read")
     except Exception:
         logger.exception("admin audit write failed for analytics.chat.read")
-    return await store.global_stats()
+    try:
+        return await store.global_stats()
+    except ChatAnalyticsUnavailableError as exc:
+        return _analytics_unavailable(str(exc))
 
 
 # =============================================================================

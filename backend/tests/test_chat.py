@@ -242,9 +242,10 @@ def test_rename_delete_missing_session_404(tmp_path):
         _run(store.close())
 
 
-def test_global_stats_never_raises_on_error(tmp_path, monkeypatch):
-    """global_stats degrades to an error payload instead of raising when the
-    underlying query fails (ERROR PATH — DB/query failure)."""
+def test_global_stats_raises_on_error(tmp_path, monkeypatch):
+    """global_stats must raise a typed error when the underlying query fails
+    (ERROR PATH — DB/query failure), so the endpoint can answer 503 instead of
+    a 200 body indistinguishable from a genuinely empty chat store (#281)."""
     store = _store(tmp_path)
     try:
         async def boom(*args, **kwargs):
@@ -252,7 +253,8 @@ def test_global_stats_never_raises_on_error(tmp_path, monkeypatch):
 
         monkeypatch.setattr(store, "_fetchone", boom)
         monkeypatch.setattr(store, "_fetchall", boom)
-        assert _run(store.global_stats()) == {"error": "chat analytics unavailable"}
+        with pytest.raises(chat_module.ChatAnalyticsUnavailableError):
+            _run(store.global_stats())
     finally:
         _run(store.close())
 
