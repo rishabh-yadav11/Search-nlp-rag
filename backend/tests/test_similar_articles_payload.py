@@ -5,8 +5,14 @@
 chars per point -- into every returned dict. The response model is untyped, so
 the bodies went over the wire, into the Redis cache for an hour, and back out
 again on every page view: the search page renders one ``SimilarArticles`` per
-result, so a single top_k=8 search pulled ~3.6MB to display a title and a
-category.
+result. Measured with bodies at ``BODY_CHAR_LIMIT`` and the real
+``_format_articles`` -- 9 points fetched per request, 8 returned once the
+source article is filtered out, and 8 requests for a top_k=8 search -- one
+page view went from 3,225,178 B to 24,410 B. The before-figure is robust
+(it is dominated by eight 50k bodies); the after-figure moves with the
+synthetic title/summary text, so the reduction lands between ~132x and
+~150x depending on that fixture. The point either way is >3MB per view.
+
 
 Nothing renders the body. ``SimilarArticles.tsx`` reads id/title/url/category,
 summary and published_date; the for-you card reads the same plus
@@ -203,6 +209,7 @@ class TestSimilarCacheEntryExcludesBody:
         response = _call_similar()
 
         assert response.cached is False, "served a cache entry written by the previous shape"
+        assert response.similar_articles, "expected the fresh fetch to return articles"
         for article in response.similar_articles:
             assert "body" not in article
 
