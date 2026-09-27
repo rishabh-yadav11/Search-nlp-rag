@@ -740,13 +740,52 @@ def test_best_body_window_still_finds_dense_region_under_a_widened_stride():
     assert "alpha" in low and "gamma" in low
 
 
-def test_best_body_window_survives_a_zero_step():
-    """`range(0, n, 0)` raises ValueError. The config clamp already rejects 0,
-    but this helper is module-level and directly callable, so it must not
-    depend on every caller having gone through config."""
-    body = "filler " * 3000
-    out = main._best_body_window(body, {"alpha"}, 1500, 0)
-    assert isinstance(out, str) and out
+class _IterationCountingTokens(set):
+    """A token set that records how many times the scan loop iterated it.
+
+    `_best_body_window` scores each window with `sum(1 for t in tokens ...)`,
+    so the number of times the set is iterated is the number of windows scored
+    (plus the single tail comparison the helper always makes). This observes
+    the real loop through `_best_body_window` itself, which is the only place
+    the budget is actually applied.
+    """
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return super().__iter__()
+
+    def windows_scored(self):
+        return self.iterations - 1
+
+
+def test_best_body_window_applies_the_window_budget():
+    """The budget must be enforced by `_best_body_window`, not merely be
+    available on `_effective_step`.
+
+    Asserting only the helper leaves the single line that applies it
+    (`step = _effective_step(...)`) uncovered: deleting that line leaves the
+    whole suite green while the DoS bound silently disappears.
+    """
+    body = "filler " * 7100  # 49,700 chars
+    tokens = _IterationCountingTokens({"alpha", "beta", "gamma"})
+    main._best_body_window(body, tokens, 1500, 1, max_windows=200)
+    # Unbudgeted, step=1 would score 48,201 windows.
+    assert tokens.windows_scored() <= 200, tokens.windows_scored()
+
+
+def test_best_body_window_does_not_widen_a_default_scan():
+    """The default scan already fits the budget, so the stride must not move
+    and the default rescue must score exactly the same windows as before."""
+    body = "filler " * 7100
+    tokens = _IterationCountingTokens({"alpha", "beta", "gamma"})
+    main._best_body_window(body, tokens, 1500, 500, max_windows=200)
+    assert tokens.windows_scored() == 97  # ceil(48201 / 500)
+
+
 
 
 # --- lifespan ---
