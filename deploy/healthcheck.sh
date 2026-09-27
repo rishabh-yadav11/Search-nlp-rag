@@ -85,9 +85,26 @@ if [ "$live_code" = "200" ] && [ "$ready_code" = "200" ]; then
 fi
 
 if [ "$live_code" = "200" ]; then
-  # Alive, not ready: a dependency or a configuration fault, not a wedged
-  # process. Restarting is not a remedy, so report what the probe actually said.
-  msg="ALERT: VCCircle backend alive but not ready: /ready/deep returned HTTP ${ready_code:-none} while the process is up ($BASE). Not restarting: check Qdrant, the loaded models, and GEMINI_API_KEY."
+  # Alive, not ready. WHICH of those it is decides what the operator is told: a
+  # 503 is a real verdict about the dependencies, while a refused, throttled or
+  # broken PROBE says nothing at all about them and must not be dressed up as one.
+  case "$ready_code" in
+    503)
+      msg="ALERT: VCCircle backend alive but not ready: /ready/deep returned HTTP 503 while the process is up ($BASE). Not restarting: check Qdrant, the loaded models, and GEMINI_API_KEY."
+      ;;
+    403 | 404)
+      msg="ALERT: VCCircle readiness probe REFUSED (HTTP $ready_code) at $BASE/ready/deep -- this is not a verdict about the backend. It answers only a direct loopback caller sending no X-Forwarded-For, so BASE points somewhere it cannot be reached (a reverse proxy, another host, or a port the API is not bound to)."
+      ;;
+    429)
+      msg="ALERT: VCCircle readiness probe was rate limited (HTTP 429) at $BASE/ready/deep -- the watchdog is sharing a budget it should not share. This run says nothing about the backend's health."
+      ;;
+    500)
+      msg="ALERT: VCCircle readiness probe failed internally (HTTP 500) at $BASE/ready/deep -- the probe itself raised, so no dependency verdict was reached. See the backend log."
+      ;;
+    *)
+      msg="ALERT: VCCircle backend alive but readiness unreachable: /ready/deep returned HTTP ${ready_code:-none} at $BASE. Not restarting: the process answered liveness."
+      ;;
+  esac
   log "$msg"
   post_webhook "$msg"
   echo "$msg"

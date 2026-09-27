@@ -358,6 +358,7 @@ class Config:
 # working configuration as broken.
 _GOOGLE_KEY_RE = re.compile(r"^AIza[0-9A-Za-z_-]{35}$")
 _GOOGLE_API_HOST = "generativelanguage.googleapis.com"
+_GOOGLE_KEY_PREFIX = "AIza"
 
 # Filler spellings that turn up in templates, docs and copy-pasted examples,
 # compared in normalised form: lowercased with every non-alphanumeric character
@@ -400,6 +401,16 @@ _PLACEHOLDER_API_KEYS = frozenset(
 # Checked against the normalised form, so "x-x-x-x" is caught as well.
 _REPEATED_FILLER_RE = re.compile(r"(.)\1{3,}")
 
+# ...but that check cannot see inside a correctly shaped key: a MASKED key is
+# usually written with its real prefix and its length, as in the docs' example
+# "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", and that is precisely a key whose
+# shape is right and whose content is filler. So the tail after the prefix is
+# also required to look random: a real 35-character tail drawn from a 64-symbol
+# alphabet has ~27 distinct characters, and the chance of a genuine key having
+# fewer than _MIN_DISTINCT_KEY_CHARS of them is vanishingly small, while every
+# masking style (all X, all digits, all dashes, a padded word) lands far below.
+_MIN_DISTINCT_KEY_CHARS = 12
+
 
 def classify_gemini_api_key(value: str | None) -> str:
     """Classify a configured GEMINI_API_KEY for readiness reporting.
@@ -408,7 +419,8 @@ def classify_gemini_api_key(value: str | None) -> str:
       "ok"          -- a key that can plausibly be sent to the configured
                        LLM endpoint.
       "missing"     -- unset, empty, or whitespace only.
-      "placeholder" -- a known filler value ("your_key_here" and friends).
+      "placeholder" -- a known filler value ("your_key_here" and friends), or
+                       a correctly shaped key whose body is masked filler.
       "malformed"   -- neither missing nor filler, but the wrong shape for the
                        configured GEMINI_BASE_URL (a typo, or a truncated key).
 
@@ -424,8 +436,15 @@ def classify_gemini_api_key(value: str | None) -> str:
     normalised = re.sub(r"[^0-9a-z]+", "", stripped.lower())
     if normalised in _PLACEHOLDER_API_KEYS or _REPEATED_FILLER_RE.fullmatch(normalised):
         return "placeholder"
-    if _GOOGLE_API_HOST in config.GEMINI_BASE_URL and not _GOOGLE_KEY_RE.fullmatch(stripped):
-        return "malformed"
+    # Host names are case-insensitive, and a blank base URL is an operator who
+    # cleared the variable rather than one who pointed it elsewhere: both keep
+    # the structural check, so re-spelling the variable cannot switch it off.
+    base_url = config.GEMINI_BASE_URL.strip().lower()
+    if not base_url or _GOOGLE_API_HOST in base_url:
+        if not _GOOGLE_KEY_RE.fullmatch(stripped):
+            return "malformed"
+        if len(set(stripped[len(_GOOGLE_KEY_PREFIX) :])) < _MIN_DISTINCT_KEY_CHARS:
+            return "placeholder"
     return "ok"
 
 

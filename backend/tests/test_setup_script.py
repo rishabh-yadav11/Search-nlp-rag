@@ -193,3 +193,18 @@ def test_the_nginx_vhost_refuses_the_uncached_probe():
     source = SETUP_SH.read_text()
 
     assert "location /ready/deep { return 404; }" in source
+
+
+def test_the_cron_entry_probes_the_port_the_api_is_actually_bound_to():
+    """API_PORT is a documented override (usage() lists it), and run_services
+    binds pm2 to 127.0.0.1:$API_PORT. The watchdog's own default is 8001, so a
+    cron entry that does not pass BASE leaves it probing a closed port on any
+    other port -- and a watchdog that cannot reach the backend restarts it every
+    five minutes, which is the outage it exists to prevent."""
+    source = SETUP_SH.read_text()
+    cron_lines = [line for line in source.splitlines() if "deploy/healthcheck.sh" in line]
+
+    assert cron_lines, "the cron entry must still be installed by setup.sh"
+    entry = cron_lines[0]
+    assert "API_PORT" in entry, f"the cron entry must derive BASE from API_PORT: {entry!r}"
+    assert "BASE=" in entry

@@ -339,6 +339,51 @@ def test_llm_status_rejects_a_key_of_the_wrong_shape(monkeypatch, value):
     assert health._llm_status() == (False, "malformed")
 
 
+# A masked key keeps the real prefix and the real length and fills the rest with
+# filler, which is how documentation examples are written and how operators
+# redact a key they are not sure about. The shape check alone calls every one of
+# these usable.
+MASKED_KEYS = [
+    "AI" + "za" + "Sy" + "X" * 33,
+    "AI" + "za" + "Sy" + "x" * 33,
+    "AI" + "za" + "0" * 35,
+    "AI" + "za" + "-" * 35,
+    "AI" + "za" + "TODO" + "X" * 31,
+]
+
+
+@pytest.mark.parametrize("value", MASKED_KEYS)
+def test_llm_status_rejects_a_correctly_shaped_but_masked_key(monkeypatch, value):
+    """Right length, right prefix, no key. This is the case a prefix-plus-length
+    shape check cannot see, and shipping one is how #279 happens again."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    ok, reason = health._llm_status()
+
+    assert ok is False
+    assert reason == "placeholder"
+
+
+def test_llm_status_still_accepts_a_key_with_repeats_in_it(monkeypatch):
+    """The guard is a floor on distinct characters, not a ban on repetition: a
+    real key may well contain two identical ones next to each other."""
+    key = "AI" + "za" + "SyD-Example_Key" + "0123456789" + "abcdefgh" + "AA"
+    monkeypatch.setattr(config, "GEMINI_API_KEY", key)
+
+    assert health._llm_status() == (True, "ok")
+
+
+@pytest.mark.parametrize("base_url", ["https://GENERATIVELANGUAGE.GOOGLEAPIS.COM/v1beta/openai/", "", "  "])
+def test_the_google_shape_check_cannot_be_switched_off_by_re_spelling_the_host(monkeypatch, base_url):
+    """A host name is case-insensitive and an empty variable is an operator who
+    cleared it, not one who pointed at a gateway. Neither may silently drop the
+    only structural guard."""
+    monkeypatch.setattr(config, "GEMINI_BASE_URL", base_url)
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "not-a-key-at-all")
+
+    assert health._llm_status() == (False, "malformed")
+
+
 def test_llm_status_accepts_a_real_shaped_key(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
 

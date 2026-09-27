@@ -405,7 +405,11 @@ run_cron() {
     # webhook URL (and a minimal PATH via healthcheck.sh) explicitly. Empty
     # webhook is harmless: healthcheck.sh treats an unset/empty value as "no
     # webhook". Keep the entry stable for idempotent re-runs.
-    local line_hc="*/5 * * * * HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
+    # BASE is passed explicitly because the API is bound to 127.0.0.1:$API_PORT
+    # and the watchdog defaults to 8001: an operator who overrides API_PORT
+    # would otherwise have the watchdog probe a closed port and restart a
+    # perfectly healthy backend every five minutes.
+    local line_hc="*/5 * * * * BASE=\"http://localhost:$API_PORT\" HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
     # Remove only the exact managed entries this script writes; preserve any

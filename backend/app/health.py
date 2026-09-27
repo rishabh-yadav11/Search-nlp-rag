@@ -407,12 +407,12 @@ async def ready_deep(request: Request) -> Response:
       READY_CACHE_TTL_SECONDS ago, so a poll landing just after a dependency
       died gets the pre-outage verdict. A watchdog acts on that answer, so this
       one re-probes every time; it neither reads nor writes the shared entry.
-    * no rate limit. A 429 here would be indistinguishable from an outage to
-      every caller: deploy/healthcheck.sh treats any non-200 as "unhealthy" and
-      restarts the backend, so a prober sharing the public /ready budget could
-      make the watchdog restart a healthy service -- and a restart storm is
-      itself the outage. Such a prober also runs on a timer, far below the
-      600/60s budget /ready needs for a load balancer.
+    * no rate limit. Its callers act on the status code, and a 429 is
+      indistinguishable from an outage to all of them: setup.sh's `wait_http`
+      uses `curl -fsS`, so a throttled probe fails the deploy outright, and the
+      watchdog would alert on a backend that is serving perfectly well. Such
+      callers also run on a timer or a single pass, far below the 600/60s
+      budget /ready needs for a load balancer polling once a second.
 
     Neither property is safe to hand to the internet, so the route is refused
     for any caller that is not a direct loopback request on this host

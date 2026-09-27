@@ -172,3 +172,32 @@ def test_the_script_is_valid_bash():
     proc = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True, timeout=30, check=False)
 
     assert proc.returncode == 0, textwrap.indent(proc.stderr, "  ")
+
+
+def test_a_refused_readiness_probe_is_not_reported_as_a_dependency_failure(tmp_path):
+    """403/404 is what the API answers when the probe cannot be reached the way
+    it requires -- a reverse proxy in front, or a BASE pointing at the wrong
+    port. That is a fact about BASE, not about Qdrant or the API key, and an
+    alert naming the dependencies sends the operator after the wrong thing."""
+    run = run_watchdog(tmp_path, health="200", ready="403")
+
+    assert run.returncode == 1
+    assert run.restarts == []
+    assert "REFUSED" in run.stdout
+    assert "GEMINI_API_KEY" not in run.stdout, "a refused probe is not a dependency verdict"
+    assert "Qdrant" not in run.stdout
+
+
+def test_a_real_readiness_failure_names_the_dependencies(tmp_path):
+    run = run_watchdog(tmp_path, health="200", ready="503")
+
+    assert "GEMINI_API_KEY" in run.stdout
+    assert "Qdrant" in run.stdout
+
+
+def test_a_broken_probe_says_so_instead_of_guessing(tmp_path):
+    run = run_watchdog(tmp_path, health="200", ready="500")
+
+    assert run.returncode == 1
+    assert "failed internally" in run.stdout
+    assert "GEMINI_API_KEY" not in run.stdout
