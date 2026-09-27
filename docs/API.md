@@ -12,7 +12,8 @@ Server-Sent-Events (SSE).
 bearer token issued by `POST /api/auth/signup` or `POST /api/auth/login`
 (`Authorization: Bearer <token>`). Tokens are opaque, expire after
 `AUTH_TOKEN_TTL_DAYS` (7) and can be revoked (`POST /api/auth/logout`). Access
-is role-based: `user` (public-signup default) may use chat; `admin` also has
+is role-based: `user` (the only role public signup can grant — it is not
+configurable) may use chat; `admin` also has
 analytics read + user management. `/search`, `/facets`, `/analytics/click` and
 the auth endpoints are public. Signup/login are rate-limited per IP (Redis);
 all inputs are validated server-side. Internal machine clients may bypass via
@@ -386,6 +387,13 @@ the `analytics:read` permission (`Authorization: Bearer <token>`).
 ```
 
 Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`).
+
+`click_positions` is keyed by result position from `CLICK_POSITION_MIN` to
+`CLICK_POSITION_MAX` (`1`..`10` in this codebase; both are constants in
+`backend/app/analytics.py`, not environment settings). A click recorded outside
+that range is clamped to the nearest bound, so every reported bucket is one the
+backend can record. `top_queries` returns at most `TOP_QUERIES_N` (20) entries
+and `click_top_queries` at most `TOP_CLICKED_QUERIES_N` (10).
 
 ---
 

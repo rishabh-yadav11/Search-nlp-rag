@@ -555,7 +555,11 @@ def test_source_context_no_facets_no_summary():
 def test_source_context_truncates_body_to_body_limit():
     a = SourceArticle(id=1, title="T", url="u", summary="s", body="x" * 100, score=0.5)
     out = main.source_context(a, 1, body_limit=20)
-    assert len(out.split("\n")[-1]) == 20
+    # Everything after the "[1] T (n/a)" meta line and the "s" summary.
+    excerpt = out.split("\n", 2)[2]
+    # The cap bounds the body characters; the note marks the cut so the model
+    # can tell a capped excerpt from an article that simply ended.
+    assert excerpt == "x" * 20 + main.BODY_TRUNCATION_NOTE
 
 
 # --- _facet_values ---

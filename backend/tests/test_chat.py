@@ -462,7 +462,7 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
                 needs_llm=True,
             )
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             for piece in ["Hello ", "world", "!"]:
                 yield piece
             if usage_holder is not None:
@@ -1087,9 +1087,11 @@ def test_chart_intent_regex():
 
 def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
     calls = []
+    systems = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
+        systems.append(system_prompt or "")
         if len(calls) == 1:
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
         return chat_module.LLMResult(
@@ -1102,9 +1104,16 @@ def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
     _pin_budget_disabled(monkeypatch)
 
-    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", []))
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", [], "SYSTEM"))
     assert len(calls) == 2
-    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") in calls[1]
+    # The retry instruction is ours, so it rides in the system role: the user
+    # message is the one the system prompt declares entirely untrusted, and
+    # trusted prose there would undercut the retry's authority.
+    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") in systems[1]
+    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") not in calls[1]
+    assert calls[1] == "PROMPT"
+    assert systems[1].startswith("SYSTEM")
+    assert systems[0] == "SYSTEM"
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 13
     assert "dataviz" in result.content
@@ -1113,7 +1122,7 @@ def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
 def test_answer_with_dataviz_single_call_when_block_present(monkeypatch):
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         return chat_module.LLMResult(
             content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]]}\n```',
@@ -1132,7 +1141,7 @@ def test_answer_with_dataviz_single_call_when_block_present(monkeypatch):
 def test_answer_with_dataviz_no_retry_for_non_numeric_question(monkeypatch):
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         return chat_module.LLMResult(content="Plain answer [1].", prompt_tokens=10, completion_tokens=5)
 
@@ -1149,7 +1158,7 @@ def test_answer_with_dataviz_no_retry_for_ranked_question_without_chart_ask(monk
     dataviz block into the answer (regression: top-N used to auto-chart)."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         return chat_module.LLMResult(content="Top deal is Zepto [1].", prompt_tokens=10, completion_tokens=5)
 
@@ -1283,7 +1292,7 @@ def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
     turn = _run(chat_module._prepare_turn("top 10 ipo deals in 2025", []))
     assert captured["top_k"] == 10
     assert len(turn.sources) == 10
-    assert "max 10" in turn.answer  # dataviz cap matches the requested N
+    assert "max 10" in turn.system  # dataviz cap matches the requested N
 
     monkeypatch.setattr(main, "retrieve_and_rerank", make_fake(chat_module.config.TOP_K))
     turn = _run(chat_module._prepare_turn("who invested in Ola Electric?", []))
@@ -1326,7 +1335,7 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
     erroring the turn."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
@@ -1536,7 +1545,7 @@ def test_answer_with_dataviz_skips_nudge_when_budget_exhausted(monkeypatch):
     exhausted budget skips the retry and keeps the first answer."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
@@ -1682,7 +1691,7 @@ def test_answer_with_dataviz_skips_nudge_when_turn_spend_exhausts_budget(monkeyp
     answer is kept (no error surfaced)."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             # 1M prompt tokens == $1.00 with the pinned pricing.
@@ -1714,7 +1723,7 @@ def test_answer_with_dataviz_nudges_when_turn_spend_still_within_budget(monkeypa
     first call, the guard must NOT block the retry."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=1_000_000, completion_tokens=0)
@@ -1898,9 +1907,11 @@ def test_answer_ranked_nudges_after_refusal(monkeypatch):
     """A ranked-list answer that refuses must be re-asked once with the ranking
     nudge (lines 799-808)."""
     calls = []
+    systems = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
+        systems.append(system_prompt or "")
         if len(calls) == 1:
             return chat_module.LLMResult(
                 content="I cannot generate a ranked list [1].", prompt_tokens=10, completion_tokens=5
@@ -1911,9 +1922,14 @@ def test_answer_ranked_nudges_after_refusal(monkeypatch):
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
     _pin_budget_disabled(monkeypatch)
 
-    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", []))
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", [], "SYSTEM"))
     assert len(calls) == 2
-    assert chat_module._RANKING_NUDGE in calls[1]
+    # Our instruction goes to the instruction channel, never into the user
+    # message the system prompt declares untrusted.
+    assert chat_module._RANKING_NUDGE in systems[1]
+    assert chat_module._RANKING_NUDGE not in calls[1]
+    assert calls[1] == "PROMPT"
+    assert systems[1].startswith("SYSTEM")
     assert result.content == "Top deal: Zepto [1]."
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 13
@@ -1924,7 +1940,7 @@ def test_answer_ranked_keeps_first_answer_when_nudge_fails(monkeypatch):
     guard at lines 803-804)."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             return chat_module.LLMResult(
@@ -1948,7 +1964,7 @@ def test_answer_ranked_skips_nudge_when_budget_exhausted(monkeypatch):
     budget skips the retry and keeps the refusal (no error surfaced)."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             return chat_module.LLMResult(
@@ -1975,7 +1991,7 @@ def test_answer_ranked_skips_nudge_when_turn_spend_exhausts_budget(monkeypatch):
     this turn's first call pushes the day past it, so the refusal is kept."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             # 1M prompt tokens == $1.00 with the pinned pricing.
@@ -2003,9 +2019,11 @@ def test_answer_ranked_nudges_when_turn_spend_still_within_budget(monkeypatch):
     """Counterpart to the case above: with headroom left after this turn's first
     call, the ranking-nudge guard must NOT block the retry."""
     calls = []
+    systems = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
+        systems.append(system_prompt or "")
         if len(calls) == 1:
             return chat_module.LLMResult(
                 content="I cannot generate a ranked list [1].", prompt_tokens=1_000_000, completion_tokens=0
@@ -2017,16 +2035,17 @@ def test_answer_ranked_nudges_when_turn_spend_still_within_budget(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", []))
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", [], "SYSTEM"))
     assert len(calls) == 2
-    assert chat_module._RANKING_NUDGE in calls[1]
+    assert chat_module._RANKING_NUDGE in systems[1]
+    assert chat_module._RANKING_NUDGE not in calls[1]
     assert result.content == "Top deal: Zepto [1]."
 
 
 def test_answer_ranked_single_call_when_not_refusal(monkeypatch):
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         return chat_module.LLMResult(content="Top deal is Zepto [1].", prompt_tokens=10, completion_tokens=5)
 
@@ -2252,7 +2271,7 @@ def test_run_turn_records_cost_and_finalizes(monkeypatch):
     async def fake_prepare(question, history):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note="note", needs_llm=True)
 
-    async def fake_answer_ranked(question, prompt, holds):
+    async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
         calls["prompt"] = prompt
         return chat_module.LLMResult(
             content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
@@ -2291,7 +2310,7 @@ def test_run_turn_releases_hold_when_llm_unavailable(monkeypatch):
     async def fake_prepare(question, history):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note=None, needs_llm=True)
 
-    async def boom(question, prompt, holds):
+    async def boom(question, prompt, holds, system_prompt=""):
         raise chat_module.LLMUnavailableError()
 
     monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -2319,7 +2338,7 @@ def test_run_turn_settles_summed_turn_cost_exactly_once(monkeypatch):
     async def fake_prepare(question, history):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         generate_calls.append(prompt)
         # A chart ask whose answer refuses: the dataviz nudge (call 2) and then
         # the ranking nudge (call 3) all fire, so the turn is billed three
@@ -2433,12 +2452,12 @@ def test_api_stream_dataviz_nudge_replaces_answer(tmp_path, monkeypatch):
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "no block here [1]."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             return chat_module.LLMResult(
                 content='Prose.\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
                 prompt_tokens=20,
@@ -2472,7 +2491,7 @@ def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
@@ -2507,14 +2526,14 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
 
         nudge_calls = []
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             nudge_calls.append(prompt)
             return chat_module.LLMResult(
                 content='Prose.\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
@@ -2567,7 +2586,7 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
             if usage_holder is not None:
                 # 1M prompt tokens == $1.00 with the pinned pricing.
@@ -2575,7 +2594,7 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
 
         nudge_calls = []
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             nudge_calls.append(prompt)
             return chat_module.LLMResult(
                 content='Prose.\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
@@ -2618,12 +2637,12 @@ def test_api_stream_ranking_nudge_replaces_answer(tmp_path, monkeypatch):
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
         async def noop(*args, **kwargs):
@@ -2652,7 +2671,7 @@ def test_api_stream_ranking_nudge_failure_keeps_answer(tmp_path, monkeypatch):
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
@@ -2687,14 +2706,14 @@ def test_api_stream_ranking_nudge_skipped_when_budget_exhausted(tmp_path, monkey
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5))
 
         nudge_calls = []
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             nudge_calls.append(prompt)
             return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
@@ -2743,7 +2762,7 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
                 # 1M prompt tokens == $1.00 with the pinned pricing.
@@ -2751,7 +2770,7 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
 
         nudge_calls = []
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             nudge_calls.append(prompt)
             return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
@@ -2794,14 +2813,14 @@ def test_api_stream_records_summed_turn_cost_exactly_once(tmp_path, monkeypatch)
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
 
         nudge_calls = []
 
-        async def fake_generate(client, prompt, model):
+        async def fake_generate(client, prompt, model, system_prompt=None):
             nudge_calls.append(prompt)
             # 200K for the dataviz nudge, 300K for the ranking nudge.
             prompt_tokens = 200_000 if len(nudge_calls) == 1 else 300_000
@@ -2978,7 +2997,7 @@ def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             for piece in ["Partial ", "answer ", "rest."]:
                 yield piece
             if usage_holder is not None:
@@ -3019,7 +3038,7 @@ def test_stream_abort_before_any_delta_deletes_user_message(tmp_path, monkeypatc
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "never seen by the client"
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
@@ -3052,7 +3071,7 @@ def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypa
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "half an answer"
             raise RuntimeError("provider dropped the connection")
 
@@ -3161,7 +3180,7 @@ def test_nudge_unreachable_counter_degrades_without_billing(monkeypatch, caplog)
     and is logged."""
     calls = []
 
-    async def fake_generate(client, prompt, model):
+    async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
 
@@ -3450,7 +3469,7 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
 
         entered = {"v": False}
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             # The LLM call has now happened and been billed; the loop's
             # disconnect check runs immediately after, with `streamed` still
             # False because the piece has not been yielded yet.
@@ -3509,7 +3528,7 @@ def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch)
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "half an answer"
             raise RuntimeError("provider dropped the connection")
 
@@ -3550,7 +3569,7 @@ def test_stream_failure_before_any_delta_releases_the_hold(tmp_path, monkeypatch
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             raise chat_module.LLMUnavailableError()
             yield  # pragma: no cover -- an async generator that never runs
 
@@ -3595,7 +3614,7 @@ def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, m
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             for piece in ["The ", "complete ", "answer."]:
                 yield piece
             if usage_holder is not None:
@@ -3636,7 +3655,7 @@ def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypat
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_answer_ranked(question, prompt, holds):
+        async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
             return chat_module.LLMResult(content="A billed answer [1].", prompt_tokens=50, completion_tokens=10)
 
         async def dead_settle(ids, actual_usd):
@@ -3700,7 +3719,7 @@ def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_answer_ranked(question, prompt, holds):
+        async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
             return chat_module.LLMResult(content="An unmetered answer [1].", prompt_tokens=50, completion_tokens=10)
 
         dead = _pin_budget_disabled_with_dead_store(monkeypatch)
@@ -3732,7 +3751,7 @@ def test_disabled_cap_never_consults_the_store_on_the_stream_path(tmp_path, monk
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A streamed, unmetered answer."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
@@ -3770,7 +3789,7 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             # No dataviz block, so the chart-intent nudge gate re-checks the
             # client after the stream has finished.
             yield "No chart here [1]."
@@ -3816,7 +3835,7 @@ def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkey
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             # A refusal, so the RANKING nudge gate is the post-stream check that
             # runs -- the dataviz gate is skipped because there is no chart ask.
             yield "I cannot generate a ranked list because amounts are missing."
@@ -3864,7 +3883,7 @@ def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tm
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             # A ranking refusal, so the turn reaches the ranking nudge gate
             # after the stream; the nudge below then raises, which lands the
             # turn in fail_turn with its answer already delivered.
@@ -3923,7 +3942,7 @@ def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypa
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A fully delivered answer [1]."
             if usage_holder is not None:
                 # Exactly what stream_answer does with no usage chunk: a truthy
@@ -3961,7 +3980,7 @@ def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, m
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
-        async def fake_stream(client, prompt, model, usage_holder=None):
+        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A fully delivered answer [1]."
             if usage_holder is not None:
                 # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10,

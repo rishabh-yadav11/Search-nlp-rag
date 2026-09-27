@@ -7,6 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from app import auth
+from app import config as config_module
 from app.auth import AuthStore, DuplicateEmailError, StoredUser, bootstrap_admin
 
 
@@ -345,6 +346,52 @@ def test_signup_duplicate_email_409(tmp_path):
         asyncio.run(s.close())
 
 
+def test_signup_role_ignores_env_default_role(tmp_path, monkeypatch):
+    """A hostile AUTH_DEFAULT_ROLE=admin env must not escalate a public signup.
+
+    Asserts all three observable surfaces: the signup response, the row
+    PERSISTED in the auth store, and what the issued session reports via /me.
+    A response-only fix would pass the first assertion and still be a full
+    compromise, so all three are checked.
+    """
+    monkeypatch.setattr(auth.config, "AUTH_DEFAULT_ROLE", "admin", raising=False)
+    client, s = _auth_app(tmp_path)
+    try:
+        r = client.post("/api/auth/signup", json={"email": "env@x.co", "password": "secret12", "name": "E"})
+        assert r.status_code == 200
+        assert r.json()["user"]["role"] == "user"
+
+        # persisted record, read straight back out of the store
+        stored = asyncio.run(s.get_user_by_email("env@x.co"))
+        assert stored is not None
+        assert stored.role == "user"
+
+        # the session minted at signup reports no privilege either
+        me = client.get("/api/auth/me", headers={"Authorization": f"Bearer {r.json()['token']}"})
+        assert me.status_code == 200
+        assert me.json()["role"] == "user"
+        assert me.json()["id"] == stored.id
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
+def test_signup_ignores_role_in_request_payload(tmp_path):
+    """A self-declared role in the signup body is not honoured."""
+    client, s = _auth_app(tmp_path)
+    try:
+        r = client.post(
+            "/api/auth/signup",
+            json={"email": "sneaky@x.co", "password": "secret12", "name": "S", "role": "admin"},
+        )
+        assert r.status_code == 200
+        assert r.json()["user"]["role"] == "user"
+        assert asyncio.run(s.get_user_by_email("sneaky@x.co")).role == "user"
+    finally:
+        auth.store = None
+        asyncio.run(s.close())
+
+
 def test_login_invalid_credentials_identical_401(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
@@ -625,26 +672,62 @@ def test_require_auth_store_uninitialized_503(monkeypatch):
 def test_client_ip_x_forwarded_for_and_fallback():
     """_client_ip honors X-Forwarded-For only behind a trusted proxy, else the
     real socket peer, then 'unknown'."""
-    # Default (no trusted proxy): XFF is ignored, the socket peer is authoritative.
+    # Auto (the shipped default) with a client that is not behind a local
+    # proxy: the header is ignored and the socket peer stays authoritative,
+    # so a direct caller cannot forge an IP to escape its own rate-limit bucket.
     req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"
-    # Behind a trusted proxy: the rightmost (nginx-appended) XFF hop wins, so a
-    # client cannot spoof its IP by prepending a forged address.
-    auth.config.AUTH_TRUST_X_FORWARDED_FOR = True
-    try:
-        req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
-        assert auth._client_ip(req) == "10.0.0.1"
-        req = _req({"x-forwarded-for": " 203.0.113.9 "})
-        assert auth._client_ip(req) == "203.0.113.9"
-    finally:
-        auth.config.AUTH_TRUST_X_FORWARDED_FOR = False
-    # socket peer fallback
+    # Auto with a loopback peer -- the reference deploy, where nginx on this
+    # host forwards to 127.0.0.1. The rightmost (nginx-appended) XFF hop wins,
+    # so a client cannot spoof its IP by prepending a forged address.
+    req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
+    req.client = SimpleNamespace(host="127.0.0.1")
+    assert auth._client_ip(req) == "10.0.0.1"
+    req = _req({"x-forwarded-for": " 203.0.113.9 "})
+    req.client = SimpleNamespace(host="::1")
+    assert auth._client_ip(req) == "203.0.113.9"
+    # No forwarded header at all: the socket peer is authoritative, so the
+    # caller keys on its own address rather than on anything it claims.
     req = _req({})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"
     # no peer at all -> "unknown"
     assert auth._client_ip(_req({})) == "unknown"
+
+
+def test_client_ip_trust_setting_overrides_the_auto_peer_check(monkeypatch):
+    """An explicit true/false forces the behaviour whatever the peer is."""
+    req = _req({"x-forwarded-for": "10.0.0.1"})
+    req.client = SimpleNamespace(host="127.0.0.1")
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", False)
+    assert auth._client_ip(req) == "127.0.0.1"
+
+    req = _req({"x-forwarded-for": "10.0.0.1"})
+    req.client = SimpleNamespace(host="203.0.113.9")
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
+    assert auth._client_ip(req) == "10.0.0.1"
+
+
+def test_xff_trust_env_parsing_is_three_state(monkeypatch):
+    """'auto' (and an unset var) must resolve to the auto behaviour, so the
+    .env shipped by setup.sh does not force a decision. A forced true/false is
+    honoured, and an unrecognised value falls back to auto rather than
+    silently picking a side."""
+    monkeypatch.delenv("PROBE_FLAG", raising=False)
+    assert config_module._env_tristate("PROBE_FLAG") is None
+    for value in ("auto", "AUTO", "", "  "):
+        monkeypatch.setenv("PROBE_FLAG", value)
+        assert config_module._env_tristate("PROBE_FLAG") is None, value
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("PROBE_FLAG", value)
+        assert config_module._env_tristate("PROBE_FLAG") is True, value
+    for value in ("0", "false", "no", "off"):
+        monkeypatch.setenv("PROBE_FLAG", value)
+        assert config_module._env_tristate("PROBE_FLAG") is False, value
+    # A typo must not resolve to the unsafe (trust-everything) side.
+    monkeypatch.setenv("PROBE_FLAG", "yse")
+    assert config_module._env_tristate("PROBE_FLAG") is None
 
 
 def _promote_to_admin(client, s, email):
