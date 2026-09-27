@@ -454,6 +454,40 @@ def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch)
     assert asyncio.run(scenario()) == auth.SERVICE_USER_ID
 
 
+
+def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypatch):
+    """Revocation must stick even though the value is still in the environment.
+
+    The env value seeds the record on a store miss, and that seed is INSERT OR
+    IGNORE -- so it cannot overwrite the tombstone of a revoked row. If it ever
+    could, every revoked configured token would silently come back to life
+    with a full fresh lifetime on the next request, which would make the expiry
+    theatre."""
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-abc")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    async def scenario():
+        first = _req({"x-service-token": "svc-abc"})
+        await auth.require_auth(first)
+        await store.revoke_service_token("svc-abc")
+        # Presented again, with the environment still naming the same value.
+        for _ in range(3):
+            second = _req({"x-service-token": "svc-abc"})
+            try:
+                await auth.require_auth(second)
+            except HTTPException as e:
+                assert e.status_code == 401
+            else:
+                raise AssertionError("a revoked service token came back to life")
+        # And its row is still there as a tombstone, not silently re-created.
+        row = await store._fetchone("SELECT revoked_at FROM auth_service_tokens")
+        return row is not None and row["revoked_at"] is not None
+
+    assert asyncio.run(scenario())
+
+
 def test_service_token_restart_does_not_extend_its_life(store, monkeypatch):
     """Seeding is INSERT OR IGNORE, so a worker restart must not push the
     expiry out -- otherwise the expiry would be theatre."""

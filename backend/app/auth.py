@@ -806,8 +806,6 @@ async def _consume_counter(
         # INCR + separate EXPIRE). Subsequent hits just increment.
         await rc.set(key, 0, nx=True, ex=window)
         n = await rc.incr(key)
-    except HTTPException:
-        raise
     except Exception:
         if fail_closed:
             logger.exception("rate limiter unavailable for %s; failing closed", action)
