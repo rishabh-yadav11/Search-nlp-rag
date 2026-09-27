@@ -590,6 +590,35 @@ class AuthStore:
         await self._db.commit()
         return cur.rowcount
 
+    async def revoke_configured_service_token(self, raw: str, scope: set[str]) -> int:
+        """Kill the env-configured value, including from a cold start.
+
+        Seeding is lazy, so a configured value that has never been presented has
+        no row at all. The plain UPDATE in ``revoke_service_token`` then matches
+        nothing, reports 0, and the very next request seeds the value live with
+        a full fresh ``AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS`` -- so "revoke this
+        now" silently does nothing precisely when an operator is trying to
+        contain a leak of a credential that is not yet in use.
+
+        So when the value has no row, INSERT a tombstone: a row that exists and
+        is already revoked. Seeding is INSERT OR IGNORE, so a later request
+        cannot overwrite it and cannot revive the credential. INSERT OR IGNORE
+        also means a value that already has a row is left exactly as it is, so
+        this can only ever make a credential deader, never younger.
+
+        Returns the number of rows this call changed (1 for a fresh tombstone,
+        1 for revoking a live row, 0 if it was already dead).
+        """
+        now = _now()
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (hash_token(raw), ",".join(sorted(scope)), now, now, now),
+        )
+        tombstoned = cur.rowcount
+        await self._db.commit()
+        return tombstoned + await self.revoke_service_token(raw)
+
     async def revoke_all_service_tokens(self) -> int:
         cur = await self._db.execute(
             "UPDATE auth_service_tokens SET revoked_at = ? WHERE revoked_at IS NULL", (_now(),)
@@ -1156,18 +1185,27 @@ async def login(body: LoginIn, request: Request):
     verifies the supplied password against a fixed dummy hash at the same
     cost factor instead of skipping the check. A deactivated account is
     verified the same way, so it is not distinguishable either.
-    The per-account rate limit below is held to the same rule: it is keyed on the
+    The per-account rate limit is held to the same rule: it is keyed on the
     submitted address alone, so a registered and an unregistered address reach
     the same counter, the same 429 and the same amount of work.
+
+    That per-account limit counts FAILED attempts only, and is applied after
+    the credential check rather than before it. Counting every attempt, and
+    gating on the counter first, made the throttle an account-lockout weapon:
+    twenty anonymous wrong-password requests against a known address, from
+    twenty source addresses, would lock the real owner out of their own
+    account indefinitely without ever guessing a password -- an unauthenticated
+    DoS aimed at anyone whose address the attacker already had. A correct
+    password must never be rate-limited, so it never touches the counter.
+
+    Credential stuffing is still bounded, because stuffing is wrong passwords:
+    the twenty-first failed attempt is refused just the same. The cost is that a
+    rotating-IP attacker past the limit still pays one bcrypt verify per
+    request, which is the same cost an unknown address has always paid here
+    (see the dummy-hash note below) and is itself bounded by the per-IP limit.
     """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
-    # Second, IP-independent bucket. Placed after normalisation (so
-    # "A@B.co" and "a@b.co" share one bucket) and before any account lookup,
-    # which is what keeps it from being an existence oracle.
-    await _check_account_rate_limit(
-        request, "login", config.AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN, email
-    )
     s = _require_auth_store()
     user = await s.get_user_by_email(email)
     # Always pay the bcrypt cost, even with no account to compare against:
@@ -1178,10 +1216,19 @@ async def login(body: LoginIn, request: Request):
         body.password,
         user.password_hash if user is not None else _DUMMY_PASSWORD_HASH,
     )
-    if not password_ok or user is None or not user.is_active:
-        raise HTTPException(status_code=401, detail="invalid email or password")
-    token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
-    return AuthOut(token=token, user=UserOut.from_user(user))
+    if password_ok and user is not None and user.is_active:
+        # A real user with a real password is never counted, never gated, and
+        # never rate-limited. Only failures consume the account's budget.
+        token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
+        return AuthOut(token=token, user=UserOut.from_user(user))
+
+    # Failed. Count it against the address, keyed on the submitted string alone
+    # (no lookup feeds this), so a registered and an unregistered address are
+    # indistinguishable here too. Raises 429 past the limit.
+    await _check_account_rate_limit(
+        request, "login", config.AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN, email
+    )
+    raise HTTPException(status_code=401, detail="invalid email or password")
 
 
 @router.get("/me", response_model=UserOut)
@@ -1347,11 +1394,25 @@ async def revoke_service_tokens(
 
     ``revoked`` is the number of rows actually changed, so revoking an unknown
     or already-revoked token reports 0 rather than a reassuring 1.
+
+    The value in ``AUTH_SERVICE_TOKEN`` is handled specially in both forms. It
+    is the one credential whose seeding is lazy, so before it has ever been
+    presented there is no row to UPDATE and a plain revoke would report 0 while
+    leaving it live -- the next request would seed it with a fresh full
+    lifetime. Revoking it writes a revoked tombstone instead, so "kill this
+    now" works from a cold start, which is exactly the case an operator
+    containing a leak needs.
     """
     s = _require_auth_store()
+    configured = config.AUTH_SERVICE_TOKEN or ""
     if body and body.token:
+        if configured and secrets.compare_digest(body.token, configured):
+            return {"revoked": await s.revoke_configured_service_token(body.token, set(_service_token_scope()))}
         return {"revoked": await s.revoke_service_token(body.token)}
-    return {"revoked": await s.revoke_all_service_tokens()}
+    revoked = await s.revoke_all_service_tokens()
+    if configured:
+        revoked += await s.revoke_configured_service_token(configured, set(_service_token_scope()))
+    return {"revoked": revoked}
 
 
 

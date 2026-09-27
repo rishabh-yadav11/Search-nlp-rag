@@ -211,6 +211,80 @@ def test_per_account_limit_bounds_ip_rotation(store, monkeypatch):
     assert codes[3:] == [429, 429, 429], f"rotating IPs must not reset the account bucket: {codes}"
 
 
+def test_a_correct_password_is_never_rate_limited(store, monkeypatch):
+    """The per-account throttle must not become an account-lockout weapon.
+
+    A bucket fed by every attempt, and consulted BEFORE the credential check,
+    lets an anonymous caller deny a known address access indefinitely: send the
+    limit's worth of wrong passwords from rotating source addresses, and the
+    real owner is then refused with 429 no matter what they type. The owner
+    knowing the correct password must get in."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_MIN", 0)  # per-IP OFF
+    monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", 3)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
+    monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
+    monkeypatch.setattr(auth, "_rate_client", None)
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+    client.post("/api/auth/signup", json={"email": "owner@corp.example", "password": "secret12", "name": "O"})
+
+    # 10 wrong passwords from 10 different source addresses -- twice the budget.
+    for i in range(10):
+        r = client.post(
+            "/api/auth/login",
+            json={"email": "owner@corp.example", "password": "wrongpw1"},
+            headers={"X-Forwarded-For": f"10.0.0.{i}"},
+        )
+        assert r.status_code in (401, 429)
+
+    # The account is now over budget, and the owner still gets in.
+    owner = client.post(
+        "/api/auth/login",
+        json={"email": "owner@corp.example", "password": "secret12"},
+        headers={"X-Forwarded-For": "203.0.113.9"},
+    )
+    assert owner.status_code == 200, f"the throttle locked the owner out: {owner.status_code} {owner.text}"
+    assert owner.json()["user"]["email"] == "owner@corp.example"
+
+
+def test_a_correct_password_does_not_consume_the_budget(store, monkeypatch):
+    """Successful logins must not count: a user signing in repeatedly from home
+    and work must never walk themselves into their own 429."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_MIN", 0)
+    monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", 2)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
+    monkeypatch.setattr(auth.config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 100)
+    monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
+    monkeypatch.setattr(auth, "_rate_client", None)
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+    client.post("/api/auth/signup", json={"email": "a@b.co", "password": "secret12", "name": "A"})
+
+    codes = [
+        client.post(
+            "/api/auth/login",
+            json={"email": "a@b.co", "password": "secret12"},
+            headers={"X-Forwarded-For": f"10.0.1.{i}"},
+        ).status_code
+        for i in range(6)
+    ]
+    assert codes == [200] * 6, f"correct logins must never be throttled: {codes}"
+
+
 def test_per_account_bucket_survives_a_key_flood(monkeypatch):
     """Flooding the fallback with fresh keys must not let an attacker discard
     the very bucket throttling them.
@@ -624,25 +698,71 @@ def test_service_token_honours_its_expiry(store, monkeypatch):
     assert e.value.status_code == 401, "an expired service token must not authenticate"
 
 
+def _chat_route_permissions() -> set[str]:
+    """The permissions app/chat.py actually installs on its router.
+
+    Read from the router rather than hardcoded, so this test tracks the real
+    dependency. A literal here would keep passing if chat.py's permission
+    changed -- at which point it would be asserting a fiction and every chat
+    turn from eval_runner.py would be getting a 403.
+    """
+    from app.chat import router
+
+    found = set()
+    for dep in router.dependencies:
+        closure = getattr(dep.dependency, "__closure__", None) or ()
+        for cell in closure:
+            if isinstance(cell.cell_contents, str):
+                found.add(cell.cell_contents)
+    assert found, "could not read a permission off the chat router; update this test deliberately"
+    return found
+
+
 def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch):
     """The one in-repo consumer, backend/scripts/eval_runner.py, sends the raw
-    AUTH_SERVICE_TOKEN and only ever calls /api/chat, whose router requires
-    exactly `chat:use` (app/chat.py). Assert the shipped default scope admits
-    that and nothing more, so the script keeps working unchanged."""
+    AUTH_SERVICE_TOKEN and only ever calls /api/chat. So the shipped default
+    scope must cover whatever permission app/chat.py's router really requires
+    -- read from that router, not assumed -- and nothing more."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-from-env")
-    assert auth._service_token_scope() == frozenset({"chat:use"})
+    # Pin the shipped default explicitly rather than reading whatever
+    # load_dotenv() put in the ambient config.
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+
+    required = _chat_route_permissions()
+    assert required == {"chat:use"}, f"app/chat.py now requires {sorted(required)}; re-check the default scope"
+    assert auth._service_token_scope() == required
 
     async def scenario():
         req = _req({"x-service-token": "svc-from-env"})
         await auth.require_auth(req)
-        # The dependency chat.py installs on every chat route.
-        await auth.require_permission("chat:use")(req)
+        # Run the real checker the router installs, for the real permission.
+        for permission in required:
+            await auth.require_permission(permission)(req)
         return req.state.user_id
 
     assert asyncio.run(scenario()) == auth.SERVICE_USER_ID
 
 
+def test_default_scope_would_not_cover_a_permission_chat_now_requires(store, monkeypatch):
+    """The negative control: the scope check really is an intersection with
+    what the routes require, so a route demanding more than the default scope
+    is genuinely refused. Without this the test above would also pass if scope
+    were ignored entirely."""
+    from fastapi import HTTPException as _HTTPException
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-from-env")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+
+    async def scenario():
+        req = _req({"x-service-token": "svc-from-env"})
+        await auth.require_auth(req)
+        with pytest.raises(_HTTPException) as e:
+            await auth.require_permission("users:manage")(req)
+        return e.value.status_code
+
+    assert asyncio.run(scenario()) == 403
 
 def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypatch):
     """Revocation must stick even though the value is still in the environment.
@@ -675,6 +795,64 @@ def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypat
         return row is not None and row["revoked_at"] is not None
 
     assert asyncio.run(scenario())
+
+
+def test_cold_start_tombstone_survives_the_reaper(store, monkeypatch):
+    """The reaper must not collect the tombstone written by a cold-start kill.
+
+    The tombstone is a dead row, so the reaper's predicate selects it -- and if
+    it were deleted, the next request would seed the configured value live
+    again with a full fresh lifetime, and the kill switch would quietly stop
+    working the first time the background reaper next runs. The reaper
+    already excludes the configured value's hash; this pins that it keeps
+    doing so for a tombstone that was never presented.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "cold-svc")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
+    admin_token = asyncio.run(store.issue_token(admin.id, 7))
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+
+    killed = client.post(
+        "/api/auth/service-tokens/revoke",
+        json={"token": "cold-svc"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert killed.json()["revoked"] == 1
+
+    # Drive the REAL reaper, not a re-implementation of its keep_hash: a copy
+    # here would keep passing even if the loop stopped passing the exclusion.
+    class StopLoop(Exception):
+        pass
+
+    async def stop_after_one_iteration(_interval):
+        raise StopLoop
+
+    monkeypatch.setattr(auth.config, "AUTH_TOKEN_PURGE_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(auth.asyncio, "sleep", stop_after_one_iteration)
+
+    async def run_reaper():
+        try:
+            await auth.token_purge_loop()
+        except StopLoop:
+            pass
+
+    asyncio.run(run_reaper())
+
+    row = asyncio.run(
+        store._fetchone("SELECT revoked_at FROM auth_service_tokens WHERE token_hash = ?", (auth.hash_token("cold-svc"),))
+    )
+    assert row is not None and row["revoked_at"] is not None, "the reaper collected the configured value's tombstone"
+    assert client.get("/api/auth/me", headers={"X-Service-Token": "cold-svc"}).status_code == 401
 
 
 def test_service_token_restart_does_not_extend_its_life(store, monkeypatch):
@@ -756,6 +934,72 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
     assert retired.json()["revoked"] == 1
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 401
     assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 200
+
+
+
+def test_kill_switch_works_before_the_configured_token_is_ever_used(store, monkeypatch):
+    """Revoking the env-configured value from a COLD start must actually kill it.
+
+    Seeding is lazy, so a configured value that has never been presented has no
+    row to UPDATE. A plain revoke then reports 0 rows, changes nothing, and the
+    next request seeds the credential live with a full fresh lifetime -- so the
+    one kill switch that matters for a suspected leak of the configured value
+    silently does nothing. Both revoke forms must tombstone it instead."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "cold-svc")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
+    admin_token = asyncio.run(store.issue_token(admin.id, 7))
+    hdr = {"Authorization": f"Bearer {admin_token}"}
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+
+    async def row_count():
+        return len(await store._fetchall("SELECT token_hash FROM auth_service_tokens"))
+
+    # Never presented: no row exists, so there is nothing for an UPDATE to hit.
+    assert asyncio.run(row_count()) == 0
+
+    killed = client.post("/api/auth/service-tokens/revoke", json={"token": "cold-svc"}, headers=hdr)
+    assert killed.status_code == 200, killed.text
+    assert killed.json()["revoked"] == 1, "a cold configured token must be killable, not a silent no-op"
+    assert asyncio.run(row_count()) == 1, "a revoked tombstone must exist to block re-seeding"
+
+    # And it stays dead however many times it is presented afterwards.
+    for _ in range(3):
+        assert client.get("/api/auth/me", headers={"X-Service-Token": "cold-svc"}).status_code == 401
+    assert asyncio.run(store.service_token_for("cold-svc")) is None
+
+
+def test_kill_everything_also_kills_an_unused_configured_token(store, monkeypatch):
+    """The no-body containment call must reach the configured value too, from a
+    cold start -- that is the form documented for a suspected leak."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "cold-svc")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
+    admin_token = asyncio.run(store.issue_token(admin.id, 7))
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+
+    killed = client.post("/api/auth/service-tokens/revoke", headers={"Authorization": f"Bearer {admin_token}"})
+    assert killed.status_code == 200, killed.text
+    assert killed.json()["revoked"] == 1
+    assert client.get("/api/auth/me", headers={"X-Service-Token": "cold-svc"}).status_code == 401
 
 
 def test_revoke_all_service_tokens_kills_every_one(store, monkeypatch):
