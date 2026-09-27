@@ -171,7 +171,13 @@ def test_bootstrap_admin_refuses_weak_password_and_names_the_reason(store, monke
     joined = "\n".join(errors)
     assert "AUTH_ADMIN_PASSWORD" in joined
     assert "validate_password" in joined
-    assert str(auth.config.AUTH_PASSWORD_MIN_LEN) in joined  # the actual reason
+    # Pin the validator's OWN reason verbatim. Asserting only the min-length
+    # number is not enough: the remediation hint also contains "8", so the test
+    # would still pass if the logged reason were an unrelated string. Deriving
+    # the expectation from validate_password itself would be worse (tautological:
+    # changing the validator would change both sides). This literal is what
+    # validate_password emits for "x" and cannot come from the hint.
+    assert "password must be at least" in joined
     assert "NOT created" in joined
 
 
