@@ -321,11 +321,13 @@ def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeyp
 @pytest.mark.parametrize(
     "pw, expected_shortfall",
     [
-        # Boundary case first: byte 72 is a complete ASCII char, so the cut is
-        # exact and nothing is dropped. This is the only kind of case that pins
-        # the cut SIZE -- in the straddle cases below, cutting at 71 or 72 both
-        # discard the same broken character and yield an identical shortfall, so
-        # they cannot detect an off-by-one in the limit.
+        # The boundary case (byte 72 is a whole ASCII char, so nothing is
+        # dropped) pins that a straddle-free value keeps all 72 bytes. The
+        # straddle cases below are what detect a change in the cut itself: at a
+        # 71-byte cut they each lose one more byte, so their expected shortfalls
+        # (1/2/3) no longer hold. The boundary case is deliberately kept because
+        # a 0-shortfall case is the only one that proves the limit is inclusive
+        # of the final byte.
         ("a" * 71 + "1", 0),
         ("Passphrase1234" + "a" * 57 + "é" * 20, 1),  # 2-byte char, cut 1 byte in
         ("a" * 70 + "€" * 5, 2),  # 3-byte char, cut 2 bytes in
@@ -1365,3 +1367,58 @@ def test_bootstrap_admin_gives_up_after_write_lock_retries(store, monkeypatch):
     asyncio.run(auth.bootstrap_admin())  # must not raise
     assert calls["create"] == 5  # 5 attempts before giving up
     assert calls["sleep"] == [1, 1, 1, 1]  # slept between attempts 0-3
+
+
+def test_bootstrap_still_flags_a_weak_admin_behind_an_email_fault(store, monkeypatch, caplog):
+    """REGRESSION: a deploy that ran pre-validator main with BOTH a dotless
+    address and a 1-character password, then upgraded. The email rejection must
+    not swallow the weak-admin warning, because the account's stored password
+    really IS the rejected config value, so rotation is the right advice.
+    Deciding rotation by which variable failed -- rather than by what the
+    account is actually on -- would hide a live 1-character admin password."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@localhost")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth, "store", store)
+    # pre-fix world: main provisioned this admin with the 1-character password
+    asyncio.run(store.create_user("admin@localhost", "x", "Administrator", role="admin"))
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "Rotate" in joined, "a live weak admin password must still be flagged"
+    assert "AUTH_ADMIN_EMAIL" in joined
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "a1" + "b" * (auth.config.AUTH_PASSWORD_MIN_LEN - 3),  # one under the minimum
+        "a1" + "b" * (auth.config.AUTH_PASSWORD_MIN_LEN - 2),  # exactly the minimum
+    ],
+)
+def test_bootstrap_enforces_the_minimum_length_boundary(store, monkeypatch, password):
+    """The headline guarantee of #290: an admin password shorter than
+    AUTH_PASSWORD_MIN_LEN is refused rather than provisioned. This pins the
+    boundary exactly, and every case has a letter AND a digit so that the
+    length rule is the only thing under test -- the pre-existing 15-character
+    case fails on composition, so it would still pass if length were wrong."""
+    assert len(password) in (
+        auth.config.AUTH_PASSWORD_MIN_LEN - 1,
+        auth.config.AUTH_PASSWORD_MIN_LEN,
+    )
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
+    monkeypatch.setattr(auth, "store", store)
+
+    asyncio.run(bootstrap_admin())
+
+    admin = asyncio.run(store.get_user_by_email("admin@x.co"))
+    if len(password) < auth.config.AUTH_PASSWORD_MIN_LEN:
+        assert admin is None, "a password one under the minimum must be refused"
+        assert asyncio.run(store.list_users()) == []
+    else:
+        # exactly at the minimum is valid and must still bootstrap, so the
+        # boundary is a real edge rather than an accident of the fixture
+        assert admin is not None and admin.role == "admin"
+        assert auth.verify_password(password, admin.password_hash)
