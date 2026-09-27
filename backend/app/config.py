@@ -130,6 +130,41 @@ def _default_route_addresses() -> tuple[str, ...]:
         return ()
 
 
+
+def _clamped_int(name: str, default: int, low: int, high: int) -> int:
+    """Read an integer env knob, clamped into ``[low, high]``.
+
+    Clamp-and-warn, not raise. This module is imported at process start, so
+    raising here would turn a mistyped deployment value into a boot failure of
+    the whole API — and the knobs guarded by this helper are throughput caps
+    whose *failure* mode is expensive CPU, not a wrong answer. Clamping keeps
+    the service up and bounds the cost; the WARNING naming the key, the
+    rejected value and the bound keeps the misconfiguration visible in the
+    logs rather than silently papering over it.
+
+    A non-integer value falls back to ``default`` for the same reason: an
+    unparseable knob is an operator typo, not a client input, and the safest
+    reading of it is "not configured", which is what an absent variable means.
+    ``default`` itself is required to sit inside ``[low, high]``.
+    """
+    assert low <= default <= high, f"{name} default {default} outside [{low}, {high}]"
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using default %d", name, raw, default)
+        return default
+    if value < low or value > high:
+        clamped = max(low, min(high, value))
+        logger.warning(
+            "%s=%d is outside [%d, %d]; clamped to %d", name, value, low, high, clamped
+        )
+        return clamped
+    return value
+
+
 def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Turn the ALLOWED_HOSTS knob into a de-duplicated tuple of hostnames.
 
@@ -272,7 +307,19 @@ class Config:
     # Fewer candidates = faster CPU rerank; 12 keeps top-8 quality vs 16 while
     # trimming latency (measured 8/8 overlap on representative queries).
     RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "12"))
+    # Clamped to [5, 50] — see _clamped_int for clamp-and-warn rationale. Both
+    # ends are real hazards, not defensive padding:
+    #   * High end: every candidate is one cross-encoder pair, and the whole
+    #     batch runs under the process-wide `inference_lock` on TORCH_THREADS
+    #     (2) cores, so a large value serialises every other inference in the
+    #     process behind one request. 50 already exceeds what any caller can
+    #     consume — /search caps top_k at 50 and CHAT_MAX_SOURCES is 20.
+    #   * Low end: below 5 there is no ranking left to do. `main.py` does
+    #     `max(top_k, RERANK_CANDIDATES)`, so a small value degrades quietly
+    #     there, but `scripts/rerank_bench.py` passes this straight through as
+    #     a Qdrant `limit`, where 0 returns nothing and a negative is invalid.
+    #     A silently dead rerank is worse than a clamped one.
+    RERANK_CANDIDATES = _clamped_int("RERANK_CANDIDATES", 12, 5, 50)
     # Reranker execution backend. 'torch' (sentence-transformers CrossEncoder)
     # is the only backend: the ONNX backend ('onnx', via optimum/onnxruntime)
     # is not installable — optimum-onnx requires transformers<4.58, which
@@ -419,10 +466,42 @@ class Config:
     # Lets deep-body matches (e.g. historical retrospectives whose relevant
     # facts live mid-article) pass the chat relevance gate; costs one extra
     # cross-encoder pass per candidate and only runs on weak-top results.
+    #
+    # The rescue is left ON by default: it exists because deep-body matches
+    # were being dropped by the relevance gate, and turning it off is a
+    # relevance regression, not a performance fix. Its cost is bounded by the
+    # three clamped knobs below instead — the expensive part is the second
+    # cross-encoder pass, not the body scan (a 50K body scans in ~0.25ms at
+    # these defaults), so that is what BODY_RESCUE_MAX_CANDIDATES bounds.
     ENABLE_BODY_RESCUE = os.getenv("ENABLE_BODY_RESCUE", "true").lower() in ("1", "true", "yes")
     BODY_RESCUE_THRESHOLD = float(os.getenv("BODY_RESCUE_THRESHOLD", "0.3"))
-    BODY_RESCUE_WINDOW = int(os.getenv("BODY_RESCUE_WINDOW", "1500"))
-    BODY_RESCUE_STEP = int(os.getenv("BODY_RESCUE_STEP", "500"))
+    # WINDOW is the size of the excerpt handed to the cross-encoder. Below 200
+    # the excerpt is too small to carry a useful passage (and a 0 window makes
+    # `_best_body_window` return an empty string, silently disabling the rescue
+    # while still paying for the pass); above 8000 it inflates the model's
+    # input for every candidate in the rescue batch.
+    BODY_RESCUE_WINDOW = _clamped_int("BODY_RESCUE_WINDOW", 1500, 200, 8000)
+    # STEP is the sliding-window stride over the body. A 0 is a hard crash —
+    # `range(0, n, 0)` raises ValueError and 500s the chat turn — and a small
+    # step re-scans the whole body: step=1 costs ~116ms per 50K body versus
+    # ~0.25ms at the default 500, which is a 470x amplification of a knob whose
+    # value is supposed to be a cost saving. The window/step ratio is also
+    # capped implicitly by the 1500 ceiling (at most ~40x overlap).
+    BODY_RESCUE_STEP = _clamped_int("BODY_RESCUE_STEP", 500, 1, 1500)
+    # Most candidates that may enter the second cross-encoder pass. The pass is
+    # the dominant cost (one pair per candidate, under `inference_lock`) and
+    # chat hands body_rescue up to CHAT_MAX_SOURCES (20) articles. 10 keeps the
+    # rescue available on the candidates it is designed for while halving the
+    # worst case; see body_rescue() in main.py for how the shortlist is picked.
+    BODY_RESCUE_MAX_CANDIDATES = _clamped_int("BODY_RESCUE_MAX_CANDIDATES", 10, 1, 50)
+
+    # Upper bound on the /search `q` parameter, in characters. This overlaps
+    # issue #241 (still open) and is deliberately the minimal version of it:
+    # q reaches the embedding encoders, the cache key and every query_intent
+    # regex, so an unbounded value costs CPU and Redis memory per request. It
+    # is set well above CLICK_QUERY_MAX_LEN (256) because a rejected search is
+    # user-visible whereas a truncated stored query string is not.
+    SEARCH_QUERY_MAX_CHARS = _clamped_int("SEARCH_QUERY_MAX_CHARS", 512, 32, 4000)
 
     # Chat history (SQLite on the host; survives restarts, unlike Redis without AOF)
     # Relative CHAT_DB_PATH resolves against the backend working dir (where
