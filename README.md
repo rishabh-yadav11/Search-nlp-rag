@@ -411,7 +411,8 @@ reports each twice), all transitive: `fastapi==0.115.0` caps starlette below
 0.39, and every fixed starlette release (0.40.0 → 1.3.1) requires raising the
 FastAPI pin. Those 7 IDs are listed by name in the workflow with that comment;
 anything new fails immediately. Remove an ID from the list and the job goes red
-again — the waiver is per-advisory and dated, not a blanket suppression.
+again — the waiver is an enumerated list of 7 advisory IDs, not a blanket
+suppression, and each one disappears as soon as the FastAPI pin is raised.
 
 The `transformers==5.10.1` pin (which fixes CVE-2026-4372 / CVE-2026-5241 /
 CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits
@@ -423,8 +424,11 @@ CI posture: the current 2 moderate findings (GHSA-82fw-gwwq-j7x9,
 `@vitest/mocker` path traversal; fix is vitest 5, a breaking change) sit below
 it and do not fail the build. A new high/critical advisory does.
 
-**gitleaks** runs the default rule set with one narrow path exclusion for
-`frontend/.next/` — the gitignored Next.js build output, which trips
-`generic-api-key` on hashed build manifests. No tracked file is excluded, and
-the scan is the only thing standing between a committed key and production;
-planting a fake AWS key in `backend/` makes the job fail.
+**gitleaks** runs the default rule set with **no allow-list and no
+`.gitleaks.toml`** — nothing is excluded, so a real key in any tracked file
+fails the job. `origin/main` scans clean (0 leaks over 554 commits). Planting a
+fake AWS key pair in `backend/` makes the scan report the leak and exit non-zero,
+which is how the gate was confirmed to bite. Next.js build output
+(`frontend/.next/`) is gitignored and absent from a fresh CI checkout, so it
+needs no exclusion; `gitleaks detect` also reads git history, not the untracked
+working tree.
