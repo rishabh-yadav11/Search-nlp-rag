@@ -101,9 +101,12 @@ def main():
         # built before this field existed has no index for it. Creating the
         # indexes here means the backfilled values are immediately usable as a
         # content-type filter, with no separate rebuild step.
-        create_payload_indexes(client)
+        # Skipped on --dry-run: creating an index mutates the collection, and a
+        # rehearsal that silently changes the schema is worse than no rehearsal.
         if dry_run:
-            log("dry-run: no payload will be written")
+            log("dry-run: no payload written and no payload index created")
+        else:
+            create_payload_indexes(client)
 
         # with_body=False: only the content_type column is needed, and body is
         # the largest column in the table.
