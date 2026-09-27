@@ -299,7 +299,10 @@ def test_redis_status_client_reused_between_concurrent_calls(monkeypatch):
     assert results == [(True, "redis")] * 3
     assert len(from_url_calls) == 1  # one client for all three callers
     assert health._redis_init_lock is lock_before  # never rebuilt by a caller
-    assert created == [lock_before]  # exactly one lock, built at import
+    # Scoped to this lock: the module also builds the readiness single-flight
+    # lock at import, and the point here is that the Redis init lock is built
+    # exactly once and never rebuilt by an arriving caller.
+    assert created.count(lock_before) == 1
     assert lock_before.max_pending == 3  # all three queued on that one lock
 
 
@@ -320,7 +323,7 @@ def test_redis_status_serializes_on_shared_lock(monkeypatch):
     monkeypatch.setattr(health.aioredis, "from_url", fake_from_url)
 
     lock = health._redis_init_lock
-    assert created == [lock]  # built once at import, before any caller arrived
+    assert created.count(lock) == 1  # built once at import, before any caller arrived
 
     async def scenario():
         await lock.acquire()  # simulate another caller owning the critical section
@@ -1023,6 +1026,17 @@ def test_ready_survives_a_sustained_one_hertz_probe(client, monkeypatch):
     nothing here stubs PUBLIC_READY_RATE_PER_MIN, because the default is
     exactly what is under test.
     """
+    # The invariant, stated against the configured window rather than a magic
+    # number: a 1 Hz prober sends one request per second, so it spends exactly
+    # PUBLIC_RATE_WINDOW_SECONDS requests per window and the limit has to clear
+    # that. Without this the behavioural check below would also pass with the
+    # limiter disabled outright (0 short-circuits before any counting), which is
+    # a different and wrong answer to the same question.
+    assert config.PUBLIC_READY_RATE_PER_MIN > config.PUBLIC_RATE_WINDOW_SECONDS, (
+        "the /ready limit must clear a 1 Hz prober over the window, and must "
+        "stay enabled (0 disables it)"
+    )
+
     monkeypatch.setattr(health, "_readiness_report", _async((True, {"ready": True})))
     polls = 2 * config.PUBLIC_RATE_WINDOW_SECONDS
 
@@ -1091,6 +1105,66 @@ def test_readiness_report_probes_dependencies_concurrently(monkeypatch):
     assert report["checks"]["redis"] == {"ok": True, "cache": "memory"}
     assert events.index("enter:redis") < events.index("exit:qdrant")
     assert events.index("enter:qdrant") < events.index("exit:redis")
+
+
+def test_readiness_cache_miss_is_single_flight(monkeypatch):
+    """A burst of pollers that miss the cache together must cost ONE probe
+    round, not one per request.
+
+    The cached entry bounds the serial probe rate, but the instant it expires
+    every request arriving in that instant misses at once. The rate limiter
+    does not prevent that herd -- it bounds arrivals, not concurrency -- so
+    without single-flight a 1 Hz prober plus its permitted burst can fan out a
+    full Qdrant + Redis probe round per request. The probe count is the
+    assertion: all callers get the same verdict, and only one of them probes.
+    """
+    calls = {"probes": 0}
+
+    async def counting_report(state):
+        calls["probes"] += 1
+        # Yield so the other pollers are all waiting on the miss when this runs.
+        await asyncio.sleep(0.01)
+        return True, {"ready": True, "probes": calls["probes"]}
+
+    monkeypatch.setattr(health, "_readiness_report", counting_report)
+
+    async def scenario():
+        return await asyncio.gather(*(health._cached_readiness_report({}) for _ in range(12)))
+
+    results = _run(scenario())
+
+    # Every poller is served, from the one probe round, with the same verdict.
+    assert results == [(True, {"ready": True, "probes": 1})] * 12
+    assert calls["probes"] == 1
+
+
+def test_readiness_cache_hit_needs_no_lock(monkeypatch):
+    """The fast path must stay lock-free: a served-from-cache poll cannot
+    serialize behind an in-flight probe, or a 1 Hz prober would queue behind
+    whichever caller happens to be refreshing."""
+    entered = []
+
+    class _NeverFree:
+        async def __aenter__(self):
+            entered.append("acquired")
+            await asyncio.Event().wait()  # would hang a lock-taking fast path
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def cached_report(state):
+        return True, {"ready": True}
+
+    async def scenario():
+        await health._cached_readiness_report({})  # populate
+        monkeypatch.setattr(health, "_readiness_probe_lock", _NeverFree())
+        ready, _ = await asyncio.wait_for(health._cached_readiness_report({}), timeout=1.0)
+        assert ready is True
+
+    monkeypatch.setattr(health, "_readiness_report", cached_report)
+    _run(scenario())
+
+    assert entered == []
 
 
 def test_readiness_report_probe_timeout_is_a_dependency_failure(monkeypatch):

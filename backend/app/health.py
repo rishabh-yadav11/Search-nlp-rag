@@ -170,6 +170,15 @@ async def _redis_status() -> tuple[bool, str]:
 # report) with a time.monotonic() deadline -- never an event-loop-bound object,
 # so it stays valid across the per-test event loops the endpoint tests run in.
 _readiness_cache: tuple[float, bool, dict] | None = None
+# Single-flight for the cache MISS. The entry above bounds the SERIAL probe
+# rate, but the moment it expires every request arriving in the same instant
+# misses together, and each would otherwise fan out its own Qdrant + Redis
+# probe round. The rate limiter above does not prevent that herd either: it
+# bounds arrival rate, not concurrency. Created eagerly at import for the same
+# reason as _redis_init_lock -- a module-level asyncio.Lock is not bound to an
+# event loop at construction on 3.10+, so it is safe to share across the
+# per-test event loops these tests run in.
+_readiness_probe_lock: asyncio.Lock = asyncio.Lock()
 
 
 def reset_readiness_cache() -> None:
@@ -180,15 +189,25 @@ def reset_readiness_cache() -> None:
 
 async def _cached_readiness_report(state: dict) -> tuple[bool, dict]:
     """Readiness report reused for READY_CACHE_TTL_SECONDS; a hit touches
-    neither Qdrant nor Redis."""
+    neither Qdrant nor Redis.
+
+    A miss is single-flight: concurrent callers that miss together run the
+    probes once between them, and the waiters re-check the cache under the lock
+    and reuse the entry the winner just wrote."""
     global _readiness_cache
-    now = time.monotonic()
     cached = _readiness_cache
-    if cached is not None and cached[0] > now:
+    if cached is not None and cached[0] > time.monotonic():
         return cached[1], cached[2]
-    ready, report = await _readiness_report(state)
-    _readiness_cache = (now + config.READY_CACHE_TTL_SECONDS, ready, report)
-    return ready, report
+    async with _readiness_probe_lock:
+        # Re-check: another caller may have refreshed the entry while this one
+        # waited for the lock, in which case there is nothing left to probe.
+        cached = _readiness_cache
+        now = time.monotonic()
+        if cached is not None and cached[0] > now:
+            return cached[1], cached[2]
+        ready, report = await _readiness_report(state)
+        _readiness_cache = (now + config.READY_CACHE_TTL_SECONDS, ready, report)
+        return ready, report
 
 
 async def _probe_bounded(name: str, coro, default):
