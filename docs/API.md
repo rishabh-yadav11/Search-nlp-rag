@@ -523,8 +523,10 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
 - **Auth**: bearer tokens (7-day expiry, revocable) gate chat, analytics and
   user management; `/search`, `/facets`, `/analytics/click` and the auth
   endpoints are public. Signup/login are rate-limited per IP via Redis and login
-  additionally per submitted address; when Redis is unreachable these limits
-  fall back to a bounded in-process limiter rather than switching off. A user
+  additionally per submitted address, counting failed logins only so the
+  per-address limit cannot be used to lock a known account out; when Redis is
+  unreachable these limits fall back to a bounded in-process limiter rather
+  than switching off. A user
   holds at most `AUTH_MAX_ACTIVE_TOKENS_PER_USER` active tokens; logging in
   past that revokes the oldest. `AUTH_SERVICE_TOKEN` lets internal scripts
   authenticate as a scoped, expiring machine user.

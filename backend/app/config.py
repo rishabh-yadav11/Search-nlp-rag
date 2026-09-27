@@ -329,7 +329,15 @@ class Config:
     # account lookup feeds it -- so its state, its 429 and its cost are the
     # same whether or not the address has an account here, which is what keeps
     # it from becoming an account-existence oracle (see the login docstring).
-    # 0 disables.
+    #
+    # It counts FAILED attempts only, and is applied after the credential
+    # check. That is deliberate: counting every attempt, and gating on the
+    # counter before the check, turned the throttle into an account-lockout
+    # weapon -- an anonymous caller could deny a known address access
+    # indefinitely by sending the limit's worth of wrong passwords from
+    # rotating source addresses, never guessing anything. A correct password
+    # is never counted and never rate-limited. Credential stuffing is still
+    # bounded, because stuffing is wrong passwords. 0 disables.
     AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", "20"))
     # Cap on simultaneously ACTIVE (unexpired) tokens per user. Every login
     # mints one, and the periodic purge only removes EXPIRED rows, so the
