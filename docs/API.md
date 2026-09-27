@@ -518,4 +518,17 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
   via cron (`update_index.py`).
 - **Caching**: `/search` responses are cached (TTL `CACHE_TTL_SECONDS`, default 300s) keyed by effective query + filters. `cached: true` indicates a cache hit. Chat turns are not cached. When Redis is unreachable, the cache degrades to an in-process store so the API keeps working.
 - **Retention**: conversations idle for 180 days are purged daily.
-- Interactive OpenAPI docs are served by FastAPI at `/docs` on the internal API port.
+- **No interactive docs**: `/docs`, `/redoc` and `/openapi.json` are disabled in
+  every environment. They publish the full route list, the request/response
+  models (including the mass-assignable `UserPatchIn`) and which routes sit
+  behind which dependency, to any unauthenticated caller. This document is the
+  API reference. To regenerate the machine-readable schema locally, run
+  `python -c "import json; from app.main import app; print(json.dumps(app.openapi(), indent=2))"`
+  from `backend/` and treat the output as a local artefact — do not serve it.
+- **Host header**: requests whose `Host` is not in `ALLOWED_HOSTS` are rejected
+  with 400 by `TrustedHostMiddleware`. The default list is derived from
+  `CORS_ORIGINS`, this box's own hostname and addresses (including its
+  default-route address, i.e. the one a public client is reaching) and
+  `localhost`/`127.0.0.1`/`testserver`. Set `ALLOWED_HOSTS` to the hostnames
+  your deployment answers to if it is reachable under a name none of those
+  cover (a separately registered public domain, for instance).
