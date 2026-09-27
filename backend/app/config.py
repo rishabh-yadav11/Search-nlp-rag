@@ -280,21 +280,27 @@ class Config:
     # revoked individually.
     AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
     AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "7"))
-    # Optional machine-to-machine bypass: any request carrying this exact value
-    # in X-Service-Token acts as an admin user. Leave empty to disable. Used by
-    # the internal eval scripts; never expose it to browsers.
-    AUTH_SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
-    # Lifetime and scope of a service token. A service token used to be a
-    # permanent, unscoped admin grant: it never expired, could not be revoked
-    # (logout only ever revoked bearer tokens), and matched any permission an
-    # admin has. It is now a row in auth_service_tokens carrying an explicit
-    # expiry and an explicit permission set, and the env var above is only the
-    # value that seeds that row at startup -- so the internal eval scripts keep
-    # working unchanged while the credential is no longer eternal.
+    # Optional machine-to-machine credential: the value carried in an
+    # X-Service-Token header. Leave empty to disable. Never expose it to
+    # browsers.
     #
-    # The expiry is NOT optional: a value <= 0 falls back to the default
-    # rather than meaning "never expires", because an eternal machine admin
-    # credential is exactly the hole this closes.
+    # This is a SEED, not a standing grant. The first request presenting it
+    # creates a row in auth_service_tokens with the scope and expiry below;
+    # from then on that row is the only authority on the token's life, so the
+    # credential stops working once it expires or is revoked.
+    #
+    # OPERATIONAL CONSEQUENCE, and it is deliberate: the seeded token expires
+    # AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS after it is first seeded (24h by
+    # default) and a restart does NOT revive it, because a credential that
+    # silently came back would be the permanent grant this replaced. Recovery
+    # is rotation -- change the value here and restart (a different value
+    # hashes to a different row, so it seeds a fresh one), or mint one with
+    # POST /api/auth/service-tokens. A machine client that runs longer than
+    # that must be given a freshly rotated value, not the original.
+    AUTH_SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
+    # Lifetime of a service token. Not optional: a value <= 0 falls back to
+    # the default rather than meaning "never expires", because an eternal
+    # machine admin credential is exactly the hole this closes.
     AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS = int(os.getenv("AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", "86400"))
     # Permissions a service token may exercise. Defaults to chat:use, the only
     # permission the in-repo consumer (scripts/eval_runner.py) needs, instead

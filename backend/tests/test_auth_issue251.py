@@ -175,22 +175,67 @@ def test_per_account_limit_bounds_ip_rotation(store, monkeypatch):
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
+    # TestClient's peer is the string "testclient", not an IP, so the shipped
+    # auto rule (trust X-Forwarded-For only from a loopback peer) DISCARDS the
+    # header. Without this the six requests below would all come from one
+    # bucket and the test would not be rotating anything. This mirrors the
+    # deployed topology, where nginx forwards from 127.0.0.1.
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
 
     app = FastAPI()
     app.include_router(auth.router)
     client = TestClient(app)
 
-    codes = []
-    for i in range(6):
-        # a brand-new source address on every single attempt
-        r = client.post(
+    # Prove the rotation is real before relying on it: each distinct
+    # X-Forwarded-For value must resolve to a distinct client IP.
+    def ip_seen_by_the_limiter(xff: str) -> str:
+        return auth._client_ip(
+            auth.Request(
+                {"type": "http", "headers": [(b"x-forwarded-for", xff.encode())], "client": ("testclient", 50000)}
+            )
+        )
+
+    assert len({ip_seen_by_the_limiter(f"10.0.0.{i}") for i in range(6)}) == 6, (
+        "the header is not being honoured, so this test would not be rotating IPs at all"
+    )
+
+    codes = [
+        client.post(
             "/api/auth/login",
             json={"email": "victim@example.com", "password": "secret12"},
-            headers={"X-Forwarded-For": f"10.0.0.{i}"},
-        )
-        codes.append(r.status_code)
+            headers={"X-Forwarded-For": f"10.0.0.{i}"},  # a new address every attempt
+        ).status_code
+        for i in range(6)
+    ]
     assert codes[:3] == [401, 401, 401], "per-IP limit is disabled, so only the account limit can act"
     assert codes[3:] == [429, 429, 429], f"rotating IPs must not reset the account bucket: {codes}"
+
+
+def test_per_account_bucket_survives_a_key_flood(monkeypatch):
+    """Flooding the fallback with fresh keys must not let an attacker discard
+    the very bucket throttling them.
+
+    The attack as modelled: keep hammering ONE account from a rotating set of
+    source addresses, so every request mints a new per-IP key while the
+    per-account bucket is hit on every single request. Because the dict is kept
+    least-recently-used and a hit re-inserts its key at the tail, the bucket
+    being attacked is the last one eviction would reach. Dropping by insertion
+    order instead would discard it and hand the attacker a fresh count."""
+    monkeypatch.setattr(auth, "_LOCAL_RATE_MAX_KEYS", 50)
+    auth.reset_local_rate_limits()
+    victim = "auth:rl:acct:login:victim@example.com"
+
+    seen = []
+    for i in range(500):
+        # New source address each time; same victim every time.
+        auth._local_rate_hit(f"auth:rl:login:10.0.0.{i}", 600)
+        seen.append(auth._local_rate_hit(victim, 600))
+
+    assert len(auth._local_rate_counters) <= 50
+    # It counted every single one of the 500 attempts, across the flooding.
+    assert seen == list(range(1, 501)), "the per-account bucket was reset by the key flood"
+    assert auth._local_rate_hit(victim, 600) == 501
+    auth.reset_local_rate_limits()
 
 
 def test_per_account_limit_is_per_account(store, monkeypatch):
@@ -355,16 +400,32 @@ def test_token_cap_does_not_evict_other_users(store, monkeypatch):
 
 
 def test_token_cap_does_not_evict_expired_rows(store, monkeypatch):
-    """An already-dead row must not be chosen as the victim in preference to a
-    live one; the purge loop owns dead rows, the cap owns live ones."""
+    """The cap must only ever count and revoke UNEXPIRED rows.
+
+    Set up so the cap genuinely has to evict something -- two live tokens
+    against a cap of one -- otherwise "nothing was evicted" and "the wrong row
+    was evicted" look identical from the outside. The oldest live token is the
+    victim, and the already-dead row is left exactly where it was."""
     monkeypatch.setattr(auth.config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 1)
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     dead = asyncio.run(store.issue_token(user.id, 0))  # expires immediately
-    live = asyncio.run(store.issue_token(user.id, 7))
-    assert asyncio.run(store.user_for_token(live)) is not None
-    # The dead row is still on disk, untouched: the cap only ever counts and
-    # revokes unexpired tokens.
-    assert asyncio.run(store.user_for_token(dead)) is None
+    oldest_live = asyncio.run(store.issue_token(user.id, 7))
+    newest_live = asyncio.run(store.issue_token(user.id, 7))
+
+    # An eviction really did happen...
+    assert asyncio.run(store.user_for_token(oldest_live)) is None
+    assert asyncio.run(store.user_for_token(newest_live)) is not None
+
+    # ...and it took the oldest LIVE token with it, not the dead row. Asserted
+    # against the table, because user_for_token returns None for any expired
+    # row whether or not the cap touched it.
+    async def stored_hashes():
+        rows = await store._fetchall("SELECT token_hash FROM auth_tokens WHERE user_id = ?", (user.id,))
+        return {r["token_hash"] for r in rows}
+
+    assert auth.hash_token(dead) in asyncio.run(stored_hashes()), "the cap must not touch expired rows"
+    assert auth.hash_token(newest_live) in asyncio.run(stored_hashes())
+    assert auth.hash_token(oldest_live) not in asyncio.run(stored_hashes())
 
 
 def test_token_cap_zero_disables(store, monkeypatch):
@@ -527,8 +588,11 @@ def test_service_token_is_scoped(store, monkeypatch):
     assert client.post("/api/auth/service-tokens", headers={"X-Service-Token": "svc-abc"}).status_code == 403
 
 
-def test_service_token_is_rotatable(store, monkeypatch):
-    """An admin can mint a fresh token and revoke the old ones."""
+def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
+    """Rotation must work in the order an operator actually reaches for: mint
+    the replacement, move consumers onto it, then retire the old one -- without
+    a window in which no credential works and without the fresh token being
+    swept up by the retirement."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -545,22 +609,52 @@ def test_service_token_is_rotatable(store, monkeypatch):
     app.include_router(auth.router)
     client = TestClient(app)
 
-    # The env bootstrap token, minted and then rotated away.
+    # The credential in service today.
     asyncio.run(store.ensure_bootstrap_service_token("old-svc", {"chat:use"}, 3600))
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 200
 
+    # 1. Mint the replacement. Both work, so nothing has an outage.
     minted = client.post("/api/auth/service-tokens", headers=hdr)
     assert minted.status_code == 200, minted.text
     new_token = minted.json()["token"]
     assert new_token
     assert minted.json()["scope"] == ["chat:use"]
     assert new_token != "old-svc", "rotation mints a fresh value, not the old one"
+    assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 200
 
-    revoked = client.post("/api/auth/service-tokens/revoke", headers=hdr)
-    assert revoked.status_code == 200
+    # 2. Retire the old one BY VALUE. This must not take the new one with it.
+    retired = client.post("/api/auth/service-tokens/revoke", json={"token": "old-svc"}, headers=hdr)
+    assert retired.status_code == 200, retired.text
+    assert retired.json()["revoked"] == 1
+    assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 401
+    assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 200
+
+
+def test_revoke_all_service_tokens_kills_every_one(store, monkeypatch):
+    """The no-body form is the suspected-leak response: everything dies, the
+    replacement included. That is the deliberate difference between the two."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
+    admin_token = asyncio.run(store.issue_token(admin.id, 7))
+    hdr = {"Authorization": f"Bearer {admin_token}"}
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+
+    asyncio.run(store.ensure_bootstrap_service_token("old-svc", {"chat:use"}, 3600))
+    new_token = client.post("/api/auth/service-tokens", headers=hdr).json()["token"]
+
+    revoked = client.post("/api/auth/service-tokens/revoke", json={}, headers=hdr)
+    assert revoked.status_code == 200, revoked.text
     assert revoked.json()["revoked"] == 2
-
-    # Both are dead now, and the new one was never stored in plaintext.
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 401
     assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 401
     assert asyncio.run(store.service_token_for(new_token)) is None
@@ -605,3 +699,38 @@ def test_service_token_unknown_scope_names_are_dropped(monkeypatch):
     a token whose scope is not what the .env says."""
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use", "chat:typpo", "not:apermission"))
     assert auth._service_token_scope() == frozenset({"chat:use"})
+
+
+def test_service_token_ttl_comes_from_config_and_never_from_nowhere(monkeypatch):
+    """The seeded lifetime must be the configured one, and a non-positive
+    configuration must fall back to the default rather than meaning 'never
+    expires'. Otherwise an operator setting 0 -- or a regression that hardcodes
+    a long life -- quietly reinstates the permanent admin credential this issue
+    is about, and nothing in the suite would notice."""
+    assert auth.config.AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS == 86400
+    assert auth._service_token_ttl_seconds() == 86400
+
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 60)
+    assert auth._service_token_ttl_seconds() == 60
+    for non_positive in (0, -1, -86400):
+        monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", non_positive)
+        assert auth._service_token_ttl_seconds() == 86400, (
+            f"AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS={non_positive} must not disable the expiry"
+        )
+
+
+def test_seeded_service_token_row_uses_the_configured_ttl(store, monkeypatch):
+    """The TTL must reach the stored row at seed time, not merely exist in
+    config: assert the row's own expiry is the configured distance away."""
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-abc")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    async def scenario():
+        await auth.require_auth(_req({"x-service-token": "svc-abc"}))
+        return await store._fetchone("SELECT created_at, expires_at FROM auth_service_tokens")
+
+    row = asyncio.run(scenario())
+    # +/- a second of slack for the float round-trip through SQLite.
+    assert 3590 < row["expires_at"] - row["created_at"] <= 3601
