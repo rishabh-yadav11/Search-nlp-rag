@@ -100,8 +100,9 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   // `trim()` is deliberately left in place. It also strips NBSP (U+00A0) and
   // BOM (U+FEFF), which the URL parser does *not* strip, so a NBSP-prefixed
   // `javascript:` is blocked here but would be a harmless relative path in the
-  // browser. That is the one place this guard is stricter than the browser; it
-  // errs towards blocking, and loosening `trim()` would reintroduce the risk.
+  // browser. That is one of two places this guard is stricter than the browser
+  // (the other is CONTROL_CHAR_RE below); both err towards blocking, and
+  // loosening `trim()` would reintroduce the risk.
   const raw = url.trim()
   if (!raw) return false
 
