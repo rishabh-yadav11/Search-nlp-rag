@@ -56,10 +56,13 @@ MAX_CONTENT_LEN = 8000
 PREVIEW_LEN = 140
 MAX_TOKEN_SUM = 2**31 - 1
 AUDIT_LOG_MAX_LIMIT = 1000
-# The admin dashboard polls /analytics/chat every 30s, so the audit trail
-# gains a row on every tick. Pruning by age on write keeps it bounded on a
-# long-lived install instead of growing without limit.
-AUDIT_RETENTION_DAYS = 30
+# The admin dashboard polls /analytics/chat every 30s, so the audit trail gains
+# a row on every tick. Rows are pruned here, alongside the conversation
+# retention sweep in `purge_expired`, so the hot write path stays a single
+# INSERT. Retention is in weeks rather than days: the trail exists to support
+# noticing a slow browse through other users' conversations, and a few days of
+# history cannot do that.
+AUDIT_RETENTION_DAYS = 90
 
 # Module-level store; set by main.lifespan (and by tests).
 store: "ChatStore | None" = None
@@ -383,14 +386,27 @@ class ChatStore:
         return [_row_to_message(r) for r in rows]
 
     async def purge_expired(self) -> int:
-        """Delete conversations idle for CHAT_RETENTION_DAYS or longer.
+        """Delete conversations idle for CHAT_RETENTION_DAYS or longer, and
+        audit rows older than AUDIT_RETENTION_DAYS. Returns the conversation
+        count purged.
 
         A single atomic DELETE (messages cascade via ON DELETE CASCADE) replaces
         the old SELECT-then-per-id-DELETE, closing a TOCTOU race where a session
-        touched after the SELECT but before its DELETE was wrongly removed."""
-        cutoff = _now() - config.CHAT_RETENTION_DAYS * 86400
+        touched after the SELECT but before its DELETE was wrongly removed.
+
+        The audit prune rides here rather than in `record_admin_audit` so that
+        recording a read stays one INSERT: this endpoint is polled every 30s,
+        and a second statement in that transaction would tax the hot path to
+        do work this daily sweep already does."""
+        now = _now()
         db = self._require_db()
-        cursor = await db.execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
+        cursor = await db.execute(
+            "DELETE FROM sessions WHERE updated_at < ?", (now - config.CHAT_RETENTION_DAYS * 86400,)
+        )
+        await db.execute(
+            "DELETE FROM admin_audit WHERE created_at < ?",
+            (now - AUDIT_RETENTION_DAYS * 86400,),
+        )
         await db.commit()
         return cursor.rowcount
 
@@ -493,22 +509,17 @@ class ChatStore:
             return {"error": "chat analytics unavailable"}
 
     async def record_admin_audit(self, actor_id: str, action: str) -> None:
-        """Append one row to the durable admin audit trail, pruning rows older
-        than AUDIT_RETENTION_DAYS in the same transaction.
+        """Append one row to the durable admin audit trail.
 
-        Pruning rides along with the write because the read being audited
-        happens on a 30s dashboard poll; an unpruned trail would grow by
-        ~2.9k rows a day for every open dashboard. ``idx_admin_audit_created``
-        keeps the range delete off a full table scan."""
+        Deliberately a single INSERT: this runs on the admin dashboard's 30s
+        poll, so the hot path carries no prune. Expiry is handled by
+        `purge_expired`, which the retention sweeper runs on the same clock as
+        conversation expiry."""
         db = self._require_db()
         now = _now()
         await db.execute(
             "INSERT INTO admin_audit (actor_id, action, created_at) VALUES (?, ?, ?)",
             (actor_id, action, now),
-        )
-        await db.execute(
-            "DELETE FROM admin_audit WHERE created_at < ?",
-            (now - AUDIT_RETENTION_DAYS * 86400,),
         )
         await db.commit()
 

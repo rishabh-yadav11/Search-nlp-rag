@@ -726,10 +726,11 @@ def test_analytics_chat_records_admin_audit(tmp_path):
 
 
 
-def test_admin_audit_prunes_rows_past_retention(tmp_path):
-    """The trail is written on every 30s dashboard poll, so it must stay
-    bounded: a write drops rows older than AUDIT_RETENTION_DAYS and keeps
-    everything inside the window."""
+def test_admin_audit_expires_via_retention_sweep(tmp_path):
+    """The trail gains a row on every 30s dashboard poll, so it must stay
+    bounded. Expiry rides on the existing retention sweep rather than the hot
+    write path: a row past AUDIT_RETENTION_DAYS is dropped by `purge_expired`,
+    and a row inside the window survives it."""
     store = _store(tmp_path)
     try:
         stale = time.time() - (chat_module.AUDIT_RETENTION_DAYS + 1) * 86400
@@ -744,11 +745,14 @@ def test_admin_audit_prunes_rows_past_retention(tmp_path):
         _run(store._db.commit())
         assert len(_run(store.admin_audit_log())) == 2
 
+        # Recording a read must not prune: the hot path is one INSERT.
         _run(store.record_admin_audit("current-admin", "analytics.chat.read"))
+        assert len(_run(store.admin_audit_log())) == 3
+
+        _run(store.purge_expired())
 
         actors = {r["actor_id"] for r in _run(store.admin_audit_log())}
         assert "old-admin" not in actors, "expired audit row was never pruned"
-        # The in-window rows survive, and the new write is recorded.
         assert actors == {"recent-admin", "current-admin"}
     finally:
         _run(store.close())

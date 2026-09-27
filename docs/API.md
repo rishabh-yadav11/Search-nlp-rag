@@ -439,8 +439,18 @@ Each `top_by_*` row is `[session_id, messages, cost | tokens, updated_at]`.
 Every read is recorded in the durable `admin_audit` table (`actor_id`,
 `action`, `created_at`), written by `ChatStore.record_admin_audit` before the
 response is returned and readable back with `ChatStore.admin_audit_log`. Rows
-older than `AUDIT_RETENTION_DAYS` are pruned on write, since the dashboard
-polls this endpoint every 30s. The trail is deliberately not exposed over HTTP.
+older than `AUDIT_RETENTION_DAYS` (90) are dropped by the existing retention
+sweep, `ChatStore.purge_expired`, so recording a read stays a single INSERT
+despite this endpoint being polled every 30s. The trail is deliberately not
+exposed over HTTP.
+
+`actor_id` is the authenticated account's id, so human admin logins are
+attributed individually. A request authenticated with the shared
+`X-Service-Token` bypass is recorded under the single `SERVICE_USER_ID`
+constant instead — the trail cannot distinguish callers that present the same
+shared secret, and no code change can recover a per-caller identity from one
+secret. Treat machine-bypass reads as attributable to "the service token",
+not to a person.
 
 ---
 
