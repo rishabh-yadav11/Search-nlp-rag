@@ -270,6 +270,140 @@ def test_bootstrap_admin_keeps_existing_weak_admin_but_warns(store, monkeypatch,
     assert existing.id in joined
 
 
+def test_bootstrap_admin_accepts_long_passphrase_and_creates_loggable_admin(store, monkeypatch):
+    """REGRESSION: bcrypt only ever sees the first 72 bytes, so a longer
+    passphrase is fully serviceable. Rejecting it would be worse than the bug it
+    guards: bootstrap_admin is the ONLY path that can ever create an admin
+    (signup hardcodes SIGNUP_ROLE, and PATCH /users needs an admin token that
+    cannot exist yet), so refusing it leaves a fresh deploy permanently
+    unadministrable while /health still reports green."""
+    long_pw = "Passphrase1234" + "a" * 89  # 103 chars
+    assert len(long_pw.encode()) > auth._BCRYPT_MAX_BYTES
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", long_pw)
+    monkeypatch.setattr(auth, "store", store)
+
+    asyncio.run(bootstrap_admin())
+
+    admin = asyncio.run(store.get_user_by_email("admin@x.co"))
+    assert admin is not None, "a long passphrase must still bootstrap an admin"
+    assert admin.role == "admin" and admin.is_active
+    # and the account is actually usable
+    assert auth.verify_password(long_pw, admin.password_hash)
+    assert len(asyncio.run(store.list_users())) == 1
+
+
+def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeypatch):
+    """A multi-byte character can straddle the 72-byte cut. A strict decode of
+    the truncated bytes would raise UnicodeDecodeError inside bootstrap and
+    restart-loop the worker -- the fail-dead outcome this check exists to
+    avoid -- so the partial character must be dropped, not decoded."""
+    pw = "Passphrase1234" + "a" * 57 + "é" * 20
+    assert len(pw.encode()) > auth._BCRYPT_MAX_BYTES
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", pw)
+    monkeypatch.setattr(auth, "store", store)
+
+    asyncio.run(bootstrap_admin())  # must not raise
+
+    admin = asyncio.run(store.get_user_by_email("admin@x.co"))
+    assert admin is not None and admin.role == "admin"
+    assert auth.verify_password(pw, admin.password_hash)
+    # The effective credential is what actually authenticates: the retained
+    # prefix of what gets hashed (a split multi-byte char leaves the decoded
+    # string a byte shorter, never longer).
+    hashed = auth._password_bytes(pw)
+    effective = auth._password_bytes(auth._effective_password(pw))
+    assert len(effective) <= auth._BCRYPT_MAX_BYTES
+    assert hashed.startswith(effective)
+
+
+def test_bootstrap_admin_still_blocks_weak_password_despite_truncation(store, monkeypatch):
+    """Normalizing to the effective value must not reopen the #290 hole: a
+    1-character password has a 1-character effective form, so it stays refused."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth, "store", store)
+
+    asyncio.run(bootstrap_admin())
+
+    assert asyncio.run(store.list_users()) == []
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "x",  # min-length reason
+        "nodigitsbutlong",  # letter-and-digit reason
+    ],
+)
+def test_bootstrap_rejection_hint_matches_the_reason(store, monkeypatch, caplog, password):
+    """The remediation must never contradict the reason it accompanies: telling
+    an operator to lengthen a password that was rejected for being too long
+    sends them the wrong way (#290)."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
+    monkeypatch.setattr(auth, "store", store)
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    assert asyncio.run(store.list_users()) == []
+    joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    with pytest.raises(HTTPException) as exc:
+        auth.validate_password(auth._effective_password(password))
+    assert exc.value.detail in joined
+    # the advice must not push the operator toward the other failure mode
+    if "at least" in exc.value.detail:
+        assert "letter and a digit" in joined
+    else:
+        assert "at least" not in joined
+
+
+def test_bootstrap_no_rotate_alarm_for_unrelated_healthy_admin(store, monkeypatch, caplog):
+    """A config value that merely fails validation says nothing about a healthy
+    admin's password. Demanding rotation of an unrelated account on every
+    worker restart is a false alarm, so 'Rotate' must appear only when the
+    configured value really is that account's current password."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")  # invalid config
+    monkeypatch.setattr(auth, "store", store)
+    # ... but the existing admin is on a strong, valid password
+    asyncio.run(store.create_user("admin@x.co", "healthy-pass1", "Administrator", role="admin"))
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    existing = asyncio.run(store.get_user_by_email("admin@x.co"))
+    assert auth.verify_password("healthy-pass1", existing.password_hash)  # untouched
+    joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "REJECTED" not in joined
+    assert "Rotate" not in joined
+    assert "needs no rotation" in joined
+
+
+def test_bootstrap_probe_failure_is_logged_not_swallowed(store, monkeypatch, caplog):
+    """If the existence probe itself fails, the operator must still see that,
+    rather than getting only the generic 'no admin account' line with the weak
+    -admin warning silently missing."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth, "store", store)
+
+    async def boom(email):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "get_user_by_email", boom)
+
+    with caplog.at_level(logging.WARNING, logger="auth"):
+        asyncio.run(bootstrap_admin())  # must not raise
+
+    joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+    assert "could not check whether admin" in joined
+    assert "OperationalError" in joined
+    assert "database is locked" in joined
+
+
 def test_role_permissions_matrix():
     perms = auth.ROLE_PERMISSIONS
     assert "chat:use" in perms["user"] and "analytics:read" not in perms["user"]
