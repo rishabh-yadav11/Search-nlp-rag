@@ -733,11 +733,35 @@ def test_effective_step_never_returns_a_zero_stride():
     assert isinstance(out, str) and out
 
 
-def test_best_body_window_still_finds_dense_region_under_a_widened_stride():
+def test_best_body_window_finds_dense_region_at_the_default_budget():
+    """The budget must be free at any value that does not force a widening.
+
+    This is the case operators actually run: win=1500/step=500 over this body
+    is 98 windows against a budget of 200, so the stride never moves and the
+    dense region is still found.
+    """
     body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
-    out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1, max_windows=64)
+    out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 500, max_windows=200)
     low = out.lower()
     assert "alpha" in low and "gamma" in low
+
+
+def test_best_body_window_a_tight_budget_can_straddle_the_dense_region():
+    """The trade-off, stated rather than papered over: a stride coarse enough
+    to widen can skip a token-dense region. That is the cost of capping the
+    work, and it is only reachable when a budget tighter than the chosen
+    stride needs is configured -- the default budget never widens.
+
+    A budget of 1 forces the single window at start=0, so the result is
+    deterministically `body[:1500]` and cannot depend on window arithmetic.
+    """
+    body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
+    out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1, max_windows=1)
+    assert out == body[:1500]
+    # The same call with no budget scans everything and finds the region,
+    # which is exactly what the budget gives up.
+    unbudgeted = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1)
+    assert "alpha" in unbudgeted.lower()
 
 
 class _IterationCountingTokens(set):

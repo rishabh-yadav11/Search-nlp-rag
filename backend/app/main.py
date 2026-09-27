@@ -720,9 +720,9 @@ def _query_content_tokens(query: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOPWORDS and len(w) > 1}
 
 
-def _effective_step(positions: int, step: int, max_windows: int) -> int:
+def _effective_step(positions: int, step: int, max_windows: int | None) -> int:
     """The stride to scan ``positions`` window starts with, honouring both a
-    minimum step of 1 and a hard budget of ``max_windows`` windows.
+    minimum step of 1 and an optional hard budget of ``max_windows`` windows.
 
     Clamping the configured stride alone does not bound the work, because a
     small stride is a legal (and deceptively cheap-looking) setting: step=1
@@ -731,30 +731,42 @@ def _effective_step(positions: int, step: int, max_windows: int) -> int:
     applies, so 20 articles cost ~2.3s for a single chat turn. Widening the
     stride bounds the work by window COUNT instead of by the raw value.
 
-    The default scan (98 windows at win=1500/step=500 over a 50K body) is
-    already inside the default budget, so it is returned unchanged and the
-    budget only engages for a deliberately expensive stride.
+    ``max_windows=None`` (or <= 0) means no budget, which is what a direct
+    caller that does not opt in gets. ``body_rescue`` always passes the
+    configured ``BODY_RESCUE_MAX_WINDOWS``.
+
+    The trade-off is recall for work: a stride coarse enough to widen can
+    straddle a token-dense region and miss it. That only happens when a budget
+    is configured below what the chosen stride would need, and at the defaults
+    (98 windows against a budget of 200) the stride is never touched, so the
+    scan is unchanged. A budget of 1 degenerates to the single window at
+    start=0 rather than an empty range.
     """
     step = max(1, step)
-    if max_windows > 0 and -(-positions // step) > max_windows:
+    if max_windows and max_windows > 0 and -(-positions // step) > max_windows:
         step = max(1, -(-positions // max_windows))
     return step
 
 
-def _best_body_window(body: str, tokens: set[str], win: int, step: int, max_windows: int = 200) -> str:
+def _best_body_window(
+    body: str, tokens: set[str], win: int, step: int, max_windows: int | None = None
+) -> str:
     """The body region with the most distinct query tokens, cheaply located by
     sliding a window over the lowercased body. Returns the window with the
     original casing (falls back to the tail region on ties).
 
-    ``max_windows`` bounds how many windows are scored per body, so the work
-    is capped by a window COUNT rather than by the raw stride value; see
-    ``_effective_step``.
+    ``max_windows`` caps how many windows are scored per body, so the work is
+    bounded by a window COUNT rather than by the raw stride; it defaults to
+    None (uncapped) so the four-argument calling convention keeps its original
+    behaviour. See ``_effective_step``.
     """
     if not tokens or len(body) <= win:
         return body
     low = body.lower()
     positions = len(body) - win + 1
     step = _effective_step(positions, step, max_windows)
+
+
     best_score, best_start = -1, 0
     for start in range(0, positions, step):
         score = sum(1 for t in tokens if t in low[start:start + win])
