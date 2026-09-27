@@ -418,15 +418,29 @@ Cross-user chat usage, read from the SQLite chat store. Admin-only
   "total_tokens": 61397,
   "total_cost": 2.1901243,
   "avg_latency_ms": 1797.1,
-  "top_by_cost": [ ["Who invested in Ola Electric?", 4, 0.3017, 1786954406.95], ... ],
-  "top_by_tokens": [ ["top deals of 2025", 6, 8432, 1786956978.24], ... ],
+  "top_by_cost": [ ["<session-id>", 4, 0.3017, 1786954406.95], ... ],
+  "top_by_tokens": [ ["<session-id>", 6, 8432, 1786956978.24], ... ],
   "sessions_today": 3,
   "daily_sessions": [ ["2026-08-17", 3], ... ]
 }
 ```
 
-No message contents are exposed — only counts, totals and per-conversation
-aggregates (privacy-safe).
+This is a cross-user response and it is **not** content-free: it exposes
+global totals plus per-session rows for every user's conversations. What keeps
+it free of user-authored text is that no session title, message body or any
+other user-written string is ever selected — the top-N queries project
+`sessions.id` only, so a session is identified by its opaque id and nothing
+else. (A session title is the first 60 characters of the user's own question,
+so returning one here would hand every admin the opening of other people's
+private conversations.)
+
+Each `top_by_*` row is `[session_id, messages, cost | tokens, updated_at]`.
+
+Every read is recorded in the durable `admin_audit` table (`actor_id`,
+`action`, `created_at`), written by `ChatStore.record_admin_audit` before the
+response is returned and readable back with `ChatStore.admin_audit_log`. Rows
+older than `AUDIT_RETENTION_DAYS` are pruned on write, since the dashboard
+polls this endpoint every 30s. The trail is deliberately not exposed over HTTP.
 
 ---
 
