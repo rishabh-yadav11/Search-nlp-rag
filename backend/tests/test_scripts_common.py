@@ -55,6 +55,7 @@ def test_make_point_payload_is_exactly_the_expected_dict():
         "url": "https://www.vccircle.com/ola-electric-ipo",
         "published_date": "2025-06-01T00:00:00",
         "category": "Series A",
+        "content_type": "article",
         "summary": "Funding news.",
         "body": "x" * 50,
         "author_names": ["Alice", "Bob"],
@@ -97,17 +98,66 @@ def test_make_point_normalises_missing_optional_fields():
     assert payload["dealtype_names"] == []
 
 
-def test_content_type_is_not_in_the_payload():
-    """The record carries content_type; the stored payload deliberately does not.
+def test_content_type_is_in_the_payload():
+    """The record carries content_type and so must the stored payload.
 
-    This is the state every write path has always been in, and it is also the
-    reason the content_type feature reads as broken end to end. Asserting the
-    omission here means the field cannot change by accident: whoever wires it up
-    has to add it to ``make_point`` and this assertion, in the same change.
+    This assertion used to be the reverse — it pinned the key as absent, which
+    was precisely what kept the content_type feature dead end to end: the read
+    path (``main._PAYLOAD_FIELDS`` -> ``SourceArticle.content_type``) and the
+    facet vocabulary both read a field that no write path ever stored. Now that
+    ``make_point`` stores it, this test is the guard that a future refactor
+    cannot silently drop the key again: removing it from the payload fails here
+    and in the exact-dict test above.
     """
     assert "content_type" in _record()  # record_from_row does supply it
 
-    assert "content_type" not in make_point(_record(), DENSE, SPARSE).payload
+    payload = make_point(_record(), DENSE, SPARSE).payload
+
+    assert payload["content_type"] == "article"
+
+
+def test_content_type_is_normalised_to_a_string():
+    """Every point stores a str for a KEYWORD-indexed field, never None.
+
+    A payload that is ``str`` on some points and ``None`` on others is a
+    mixed-type field, which Qdrant's payload index handles inconsistently. The
+    read side maps the empty string back to None
+    (``payload.get("content_type") or None``), so nothing is lost.
+    """
+    for absent in (None, ""):
+        payload = make_point(_record(content_type=absent), DENSE, SPARSE).payload
+
+        assert payload["content_type"] == ""
+        assert isinstance(payload["content_type"], str)
+
+    # Whitespace is deliberately not re-stripped: both producers of this record
+    # (record_from_row for MySQL, and the jsonl it dumps for the build path)
+    # already strip the column, so re-stripping would add a second convention
+    # rather than a guarantee. A real value passes through verbatim so the read
+    # side can match it exactly against the live facet vocabulary.
+    assert make_point(_record(content_type="Interview"), DENSE, SPARSE).payload["content_type"] == (
+        "Interview"
+    )
+
+
+def test_payload_keys_cover_what_the_read_path_requests():
+    """Every field the search read path asks Qdrant for is one we actually store.
+
+    hybrid_search passes _PAYLOAD_FIELDS as `with_payload`, so a field listed
+    there but never written is exactly the dead end this issue is about:
+    `content_type` was requested on every read and produced by no write path.
+    This asserts the two sides agree, in both directions, so the next field
+    added to one without the other fails here.
+    """
+    from app import main
+
+    stored = set(make_point(_record(), DENSE, SPARSE).payload)
+    requested = set(main._PAYLOAD_FIELDS)
+
+    assert "content_type" in requested & stored
+    # `body` is deliberately excluded from _PAYLOAD_FIELDS (fetched separately
+    # via with_body=True), so the read set must be a subset of the stored keys.
+    assert requested <= stored
 
 
 def test_make_pool_passes_configured_credentials_and_no_unsupported_kwargs(monkeypatch):

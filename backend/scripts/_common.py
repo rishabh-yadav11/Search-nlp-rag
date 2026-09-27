@@ -43,15 +43,23 @@ def make_point(rec: dict, dvec, svec) -> PointStruct:
 
     This is the single definition of the indexed payload, shared by every write
     path, so two scripts can no longer store a different set of keys for the
-    same article. The key set is deliberately fixed at the nine fields the
+    same article. The key set is deliberately fixed at the ten fields the
     search read path uses; a field that is not stored here is not stored by any
     script.
+
+    ``content_type`` is the tenth key, and every value is normalised to ``str``
+    (never ``None``): it carries a KEYWORD payload index, and a field that is
+    ``str`` on some points and ``None`` on others is a mixed-type field that
+    Qdrant indexes inconsistently. The read side maps a falsy value back to
+    ``None`` (``payload.get("content_type") or None``), so an article with no
+    content type in MySQL round-trips as absent exactly as before.
     """
     payload = {
         "title": rec["title"],
         "url": rec["url"],
         "published_date": rec.get("published_date"),
         "category": rec.get("category"),
+        "content_type": rec.get("content_type") or "",
         "summary": rec.get("summary") or "",
         "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
         "author_names": rec.get("author_names") or [],
