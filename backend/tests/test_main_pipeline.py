@@ -135,6 +135,23 @@ class _FakeReranker:
         return self.logits
 
 
+
+class _RecordingReranker:
+    """Reranker fake that keeps the exact (query, document) pairs it was handed,
+    so a test can assert both how many candidates entered the second pass and
+    which ones they were -- not merely that predict() was called once."""
+
+    def __init__(self, logits):
+        self.logits = logits
+        self.calls = 0
+        self.pairs = []
+
+    def predict(self, pairs):
+        self.calls += 1
+        self.pairs = list(pairs)
+        return self.logits
+
+
 class _FakeFacetClient:
     def __init__(self, result):
         self.result = result
@@ -403,6 +420,59 @@ def test_body_rescue_reranker_error_propagates(monkeypatch):
     a = _article(1, 0.1, body="some body with funding deals")
     with pytest.raises(RuntimeError):
         _run(main.body_rescue("funding deals", [a]))
+
+
+def test_body_rescue_makes_no_second_pass_when_gate_is_off(monkeypatch):
+    """The gate has to live in body_rescue itself, because body_rescue is what
+    pays for the second cross-encoder pass. With ENABLE_BODY_RESCUE off, weak
+    results that do have bodies must never reach the reranker -- otherwise a
+    caller that forgets the check silently pays the cost again."""
+    monkeypatch.setattr(main.config, "ENABLE_BODY_RESCUE", False)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.2)
+    fake = _RecordingReranker([9.0])
+    monkeypatch.setitem(main.state, "reranker", fake)
+    arts = [
+        _article(1, 0.1, body="funding deals round " * 20),
+        _article(2, 0.05, body="funding deals round " * 20),
+    ]
+    out = _run(main.body_rescue("funding deals", arts))
+    assert fake.calls == 0
+    assert fake.pairs == []
+    assert [a.score for a in out] == [0.1, 0.05]
+
+
+def test_body_rescue_caps_candidates_entering_the_second_pass(monkeypatch):
+    """The rescue costs one cross-encoder prediction per candidate, so chat
+    handing it CHAT_MAX_SOURCES articles must not mean 20 predictions under
+    the global inference lock."""
+    monkeypatch.setattr(main.config, "ENABLE_BODY_RESCUE", True)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.2)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_MAX_CANDIDATES", 3)
+    fake = _RecordingReranker([5.0] * 9)
+    monkeypatch.setitem(main.state, "reranker", fake)
+    arts = [_article(i, 0.1, body="funding deals round " * 20) for i in range(1, 10)]
+    _run(main.body_rescue("funding deals", arts))
+    assert fake.calls == 1
+    assert len(fake.pairs) == 3
+
+
+def test_body_rescue_shortlists_by_body_overlap_not_by_score(monkeypatch):
+    """A weak title+summary score is precisely the reason the rescue exists:
+    the article worth rescoring is the one whose match lives in the body. So
+    the limited budget goes to the highest body-window overlap -- not to the
+    top scorer, and not to the first articles in list order (the buried match
+    here is second)."""
+    monkeypatch.setattr(main.config, "ENABLE_BODY_RESCUE", True)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.95)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_MAX_CANDIDATES", 1)
+    fake = _RecordingReranker([5.0, 5.0])
+    monkeypatch.setitem(main.state, "reranker", fake)
+    top_scored = _article(1, 0.9, title="Strong on title", body="weather and markets " * 100)
+    buried = _article(2, 0.05, title="Buried match", body="lessons 2008 crisis central banks " * 40)
+    _run(main.body_rescue("lessons 2008 crisis central banks", [top_scored, buried]))
+    assert len(fake.pairs) == 1
+    assert "Buried match" in fake.pairs[0][1]
+    assert "Strong on title" not in fake.pairs[0][1]
 
 
 # --- _attach_bodies ---

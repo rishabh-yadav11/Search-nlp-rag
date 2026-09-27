@@ -746,25 +746,51 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
     live mid-article (e.g. historical retrospectives). Re-score each candidate
     against the body region with the most lexical query overlap and keep
     max(baseline, body), so such matches can pass the chat relevance gate.
-    Costs one extra cross-encoder pass per candidate and only runs on weak
-    results, so normal queries are unaffected."""
+
+    The whole feature is gated on ENABLE_BODY_RESCUE here rather than only at
+    the call sites: this is the function that pays the cost (a second
+    cross-encoder pass under the process-wide inference lock), so the guard
+    belongs where the cost is, not in every future caller that has to remember
+    it. The call-site guards in chat.py stay as a cheap short-circuit.
+
+    The pass runs on at most BODY_RESCUE_MAX_CANDIDATES articles: the body
+    pass costs one cross-encoder prediction per candidate and dominates the
+    window scan by two orders of magnitude, so the candidate count is the only
+    budget that matters."""
     if not articles:
+        return articles
+    if not config.ENABLE_BODY_RESCUE:
         return articles
     if max((a.score for a in articles), default=0.0) >= config.BODY_RESCUE_THRESHOLD:
         return articles
     tokens = _query_content_tokens(query)
     if not tokens:
         return articles
-    pairs: list[tuple[str, str]] = []
-    indices: list[int] = []
+    candidates: list[tuple[int, int, tuple[str, str]]] = []
     for i, a in enumerate(articles):
         if not a.body:
             continue
         win = _best_body_window(a.body, tokens, config.BODY_RESCUE_WINDOW, config.BODY_RESCUE_STEP)
-        pairs.append((query, f"{a.title}. {a.summary or ''}. {win}".strip()))
-        indices.append(i)
-    if not pairs:
+        # How many distinct query tokens the best window actually contains --
+        # the same signal _best_body_window maximised, i.e. what the second
+        # pass would have to work with.
+        low_win = win.lower()
+        overlap = sum(1 for t in tokens if t in low_win)
+        candidates.append((overlap, i, (query, f"{a.title}. {a.summary or ''}. {win}".strip())))
+    if not candidates:
         return articles
+    # Shortlist by body-window overlap, NOT by a.score and NOT by list order.
+    # A weak title+summary score is the very reason the rescue exists: taking
+    # the top-N by score would drop exactly the deep-body matches it exists to
+    # rescue, and taking the first N by list order would let retrieval ranking
+    # decide the budget. An article whose best window contains none of the
+    # query tokens is one the body pass cannot lift, so it is the correct thing
+    # to drop first when the budget runs out. Ties resolve on the original
+    # index so a run is reproducible.
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    kept = candidates[: config.BODY_RESCUE_MAX_CANDIDATES]
+    pairs = [c[2] for c in kept]
+    indices = [c[1] for c in kept]
     async with inference_lock:
         logits = await asyncio.to_thread(state["reranker"].predict, pairs)
     for i, logit in zip(indices, logits):
@@ -1119,7 +1145,7 @@ async def retrieve_by_date_window(
     dependencies=[Depends(public_rate_limit("search", "PUBLIC_SEARCH_RATE_PER_MIN"))],
 )
 async def search(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=config.SEARCH_QUERY_MAX_CHARS),
     top_k: int = Query(config.TOP_K, ge=1, le=50),
     industry: str | None = Query(None),
     dealtype: str | None = Query(None),
