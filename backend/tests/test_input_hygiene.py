@@ -432,6 +432,32 @@ def test_query_of_only_control_characters_is_rejected(monkeypatch):
     assert response.json()["detail"] == "empty query"
 
 
+def test_search_cache_key_is_bounded(monkeypatch):
+    """The /search key is a second, independent key a query reaches. It has to
+    be bounded on its own terms -- covering only the retrieve key would leave a
+    long query to build an arbitrarily long /search key."""
+    cache, _, _ = _wire(monkeypatch)
+    response = _client.get("/search", params={"q": "q" * 1000})
+    assert response.status_code == 200
+    assert cache.gets, "expected the request to build a cache key"
+    for key in cache.gets:
+        assert key.startswith("search:sha256:"), "an over-long query must be digested"
+        assert len(key) == len("search:sha256:") + 64
+
+
+def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
+    """A long-but-in-bounds facet set must not push the key past the bound
+    either, since the token is part of the same key. This one stays under the
+    limit and must remain readable rather than being digested for nothing."""
+    cache, _, _ = _wire(monkeypatch)
+    values = ",".join("v" * MAX_FACET_VALUE_LEN for _ in range(MAX_FACET_VALUES))
+    response = _client.get("/search", params={"q": "test", "industry": values})
+    assert response.status_code == 200
+    for key in cache.gets:
+        assert key.startswith("search:")
+        assert len(key) <= MAX_KEY_LEN
+
+
 def test_retrieve_cache_key_is_bounded_and_control_free(monkeypatch):
     """The retrieve-level key is the other key a query reaches (chat shares
     this pipeline), so it has to be bounded and cleaned on the same terms."""

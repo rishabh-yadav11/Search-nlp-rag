@@ -767,10 +767,20 @@ async def hybrid_search(
     # the cache key is built so the key and the embedded text always describe
     # the same string.
     query = query[: config.RETRIEVAL_QUERY_MAX_CHARS]
-    vec_key = (
-        f"vec:{config.EMBED_MODEL}|{config.SPARSE_MODEL}:"
-        f"{_cache_key_component(query)}"
-    )
+    # Normalised here, where the embedding is actually computed, so the key and
+    # the embedded text cannot drift apart: the cached (dense, sparse) pair
+    # stands for one exact input string. This is the same query the other two
+    # keys see, so a control character or a compatibility variant cannot
+    # fragment the vector cache either. Normalisation only ever shrinks the
+    # text, so it runs after the clamp above and the encoders still see at most
+    # RETRIEVAL_QUERY_MAX_CHARS characters.
+    query = normalize_text(query)
+    # Same two bounds as the search: and retrieve: keys: the query segment is
+    # digested once past CACHE_KEY_QUERY_MAX_CHARS (#241) and the key is
+    # length-prefixed and bounded as a whole (#252), so the model names stay
+    # readable in Redis next to a digest rather than spelled-out query text.
+    vec_key = build_cache_key(config.EMBED_MODEL, config.SPARSE_MODEL,
+                              _cache_key_component(query), namespace="vec")
     vec = await cache.get(vec_key)
     if vec is None:
         async with inference_lock:
