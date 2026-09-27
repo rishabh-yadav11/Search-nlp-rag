@@ -17,11 +17,13 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
 
 import aiosqlite
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -2367,6 +2369,40 @@ _LLM_UNAVAILABLE: dict = {
     "detail": "The language model could not be reached; please retry shortly.",
 }
 
+
+async def _reconcile_cancelled_turn(action: Callable[[], Awaitable[None]]) -> None:
+    """Run a cancelled turn's rollback to completion, then let the cancel out.
+
+    A `asyncio.CancelledError` is a `BaseException`, so it passes straight
+    through every `except Exception` in a chat turn: on a client disconnect, a
+    tab close, an nginx drop or a worker shutdown the turn was simply abandoned
+    and the user message stayed in the database with no assistant reply -- the
+    one state the rollback exists to prevent. The callers catch it explicitly
+    and hand the reconciliation here.
+
+    The shielded scope is not decoration, it is what makes the write happen.
+    Starlette runs the SSE body iterator inside an anyio task group and cancels
+    it on `http.disconnect`, and anyio delivers that as a LEVEL cancellation:
+    the enclosing cancel scope re-raises `CancelledError` at every following
+    await until the scope is left, so a plain `await` in a handler is
+    interrupted before the row is written. `asyncio.shield` does not help -- its
+    own await is re-cancelled exactly the same way -- whereas a shielded anyio
+    scope suspends the re-delivery until the rollback is done. A shield defers
+    an enclosing anyio cancel scope, not an independent second
+    `Task.cancel()`, so this guarantees the write for the disconnect and
+    shutdown paths that actually cancel a turn; it does not survive a caller
+    that cancels the task a second time mid-rollback.
+
+    A rollback that itself fails is logged, not raised: the caller is already
+    unwinding from a cancellation and re-raises it either way, so letting a
+    database error out of here would only replace it with an unrelated trace.
+    """
+    try:
+        with anyio.CancelScope(shield=True):
+            await action()
+    except Exception:
+        logger.exception("chat turn rollback failed after cancellation")
+
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
 async def send_message(session_id: str, body: MessageIn, request: Request):
     user_id = request.state.user_id
@@ -2402,6 +2438,17 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
             status_code=503,
             detail={"error": "AI budget service unavailable", "detail": f"The daily chat budget could not be verified; please retry shortly. ({exc})"},
         ) from exc
+    except asyncio.CancelledError:
+        # The turn was cancelled, not failed: a client disconnect, a closed tab,
+        # a dropped proxy connection or a server shutdown cancels the task, and
+        # a CancelledError is a BaseException, so the handlers above never see
+        # it. Roll the user message back under the rule the polled-disconnect
+        # check below applies (a JSON client is never shown a partial answer),
+        # then re-raise so the task still ends cancelled.
+        await _reconcile_cancelled_turn(
+            lambda: s.delete_message(session_id, user_id, user_msg.id)
+        )
+        raise
     except Exception:
         # Any other failure during the turn (DB error, retrieval error, etc.)
         # must also roll back the dangling user message — the stream path deletes
@@ -2409,33 +2456,46 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         await s.delete_message(session_id, user_id, user_msg.id)
         raise
 
-    # A JSON client receives the whole answer at once, so unlike the SSE path
-    # nothing was ever shown before the disconnect: a dropped connection here
-    # is a clean rollback, not a partial turn to persist. Roll the user message
-    # back and report a non-success status (499, the conventional "client closed
-    # request") so it can never be mistaken for a completed turn (#255).
-    if await request.is_disconnected():
-        await s.delete_message(session_id, user_id, user_msg.id)
-        raise HTTPException(
-            status_code=499,
-            detail={"error": "Client disconnected", "detail": "The request was cancelled before the answer could be delivered."},
+    # Whether the assistant reply is already stored. A cancellation arriving
+    # after this point must leave the completed turn alone, or the rollback
+    # above would delete the user message out from under a reply the client can
+    # still read -- trading a dangling user row for a dangling assistant one.
+    reply_stored = False
+    try:
+        # A JSON client receives the whole answer at once, so unlike the SSE path
+        # nothing was ever shown before the disconnect: a dropped connection here
+        # is a clean rollback, not a partial turn to persist. Roll the user message
+        # back and report a non-success status (499, the conventional "client closed
+        # request") so it can never be mistaken for a completed turn (#255).
+        if await request.is_disconnected():
+            await s.delete_message(session_id, user_id, user_msg.id)
+            raise HTTPException(
+                status_code=499,
+                detail={"error": "Client disconnected", "detail": "The request was cancelled before the answer could be delivered."},
+            )
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        assistant_msg = await s.append_message(
+            session_id,
+            user_id,
+            "assistant",
+            answer,
+            sources,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost=cost,
+            latency_ms=latency_ms,
         )
-
-    latency_ms = (time.perf_counter() - start) * 1000
-
-    assistant_msg = await s.append_message(
-        session_id,
-        user_id,
-        "assistant",
-        answer,
-        sources,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cost=cost,
-        latency_ms=latency_ms,
-    )
-    await _auto_title(s, session_id, user_id, question)
-    return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
+        reply_stored = True
+        await _auto_title(s, session_id, user_id, question)
+        return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
+    except asyncio.CancelledError:
+        if not reply_stored:
+            await _reconcile_cancelled_turn(
+                lambda: s.delete_message(session_id, user_id, user_msg.id)
+            )
+        raise
 
 
 def _sse(event: str, data: dict) -> str:
@@ -2473,6 +2533,17 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
         # attempts even though the streamed answer is kept, so the figure joins
         # this turn's single settle instead of being forgiven (#347).
         spend = _FailedCallSpend()
+
+        # Whether this turn's assistant reply is already in the database. Set the
+        # moment any append succeeds, so a cancellation arriving after the reply
+        # was stored cannot roll the user message back out from under it -- that
+        # would trade a dangling user row for a dangling assistant one.
+        persisted = False
+        # Set once the budget gate has let this turn make its first billed LLM
+        # call. From here a cancelled turn may still have been paid for by the
+        # provider, so its holds are settled at the estimate rather than
+        # released: under-counting a call is free spend (#255).
+        gate_passed = False
 
         def billed_usd(usage: list) -> float:
             """What a turn whose LLM call has already been made is charged.
@@ -2549,6 +2620,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             by both halves of the abort rule and by the mid-stream-failure path.
             `aborted` records that the client had already gone, so the stored
             history explains why the answer stops mid-sentence."""
+            nonlocal persisted
             latency_ms = (time.perf_counter() - start) * 1000
             answer = _finalize_answer(answer, question).rstrip() + "\n\n[answer truncated]"
             await finish_holds(cost_usd)
@@ -2557,6 +2629,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                 cost=cost_usd, latency_ms=latency_ms, aborted=aborted,
             )
+            persisted = True
             await _auto_title(s, session_id, user_id, question)
             return assistant_msg
 
@@ -2670,6 +2743,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     prompt_tokens=turn.prompt_tokens, completion_tokens=turn.completion_tokens,
                     cost=turn.cost, latency_ms=latency_ms,
                 )
+                persisted = True
                 await _auto_title(s, session_id, user_id, question)
                 yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
                 return
@@ -2683,6 +2757,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             gate_hold = await reserve()
             if gate_hold:
                 holds.append(gate_hold)
+            gate_passed = True
             usage_holder: list = []
             chunks: list[str] = []
             try:
@@ -2854,6 +2929,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 cost=cost_usd,
                 latency_ms=latency_ms,
             )
+            persisted = True
             await _auto_title(s, session_id, user_id, question)
             yield _sse(
                 "done",
@@ -2880,6 +2956,26 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             logger.warning("daily cost counter unavailable during stream turn: %s", exc)
             await fail_turn()
             yield _sse("error", {"error": "AI budget service unavailable"})
+        except asyncio.CancelledError:
+            # The client dropped, the proxy cut the connection, or the server is
+            # shutting down: Starlette cancels the body iterator instead of
+            # returning from it. A CancelledError is a BaseException, so every
+            # `except Exception` in this function -- including the one below --
+            # misses it, and the turn was abandoned with the user message still
+            # in the database and no assistant reply. That is exactly the state
+            # this rule exists to prevent, so the cancellation is reconciled
+            # under the ONE abort rule (#255): nothing streamed yet -> clean
+            # rollback; deltas already on the wire -> persist the truncated turn
+            # flagged aborted, because the client already rendered that text.
+            # A turn that already stored its reply is left alone, or the
+            # rollback would trade a dangling user row for a dangling assistant
+            # one. Re-raised so the task still ends cancelled.
+            logger.info("chat stream turn cancelled; reconciling the stored turn")
+            if not persisted:
+                await _reconcile_cancelled_turn(
+                    lambda: fail_turn(mid_stream_estimate if gate_passed else 0.0)
+                )
+            raise
         except Exception:
             logger.exception("chat stream turn failed")
             await fail_turn()
