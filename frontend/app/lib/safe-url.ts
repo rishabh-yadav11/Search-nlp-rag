@@ -52,6 +52,11 @@ const SSR_BASE = 'https://localhost/'
 export function isSafeUrl(url: unknown, base?: string): boolean {
   if (typeof url !== 'string') return false
 
+  // `trim()` is deliberately left in place. It also strips NBSP (U+00A0) and
+  // BOM (U+FEFF), which the URL parser does *not* strip, so a NBSP-prefixed
+  // `javascript:` is blocked here but would be a harmless relative path in the
+  // browser. That is the one place this guard is stricter than the browser; it
+  // errs towards blocking, and loosening `trim()` would reintroduce the risk.
   const raw = url.trim()
   if (!raw) return false
 
