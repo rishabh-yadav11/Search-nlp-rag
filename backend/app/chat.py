@@ -1670,6 +1670,17 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
             0.0,
         )
     cost_usd = to_usd(result.cost())
+    if cost_usd <= 0:
+        # A zero here means the provider reported no usage, NOT that the call
+        # was free. `LLMResult.cost()` is an estimate built from token counts,
+        # and generate_answer reports zero tokens when the response carries no
+        # usage -- so charging 0 here would settle a delivered, already-billed
+        # answer as free and leave the cap inert against such a provider.
+        # Charge the estimate the gate held, the same figure and the same rule
+        # the streaming path's mid_stream_estimate uses, and return that same
+        # number so the stored message cost and the budget cannot disagree
+        # (#255).
+        cost_usd = config.LLM_CALL_RESERVE_USD
     if holds:
         # The turn's single counter write: it drops every hold and records what
         # the turn actually cost, which may exceed the reserved estimates —
