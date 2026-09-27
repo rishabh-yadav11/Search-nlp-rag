@@ -46,8 +46,29 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
-      - name: Pytest
-        run: python -m pytest
+      # tests/test_budget_lua.py runs the real shipped _BUDGET_LUA source
+      # under lua5.1 and is the only thing that catches drift between that
+      # script and the Python model. It skips itself when the interpreter is
+      # absent, so without this step CI would report success while leaving the
+      # spend cap unverified. lua5.1 is in Ubuntu noble universe, which
+      # GitHub-hosted runners enable.
+      - name: Install lua5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.1
+          lua5.1 -v
+      # -rs prints the skip reasons, and the assertion turns a silent skip
+      # into a red build. `set -o pipefail` is load-bearing: without it `tee`
+      # would swallow a pytest failure. Developers running the suite locally
+      # without lua5.1 are unaffected -- this lives in CI only.
+      - name: Pytest (no skipped tests)
+        run: |
+          set -o pipefail
+          python -m pytest -rs | tee /tmp/pytest.log
+          if grep -qE '[0-9]+ skipped' /tmp/pytest.log; then
+            echo "::error::pytest skipped tests in CI. The suite must be fully covered; see the SKIPPED lines above."
+            exit 1
+          fi
 
   frontend:
     name: frontend (lint + typecheck + build + vitest)
@@ -101,9 +122,17 @@ jobs:
       # ignore list below. The list exists solely because fastapi==0.115.0 caps
       # starlette below 0.39, and every fixed starlette release (0.40.0 through
       # 1.3.1) needs a FastAPI upgrade. These are transitive findings, not
-      # direct pins, and they stay listed until the FastAPI pin is raised --
-      # each one is a real, dated, removable entry rather than a blanket waiver.
-      # A new advisory in any other package fails the job immediately.
+      # direct pins. A new advisory in any other package fails the job
+      # immediately.
+      #
+      # OWNER: the maintainer who bumps `fastapi` in backend/requirements.txt.
+      # TRACKED BY: issue #331. REVIEW BY: 2026-12-27 (90 days from #245).
+      #
+      # The list is version-anchored, not time-anchored: every ID below is a
+      # starlette advisory reachable only through fastapi==0.115.0. Raising
+      # that pin re-fails this gate by construction, so the suppression cannot
+      # silently outlive the reason for it. When #331 lands, delete all seven
+      # entries and this comment together.
       - name: pip-audit (runtime dependencies)
         run: |
           python -m pip_audit -r backend/requirements.txt \
