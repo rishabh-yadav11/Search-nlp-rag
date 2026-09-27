@@ -15,9 +15,11 @@ bearer token issued by `POST /api/auth/login`
 is role-based: `user` (the only role public signup can grant — it is not
 configurable) may use chat; `admin` also has
 analytics read + user management. `/search`, `/facets`, `/analytics/click` and
-the auth endpoints are public. Signup/login are rate-limited per IP (Redis);
-all inputs are validated server-side. Internal machine clients may bypass via
-`X-Service-Token` (config `AUTH_SERVICE_TOKEN`).
+the auth endpoints are public. Signup/login are rate-limited per IP and, for
+login, per submitted address counting failed attempts only (a correct password
+is never rate-limited); all inputs are validated server-side.
+Internal machine clients may authenticate with `X-Service-Token` (config
+`AUTH_SERVICE_TOKEN`) — a scoped, expiring credential, not an open admin grant.
 
 ### Auth endpoints
 
@@ -113,9 +115,18 @@ chart or strip the fence before showing raw markdown.
   not found, `409` duplicate email, `422` input validation, `429` rate limit or
   daily LLM budget reached, `503` LLM/model unavailable.
 - All `GET /search` responses carry `cached`, `latency_ms`, and `note` fields.
-- The internal eval scripts authenticate with an `X-Service-Token` header that
-  acts as an admin. That bypass is for machine-to-machine use only — never
-  expose it in a browser client.
+- The internal eval scripts authenticate with an `X-Service-Token` header. It is
+  a scoped, expiring credential: it may only exercise
+  `AUTH_SERVICE_TOKEN_SCOPE` (default `chat:use`) and stops working
+  `AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS` (default 24h) after it is first seeded. A
+  restart does **not** revive it. To rotate, an admin mints a replacement with
+  `POST /api/auth/service-tokens`, moves consumers onto it, then retires the old
+  one with `POST /api/auth/service-tokens/revoke` and a body of
+  `{"token": "<old value>"}` (an empty body revokes all of them at once — the
+  right move for a suspected leak, the wrong one for a planned rotation, since
+  it would take the replacement down too). A long-running machine client that
+  runs past 24h must be given a rotated value. Never expose it in a browser
+  client.
 
 ---
 
@@ -179,7 +190,7 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 Conversations are stored per authenticated account in SQLite and survive
 restarts; they are purged after `CHAT_RETENTION_DAYS` (180) of inactivity.
 **Every chat request must send `Authorization: Bearer <token>`** (or the
-`X-Service-Token` machine bypass). Conversations are scoped to the account, so
+`X-Service-Token` machine credential). Conversations are scoped to the account, so
 other users can never see or modify them.
 
 ### Identity & session shape
@@ -512,8 +523,17 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
 
 - **Auth**: bearer tokens (7-day expiry, revocable) gate chat, analytics and
   user management; `/search`, `/facets`, `/analytics/click` and the auth
-  endpoints are public. Signup/login are rate-limited per IP via Redis; set
-  `AUTH_SERVICE_TOKEN` to let internal scripts bypass as an admin user.
+  endpoints are public. Signup/login are rate-limited per IP via Redis and login
+  additionally per submitted address, counting failed logins only so the
+  per-address limit cannot be used to lock a known account out. The
+  per-address limit caps the *rate* of attempts on one account, not an
+  attacker's cost — it is checked after the password verify, so being refused
+  is free; the per-IP limit is what bounds cost. When Redis is unreachable
+  these limits fall back to a bounded in-process limiter rather than switching
+  off. A user
+  holds at most `AUTH_MAX_ACTIVE_TOKENS_PER_USER` active tokens; logging in
+  past that revokes the oldest. `AUTH_SERVICE_TOKEN` lets internal scripts
+  authenticate as a scoped, expiring machine user.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
 - **Caching**: `/search` responses are cached (TTL `CACHE_TTL_SECONDS`, default 300s) keyed by effective query + filters. `cached: true` indicates a cache hit. Chat turns are not cached. When Redis is unreachable, the cache degrades to an in-process store so the API keeps working.
