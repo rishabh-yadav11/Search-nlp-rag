@@ -18,7 +18,9 @@ import subprocess
 import sys
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import config as config_module
 from app import main as main_module
@@ -127,7 +129,12 @@ def test_default_allow_list_covers_the_default_route_address(monkeypatch):
 
 
 def test_default_route_address_is_read_from_the_routing_table(monkeypatch):
-    """The probe is a real socket, not a guess: it reports what the kernel picks."""
+    """The probe is a real socket, not a guess: it reports what the kernel picks.
+
+    IPv4 only, and deliberately so. An IPv6 source address cannot be
+    expressed in this allow-list (Starlette compares ``host.split(":")[0]``),
+    so probing for one would only ever yield an entry that can never match.
+    """
     seen: list[tuple] = []
 
     class _Probe:
@@ -147,9 +154,11 @@ def test_default_route_address_is_read_from_the_routing_table(monkeypatch):
             return ("203.0.113.7", 53)
 
     monkeypatch.setattr(config_module.socket, "socket", _Probe)
-    assert _default_route_addresses() == ("203.0.113.7", "203.0.113.7")
+    assert _default_route_addresses() == ("203.0.113.7",)
     assert (socket.AF_INET, socket.SOCK_DGRAM) in seen
     assert ("8.8.8.8", 53) in seen
+    # No IPv6 leg: an IPv6 address could not be matched by the middleware.
+    assert socket.AF_INET6 not in [family for family, _ in seen]
 
 
 def test_default_route_probe_failure_degrades_instead_of_raising(monkeypatch):
@@ -171,44 +180,74 @@ def test_default_route_probe_never_raises_at_import(monkeypatch):
     """No probe failure may escape: this runs while the module is imported.
 
     The route probe is a best-effort nicety, so *any* failure has to cost one
-    allowed host and nothing more. Two paths are pinned here because neither is
-    an OSError, so a narrow ``except OSError`` misses both and the API refuses
-    to boot over a cosmetic detail:
-
-    * a build without IPv6 has no ``socket.AF_INET6`` at all, and reading the
-      attribute outside the guard raises AttributeError;
-    * an unusable address family raises TypeError from ``socket.socket()``.
+    allowed host and nothing more. An unusable address family raises TypeError
+    from ``socket.socket()``, which a narrow ``except OSError`` would miss, and
+    the API would then refuse to boot over a cosmetic detail.
     """
 
-    class NoIPv6:
-        """A socket module without AF_INET6, as on an IPv6-less build.
+    def boom(*args, **kwargs):
+        raise TypeError("AF_INET unavailable in this build")
 
-        Delegates every other attribute to the real socket module, so only the
-        missing constant is simulated and the name probes still work.
-        """
-
-        AF_INET = socket.AF_INET
-        SOCK_DGRAM = socket.SOCK_DGRAM
-
-        def __getattr__(self, name):
-            if name == "AF_INET6":
-                # The one simulated absence. Must raise rather than fall
-                # through, or the fake would hand back the real constant and
-                # the test would pass without exercising anything.
-                raise AttributeError(name)
-            return getattr(socket, name)
-
-        @staticmethod
-        def socket(family, socktype):
-            return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    monkeypatch.setattr(config_module, "socket", NoIPv6())
-    assert _default_route_addresses()  # the IPv4 probe still worked
+    monkeypatch.setattr(config_module.socket, "socket", boom)
+    assert _default_route_addresses() == ()
+    # Still a closed, usable allow-list rather than a raised import.
     assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
         "localhost",
         "127.0.0.1",
         "testserver",
     )
+
+
+def test_ipv6_literals_never_enter_the_allow_list(monkeypatch):
+    """A dual-stack box must not widen the Host check with a truncated IPv6.
+
+    Starlette compares the authority as ``host.split(":")[0]``, so an IPv6
+    literal cannot be matched: ``[::1]`` arrives as ``[``, and an unbracketed
+    ``2001:db8::5`` arrives as ``2001``. Normalising the latter and keeping the
+    result would admit ``2001``, which matches ANY ``2001:*`` Host header --
+    the check failing open on a guessable value, plus a real IPv6 client being
+    400'd. So the literals are dropped at the source instead.
+    """
+
+    class DualStack:
+        """A box whose getaddrinfo returns both an IPv4 and an IPv6 address."""
+
+        AF_INET = socket.AF_INET
+        SOCK_DGRAM = socket.SOCK_DGRAM
+
+        def __getattr__(self, name):
+            return getattr(socket, name)
+
+        @staticmethod
+        def gethostname():
+            return "box"
+
+        @staticmethod
+        def getfqdn():
+            return "box"
+
+        @staticmethod
+        def getaddrinfo(*a, **k):
+            return [
+                (socket.AF_INET, 1, 6, "", ("192.168.1.7", 0)),
+                (socket.AF_INET6, 1, 6, "", ("2001:db8::5", 0, 0, 0)),
+            ]
+
+    monkeypatch.setattr(config_module, "socket", DualStack())
+    hosts = _machine_hosts()
+    assert "192.168.1.7" in hosts, "the IPv4 identity is still found"
+    assert not any(":" in h for h in hosts), f"no IPv6 literal survives: {hosts}"
+    derived = _parse_allowed_hosts(None, config.CORS_ORIGINS + hosts)
+    assert not any(":" in h for h in derived), f"no IPv6 reaches the allow-list: {derived}"
+    # The fail-open itself: a hextet entry would match any 2001:* Host.
+    assert "2001" not in derived
+
+
+@pytest.mark.parametrize("host", ["2001:evil.test", "2001:attacker.example", "2001:anything"])
+def test_truncated_ipv6_hextet_does_not_admit_any_host(host):
+    """No Host under a previously-truncated hextet may be accepted."""
+    r = _client.get("/health", headers={"host": host})
+    assert r.status_code == 400, f"{host} was accepted; the check is failing open"
 
 
 @pytest.mark.parametrize(
@@ -297,6 +336,57 @@ def test_unusable_allow_list_is_rejected_loudly(raw):
     """Better a startup error than a list that matches nothing and 400s the site."""
     with pytest.raises(ValueError):
         _parse_allowed_hosts(raw)
+
+
+@pytest.mark.parametrize("raw", ["a.*.com", "example.*", "*x", "a*.example.com", "*.*.com"])
+def test_malformed_wildcard_is_rejected_at_config_load(raw):
+    """A bad wildcard shape must fail at import, not 500 every request.
+
+    TrustedHostMiddleware asserts on the pattern's shape, but add_middleware
+    only builds the stack on the FIRST REQUEST. So an unvalidated `a.*.com`
+    boots cleanly, logs a healthy-looking allow-list and then turns every
+    request into a 500. The parser is the only place that can catch it.
+    """
+    with pytest.raises(ValueError, match="not a valid wildcard pattern"):
+        _parse_allowed_hosts(raw)
+
+
+def test_leading_wildcard_still_works():
+    """The one shape the middleware supports must keep working."""
+    assert _parse_allowed_hosts("*.example.com") == ("*.example.com",)
+
+
+def test_leading_wildcard_actually_admits_its_subdomain(monkeypatch):
+    """End to end through the real middleware, not just the parser."""
+    hosts = _parse_allowed_hosts("*.example.com")
+    app_under_test = FastAPI()
+    app_under_test.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
+    client = TestClient(app_under_test, raise_server_exceptions=False)
+    assert client.get("/", headers={"host": "api.example.com"}).status_code != 400
+    assert client.get("/", headers={"host": "evil.org"}).status_code == 400
+
+
+@pytest.mark.parametrize("entry", ["[::1]", "2001:db8::5", "::1", "[2001:db8::5]:8001"])
+def test_ipv6_entry_is_rejected_loudly(entry):
+    """An explicit IPv6 entry is refused, not quietly truncated.
+
+    A bracketed literal would sit in the list as dead weight and a bare one
+    would truncate to its first hextet, matching any Host under that prefix --
+    a silent fail-open. Failing at config load says so plainly instead.
+    """
+    with pytest.raises(ValueError, match="IPv6 literal"):
+        _parse_allowed_hosts(entry)
+
+
+def test_ipv6_origin_in_cors_is_filtered_from_the_derived_default():
+    """The self-inflicted edge: a bracketed origin must not become an entry.
+
+    An operator listing an IPv6 origin in CORS_ORIGINS is plausible, and the
+    derived default must not turn that into a dead or fail-open entry.
+    """
+    hosts = _parse_allowed_hosts(None, ("[::1]", "http://localhost:3000"))
+    assert not any(":" in h or h == "[" for h in hosts), f"IPv6 leaked in: {hosts}"
+    assert "localhost" in hosts
 
 
 @pytest.mark.parametrize("raw", ["", "   ", None])
