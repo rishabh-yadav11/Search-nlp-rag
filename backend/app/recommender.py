@@ -42,6 +42,18 @@ SIMILAR_ARTICLES_TTL_SECONDS = 3600  # 1 hour
 USER_RECOMMENDATIONS_TTL_SECONDS = 1800  # 30 minutes
 
 
+def _candidate_pool(limit: int) -> int:
+    """How many candidates a strategy fetches to fill a page of ``limit``.
+
+    The pool is wider than the page on purpose: the hybrid scorer and the
+    exclusion/diversity filters in ``_format_articles`` drop candidates, so a
+    pool of exactly ``limit`` would return a short page. ``RECOMMEND_CANDIDATES_LIMIT``
+    sets that width; a caller asking for more than the pool (the API caps
+    ``limit`` at 20) still gets at least ``limit`` candidates.
+    """
+    return max(limit, config.RECOMMEND_CANDIDATES_LIMIT)
+
+
 async def get_similar_articles(
     article_id: int | str,
     limit: int = config.RECOMMEND_DEFAULT_LIMIT,
@@ -117,7 +129,7 @@ async def get_similar_articles(
             query=int(article_id),  # Use point ID as query for nearest neighbors
             using="dense",  # Collection uses a named 'dense' vector
             query_filter=qfilter,
-            limit=limit * 3,  # Fetch more to apply filters/post-processing
+            limit=_candidate_pool(limit),  # Over-fetch for filters/post-processing
             with_payload=True,
             with_vectors=False,
         )
@@ -207,7 +219,7 @@ async def get_personalized_recommendations(
                         query=int(article_id),
                         using="dense",  # Collection uses a named 'dense' vector
                         query_filter=qfilter,
-                        limit=limit,
+                        limit=_candidate_pool(limit),
                         with_payload=True,
                         with_vectors=False,
                     )
@@ -229,7 +241,7 @@ async def get_personalized_recommendations(
                 pts = await client.query_points(
                     collection_name=config.QDRANT_COLLECTION,
                     query_filter=category_filter,
-                    limit=limit * 2,
+                    limit=_candidate_pool(limit),
                     with_payload=True,
                     with_vectors=False,
                 )
@@ -242,7 +254,7 @@ async def get_personalized_recommendations(
         async def _trending_candidates():
             """Get trending articles."""
             try:
-                trending = await get_trending_articles(limit)
+                trending = await get_trending_articles(_candidate_pool(limit))
                 if not trending:
                     return []
                 ids = [t["article_id"] for t in trending]
@@ -367,7 +379,7 @@ async def get_trending_feed(
         exclude_ids = exclude_ids or []
 
         # Get trending data from Redis
-        trending = await get_trending_articles(limit * 2)
+        trending = await get_trending_articles(_candidate_pool(limit))
         if not trending:
             # Fallback to latest articles
             return await _get_latest_top_stories(limit, exclude_ids)
@@ -439,7 +451,7 @@ async def _get_latest_top_stories(
         # Get recent articles (last 30 days)
         pts, _ = await client.scroll(
             collection_name=config.QDRANT_COLLECTION,
-            limit=limit * 3,
+            limit=_candidate_pool(limit),
             with_payload=True,
             with_vectors=False,
             scroll_filter=qfilter,

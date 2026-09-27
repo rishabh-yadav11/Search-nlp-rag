@@ -554,10 +554,13 @@ class Config:
     RECOMMEND_CATEGORY_WEIGHT = float(os.getenv("RECOMMEND_CATEGORY_WEIGHT", "0.3"))
     RECOMMEND_RECENCY_WEIGHT = float(os.getenv("RECOMMEND_RECENCY_WEIGHT", "0.2"))
     RECOMMEND_POPULARITY_WEIGHT = float(os.getenv("RECOMMEND_POPULARITY_WEIGHT", "0.1"))
-    # User profile decay rate for interaction history (exponential)
-    USER_PROFILE_DECAY_LAMBDA = float(os.getenv("USER_PROFILE_DECAY_LAMBDA", "0.1"))
     USER_INTERACTION_TTL_DAYS = int(os.getenv("USER_INTERACTION_TTL_DAYS", "90"))
     RECOMMEND_DEFAULT_LIMIT = int(os.getenv("RECOMMEND_DEFAULT_LIMIT", "10"))
+    # Width of the candidate pool each recommendation strategy fetches, which
+    # is deliberately wider than the result page so scoring and diversity
+    # post-processing have something to choose from (see _candidate_pool in
+    # app/recommender.py). A request asking for more than this still gets at
+    # least `limit` candidates.
     RECOMMEND_CANDIDATES_LIMIT = int(os.getenv("RECOMMEND_CANDIDATES_LIMIT", "50"))
     # Redis keys for user profiles and interactions
     USER_PROFILE_REDIS_DB = int(os.getenv("USER_PROFILE_REDIS_DB", "2"))
