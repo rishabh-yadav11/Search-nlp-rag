@@ -294,6 +294,41 @@ def test_reaping_the_tombstone_would_resurrect_it(store, monkeypatch):
     )
 
 
+def test_reaping_keeps_a_dead_configured_token_dead(store, monkeypatch):
+    """The exclusion must hold for a configured token that is ALREADY dead.
+
+    The other test opts out of the exclusion to show what deletion costs; this
+    one passes the configured hash, as the reaper does, and requires that a
+    revoked configured token is still revoked afterwards -- the row survives as
+    a tombstone, and presenting it is still a 401. Without the exclusion in
+    the SQL the row is reaped and INSERT OR IGNORE silently hands the credential
+    a fresh lifetime, permanently."""
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-configured")
+
+    async def scenario():
+        await store.ensure_bootstrap_service_token("svc-configured", {"chat:use"}, 3600)
+        await store.revoke_service_token("svc-configured")
+
+        purged = await store.purge_dead_service_tokens(
+            keep_hash=auth.hash_token("svc-configured")
+        )
+        row = await store._fetchone(
+            "SELECT token_hash, revoked_at FROM auth_service_tokens WHERE token_hash = ?",
+            (auth.hash_token("svc-configured"),),
+        )
+        # Nothing was reaped, and the tombstone is still there.
+        assert purged == 0
+        assert row is not None and row["revoked_at"] is not None
+
+        # And presenting it is still a 401, not a silently revived credential.
+        with pytest.raises(HTTPException) as e:
+            await auth.require_auth(_req({"x-service-token": "svc-configured"}))
+        assert e.value.status_code == 401
+        return True
+
+    assert asyncio.run(scenario())
+
 
 def test_token_purge_loop_reaps_both_token_tables(store, monkeypatch):
     """The background reaper must actually drive both purges, and must pass the
