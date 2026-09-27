@@ -326,8 +326,10 @@ app.add_middleware(
 # A host that is missing from ALLOWED_HOSTS answers 400 to every request, which
 # looks like a broken app rather than a config mistake. Log the effective list
 # at import (before anything can fail) so the cause is visible in the worker
-# logs straight away.
-logger.info("TrustedHost allowed hosts: %s", ", ".join(config.ALLOWED_HOSTS))
+# logs straight away. WARNING, not INFO: neither gunicorn nor uvicorn attaches a
+# handler to the root logger, so an INFO record here is silently dropped and the
+# one clue during such an outage would never appear.
+logger.warning("TrustedHost allowed hosts: %s", ", ".join(config.ALLOWED_HOSTS))
 
 app.include_router(health_router)
 app.include_router(auth_module.router)
