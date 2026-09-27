@@ -3845,7 +3845,7 @@ def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkey
         _run(chat_store.close())
 
 
-def test_fail_turn_after_deltas_settles_the_actual_cost(tmp_path, monkeypatch):
+def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tmp_path, monkeypatch):
     """A failure raised OUTSIDE the stream loop must still CHARGE the turn
     (#255) -- this is the `fail_turn` sibling of the mid-stream-failure path.
 
