@@ -316,31 +316,107 @@ def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeyp
     effective = auth._password_bytes(auth._effective_password(pw))
     assert len(effective) <= auth._BCRYPT_MAX_BYTES
     assert hashed.startswith(effective)
- 
- 
+
+
 @pytest.mark.parametrize(
-    "pw",
+    "pw, expected_shortfall",
     [
-        "Passphrase1234" + "a" * 57 + "é" * 20,  # 2-byte char straddles the cut
-        "a" * 70 + "€" * 5,  # 3-byte char
-        "a" * 69 + "\U0001F600" * 5,  # 4-byte char
+        # Boundary case first: byte 72 is a complete ASCII char, so the cut is
+        # exact and nothing is dropped. This is the only kind of case that pins
+        # the cut SIZE -- in the straddle cases below, cutting at 71 or 72 both
+        # discard the same broken character and yield an identical shortfall, so
+        # they cannot detect an off-by-one in the limit.
+        ("a" * 71 + "1", 0),
+        ("Passphrase1234" + "a" * 57 + "é" * 20, 1),  # 2-byte char, cut 1 byte in
+        ("a" * 70 + "€" * 5, 2),  # 3-byte char, cut 2 bytes in
+        ("a" * 69 + "\U0001F600" * 5, 3),  # 4-byte char, cut 3 bytes in
     ],
 )
-def test_effective_password_is_a_byte_prefix_of_what_gets_hashed(pw):
+def test_effective_password_is_a_byte_prefix_of_what_gets_hashed(pw, expected_shortfall):
     """Whatever the character width at the cut, the decoded value is a prefix of
-    the hashed bytes and never longer. A split character is dropped whole, so the
-    shortfall is the number of that character's bytes that fall inside the
-    truncated buffer (1-3, not its full encoded length), and it is only nonzero
-    when the cut actually lands mid-character."""
+    the hashed bytes and never longer, and the shortfall is the EXACT number of
+    that character's bytes left inside the truncated buffer.
+
+    Asserting the exact count (not a 1-3 range) is deliberate: an off-by-one in
+    the cut would change which credentials pass the bootstrap guard, and a range
+    would let that regression pass unnoticed.
+    """
     hashed = auth._password_bytes(pw)
     effective = auth._password_bytes(auth._effective_password(pw))
     assert len(hashed) == auth._BCRYPT_MAX_BYTES
     assert hashed.startswith(effective)
-    shortfall = len(hashed) - len(effective)
-    # each case must genuinely straddle the cut, not sit on a boundary
-    assert shortfall > 0
-    # at most a 4-byte char's lead plus its retained continuations
-    assert shortfall <= 3
+    assert len(hashed) - len(effective) == expected_shortfall
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "a" * 80 + "1",  # the only digit sits past byte 72
+        "Passphrase" + "a" * 62 + "123",  # digits start past byte 72
+    ],
+)
+def test_bootstrap_admin_accepts_digit_past_the_bcrypt_cut(store, monkeypatch, password):
+    """REGRESSION: the letter+digit rule is about the secret the operator
+    configured, not the truncated prefix. Judging it on the prefix refuses a
+    long, usable passphrase whose only digit was appended past byte 72 -- which
+    main accepted and login would authenticate -- and since bootstrap_admin is
+    the only path that can create an admin, that refusal leaves a fresh deploy
+    unadministrable."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
+    monkeypatch.setattr(auth, "store", store)
+
+    asyncio.run(bootstrap_admin())
+
+    admin = asyncio.run(store.get_user_by_email("admin@x.co"))
+    assert admin is not None, "a digit past byte 72 must not block the admin"
+    assert admin.role == "admin"
+    assert auth.verify_password(password, admin.password_hash)
+    # the 72-byte prefix really does lack a digit -- that is the point
+    assert not re.search(r"\d", auth._effective_password(password))
+
+
+def test_bootstrap_admin_refuses_genuinely_composition_free_password(store, monkeypatch, caplog):
+    """The documented residual: composition is still enforced on the whole
+    value, so a password with no letter and no digit at all is refused even
+    though it is long. Judging it on the prefix would only have admitted it."""
+    password = "\U0001F600" * 100
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
+    monkeypatch.setattr(auth, "store", store)
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    assert asyncio.run(store.list_users()) == []
+    joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "letter and a digit" in joined
+
+
+def test_bootstrap_does_not_demand_rotation_for_an_email_rejection(store, monkeypatch, caplog):
+    """A dotless address can never validate, so a rejection on the email axis
+    fires on every worker start forever. Demanding a PASSWORD rotation there
+    would be an unresolvable instruction for a perfectly healthy account: the
+    only real fault is the configured address, which is what the fix must name.
+    """
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@localhost")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "healthy-pass1")
+    monkeypatch.setattr(auth, "store", store)
+    asyncio.run(store.create_user("admin@localhost", "healthy-pass1", "Administrator", role="admin"))
+
+    for _ in range(2):  # every worker start
+        with caplog.at_level(logging.ERROR, logger="auth"):
+            asyncio.run(bootstrap_admin())
+
+    existing = asyncio.run(store.get_user_by_email("admin@localhost"))
+    assert auth.verify_password("healthy-pass1", existing.password_hash)  # untouched
+    joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    assert "Rotate" not in joined, "an email rejection must never demand a password rotation"
+    assert "REJECTED" not in joined
+    # and the remedy must name the address, which is the actual fault
+    assert "AUTH_ADMIN_EMAIL" in joined
+    assert "address" in joined
+    assert len(asyncio.run(store.list_users())) == 1
 
 
 def test_bootstrap_admin_still_blocks_weak_password_despite_truncation(store, monkeypatch):
