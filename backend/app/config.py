@@ -1,7 +1,11 @@
+import logging
 import os
+import socket
 from typing import ClassVar
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -12,6 +16,182 @@ load_dotenv()
 _TORCH_THREADS = int(os.getenv("TORCH_THREADS", "2"))
 os.environ.setdefault("OMP_NUM_THREADS", str(_TORCH_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(_TORCH_THREADS))
+
+# Hostnames the API answers to, enforced by TrustedHostMiddleware (see
+# app/main.py). The allowed entries are compared against the incoming `Host`
+# header with the port already stripped, so every entry is normalised the same
+# way here.
+_DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "testserver")
+
+
+def _normalize_host(entry: str) -> str:
+    """Lowercase a host/origin and drop any scheme and :port suffix.
+
+    Only IPv4 and names. Starlette compares the Host authority as
+    ``headers.get("host", "").split(":")[0]`` — everything before the FIRST
+    colon — so an IPv6 literal cannot be expressed in this allow-list at all: a
+    bracketed ``[::1]`` arrives already split to ``[``, and an unbracketed
+    ``2001:db8::5`` arrives as ``2001``. Keeping the brackets would silently
+    admit an entry that can never match, and truncating to the first hextet
+    would be worse: ``2001`` matches ANY ``2001:*`` Host, turning the check
+    into a fail-open on a guessable header. So IPv6 is excluded by
+    ``_is_ipv6_literal`` at every source instead, and serving an IPv6-only
+    deployment needs a middleware that parses the authority properly.
+    """
+    host = entry.strip().lower().split("://", 1)[-1]
+    return host.partition(":")[0]
+
+
+def _is_ipv6_literal(entry: str) -> bool:
+    """True for an address that a split-on-first-colon Host can never match.
+
+    Both spellings occur in the wild: ``getaddrinfo`` and ``getsockname`` hand
+    back unbracketed literals, while an operator writing ``CORS_ORIGINS`` is
+    likely to bracket them.
+    """
+    host = entry.strip().lower().split("://", 1)[-1]
+    if host.startswith("["):
+        return True
+    return host.count(":") > 1
+
+
+def _machine_hosts() -> tuple[str, ...]:
+    """Hostnames and addresses this box itself answers to.
+
+    Production is same-origin through nginx behind a `server_name _` catch-all
+    vhost that forwards whatever `Host` the client used, and the documented
+    posture leaves CORS_ORIGINS at its localhost default — so neither CORS nor
+    a hardcoded domain covers a site reached by IP or by the box's own name.
+    These are the box's name, the addresses bound to it and its default-route
+    address; without them, every public request 400s. A separately registered
+    public domain still has to be added to ALLOWED_HOSTS by the operator.
+
+    Best effort by design: this runs at import, so a name-resolution failure
+    must degrade to "fewer allowed hosts", never take the whole API down.
+    """
+    hosts: list[str] = []
+    for getter in (socket.gethostname, socket.getfqdn):
+        try:
+            name = getter()
+        except (OSError, ValueError):
+            # Narrow on purpose: gaierror is an OSError and a non-decodable
+            # hostname raises UnicodeDecodeError, which is a ValueError. A
+            # best-effort identity probe that loses one hostname beats refusing
+            # to boot the API.
+            continue
+        if name:
+            hosts.append(name)
+    try:
+        hosts.extend({info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)})
+    except (OSError, ValueError):
+        pass
+    hosts.extend(_default_route_addresses())
+    # IPv6 literals are dropped here rather than in _normalize_host: a hextet
+    # left behind by a later truncation is a silently fail-open entry, so the
+    # literal must never travel as far as normalisation. See _normalize_host.
+    return tuple(h for h in dict.fromkeys(hosts) if h and not _is_ipv6_literal(h))
+
+
+def _default_route_addresses() -> tuple[str, ...]:
+    """The address this box would source outbound traffic from.
+
+    `getaddrinfo(gethostname())` only yields the addresses bound to the box's
+    own name, which on a NAT'd cloud host is the private one — but the site is
+    reached at the public address, and nginx forwards the client's `Host`
+    through (`server_name _;` plus `proxy_set_header Host $host`). Without the
+    public address in the allow-list, every public request answers 400.
+
+    A connected UDP socket sends no packets: it only asks the routing table
+    which source address it would pick. Any failure (no route, a sandboxed
+    import, a missing address family) just means one fewer allowed host, so
+    every step is guarded: this runs at import, and an exception escaping here
+    would take the whole API down, which is strictly worse than a narrower
+    allow-list.
+
+    IPv4 only. An IPv6 source address cannot be put in the allow-list at all
+    (see _normalize_host), so probing for one would only add an entry that
+    could never match.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 53))
+            return (probe.getsockname()[0],)
+    except Exception:
+        # Broad on purpose, and asserted by test so it cannot be narrowed
+        # back: the only contract that matters here is "never raise at
+        # import". No route, a sandboxed socket module and an unusable
+        # address family all cost the same one allowed host.
+        # DEBUG, not WARNING: a box with no default route is unremarkable, so
+        # this would fire once per worker on an ordinary boot and a warning
+        # traceback would be noise. The operator signal that matters is the
+        # effective allow-list main.py logs at startup, which already shows a
+        # public address missing from it.
+        logger.debug("default-route probe failed", exc_info=True)
+        return ()
+
+
+def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Turn the ALLOWED_HOSTS knob into a de-duplicated tuple of hostnames.
+
+    Unset or blank falls back to the local dev/test hosts plus whatever
+    extra_hosts carries (the CORS origins and this box's own identities), so a
+    missing knob keeps localhost, the dev stack, the test client and the real
+    deployment working without ever opening the check. An explicit value
+    replaces that default wholesale: a bare "*" is rejected outright (it would
+    silently disable the check, which is the exact opposite of the knob's
+    purpose) and a value that contains no usable hostname is rejected too,
+    because it would otherwise match nothing and 400 every request with no clue
+    why.
+
+    A wildcard is only accepted in the one shape TrustedHostMiddleware itself
+    supports, a leading ``*.``. Any other placement is rejected HERE rather
+    than left to the middleware, because ``add_middleware`` defers building the
+    middleware stack to the first request: a malformed pattern such as
+    ``a.*.com`` would otherwise boot cleanly, log a healthy-looking allow-list
+    and then turn every single request into a 500 from the middleware's own
+    ``assert``. Failing at config load turns that into a clear message.
+    """
+    if raw is None or not raw.strip():
+        # IPv6 literals are dropped for the same reason as in _machine_hosts: a
+        # truncated hextet would silently widen the allow-list, and a bracketed
+        # one can never match.
+        usable = [h for h in extra_hosts if not _is_ipv6_literal(h)]
+        derived = _DEFAULT_ALLOWED_HOSTS + tuple(_normalize_host(h) for h in usable)
+        return tuple(dict.fromkeys(h for h in derived if h))
+
+    hosts: list[str] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry == "*":
+            raise ValueError(
+                "ALLOWED_HOSTS=* would disable the Host header check entirely; "
+                "list the hostnames the API is reachable as instead"
+            )
+        if "*" in entry and not (entry.startswith("*.") and "*" not in entry[2:]):
+            raise ValueError(
+                f"ALLOWED_HOSTS entry {entry!r} is not a valid wildcard pattern; "
+                "only a leading '*.' (as in '*.example.com') is supported"
+            )
+        if _is_ipv6_literal(entry):
+            # Rejected rather than normalised: a bracketed literal would sit in
+            # the list as dead weight, and a bare one would truncate to its
+            # first hextet and match any Host under that prefix. See
+            # _normalize_host.
+            raise ValueError(
+                f"ALLOWED_HOSTS entry {entry!r} is an IPv6 literal, which this Host "
+                "check cannot match; TrustedHostMiddleware compares the authority "
+                "up to its first colon, so serving an IPv6-only name needs a "
+                "different middleware"
+            )
+        host = _normalize_host(entry)
+        if not host:
+            raise ValueError(f"ALLOWED_HOSTS entry {entry!r} is not a usable hostname")
+        hosts.append(host)
+    if not hosts:
+        raise ValueError("ALLOWED_HOSTS is set but contains no usable hostname")
+    return tuple(dict.fromkeys(hosts))
 
 
 def _env_tristate(name: str) -> bool | None:
@@ -341,6 +521,21 @@ class Config:
         o.strip()
         for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8001").split(",")
         if o.strip()
+    )
+
+    # Hostnames this API answers to, enforced by TrustedHostMiddleware. The
+    # default is derived from CORS_ORIGINS, this box's own name and addresses
+    # (bound ones plus its default-route address), and the local dev/test
+    # hosts, so a site reached by IP or by the box's own name keeps working
+    # with no configuration at all. Set
+    # ALLOWED_HOSTS explicitly (comma separated hostnames) when the API is
+    # reachable under a name none of those cover — a separately registered
+    # public domain, for instance. A wrong value here answers 400 to every
+    # request; the effective list is logged at startup.
+    # Immutable (tuple), like CORS_ORIGINS, so the allow-list can't be mutated
+    # at runtime.
+    ALLOWED_HOSTS: ClassVar[tuple[str, ...]] = _parse_allowed_hosts(
+        os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS + _machine_hosts()
     )
 
 

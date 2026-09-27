@@ -23,6 +23,7 @@ from qdrant_client.models import (
     Prefetch,
     SparseVector,
 )
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 # Import config FIRST so the OMP/MKL thread caps in app.config are set before
 # any inference library (torch/onnxruntime) is imported below.
@@ -295,7 +296,18 @@ async def lifespan(app: FastAPI):
     await health_module_close_redis()
 
 
-app = FastAPI(title="VCCircle New Search", lifespan=lifespan)
+app = FastAPI(
+    title="VCCircle New Search",
+    lifespan=lifespan,
+    # No interactive docs and no published schema, in any environment: those
+    # three routes hand any unauthenticated caller the complete route list, the
+    # request/response models (including the mass-assignable UserPatchIn) and
+    # which routes sit behind which dependency — the reconnaissance step for
+    # probing /users and the admin management endpoints.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -303,6 +315,21 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    # Reject requests whose Host is not one this deployment answers to. The
+    # allow-list comes from config (derived from CORS_ORIGINS by default) and
+    # is validated there, so it can never be silently empty or wildcarded.
+    TrustedHostMiddleware,
+    allowed_hosts=config.ALLOWED_HOSTS,
+)
+
+# A host that is missing from ALLOWED_HOSTS answers 400 to every request, which
+# looks like a broken app rather than a config mistake. Log the effective list
+# at import (before anything can fail) so the cause is visible in the worker
+# logs straight away. WARNING, not INFO: neither gunicorn nor uvicorn attaches a
+# handler to the root logger, so an INFO record here is silently dropped and the
+# one clue during such an outage would never appear.
+logger.warning("TrustedHost allowed hosts: %s", ", ".join(config.ALLOWED_HOSTS))
 
 app.include_router(health_router)
 app.include_router(auth_module.router)
