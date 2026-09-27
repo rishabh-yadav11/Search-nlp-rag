@@ -209,8 +209,9 @@ def _certified_root(tmp_path, domain, *, pair=None):
 
 
 def _broken_cert_root(tmp_path, domain, how):
-    """A letsencrypt root holding a pair nginx or certbot could not actually
-    serve, which is the case "auto" has to refuse."""
+    """A letsencrypt root holding a pair that is not something nginx should be
+    pointed at. `unparseable_cert` and `expired` still keep TLS (see the test
+    that uses them); the rest have no pair to serve and answer "off"."""
     if how == "expired":
         return _certified_root(tmp_path, domain, pair=_expired_pair(domain))
     root = _certified_root(tmp_path, domain)
@@ -509,7 +510,7 @@ def test_auto_mode_falls_back_to_plain_when_there_is_no_certificate(tmp_path):
     missing = str(_missing_cert_root(tmp_path))
     auto = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=missing)
     plain = _rendered(tmp_path, "off", LE_DOMAIN=DOMAIN, LE_ROOT=missing)
-    assert auto == plain, "auto with no readable certificate must render the plain site, byte for byte"
+    assert auto == plain, "auto with no certificate at all must render the plain site, byte for byte"
     assert "listen 443" not in auto, f"a 443 server without a certificate:\n{auto}"
     assert "ssl_" not in auto, f"an ssl_ directive without a certificate:\n{auto}"
 
@@ -594,20 +595,14 @@ def test_tls_mode_refuses_to_render_a_config_for_a_missing_private_key(tmp_path)
     assert expected in proc.stderr, f"the error must name the missing key {expected}:\n{proc.stderr}"
 
 
-@requires_openssl
-@pytest.mark.parametrize(
-    "how",
-    ["no_key", "empty_key", "empty_cert", "unparseable_cert", "expired"],
-)
-def test_auto_mode_refuses_a_certificate_pair_it_cannot_serve(how, tmp_path):
-    """"auto" has to mean usable, not present.
+@pytest.mark.parametrize("how", ["no_key", "empty_key", "empty_cert"])
+def test_auto_mode_refuses_a_pair_that_is_not_there(how, tmp_path):
+    """"auto" has to mean present-and-complete, not just present.
 
-    Every one of these leaves a certificate in place that nginx or certbot
-    cannot actually serve: a half-written pair from an interrupted run, text
-    that is not a certificate, or a leaf that has already expired. Keeping TLS
-    on any of them leaves a site that is broken in a way nobody notices, so
-    the answer has to be plain HTTP -- and because this verdict is only ever a
-    pre-flight, certbot runs next and puts TLS straight back.
+    Each of these is a half-written pair from an interrupted run: a file that
+    nginx would name in a config it cannot load, so there is nothing to serve
+    TLS with. Plain HTTP is the only honest answer, and the loud warning says
+    so.
     """
     root = _broken_cert_root(tmp_path, DOMAIN, how)
     config = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
@@ -616,6 +611,64 @@ def test_auto_mode_refuses_a_certificate_pair_it_cannot_serve(how, tmp_path):
         f"a certificate pair that is {how} must not be rendered as a TLS server:\n{config}"
     )
     assert "return 301 https://" not in config, f"nothing to redirect to:\n{config}"
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root can read any file, so the permission difference cannot be modelled this way",
+)
+def test_a_key_only_its_owner_can_read_still_renders(tmp_path):
+    """certbot writes privkey.pem 0600 root:root, and that is the normal case.
+
+    The pre-emit gate in nginx_site_config runs as whoever invoked the script,
+    while `nginx -t` runs as root. A readability test in the gate therefore
+    refused to emit a config that nginx loads perfectly well -- permanently,
+    because the key stays 0600 forever -- and the error told the operator to
+    run the command they had just run. Existence is the gate's job; what nginx
+    can read is `nginx -t`'s, and it is the gate that rolls back.
+    """
+    root = _certified_root(tmp_path, DOMAIN)
+    key = root / "live" / DOMAIN / "privkey.pem"
+    key.chmod(0o000)
+    try:
+        # The premise, stated as a check: this really is a complete, non-empty
+        # pair that this process cannot read.
+        assert key.is_file() and key.stat().st_size > 0, "the key must be present and non-empty"
+        assert not os.access(key, os.R_OK), (
+            f"the premise needs a key this user cannot read, but {key} is readable"
+        )
+
+        config = _site_config(tmp_path, NGINX_TLS="on", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
+    finally:
+        key.chmod(0o600)
+
+    ports = {port for block in _server_blocks(config) for port in _listen_ports(block)}
+    assert 443 in ports, f"a root-only key must not stop the HTTPS config being written:\n{config}"
+
+
+@requires_openssl
+@pytest.mark.parametrize("how", ["unparseable_cert", "expired"])
+def test_auto_mode_keeps_tls_for_a_pair_that_is_only_unusable(how, tmp_path):
+    """The other half of the rule, and the part that must NOT downgrade.
+
+    These pairs are on disk, non-empty, and complete. What is wrong with them
+    is something only the certificate itself can tell you: text that does not
+    parse, or a notAfter in the past. Answering "off" would strip a live :443
+    server and hand the site back in cleartext -- and `nginx_tls_mode` is
+    reachable from `./setup.sh nginx` and `./setup.sh all`, where no certbot
+    ever runs to put TLS back. A lapsed certificate is a browser warning;
+    `./setup.sh tls` renews it. Refusing to load a bad certificate is `nginx
+    -t`'s job, and run_nginx rolls back when it says no.
+    """
+    root = _broken_cert_root(tmp_path, DOMAIN, how)
+    config = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
+
+    ports = {port for block in _server_blocks(config) for port in _listen_ports(block)}
+    assert 443 in ports, (
+        f"a complete pair that merely cannot be parsed must not cost the site its "
+        f"HTTPS server: {how}\n{config}"
+    )
+    assert "return 301 https://" in config, f"the redirect must stay too:\n{config}"
 
 
 @requires_openssl

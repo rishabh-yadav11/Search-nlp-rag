@@ -20,8 +20,8 @@ LE_ROOT="${LE_ROOT:-/etc/letsencrypt}"
 LE_DOMAIN="${LE_DOMAIN:-}"
 LE_EMAIL="${LE_EMAIL:-}"
 # auto|on|off. "auto" means: TLS once a domain is configured and its
-# certificate is actually usable (see nginx_tls_cert_valid), plain HTTP
-# otherwise.
+# certificate pair is there to be served (see nginx_tls_cert_valid),
+# plain HTTP otherwise.
 NGINX_TLS="${NGINX_TLS:-auto}"
 LE_LIVE="$LE_ROOT/live/$LE_DOMAIN"
 LE_CERT="$LE_LIVE/fullchain.pem"
@@ -422,30 +422,44 @@ nginx_server_name() {
     fi
 }
 
-# True when the certificate pair nginx needs is actually usable. This is the
-# whole meaning of NGINX_TLS=auto, so it has to mean "usable", not "present":
+# True when a certificate pair is there to be served: LE_DOMAIN configured, and
+# both halves present as regular non-empty files. certbot writes exactly
+# fullchain.pem and privkey.pem and nginx reads exactly those, so a directory
+# that exists, or a half-written pair from an interrupted run, is not something
+# to point a live server at.
 #
-#   * both halves, as regular non-empty files. certbot writes exactly
-#     fullchain.pem and privkey.pem and nginx reads exactly those; a directory
-#     that exists, or a half-written pair, is not something to point a live
-#     server at. A config naming an unreadable certificate is rejected by
-#     `nginx -t`, which means the rollback path, which means an outage.
-#   * the leaf not expired, so a stale certificate is re-issued rather than
-#     kept. An expired certificate still loads, so this is not a load-time
-#     failure, but serving one is precisely the broken-TLS state this stage
-#     exists to end -- and answering "off" here is only ever a pre-flight
-#     verdict, because certbot runs immediately afterwards and puts TLS back.
+# Deliberately NOT part of this: whether the invoking user can READ the files,
+# and whether the leaf has expired.
 #
-# Without openssl the expiry cannot be established, so the file test stands
-# alone. Guessing "not valid" there would downgrade a working HTTPS site
-# because a tool is missing, which is the failure this whole check prevents.
+#   * Readability. This runs as the operator, but `nginx -t` runs as root.
+#     certbot writes privkey.pem 0600 root:root, so a readability test here
+#     refuses to emit a config that nginx would load happily -- and then points
+#     the operator at the very command they just ran. `nginx -t` is the
+#     authority on readability, and it is already the gate that rolls back.
+#   * Expiry. A lapsed certificate still loads; nothing breaks. Dropping the
+#     :443 server for one trades a browser warning for cleartext, and this
+#     function is reachable from `./setup.sh nginx` and `./setup.sh all`,
+#     where no certbot ever runs to put TLS back. So a lapsed certificate is
+#     reported by nginx_tls_cert_expired and renewed by `./setup.sh tls` (a
+#     certificate that has already lapsed is "until expiring" to certbot) --
+#     never used as a reason to go quiet on the wire.
 nginx_tls_cert_valid() {
     [ -n "$LE_DOMAIN" ] || return 1
     [ -f "$LE_CERT" ] && [ -s "$LE_CERT" ] || return 1
     [ -f "$LE_KEY" ] && [ -s "$LE_KEY" ] || return 1
-    if have openssl; then
-        openssl x509 -checkend 0 -noout -in "$LE_CERT" >/dev/null 2>&1 || return 1
-    fi
+    return 0
+}
+
+# True when the leaf is past its notAfter. Reporting only: this never feeds
+# nginx_tls_mode, because a lapsed certificate is a warning, not a reason to
+# remove a live HTTPS server. No openssl, no verdict -- the absence of the tool
+# is not evidence of anything.
+nginx_tls_cert_expired() {
+    have openssl || return 1
+    [ -f "$LE_CERT" ] || return 1
+    # -checkend exits non-zero when the certificate HAS expired, so the verdict
+    # is the other way round from what it looks like.
+    openssl x509 -checkend 0 -noout -in "$LE_CERT" >/dev/null 2>&1 && return 1
     return 0
 }
 
@@ -604,24 +618,31 @@ NGINX
 }
 
 # The complete site config on stdout. Refuses to emit a config that points at a
-# certificate that cannot be read: nginx -t would reject it and the reload
-# would fail, so the gate is here, before anything is written.
+# certificate pair that is not there at all: `nginx -t` would reject it and the
+# reload would fail, so the gate is here, before anything is written.
+#
+# Existence and non-emptiness, NOT readability. This gate runs as whoever
+# invoked the script, while `nginx -t` runs as root and certbot writes
+# privkey.pem 0600 root:root, so testing readability here refused to emit a
+# config that nginx loads perfectly well -- and the error told the operator to
+# run the command they had just run. `nginx -t` is the authority on what nginx
+# can read, and it is already the gate that rolls back.
 nginx_site_config() {
     local mode
     mode="$(nginx_tls_mode)"
     if [ "$mode" = "on" ]; then
-        # Both halves, not just the certificate: nginx reads privkey.pem from
-        # the very same config, so a missing key fails `nginx -t` exactly like
-        # a missing certificate does. NGINX_TLS=on is the only way to get here
-        # without nginx_tls_cert_valid having already checked both.
-        if [ ! -r "$LE_CERT" ]; then
-            echo "ERROR: TLS is on but no readable certificate at $LE_CERT." >&2
+        # Both halves: nginx reads privkey.pem from the very same config, so a
+        # missing key fails `nginx -t` exactly like a missing certificate.
+        # NGINX_TLS=on is the only way to get here without nginx_tls_cert_valid
+        # having already checked both.
+        if [ ! -f "$LE_CERT" ] || [ ! -s "$LE_CERT" ]; then
+            echo "ERROR: TLS is on but there is no certificate at $LE_CERT." >&2
             echo "       Get one with: LE_DOMAIN=... LE_EMAIL=... ./setup.sh tls" >&2
             echo "       Or go back to HTTP with: NGINX_TLS=off ./setup.sh nginx" >&2
             return 1
         fi
-        if [ ! -r "$LE_KEY" ]; then
-            echo "ERROR: TLS is on but no readable private key at $LE_KEY." >&2
+        if [ ! -f "$LE_KEY" ] || [ ! -s "$LE_KEY" ]; then
+            echo "ERROR: TLS is on but there is no private key at $LE_KEY." >&2
             echo "       Get one with: LE_DOMAIN=... LE_EMAIL=... ./setup.sh tls" >&2
             echo "       Or go back to HTTP with: NGINX_TLS=off ./setup.sh nginx" >&2
             return 1
@@ -638,16 +659,35 @@ run_nginx() {
     fi
     local mode
     mode="$(nginx_tls_mode)"
-    # A domain configured without a certificate is the silent-plaintext failure
-    # mode this stage exists to prevent, so say so loudly instead of quietly
-    # TLS_BOOTSTRAP=1 marks the deliberate pass-through to plain HTTP that
-    # run_tls makes before certbot runs; that one is not the silent failure.
-    if [ "$mode" = "off" ] && [ -n "$LE_DOMAIN" ] && [ "${TLS_BOOTSTRAP:-0}" != "1" ]; then
-        echo "WARNING: LE_DOMAIN=$LE_DOMAIN is configured but there is no readable" >&2
-        echo "         certificate at $LE_CERT, so this site is being served over" >&2
-        echo "         plain HTTP. Passwords, bearer tokens and chat content will" >&2
-        echo "         cross the wire in cleartext until that file exists." >&2
-        echo "         Fix it with: LE_DOMAIN=$LE_DOMAIN LE_EMAIL=you@example.com ./setup.sh tls" >&2
+    # A domain configured without a certificate pair is the silent-plaintext
+    # failure mode this stage exists to prevent, so say so loudly instead of
+    # quietly serving. TLS_BOOTSTRAP=1 marks the deliberate pass-through to
+    # plain HTTP that run_tls makes before certbot runs; that one is not the
+    # silent failure, and certbot is about to fix it, so both warnings below are
+    # suppressed there.
+    if [ -n "$LE_DOMAIN" ] && [ "${TLS_BOOTSTRAP:-0}" != "1" ]; then
+        if [ "$mode" = "off" ]; then
+            # "no readable certificate" was wrong twice over: readability is
+            # not what this mode is decided on, and the certificate is often
+            # there and merely unusable. Name the pair instead.
+            echo "WARNING: LE_DOMAIN=$LE_DOMAIN is configured but there is no" >&2
+            echo "         certificate and private key at" >&2
+            echo "           $LE_CERT" >&2
+            echo "           $LE_KEY" >&2
+            echo "         so this site is being served over plain HTTP. Passwords," >&2
+            echo "         bearer tokens and chat content will cross the wire in" >&2
+            echo "         cleartext until that pair exists." >&2
+            echo "         Fix it with: LE_DOMAIN=$LE_DOMAIN LE_EMAIL=you@example.com ./setup.sh tls" >&2
+        elif nginx_tls_cert_expired; then
+            # Reporting, not a mode change. The site stays on HTTPS: a lapsed
+            # certificate is a browser warning, and removing the :443 server
+            # over one would trade that warning for cleartext -- on a path
+            # (`./setup.sh nginx`, `./setup.sh all`) where nothing renews it.
+            echo "WARNING: the certificate at $LE_CERT has expired." >&2
+            echo "         The site is still being served over HTTPS, but browsers" >&2
+            echo "         will warn and clients may refuse the connection." >&2
+            echo "         Renew it with: LE_DOMAIN=$LE_DOMAIN LE_EMAIL=you@example.com ./setup.sh tls" >&2
+        fi
     fi
     local tmp
     tmp="$(mktemp)"
