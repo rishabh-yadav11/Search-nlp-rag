@@ -13,6 +13,18 @@ logic is exercised without a live server.
 import pytest
 
 from app import cost_budget
+from app.config import config
+
+
+def test_shipped_default_cap_is_not_disabled():
+    """The cap must be ON by default, and nothing else pins it.
+
+    Every other test sets LLM_DAILY_BUDGET_USD through monkeypatch, so the
+    shipped value itself was unconstrained: restoring the fail-open default of
+    0 (= disabled) left the whole suite green. That default is the live-billing
+    decision the issue made deliberately, so it is asserted here rather than
+    left to a code comment (#255)."""
+    assert config.LLM_DAILY_BUDGET_USD > 0.0
 
 
 def test_disabled_budget_reserve_is_a_noop(monkeypatch):

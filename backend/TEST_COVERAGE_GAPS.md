@@ -1,6 +1,6 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app`: **652 passed**, 86% overall (3652 statements,
+Measured with `pytest --cov=app`: **657 passed**, 86% overall (3652 statements,
 504 missed). This is a checklist of functions and branches that have **no test
 coverage**, grouped by module. The figures re-measured here are the ones for
 the modules this change rewrote (`app/cost_budget.py`, `app/chat.py`); the rest
@@ -303,7 +303,7 @@ without a failure.
 
 ## app/chat.py — 92% (covered by tests/test_chat.py)
 
-Measured: 841 statements, 70 missed. The entries below are the branches this
+Measured: 848 statements, 67 missed. The entries below are the branches this
 change added or re-pointed at. The residual is mostly
 `_prepare_multi_entity_turn` (lines 1330-1440), which this change did not
 touch. The missed lines inside the code this change added or edited are all
@@ -373,38 +373,44 @@ accounting is #295's audit. Do not read this section as 100%.
       down.**
 - [x] **`_require_store` uninitialized → 503** (line 1644) and
       **`_validate_question` too-long → 400** (line 1653).
-- [x] **`send_message_stream` nudge retry branches** (lines 2072-2083,
-      2104-2113): a dataviz/ranking nudge that succeeds appends its block and
+- [x] **`send_message_stream` nudge retry branches** (lines 2091-2100,
+      2123-2132): a dataviz/ranking nudge that succeeds appends its block and
       sums tokens; a failed nudge (`LLMUnavailableError`) keeps the streamed
       answer. **`error` SSE handlers**: mid-stream `LLMUnavailableError` →
-      "LLM temporarily unavailable" (line 2151); `BudgetExceeded` → "Daily AI
-      budget reached" (line 2154); `BudgetUnavailable` → "AI budget service
-      unavailable" (line 2160); unexpected exceptions → "Something went wrong"
-      (line 2164), never a 500. The `BudgetUnavailable` handler is still
+      "LLM temporarily unavailable" (line 2181); `BudgetExceeded` → "Daily AI
+      budget reached" (line 2184); `BudgetUnavailable` → "AI budget service
+      unavailable" (line 2190); unexpected exceptions → "Something went wrong"
+      (line 2194), never a 500. The `BudgetUnavailable` handler is still
       reachable: `reserve()` is called at the pre-call gate and by each nudge,
       and a rejection there propagates before a byte is delivered. **ERROR PATH —
       LLMUnavailableError / BudgetExceeded / BudgetUnavailable mid-stream.**
-- [x] **`retention_loop`** (lines 2177-2185): a failing purge is swallowed and
+- [x] **`retention_loop`** (lines 2207-2215): a failing purge is swallowed and
       the loop keeps ticking; the next tick purges expired conversations.
 
 Added by this change, all exercised end to end through the HTTP handlers:
 
-- [x] **the ONE abort rule** (lines 1904-1945): the client's disconnect is
+- [x] **the ONE abort rule** (lines 1927-1968): the client's disconnect is
       checked at every gate, and a turn that streamed nothing is rolled back
       while a turn that streamed anything is PERSISTED with
       `[answer truncated]` and `aborted=True` — the server's history can never
       contradict what is already on the client's screen. `persist_truncated_turn`
-      (lines 1880-1902) is the single writer for every partial turn, including
+      (lines 1903-1924) is the single writer for every partial turn, including
       the mid-stream-failure path.
 - [x] **a billed call is charged, never refunded, on a disconnect** (lines
-      2000-2014, 2072-2083, 2104-2113): a disconnect in the gate-to-first-delta
+      2049-2064, 2091-2100, 2123-2132): a disconnect in the gate-to-first-delta
       window settles the hold at the estimate the gate took it at, and the two
       post-stream checks pass the finished stream's real cost instead of
       storing the turn as free. A mid-stream FAILURE after deltas is charged
-      too (lines 2027-2053): `chunks` is non-empty there, so the provider billed
-      those tokens even though usage was never reported. A turn that made no
-      billed call at all still releases.
-- [x] **a delivered answer survives a failed settle** (lines 1836-1869,
+      too (lines 2036-2069): `chunks` is non-empty there, so the provider
+      billed those tokens even though usage was never reported, and
+      `fail_turn` (lines 1970-1997) applies the same rule. A zero COMPUTED
+      cost is not evidence that nothing was spent — `stream_answer` appends a
+      truthy zero-token result when a provider sends no usage chunk — so every
+      abandon site routes through `billed_usd` (lines 1841-1857) and the
+      completed path floors at the estimate (lines 2145-2156); otherwise a
+      provider that never reports usage would leave the cap inert and every
+      turn free. A turn that made no billed call at all still releases.
+- [x] **a delivered answer survives a failed settle** (lines 1859-1892,
       1481-1502): once deltas are on the wire, or the LLM has already answered,
       an unreachable counter no longer converts a complete answer into a
       truncated `aborted` row plus an `error` event.
