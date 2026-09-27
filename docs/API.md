@@ -1,9 +1,9 @@
 # VCCircle New Search — API Reference
 
 Base URL: `http://<host>/` — the public entrypoint is nginx on port 80 (plain
-HTTP; the app is not served on an internal port). The FastAPI backend is also
-reachable directly at `http://<host>:8001` on the host itself for internal/dev
-use only, not for public access.
+HTTP; the app is not served on an internal port). The FastAPI backend binds
+`127.0.0.1:8001` on the host itself, so it answers on `http://127.0.0.1:8001`
+for internal/dev use only and is not reachable from off-host at all.
 
 Most endpoints return JSON. Search and analytics are `GET`; chat is JSON or
 Server-Sent-Events (SSE).
