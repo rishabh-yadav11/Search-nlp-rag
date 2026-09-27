@@ -116,11 +116,16 @@ chart or strip the fence before showing raw markdown.
 - All `GET /search` responses carry `cached`, `latency_ms`, and `note` fields.
 - The internal eval scripts authenticate with an `X-Service-Token` header. It is
   a scoped, expiring credential: it may only exercise
-  `AUTH_SERVICE_TOKEN_SCOPE` (default `chat:use`), stops working
-  `AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS` (default 24h) after it is first seeded,
-  and can be revoked outright — an admin mints a new one with
-  `POST /api/auth/service-tokens` and kills the old ones with
-  `POST /api/auth/service-tokens/revoke`. Never expose it in a browser client.
+  `AUTH_SERVICE_TOKEN_SCOPE` (default `chat:use`) and stops working
+  `AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS` (default 24h) after it is first seeded. A
+  restart does **not** revive it. To rotate, an admin mints a replacement with
+  `POST /api/auth/service-tokens`, moves consumers onto it, then retires the old
+  one with `POST /api/auth/service-tokens/revoke` and a body of
+  `{"token": "<old value>"}` (an empty body revokes all of them at once — the
+  right move for a suspected leak, the wrong one for a planned rotation, since
+  it would take the replacement down too). A long-running machine client that
+  runs past 24h must be given a rotated value. Never expose it in a browser
+  client.
 
 ---
 

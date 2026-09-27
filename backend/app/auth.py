@@ -179,6 +179,12 @@ class ServiceTokenOut(BaseModel):
     expires_at: float
 
 
+class ServiceTokenRevokeIn(BaseModel):
+    """Which service token to retire. Omit ``token`` to revoke all of them."""
+
+    token: str = ""
+
+
 def validate_email(email: str) -> str:
     """Normalize + validate an email address, raising 422 on any violation."""
     email = (email or "").strip().lower()
@@ -539,10 +545,14 @@ class AuthStore:
         revoking the row (or changing the env value, which hashes differently
         and seeds a new row) so the next call seeds a fresh lifetime.
         """
+        # One timestamp for both columns: reading the clock twice would make
+        # created_at and expires_at disagree by however long the two calls
+        # straddle, which is not a lifetime anyone can reason about.
+        created = _now()
         await self._db.execute(
             "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
             " VALUES (?, ?, ?, ?, NULL)",
-            (hash_token(raw), ",".join(sorted(scope)), _now(), _now() + ttl_seconds),
+            (hash_token(raw), ",".join(sorted(scope)), created, created + ttl_seconds),
         )
         await self._db.commit()
 
@@ -836,9 +846,16 @@ _local_rate_counters: dict[str, tuple[int, float]] = {}
 # Hard bound on the fallback's memory. An attacker who can make us fail over to
 # the fallback can also mint unlimited distinct keys (one per source address,
 # one per submitted address), so an unbounded dict would be a memory-exhaustion
-# DoS in place of the rate-limit DoS it replaced. Past the cap the oldest
-# entries are dropped, which is a deliberate trade: those buckets forget
-# themselves, but the process stays inside its memory budget.
+# DoS in place of the rate-limit DoS it replaced.
+#
+# What is dropped when the cap is hit matters, because the buckets this dict
+# holds are not all equal. An attacker flooding it with fresh source addresses
+# must not be able to use the pressure to discard the per-ACCOUNT bucket they
+# are actually being throttled by. So the dict is kept in least-recently-used
+# order (every hit re-inserts its key at the tail) and eviction drops from the
+# head, which makes an actively-attacked bucket the last thing to go rather
+# than the first. Windows that have already closed are reclaimed first,
+# before any live bucket is touched -- they are worth nothing to anyone.
 _LOCAL_RATE_MAX_KEYS = 20_000
 
 
@@ -854,13 +871,28 @@ def _local_rate_hit(key: str, window: int) -> int:
         if now >= expiry:
             count, expiry = 0, now + window
         count += 1
+        # Re-insert rather than update: deleting first moves the key to the
+        # tail, which is what makes this least-recently-used ordered.
+        _local_rate_counters.pop(key, None)
         _local_rate_counters[key] = (count, expiry)
         if len(_local_rate_counters) > _LOCAL_RATE_MAX_KEYS:
-            # Insertion-ordered dict: the head is the oldest key opened. Drop
-            # from the head until back under the cap.
-            for stale in list(_local_rate_counters)[: len(_local_rate_counters) - _LOCAL_RATE_MAX_KEYS]:
-                del _local_rate_counters[stale]
+            _prune_local_rate_counters(now)
         return count
+
+
+def _prune_local_rate_counters(now: float) -> None:
+    """Bring the fallback dict back under ``_LOCAL_RATE_MAX_KEYS``. Call with
+    the lock held."""
+    for key in [k for k, (_, expiry) in _local_rate_counters.items() if expiry <= now]:
+        del _local_rate_counters[key]
+    over = len(_local_rate_counters) - _LOCAL_RATE_MAX_KEYS
+    if over <= 0:
+        return
+    # Head first == least recently used first. A live bucket is only ever
+    # dropped when the attacker is generating keys faster than the windows
+    # close, and then only in recency order.
+    for stale in list(_local_rate_counters)[:over]:
+        del _local_rate_counters[stale]
 
 
 def reset_local_rate_limits() -> None:
@@ -1255,14 +1287,27 @@ async def mint_service_token(
 
 @router.post("/service-tokens/revoke")
 async def revoke_service_tokens(
+    body: ServiceTokenRevokeIn,
     request: Request,
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("users:manage")),
 ):
-    """Revoke every live service token, the other half of rotation. Returns the
-    number revoked."""
-    n = await _require_auth_store().revoke_all_service_tokens()
-    return {"revoked": n}
+    """Revoke a service token: the other half of rotation.
+
+    Pass the token to retire and only that one dies, which is what makes
+    rotation safe to perform in the order an operator naturally reaches for --
+    mint the replacement, move consumers onto it, *then* kill the old one,
+    without a window in which no credential works. With no ``token`` in the
+    body every live service token is revoked at once; that is the right move
+    for a suspected leak, and the wrong one for a planned rotation because it
+    would take down the replacement minted moments earlier.
+    """
+    s = _require_auth_store()
+    if body.token:
+        await s.revoke_service_token(body.token)
+        return {"revoked": 1}
+    return {"revoked": await s.revoke_all_service_tokens()}
+
 
 
 async def bootstrap_admin() -> None:
