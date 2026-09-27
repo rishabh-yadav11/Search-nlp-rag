@@ -399,7 +399,7 @@ Coverage: query-intent/date parsing, facet filter construction, effective intent
 runs are cancelled (concurrency group keyed on workflow + ref) and every job has
 an explicit timeout.
 
-1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest` (790 tests). Installs the *full* `requirements.txt`, not a slimmed test set: `app/main.py`, `app/encoders.py` and `app/reranker.py` import `torch`/`transformers`/`fastembed` at module scope, so a reduced set would not import. There is deliberately **no `ruff format` gate** — `ruff format --check` already reports 47 pre-existing offenders, so enforcing it would mean reformatting the tree, not CI.
+1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest` (790 tests). Installs the *full* `requirements.txt`, not a slimmed test set: `app/main.py`, `app/encoders.py` and `app/reranker.py` import `torch`/`transformers`/`fastembed` at module scope, so a reduced set would not import. There is deliberately **no `ruff format` gate** — `ruff format --check` already reports 50 pre-existing offenders (19 of 69 files are clean), so enforcing it would mean reformatting the tree, not CI.
 2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest, 127 tests).
 3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan over full history (pinned to 8.28.0, download SHA-256 verified).
 
