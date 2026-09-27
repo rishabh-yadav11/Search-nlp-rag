@@ -24,6 +24,7 @@ neutralises `load_dotenv` itself for the duration of each reload.
 import asyncio
 import importlib
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -215,6 +216,36 @@ def test_unset_boolean_knob_keeps_its_default(monkeypatch):
     assert _env_bool("SOME_TOGGLE", True) is True
     monkeypatch.setenv("SOME_TOGGLE", "   ")
     assert _env_bool("SOME_TOGGLE", False) is False
+
+
+def test_truthy_spellings_match_the_setup_sh_auth_trust_warning():
+    """The accepted true-spellings must be exactly the ones setup.sh warns about.
+
+    `setup.sh services` prints a security warning when
+    `AUTH_TRUST_X_FORWARDED_FOR` is a forced True, and its regex comment claims
+    it covers "exactly the ones config._env_tristate reads". That claim is
+    load-bearing: a forced True leaves X-Forwarded-For trusted from ANY peer
+    (issue #245), and the setup warning is the only signal for it. So if the
+    truthy set is widened and the regex is not, a value like `=y` forces header
+    trust with no warning anywhere.
+    """
+    setup_sh = (Path(__file__).resolve().parents[2] / "setup.sh").read_text()
+    regex = re.search(
+        r"grep -qiE '\^AUTH_TRUST_X_FORWARDED_FOR=(?P<body>[^']*)'", setup_sh
+    )
+    assert regex is not None, (
+        "could not find the AUTH_TRUST_X_FORWARDED_FOR spellings regex in setup.sh; "
+        "this guard must be updated to follow it"
+    )
+    # Strip the POSIX character classes first: their names ("space") sit inside
+    # brackets and are not spellings.
+    body = re.sub(r"\[\[:?[^]]*\]\]", "", regex.group("body"))
+    guarded = frozenset(re.findall(r"[a-z0-9]+", body))
+    assert config_module._TRUE_VALUES == guarded, (
+        f"config accepts {sorted(config_module._TRUE_VALUES)} as true but setup.sh "
+        f"only warns for {sorted(guarded)}; a value in the difference forces "
+        "X-Forwarded-For trust from any peer with no setup warning"
+    )
 
 
 @pytest.mark.parametrize("knob", BOOL_KNOBS)

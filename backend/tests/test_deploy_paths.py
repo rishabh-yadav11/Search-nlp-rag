@@ -34,6 +34,11 @@ APPS = (
 KNOWN_HOME_LITERAL = re.compile(r"home/ubuntu")
 GENERIC_HOME = re.compile(r"/(?:home/[a-z_][a-z0-9_-]*|Users/[A-Za-z0-9_.-]+)/")
 
+# A shipped `su <user> <group>` directive pinning one operator's account. Kept
+# as a separate pattern because, unlike the two above, it names an identity
+# rather than a path and has no leading slash to key off.
+SU_DIRECTIVE = re.compile(r"^\s*su\s+(?!deploy-user\b)\S+")
+
 # A quoted string starting at the filesystem root, i.e. a path baked into the
 # source instead of derived from the file's own location.
 QUOTED_ABSOLUTE_PATH = re.compile(r"""["'`](/[^"'`\n]*)["'`]""")
@@ -77,6 +82,7 @@ def _node_apps(node: str) -> list[dict[str, Any]]:
     [
         (KNOWN_HOME_LITERAL, "the previously shipped /home/ubuntu path"),
         (GENERIC_HOME, "an absolute per-user home directory"),
+        (SU_DIRECTIVE, "a logrotate `su` directive pinning one operator's account"),
     ],
 )
 def test_no_hardcoded_home_directory_in_shipped_deploy_config(

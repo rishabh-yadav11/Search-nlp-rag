@@ -44,10 +44,19 @@ def _data_path(name: str, default: str) -> str:
     return str(path)
 
 
-# Spellings accepted for a boolean env knob. Deliberately shared with
-# _env_tristate so there is one answer to "what does `yes` mean" in this module.
-_TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on", "t"})
-_FALSE_VALUES = frozenset({"0", "false", "no", "n", "off", "f"})
+# Spellings accepted for a boolean env knob. Shared with _env_tristate so there
+# is one answer to "what does `yes` mean" in this module.
+#
+# These two sets are deliberately EXACTLY the spellings setup.sh's
+# AUTH_TRUST_X_FORWARDED_FOR guard greps for (the `(1|true|yes|on)` regex whose
+# comment claims it covers "exactly the ones config._env_tristate reads as a
+# forced True"). That claim is load-bearing: a forced True is the setting that
+# leaves X-Forwarded-For trusted from ANY peer, and the setup warning is the
+# only signal for it. Widening these sets without widening that regex would make
+# a value like `AUTH_TRUST_X_FORWARDED_FOR=y` force header trust with no warning
+# at all, so the two must change together or not at all.
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def _env_bool(name: str, default: bool) -> bool:
