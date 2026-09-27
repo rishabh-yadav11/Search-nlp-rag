@@ -2,12 +2,16 @@
 // prints its verdicts as JSON, so the backend's cross-language contract test
 // (test_dataviz_contract.py) can compare them with parse_dataviz's own.
 //
-//   node dataviz_harness.mjs <datavizContract.ts> [corpus.json]
+//   node [--experimental-strip-types] dataviz_harness.mjs <datavizContract.ts> [corpus.json]
 //
 // The module is IMPORTED, not copied or re-typed, so this measures the code the
 // browser actually runs. It is a plain .mjs with a dynamic import of a .ts
 // file, which node handles with its built-in TypeScript support — no bundler,
 // no node_modules, no JSX (the validator has none by design).
+//
+// The caller probes the node version before getting here and passes
+// --experimental-strip-types on the versions that need it to opt in (the flag
+// is accepted as a no-op on newer ones, so it is always safe to pass).
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
@@ -19,6 +23,7 @@ if (!modulePath || !corpusPath) {
 
 const contract = await import(pathToFileURL(modulePath).href)
 const corpus = JSON.parse(readFileSync(corpusPath, 'utf8'))
+
 // The coerced value of every non-missing cell in the value column: the exact
 // numbers a chart would plot. Comparing the whole list, not just the first
 // cell, is what catches the two sides reading the SAME cell differently
@@ -40,8 +45,9 @@ for (const fixture of corpus.fixtures) {
   results[fixture.name] = {
     // The full match extent and the captured payload, not just the verdict: a
     // whitespace class that the two regex engines read differently changes how
-    // much text a side swallows after the closing fence without changing
-    // whether the block is accepted, so a verdict-only comparison cannot see it.
+    // much text a side swallows without changing whether the block is accepted,
+    // so a verdict-only comparison cannot see it. The offsets are JavaScript
+    // string indices, i.e. UTF-16 code units; the Python side converts to match.
     span: m ? [m.index, m.index + m[0].length] : null,
     captured: m ? m[1] : null,
     accept: !!block,
@@ -71,4 +77,3 @@ process.stdout.write(JSON.stringify({
   missing_value_tokens: tokens instanceof Set ? [...tokens] : Object.keys(tokens),
   results,
 }))
-
