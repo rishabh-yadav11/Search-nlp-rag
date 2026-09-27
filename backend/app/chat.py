@@ -801,6 +801,15 @@ _NUMERIC_LITERAL_RE = re.compile(_NUMERIC_LITERAL_SRC)
 # cell carrying a BOM was "missing" in the browser and a real value on the
 # server. ASCII whitespace is named explicitly so both sides trim the same
 # characters; the contract test probes them one by one.
+# The nesting depth past which a payload is treated as malformed, and it is
+# deliberately SMALL: json.loads raises RecursionError on a deeply nested
+# payload a couple of thousand levels down, and this walk must refuse those
+# before reaching a depth that would overflow the stack walking them -- the same
+# way a bare RecursionError escaping into a 500 would. The frontend walks with
+# the same limit, because V8's JSON.parse tolerates far more nesting than either
+# side should.
+_MAX_JSON_DEPTH = 100
+
 _TRIM_CHARS = " \t\n\r\v\f"
 _TRIM_SRC = "\\t\\n\\v\\f\\r "
 
@@ -829,6 +838,37 @@ def _reject_json_constant(name: str) -> None:
     anywhere -- in a cell, but equally in ``title`` or any other key -- was kept
     by the server and unparseable in the browser (#267)."""
     raise ValueError(f"not a JSON literal: {name}")
+
+
+def _has_non_finite(value: object, depth: int = 0) -> bool:
+    """True when ANY number in the payload is not a finite double, or when the
+    payload nests deeper than _MAX_JSON_DEPTH.
+
+    A non-finite number disqualifies the block wherever it sits, not only in the
+    value column: a LABEL cell reading 1e999 survives every value check but can
+    never be displayed, and a literal too wide for Python's int conversion
+    (>4300 digits) makes json.loads raise and reject the whole payload while
+    JSON.parse quietly yields Infinity. The frontend applies the identical walk,
+    so both sides reject the same blocks rather than the server dropping one the
+    browser happily renders (#267)."""
+    if depth > _MAX_JSON_DEPTH:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        # A number counts only if it is a finite double, which is exactly what
+        # the other side sees: an integer literal too wide for a double is a
+        # perfectly good Python int but reaches JavaScript as Infinity, so
+        # math.isfinite raising OverflowError means "not finite" here too.
+        try:
+            return not math.isfinite(value)
+        except OverflowError:
+            return True
+    if isinstance(value, dict):
+        return any(_has_non_finite(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_non_finite(v, depth + 1) for v in value)
+    return False
 
 def _as_float(v: object) -> float | None:
     """Coerce a cell to a FINITE float, else None.
@@ -934,9 +974,17 @@ def parse_dataviz(text: str) -> dict | None:
         return None
     try:
         data = json.loads(m.group(1), parse_constant=_reject_json_constant)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: a payload nested thousands deep makes json.loads raise
+        # rather than return, and it used to escape parse_dataviz, then
+        # _sanitize_dataviz and _finalize_answer, failing the whole request
+        # instead of dropping the block (the same shape as the OverflowError
+        # above). JSON.parse tolerates that depth, so refusing it is also what
+        # keeps the two sides agreeing.
         return None
     if not isinstance(data, dict):
+        return None
+    if _has_non_finite(data):
         return None
     columns = data.get("columns")
     rows = data.get("rows")
@@ -1176,8 +1224,14 @@ def _parse_dataviz_with_view(text: str, view: str) -> dict | None:
     if not m:
         return None
     try:
-        data = json.loads(m.group(1))
-    except (ValueError, TypeError):
+        # The SAME rules as parse_dataviz: a second, laxer copy of this load
+        # used to let a block through that the re-validation below then
+        # rejected, so _apply_requested_view silently returned it unpinned and
+        # a user who asked for a bar chart quietly lost it (#267).
+        data = json.loads(m.group(1), parse_constant=_reject_json_constant)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if _has_non_finite(data):
         return None
     if not isinstance(data, dict):
         return None
