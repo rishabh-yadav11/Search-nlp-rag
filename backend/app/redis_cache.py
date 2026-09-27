@@ -3,6 +3,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 
 import redis
 import redis.asyncio as aioredis
@@ -169,13 +170,48 @@ class HybridCache:
         self._mem_bytes += cost
         self._evict_mem()
 
+    async def delete_keys(self, keys: Iterable[str]) -> None:
+        """Delete an explicitly known set of keys (Redis + memory).
+
+        This is the request-path invalidation primitive. Cost is O(len(keys))
+        -- a single ``DEL`` for the whole set -- because the caller derives the
+        key set from what it actually wrote instead of asking Redis to find it.
+        Use it whenever the key space of a cache entry is small and knowable,
+        which is the case for every per-user cache in this service.
+
+        In-process entries are dropped first so the fallback cache cannot serve
+        a stale value even if the Redis round trip then fails.
+        """
+        targets = set(keys)
+        if not targets:
+            return
+        for key in list(self._mem.keys()):
+            if key in targets:
+                self._drop_mem(key)
+        client, is_new = self._acquire()
+        try:
+            await client.delete(*targets)
+        except _REDIS_ERRORS as exc:
+            if is_new:
+                await self._discard(client)
+            self._degraded(exc)
+        else:
+            await self._publish(client)
+
     async def delete_prefix(self, prefix: str) -> None:
         """Delete every cached key starting with ``prefix`` (Redis + memory).
 
-        Used to invalidate per-user recommendation caches (whose keys embed a
-        varying limit component, e.g. ``recommend:for-you:{user}:{limit}``)
-        when a new interaction lands. Scans Redis and also purges any matching
-        in-process entries so the fallback cache does not return stale data.
+        O(keyspace): implemented with ``SCAN``, which walks *every* key in the
+        database server-side and filters by ``MATCH`` only after the fact. The
+        cost therefore scales with the total number of keys in the cache, not
+        with the number that match, and a single call can walk the whole
+        keyspace.
+
+        NEVER call this from a request handler. It has no production call site
+        left for exactly that reason: the per-user recommendation cache that
+        used to be purged this way has a knowable key set and is invalidated
+        with :meth:`delete_keys` instead. Reserve this for maintenance and
+        teardown paths, where a one-off full walk is acceptable.
         """
         for key in list(self._mem.keys()):
             if key.startswith(prefix):
