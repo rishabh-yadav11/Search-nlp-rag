@@ -270,8 +270,9 @@ def _effective_password(password: str) -> str:
     that character's bytes that fell inside the truncated buffer (1-3, depending
     on its width and where the cut landed) rather than by a fixed amount. That
     only ever drops a non-ASCII tail, so it cannot turn a policy-failing value
-    into a passing one; the min-length and letter+digit rules are decided
-    entirely by the retained prefix.
+    into a passing one. The min-length rule is decided entirely by the retained
+    prefix; the letter+digit rule is decided on the whole configured value (see
+    ``_bootstrap_password_rejection``).
     """
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
 
