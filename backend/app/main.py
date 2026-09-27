@@ -994,9 +994,10 @@ def retrieval_config_fingerprint() -> str:
 
     The digest covers two groups:
 
-    * the retrieval/rerank pipeline (query expansion, candidate depth, rerank
-      model/backend, collection, entity boost) — read by
-      ``retrieve_and_rerank``, and therefore affecting the ``search:`` entry
+    * the retrieval/rerank pipeline (the dense and sparse embedding models,
+      collection, query expansion, candidate depth, rerank model/backend, and
+      the entity boost) — read by ``retrieve_and_rerank`` and
+      ``hybrid_search``, and therefore affecting the ``search:`` entry
       transitively as well;
     * the post-retrieval /search shaping (click boost and its thresholds,
       diversity and its parameters, and the ``ASK_MIN_SCORE`` relevance gate
@@ -1012,6 +1013,8 @@ def retrieval_config_fingerprint() -> str:
     """
     values = {
         "qdrant_collection": config.QDRANT_COLLECTION,
+        "embed_model": config.EMBED_MODEL,
+        "sparse_model": config.SPARSE_MODEL,
         "rerank_backend": config.RERANK_BACKEND,
         "rerank_model": config.RERANK_MODEL,
         "rerank_candidates": config.RERANK_CANDIDATES,

@@ -19,6 +19,8 @@ from app.redis_cache import HybridCache
 # cached article set, so each one must be part of the cache key.
 RETRIEVAL_KNOBS = [
     "QDRANT_COLLECTION",
+    "EMBED_MODEL",
+    "SPARSE_MODEL",
     "RERANK_BACKEND",
     "RERANK_MODEL",
     "RERANK_CANDIDATES",
