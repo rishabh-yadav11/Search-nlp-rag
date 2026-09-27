@@ -21,14 +21,17 @@ it was written, which meant adding a fourth option to the ecosystem file left th
 suite green -- the exact drift it exists to catch.
 
 For the value comparison, options that take no value (a bare flag such as
-`--watch`) are checked for presence only, and a value that is a shell variable is
-resolved through setup.sh's own `${VAR:-default}` declaration so that
-`--max-memory-restart "$API_MAX_MEMORY"` compares equal to the literal `"5G"`.
+`--watch`, which the backslash-continued `pm2 start` line leaves followed by
+the `'\n'` token shlex emits for the continuation) are checked for presence
+only, and a value that is a shell variable is resolved through setup.sh's own
+`${VAR:-default}` declaration so that `--max-memory-restart "$API_MAX_MEMORY"`
+compares equal to the literal `"5G"`.
 """
 from __future__ import annotations
 
 import re
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -95,8 +98,11 @@ def _setup_sh_start_options(app_name: str) -> dict[str, str | None]:
             continue
         flag = tokens[i]
         nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-        if nxt.startswith("--"):
-            # A bare flag with no value, e.g. `--watch`.
+        if nxt.startswith("--") or not nxt.strip():
+            # A bare flag with no value, e.g. `--watch`. The next token is
+            # either the following `--flag` or the `'\n'` that shlex leaves
+            # behind for the backslash line continuation the `pm2 start` line
+            # uses; a whitespace-only token is not a value.
             options[flag] = None
             i += 1
         else:
@@ -136,6 +142,28 @@ def _ecosystem_options(app_name: str) -> dict[str, str]:
     return options
 
 
+def _missing_options(
+    declared: dict[str, str], passed: dict[str, str | None]
+) -> list[str]:
+    """Options `ecosystem.config.js` declares that setup.sh does not pass."""
+    return sorted(set(declared) - set(passed))
+
+
+def _mismatched_values(
+    declared: dict[str, str], passed: dict[str, str | None]
+) -> dict[str, tuple[str, str | None]]:
+    """Declared options setup.sh passes, but with a different value.
+
+    A valueless flag (value None on the setup.sh side) is not a mismatch: it
+    carries no value to disagree about, so presence alone is the check.
+    """
+    return {
+        flag: (declared[flag], passed[flag])
+        for flag in declared
+        if flag in passed and passed[flag] is not None and declared[flag] != passed[flag]
+    }
+
+
 @pytest.mark.parametrize("app_name", APP_NAMES)
 def test_setup_sh_passes_every_ecosystem_process_option(app_name: str) -> None:
     """No process option in ecosystem.config.js may be absent from setup.sh.
@@ -148,7 +176,7 @@ def test_setup_sh_passes_every_ecosystem_process_option(app_name: str) -> None:
     assert declared, f"no process options parsed for {app_name} in ecosystem.config.js"
 
     passed = _setup_sh_start_options(app_name)
-    missing = sorted(set(declared) - set(passed))
+    missing = _missing_options(declared, passed)
     assert not missing, (
         f"ecosystem.config.js declares {missing} for {app_name} but setup.sh's "
         f"`pm2 start --name {app_name}` does not pass them, so `./setup.sh services` "
@@ -168,15 +196,118 @@ def test_setup_sh_process_options_match_ecosystem_values(app_name: str) -> None:
     declared = _ecosystem_options(app_name)
     passed = _setup_sh_start_options(app_name)
 
-    mismatched = {
-        flag: (declared[flag], passed[flag])
-        for flag in declared
-        if flag in passed and passed[flag] is not None and declared[flag] != passed[flag]
-    }
+    mismatched = _mismatched_values(declared, passed)
     assert not mismatched, (
         f"{app_name} process options disagree between ecosystem.config.js and "
         f"setup.sh (ecosystem, setup.sh): {mismatched}"
     )
+
+
+def _write_deploy_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, setup_line: str, declared: str
+) -> None:
+    """Point the drift guard at a synthetic `setup.sh` + `ecosystem.config.js`.
+
+    `setup_line` is the continuation-joined body of the app's `pm2 start` line
+    (everything after `--name demo-app`), and `declared` is the app's option
+    lines as they appear in `ecosystem.config.js`.
+    """
+    setup = tmp_path / "setup.sh"
+    setup.write_text(
+        '#!/usr/bin/env bash\n'
+        'API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"\n'
+        "\n"
+        "run_services() {\n"
+        f"    pm2 start ./demo-app \\\n        --name demo-app \\\n{setup_line}"
+        "        -- app.main:app)\n"
+        "}\n"
+    )
+    ecosystem = tmp_path / "ecosystem.config.js"
+    ecosystem.write_text(
+        "module.exports = {\n"
+        "  apps: [\n"
+        "    {\n"
+        '      name: "demo-app",\n'
+        '      cwd: "/srv/demo",\n'
+        '      script: "demo-app",\n'
+        '      args: "app.main:app",\n'
+        f"{declared}"
+        "    },\n"
+        "  ],\n"
+        "};\n"
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SETUP_SH", setup)
+    monkeypatch.setattr(sys.modules[__name__], "ECOSYSTEM_JS", ecosystem)
+
+
+_WATCH_ECOSYSTEM = "      watch: true,\n"
+_WATCH_SETUP = "        --watch \\\n"
+
+
+def test_a_bare_flag_on_both_sides_is_compared_by_presence_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valueless flag declared and passed alike is agreement, not drift.
+
+    The `pm2 start` lines are backslash-continued, so `shlex.split` emits a
+    stray `'\n'` token after every flag. Reading that token as the flag's
+    value made a consistent `--watch` pairing fail as
+    `{'--watch': ('true', '\\n')}`, blocking a legitimate future change.
+    """
+    _write_deploy_files(
+        tmp_path,
+        monkeypatch,
+        setup_line=_WATCH_SETUP,
+        declared=_WATCH_ECOSYSTEM,
+    )
+
+    declared = _ecosystem_options("demo-app")
+    passed = _setup_sh_start_options("demo-app")
+
+    assert passed["--watch"] is None, (
+        f"a bare `--watch` must parse as valueless, not with value {passed['--watch']!r}"
+    )
+    assert _missing_options(declared, passed) == []
+    assert _mismatched_values(declared, passed) == {}
+
+
+def test_a_bare_flag_declared_but_not_passed_is_still_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Presence-only comparison must not mean a bare flag is never checked.
+
+    If `--watch` is declared in `ecosystem.config.js` but absent from the
+    `pm2 start` line, `./setup.sh services` drops it from the running process,
+    so the missing option must still be reported.
+    """
+    _write_deploy_files(
+        tmp_path, monkeypatch, setup_line="", declared=_WATCH_ECOSYSTEM
+    )
+
+    assert _missing_options(
+        _ecosystem_options("demo-app"), _setup_sh_start_options("demo-app")
+    ) == ["--watch"]
+
+
+def test_a_bare_flag_passed_but_not_declared_is_not_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard is one-directional: extra setup.sh options are not reported.
+
+    An option pm2 accepts on the CLI but the ecosystem file omits is not a
+    silent-drop regression -- the process still gets it -- so it is out of
+    scope here, and pinning that keeps the direction of the guard explicit.
+    """
+    _write_deploy_files(
+        tmp_path, monkeypatch, setup_line=_WATCH_SETUP, declared=""
+    )
+
+    declared = _ecosystem_options("demo-app")
+    passed = _setup_sh_start_options("demo-app")
+
+    assert passed["--watch"] is None
+    assert _missing_options(declared, passed) == []
+    assert _mismatched_values(declared, passed) == {}
 
 
 def test_both_startup_paths_bind_the_api_to_loopback() -> None:
