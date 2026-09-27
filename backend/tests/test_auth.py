@@ -309,13 +309,32 @@ def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeyp
     admin = asyncio.run(store.get_user_by_email("admin@x.co"))
     assert admin is not None and admin.role == "admin"
     assert auth.verify_password(pw, admin.password_hash)
-    # The effective credential is what actually authenticates: the retained
-    # prefix of what gets hashed (a split multi-byte char leaves the decoded
-    # string a byte shorter, never longer).
+    # The effective credential is what actually authenticates: a byte-prefix of
+    # what gets hashed. A split multi-byte char drops the whole character, so
+    # the decoded string is shorter, never longer.
     hashed = auth._password_bytes(pw)
     effective = auth._password_bytes(auth._effective_password(pw))
     assert len(effective) <= auth._BCRYPT_MAX_BYTES
     assert hashed.startswith(effective)
+ 
+ 
+@pytest.mark.parametrize(
+    "pw",
+    [
+        "Passphrase1234" + "a" * 57 + "é" * 20,  # 2-byte char straddles the cut
+        "a" * 70 + "€" * 5,  # 3-byte char
+        "a" * 69 + "\U0001F600" * 5,  # 4-byte char
+    ],
+)
+def test_effective_password_is_a_byte_prefix_of_what_gets_hashed(pw):
+    """Whatever the character width at the cut, the decoded value is a prefix of
+    the hashed bytes and never longer: a split character is dropped whole, so
+    the shortfall is that character's full encoded length, not a fixed byte."""
+    hashed = auth._password_bytes(pw)
+    effective = auth._password_bytes(auth._effective_password(pw))
+    assert len(hashed) == auth._BCRYPT_MAX_BYTES
+    assert hashed.startswith(effective)
+    assert 0 <= len(hashed) - len(effective) <= 4
 
 
 def test_bootstrap_admin_still_blocks_weak_password_despite_truncation(store, monkeypatch):

@@ -220,12 +220,14 @@ def _effective_password(password: str) -> str:
     ``decode("utf-8", "ignore")`` matters: a multi-byte character can straddle
     the 72-byte cut, and a strict decode would raise UnicodeDecodeError during
     startup -- the fail-dead this check exists to avoid. The result is therefore
-    *at most* ``_BCRYPT_MAX_BYTES`` bytes and is a prefix of what
-    ``_password_bytes`` hashes: when the cut splits a character, the orphaned
-    lead byte is dropped along with the partial character, so the decoded string
-    can be one byte shorter. That only ever drops a non-ASCII tail byte, so it
-    cannot turn a policy-failing value into a passing one; the min-length and
-    letter+digit rules are decided entirely by the retained prefix.
+    *at most* ``_BCRYPT_MAX_BYTES`` bytes and a byte-prefix of what
+    ``_password_bytes`` hashes: when the cut splits a character, the partial
+    character AND its orphaned lead bytes are both dropped, so the decoded
+    string is shorter by that character's full encoded length (1 byte for a
+    2-byte character, 2 for a 3-byte one, 3 for a 4-byte one). That only ever
+    drops a non-ASCII tail, so it cannot turn a policy-failing value into a
+    passing one; the min-length and letter+digit rules are decided entirely by
+    the retained prefix.
     """
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
 
