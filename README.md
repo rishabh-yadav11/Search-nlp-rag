@@ -338,7 +338,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` / `INR_PER_USD` | `0.25` / `1.50` / `95.60` | USD per 1M input/output tokens (for cost display); USD→INR rate |
 | `LLM_DAILY_BUDGET_USD` | `5.0` | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value. Each turn reserves this cap atomically before a billed call, so concurrent turns contend for the same budget. Set `0` to deliberately disable the cap (see `app/cost_budget.py`) |
 | `LLM_CALL_RESERVE_USD` | `0.05` | Budget a turn holds against the cap before each billed LLM call; the hold is reconciled to the real cost when the turn ends (see `app/cost_budget.py`) |
-| `COST_RESERVATION_TTL_SECONDS` | `900` | Lifetime of an unsettled budget reservation, so a crashed turn's hold lapses instead of eating budget forever |
+| `COST_RESERVATION_TTL_SECONDS` | `900` | Lifetime of an unsettled budget reservation. A hold that is never settled (a crashed turn) is swept after this long and **charged** to the day's spend at its reserved amount, not refunded — it leaves the holds table at the same time, so one crash can neither be free spend nor starve the cap until the day rolls over |
 | `CHAT_MAX_HISTORY_CHARS` | `24000` | Total character budget for conversation history fed to the LLM; oldest turns are dropped once exceeded (see `CHAT_MAX_HISTORY_TURNS`) |
 | `LLM_TIMEOUT_SECONDS` / `LLM_MAX_RETRIES` / `LLM_RETRY_BACKOFF` | `60` / `2` / `1.0` | LLM per-call timeout, retry count, exponential-backoff base |
 | `TOP_K` / `ASK_MIN_SCORE` | `8` / `0.2` | Default result count; chat retrieval threshold |
