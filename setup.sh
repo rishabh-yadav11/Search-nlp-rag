@@ -273,7 +273,7 @@ run_services() {
     (cd backend && pm2 start "$VENV_PY" \
         --name vccircle-backend -- -m gunicorn \
         -k uvicorn.workers.UvicornWorker \
-        --workers "$GUNICORN_WORKERS" --bind "0.0.0.0:$API_PORT" \
+        --workers "$GUNICORN_WORKERS" --bind "127.0.0.1:$API_PORT" \
         --timeout 120 app.main:app)
     wait_http "http://localhost:$API_PORT/health"
 

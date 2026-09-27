@@ -219,7 +219,7 @@ Backups are local to the host — ship `backend/backups/` (plus `data/articles.j
 ```bash
 cd backend
 ./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 4 \
-  --bind 0.0.0.0:8001 --timeout 120 app.main:app
+  --bind 127.0.0.1:8001 --timeout 120 app.main:app
 ```
 
 | Endpoint                                       | Description                                                 |
@@ -304,7 +304,8 @@ server {
 Hardening I baked into `setup.sh`:
 
 - **Services bound to localhost** — Qdrant and Redis are published as `127.0.0.1:PORT:PORT` so they're only reachable from the host (nginx, the API), never the internet. If containers were previously created with public binds, `setup.sh backend` detects it and recreates them with the local bind (Qdrant's data volume is preserved).
-- **Host firewall** — I recommend UFW: allow only SSH and HTTP, deny the rest:
+- **API bound to localhost** — gunicorn binds `127.0.0.1:$API_PORT`, not `0.0.0.0`. Search, chat, auth and analytics are reachable only through nginx on `:80`; nothing on `:8001` answers from off-host even if every firewall below is skipped. `setup.sh services` and `ecosystem.config.js` both use the loopback bind, and the nginx config writes `proxy_pass http://127.0.0.1:$API_PORT` to match.
+- **Host firewall — MANDATORY** — a loopback bind is the primary control, not the only one: it does nothing for the ports that *are* meant to be public, and it fails open the moment someone re-binds a service to a wildcard address. UFW is a required deployment step, not a recommendation. Allow only SSH and HTTP, deny the rest:
 
 ```bash
 sudo ufw default deny incoming
