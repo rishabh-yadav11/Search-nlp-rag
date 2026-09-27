@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
@@ -18,7 +18,6 @@ import { describe, expect, it } from 'vitest'
  */
 
 const FRONTEND_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
-const APP_DIR = join(FRONTEND_ROOT, 'app')
 
 /** The modules that are allowed to own each helper. */
 const OWNERS: Record<string, string[]> = {
@@ -31,6 +30,8 @@ const OWNERS: Record<string, string[]> = {
   formatDate: ['app/lib/format.ts'],
   formatArticleDate: ['app/lib/format.ts'],
   formatEpochRelative: ['app/lib/format.ts'],
+  formatEpochDateTime: ['app/lib/format.ts'],
+  formatClockTime: ['app/lib/format.ts'],
   formatCost: ['app/lib/format.ts'],
   logout: ['app/lib/auth.ts'],
 }
@@ -50,29 +51,40 @@ const RETIRED: Record<string, string> = {
 }
 
 /**
- * Source files to scan: every app module, the edge middleware, and the
- * root-level TypeScript config. Test files are excluded — they legitimately
- * name these helpers and the env var in order to assert on them, so including
- * them would make the scan assert against itself.
+ * Source files to scan: every TypeScript module under the frontend root —
+ * `app/`, `middleware.ts`, the configs, and any directory added later.
+ *
+ * The whole root, not just `app/`: walking only `app/` means the first person
+ * to add a top-level `lib/` or `hooks/` directory silently moves every rule in
+ * this file out of coverage, and a guard that quietly stops guarding is worse
+ * than no guard. Build output and dependencies are skipped, as are test
+ * files — they legitimately name these helpers and the env var in order to
+ * assert on them, so including them would make the scan assert against itself.
  */
+const SKIP_DIRS: Record<string, true> = {
+  node_modules: true,
+  '.next': true,
+  out: true,
+  coverage: true,
+  dist: true,
+}
+
 function sourceFiles(): string[] {
-  const found: string[] = [join(FRONTEND_ROOT, 'middleware.ts')]
+  const found: string[] = []
 
   const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir)) {
-      const full = join(dir, entry)
-      if (statSync(full).isDirectory()) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (SKIP_DIRS[entry.name] === true || entry.name.startsWith('.')) continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
         walk(full)
-      } else if (/\.tsx?$/.test(entry) && !/\.test\.tsx?$/.test(entry)) {
+      } else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) {
         found.push(full)
       }
     }
   }
 
-  walk(APP_DIR)
-  for (const entry of readdirSync(FRONTEND_ROOT)) {
-    if (/^(next|vitest)\.(config\.)?tsx?$/.test(entry)) found.push(join(FRONTEND_ROOT, entry))
-  }
+  walk(FRONTEND_ROOT)
   return found.map((f) => relative(FRONTEND_ROOT, f).split(sep).join('/'))
 }
 
@@ -87,34 +99,65 @@ function codeOf(source: string): string {
 }
 
 /**
- * True when `code` DECLARES `name` — `function name`, `const name =`, with or
- * without `export`. A call or an import of the same name is not a
- * declaration, which is the distinction that lets a page consume a shared
- * helper without tripping the owner checks.
+ * True when `code` DECLARES `name`, in any of the forms a duplicate could
+ * take: a `function` or `class` declaration, a `const`/`let`/`var` binding, or
+ * an object-literal property or method. Matching only `function` and `const`
+ * was a hole — `let usd = …` and `const helpers = { isSafeRedirect() {} }`
+ * both slipped past the owner and retired-name checks.
+ *
+ * A call or an import of the same name is NOT a declaration, which is what
+ * lets a page consume a shared helper without tripping these checks: an
+ * imported name is followed by `}` or `,` in a list, never by `:` or `(`.
+ *
+ * `allowObjectLiteral` must be false for `.tsx` files. In TSX, `= {` is not
+ * reliably an object literal: `<Card value={formatCost(x)} />` is textually
+ * identical to `const x = {formatCost() {}}`, and JSX expression containers
+ * (`{formatCost(x)}`) are indistinguishable from object literals too. In a
+ * plain `.ts` module there is no JSX, so the same pattern is safe there.
  */
-function declares(code: string, name: string): boolean {
-  return new RegExp(
-    `(?:^|\\n)\\s*(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\b|(?:^|\\n)\\s*(?:export\\s+)?const\\s+${name}\\b`,
-  ).test(code)
+function declares(code: string, name: string, allowObjectLiteral: boolean): boolean {
+  const alternatives = [
+    // function name( / async function name( / export default function name(
+    `(?:^|[\\n{;])\\s*(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${name}\\b`,
+    // class name
+    `(?:^|[\\n{;])\\s*(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?class\\s+${name}\\b`,
+    // const/let/var name
+    `(?:^|[\\n{;])\\s*(?:export\\s+)?(?:const|let|var)\\s+${name}\\b`,
+  ]
+  if (allowObjectLiteral) {
+    // Object-literal member: `= { name(` , `return { name: … }`.
+    alternatives.push(`(?:=|,|\\(|return|:)\\s*\\{\\s*(?:async\\s+)?${name}\\s*[:(]`)
+  }
+  return new RegExp(alternatives.join('|')).test(code)
 }
 
 /** Every frontend module, scanned once. */
 const files = sourceFiles()
 
 describe('shared layer — exactly one definition of each helper', () => {
-  it('scans the app tree, the middleware and the root config', () => {
-    // A silently-empty scan would make every assertion below vacuously true.
+  it('scans every module under the frontend root', () => {
+    // A silently-empty or wrongly-scoped scan would make every assertion in
+    // this file vacuously true, so pin both the breadth and the exclusions.
     expect(files).toContain('middleware.ts')
     expect(files).toContain('app/page.tsx')
     expect(files).toContain('app/lib/auth.ts')
+    // Root-level config and setup files, not just `app/`: the walk must not
+    // stop at the first directory.
     expect(files).toContain('next.config.ts')
-    expect(files.some((f) => f.endsWith('.test.ts') || f.endsWith('.test.tsx'))).toBe(false)
+    expect(files).toContain('vitest.config.ts')
+    expect(files).toContain('vitest.setup.ts')
+    // Exclusions: test files (they name these helpers on purpose) and
+    // dependency/build directories.
+    expect(files.some((f) => /\.test\.tsx?$/.test(f))).toBe(false)
+    expect(files.some((f) => f.includes('node_modules') || f.startsWith('.'))).toBe(false)
     expect(files.length).toBeGreaterThan(10)
   })
 
   for (const [helper, owners] of Object.entries(OWNERS)) {
     it(`declares ${helper} in exactly one module`, () => {
-      const declaredIn = files.filter((file) => declares(codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8')), helper))
+      const declaredIn = files.filter((file) =>
+        declares(codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8')), helper, !file.endsWith('.tsx')),
+      )
       expect(declaredIn).toEqual(owners)
     })
   }
@@ -124,7 +167,9 @@ describe('shared layer — exactly one definition of each helper', () => {
       // The issue's own symptom was a helper that came back under a different
       // name, which the owner list above cannot see: `usd` is not `formatCost`
       // and declares nothing that looks like one.
-      const revived = files.filter((file) => declares(codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8')), retired))
+      const revived = files.filter((file) =>
+        declares(codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8')), retired, !file.endsWith('.tsx')),
+      )
       expect(revived, `${retired}() was replaced by ${RETIRED[retired]}`).toEqual([])
     })
   }
@@ -161,18 +206,29 @@ describe('shared layer — pages consume the shared helpers', () => {
   const read = (file: string): string => codeOf(readFileSync(join(FRONTEND_ROOT, file), 'utf8'))
 
   it('no page renders a date or timestamp with its own locale call', () => {
-    // The analytics dashboard's `toLocaleString([], { dateStyle: 'short',
-    // timeStyle: 'short' })` is the duplicate this issue initially left
-    // behind: a bare `[]` locale, so the server and the browser can disagree.
-    // The pattern keys on the DATE options or on a bare locale, not on
-    // `toLocaleString` itself, because grouping a token count or a message
-    // count through that call is number formatting and is not what this
-    // invariant is about — see the call sites in `app/chat/page.tsx` and
-    // `app/analytics/dashboard/page.tsx`.
-    const DATE_RENDERING =
-      /\.toLocale(?:Date|Time)?String\(\s*(?:\[\]|''|"")|dateStyle|timeStyle|timeZone|\byear:|\bmonth:|\bday:|\bhour:/i
+    // Three shapes, because one regex cannot separate dates from number
+    // grouping — and the FIRST shape must not require a locale argument. The
+    // exact regression issue #301 was filed about is
+    // `new Date(article.published_date).toLocaleDateString()`, with NO
+    // argument at all, so a rule keyed on `[]`/`''` locale missed it.
+    const DATE_RENDERING: RegExp[] = [
+      // `toLocaleDateString` / `toLocaleTimeString` are date-only callees by
+      // definition, whatever they are passed.
+      /\.toLocale(?:Date|Time)String\(/,
+      // A locale call handed an options bag naming a date field. The date
+      // options are what make this a date: `maximumFractionDigits` in
+      // `app/chat/DataViz.tsx` is number formatting and must not match.
+      /\.toLocale\w*String\([^)]*\{[^)]*\b(?:dateStyle|timeStyle|timeZone|weekday|era|year|month|day|hour|minute|second)\s*:/,
+      // A Date expression feeding any locale call, e.g. the dashboard's
+      // `new Date(ts * 1000).toLocaleString([], { dateStyle: … })`.
+      /new Date\([^)]*\)[\s\S]{0,120}?\.toLocale\w*String\(/,
+      // A bare `[]` / `''` locale, which takes the viewer's locale.
+      /\.toLocale\w*String\(\s*(?:\[\]|''|"")/,
+    ]
+    // `Number(n).toLocaleString()` and `tokens.toLocaleString()` group a
+    // number; they are not date rendering and are not in scope for this rule.
     const offenders = files.filter(
-      (file) => !OWNERS.formatDate.includes(file) && DATE_RENDERING.test(read(file)),
+      (file) => !OWNERS.formatDate.includes(file) && DATE_RENDERING.some((re) => re.test(read(file))),
     )
     expect(offenders).toEqual([])
   })
@@ -196,18 +252,28 @@ describe('shared layer — pages consume the shared helpers', () => {
     expect(offenders).toEqual([])
   })
 
-  it('wires the shared logout() to the log-out button, not just its name', () => {
+  it('wires the shared logout() to every log-out button', () => {
     // Asserting the substring `logout` is worthless on its own: every one of
     // these files matches it through a CSS class (`topbar-logout`,
     // `chat-logout`, `dash-logout`) and through the import alone, so it would
     // stay green with the handler re-pointed at something local. Require the
     // button to actually be wired to it.
+    //
+    // The rule is "these three pages must be wired", NOT "exactly these three
+    // pages exist". Pinning the list exhaustively would go red the first time
+    // someone correctly adds a page with a log-out button — a guard that
+    // punishes correct behaviour is a guard that gets deleted, and then the
+    // regression it was written for comes straight back. So this is a
+    // superset check: the known pages are required, further ones are allowed,
+    // and every page found must be wired to the shared helper.
     const pagesWithLogoutButton = files.filter((file) => /Log out|Log Out/.test(read(file)))
-    expect(pagesWithLogoutButton.sort()).toEqual([
-      'app/analytics/dashboard/page.tsx',
-      'app/chat/page.tsx',
-      'app/page.tsx',
-    ])
+    expect(pagesWithLogoutButton).toEqual(
+      expect.arrayContaining([
+        'app/analytics/dashboard/page.tsx',
+        'app/chat/page.tsx',
+        'app/page.tsx',
+      ]),
+    )
     for (const file of pagesWithLogoutButton) {
       expect(read(file), `${file} must wire its log-out button to logout()`).toMatch(
         /onClick=\{logout\}/,

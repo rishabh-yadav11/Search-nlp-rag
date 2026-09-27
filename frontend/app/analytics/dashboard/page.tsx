@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { API_BASE, authHeaders, getMe, getToken, logout, redirectToLogin } from '../../lib/auth'
-import { formatCost, formatEpochDateTime } from '../../lib/format'
+import { formatClockTime, formatCost, formatEpochDateTime } from '../../lib/format'
 
 interface Summary {
   searches_total: number
@@ -257,7 +257,7 @@ export default function AnalyticsDashboardPage() {
       if ('degraded' in sFeed || 'degraded' in cFeed) {
         setUpdated('Unavailable — live figures are missing, not zero')
       } else {
-        setUpdated(`Updated ${new Date().toLocaleTimeString()}`)
+        setUpdated(`Updated ${formatClockTime(Date.now())}`)
       }
     } catch (e) {
       // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.

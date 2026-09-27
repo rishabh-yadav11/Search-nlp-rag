@@ -155,3 +155,18 @@ export function formatEpochDateTime(ts: number): string {
     timeZone: 'UTC',
   })
 }
+
+/**
+ * A clock-time label for an instant given in milliseconds ("10:13 PM"). Fixed
+ * locale and zone, like every other renderer here, so the "Updated ..." line
+ * on the analytics dashboard cannot render differently on the server than in
+ * the browser. That line previously called `new Date().toLocaleTimeString()`,
+ * which takes both the viewer's locale and the viewer's zone.
+ */
+export function formatClockTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: 'UTC',
+  })
+}

@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { formatArticleDate, formatCost, formatDate, formatEpochRelative, parseLocalDate } from './format'
+import {
+  formatArticleDate,
+  formatClockTime,
+  formatCost,
+  formatDate,
+  formatEpochDateTime,
+  formatEpochRelative,
+  parseLocalDate,
+} from './format'
 
 /**
  * These are the assertions the per-page copies could not make, because there
@@ -128,6 +136,45 @@ describe('formatEpochRelative — labels a UNIX timestamp in seconds', () => {
   it('falls back to the same absolute label the article cards use', () => {
     const old = Math.floor(Date.UTC(2024, 4, 1) / 1000)
     expect(formatEpochRelative(old)).toBe('May 1, 2024')
+  })
+})
+
+describe('formatEpochDateTime — a pinned absolute instant', () => {
+  it('renders a known timestamp to a known string', () => {
+    // A literal, not a re-derivation: the dashboard test delegates to this
+    // function, so if this assertion also called the function it would only be
+    // comparing the page against itself. The literal is what makes the
+    // locale/zone pinning an actual guarantee rather than an intention.
+    expect(formatEpochDateTime(1_700_000_000)).toBe('Nov 14, 2023, 10:13 PM')
+  })
+
+  it('does not shift with the ambient timezone', () => {
+    // 10:13 PM UTC is 02:13 the next day in Los Angeles and 23:13 the same day
+    // in Tokyo. Pinning `timeZone: 'UTC'` is what makes the value above true
+    // everywhere, so the pin is asserted rather than assumed.
+    const previousTz = process.env.TZ
+    try {
+      process.env.TZ = 'America/Los_Angeles'
+      expect(formatEpochDateTime(1_700_000_000)).toBe('Nov 14, 2023, 10:13 PM')
+    } finally {
+      process.env.TZ = previousTz
+    }
+  })
+})
+
+describe('formatClockTime — a pinned clock label', () => {
+  it('renders a known instant to a known string', () => {
+    expect(formatClockTime(1_700_000_000_000)).toBe('10:13 PM')
+  })
+
+  it('does not shift with the ambient timezone', () => {
+    const previousTz = process.env.TZ
+    try {
+      process.env.TZ = 'Asia/Tokyo'
+      expect(formatClockTime(1_700_000_000_000)).toBe('10:13 PM')
+    } finally {
+      process.env.TZ = previousTz
+    }
   })
 })
 
