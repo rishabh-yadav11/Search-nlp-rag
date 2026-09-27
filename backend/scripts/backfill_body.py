@@ -19,15 +19,19 @@ Usage:
     python scripts/backfill_body.py
 """
 import asyncio
+import os
 import sys
 import time
-from datetime import UTC, datetime
 
 import aiomysql
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointVectors, SparseVector
 from update_index import EXTERNAL_URL_SQL, record_from_row
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _common import log, make_pool
 
 from app.config import config
 from app.index_text import compose_sparse_text
@@ -36,23 +40,6 @@ from app.index_text import compose_sparse_text
 # keeps the working set in memory small even on huge collections/tables.
 PAGE_SIZE = 500
 VECTOR_BATCH = 100
-
-
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
-
-
-async def make_pool():
-    return await aiomysql.create_pool(
-        host=config.MYSQL_HOST,
-        port=config.MYSQL_PORT,
-        user=config.MYSQL_USER,
-        password=config.MYSQL_PASSWORD,
-        db=config.MYSQL_DATABASE,
-        autocommit=True,
-        minsize=1,
-        maxsize=3,
-    )
 
 
 async def fetch_records_by_ids(pool, ids: list[int]) -> dict[int, dict]:
