@@ -575,12 +575,20 @@ class AuthStore:
             expires_at=float(row["expires_at"]),
         )
 
-    async def revoke_service_token(self, raw: str) -> None:
-        await self._db.execute(
+    async def revoke_service_token(self, raw: str) -> int:
+        """Soft-revoke one machine credential. Marks the row rather than
+        deleting it: the row is the tombstone that stops a revoked configured
+        value being re-seeded with a fresh lifetime (see
+        ``ensure_bootstrap_service_token``). Returns how many rows it actually
+        revoked -- 0 for an unknown or already-revoked token, which the caller
+        must be able to see rather than assume.
+        """
+        cur = await self._db.execute(
             "UPDATE auth_service_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
             (_now(), hash_token(raw)),
         )
         await self._db.commit()
+        return cur.rowcount
 
     async def revoke_all_service_tokens(self) -> int:
         cur = await self._db.execute(
@@ -1059,7 +1067,11 @@ async def require_auth(request: Request) -> None:
             request.state.scope = record.scope
             request.state.service_token = service
             return
-        logger.warning("auth: a service token was presented but is unknown, revoked or expired")
+        # Debug, not warning: this sits on an unauthenticated, attacker-
+        # controlled path, so at warning level any anonymous request with a
+        # junk header writes a log line -- a log-flood amplifier, and a steady
+        # stream of noise from a machine client that has outlived its token.
+        logger.debug("auth: a presented service token did not resolve")
     token = _token_from_request(request)
     if token is None:
         raise HTTPException(status_code=401, detail="authentication required")
@@ -1318,8 +1330,8 @@ async def mint_service_token(
 
 @router.post("/service-tokens/revoke")
 async def revoke_service_tokens(
-    body: ServiceTokenRevokeIn,
     request: Request,
+    body: ServiceTokenRevokeIn | None = None,
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("users:manage")),
 ):
@@ -1328,15 +1340,17 @@ async def revoke_service_tokens(
     Pass the token to retire and only that one dies, which is what makes
     rotation safe to perform in the order an operator naturally reaches for --
     mint the replacement, move consumers onto it, *then* kill the old one,
-    without a window in which no credential works. With no ``token`` in the
-    body every live service token is revoked at once; that is the right move
+    without a window in which no credential works. Posting no body at all (or an
+    empty one) revokes every live service token at once; that is the right move
     for a suspected leak, and the wrong one for a planned rotation because it
     would take down the replacement minted moments earlier.
+
+    ``revoked`` is the number of rows actually changed, so revoking an unknown
+    or already-revoked token reports 0 rather than a reassuring 1.
     """
     s = _require_auth_store()
-    if body.token:
-        await s.revoke_service_token(body.token)
-        return {"revoked": 1}
+    if body and body.token:
+        return {"revoked": await s.revoke_service_token(body.token)}
     return {"revoked": await s.revoke_all_service_tokens()}
 
 

@@ -780,12 +780,44 @@ def test_revoke_all_service_tokens_kills_every_one(store, monkeypatch):
     asyncio.run(store.ensure_bootstrap_service_token("old-svc", {"chat:use"}, 3600))
     new_token = client.post("/api/auth/service-tokens", headers=hdr).json()["token"]
 
-    revoked = client.post("/api/auth/service-tokens/revoke", json={}, headers=hdr)
+    # A POST with NO body at all must mean revoke-everything -- that is the
+    # form the docs give -- so it must not be a 422 for a missing body.
+    revoked = client.post("/api/auth/service-tokens/revoke", headers=hdr)
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["revoked"] == 2
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 401
     assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 401
     assert asyncio.run(store.service_token_for(new_token)) is None
+
+
+def test_revoke_reports_what_it_actually_revoked(store, monkeypatch):
+    """``revoked`` is the operator's only confirmation that a retirement took,
+    so revoking something unknown or already dead must say 0, not a reassuring
+    1."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 3600)
+
+    admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
+    admin_token = asyncio.run(store.issue_token(admin.id, 7))
+    hdr = {"Authorization": f"Bearer {admin_token}"}
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    client = TestClient(app)
+
+    minted = client.post("/api/auth/service-tokens", headers=hdr).json()["token"]
+    first = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, headers=hdr)
+    assert first.json()["revoked"] == 1
+    # Same token again, and a token that never existed: nothing changed.
+    again = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, headers=hdr)
+    assert again.json()["revoked"] == 0
+    never = client.post("/api/auth/service-tokens/revoke", json={"token": "never-existed"}, headers=hdr)
+    assert never.json()["revoked"] == 0
 
 
 def test_service_token_logout_actually_revokes(store, monkeypatch):
@@ -835,9 +867,10 @@ def test_service_token_ttl_comes_from_config_and_never_from_nowhere(monkeypatch)
     expires'. Otherwise an operator setting 0 -- or a regression that hardcodes
     a long life -- quietly reinstates the permanent admin credential this issue
     is about, and nothing in the suite would notice."""
-    assert auth.config.AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS == 86400
-    assert auth._service_token_ttl_seconds() == 86400
-
+    # No assertion on the ambient config value: it is populated by
+    # load_dotenv(), so it reads whatever backend/.env on the host says. The
+    # monkeypatched 60 and the non-positive loop below pin the honoured value
+    # and the fallback env-independently.
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 60)
     assert auth._service_token_ttl_seconds() == 60
     for non_positive in (0, -1, -86400):
