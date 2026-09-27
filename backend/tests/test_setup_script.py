@@ -217,7 +217,21 @@ CURL_STUB = """\
 url="${@: -1}"
 printf '%s\\n' "$url" >>"$CURL_LOG"
 case "$url" in
-*/ready/deep) code="$READY_DEEP_CODE" ;;
+*/ready/deep)
+    code="$READY_DEEP_CODE"
+    if [ "$1" = "-fsS" ]; then
+        # wait_http uses -f: no body on a failure, and a non-zero exit. 000 is
+        # a refused connection, which is also a curl failure.
+        printf '%s' "$code"
+        [ "$code" -ge 400 ] 2>/dev/null && exit 22
+        [ "$code" = "000" ] && exit 7
+        exit 0
+    fi
+    # The diagnostic curl has no -f, so the body survives -- that is the whole
+    # reason it is written that way.
+    [ "$code" -ge 400 ] && printf '%s' "$READY_DEEP_BODY"
+    exit 0
+    ;;
 *) code=200 ;;
 esac
 printf '%s' "$code"
@@ -243,7 +257,13 @@ def _extract_function(name):
     return "\n".join(lines[start : end + 1])
 
 
-def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200):
+READY_REPORT_BODY = (
+    '{"ready": false, "checks": {"qdrant": {"ok": true}, "models": {"ok": true},'
+    ' "redis": {"ok": true, "cache": "memory"}, "llm": {"ok": false, "reason": "placeholder"}}}'
+)
+
+
+def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200, report=READY_REPORT_BODY):
     """Run the real run_services against stub pm2/curl. Returns (rc, pm2_log,
     stdout+stderr)."""
     home = tmp_path / "host"
@@ -256,9 +276,9 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
     if env_base:
         env_lines.append(f"GEMINI_BASE_URL={env_base}")
     (home / "backend" / ".env").write_text("\n".join(env_lines) + "\n")
-    for name, body in (("curl", CURL_STUB), ("pm2", PM2_STUB)):
+    for name, stub_body in (("curl", CURL_STUB), ("pm2", PM2_STUB)):
         stub = home / "bin" / name
-        stub.write_text(body)
+        stub.write_text(stub_body)
         stub.chmod(0o755)
 
     pm2_log = tmp_path / "pm2.log"
@@ -274,7 +294,6 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
             "sleep() { :; }",  # wait_http's 1s backoff would cost 30s per run
             "stage() { :; }",
             "ensure_pm2() { :; }",
-            _extract_function("api_key_preflight"),
             _extract_function("report_readiness_reason"),
             _extract_function("wait_http"),
             _extract_function("run_services"),
@@ -289,6 +308,7 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
             "PM2_LOG": str(pm2_log),
             "CURL_LOG": str(curl_log),
             "READY_DEEP_CODE": str(ready_deep_code),
+            "READY_DEEP_BODY": report,
         },
         capture_output=True,
         text=True,
@@ -296,11 +316,6 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
         check=False,
     )
     return proc, (pm2_log.read_text() if pm2_log.exists() else "")
-
-
-def curl_log_text(tmp_path):
-    path = tmp_path / "curl.log"
-    return path.read_text() if path.exists() else ""
 
 
 def _started(pm2_log, service):
@@ -330,17 +345,6 @@ def test_the_gate_is_not_satisfied_by_the_liveness_stub(tmp_path):
     assert _started(pm2_log, "vccircle-frontend")
 
 
-def test_a_shipped_placeholder_key_aborts_before_anything_is_touched(tmp_path):
-    """The common cause is caught before the teardown, so a host still holding
-    the value .env.example ships loses nothing at all."""
-    proc, pm2_log = run_services(tmp_path, env_key=PLACEHOLDER_KEY)
-
-    assert "RUN_SERVICES_RC=1" in proc.stdout
-    assert pm2_log == "", f"nothing may be deleted or started: {pm2_log!r}"
-    assert "placeholder" in proc.stderr
-    assert "/ready/deep" not in curl_log_text(tmp_path), "the pre-flight must decide this, not the gate"
-
-
 def test_a_ready_deployment_still_succeeds(tmp_path):
     """The control: the reordering must not have broken the happy path."""
     proc, pm2_log = run_services(tmp_path, ready_deep_code=200)
@@ -365,3 +369,73 @@ def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
     )
 
     assert "RUN_SERVICES_RC=0" in proc.stdout, proc.stdout + proc.stderr
+
+
+# The drift guard: setup.sh must never hold a copy of the placeholder list.
+#
+# An earlier revision of this change added an `api_key_preflight` that re-implemented
+# app.config.classify_gemini_api_key in bash. It was a second classifier, and a
+# review proved it wrong: it carried 20 of the classifier's 28 sentinels, and the
+# eight it missed (plus the repeated-filler rule) are all reachable when
+# GEMINI_BASE_URL is a non-Google gateway -- a configuration this repo supports.
+# A host in that shape passed the pre-flight, lost both pm2 services to the
+# teardown, and only then learned from the gate that it was never ready.
+#
+# The pre-flight is gone. What is tested instead is the property that actually
+# matters, against every sentinel the app rejects INCLUDING any added later:
+# a not-ready deploy must never leave the frontend stopped.
+
+
+def _all_app_placeholders():
+    """Every value classify_gemini_api_key calls a placeholder, plus the
+    repeated-filler shapes it rejects outside the sentinel list. Read from the
+    app so a new sentinel cannot escape this test."""
+    from app.config import _PLACEHOLDER_API_KEYS
+
+    return sorted(_PLACEHOLDER_API_KEYS | {"x" * 9, "a-x-a-x-a-x", "0" * 9})
+
+
+@pytest.mark.parametrize("placeholder", _all_app_placeholders())
+def test_every_placeholder_the_app_rejects_still_deploys_both_services(tmp_path, placeholder):
+    """Whatever the app makes of the key, the deploy is not left torn down: both
+    services are started and the dump is saved before the gate can fail. The
+    base URL is a non-Google gateway on purpose -- that is the path on which the
+    shell-side shape rule was skipped, and therefore the path where the old
+    pre-flight's gaps were reachable."""
+    proc, pm2_log = run_services(
+        tmp_path,
+        env_key=placeholder,
+        env_base="https://llm-gateway.internal/v1",
+        ready_deep_code=503,
+    )
+
+    assert "RUN_SERVICES_RC=1" in proc.stdout
+    assert _started(pm2_log, "vccircle-backend")
+    assert _started(pm2_log, "vccircle-frontend"), f"{placeholder!r} tore the frontend down"
+    assert "save" in pm2_log
+
+
+def test_a_failed_gate_names_the_key_fault_from_the_app_not_from_shell(tmp_path):
+    """The operator has to be told WHICH fault, and the only trustworthy source
+    is the app: report_readiness_reason prints the response body, which carries
+    checks.llm.reason. Its curl deliberately has no -f -- with -f the body is
+    suppressed on exactly the >=400 response this function only ever sees, and
+    the function becomes dead code."""
+    proc, _pm2_log = run_services(tmp_path, env_key=PLACEHOLDER_KEY, ready_deep_code=503)
+    output = proc.stdout + proc.stderr
+
+    assert "not ready after" in output
+    assert "placeholder" in output, f"the readiness reason never reached the operator: {output}"
+    assert "readiness report" in output
+
+
+def test_a_failed_gate_says_so_even_when_the_probe_returns_no_body(tmp_path):
+    """A probe that cannot be reached at all must not print an empty report
+    silently; the operator is told the difference between 'not ready' and 'no
+    answer'."""
+    # A refused connection: curl fails and writes no body (the string matters,
+    # 000 is curl's "no answer" code -- the int 0 would str() to "0").
+    proc, _pm2_log = run_services(tmp_path, ready_deep_code="000", report="")
+
+    assert "no report body" in proc.stderr
+    assert "not ready after" in proc.stderr

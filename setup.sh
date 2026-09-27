@@ -301,74 +301,27 @@ start_service() {
     echo "'$name' started (pid $(cat "$pidfile"))"
 }
 
-# Would the API report itself ready with the GEMINI_API_KEY in backend/.env?
-# Checked here, BEFORE anything is torn down, because the deploy gate below can
-# now legitimately fail (#279) and `set -e` aborts there: a host still holding
-# the placeholder that .env.example ships would otherwise lose both pm2
-# services and never get the frontend back.
-#
-# This is a deliberately small SUBSET of app.config.classify_gemini_api_key --
-# the empty and known-sentinel cases a shell can judge on its own -- not a
-# second implementation of it. The shape rule is only applied when the endpoint
-# is Google's, exactly as the Python classifier does, because GEMINI_BASE_URL is
-# configurable and a gateway deployment legitimately holds a different key.
-api_key_preflight() {
-    [ -f "$ENV_FILE" ] || return 0   # nothing to judge yet; the gate will report it
-    local key base normalised
-    key="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?GEMINI_API_KEY=//p' "$ENV_FILE" | tail -n 1)"
-    key="${key%\"}"; key="${key#\"}"; key="${key%\'}"; key="${key#\'}"
-    key="$(printf '%s' "$key" | tr -d '[:space:]')"
-    if [ -z "$key" ]; then
-        echo "ERROR: GEMINI_API_KEY is not set in $ENV_FILE. The backend reports" >&2
-        echo "       not-ready without it (chat would answer everything with the" >&2
-        echo "       canned fallback), so nothing has been started or stopped." >&2
-        echo "       Set a real key (https://aistudio.google.com/apikey) and re-run." >&2
-        return 1
-    fi
-    normalised="$(printf '%s' "$key" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
-    case "$normalised" in
-        yourkeyhere | yourapikey | yourapikeyhere | yourkey | yourgeminiapikey | changeme | replaceme | \
-        placeholder | sample | dummy | example | test | secret | todo | tbd | none | null | nil | na | key)
-            echo "ERROR: GEMINI_API_KEY in $ENV_FILE is still the placeholder '$normalised'." >&2
-            echo "       The backend reports not-ready with a placeholder key, so nothing has" >&2
-            echo "       been started or stopped. Set a real key" >&2
-            echo "       (https://aistudio.google.com/apikey) and re-run." >&2
-            return 1
-            ;;
-    esac
-    base="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?GEMINI_BASE_URL=//p' "$ENV_FILE" | tail -n 1)"
-    case "$base" in
-        "" | *generativelanguage.googleapis.com*)
-            # A real Google key is the 4-character prefix plus 35 more.
-            if [ "${key#AIza}" = "$key" ] || [ "${#key}" -ne 39 ]; then
-                echo "ERROR: GEMINI_API_KEY in $ENV_FILE is not shaped like a Google key" >&2
-                echo "       (the 'AIza' prefix plus 35 characters). A typo or a truncated paste" >&2
-                echo "       fails every chat request, so nothing has been started or stopped." >&2
-                echo "       Fix the key and re-run." >&2
-                return 1
-            fi
-            ;;
-    esac
-    return 0
-}
-
 # Name the reason the readiness gate rejected the deploy, so a 30-second
 # timeout does not end in a bare "not ready".
+#
+# No -f here, deliberately. This only ever runs when the probe answered >= 400
+# (or the connection failed), and `curl -f` suppresses the body on exactly those
+# responses -- which made this function dead code and left the operator with the
+# bare "not ready after 30s" it exists to prevent. The report body, including
+# checks.llm.reason, is the app's own answer and is what gets printed.
 report_readiness_reason() {
     local body
-    body="$(curl -fsS -m 5 "http://localhost:$API_PORT/ready/deep" 2>/dev/null || true)"
+    body="$(curl -sS -m 5 "http://localhost:$API_PORT/ready/deep" 2>/dev/null || true)"
     if [ -n "$body" ]; then
         echo "       readiness report:" >&2
         printf '%s\n' "$body" | sed 's/^/         /' >&2
+    else
+        echo "       (no report body; the probe did not answer)" >&2
     fi
 }
 
 run_services() {
     stage "services"
-    # `|| return 1` rather than a bare call: `set -e` is SUSPENDED inside a
-    # function invoked in a && / || / if condition, so a bare call would let
-    # the teardown run anyway for any caller that tests the return value.
-    api_key_preflight || return 1
     mkdir -p "$LOGS" "$PID_DIR"
     ensure_pm2
     pm2 delete vccircle-backend >/dev/null 2>&1 || true
@@ -404,8 +357,15 @@ run_services() {
     # misconfigured key into a torn-down deployment with the frontend never
     # coming back. Here both services are up and the pm2 dump is saved, so the
     # operator is told the deploy is not ready with everything still running,
-    # and can fix the key and re-run. The key itself is checked before the
-    # teardown (api_key_preflight) so the common cause never gets this far.
+    # and can fix the key and re-run.
+    #
+    # There is deliberately NO shell-side check of GEMINI_API_KEY before the
+    # teardown. app.config.classify_gemini_api_key is the only classifier, and
+    # a shell copy of its sentinel list is a second one that silently drifts:
+    # a shorter copy misses placeholders, a longer one refuses deploys the app
+    # would accept. The verdict here is the app's own -- report_readiness_reason
+    # prints checks.llm.reason from the response -- so it cannot disagree with
+    # what /ready will actually say.
     if ! wait_http "http://localhost:$API_PORT/ready/deep"; then
         report_readiness_reason
         return 1
