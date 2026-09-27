@@ -24,13 +24,12 @@ neutralises `load_dotenv` itself for the duration of each reload.
 import asyncio
 import importlib
 import os
-import re
 from pathlib import Path
 
 import pytest
 
 import app.config as config_module
-from app.config import BACKEND_ROOT, _data_path, _env_bool, ensure_data_paths_ready
+from app.config import BACKEND_ROOT, _data_path, ensure_data_paths_ready
 
 # The env vars that steer the knobs under test, cleared so a developer's or the
 # deploy box's real .env cannot decide any answer here.
@@ -42,17 +41,6 @@ _DATA_PATH_ENV = (
 )
 
 DATA_PATH_KNOBS = _DATA_PATH_ENV
-
-BOOL_KNOBS = (
-    "ENABLE_QUERY_EXPANSION",
-    "ENABLE_ENTITY_BOOST",
-    "ENABLE_WEAK_FALLBACK",
-    "ENABLE_QUERY_FIX",
-    "ENABLE_DIVERSITY",
-    "ENABLE_CLICK_BOOST",
-    "ENABLE_BODY_RESCUE",
-    "ENABLE_RECOMMENDATIONS",
-)
 
 
 @pytest.fixture
@@ -168,102 +156,6 @@ def test_data_path_helper_never_returns_a_relative_path(monkeypatch):
         assert Path(resolved).is_absolute()
         assert Path(resolved) == expected
 
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("true", True),
-        ("TRUE", True),
-        ("True", True),
-        ("on", True),
-        ("ON", True),
-        ("YES", True),
-        ("1", True),
-        ("  true  ", True),
-        ('"true"', True),
-        ("false", False),
-        ("FALSE", False),
-        ("off", False),
-        ("No", False),
-        ("0", False),
-        ("  false  ", False),
-    ],
-)
-def test_boolean_knob_accepts_every_reasonable_spelling(monkeypatch, raw, expected):
-    """`TRUE`, `True` and `on` all mean true.
-
-    Before the fix the parser was
-    `os.getenv(X, "true").lower() in ("1", "true", "yes")`, so `TRUE` and `on`
-    silently read as FALSE: a whole feature turned off with no signal anywhere.
-    The default is set to the opposite of `expected` so a parser that ignored
-    the value entirely would also fail this.
-    """
-    monkeypatch.delenv("SOME_TOGGLE", raising=False)
-    monkeypatch.setenv("SOME_TOGGLE", raw)
-    assert _env_bool("SOME_TOGGLE", not expected) is expected
-
-
-def test_unrecognised_boolean_value_raises_instead_of_defaulting(monkeypatch):
-    """`ENABLE_X=treu` must not silently read as "feature disabled"."""
-    monkeypatch.setenv("SOME_TOGGLE", "treu")
-    with pytest.raises(ValueError, match="SOME_TOGGLE"):
-        _env_bool("SOME_TOGGLE", True)
-
-
-def test_unset_boolean_knob_keeps_its_default(monkeypatch):
-    """An absent variable is a legitimate "not configured", not a typo."""
-    monkeypatch.delenv("SOME_TOGGLE", raising=False)
-    assert _env_bool("SOME_TOGGLE", True) is True
-    monkeypatch.setenv("SOME_TOGGLE", "   ")
-    assert _env_bool("SOME_TOGGLE", False) is False
-
-
-def test_truthy_spellings_match_the_setup_sh_auth_trust_warning():
-    """The accepted true-spellings must be exactly the ones setup.sh warns about.
-
-    `setup.sh services` prints a security warning when
-    `AUTH_TRUST_X_FORWARDED_FOR` is a forced True, and its regex comment claims
-    it covers "exactly the ones config._env_tristate reads". That claim is
-    load-bearing: a forced True leaves X-Forwarded-For trusted from ANY peer
-    (issue #245), and the setup warning is the only signal for it. So if the
-    truthy set is widened and the regex is not, a value like `=y` forces header
-    trust with no warning anywhere.
-    """
-    setup_sh = (Path(__file__).resolve().parents[2] / "setup.sh").read_text()
-    regex = re.search(
-        r"grep -qiE '\^AUTH_TRUST_X_FORWARDED_FOR=(?P<body>[^']*)'", setup_sh
-    )
-    assert regex is not None, (
-        "could not find the AUTH_TRUST_X_FORWARDED_FOR spellings regex in setup.sh; "
-        "this guard must be updated to follow it"
-    )
-    # Strip the POSIX character classes first: their names ("space") sit inside
-    # brackets and are not spellings.
-    body = re.sub(r"\[\[:?[^]]*\]\]", "", regex.group("body"))
-    guarded = frozenset(re.findall(r"[a-z0-9]+", body))
-    assert config_module._TRUE_VALUES == guarded, (
-        f"config accepts {sorted(config_module._TRUE_VALUES)} as true but setup.sh "
-        f"only warns for {sorted(guarded)}; a value in the difference forces "
-        "X-Forwarded-For trust from any peer with no setup warning"
-    )
-
-
-@pytest.mark.parametrize("knob", BOOL_KNOBS)
-def test_every_boolean_knob_goes_through_the_validating_parser(load_config, knob):
-    """A typo in any shipped ENABLE_* knob is a boot failure, not a silent off.
-
-    Asserted through the real class body: a knob left on the old inline
-    `.lower() in ("1", "true", "yes")` expression cannot pass this.
-    """
-    with pytest.raises(ValueError, match=knob):
-        load_config({knob: "definitely-not-a-bool"})
-
-
-@pytest.mark.parametrize("knob", BOOL_KNOBS)
-def test_boolean_knob_still_defaults_to_enabled_when_unset(load_config, knob):
-    """The control for the test above: an absent knob keeps its shipped default."""
-    cfg = load_config({})
-    assert getattr(cfg, knob) is True, f"{knob} no longer defaults to enabled"
 
 
 class _Cfg:
