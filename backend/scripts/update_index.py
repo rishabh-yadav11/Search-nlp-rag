@@ -383,6 +383,7 @@ async def main():
     # previous version matches nothing and the whole corpus looks changed. That
     # is indistinguishable from "every row really was edited", and the cost is a
     # full re-embed, so say so explicitly rather than quietly re-embedding.
+
     if len(records) > 1 and len(changed) == len(records):
         log(
             f"WARNING: all {len(records)} rows read as changed. If the index was just "
