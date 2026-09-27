@@ -362,6 +362,7 @@ def test_a_concurrent_login_cannot_publish_a_half_finished_change(tmp_path, monk
         await store._db.execute("PRAGMA busy_timeout=200")
         pause = _PauseAt(_STEP_HASH)
         _attach(monkeypatch, store, pause)
+        change = None
         try:
             change = asyncio.create_task(store.change_password(user.id, auth.hash_password(NEW_PW), 7))
             await asyncio.wait_for(pause.reached.wait(), 10)
@@ -385,7 +386,15 @@ def test_a_concurrent_login_cannot_publish_a_half_finished_change(tmp_path, monk
             assert all([await reader.user_for_token(t) is None for t in tokens])
             assert await reader.user_for_token(token) is not None
         finally:
+            # Always let the change finish before anything is closed. A
+            # mutation that trips an assertion above leaves this task parked
+            # on the pause, so it has to be released and awaited first --
+            # closing the store out from under it would report "Cannot
+            # operate on a closed database" as the failure and bury the
+            # assertion that actually caught the mutation.
             pause.release()
+            if change is not None:
+                await asyncio.gather(change, return_exceptions=True)
             _unarm(monkeypatch)
             await reader.close()
             await store.close()
