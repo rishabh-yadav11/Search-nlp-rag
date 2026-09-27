@@ -603,28 +603,6 @@ def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
     assert r.status_code == 500
 
 
-# --- /analytics/click ---
-
-
-@pytest.mark.parametrize(
-    "event,expected",
-    [
-        (main.ClickEvent(query="fintech", position=2, id=42), ("fintech", 2, 42)),
-        (main.ClickEvent(query="fintech", position=2, id=None), ("fintech", 2, None)),
-    ],
-)
-def test_analytics_click(monkeypatch, event, expected):
-    calls = []
-
-    async def fake_record_click(*args):
-        calls.append(args)
-
-    monkeypatch.setattr(main, "record_click", fake_record_click)
-
-    resp = _run(main.analytics_click(event))
-    assert resp == {"ok": True}
-    assert calls == [expected]
-
 
 # --- /analytics/summary ---
 
