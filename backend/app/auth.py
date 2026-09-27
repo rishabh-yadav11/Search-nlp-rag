@@ -204,6 +204,32 @@ def _password_bytes(password: str) -> bytes:
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
 
 
+def _effective_password(password: str) -> str:
+    """Return the password as it will actually be used: the first
+    ``_BCRYPT_MAX_BYTES`` bytes, decoded back to ``str``.
+
+    ``hash_password`` / ``verify_password`` both go through ``_password_bytes``,
+    so anything past byte 72 is silently dropped and never takes part in
+    authentication. Validating a bootstrap credential must therefore judge the
+    part that is really in effect, not the raw string: a long passphrase is
+    perfectly serviceable, and rejecting it would make a fresh deploy
+    unadministrable (bootstrap_admin is the only path that can ever create an
+    admin, since signup hardcodes SIGNUP_ROLE and role changes need an
+    existing admin token).
+
+    ``decode("utf-8", "ignore")`` matters: a multi-byte character can straddle
+    the 72-byte cut, and a strict decode would raise UnicodeDecodeError during
+    startup -- the fail-dead this check exists to avoid. The result is therefore
+    *at most* ``_BCRYPT_MAX_BYTES`` bytes and is a prefix of what
+    ``_password_bytes`` hashes: when the cut splits a character, the orphaned
+    lead byte is dropped along with the partial character, so the decoded string
+    can be one byte shorter. That only ever drops a non-ASCII tail byte, so it
+    cannot turn a policy-failing value into a passing one; the min-length and
+    letter+digit rules are decided entirely by the retained prefix.
+    """
+    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt()).decode("utf-8")
 
@@ -915,16 +941,34 @@ async def bootstrap_admin() -> None:
     email_error = _validator_rejection(validate_email, email)
     if email_error:
         await _reject_bootstrap(
-            "AUTH_ADMIN_EMAIL", email_error,
+            "AUTH_ADMIN_EMAIL",
+            email_error,
             hint=f"set it to a valid address (max {config.AUTH_MAX_EMAIL_LEN} characters) and restart",
         )
         return
-    password_error = _validator_rejection(validate_password, password)
+    # The password is validated as it will actually be used. bcrypt only ever
+    # sees the first _BCRYPT_MAX_BYTES bytes (hash_password and verify_password
+    # both truncate), so those bytes ARE the credential. Validating the raw
+    # string instead would reject a long passphrase whose effective form is
+    # perfectly strong -- and because bootstrap_admin is the only path that can
+    # ever create an admin (signup hardcodes SIGNUP_ROLE, and a role change
+    # needs an admin token that cannot exist yet), that rejection would leave a
+    # fresh deploy permanently unadministrable. The original password is still
+    # what gets stored, so the row and its hash are byte-identical to before.
+    effective = _effective_password(password)
+    if effective != password:
+        logger.warning(
+            "AUTH_ADMIN_PASSWORD exceeds bcrypt's %d-byte limit; the trailing bytes are dropped "
+            "and only the first %d bytes will ever authenticate. Shorten it, or accept that the "
+            "tail is not part of the credential.",
+            _BCRYPT_MAX_BYTES, _BCRYPT_MAX_BYTES,
+        )
+    password_error = _validator_rejection(validate_password, effective)
     if password_error:
         await _reject_bootstrap(
-            "AUTH_ADMIN_PASSWORD", password_error,
-            hint=f"set it to a password of at least {config.AUTH_PASSWORD_MIN_LEN} characters "
-                 "containing both a letter and a digit, then restart",
+            "AUTH_ADMIN_PASSWORD",
+            password_error,
+            hint=_password_hint(password_error),
         )
         return
     s = _require_auth_store()
@@ -943,8 +987,8 @@ async def bootstrap_admin() -> None:
                 logger.error("bootstrap admin %s could not be created (write lock)", email)
                 return
             await asyncio.sleep(1)
- 
- 
+
+
 async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
     """Log that the configured bootstrap admin credentials were refused, and
     report (never delete) an account a previous run already created from the
@@ -959,20 +1003,39 @@ async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
     # Removing it here would be an unauthenticated, startup-time way to delete
     # the only admin account and lock every operator out, so the row is left
     # alone and surfaced loudly for out-of-band rotation instead.
+    #
+    # "Rotate" is demanded only when the configured value is genuinely the
+    # account's current password. A config value that merely fails validation
+    # says nothing about a healthy admin's password, so demanding rotation of an
+    # unrelated account on every worker restart would be a false alarm.
     if store is not None:
         probe = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
+        existing = None
         try:
             existing = await store.get_user_by_email(probe) if probe else None
-        except Exception:  # noqa: BLE001 - a probe must never break startup
+        except Exception as exc:  # noqa: BLE001 - a probe must never break startup
+            logger.warning(
+                "could not check whether admin %s already exists (%s: %s); reporting the rejected "
+                "bootstrap config on its own merits.",
+                probe, type(exc).__name__, exc,
+            )
             existing = None
         if existing is not None and existing.role == "admin":
-            logger.error(
-                "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
-                "No account was created, and the pre-existing admin account (id %s) -- which may "
-                "have been provisioned from this same non-compliant value before these checks "
-                "existed -- was left in place. Rotate that account's password out of band: %s.",
-                probe, _validator_name_for(variable), variable, reason, existing.id, hint,
-            )
+            if verify_password(config.AUTH_ADMIN_PASSWORD or "", existing.password_hash):
+                logger.error(
+                    "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
+                    "No account was created, and the pre-existing admin account (id %s) -- which was "
+                    "provisioned from this same non-compliant value before these checks existed -- "
+                    "was left in place. Rotate that account's password out of band: %s.",
+                    probe, _validator_name_for(variable), variable, reason, existing.id, hint,
+                )
+            else:
+                logger.error(
+                    "bootstrap admin NOT created: %s rejected the configured %s: %s. An unrelated "
+                    "admin account (id %s) already exists on a different, valid password, so it was "
+                    "left untouched and needs no rotation. %s.",
+                    _validator_name_for(variable), variable, reason, existing.id, hint,
+                )
             return
     logger.error(
         "bootstrap admin NOT created: %s rejected the configured %s: %s. This is a configuration "
@@ -980,6 +1043,27 @@ async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
         "account: %s. The service is up, so you can fix the config and restart.",
         _validator_name_for(variable), variable, reason, hint,
     )
+
+
+def _password_hint(reason: str) -> str:
+    """The remediation hint for a ``validate_password`` reason.
+
+    Keyed on the reason so the advice can never contradict it -- one fixed hint
+    would tell an operator to lengthen a password that was rejected for being
+    too long. Only the reasons still reachable for an already-truncated value
+    appear here: the too-long branch cannot fire, because ``bootstrap_admin``
+    validates the output of ``_effective_password``.
+    """
+    if "at least" in reason:
+        return (
+            f"set it to a password of at least {config.AUTH_PASSWORD_MIN_LEN} characters "
+            "containing both a letter and a digit, then restart"
+        )
+    if "letter and a digit" in reason:
+        return "set it to a password containing both a letter and a digit, then restart"
+    # A future reason must not fall through to advice that could be wrong, so
+    # the fallback stays reason-agnostic.
+    return "set AUTH_ADMIN_PASSWORD to a password that satisfies the password policy, then restart"
 
 
 def _validator_name_for(variable: str) -> str:
