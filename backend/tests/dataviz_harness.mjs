@@ -66,6 +66,7 @@ process.stdout.write(JSON.stringify({
   fence_src: contract.FENCE_SRC,
   numeric_literal_src: contract.NUMERIC_LITERAL_SRC,
   trim_src: contract.TRIM_SRC,
+  max_json_depth: contract.MAX_JSON_DEPTH,
   trim_probes: trimProbes,
   missing_value_tokens: tokens instanceof Set ? [...tokens] : Object.keys(tokens),
   results,
