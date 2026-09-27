@@ -158,6 +158,10 @@ describe('isSafeUrl — server/client parity', () => {
     '\x00javascript:alert(1)',
     '\x00data:text/html,x',
     '//ssr.invalid/x',
+    '\\ssr.invalid/x',
+    '/\\ssr.invalid/x',
+    '\\/ssr.invalid/x',
+    '\\\\ssr.invalid/x',
     '/\\evil.com',
     '\\/evil.com',
     '\\\\evil.com',
@@ -192,6 +196,24 @@ describe('isSafeUrl — server/client parity', () => {
   it.each(CORPUS)('returns the same verdict for %j on the server and the client', (url) => {
     expect(verdictIn(url, false)).toBe(verdictIn(url, true))
   })
+
+  // Two or more leading slashes/backslashes aimed at the stand-in origin
+  // resolve to exactly that origin on the server, so the origin comparison
+  // alone would wave them through there while the client (base
+  // https://app.vccircle.com/) rejects them as off-origin. A parity assertion
+  // alone would not catch that, because it only compares the two verdicts; the
+  // explicit `false` pins the actual outcome.
+  //
+  // The single-backslash form is deliberately absent: `\ssr.invalid/x` is one
+  // separator, not two, so the browser resolves it to a same-origin path
+  // (…/ssr.invalid/x) and both environments legitimately allow it.
+  it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
+    'rejects the backslash escape %j aimed at the stand-in origin',
+    (url) => {
+      expect(verdictIn(url, false)).toBe(false)
+      expect(verdictIn(url, true)).toBe(false)
+    }
+  )
 })
 
 describe('isSafeUrl — deliberate strictness on control characters', () => {
