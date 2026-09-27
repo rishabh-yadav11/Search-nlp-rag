@@ -73,7 +73,6 @@ from app.query_intent import (
 from app.recommender import (
     SIMILAR_ARTICLES_TTL_SECONDS,
     USER_RECOMMENDATIONS_TTL_SECONDS,
-    get_latest_top_stories,
     get_personalized_recommendations,
     get_similar_articles,
     get_trending_feed,
@@ -1646,19 +1645,16 @@ async def get_for_you(
     """Get personalized recommendations for the authenticated user.
 
     Uses user interaction history, category affinity, and hybrid scoring
-    to surface relevant articles. Falls back to latest top stories for
-    cold-start users with no history.
+    to surface relevant articles. A cold-start user -- one who is
+    authenticated but has no interaction history -- is served latest top
+    stories by ``get_personalized_recommendations`` and flagged via
+    ``cold_start`` in the response.
+
+    Every caller reaching this handler has been through ``require_auth``,
+    which sets ``request.state.user_id`` to a real user id or the service
+    token id, so there is no anonymous case here (#303).
     """
     user_id = request.state.user_id
-
-    if user_id == "unknown":
-        articles = await get_latest_top_stories(limit)
-        return RecommendationsResponse(
-            user_id="anonymous",
-            recommendations=articles,
-            limit=limit,
-            cold_start=True,
-        )
 
     cached_key = f"recommend:for-you:{user_id}:{limit}"
     cached = await cache.get(cached_key)

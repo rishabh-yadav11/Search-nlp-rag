@@ -447,17 +447,6 @@ async def get_trending_feed(
         return []
 
 
-async def get_latest_top_stories(
-    limit: int = config.RECOMMEND_DEFAULT_LIMIT,
-    exclude_ids: list[int | str] | None = None,
-) -> list[dict]:
-    """Get latest top stories for cold-start fallback.
-
-    Returns diverse articles from recent time period.
-    """
-    return await _get_latest_top_stories(limit, exclude_ids)
-
-
 async def _get_latest_top_stories(
     limit: int = config.RECOMMEND_DEFAULT_LIMIT,
     exclude_ids: list[int | str] | None = None,
