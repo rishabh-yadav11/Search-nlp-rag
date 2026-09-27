@@ -7,15 +7,24 @@ A backup is a directory under ``backend/backups/`` named
   * the Qdrant collection snapshot file downloaded from the server (``.snapshot``)
   * copies of ``data/articles.jsonl`` and ``data/index_state.json`` (if present)
 
-``create_snapshot`` itself is authoritative: the server-side snapshot is the
-durable artifact. Downloading it locally is *optional/safe* — if the download
-fails we log a clear error but still copy the local artifacts, so a backup
-directory is never left useless by a transient network hiccup.
+The *local* copy of the snapshot is the only durable artifact: a server-side
+snapshot lives in the Qdrant container's local storage and is destroyed by a
+container recreate, a ``docker rm``, or the port rebind in ``setup.sh``. A
+backup therefore only counts as successful when a non-empty, readable snapshot
+archive was written to disk and verified — ``reset_index.py`` hard-gates an
+irreversible delete on that signal, and a green-looking but empty backup would
+turn a declared-safe rebuild into unrecoverable data loss.
+
+Snapshot download uses ``urllib.request`` from the stdlib rather than
+``requests``, which was never declared in ``requirements.txt`` and so was only
+present in a venv as an unpinned transitive artifact: on a clean
+``pip install -r requirements.txt`` the download raised ``ImportError``, which
+the old blanket ``except Exception`` swallowed into a success report.
 
 Used by:
 
   * ``backup_qdrant.py``      — CLI entry point
-  * ``reset_index.py``        — hard-gates deletion on a successful snapshot
+  * ``reset_index.py``        — hard-gates deletion on a verified local snapshot
   * ``build_index.py``        — best-effort backup before a schema recreate
 
 Only the most recent ``BACKUP_RETENTION`` (default 5) backups per collection are
@@ -25,8 +34,10 @@ import os
 import re
 import shutil
 import sys
-from contextlib import contextmanager
+import tarfile
+import urllib.request
 from datetime import UTC, datetime
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +49,44 @@ BACKUPS_DIR = os.path.join(BACKEND_DIR, "backups")
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
 
 TS_RE = re.compile(r"^\d{8}-\d{6}-\d{6}$")
+
+DOWNLOAD_TIMEOUT = 300
+
+
+class SnapshotResult(NamedTuple):
+    """Outcome of one create-snapshot + download attempt.
+
+    ``name`` is the server-side snapshot name when Qdrant created one, so an
+    operator can still retrieve it from the container. ``ok`` — and only
+    ``ok`` — means a verified local copy exists; ``local_path`` is then set.
+    ``detail`` is a human-readable reason, always populated when ``ok`` is
+    false, for the operator-facing log line.
+    """
+
+    name: str | None
+    ok: bool
+    local_path: str | None
+    detail: str
+
+    @property
+    def server_side_only(self) -> bool:
+        """A snapshot exists in the container but nothing durable was written."""
+        return self.name is not None and not self.ok
+
+
+class BackupResult(NamedTuple):
+    """Outcome of ``make_backup``.
+
+    ``dest`` is the backup directory (``None`` when nothing at all could be
+    backed up). ``snapshot_ok`` means a verified local snapshot archive exists;
+    ``snapshot_name`` is set whenever the server-side snapshot was created, and
+    ``artifacts`` lists the local data files copied.
+    """
+
+    dest: str | None
+    snapshot_ok: bool
+    snapshot_name: str | None
+    artifacts: list
 
 
 def _parse_retention() -> int:
@@ -87,51 +136,90 @@ def _redact_url(url: str) -> str:
         return "<redacted>"
 
 
-@contextmanager
-def _open_url(url: str, **kwargs):
-    import requests
+def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
+    """Stream ``url`` to ``dest`` using only the stdlib.
 
-    resp = requests.get(url, **kwargs)
+    ``urllib.request.urlopen`` follows 3xx redirects through the default
+    opener and raises ``HTTPError`` on any non-2xx status (the equivalent of
+    ``requests``' ``raise_for_status()``), and applies ``timeout`` to both the
+    connect and each socket read. A transfer that dies part-way raises out of
+    ``shutil.copyfileobj`` (``http.client.IncompleteRead``), so a truncated
+    download can never be mistaken for a complete one. Nothing here needs
+    ``requests``, which is not a declared dependency of this project.
+    """
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+
+def _local_snapshot_is_valid(path: str) -> tuple[bool, str]:
+    """Check that ``path`` is a readable, non-empty Qdrant snapshot archive.
+
+    A Qdrant collection snapshot is a tar archive, so this walks the member
+    headers: a zero-byte file, a file of unrelated bytes, or a download that
+    was truncated mid-stream all fail here rather than being reported as a
+    backup. Returns ``(ok, detail)`` where ``detail`` is a human-readable size
+    summary on success and the reason on failure.
+    """
+    if not os.path.isfile(path):
+        return False, f"no file at {path}"
+    size = os.path.getsize(path)
+    if size == 0:
+        return False, f"{path} is empty (0 bytes)"
     try:
-        yield resp
-    finally:
-        resp.close()
+        with tarfile.open(path, "r:*") as tf:
+            members = sum(1 for _ in tf)
+    except (tarfile.TarError, OSError, EOFError) as e:
+        return False, f"{path} is not a readable snapshot archive ({e})"
+    if members == 0:
+        return False, f"{path} is an empty archive (0 entries)"
+    return True, f"{size} bytes, {members} entries"
 
 
-def create_and_download_snapshot(client, collection_name: str, dest_dir: str):
-    """Create a server-side collection snapshot and try to download it locally.
+def create_and_download_snapshot(client, collection_name: str, dest_dir: str) -> SnapshotResult:
+    """Create a server-side collection snapshot and download it locally.
 
-    Returns the snapshot file name (already downloaded) on success. Returns the
-    snapshot name even when only the *download* failed (the server-side snapshot
-    is durable), and ``None`` when the snapshot could not be created.
+    Returns a :class:`SnapshotResult` whose ``ok`` flag is true only when a
+    verified local archive was written to ``dest_dir``. A snapshot that exists
+    solely in the Qdrant container is reported as ``ok=False`` with the
+    server-side ``name`` populated, because that artifact does not survive a
+    container recreate and must not be treated as a backup.
     """
     try:
         snap = client.create_snapshot(collection_name=collection_name, wait=True)
     except Exception as e:
         log(f"ERROR: could not create snapshot for collection '{collection_name}': {e}")
-        return None
+        return SnapshotResult(None, False, None, f"snapshot creation failed: {e}")
     if snap is None:
         log(f"ERROR: create_snapshot returned no snapshot for collection '{collection_name}'")
-        return None
+        return SnapshotResult(None, False, None, "create_snapshot returned no snapshot")
 
     name = snap.name
+    url = None
+    dest = os.path.join(dest_dir, name)
     try:
         url = _snapshot_download_url(collection_name, name)
         log(f"downloading snapshot '{name}' from {_redact_url(url)}")
-        with _open_url(url, timeout=300, stream=True) as resp:
-            resp.raise_for_status()
-            dest = os.path.join(dest_dir, name)
-            with open(dest, "wb") as f:
-                shutil.copyfileobj(resp.raw, f)
-        log(f"saved snapshot to {os.path.relpath(dest, BACKEND_DIR)}")
+        _download_to(url, dest)
     except Exception as e:
-        redacted = _redact_url(url)
-        redacted_err = str(e).replace(url, redacted)
+        err = str(e).replace(url, _redact_url(url)) if url else str(e)
         log(
-            f"WARNING: snapshot '{name}' was created server-side but could not be "
-            f"downloaded locally: {redacted_err}",
+            f"ERROR: snapshot '{name}' was created server-side but NO local copy was "
+            f"written ({err}); it survives only inside the Qdrant container and is "
+            f"destroyed by a container recreate or `docker rm` — this is not a backup",
         )
-    return name
+        return SnapshotResult(name, False, None, err)
+
+    ok, detail = _local_snapshot_is_valid(dest)
+    if not ok:
+        # A file that exists but does not verify is worse than none: a restore
+        # would pick it up. Remove it so only verified artifacts remain.
+        os.remove(dest)
+        log(f"ERROR: downloaded snapshot '{name}' failed verification: {detail}")
+        return SnapshotResult(name, False, None, detail)
+
+    log(f"saved verified snapshot to {os.path.relpath(dest, BACKEND_DIR)} ({detail})")
+    return SnapshotResult(name, True, dest, detail)
 
 
 def copy_local_artifacts(dest_dir: str) -> list:
@@ -179,25 +267,39 @@ def prune_backups(collection_name: str, retention: int | None = None) -> list:
     return removed
 
 
-def make_backup(client, collection_name: str):
+def make_backup(client, collection_name: str) -> BackupResult:
     """Create one backup (snapshot + local artifacts) and enforce retention.
 
-    Returns ``(dest_dir, snapshot_ok)`` where ``dest_dir`` is ``None`` when
-    nothing could be backed up at all.
+    Returns a :class:`BackupResult` whose ``snapshot_ok`` is true only when a
+    verified local snapshot archive exists. ``dest`` is ``None`` when nothing
+    at all could be backed up; a non-``None`` ``dest`` with ``snapshot_ok``
+    false means the directory holds local artifacts but no collection snapshot
+    and is therefore not a usable backup of the collection.
     """
     dest = new_backup_dir(collection_name)
-    snapshot_ok = create_and_download_snapshot(client, collection_name, dest) is not None
+    result = create_and_download_snapshot(client, collection_name, dest)
     copied = copy_local_artifacts(dest)
 
-    if not snapshot_ok and not copied:
+    if not result.ok and not copied:
         shutil.rmtree(dest, ignore_errors=True)
-        log(f"ERROR: no snapshot and no local artifacts to back up for '{collection_name}'")
-        return None, False
+        log(
+            f"ERROR: no verified snapshot and no local artifacts to back up for "
+            f"'{collection_name}'; the backup directory was removed",
+        )
+        return BackupResult(None, False, result.name, copied)
+
+    if not result.ok:
+        log(
+            f"ERROR: backup for '{collection_name}' is INCOMPLETE — the collection "
+            f"snapshot was not written to disk ({result.detail}); only the local "
+            f"artifacts {copied} are in this directory",
+        )
+        return BackupResult(dest, False, result.name, copied)
 
     log(
         f"backup written to {os.path.relpath(dest, BACKEND_DIR)} "
-        f"(snapshot={'ok' if snapshot_ok else 'FAILED'}, artifacts={copied or 'none'})",
+        f"(snapshot=ok, artifacts={copied or 'none'})",
     )
     for removed in prune_backups(collection_name):
         log(f"pruned old backup {os.path.relpath(removed, BACKUPS_DIR)}")
-    return dest, snapshot_ok
+    return BackupResult(dest, True, result.name, copied)

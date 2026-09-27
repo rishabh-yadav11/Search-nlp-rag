@@ -6,10 +6,16 @@ Drops the Qdrant collection and deletes the local data artifacts
 model cache, venv, and .env are left untouched.
 
 Safety: before deleting anything, a snapshot backup is taken
-via qdrant_backup.make_backup() (Qdrant collection snapshot + copies of
-articles.jsonl/index_state.json under backend/backups/). Deletion only proceeds
-after the snapshot succeeds, unless the explicit --skip-backup flag is passed
-(dangerous). Run scripts/backup_qdrant.py to back up without resetting.
+via qdrant_backup.make_backup() (Qdrant collection snapshot downloaded to
+backend/backups/ + copies of articles.jsonl/index_state.json). Deletion only
+proceeds when a *verified local* snapshot archive exists on disk, unless the
+explicit --skip-backup flag is passed (dangerous). A snapshot that exists only
+inside the Qdrant container does not count: it is destroyed by a container
+recreate or `docker rm`. Run scripts/backup_qdrant.py to back up without
+resetting.
+
+Exit status: 0 only when the reset ran to completion; 1 on any abort
+(declined confirmation, Qdrant unreachable, or no usable backup).
 
 Usage:
     python scripts/reset_index.py            # interactive confirmation
@@ -58,7 +64,7 @@ def api_is_live() -> bool:
         return False
 
 
-def main():
+def main() -> int:
     keep_data = "--keep-data" in sys.argv
     assume_yes = "--yes" in sys.argv
     skip_backup = "--skip-backup" in sys.argv
@@ -84,7 +90,7 @@ def main():
         reply = input("Type 'yes' to continue: ").strip().lower()
         if reply != "yes":
             print("Aborted.")
-            return
+            return 1
 
     if api_is_live():
         log(f"WARNING: something is listening on port {API_PORT} — live queries will fail after this")
@@ -98,24 +104,26 @@ def main():
                 f"ERROR: could not connect to Qdrant at {config.QDRANT_URL}: {exc}\n"
                 f"       check that Qdrant is running and QDRANT_URL is correct; aborting reset.",
             )
-            return
+            return 1
 
         if not skip_backup:
             if config.QDRANT_COLLECTION in existing:
-                dest, snapshot_ok = make_backup(client, config.QDRANT_COLLECTION)
-                if not snapshot_ok:
+                backup = make_backup(client, config.QDRANT_COLLECTION)
+                if not backup.snapshot_ok:
                     log(
-                        f"ERROR: snapshot for '{config.QDRANT_COLLECTION}' could not be created; "
+                        f"ERROR: no verified local backup of collection "
+                        f"'{config.QDRANT_COLLECTION}' on disk ({backup.dest or 'nothing written'}"
+                        f"{'' if not backup.snapshot_name else f', snapshot {backup.snapshot_name} exists only in the Qdrant container'}); "
                         f"aborting reset to avoid irreversible loss",
                     )
                     log("Re-run with --skip-backup to force deletion without a backup.")
-                    return
-                log(f"backup before reset: {dest}")
+                    return 1
+                log(f"backup before reset: {backup.dest}")
             else:
                 # Collection is missing: still attempt a backup of any local artifacts
                 # so the reset leaves a recoverable record instead of silently doing nothing.
-                dest, snapshot_ok = make_backup(client, config.QDRANT_COLLECTION)
-                if dest is None:
+                backup = make_backup(client, config.QDRANT_COLLECTION)
+                if backup.dest is None:
                     log(
                         f"collection '{config.QDRANT_COLLECTION}' does not exist and no local "
                         f"artifacts were available to back up — nothing to snapshot; proceeding",
@@ -123,7 +131,7 @@ def main():
                 else:
                     log(
                         f"collection '{config.QDRANT_COLLECTION}' does not exist; backed up "
-                        f"available local artifacts only before reset: {dest}",
+                        f"available local artifacts only before reset: {backup.dest}",
                     )
 
         if config.QDRANT_COLLECTION in existing:
@@ -149,7 +157,8 @@ def main():
     print("  2. python scripts/build_index.py")
     print("  3. python scripts/update_index.py --init")
     print("  4. (re)start the API")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
