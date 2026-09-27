@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 import sqlite3
 import statistics
@@ -147,6 +148,120 @@ def test_bootstrap_admin_disabled_without_env(store, monkeypatch):
     monkeypatch.setattr(auth, "store", store)
     asyncio.run(bootstrap_admin())
     assert asyncio.run(store.list_users()) == []
+
+
+def test_bootstrap_admin_refuses_weak_password_and_names_the_reason(store, monkeypatch, caplog):
+    """AUTH_ADMIN_PASSWORD=x must not provision a full-admin account with a
+    1-character password -- the signup path would reject that same value, and
+    the bootstrap path is the one that skipped the validators (#290)."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth, "store", store)
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())  # must not raise: the worker still starts
+
+    # nothing was created
+    assert asyncio.run(store.list_users()) == []
+    assert asyncio.run(store.get_user_by_email("admin@x.co")) is None
+
+    # and the operator learns WHICH variable, WHICH validator, and WHY
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "a refused bootstrap admin must be logged, not silently skipped"
+    joined = "\n".join(errors)
+    assert "AUTH_ADMIN_PASSWORD" in joined
+    assert "validate_password" in joined
+    assert str(auth.config.AUTH_PASSWORD_MIN_LEN) in joined  # the actual reason
+    assert "NOT created" in joined
+
+
+def test_bootstrap_admin_refuses_malformed_email_and_names_the_reason(store, monkeypatch, caplog):
+    """A malformed AUTH_ADMIN_EMAIL creates an account that can never be
+    validated or repaired through the normal flows, so nothing is created and
+    validate_email is named in the log (#290)."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "not-an-email")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "adminpass1")
+    monkeypatch.setattr(auth, "store", store)
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    assert asyncio.run(store.list_users()) == []
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    joined = "\n".join(errors)
+    assert "AUTH_ADMIN_EMAIL" in joined
+    assert "validate_email" in joined
+    assert "invalid email address" in joined
+
+
+def test_bootstrap_admin_rejection_is_not_retried_five_times(store, monkeypatch, caplog):
+    """A config value the validators reject is a permanent fault: retrying it
+    inside the 5-attempt write-lock loop would re-log the identical error five
+    times. Transient SQLite faults must still retry, so both are checked."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth, "store", store)
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(auth.asyncio, "sleep", fake_sleep)
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    rejects = [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.ERROR and "AUTH_ADMIN_PASSWORD" in r.getMessage()
+    ]
+    assert len(rejects) == 1, f"expected one rejection log, got {len(rejects)}"
+    assert sleeps == [], "a permanent config fault must not enter the retry loop"
+
+    # control: a genuine transient write-lock fault still retries 5x
+    calls = {"create": 0}
+
+    async def locked_create(email, password, name, role):
+        calls["create"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "adminpass1")
+    monkeypatch.setattr(store, "create_user", locked_create)
+    sleeps2 = []
+
+    async def fake_sleep2(seconds):
+        sleeps2.append(seconds)
+
+    monkeypatch.setattr(auth.asyncio, "sleep", fake_sleep2)
+    asyncio.run(auth.bootstrap_admin())
+    assert calls["create"] == 5 and sleeps2 == [1, 1, 1, 1]
+
+
+def test_bootstrap_admin_keeps_existing_weak_admin_but_warns(store, monkeypatch, caplog):
+    """An admin created by an earlier run with weak credentials must survive --
+    deleting the only admin at startup is an unauthenticated lockout -- but it
+    must be reported loudly for out-of-band rotation (#290)."""
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth, "store", store)
+    # simulate the pre-fix world: a weak admin already exists
+    asyncio.run(store.create_user("admin@x.co", "x", "Administrator", role="admin"))
+
+    with caplog.at_level(logging.ERROR, logger="auth"):
+        asyncio.run(bootstrap_admin())
+
+    # left in place, and NOT overwritten
+    existing = asyncio.run(store.get_user_by_email("admin@x.co"))
+    assert existing is not None and existing.role == "admin"
+    assert auth.verify_password("x", existing.password_hash)
+    assert len(asyncio.run(store.list_users())) == 1
+
+    joined = "\n".join(
+        r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR
+    )
+    assert "REJECTED" in joined
+    assert "Rotate" in joined
+    assert existing.id in joined
 
 
 def test_role_permissions_matrix():
