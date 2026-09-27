@@ -59,6 +59,8 @@ stages (run in order):
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
+  API_MAX_MEMORY API_MAX_RESTARTS FRONTEND_MAX_MEMORY RESTART_BACKOFF_MS
+     pm2 process tuning; must match ecosystem.config.js (tests enforce it)
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
