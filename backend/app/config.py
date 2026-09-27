@@ -279,6 +279,8 @@ class Config:
     # poisoning. 0 disables an individual limit. Unlike the auth limits these
     # FAIL CLOSED (503) when Redis is unreachable: these endpoints are the
     # abuse surface, so an unrated request is not an acceptable fallback.
+    # /ready is the one deliberate exception and fails open instead -- see
+    # health.py and auth.public_rate_limit.
     PUBLIC_SEARCH_RATE_PER_MIN = int(os.getenv("PUBLIC_SEARCH_RATE_PER_MIN", "60"))
     PUBLIC_FACETS_RATE_PER_MIN = int(os.getenv("PUBLIC_FACETS_RATE_PER_MIN", "60"))
     PUBLIC_CLICK_RATE_PER_MIN = int(os.getenv("PUBLIC_CLICK_RATE_PER_MIN", "120"))

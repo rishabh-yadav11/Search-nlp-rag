@@ -156,6 +156,38 @@ def test_facets_over_the_limit_is_rejected_with_429(monkeypatch):
     assert _client.get("/facets").status_code == 429
 
 
+def test_exhausting_the_search_limit_does_not_spend_the_facets_budget(monkeypatch):
+    """The per-endpoint limits are separate budgets, not one shared counter.
+
+    The limiter key is public:rl:<action>:<client ip>. If the action segment
+    were ever dropped, a client that burned its /search allowance would also
+    be throttled on /facets and its click beacons, and a runaway /ready prober
+    could throttle search -- with every other limit test still green, since
+    each of them only ever exhausts one endpoint at a time.
+    """
+
+    class _BothEndpointsCache:
+        """One cache serving both routes: facets wants a mapping, search a list."""
+
+        async def get(self, key):
+            if key == main.FACETS_CACHE_KEY:
+                return {"industry": [], "dealtype": []}
+            return [_summary_dict(1, 0.9)]
+
+        async def set(self, key, value, ttl=None):
+            return None
+
+    monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
+    monkeypatch.setattr(config, "PUBLIC_FACETS_RATE_PER_MIN", 1)
+    _cached_search_client(monkeypatch)
+    monkeypatch.setattr(main, "cache", _BothEndpointsCache())
+
+    assert _client.get("/search", params={"q": "test"}).status_code == 200
+    assert _client.get("/search", params={"q": "test"}).status_code == 429
+    # The search allowance is spent, but facets has its own.
+    assert _client.get("/facets").status_code == 200
+
+
 def test_analytics_click_over_the_limit_is_rejected_with_429(monkeypatch):
     monkeypatch.setattr(config, "PUBLIC_CLICK_RATE_PER_MIN", 1)
     monkeypatch.setattr(main, "record_click", _noop_async)

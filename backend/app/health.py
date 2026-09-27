@@ -260,7 +260,14 @@ async def ready() -> JSONResponse:
     return JSONResponse(status_code=200 if ok else 503, content=report)
 
 
-@router.get("/readyz")
+@router.get(
+    "/readyz",
+    # The same limiter, and deliberately the same "ready" action, as /ready:
+    # this alias runs the identical readiness probe, so it shares one budget
+    # rather than handing a caller a second allowance by changing one path
+    # segment. Same fail-open deviation, same reason.
+    dependencies=[Depends(public_rate_limit("ready", "PUBLIC_READY_RATE_PER_MIN", fail_closed=False))],
+)
 async def readyz() -> Response:
     from app.main import state  # lazy: avoid circular import at startup
 
