@@ -469,7 +469,10 @@ run_cron() {
     # ACCEPTED COST, named so it is a decision and not an accident: a user's own
     # crontab line that runs healthcheck.sh on a CUSTOM schedule is replaced by
     # the managed one. Put the webhook or LOG overrides on the managed entry
-    # instead. Any line that does not run these two scripts is untouched.
+    # instead. Two things are NOT touched: a line that does not run these two
+    # scripts, and a COMMENTED line that merely mentions healthcheck.sh -- a
+    # commented-out entry is how an operator disables the watchdog, and deleting
+    # it would silently re-arm one they believe is off.
     #
     # A MANAGED_BY=<tag> env prefix would let us keep such a line, but it cannot
     # be the filter: an entry written before the tag existed carries no tag, so
@@ -480,7 +483,16 @@ run_cron() {
     # text, and an exact match keeps a user's hand-edited variant (a different
     # schedule, a `nice` tweak) from being deleted out from under them. That
     # asymmetry is the cost of not wanting the same P1 there.
-    crontab -l 2>/dev/null | grep -vFx "$line_idx" | grep -vF "$SCRIPT_DIR/deploy/healthcheck.sh" > "$tmp" || true
+    #
+    # The healthcheck filter matches on the path but skips COMMENTED lines, so a
+    # user who disabled the watchdog by commenting its entry out keeps that
+    # marker. A plain substring `grep -vF` deleted it, which would silently
+    # re-arm a watchdog the operator believes they had switched off.
+    crontab -l 2>/dev/null \
+        | grep -vFx "$line_idx" \
+        | awk -v p="$SCRIPT_DIR/deploy/healthcheck.sh" \
+            'index($0, p) && $0 !~ /^[[:space:]]*#/ { next } { print }' > "$tmp" \
+        || true
     printf '%s\n' "$line_idx" >> "$tmp"
     printf '%s\n' "$line_hc" >> "$tmp"
     crontab "$tmp"

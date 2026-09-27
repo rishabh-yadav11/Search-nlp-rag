@@ -608,3 +608,33 @@ def test_run_cron_reclaims_a_users_own_healthcheck_line_by_design(tmp_path):
     entries = _hc_entries(crontab)
     assert len(entries) == 1
     assert entries[0].startswith("*/5 * * * *"), entries[0]
+
+
+def test_run_cron_keeps_a_commented_out_healthcheck_entry(tmp_path):
+    """Commenting the entry out is how an operator switches the watchdog off, so
+    that marker must survive. A plain substring `grep -vF` on the script path
+    deleted it, which would silently re-arm a watchdog the operator believes is
+    disabled -- and the documented contract said such lines were untouched.
+    """
+    script_dir = tmp_path / "host" / "app"
+    disabled = f"# disabled for now: {script_dir}/deploy/healthcheck.sh"
+    proc, crontab = run_cron(tmp_path, seeded_lines=[disabled], api_port="9001")
+
+    assert proc.returncode == 0, proc.stderr
+    assert disabled in crontab.splitlines(), "a commented-out entry is the user's disable marker, not a managed line"
+
+
+def test_run_cron_still_removes_an_active_healthcheck_entry_among_comments(tmp_path):
+    """The narrowing must not become a loophole: an ACTIVE line that runs our
+    script is still reclaimed even when comments sit around it."""
+    log = tmp_path / "healthcheck.log"
+    script_dir = tmp_path / "host" / "app"
+    active = f"*/7 * * * * LOG={log} {script_dir}/deploy/healthcheck.sh"
+    comment = f"# an old copy of the watchdog: {script_dir}/deploy/healthcheck.sh"
+    proc, crontab = run_cron(tmp_path, seeded_lines=[active, comment], api_port="9001")
+
+    assert proc.returncode == 0, proc.stderr
+    assert active not in crontab.splitlines()
+    assert comment in crontab.splitlines()
+    active_lines = [line for line in crontab.splitlines() if not line.lstrip().startswith("#")]
+    assert len(_hc_entries("\n".join(active_lines))) == 1

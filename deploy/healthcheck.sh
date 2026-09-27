@@ -99,9 +99,15 @@ alert() {
     log "still failing ($key); alert suppressed for another $((ALERT_COOLDOWN_SECONDS - age))s"
     return 0
   fi
-  # Written atomically: `>` truncates first, so a crash mid-write would leave an
-  # empty file for the next run to read. The alert matters more than the state,
-  # so a failed write is a warning, not a reason to stay quiet.
+  # Written atomically (tmp + mv on one filesystem) because `>` truncates first:
+  # a crash between the two left an empty file, which the next run would read as
+  # "never alerted" -- safe, but it silently re-enabled every alert.
+  #
+  # Two things are deliberately NOT covered by a test, and are not claimed to be:
+  # the torn-write window itself (a test cannot kill the script between truncate
+  # and write) and the mv failing. What IS tested is the consequence that
+  # matters -- a state write that fails still logs a warning and still reaches
+  # the operator, rather than silently disabling deduplication.
   if printf '%s %s\n' "$key" "$now" >"$STATE_FILE.tmp" 2>/dev/null; then
     mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null || log "WARNING: could not update $STATE_FILE"
   else
