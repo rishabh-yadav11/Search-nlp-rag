@@ -462,6 +462,25 @@ def test_streaming_ranking_retry_nudge_lands_in_the_system_role(
         _run(chat_store.close())
 
 
+@pytest.mark.parametrize("limit", [0, 40, 57, 60, 61, 80, 100, 181])
+def test_history_that_had_turns_never_claims_there_were_none(monkeypatch, limit):
+    """A budget too small to hold any turn still must not report the session as
+    having had no earlier conversation when turns existed: the omission note
+    names what was dropped, and where not even the note fits the honest answer
+    is silence. Saying "(no earlier conversation)" here would be a false claim
+    about the replay, and would lose the report of 10 turns."""
+    monkeypatch.setattr(chat_module.config, "CHAT_HISTORY_CHAR_LIMIT", limit)
+    prior = [_message(i, "user" if i % 2 else "assistant", f"[msg{i}] " + "z" * 500) for i in range(1, 11)]
+    note = "[10 earlier turn(s) omitted: history character limit reached]"
+
+    replay = chat_module._history_fence(prior)
+
+    assert len(replay) <= max(0, limit)
+    assert "no earlier conversation" not in replay
+    # The note needs 61 chars for a 10-turn history; below that, say nothing.
+    assert replay == (note if limit >= len(note) else "")
+
+
 # --- multi-entity entity names ---
 
 
