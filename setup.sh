@@ -221,23 +221,25 @@ run_backend() {
         echo "REDIS_URL=redis://localhost:$REDIS_PORT/0" >> "$ENV_FILE"
     fi
     # Per-IP rate limiting keys on the client IP, which behind nginx comes from
-    # X-Forwarded-For. Two stale states have to be repaired, not just a missing
-    # key:
-    #   * the key absent -- every proxied request keys on the nginx peer
-    #     (127.0.0.1) and the whole site shares one rate-limit bucket;
-    #   * the key =true, which .env.example used to ship, so any .env created
-    #     by the cp above already carries it. That trusts the header for EVERY
-    #     peer, letting a client connecting straight to :8001 forge one to land
-    #     in a fresh bucket per request and dodge the limit entirely.
-    # 'auto' trusts the header only for a loopback peer, which is nginx here and
-    # never a directly-connecting client, so it fixes both without opening a
-    # spoofing hole. An explicit false is left alone -- that is a deliberate
-    # local/direct-only choice. Re-run with true if your proxy is on another host.
-    if grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*true[[:space:]]*$' "$ENV_FILE"; then
-        echo "upgrading AUTH_TRUST_X_FORWARDED_FOR=true -> auto (re-apply true only if your proxy is not on this host)"
-        sed -i -E 's/^(AUTH_TRUST_X_FORWARDED_FOR=)[[:space:]]*[Tt][Rr][Uu][Ee][[:space:]]*$/\1auto/' "$ENV_FILE"
-    elif ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
+    # X-Forwarded-For. An .env that predates the per-IP public rate limits has
+    # no trust setting at all, so every proxied request keys on the nginx peer
+    # (127.0.0.1) and the whole site shares one rate-limit bucket. Append the
+    # shipped default in that one case.
+    if ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
         echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$ENV_FILE"
+    elif grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*true[[:space:]]*$' "$ENV_FILE"; then
+        # Warn, never rewrite. 'true' is the correct setting when the proxy
+        # runs on ANOTHER host, and silently downgrading it to 'auto' would
+        # collapse exactly that deployment back into the single-bucket outage.
+        # Such a host is already rate-limiting per IP correctly; its residual
+        # risk is that the header is trusted from ANY peer, which only matters
+        # when :8001 is also reachable directly (gunicorn binds 0.0.0.0 -- see
+        # issue #245). 'auto' closes that and is safe whenever the proxy is on
+        # this host, but the operator's value is theirs to change.
+        echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR=true trusts X-Forwarded-For from" >&2
+        echo "         ANY peer, so a client reaching :8001 directly can forge it" >&2
+        echo "         to dodge a rate limit. Set it to 'auto' (the new default)" >&2
+        echo "         if your reverse proxy runs on this host." >&2
     fi
     echo "backend ready"
 }

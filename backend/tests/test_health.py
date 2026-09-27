@@ -299,10 +299,7 @@ def test_redis_status_client_reused_between_concurrent_calls(monkeypatch):
     assert results == [(True, "redis")] * 3
     assert len(from_url_calls) == 1  # one client for all three callers
     assert health._redis_init_lock is lock_before  # never rebuilt by a caller
-    # Scoped to this lock: the module also builds the readiness single-flight
-    # lock at import, and the point here is that the Redis init lock is built
-    # exactly once and never rebuilt by an arriving caller.
-    assert created.count(lock_before) == 1
+    assert created == [lock_before]  # exactly one lock, built at import
     assert lock_before.max_pending == 3  # all three queued on that one lock
 
 
@@ -323,7 +320,7 @@ def test_redis_status_serializes_on_shared_lock(monkeypatch):
     monkeypatch.setattr(health.aioredis, "from_url", fake_from_url)
 
     lock = health._redis_init_lock
-    assert created.count(lock) == 1  # built once at import, before any caller arrived
+    assert created == [lock]  # built once at import, before any caller arrived
 
     async def scenario():
         await lock.acquire()  # simulate another caller owning the critical section
@@ -1165,6 +1162,30 @@ def test_readiness_cache_hit_needs_no_lock(monkeypatch):
     _run(scenario())
 
     assert entered == []
+
+
+def test_readiness_single_flight_lock_does_not_outlive_the_cache_entry():
+    """reset_readiness_cache must drop the single-flight lock as well.
+
+    A contended asyncio.Lock binds itself to the event loop that contended it
+    and refuses to be used from another one. These tests each run their own
+    event loop, so a lock carried over from an earlier test would make the next
+    concurrent miss raise "is bound to a different event loop". Resetting it
+    alongside the cached entry is what keeps each test's lock local to its own
+    loop.
+    """
+    assert health._readiness_probe_lock is None, "the autouse fixture resets it between tests"
+
+    async def scenario():
+        await asyncio.gather(*(health._cached_readiness_report({}) for _ in range(4)))
+        contended = health._readiness_probe_lock
+        health.reset_readiness_cache()
+        return contended, health._readiness_probe_lock
+
+    contended, after_reset = _run(scenario())
+
+    assert contended is not None, "the miss path must build a lock"
+    assert after_reset is None
 
 
 def test_readiness_report_probe_timeout_is_a_dependency_failure(monkeypatch):
