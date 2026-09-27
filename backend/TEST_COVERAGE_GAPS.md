@@ -15,8 +15,8 @@ deliberately carry no coverage percentages — a percentage in prose would be a
 second, ungated copy of the truth — and
 `tests/test_coverage_doc.py` checks the open-gaps list against the generated
 table: a module with uncovered statements may not be missing from it, a fully
-covered module may not appear in it, every `lines A-B` it cites must be inside
-that module's uncovered lines, and no line outside the generated block may pair
+covered module may not appear in it, every `lines A-B` it cites must contain an
+uncovered line of that module, and no line outside the generated block may pair
 a specific `app/<module>.py` reference with a percentage at all.
 
 ## Why this split
@@ -44,8 +44,9 @@ python scripts/measure_coverage.py                     # exit 1 if this file is 
 python scripts/measure_coverage.py --write             # regenerate the block below
 ```
 
-`pytest-cov` is pinned in `requirements-dev.txt`, so the measurement reproduces
-from a clean install of the pinned dependencies. The gate re-runs the same suite
+`pytest-cov` is a declared dev dependency in `requirements-dev.txt` (with a
+floor, the style the rest of that file uses), so the measurement reproduces from
+a clean install of the declared dependencies. The gate re-runs the same suite
 with `--cov-report=json` and compares the result module by module, so a
 hand-edited percentage, a deleted module row, a stale uncovered-line list, or a
 new `app/*.py` module that nobody wrote a row for all fail the backend CI job.
@@ -182,8 +183,8 @@ the generated table.
 - `app/analytics.py` — 94.3% (8/141 statements uncovered). The two `int()`
   casts in `record_click` and their fallbacks (lines 143-144 and 152-153, the
   second dropping the article id), the `_ZSUM_BATCH` paging in `click_signals`
-  lines 201, 206, and `_safe_int` lines 220-221, so a malformed click beacon
-  position is not exercised end to end.
+  lines 201, 206, and `_safe_int` lines 220-221, so neither a malformed beacon
+  position nor a poisoned article id in the stored signal is exercised.
 - `app/llm.py` — 94.3% (6/105 statements uncovered). `_retry_after_seconds`
   lines 88-90 and 92, the `Retry-After` header parsing including its
   unparseable-value path, and in `generate_answer` lines 127 and 134 the
@@ -195,10 +196,12 @@ the generated table.
   degradation to the in-process cache, the warn-once in `_degraded` lines
   107-109, and the client-discard in `delete_keys` line 217.
 - `app/health.py` — 95.0% (8/160 statements uncovered). `_redis_status` lines
-  179-180 and 183, the ping-failure and timeout legs that report `down` and
-  `degraded`, the two rejection returns in `_is_host_local_probe` lines 390 and
-  393, and the `except Exception` of `ready_deep` lines 429-433, which must
-  return a 500 rather than launder a probe defect into a verdict.
+  179-180 and 183, the `from_url` construction failure that reports `down` and
+  the `client is None` guard that reports `degraded` — the ping-failure and
+  timeout legs that also report `degraded` are covered. The two rejection
+  returns in `_is_host_local_probe` lines 390 and 393, and the `except Exception`
+  of `ready_deep` lines 429-433, which must return a 500 rather than launder a
+  probe defect into a verdict.
 - `app/index_text.py` — 97.5% (2/81 statements uncovered): `split_names` line
   42 and `_join_vals` line 148.
 - `app/rerank_boost.py` — 97.6% (2/83 statements uncovered):
@@ -353,9 +356,9 @@ symspellpy faked in sys.modules; vocab artifacts written to tmp paths.
 
 ### app/health.py (covered by tests/test_health.py)
 
-_Not fully covered: the `down` and `degraded` legs of `_redis_status`, the two
-rejections in `_is_host_local_probe`, and `ready_deep`'s catch-all. See the
-open-gaps entry for what the measurement says is missing._
+_Not fully covered: the `from_url` construction failure and the `client is None`
+guard in `_redis_status`, the two rejection returns in `_is_host_local_probe`,
+and `ready_deep`'s catch-all. See the open-gaps entry._
 
 Redis `from_url`/`ping` mocked (no live Redis), the module-global
 `_redis_client` reset between tests, and Qdrant faked with a `collection_exists`
@@ -376,15 +379,25 @@ coroutine.
       those as healthy.**
 - [x] **`_redis_status`**: no REDIS_URL → `(True, "memory")`;
       ping ok → `(True, "redis")` (plus client reuse, single `from_url`);
-      ping fail / timeout → `(True, "degraded")`. **ERROR PATH — Redis down.**
+      ping fail / timeout → `(False, "degraded")`, and the client is dropped.
+      **ERROR PATH — Redis down.**
+- [ ] **`_redis_status` construction failure**: a `from_url` that raises answers
+      `(False, "down")` — no test executes it.
+- [ ] **`_redis_status` `client is None`** answers `(False, "degraded")` — no
+      test executes it.
 - [x] **`_readiness_report` + `/ready`/`/readyz`**:
       report shape asserted with mocked + real checks wired together; ready →
       200, not-ready → 503 on both endpoints, and the verdict requires a usable
       LLM key.
 - [x] **`/ready/deep`** + **`_is_host_local_probe`**: the
       uncached/unrated monitoring probe, its bypass of both the shared readiness
-      cache and the limiter, and its refusal of a non-loopback peer or a request
-      carrying `X-Forwarded-For` — each proved by mutation.
+      cache and the limiter, and its refusal of a request carrying
+      `X-Forwarded-For` or of a peer that is not an IP address — each proved by
+      mutation.
+- [ ] **refusing a non-loopback peer** (`_is_host_local_probe`): both rejection
+      returns go unexecuted, so the "fail closed" claim above is untested.
+- [ ] **`ready_deep`'s catch-all**: the `except Exception` that has to answer
+      500 instead of a verdict.
 
 ---
 
@@ -864,9 +877,13 @@ trending scan, and the failure paths of the writers. See the open-gaps entry.
 ## Error-path status
 
 The generated block above lists, by module, every `except` and `raise`
-statement that no test executes. That list is the answer to "are the error paths
-covered?" — the opposite of what the previous version of this document did,
-which asserted that all of them were while the measurement said otherwise.
+statement that no test executes. That list is the closest thing here to an
+answer to "are the error paths covered?" — the opposite of what the previous
+version of this document did, which asserted that all of them were while the
+measurement said otherwise. It is narrower than the question: it classifies
+`except` and `raise` statements, so an error path written as a bare early
+return (`ChatStore.delete_message` in `app/chat.py`, for one) appears only in
+the table's uncovered-lines column.
 
 The untested error paths, grouped by the failure that would have been caught:
 
@@ -876,8 +893,8 @@ The untested error paths, grouped by the failure that would have been caught:
   their catch-alls, plus the whole of `retrieve_by_date_window` in
   `app/main.py`. A wrong `FieldCondition` or a changed `query_points` argument
   returns an empty or mis-ranked feed for every user, silently.
-* **Redis down, or returning malformed data.** The `down` and `degraded` legs
-  of `_redis_status` in `app/health.py`; the corrupt-payload degradation in
+* **Redis down, or returning malformed data.** The construction-failure leg of
+  `_redis_status` in `app/health.py`; the corrupt-payload degradation in
   `HybridCache.get`; the `int()` casts and their fallbacks in `record_click` in
   `app/analytics.py`; the `Retry-After` parsing and the empty-`choices`
   `LLMUnavailableError` in `app/llm.py`; the whole `get_trending_articles`
