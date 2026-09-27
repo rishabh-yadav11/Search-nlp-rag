@@ -8,8 +8,9 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
 import SimilarArticles from '../components/SimilarArticles'
-import { API_BASE, authHeaders, getToken, redirectToLogin } from '../lib/auth'
+import { API_BASE, authHeaders, getToken, logout, redirectToLogin } from '../lib/auth'
 import { isSafeUrl } from '../lib/safe-url'
+import { formatCost, formatEpochRelative } from '../lib/format'
 
 type Source = {
   id: number
@@ -105,25 +106,6 @@ async function api(path: string, init?: RequestInit) {
     throw new Error(detail || `Request failed (${res.status})`)
   }
   return res.json() as Promise<Record<string, unknown>>
-}
-
-// Always format with a fixed locale/timezone so output is identical across
-// clients and never diverges on hydration. `now` is computed at call time so
-// relative strings keep advancing while the page is open.
-function relativeTime(ts: number): string {
-  const diff = Date.now() / 1000 - ts
-  if (diff < 60) return 'just now'
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`
-  return new Date(ts * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })
-}
-
-function formatCost(cost: number): string {
-  if (cost <= 0) return ''
-  if (cost >= 1) return `$${cost.toFixed(2)}`
-  if (cost >= 0.01) return `$${cost.toFixed(4)}`
-  return `$${cost.toFixed(6)}`
 }
 
 function formatTime(ms: number): string {
@@ -625,7 +607,7 @@ export default function ChatPage() {
                   {s.title || 'New chat'}
                 </div>
                 <div className="chat-session-meta">
-                  <span suppressHydrationWarning>{relativeTime(s.updated_at)}</span>
+                  <span suppressHydrationWarning>{formatEpochRelative(s.updated_at)}</span>
                   {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
                 </div>
               </button>
@@ -647,14 +629,7 @@ export default function ChatPage() {
           <Link href="/" className="chat-back-link">
             ← Back to search
           </Link>
-          <button
-            type="button"
-            className="chat-logout"
-            onClick={() => {
-              fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
-              redirectToLogin()
-            }}
-          >
+          <button type="button" className="chat-logout" onClick={logout}>
             Log out
           </button>
         </div>
