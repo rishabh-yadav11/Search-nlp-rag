@@ -330,7 +330,8 @@ accounting is #295's audit. Do not read this section as 100%.
 - [x] **`rename_session` / `delete_session` when session missing** (lines 321,
       336) → 404.
 - [x] **`global_stats` exception handler** (lines 404-464): a failing query
-      degrades to `{"error": "chat analytics unavailable"}`, never raises.
+      raises `ChatAnalyticsUnavailableError`, which `/analytics/chat` maps to
+      a 503 (never a 200 error-shaped body). See #281.
 - [x] **`json_loads` malformed JSON** (lines 562-616): bad JSON, `None`, and
       non-string input all → `[]`. **ERROR PATH — malformed stored rows.**
 - [x] **`_row_to_message`** (lines 616-628): malformed/legacy row field

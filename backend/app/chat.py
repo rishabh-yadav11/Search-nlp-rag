@@ -75,6 +75,16 @@ AUDIT_RETENTION_DAYS = 90
 store: "ChatStore | None" = None
 
 
+class ChatAnalyticsUnavailableError(RuntimeError):
+    """The chat store could not be read for cross-user analytics.
+
+    Raised by :meth:`ChatStore.global_stats` instead of returning an
+    error-shaped payload, so the HTTP layer can answer 503. Returning
+    ``{"error": ...}`` as a 200 was indistinguishable from a chat store that
+    genuinely has no conversations.
+    """
+
+
 class SessionOut(BaseModel):
     id: str
     title: str
@@ -473,7 +483,7 @@ class ChatStore:
         )
 
     async def global_stats(self) -> dict:
-        """Cross-user analytics across the whole chat DB. Never raises.
+        """Cross-user analytics across the whole chat DB.
 
         This response is NOT content-free: it exposes global totals plus
         per-session rows (opaque session id, message count, cost or tokens,
@@ -485,7 +495,12 @@ class ChatStore:
         read of this data is written to the admin audit trail by
         `record_admin_audit`; `admin_audit_log` reads it back. Both are
         ChatStore methods — the trail is deliberately not exposed over HTTP,
-        so exposing cross-user read history cannot itself become a leak."""
+        so exposing cross-user read history cannot itself become a leak.
+
+        Raises :class:`ChatAnalyticsUnavailableError` if the chat database
+        cannot be read, so callers answer 503 instead of returning a body that
+        is indistinguishable from a genuinely empty chat store.
+        """
         try:
             sessions_row = await self._fetchone(
                 "SELECT COUNT(*) AS n FROM sessions"
@@ -541,9 +556,9 @@ class ChatStore:
                 "sessions_today": sum(int(r["n"]) for r in day_rows if r["d"] == today),
                 "daily_sessions": [[r["d"], int(r["n"])] for r in day_rows],
             }
-        except Exception:
-            logger.exception("chat global_stats failed")
-            return {"error": "chat analytics unavailable"}
+        except Exception as exc:
+            logger.exception("chat global_stats failed; chat store unavailable")
+            raise ChatAnalyticsUnavailableError("chat analytics unavailable") from exc
 
     async def record_admin_audit(self, actor_id: str, action: str) -> None:
         """Append one row to the durable admin audit trail.

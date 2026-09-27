@@ -148,3 +148,104 @@ describe('AnalyticsDashboardPage — empty chat stats', () => {
     expect(screen.queryAllByText(/^Session \w+$/)).toHaveLength(0)
   })
 })
+
+
+// --- #281: a failed feed is shown as failed, never as an all-zero report ---
+
+const UNAVAILABLE_SUMMARY = { error: 'analytics unavailable', detail: 'the analytics store could not be read' }
+const UNAVAILABLE_CHAT = { error: 'chat analytics unavailable', detail: 'the analytics store could not be read' }
+
+function statusResponse(status: number, data: unknown): StubResponse {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => data,
+    text: async () => JSON.stringify(data),
+  }
+}
+
+function stubFeeds(summary: StubResponse, chat: StubResponse) {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL): Promise<StubResponse> => {
+      const url = String(input)
+      if (url.includes('/api/auth/me')) return jsonResponse(ADMIN)
+      if (url.includes('/analytics/chat')) return chat
+      if (url.includes('/analytics/summary')) return summary
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+  )
+}
+
+async function renderFeeds(summary: StubResponse, chat: StubResponse) {
+  stubFeeds(summary, chat)
+  render(<AnalyticsDashboardPage />)
+  await screen.findByText(/^Analytics unavailable/)
+}
+
+/** Whole card text (label + value + hint) for a metric card. */
+function cardText(label: string): string {
+  return screen.getByText(label).parentElement?.textContent ?? ''
+}
+
+describe('AnalyticsDashboardPage — a store that cannot be read is not a quiet day', () => {
+  it('shows an unavailable state, not zero cards, when both feeds answer 503', async () => {
+    await renderFeeds(statusResponse(503, UNAVAILABLE_SUMMARY), statusResponse(503, UNAVAILABLE_CHAT))
+
+    expect(screen.getByText(/Analytics unavailable/)).toBeTruthy()
+    expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
+    expect(screen.getByText(/Chat usage \(unavailable\)/)).toBeTruthy()
+    // The zeroed report is the bug: none of its cards may render.
+    for (const label of ['Searches today', 'Zero-result rate', 'Clicks', 'Chat users', 'Total tokens']) {
+      expect(screen.queryByText(label)).toBeNull()
+    }
+    expect(screen.queryByText('No data yet.')).toBeNull()
+    expect(screen.queryByText('No chat activity yet.')).toBeNull()
+    // And it must not claim a successful fresh read.
+    expect(document.body.textContent).not.toMatch(/Updated \d/)
+  })
+
+  it('treats a 503 with no error key as a failure on the status line alone', async () => {
+    // An intermediary (nginx, a gateway) can answer 503 with an HTML error
+    // page or an empty body, so the status line has to be load-bearing on its
+    // own — not only the `error` key.
+    await renderFeeds(statusResponse(503, '<html>502 Bad Gateway</html>'), statusResponse(200, CHAT))
+
+    expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
+    expect(screen.getByText(/HTTP 503/)).toBeTruthy()
+    expect(screen.queryByText('Searches today')).toBeNull()
+  })
+
+  it('still detects the legacy 200-with-error body the backend used to send', async () => {
+    // Status 200 + an `error` key is byte-for-byte what the old backend sent
+    // during a Redis outage; treating it as data is what produced the all-zero
+    // dashboard, so it must be treated as a failure.
+    await renderFeeds(statusResponse(200, UNAVAILABLE_SUMMARY), statusResponse(200, UNAVAILABLE_CHAT))
+
+    expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
+    expect(screen.queryByText('Searches today')).toBeNull()
+    expect(screen.queryByText('Chat users')).toBeNull()
+  })
+
+  it('keeps the healthy feed rendering when only the other one is down', async () => {
+    await renderFeeds(statusResponse(503, UNAVAILABLE_SUMMARY), jsonResponse(CHAT))
+
+    expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
+    expect(screen.queryByText('Searches today')).toBeNull()
+    // The chat half is real data and must still be readable.
+    await screen.findByText('Chat usage')
+    expect(cardText('Chat users')).toContain('2')
+    expect(screen.getAllByText(/^Session \w+$/)).toHaveLength(2)
+  })
+
+  it('renders the full report with no unavailable state when both feeds are healthy', async () => {
+    stubFeeds(jsonResponse(SUMMARY), jsonResponse(CHAT))
+    render(<AnalyticsDashboardPage />)
+    await screen.findByText('Chat usage')
+
+    expect(screen.queryByText(/unavailable/i)).toBeNull()
+    expect(cardText('Searches today')).toContain('4')
+    expect(cardText('Chat users')).toContain('2')
+    expect(document.body.textContent).toMatch(/Updated \d/)
+  })
+})
