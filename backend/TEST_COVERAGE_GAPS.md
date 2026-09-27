@@ -298,7 +298,10 @@ without a failure.
       filter → `retrieve_and_rerank` → click-boost + diversity wiring,
       `cache.set`, `record_search` cached=False); boost/diversity disabled
       variant; built qfilter passed through. **ERROR PATH — Qdrant/Redis down
-      → 500 via TestClient** (`raise_server_exceptions=False`).
+      → 500 via TestClient** (`raise_server_exceptions=False`) whose body is
+      only the opaque detail plus the request id, alongside the logged
+      traceback stamped with the same id
+      (`tests/test_request_context.py`).
 - [x] **`source_context` author/industry/dealtype branches** (lines 593-598):
       all facets → `Authors:`/`Industry:`/`Dealtype:` suffixes; none → bare
       `n/a`; body truncated to `body_limit`; no-summary.
@@ -534,6 +537,29 @@ Added by this change, all exercised end to end through the HTTP handlers:
       `datetime` instance kept verbatim then tz-normalized; blank string →
       `None`; a non-parseable string is returned as-is instead of raising.
       **ERROR PATH — malformed index rows.**
+
+## app/request_context.py + app/observability.py (covered by tests/test_request_context.py)
+
+- [x] **id resolution**: a valid inbound `X-Request-ID`
+      (`[A-Za-z0-9._-]{1,64}`) is honoured; 200-char, newline-bearing,
+      space-bearing and empty values are replaced by a generated 32-char hex
+      id and never echoed back.
+- [x] **propagation**: the id is bound for the whole downstream call, so a
+      record emitted several layers inside a handler carries it; it is reset
+      afterwards (no leak into the next request); a `StreamingResponse` (the
+      SSE chat path) keeps every chunk and still carries the header.
+- [x] **access log**: one INFO record per request with method, path, status,
+      `duration_ms` and user id, at a level the shipped gunicorn/uvicorn
+      deployment actually renders (root stays at WARNING; `app.access` is
+      pinned to INFO).
+- [x] **top-level handler**: an unhandled exception is logged once with the
+      traceback and the id, and answered with an opaque 500 whose body is
+      `detail` + `request_id` only — never the exception text, class name or
+      traceback.
+- [x] **not swallowed**: `HTTPException` keeps Starlette's own status and
+      detail (404, 418) and logs nothing at ERROR; `RequestValidationError`
+      stays a 422 with the `detail`-is-a-list shape clients already parse,
+      minus the non-serialisable `ctx`/`input`.
 
 ---
 

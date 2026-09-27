@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastembed import SparseTextEmbedding
@@ -45,6 +46,12 @@ from app.health import close_redis as health_module_close_redis
 from app.health import router as health_router
 from app.health import warn_if_llm_key_unusable
 from app.logging_config import configure_logging
+from app.observability import (
+    RequestIdMiddleware,
+    attach_request_id_filter,
+    unhandled_exception_handler,
+    validation_exception_handler,
+)
 from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
@@ -353,6 +360,17 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=config.ALLOWED_HOSTS,
 )
+
+# Outermost of the user middlewares (add_middleware inserts at index 0) so every
+# request, including one rejected by TrustedHost/CORS below it, is correlated.
+app.add_middleware(RequestIdMiddleware)
+app.add_exception_handler(Exception, unhandled_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+# #293's configure_logging() above owns the app's single root handler; this only
+# adds the per-request id filter to that handler, so a record it renders carries
+# the id. Installing a second handler here would write every app line twice, and
+# it must stay after that call -- installed_handler() is None until then.
+attach_request_id_filter()
 
 # A host that is missing from ALLOWED_HOSTS answers 400 to every request, which
 # looks like a broken app rather than a config mistake. Log the effective list
