@@ -401,7 +401,7 @@ an explicit timeout.
 
 1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest` (790 tests). It installs the *full* `requirements.txt` rather than a slimmed test set because `app/main.py` does `from fastembed import SparseTextEmbedding` at module scope and six test modules import `app.main`, so the suite cannot be collected without the runtime stack. (`app/encoders.py` and `app/reranker.py` import `fastembed`/`sentence_transformers` lazily inside their constructors, and their tests fake those modules in `sys.modules`.) There is deliberately **no `ruff format` gate** — `ruff format --check` already reports 50 files that would be reformatted, so enforcing it would mean reformatting the tree, not CI.
 2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest, 127 tests).
-3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan over full history (pinned to 8.28.0, download SHA-256 verified).
+3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan (binary pinned to 8.28.0, download SHA-256 verified) over the full history of the checked-out ref.
 
 ### Audit policy
 
