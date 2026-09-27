@@ -18,6 +18,14 @@ interface Summary {
   click_top_queries: [string, number][]
 }
 
+// The first element of each chat row is the OPAQUE session id, never the
+// session title. The title is the first 60 characters of the user's own
+// question, so surfacing it here would leak one user's message text to every
+// `analytics:read` holder. The backend sends the id instead; do not
+// "helpfully" render a title here — there isn't one to render.
+type ChatRow = [sessionId: string, messages: number, cost: number, updatedAt: number]
+type ChatTokenRow = [sessionId: string, messages: number, tokens: number, updatedAt: number]
+
 interface ChatStats {
   sessions: number
   users: number
@@ -26,8 +34,8 @@ interface ChatStats {
   total_cost: number
   avg_latency_ms: number
   sessions_today: number
-  top_by_cost: [string, number, number, number][]
-  top_by_tokens: [string, number, number, number][]
+  top_by_cost: ChatRow[]
+  top_by_tokens: ChatTokenRow[]
 }
 
 function fmt(n: number | null | undefined): string {
@@ -85,7 +93,7 @@ function ChatTable({
   rows,
   cost,
 }: {
-  rows: [string, number, number, number][] | undefined
+  rows: (ChatRow | ChatTokenRow)[] | undefined
   cost: boolean
 }) {
   if (!rows || rows.length === 0) return <div className="dash-empty">No chat activity yet.</div>
@@ -93,16 +101,23 @@ function ChatTable({
     <table>
       <thead>
         <tr>
-          <th scope="col">Conversation</th>
+          <th scope="col">Session</th>
           <th scope="col" className="num">Msgs</th>
           <th scope="col" className="num">{cost ? 'Cost' : 'Tokens'}</th>
           <th scope="col">Updated</th>
         </tr>
       </thead>
       <tbody>
-        {rows.map(([title, msgs, value, ts]) => (
-          <tr key={title + ts}>
-            <td>{title}</td>
+        {rows.map(([sessionId, msgs, value, ts]) => (
+          // Keyed by the session id, never the timestamp: a session updated
+          // twice within one poll would otherwise remount the row and lose
+          // whatever the cell holds.
+          <tr key={sessionId}>
+            {/* A non-identifying surrogate for the conversation: a short
+                prefix is enough to correlate rows, and the full id lives in
+                the `title` attribute so an admin can still copy it. The
+                conversation text itself must never reach this table. */}
+            <td title={sessionId}>Session {sessionId.slice(0, 8)}</td>
             <td className="num">{fmt(msgs)}</td>
             <td className="num">{cost ? usd(value) : fmt(value)}</td>
             <td>{new Date(ts * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}</td>
