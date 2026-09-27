@@ -996,8 +996,9 @@ def retrieval_config_fingerprint() -> str:
 
     * the retrieval/rerank pipeline (the dense and sparse embedding models,
       collection, query expansion, candidate depth, rerank model/backend, and
-      the entity boost) — read by ``retrieve_and_rerank`` and
-      ``hybrid_search``, and therefore affecting the ``search:`` entry
+      the entity boost, and the recency blend that sorts and re-scores the
+      final set) — read by ``retrieve_and_rerank``, ``hybrid_search`` and
+      ``sort_results``, and therefore affecting the ``search:`` entry
       transitively as well;
     * the post-retrieval /search shaping (click boost and its thresholds,
       diversity and its parameters, and the ``ASK_MIN_SCORE`` relevance gate
@@ -1018,6 +1019,8 @@ def retrieval_config_fingerprint() -> str:
         "rerank_backend": config.RERANK_BACKEND,
         "rerank_model": config.RERANK_MODEL,
         "rerank_candidates": config.RERANK_CANDIDATES,
+        "recency_strength": config.RECENCY_STRENGTH,
+        "recency_decay_days": config.RECENCY_DECAY_DAYS,
         "enable_query_expansion": config.ENABLE_QUERY_EXPANSION,
         "enable_entity_boost": config.ENABLE_ENTITY_BOOST,
         "enable_click_boost": config.ENABLE_CLICK_BOOST,
