@@ -1264,6 +1264,11 @@ def _history_fence(history: list[MessageOut]) -> str:
     # Label in display order (oldest first) so the turn numbers read naturally.
     labels = [f"TURN {i} {m.role}" for i, m in enumerate(turns, start=1)]
     blocks = [_fence(label, _neutralise_fences(m.content)) for label, m in zip(labels, turns, strict=True)]
+    if not blocks:
+        # A fresh session still says so explicitly, rather than leaving a bare
+        # "Conversation so far:" label with nothing under it.
+        return _NO_EARLIER_CONVERSATION if budget >= len(_NO_EARLIER_CONVERSATION) else ""
+
 
     # The note and the "\n" that joins it to the turns below are part of the
     # rendered replay, so their worst-case cost is reserved up front. Reserving
