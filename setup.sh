@@ -598,8 +598,9 @@ run_nginx() {
     mode="$(nginx_tls_mode)"
     # A domain configured without a certificate is the silent-plaintext failure
     # mode this stage exists to prevent, so say so loudly instead of quietly
-    # serving cleartext.
-    if [ "$mode" = "off" ] && [ -n "$LE_DOMAIN" ]; then
+    # TLS_BOOTSTRAP=1 marks the deliberate pass-through to plain HTTP that
+    # run_tls makes before certbot runs; that one is not the silent failure.
+    if [ "$mode" = "off" ] && [ -n "$LE_DOMAIN" ] && [ "${TLS_BOOTSTRAP:-0}" != "1" ]; then
         echo "WARNING: LE_DOMAIN=$LE_DOMAIN is configured but there is no readable" >&2
         echo "         certificate at $LE_CERT, so this site is being served over" >&2
         echo "         plain HTTP. Passwords, bearer tokens and chat content will" >&2
@@ -665,6 +666,14 @@ run_tls() {
         echo "ERROR: certbot is not installed (e.g. sudo apt-get install -y certbot)." >&2
         return 1
     fi
+    # The challenge must be servable BEFORE certbot asks Let's Encrypt to fetch
+    # it. On a host whose nginx config predates the ACME location, the token
+    # would fall through "location /" to Next.js, 404, and validation would fail
+    # on the very first run. Installing the plain-HTTP config first is a no-op
+    # for the site (it already serves plain HTTP; this only adds the challenge
+    # location) and it is what makes "./setup.sh tls" work standalone.
+    NGINX_TLS=off
+    TLS_BOOTSTRAP=1 run_nginx || return 1
     sudo mkdir -p "$CERTBOT_WEBROOT/.well-known/acme-challenge"
     # webroot, never --standalone: --standalone needs port 80 free, so on the
     # live site it would fail with the port taken (or force nginx to stop and
@@ -677,7 +686,12 @@ run_tls() {
         --email "$LE_EMAIL" --agree-tos --non-interactive \
         --keep-until-expiring \
         --deploy-hook 'systemctl reload nginx'; then
-        echo "ERROR: certbot failed; the plain-HTTP config is untouched and still serving." >&2
+        echo "ERROR: certbot failed; the plain-HTTP config is still installed and serving." >&2
+        echo "       The usual cause is that http://$LE_DOMAIN/.well-known/acme-challenge/" >&2
+        echo "       is not reaching this host: check that the domain's A/AAAA record" >&2
+        echo "       points here and that port 80 is open in the firewall and the" >&2
+        echo "       cloud security group. certbot's own log:" >&2
+        echo "       sudo journalctl -u certbot -n 50 --no-pager" >&2
         return 1
     fi
     # The certificate is on disk now, so the :443 server can be rendered.
