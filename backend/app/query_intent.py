@@ -720,17 +720,6 @@ def range_query_topic(query: str) -> str | None:
     return None
 
 
-def month_query_topic(query: str) -> str | None:
-    """Cleaned retrieval/rerank query for a month-scoped query, e.g.
-    'top pharma deals of month january 2025' -> 'pharma deals'. The date filter
-    already scopes the month, so dropping the 'top/of/month/year' words lets the
-    embeddings and cross-encoder focus on the actual topic. None when the query
-    doesn't mention a specific month."""
-    if extract_month_range(query) is None:
-        return None
-    return range_query_topic(query)
-
-
 def extract_list_topic(query: str) -> str | None:
     """The bare topic of a top-N query with year/time words removed, e.g.
     'top 3 unicorns created in 2025' -> 'unicorns created'. None when the
