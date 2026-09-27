@@ -426,9 +426,16 @@ it and do not fail the build. A new high/critical advisory does.
 
 **gitleaks** runs the default rule set with **no allow-list and no
 `.gitleaks.toml`** — nothing is excluded, so a real key in any tracked file
-fails the job. `origin/main` scans clean (0 leaks over 554 commits). Planting a
-fake AWS key pair in `backend/` makes the scan report the leak and exit non-zero,
-which is how the gate was confirmed to bite. Next.js build output
-(`frontend/.next/`) is gitignored and absent from a fresh CI checkout, so it
-needs no exclusion; `gitleaks detect` also reads git history, not the untracked
-working tree.
+fails the job. The scan is pinned to `HEAD` rather than gitleaks' default
+`--all`: a `fetch-depth: 0` checkout has every branch in the object store, and
+`--all` reports secrets committed on unrelated branches, which would fail this
+job for code a PR never touched. `HEAD` loses nothing — a `pull_request`
+checkout is the merge commit, so its history contains both the branch and
+everything it branched off from. This branch scans clean (0 leaks).
+
+The scan reads committed history, not the working tree, so the gate was proved
+by committing a throwaway RSA private key on a scratch clone: gitleaks reported
+the leak and exited 1, and the identical command exits 0 without it. Worth
+knowing: gitleaks' built-in dummy allowlist swallows the canonical placeholder
+AWS key and a synthetic `ghp_` token, so a probe using those two strings is
+not evidence the gate works.
