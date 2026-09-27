@@ -227,19 +227,24 @@ run_backend() {
     # shipped default in that one case.
     if ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
         echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$ENV_FILE"
-    elif grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*true[[:space:]]*$' "$ENV_FILE"; then
-        # Warn, never rewrite. 'true' is the correct setting when the proxy
-        # runs on ANOTHER host, and silently downgrading it to 'auto' would
-        # collapse exactly that deployment back into the single-bucket outage.
-        # Such a host is already rate-limiting per IP correctly; its residual
-        # risk is that the header is trusted from ANY peer, which only matters
-        # when :8001 is also reachable directly (gunicorn binds 0.0.0.0 -- see
-        # issue #245). 'auto' closes that and is safe whenever the proxy is on
-        # this host, but the operator's value is theirs to change.
-        echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR=true trusts X-Forwarded-For from" >&2
-        echo "         ANY peer, so a client reaching :8001 directly can forge it" >&2
-        echo "         to dodge a rate limit. Set it to 'auto' (the new default)" >&2
-        echo "         if your reverse proxy runs on this host." >&2
+    elif grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*(1|true|yes|on)[[:space:]]*$' "$ENV_FILE"; then
+        # The spellings above are exactly the ones config._env_tristate reads as
+        # a forced True, so this warning covers every value that leaves the
+        # header trusted from any peer -- not just the literal "true".
+        # Warn, never rewrite. A forced True is the correct setting when the
+        # proxy runs on ANOTHER host, and silently downgrading it to 'auto'
+        # would collapse exactly that deployment back into the single-bucket
+        # outage. Such a host is already rate-limiting per IP correctly; its
+        # residual risk is that the header is trusted from ANY peer, which only
+        # matters when :8001 is also reachable directly (gunicorn binds
+        # 0.0.0.0 -- see issue #245). 'auto' closes that and is safe whenever
+        # the proxy is on this host, but the operator's value is theirs.
+        echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR is set to a forced-true value" >&2
+        echo "         (1/true/yes/on), which trusts X-Forwarded-For from ANY" >&2
+        echo "         peer, so a client reaching :8001 directly can forge it to" >&2
+        echo "         dodge a rate limit. Set it to 'auto' (the new default) if" >&2
+        echo "         your reverse proxy runs on this host; keep it forced if the" >&2
+        echo "         proxy runs on another host." >&2
     fi
     echo "backend ready"
 }
