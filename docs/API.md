@@ -444,10 +444,11 @@ endpoints below with the bearer token, and refreshes every 30s.
 
 | Endpoint | Purpose | Status |
 |----------|---------|--------|
-| `GET /health` | Liveness | always `200` if the process is up |
+| `GET /health` | Liveness (checks nothing) | always `200` if the process is up |
 | `GET /live`   | Liveness alias | `200` |
-| `GET /ready`  | Readiness (JSON report) | `200` when ready, `503` if Qdrant/models unavailable |
+| `GET /ready`  | Readiness (JSON report) | `200` when ready, `503` if Qdrant/models unavailable or `GEMINI_API_KEY` is missing/placeholder/malformed |
 | `GET /readyz` | Readiness (bare) | `200` / `503` |
+| `GET /ready/deep` | Readiness, uncached + unrated, local monitoring only | `200` / `503`; `403` for a non-loopback or proxied caller |
 
 `/ready` example:
 
@@ -458,12 +459,20 @@ endpoints below with the bearer token, and refreshes every 30s.
     "qdrant": { "ok": true },
     "models": { "ok": true },
     "redis": { "ok": true, "cache": "redis" },
-    "llm": { "ok": true }
+    "llm": { "ok": true, "reason": "ok" }
   }
 }
 ```
 
 Redis down does not fail readiness (the API degrades to an in-process cache).
+A missing, placeholder or malformed `GEMINI_API_KEY` does: chat would answer
+every question from the canned fallback, so `checks.llm.reason` is `missing`,
+`placeholder` or `malformed` and readiness is `false`. `reason` is a
+classification — the key itself is never included.
+
+`/health` and `/live` are liveness only and inspect no dependency, so they
+answer `200` for a backend that is not ready at all. Never gate a deploy, a load
+balancer or an alert on them.
 
 ---
 

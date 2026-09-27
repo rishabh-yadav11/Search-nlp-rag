@@ -458,6 +458,11 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
+    # /ready/deep is deliberately NOT proxied (#279): it is the watchdog's probe,
+    # uncached and unrated, and the API only answers it for a direct loopback
+    # request with no X-Forwarded-For -- which every request through this block
+    # has. Keep it off the internet; setup.sh and deploy/healthcheck.sh reach it
+    # on 127.0.0.1 directly.
     location /facets {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_set_header X-Real-IP \$remote_addr;
