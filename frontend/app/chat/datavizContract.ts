@@ -83,11 +83,24 @@ export const VIEWS = ['table', 'bar', 'line', 'pie'] as const
 export const NUMERIC_LITERAL_SRC = '[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?'
 const NUMERIC_LITERAL = new RegExp(`^${NUMERIC_LITERAL_SRC}$`)
 
+/**
+ * The whitespace trimmed off a cell, spelled out as ASCII whitespace. NOT
+ * `String.prototype.trim`, which also removes U+FEFF while Python's
+ * `str.strip()` leaves it: a cell carrying a BOM was "missing" here and a real
+ * value on the server. The contract test probes every one of these characters
+ * against the backend's `_TRIM_CHARS` so the two cannot drift apart again.
+ */
+export const TRIM_SRC = '\\t\\n\\v\\f\\r '
+
+const TRIM = new RegExp(`^[${TRIM_SRC}]+|[${TRIM_SRC}]+$`, 'g')
+
+export const trimCell = (s: string): string => s.replace(TRIM, '')
+
 export function toNum(v: unknown): number | null {
   if (typeof v === 'boolean') return null
   if (typeof v === 'number') return Number.isFinite(v) ? v : null
   if (typeof v === 'string') {
-    const cleaned = v.replace(/,/g, '').trim()
+    const cleaned = trimCell(v.replace(/,/g, ''))
     if (!NUMERIC_LITERAL.test(cleaned)) return null
     const n = Number(cleaned)
     return Number.isFinite(n) ? n : null
@@ -125,7 +138,7 @@ export function isMissing(v: unknown): boolean {
   // Object.hasOwn, not a plain lookup: a cell reading "constructor" or
   // "__proto__" must not find Object.prototype's members and count as missing.
   if (typeof v === 'string') {
-    return Object.hasOwn(MISSING_VALUE_TOKENS, v.trim().toLowerCase())
+    return Object.hasOwn(MISSING_VALUE_TOKENS, trimCell(v).toLowerCase())
   }
   return false
 }

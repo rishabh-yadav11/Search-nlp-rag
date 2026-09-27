@@ -179,3 +179,26 @@ def test_corpus_exercises_every_missing_value_token(corpus):
         if tok not in cells:
             problems.append(f"{tok!r}: fixture {name} does not contain it as a cell (cells={cells!r})")
     assert not problems, "missing-value tokens no fixture really covers:\n" + "\n".join(problems)
+
+
+def test_both_sides_trim_the_same_whitespace(frontend):
+    """Which characters get trimmed off a cell, checked one codepoint at a time.
+
+    The two languages disagree here and a string comparison cannot see it:
+    JavaScript's trim() removes U+FEFF and Python's str.strip() does not, so a
+    cell carrying a BOM read as "missing" in the browser and as a real value on
+    the server. Both sides now name ASCII whitespace explicitly, and this pins
+    every character either side might have an opinion about -- including the
+    ones that must NOT be trimmed."""
+    mismatched = [
+        f"U+{cp.upper()}: backend trims={backend_trims} frontend trims={frontend['trim_probes'].get(cp)}"
+        for cp, backend_trims in sorted(chat_module._TRIM_PROBES.items())
+        if frontend["trim_probes"].get(cp) != backend_trims
+    ]
+    assert not mismatched, "the two sides trim different characters:\n" + "\n".join(mismatched)
+
+
+def test_trim_grammar_is_one_string_on_both_sides(frontend):
+    """The trim set is shared as a string, so the character class behind the
+    per-codepoint probe above can only be changed in both places at once."""
+    assert frontend["trim_src"] == chat_module._TRIM_SRC

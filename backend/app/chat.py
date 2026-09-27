@@ -795,6 +795,41 @@ def _strip_unclosed_fence(text: str) -> str:
 _NUMERIC_LITERAL_SRC = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _NUMERIC_LITERAL_RE = re.compile(_NUMERIC_LITERAL_SRC)
 
+
+# The whitespace trimmed off a cell, spelled out. NOT str.strip()'s default:
+# JavaScript's trim() also removes U+FEFF, Python's str.strip() does not, so a
+# cell carrying a BOM was "missing" in the browser and a real value on the
+# server. ASCII whitespace is named explicitly so both sides trim the same
+# characters; the contract test probes them one by one.
+_TRIM_CHARS = " \t\n\r\v\f"
+_TRIM_SRC = "\\t\\n\\v\\f\\r "
+
+
+def _trims(ch: str) -> bool:
+    return f"x{ch}".strip(_TRIM_CHARS) == "x"
+
+
+# Every codepoint either language has an opinion about, and whether the backend
+# trims it. The contract test compares this against the same probe run under
+# node, so a whitespace class that means different things in the two languages
+# is caught even though the two source strings are identical.
+_TRIM_PROBES: dict[str, bool] = {
+    f"{cp:04x}": _trims(chr(cp))
+    for cp in (
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000, 0x200B,
+        0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF,
+    )
+}
+
+
+def _reject_json_constant(name: str) -> None:
+    """Refuse the bare JSON literals ``NaN``, ``Infinity`` and ``-Infinity``.
+
+    json.loads accepts them, JSON.parse throws on them, so a block carrying one
+    anywhere -- in a cell, but equally in ``title`` or any other key -- was kept
+    by the server and unparseable in the browser (#267)."""
+    raise ValueError(f"not a JSON literal: {name}")
+
 def _as_float(v: object) -> float | None:
     """Coerce a cell to a FINITE float, else None.
 
@@ -820,7 +855,7 @@ def _as_float(v: object) -> float | None:
     if isinstance(v, (int, float)):
         return float(v) if math.isfinite(v) else None
     if isinstance(v, str):
-        cleaned = v.replace(",", "").strip()
+        cleaned = v.replace(",", "").strip(_TRIM_CHARS)
         if _NUMERIC_LITERAL_RE.fullmatch(cleaned) is None:
             return None
         parsed = float(cleaned)
@@ -841,7 +876,7 @@ def _missing_cell(v: object) -> bool:
     if v is None:
         return True
     if isinstance(v, str):
-        return v.strip().lower() in _MISSING_VALUE_TOKENS
+        return v.strip(_TRIM_CHARS).lower() in _MISSING_VALUE_TOKENS
     return False
 
 
@@ -887,7 +922,7 @@ def parse_dataviz(text: str) -> dict | None:
     if not m:
         return None
     try:
-        data = json.loads(m.group(1))
+        data = json.loads(m.group(1), parse_constant=_reject_json_constant)
     except (ValueError, TypeError):
         return None
     if not isinstance(data, dict):
