@@ -527,6 +527,13 @@ class AuthStore:
         return n
 
     async def set_password(self, user_id: str, password_hash: str) -> None:
+        """Overwrite one user's stored hash on its own.
+
+        A caller that also has to invalidate credentials must not use this: a
+        password write that commits without the matching revocation leaves
+        every previously issued token alive behind a password the owner has
+        just changed. ``change_password`` is the atomic form.
+        """
         await self._db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
         await self._db.commit()
 
@@ -755,6 +762,63 @@ class AuthStore:
     async def revoke_all_tokens(self, user_id: str) -> None:
         await self._db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
         await self._db.commit()
+
+    async def change_password(self, user_id: str, new_password_hash: str, ttl_days: int) -> str:
+        """Store a new password, revoke every existing token and mint a
+        replacement as ONE durable unit. Returns the replacement token.
+
+        These three writes only mean anything together, so they are applied
+        inside a single ``BEGIN IMMEDIATE`` .. ``COMMIT``: SQLite keeps an
+        uncommitted transaction invisible to every other connection and
+        discards it outright if the process dies, so the database is always on
+        one side of the change or the other and never inside it. The shared
+        connection cannot provide that: it serialises every request in the
+        worker, so another coroutine's ``commit()`` could land between two of
+        these statements and make a half-finished password change durable (and
+        its ``rollback()`` could throw this one away) -- the very "one
+        connection is never shared across concurrent coroutines" hazard
+        ``create_user`` already rolls back on. Hence a short-lived dedicated
+        connection to the same file; WAL lets it read and write alongside the
+        shared one, and ``BEGIN IMMEDIATE`` takes the write lock up front so
+        this waits out the same 5 s busy timeout rather than failing on a
+        mid-transaction lock upgrade.
+
+        The statements are ALSO ordered revoke -> set hash -> mint, so the
+        change stays safe even where that atomicity is unavailable. An
+        interruption after the revoke leaves the old password and no live
+        tokens; one after the hash write leaves the new password and no live
+        tokens. Either way the user logs back in, and no interruption point
+        leaves a changed password standing next to a token minted before it.
+
+        The per-user token cap is deliberately not re-applied here: every other
+        token was deleted in this same transaction, so the user can hold at
+        most the single row inserted below.
+        """
+        if self._db is None:
+            raise RuntimeError("auth store is not connected")
+        db = await aiosqlite.connect(self._path, isolation_level=None)
+        try:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
+            await db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_password_hash, user_id))
+            raw = secrets.token_urlsafe(32)
+            created = _now()
+            await db.execute(
+                "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (hash_token(raw), user_id, created, created + ttl_days * 86400),
+            )
+            await db.commit()
+        except BaseException:
+            # BaseException, not Exception: a request cancelled out from under
+            # this coroutine (client gone, worker shutting down) must not
+            # abandon an open write transaction, which is what leaves the file
+            # locked against every other connection.
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+        return raw
 
     async def purge_expired_tokens(self) -> int:
         """Delete rows whose expiry has passed. Parameterized to avoid SQL
@@ -1373,7 +1437,11 @@ async def logout(request: Request, _: None = Depends(require_auth)):
 @router.post("/change-password")
 async def change_password(body: ChangePasswordIn, request: Request, _: None = Depends(require_auth)):
     """Change the current user's password after verifying the old one. Invalidates
-    every other token the user holds (the current session stays signed in)."""
+    every other token the user holds (the current session stays signed in).
+
+    "Invalidates" holds even if the worker is killed mid-request: the hash
+    write, the revocation and the replacement token commit together or not at
+    all -- see ``AuthStore.change_password``."""
     user = request.state.user
     s = _require_auth_store()
     stored = await s.get_user(user.id)
@@ -1382,9 +1450,10 @@ async def change_password(body: ChangePasswordIn, request: Request, _: None = De
     ):
         raise HTTPException(status_code=400, detail="current password is incorrect")
     new_password = validate_password(body.new_password)
-    await s.set_password(user.id, await asyncio.to_thread(hash_password, new_password))
-    await s.revoke_all_tokens(user.id)
-    token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
+    # Hash first, then take the write lock: bcrypt is the slow part and has no
+    # business being spent holding it.
+    new_hash = await asyncio.to_thread(hash_password, new_password)
+    token = await s.change_password(user.id, new_hash, config.AUTH_TOKEN_TTL_DAYS)
     return AuthOut(token=token, user=UserOut.from_user(stored))
 
 
