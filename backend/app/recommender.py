@@ -129,7 +129,10 @@ async def get_similar_articles(
             query=int(article_id),  # Use point ID as query for nearest neighbors
             using="dense",  # Collection uses a named 'dense' vector
             query_filter=qfilter,
-            limit=_candidate_pool(limit),  # Over-fetch for filters/post-processing
+            # 3x for filters/post-processing, deliberately not _candidate_pool:
+            # nothing selects or scores below, so the over-fetch IS the response
+            # and widening it would change this endpoint's payload size.
+            limit=limit * 3,
             with_payload=True,
             with_vectors=False,
         )
