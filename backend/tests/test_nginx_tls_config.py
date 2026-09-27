@@ -216,7 +216,9 @@ def _broken_cert_root(tmp_path, domain, how):
         return _certified_root(tmp_path, domain, pair=_expired_pair(domain))
     root = _certified_root(tmp_path, domain)
     live = root / "live" / domain
-    if how == "no_key":
+    if how == "no_cert":
+        (live / "fullchain.pem").unlink()
+    elif how == "no_key":
         (live / "privkey.pem").unlink()
     elif how == "empty_key":
         (live / "privkey.pem").write_text("")
@@ -224,6 +226,10 @@ def _broken_cert_root(tmp_path, domain, how):
         (live / "fullchain.pem").write_text("")
     elif how == "unparseable_cert":
         (live / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\nnot base64\n")
+    elif how == "unreadable_cert":
+        # The mode certbot gives privkey.pem, and the reason readability is
+        # never tested: this user cannot open it, but nginx runs as root.
+        (live / "fullchain.pem").chmod(0o000)
     else:
         raise AssertionError(f"unknown breakage {how!r}")
     return root
@@ -682,12 +688,17 @@ def test_auto_mode_keeps_tls_for_a_pair_openssl_still_accepts(tmp_path):
     assert 443 in ports, f"a usable certificate must keep serving over TLS:\n{config}"
 
 
-def test_auto_mode_does_not_downgrade_when_openssl_is_missing(tmp_path):
-    """Expiry is the one check that needs a tool, and it is not worth a
-    downgrade: without openssl setup.sh cannot read an expiry verdict, so the
-    file test stands alone rather than assuming the site is broken."""
+def test_cert_state_is_unknown_when_openssl_is_missing(tmp_path):
+    """The absence of a tool is not evidence, in either direction.
+
+    This used to assert that `auto` kept TLS without openssl, which stopped
+    testing anything the moment the expiry check left the mode decision -- it
+    would have passed with openssl present too. Now that openssl only feeds
+    `nginx_tls_cert_state`, the honest claim is that it reports "unknown" and
+    never guesses "expired" or "corrupt" about a certificate it could not open.
+    """
     root = _certified_root(tmp_path, DOMAIN)
-    env = _env(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
+    env = _env(tmp_path, LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
     # A PATH holding only what is needed to reach and source the script:
     # `dirname` for SCRIPT_DIR, `bash` for this call, `env` for the subprocess
     # lookup. `command -v openssl` then cannot succeed.
@@ -697,12 +708,46 @@ def test_auto_mode_does_not_downgrade_when_openssl_is_missing(tmp_path):
         os.symlink(shutil.which(tool), lean_path / tool)
     env["PATH"] = str(lean_path)
 
-    proc = _call(env, "nginx_tls_mode")
+    # The premise, asserted: if this ever stops hiding openssl the test below
+    # would be measuring nothing at all.
+    premise = _call(env, "command -v openssl")
+    assert premise.returncode != 0, f"openssl is still reachable on the lean PATH: {premise.stdout!r}"
 
-    assert proc.returncode == 0, f"nginx_tls_mode failed without openssl: {proc.stderr}"
-    assert proc.stdout.strip() == "on", (
-        f"a present, non-empty pair must not be downgraded just because openssl is absent, "
-        f"got {proc.stdout.strip()!r}"
+    proc = _call(env, "nginx_tls_cert_state")
+
+    assert proc.returncode == 0, f"nginx_tls_cert_state failed without openssl: {proc.stderr}"
+    assert proc.stdout.strip() == "unknown", (
+        f"with no openssl the state must be unknown, not a verdict; got {proc.stdout.strip()!r}"
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read any file, so 'unreadable' is unreachable")
+@pytest.mark.parametrize(
+    ("how", "expected"),
+    [
+        ("no_cert", "missing"),
+        ("empty_cert", "empty"),
+        ("unreadable_cert", "unreadable"),
+        ("unparseable_cert", "corrupt"),
+    ],
+)
+def test_cert_state_tells_a_lapsed_certificate_from_an_unusable_one(how, expected, tmp_path):
+    """`openssl x509 -checkend` exits non-zero for a lapsed notAfter, for text
+    that is not a certificate, and for a file it cannot open -- and the three
+    need different advice. Collapsing them into "expired" sent the operator to
+    re-run a command that, because of --keep-until-expiring, could not fix a
+    corrupt file at all."""
+    root = _broken_cert_root(tmp_path, DOMAIN, how)
+    cert = root / "live" / DOMAIN / "fullchain.pem"
+    try:
+        proc = _call(_env(tmp_path, LE_DOMAIN=DOMAIN, LE_ROOT=str(root)), "nginx_tls_cert_state")
+    finally:
+        if cert.exists():
+            cert.chmod(0o600)
+
+    assert proc.returncode == 0, f"nginx_tls_cert_state failed: {proc.stderr}"
+    assert proc.stdout.strip() == expected, (
+        f"a certificate that is {how} should read as {expected!r}, got {proc.stdout.strip()!r}"
     )
 
 
