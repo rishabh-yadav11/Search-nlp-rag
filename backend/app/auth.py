@@ -589,6 +589,29 @@ class AuthStore:
         await self._db.commit()
         return cur.rowcount
 
+    async def purge_dead_service_tokens(self, keep_hash: str = "") -> int:
+        """Delete service-token rows that can no longer authenticate anything --
+        revoked, or past their expiry -- so a long rotation history cannot grow
+        the table without bound the way an unrotated one would.
+
+        ``keep_hash`` is excluded, and it must be: that row is the tombstone
+        which stops a revoked or expired configured ``AUTH_SERVICE_TOKEN`` from
+        being re-seeded with a fresh lifetime on the next request. Delete it and
+        the reaper would hand the credential straight back, which is the
+        permanent-grant failure this table exists to prevent. Once the operator
+        points the env var at a different value the old row is no longer
+        excluded and is collected like any other dead row.
+        """
+        now = _now()
+        cur = await self._db.execute(
+            "DELETE FROM auth_service_tokens"
+            " WHERE (revoked_at IS NOT NULL OR expires_at < ?)"
+            " AND (? = '' OR token_hash != ?)",
+            (now, keep_hash, keep_hash),
+        )
+        await self._db.commit()
+        return cur.rowcount
+
     async def user_for_token(self, raw_token: str) -> StoredUser | None:
         """Resolve a raw bearer token to an active user, or None when the token
         is unknown, expired, or the account is disabled."""
@@ -650,8 +673,9 @@ async def close_rate_redis() -> None:
 
 
 async def token_purge_loop() -> None:
-    """Background task: purge expired auth_tokens rows. Never raises. Disabled
-    when AUTH_TOKEN_PURGE_INTERVAL_SECONDS is 0 (e.g. tests)."""
+    """Background task: purge dead token rows -- expired user tokens, and
+    service tokens that are revoked or expired. Never raises. Disabled when
+    AUTH_TOKEN_PURGE_INTERVAL_SECONDS is 0 (e.g. tests)."""
     interval = config.AUTH_TOKEN_PURGE_INTERVAL_SECONDS
     while interval > 0:
         try:
@@ -659,6 +683,12 @@ async def token_purge_loop() -> None:
                 n = await store.purge_expired_tokens()
                 if n:
                     logger.info("auth: purged %d expired token(s)", n)
+                # The configured value's row is kept as a tombstone; see
+                # purge_dead_service_tokens.
+                keep = hash_token(config.AUTH_SERVICE_TOKEN) if config.AUTH_SERVICE_TOKEN else ""
+                m = await store.purge_dead_service_tokens(keep_hash=keep)
+                if m:
+                    logger.info("auth: purged %d dead service token(s)", m)
         except Exception:
             logger.exception("auth token purge failed")
         await asyncio.sleep(interval)

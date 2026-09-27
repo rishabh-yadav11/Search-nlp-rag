@@ -238,6 +238,99 @@ def test_per_account_bucket_survives_a_key_flood(monkeypatch):
     auth.reset_local_rate_limits()
 
 
+def test_dead_service_tokens_are_purged_but_the_configured_tombstone_is_kept(store, monkeypatch):
+    """Rotation must not grow the table without bound -- but reaping the
+    configured value's row would let the next request re-seed it and hand a
+    revoked or expired credential straight back, so that one row is kept."""
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-configured")
+
+    async def scenario():
+        await store.ensure_bootstrap_service_token("svc-configured", {"chat:use"}, 3600)
+        minted = [(await store.issue_service_token({"chat:use"}, 3600))[0] for _ in range(3)]
+        await store.revoke_service_token(minted[0])
+        await store._db.execute(
+            "UPDATE auth_service_tokens SET expires_at = ? WHERE token_hash != ?",
+            (time.time() - 1, auth.hash_token("svc-configured")),
+        )
+        await store._db.commit()
+
+        async def remaining():
+            rows = await store._fetchall("SELECT token_hash FROM auth_service_tokens")
+            return {r["token_hash"] for r in rows}
+
+        before = await remaining()
+        purged = await store.purge_dead_service_tokens(
+            keep_hash=auth.hash_token("svc-configured")
+        )
+        return purged, before, await remaining()
+
+    purged, before, after = asyncio.run(scenario())
+    # The two expired minted tokens and the revoked one are all gone...
+    assert purged == 3
+    assert len(before) == 4
+    assert after == {auth.hash_token("svc-configured")}
+
+
+def test_reaping_the_tombstone_would_resurrect_it(store, monkeypatch):
+    """Why the exclusion exists, stated as an executable fact: with the row
+    deleted, the configured value re-seeds with a full fresh lifetime."""
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-configured")
+
+    async def scenario():
+        await store.ensure_bootstrap_service_token("svc-configured", {"chat:use"}, 3600)
+        await store.revoke_service_token("svc-configured")
+        assert await store.service_token_for("svc-configured") is None
+        # Reap it, ignoring the exclusion, and present it again.
+        await store.purge_dead_service_tokens()
+        assert await store.service_token_for("svc-configured") is None
+        req = _req({"x-service-token": "svc-configured"})
+        await auth.require_auth(req)
+        return req.state.user_id
+
+    assert asyncio.run(scenario()) == auth.SERVICE_USER_ID, (
+        "deleting the tombstone let the revoked configured token back in"
+    )
+
+
+
+def test_token_purge_loop_reaps_both_token_tables(store, monkeypatch):
+    """The background reaper must actually drive both purges, and must pass the
+    configured value's hash through as the tombstone to keep."""
+    calls = []
+
+    async def record_user_purge():
+        calls.append("user")
+        return 0
+
+    async def record_service_purge(keep_hash=""):
+        calls.append(("service", keep_hash))
+        return 0
+
+    class StopLoop(Exception):
+        pass
+
+    async def stop_after_one_iteration(_interval):
+        raise StopLoop
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_TOKEN_PURGE_INTERVAL_SECONDS", 60)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-configured")
+    monkeypatch.setattr(store, "purge_expired_tokens", record_user_purge)
+    monkeypatch.setattr(store, "purge_dead_service_tokens", record_service_purge)
+    monkeypatch.setattr(auth.asyncio, "sleep", stop_after_one_iteration)
+
+    async def run():
+        try:
+            await auth.token_purge_loop()
+        except StopLoop:
+            pass
+
+    asyncio.run(run())
+    assert calls == ["user", ("service", auth.hash_token("svc-configured"))]
+
+
 def test_per_account_limit_is_per_account(store, monkeypatch):
     """The account bucket must not become a global one: a second address is
     unaffected by the first address exhausting its own bucket."""
