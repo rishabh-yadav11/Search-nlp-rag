@@ -145,9 +145,16 @@ def _clamped_int(name: str, default: int, low: int, high: int) -> int:
     A non-integer value falls back to ``default`` for the same reason: an
     unparseable knob is an operator typo, not a client input, and the safest
     reading of it is "not configured", which is what an absent variable means.
-    ``default`` itself is required to sit inside ``[low, high]``.
+    ``default`` itself is required to sit inside ``[low, high]``; violating
+    that raises ``ValueError``, and deliberately not via ``assert`` so the
+    guarantee survives ``python -O``.
     """
-    assert low <= default <= high, f"{name} default {default} outside [{low}, {high}]"
+    # An explicit raise, not an `assert`: this is a programming-error guard on
+    # our own call sites, and CPython strips asserts under `python -O`, which
+    # would silently turn a stated guarantee into no guarantee at all. The
+    # assert stays only as a readable marker, never as the enforcement.
+    if not low <= default <= high:
+        raise ValueError(f"{name} default {default} outside [{low}, {high}]")
     raw = os.getenv(name)
     if raw is None:
         return default

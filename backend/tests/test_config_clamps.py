@@ -109,9 +109,43 @@ def test_clamped_int_falls_back_to_default_on_non_integer(monkeypatch, caplog):
 
 def test_clamped_int_rejects_a_default_outside_the_bounds():
     # A default outside the bounds would make the effective value depend on
-    # whether the operator set the variable at all.
-    with pytest.raises(AssertionError):
+    # whether the operator set the variable at all. `ValueError` rather than
+    # `AssertionError` on purpose: pytest runs with assertions enabled but the
+    # shipped interpreter may be `python -O`, where an `assert` is stripped and
+    # this guarantee would silently evaporate. See the `-O` test below.
+    with pytest.raises(ValueError):
         _clamped_int("PROBE_CANDIDATES", 500, 5, 50)
+
+
+def test_clamped_int_default_range_guard_survives_python_O():
+    """The guard must not be an `assert`: `python -O` strips those, so the
+    guarantee would hold under pytest and not in production. Subprocess both
+    ways and require the ValueError in each."""
+    import pathlib
+    import subprocess
+    import sys
+
+    code = """
+import sys
+sys.path.insert(0, '.')
+from app.config import _clamped_int
+try:
+    _clamped_int('NOPE', 500, 5, 50)
+except ValueError:
+    print('RAISED')
+else:
+    print('NO RAISE')
+"""
+    backend = pathlib.Path(__file__).resolve().parent.parent
+    for flags in ([], ["-O"]):
+        out = subprocess.run(
+            [sys.executable, *flags, "-c", code],
+            capture_output=True, text=True, cwd=str(backend), check=False,
+        )
+        assert "RAISED" in out.stdout, (
+            f"default-range guard did not fire under flags={flags or ['(none)']}: "
+            f"stdout={out.stdout!r} stderr={out.stderr[-300:]!r}"
+        )
 
 
 # --- RERANK_CANDIDATES at the call site --------------------------------
