@@ -101,9 +101,10 @@ class Config:
     # deployments that set RERANK_BACKEND keep working; any value other than
     # 'torch' logs a warning and uses torch.
     RERANK_BACKEND = os.getenv("RERANK_BACKEND", "torch")
-    # Unused: local dir that held the exported ONNX cross-encoder cache when the
-    # ONNX backend existed. Kept so existing environments don't break on an
-    # unknown-variable check; nothing reads it now.
+    # Inert: local dir that held the exported ONNX cross-encoder cache when the
+    # ONNX backend existed. Nothing reads it now; kept as a documented
+    # placeholder (it is still listed in .env.example) rather than an env var
+    # that silently disappears from deployed setups.
     RERANK_ONNX_DIR = os.getenv("RERANK_ONNX_DIR", "data/reranker_onnx")
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
