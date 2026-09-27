@@ -725,6 +725,39 @@ def test_analytics_chat_records_admin_audit(tmp_path):
         _run(chat_store.close())
 
 
+def test_analytics_chat_survives_a_failing_audit_write(tmp_path, monkeypatch):
+    """The audit write is best-effort by design — a broken trail must not take
+    the admin dashboard down with it. Pins the try/except at the call site."""
+    from app import main
+
+    chat_store = _store(tmp_path)
+    auth_store = _auth_store(tmp_path)
+    chat_module.store = chat_store
+    auth_module.store = auth_store
+    client = TestClient(main.app)
+
+    async def exploding_audit(actor_id, action):
+        raise RuntimeError("audit table unavailable")
+
+    try:
+        admin_h = _auth_headers(auth_store, email="admin@example.com", role="admin")
+        admin = _run(auth_store.get_user_by_email("admin@example.com"))
+        sid = client.post("/api/chat/sessions", headers=admin_h).json()["id"]
+        # top_by_* joins messages, so an empty session would not appear at all.
+        _run(chat_store.append_message(sid, admin.id, "user", "a question"))
+        monkeypatch.setattr(chat_store, "record_admin_audit", exploding_audit)
+
+        res = client.get("/analytics/chat", headers=admin_h)
+        assert res.status_code == 200
+        # The read still returns real data, not a degraded error payload.
+        assert res.json()["sessions"] >= 1
+        assert [row[0] for row in res.json()["top_by_cost"]] == [sid]
+    finally:
+        chat_module.store = None
+        auth_module.store = None
+        _run(auth_store.close())
+        _run(chat_store.close())
+
 
 def test_admin_audit_expires_via_retention_sweep(tmp_path):
     """The trail gains a row on every 30s dashboard poll, so it must stay
@@ -758,25 +791,24 @@ def test_admin_audit_expires_via_retention_sweep(tmp_path):
         _run(store.close())
 
 
-def test_global_stats_docstring_is_accurate():
-    """The docstring must not claim the payload is content-free — that false
-    claim is what let the title leak through review."""
+def test_global_stats_docstring_makes_no_false_safety_claim():
+    """Guard against re-introducing the specific false claim that let the
+    title leak through review.
+
+    Deliberately only negative assertions. Pinning the *replacement* wording
+    would fail on any harmless rewording, creating pressure against editing
+    the docs — the opposite of the intent, since the original defect was a
+    documentation problem. The real behavioural guard is
+    `test_analytics_chat_endpoint_omits_titles`, which drives the live
+    endpoint and fails against the pre-fix code.
+    """
     doc = ChatStore.global_stats.__doc__
     assert doc is not None
     low = doc.lower()
     assert "privacy-safe" not in low
+    assert "privacy safe" not in low
     assert "only counts/aggregates" not in low
-    # It must affirmatively disclose the cross-user per-session exposure...
-    assert "cross-user" in low
-    assert "not content-free" in low
-    assert "per-session rows" in low
-    # ...and state why no user text can appear.
-    assert "no session title" in low
-    assert "message body" in low
-    assert "ever selected or" in low
-    # ...and name the audit trail that records the reads.
-    assert "record_admin_audit" in doc
-    assert "admin_audit_log" in doc
+    assert "no message contents" not in low
 
 
 def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
