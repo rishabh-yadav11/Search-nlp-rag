@@ -14,6 +14,17 @@ PUBLIC_PORT="${PUBLIC_PORT:-80}"
 GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 
+# pm2 process tuning. These MUST stay equal to the values in
+# ecosystem.config.js — backend/tests/test_deploy_config.py fails if the two
+# process definitions disagree, because `./setup.sh services` re-registers
+# pm2 from this file and would otherwise silently drop the OOM auto-restart
+# guard that ecosystem.config.js declares.
+API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"
+API_MAX_RESTARTS="${API_MAX_RESTARTS:-10}"
+FRONTEND_MAX_MEMORY="${FRONTEND_MAX_MEMORY:-1G}"
+RESTART_BACKOFF_MS="${RESTART_BACKOFF_MS:-100}"
+
+
 # Pinned docker images with digests for reproducibility. IMPORTANT: the Qdrant
 # version must be >= the version that wrote an existing collection (older
 # versions cannot deserialize newer storage formats). Current default matches
@@ -48,6 +59,8 @@ stages (run in order):
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
+  API_MAX_MEMORY API_MAX_RESTARTS FRONTEND_MAX_MEMORY RESTART_BACKOFF_MS
+     pm2 process tuning; must match ecosystem.config.js (tests enforce it)
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
@@ -220,6 +233,32 @@ run_backend() {
     if ! grep -q '^REDIS_URL=' "$ENV_FILE"; then
         echo "REDIS_URL=redis://localhost:$REDIS_PORT/0" >> "$ENV_FILE"
     fi
+    # Per-IP rate limiting keys on the client IP, which behind nginx comes from
+    # X-Forwarded-For. An .env that predates the per-IP public rate limits has
+    # no trust setting at all, so every proxied request keys on the nginx peer
+    # (127.0.0.1) and the whole site shares one rate-limit bucket. Append the
+    # shipped default in that one case.
+    if ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
+        echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$ENV_FILE"
+    elif grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*(1|true|yes|on)[[:space:]]*$' "$ENV_FILE"; then
+        # The spellings above are exactly the ones config._env_tristate reads as
+        # a forced True, so this warning covers every value that leaves the
+        # header trusted from any peer -- not just the literal "true".
+        # Warn, never rewrite. A forced True is the correct setting when the
+        # proxy runs on ANOTHER host, and silently downgrading it to 'auto'
+        # would collapse exactly that deployment back into the single-bucket
+        # outage. Such a host is already rate-limiting per IP correctly; its
+        # residual risk is that the header is trusted from ANY peer, which only
+        # matters when :8001 is also reachable directly (gunicorn binds
+        # 0.0.0.0 -- see issue #245). 'auto' closes that and is safe whenever
+        # the proxy is on this host, but the operator's value is theirs.
+        echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR is set to a forced-true value" >&2
+        echo "         (1/true/yes/on), which trusts X-Forwarded-For from ANY" >&2
+        echo "         peer, so a client reaching :8001 directly can forge it to" >&2
+        echo "         dodge a rate limit. Set it to 'auto' (the new default) if" >&2
+        echo "         your reverse proxy runs on this host; keep it forced if the" >&2
+        echo "         proxy runs on another host." >&2
+    fi
     echo "backend ready"
 }
 
@@ -271,14 +310,22 @@ run_services() {
     sleep 2
 
     (cd backend && pm2 start "$VENV_PY" \
-        --name vccircle-backend -- -m gunicorn \
+        --name vccircle-backend \
+        --max-memory-restart "$API_MAX_MEMORY" \
+        --max-restarts "$API_MAX_RESTARTS" \
+        --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
+        -- -m gunicorn \
         -k uvicorn.workers.UvicornWorker \
-        --workers "$GUNICORN_WORKERS" --bind "0.0.0.0:$API_PORT" \
+        --workers "$GUNICORN_WORKERS" --bind "127.0.0.1:$API_PORT" \
         --timeout 120 app.main:app)
     wait_http "http://localhost:$API_PORT/health"
 
     (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
-        --name vccircle-frontend -- start -p "$NEXT_PORT")
+        --name vccircle-frontend \
+        --max-memory-restart "$FRONTEND_MAX_MEMORY" \
+        --max-restarts "$API_MAX_RESTARTS" \
+        --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
+        -- start -p "$NEXT_PORT")
     pm2 save >/dev/null 2>&1
     wait_http "http://localhost:$NEXT_PORT/"
 }
@@ -385,12 +432,32 @@ server {
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-    location /search { proxy_pass http://127.0.0.1:$API_PORT; }
+    # Every API location must forward the client IP. The per-IP rate limiter on
+    # /search, /facets, /analytics/click and /ready keys on this header; without
+    # it every proxied request looks like 127.0.0.1 and the whole site shares a
+    # single rate-limit bucket.
+    location /search {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
     location /health { proxy_pass http://127.0.0.1:$API_PORT; }
     location /live { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /ready { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /readyz { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /facets { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /ready {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location /readyz {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location /facets {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
     location /api {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_read_timeout 300s;
@@ -399,8 +466,16 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
-    location /recommend/ { proxy_pass http://127.0.0.1:$API_PORT; }
-    location /analytics/click { proxy_pass http://127.0.0.1:$API_PORT; }
+    location /recommend/ {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    location /analytics/click {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
     location /analytics/summary { proxy_pass http://127.0.0.1:$API_PORT; }
     location /analytics/chat { proxy_pass http://127.0.0.1:$API_PORT; }
     location /analytics { proxy_pass http://127.0.0.1:$NEXT_PORT; }

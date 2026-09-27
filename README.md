@@ -127,7 +127,7 @@ I wrote `setup.sh` to provision everything in stages. Run `./setup.sh all`, or p
 ./setup.sh all          # deps backend index frontend services pm2-startup cron nginx
 ```
 
-Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`.
+Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`. pm2 process tuning: `API_MAX_MEMORY` (5G), `FRONTEND_MAX_MEMORY` (1G), `API_MAX_RESTARTS` (10), `RESTART_BACKOFF_MS` (100) — these must stay equal to `ecosystem.config.js`, and `backend/tests/test_deploy_config.py` fails the build if the two process definitions drift apart.
 
 If you'd rather run pieces manually, keep reading.
 
@@ -219,7 +219,7 @@ Backups are local to the host — ship `backend/backups/` (plus `data/articles.j
 ```bash
 cd backend
 ./venv/bin/gunicorn -k uvicorn.workers.UvicornWorker --workers 4 \
-  --bind 0.0.0.0:8001 --timeout 120 app.main:app
+  --bind 127.0.0.1:8001 --timeout 120 app.main:app
 ```
 
 | Endpoint                                       | Description                                                 |
@@ -270,12 +270,36 @@ server {
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-    location /search    { proxy_pass http://127.0.0.1:8001; }
-    location /facets    { proxy_pass http://127.0.0.1:8001; }
+    # The per-IP rate limiter on /search, /facets, /analytics/click and /ready
+    # keys on the client IP these headers carry. Without them every proxied
+    # request looks like 127.0.0.1 and the whole site shares one rate-limit bucket.
+    # These headers are trusted by default here: with the peer being loopback
+    # the API reads the forwarded client IP (AUTH_TRUST_X_FORWARDED_FOR=auto,
+    # the shipped default). A client hitting :8001 directly is its own
+    # non-loopback peer, so the same header is ignored for it and cannot be
+    # used to dodge a rate limit.
+    location /search {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /facets {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
     location /health    { proxy_pass http://127.0.0.1:8001; }
     location /live      { proxy_pass http://127.0.0.1:8001; }
-    location /ready     { proxy_pass http://127.0.0.1:8001; }
-    location /readyz    { proxy_pass http://127.0.0.1:8001; }
+    location /ready {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /readyz {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
     location /api {
         proxy_pass http://127.0.0.1:8001;
         proxy_read_timeout 300s;
@@ -284,8 +308,16 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
-    location /recommend/ { proxy_pass http://127.0.0.1:8001; }
-    location /analytics/click   { proxy_pass http://127.0.0.1:8001; }
+    location /recommend/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+    location /analytics/click {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
     location /analytics/summary { proxy_pass http://127.0.0.1:8001; }
     location /analytics/chat    { proxy_pass http://127.0.0.1:8001; }
     location /analytics { proxy_pass http://127.0.0.1:3000; }
@@ -304,7 +336,8 @@ server {
 Hardening I baked into `setup.sh`:
 
 - **Services bound to localhost** — Qdrant and Redis are published as `127.0.0.1:PORT:PORT` so they're only reachable from the host (nginx, the API), never the internet. If containers were previously created with public binds, `setup.sh backend` detects it and recreates them with the local bind (Qdrant's data volume is preserved).
-- **Host firewall** — I recommend UFW: allow only SSH and HTTP, deny the rest:
+- **API bound to localhost** — gunicorn binds `127.0.0.1:$API_PORT`, never the wildcard address. Search, chat, auth and analytics are reachable only through nginx on `:80`; nothing on `:8001` answers from off-host even if every firewall below is skipped. `setup.sh services` and `ecosystem.config.js` both use the loopback bind, and the nginx config writes `proxy_pass http://127.0.0.1:$API_PORT` to match. To apply the bind on an already-deployed host, run `./setup.sh services` — it deletes and re-registers the pm2 process, which is the only step that rewrites the stored argv. A bare `pm2 restart vccircle-backend` (including with `--update-env`, which refreshes environment variables but not the argument list) replays the argv pm2 stored at start time, so it keeps the old wildcard bind, and the enabled pm2 systemd unit resurrects that same argv from `~/.pm2/dump.pm2` after a reboot. Confirm with `ss -ltn | grep 8001` that the listening address is `127.0.0.1`.
+- **Host firewall — MANDATORY** — a loopback bind is the primary control, not the only one: it does nothing for the ports that *are* meant to be public, and it fails open the moment someone re-binds a service to a wildcard address. UFW is a required deployment step, not a recommendation. Allow only SSH and HTTP, deny the rest:
 
 ```bash
 sudo ufw default deny incoming
@@ -317,7 +350,7 @@ sudo ufw --force enable
 - **nginx security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin` on every location. CSP is set by the frontend (`middleware.ts`, per-request nonce), so I don't duplicate it at nginx. Plain HTTP only.
 - **Pinned images** — Qdrant/Redis run from pinned, digest-resolvable tags (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`, `REDIS_IMAGE=redis:7-alpine`). If you override Qdrant, keep it >= the version that wrote any existing collection — older releases can't read newer storage formats.
 - **API note** — CORS is restricted to the origins in `CORS_ORIGINS` (localhost dev origins by default; production is same-origin through nginx). **Auth** uses opaque bearer tokens with RBAC roles (see `app/auth.py`), and signup/login endpoints are rate-limited per client IP (Redis-backed). LLM spend is bounded by `LLM_DAILY_BUDGET_USD` (see `app/cost_budget.py`).
-- **Health monitoring** — `deploy/healthcheck.sh` probes `/health` (I run it from cron every few minutes), restarts `vccircle-backend` when unhealthy, and posts an alert to `HEALTHCHECK_WEBHOOK_URL` if a restart doesn't recover the app. Logs to `logs/healthcheck.log`.
+- **Health monitoring** — `deploy/healthcheck.sh` probes `/health` (I run it from cron every few minutes), restarts `vccircle-backend` when unhealthy, and posts an alert to `HEALTHCHECK_WEBHOOK_URL` if a restart doesn't recover the app. Logs to `logs/healthcheck.log`. That recovery uses `pm2 restart`, which replays the stored argv — correct for reviving a sick process, but it cannot apply a changed bind or any other process option. Anything that changes the pm2 process definition (the API bind, the OOM auto-restart limits) needs `./setup.sh services`.
 
 ## Supported Settings
 

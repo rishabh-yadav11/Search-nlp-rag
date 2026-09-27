@@ -33,7 +33,7 @@ from app.analytics import close as close_analytics
 from app.analytics import record_click, record_search
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
-from app.auth import require_auth, require_permission
+from app.auth import public_rate_limit, require_auth, require_permission
 from app.click_boost import apply_click_boost
 from app.config import config
 from app.cost_budget import close as close_cost_budget
@@ -1113,7 +1113,11 @@ async def retrieve_by_date_window(
     return articles[:top_k]
 
 
-@app.get("/search", response_model=SearchResponse)
+@app.get(
+    "/search",
+    response_model=SearchResponse,
+    dependencies=[Depends(public_rate_limit("search", "PUBLIC_SEARCH_RATE_PER_MIN"))],
+)
 async def search(
     q: str = Query(..., min_length=1),
     top_k: int = Query(config.TOP_K, ge=1, le=50),
@@ -1190,6 +1194,11 @@ async def search(
                           latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
 
+# Appended to a body excerpt the char cap cut short, so the model can tell the
+# text stops here because of the cap rather than because the article ended.
+BODY_TRUNCATION_NOTE = "\n[... body truncated ...]"
+
+
 def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) -> str:
     """Packs an article's metadata + summary + body into a numbered
     context block for the chat LLM prompt. The body excerpt is capped by
@@ -1210,7 +1219,10 @@ def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) ->
         # (even 0, meaning "no body"), and only when it is None do we fall back
         # to the configured default. Negative values are clamped to 0.
         limit = config.CHAT_BODY_CHAR_LIMIT if body_limit is None else max(0, int(body_limit))
-        parts.append(s.body[: min(limit, len(s.body))])
+        if limit and len(s.body) > limit:
+            parts.append(s.body[:limit] + BODY_TRUNCATION_NOTE)
+        elif limit:
+            parts.append(s.body)
     return "\n".join(parts)
 
 
@@ -1264,7 +1276,10 @@ async def _facet_values(key: str) -> list[str]:
     return sorted(values)[:FACETS_LIMIT]
 
 
-@app.get("/facets")
+@app.get(
+    "/facets",
+    dependencies=[Depends(public_rate_limit("facets", "PUBLIC_FACETS_RATE_PER_MIN"))],
+)
 async def facets():
     """Distinct industry_names and dealtype_names values across the collection,
     used for filter autocomplete. Cached in Redis (small controlled vocab)."""
@@ -1286,7 +1301,10 @@ class ClickEvent(BaseModel):
     id: int | None = None
 
 
-@app.post("/analytics/click")
+@app.post(
+    "/analytics/click",
+    dependencies=[Depends(public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN"))],
+)
 async def analytics_click(event: ClickEvent):
     """Anonymous result-click beacon from the public search page (no data
     returned, so it stays open to keep collecting interaction analytics). The
