@@ -32,10 +32,17 @@ const SESSION = { id: 's1', title: 'Budget', created_at: 1_700_000_000, updated_
 type Payload = { id: number; title: string; url: string; score: number }
 
 /**
- * The escape spellings #246 was written for, in the two forms that matter:
- * bare (`//evil.com`, `/\evil.com`, …) and carrying a scheme
- * (`https:/\evil.com`, …). The browser resolves every one of them to
+ * The escape spellings #246 was written for, in the three forms that matter:
+ * bare (`//evil.com`, `/\evil.com`, …), carrying a scheme but no `//`
+ * (`https:/\evil.com`, …) and carrying a full `https://` prefix
+ * (`https://\evil.com`, …). A browser resolves every one of them to
  * `https://evil.com/`, so each must end up inert rather than clickable.
+ *
+ * The third group is the one that proves anything about the old inline
+ * `/^https?:\/\//` check: the first eight characters of those payloads *are*
+ * `https://`, so that regex admits them and the old code rendered a
+ * clickable off-origin link. The first two groups are refused by the old
+ * check too, and are here to pin that the shared guard keeps refusing them.
  */
 const UNSAFE: Payload[] = [
   { id: 1, title: 'Script scheme', url: "javascript:fetch(localStorage.getItem('vccircle_auth_token'))", score: 1 },
@@ -49,6 +56,9 @@ const UNSAFE: Payload[] = [
   { id: 9, title: 'Scheme backslash slash', url: 'https:\\/evil.com', score: 1 },
   { id: 10, title: 'NUL control escape', url: 'https:\x00//evil.com', score: 1 },
   { id: 11, title: 'Leading space script scheme', url: ' javascript:alert(1)', score: 1 },
+  { id: 12, title: 'Full prefix slash backslash', url: 'https://\\evil.com', score: 1 },
+  { id: 13, title: 'Full prefix backslash slash', url: 'https://\\/evil.com', score: 1 },
+  { id: 14, title: 'Full prefix double backslash', url: 'https://\\\\evil.com', score: 1 },
 ]
 
 const SAFE: Payload[] = [

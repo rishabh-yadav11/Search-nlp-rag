@@ -55,6 +55,10 @@ describe('isSafeUrl — blocks protocol-relative and backslash escapes', () => {
 // as a separator for special schemes, so the backslash spelling still ends up
 // on an `https:` URL and the scheme allowlist alone waves it through. A pinned
 // `false` (not a parity assertion) is the only assertion that catches this.
+//
+// The `https://`-prefixed spellings at the end are the sharp end: their first
+// eight characters really are `https://`, so the old inline `/^https?:\/\//`
+// check the chat source list used admitted them as clickable links.
 describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
   const SCHEME_ESCAPES = [
     'https:/\\evil.com',
@@ -63,6 +67,9 @@ describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
     'http:/\\evil.com',
     'HTTPS:/\\evil.com',
     'https:\\\\evil.com/path?q=1',
+    'https://\\evil.com',
+    'https://\\/evil.com',
+    'https://\\\\evil.com',
   ]
 
   it.each(SCHEME_ESCAPES)('rejects %j', (payload) => {
@@ -81,6 +88,19 @@ describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
     // URL is a well-formed off-origin https link, so nothing downstream of the
     // scheme check can object to it.
     expect(new URL('https:/\\evil.com', BASE).href).toBe('https://evil.com/')
+    expect(new URL('https://\\evil.com', BASE).href).toBe('https://evil.com/')
+  })
+
+  it('refuses the spellings the old inline https-prefix check admitted', () => {
+    // The defect this closes, stated as a test: these payloads pass
+    // `/^https?:\/\//`, which is why the chat source list rendered them as
+    // clickable links that navigate to `https://evil.com/`.
+    const OLD_INLINE_RE = /^https?:\/\//
+    const ADMITTED = ['https://\\evil.com', 'https://\\/evil.com', 'https://\\\\evil.com']
+    for (const payload of ADMITTED) {
+      expect(OLD_INLINE_RE.test(payload)).toBe(true)
+      expect(isSafeUrl(payload, BASE)).toBe(false)
+    }
   })
 })
 
