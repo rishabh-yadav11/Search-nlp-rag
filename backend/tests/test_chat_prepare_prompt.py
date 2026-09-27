@@ -233,6 +233,19 @@ def test_gate_to_empty_answers_without_calling_the_llm(frozen, path):
     assert turn.needs_llm is False
 
 
+def test_multi_entity_intersection_gated_to_empty_keeps_its_degradation_note(frozen):
+    """The multi-entity early return is NOT the single-entity one: when an
+    intersection has no article covering every entity it has already set the
+    degradation note, and that note must survive the empty gated set. Sharing
+    the two early returns would have hardcoded note=None and lost it."""
+    frozen.setattr(chat_module.config, "ASK_MIN_SCORE", 0.99)
+    turn = _multi_turn(frozen, "intersection")
+    assert turn.sources == []
+    assert turn.answer == "No sufficiently relevant articles were found for this query."
+    assert turn.note == "No single article covers all of Alpha, Beta; showing related articles per entity."
+    assert turn.needs_llm is False
+
+
 def test_multi_entity_degraded_intersection_still_carries_its_note(frozen, monkeypatch):
     """When no article covers every entity the turn falls back to the union and
     says so. The single-entity path has no equivalent note, so the two early
