@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import socket
+from pathlib import Path
 from typing import ClassVar
 
 from dotenv import load_dotenv
@@ -9,6 +10,39 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# The backend package's parent directory: the stable anchor for every data
+# path. Resolved from this file's own location, never from the process working
+# directory -- gunicorn, pm2, systemd, a shell and a test runner can each start
+# the same app from a different CWD, and a CWD-relative data path turns that
+# into a brand-new empty SQLite file created in the wrong place.
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _data_path(name: str, default: str) -> str:
+    """Read a data-path knob and return it as an absolute path.
+
+    A relative value (what ``.env.example`` ships, and what an operator copies)
+    is resolved against :data:`BACKEND_ROOT`, so ``data/chat.db`` always means
+    ``<repo>/backend/data/chat.db`` no matter where the process was started.
+    An absolute value is kept as given, so a deployment that mounts its data on
+    a separate volume is unaffected. ``~`` is expanded, because an operator
+    writing ``~/data/chat.db`` means their home, not a literal ``~`` directory.
+
+    Every result is absolute, so a caller can compare, log or stat it without
+    re-deriving the same guess about the CWD.
+    """
+    raw = os.getenv(name, default).strip().strip("\"'").strip()
+    if not raw:
+        raise ValueError(
+            f"{name} is set but empty; it must be a filesystem path "
+            f"(relative paths resolve against {BACKEND_ROOT})"
+        )
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BACKEND_ROOT / path
+    return str(path)
+
 
 # Cap the number of CPU threads torch/onnxruntime use per process BEFORE any
 # inference library is imported. With GUNICORN_WORKERS processes sharing the
@@ -252,6 +286,66 @@ def _env_tristate(name: str) -> bool | None:
     return None
 
 
+def _ensure_data_dir(path: str, env_var: str) -> None:
+    """Create ``path``'s parent directory, or fail with an actionable message.
+
+    The two failure modes this refuses to swallow:
+
+    - the parent cannot be created at all (a path component is a regular file,
+      or the volume is read-only). `os.makedirs` in the store would raise, but
+      deep inside `ChatStore.connect`, with the exception buried in a
+      traceback that names no knob and no path.
+    - the parent exists but is not writable. Here `os.makedirs(exist_ok=True)`
+      SUCCEEDS and `sqlite3.connect` then succeeds too, creating a fresh EMPTY
+      database that the app serves as if it simply had no history. That is the
+      silent-data-loss failure this function exists for.
+
+    Raises RuntimeError naming the env var, the absolute path and the reason, so
+    the operator sees the fix in the first lines of the startup log instead of
+    discovering it as "all my conversations are gone" days later.
+    """
+    parent = Path(path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"{env_var}={path!r} cannot be used: its directory {parent} could not be "
+            f"created ({exc.strerror or exc}). Point {env_var} at a writable location."
+        ) from exc
+    if not parent.is_dir():  # pragma: no cover - mkdir(exist_ok=True) raises first
+        raise RuntimeError(
+            f"{env_var}={path!r} cannot be used: {parent} is not a directory."
+        )
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise RuntimeError(
+            f"{env_var}={path!r} cannot be used: directory {parent} is not writable. "
+            f"Starting anyway would create an EMPTY database there and silently lose "
+            f"every existing row, so the app refuses to start."
+        )
+
+
+def ensure_data_paths_ready(cfg: "Config") -> None:
+    """Validate every configured data location before the app serves traffic.
+
+    Called from the FastAPI lifespan ahead of the store connections, so a
+    misconfigured data location is a loud boot failure rather than a running
+    process that answers every request as if the deployment were brand new.
+
+    Only the paths the app WRITES are checked. A missing
+    ``QUERY_FIX_VOCAB_PATH`` file is a legitimate no-op (typo correction
+    degrades by design, see QUERY_FIX_VOCAB_PATH), so only its directory has
+    to be usable. ``RERANK_ONNX_DIR`` is inert and is deliberately not
+    validated: nothing reads it, so requiring the directory would fail a
+    perfectly healthy deploy.
+    """
+    for env_var, path in (
+        ("CHAT_DB_PATH", cfg.CHAT_DB_PATH),
+        ("AUTH_DB_PATH", cfg.AUTH_DB_PATH),
+        ("QUERY_FIX_VOCAB_PATH", cfg.QUERY_FIX_VOCAB_PATH),
+    ):
+        _ensure_data_dir(path, env_var)
+
+
 class Config:
     # MySQL
     MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
@@ -348,7 +442,7 @@ class Config:
     # ONNX backend existed. Nothing reads it now; kept as a documented
     # placeholder (it is still listed in .env.example) rather than an env var
     # that silently disappears from deployed setups.
-    RERANK_ONNX_DIR = os.getenv("RERANK_ONNX_DIR", "data/reranker_onnx")
+    RERANK_ONNX_DIR = _data_path("RERANK_ONNX_DIR", "data/reranker_onnx")
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
@@ -447,7 +541,7 @@ class Config:
     # fixer is a no-op. Corrected strings also normalize the cache keys, so
     # repeated typos of the same query reuse the same cached results.
     ENABLE_QUERY_FIX = os.getenv("ENABLE_QUERY_FIX", "true").lower() in ("1", "true", "yes")
-    QUERY_FIX_VOCAB_PATH = os.getenv("QUERY_FIX_VOCAB_PATH", "data/query_vocab.json.gz")
+    QUERY_FIX_VOCAB_PATH = _data_path("QUERY_FIX_VOCAB_PATH", "data/query_vocab.json.gz")
     QUERY_FIX_MAX_EDIT = int(os.getenv("QUERY_FIX_MAX_EDIT", "2"))
     QUERY_FIX_MIN_COUNT = int(os.getenv("QUERY_FIX_MIN_COUNT", "5"))
     QUERY_FIX_MIN_TOKEN_LEN = int(os.getenv("QUERY_FIX_MIN_TOKEN_LEN", "3"))
@@ -540,9 +634,11 @@ class Config:
     SEARCH_QUERY_MAX_CHARS = _clamped_int("SEARCH_QUERY_MAX_CHARS", 512, 32, 4000)
 
     # Chat history (SQLite on the host; survives restarts, unlike Redis without AOF)
-    # Relative CHAT_DB_PATH resolves against the backend working dir (where
-    # gunicorn runs). Retention purges conversations idle for CHAT_RETENTION_DAYS.
-    CHAT_DB_PATH = os.getenv("CHAT_DB_PATH", "data/chat.db")
+    # Resolved to an absolute path against the backend root, never the process
+    # working directory (see _data_path): a CWD-relative path made a wrong CWD
+    # open a brand-new empty chat DB with no error anywhere.
+    # Retention purges conversations idle for CHAT_RETENTION_DAYS.
+    CHAT_DB_PATH = _data_path("CHAT_DB_PATH", "data/chat.db")
     CHAT_RETENTION_DAYS = int(os.getenv("CHAT_RETENTION_DAYS", "180"))
     CHAT_MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "10"))
     CHAT_PURGE_INTERVAL_SECONDS = int(os.getenv("CHAT_PURGE_INTERVAL_SECONDS", "86400"))
@@ -599,7 +695,7 @@ class Config:
     # layer maps roles to permissions (see app/auth.py). Tokens are opaque,
     # hashed (SHA-256) in storage, expire after AUTH_TOKEN_TTL_DAYS, and can be
     # revoked individually.
-    AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "data/auth.db")
+    AUTH_DB_PATH = _data_path("AUTH_DB_PATH", "data/auth.db")
     # Redis DB holding the auth rate-limit counters. Pinned explicitly, like
     # ANALYTICS_REDIS_DB and USER_PROFILE_REDIS_DB, rather than inherited from
     # any db segment in REDIS_URL. The inherited value was DB 0, which this
