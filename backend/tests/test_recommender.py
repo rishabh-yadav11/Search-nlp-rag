@@ -5,12 +5,15 @@ Qdrant or Redis to be running. Integration tests that require the full stack
 should be added separately.
 """
 import json
+import logging
 import math
 import sys
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from qdrant_client.models import ScoredPoint
 
 
 class TestCalculateRecencyScore:
@@ -256,3 +259,135 @@ class TestUserProfileIntegration:
         pipe.set.assert_called_once()
         assert json.loads(pipe.set.call_args.args[1]) == [2.0, 4.0]
         pipe.zadd.assert_called_once_with("user:categories:user1", {"technology": pytest.approx(1.0), "merger": pytest.approx(1.0)})
+
+
+def _scored_point(pid: int, title: str) -> ScoredPoint:
+    """A minimal Qdrant point the recommender can score and format."""
+    return ScoredPoint(
+        id=pid,
+        version=0,
+        score=0.5,
+        payload={
+            "title": title,
+            "url": f"https://example.com/{pid}",
+            "published_date": "2026-01-01T00:00:00Z",
+        },
+        vector=None,
+    )
+
+
+class _FakeQdrant:
+    """Qdrant double whose vector, category and trending legs fail on demand.
+
+    The vector leg queries with a point id (`query=...`); the category leg
+    queries with only a filter. That is what lets a single fake fail one leg
+    while the others keep working.
+    """
+
+    OUTAGE = "qdrant unreachable"
+
+    def __init__(self, *, fail_vector=False, fail_category=False, fail_trending=False):
+        self.fail_vector = fail_vector
+        self.fail_category = fail_category
+        self.fail_trending = fail_trending
+
+    async def query_points(self, **kwargs):
+        if "query" in kwargs:
+            if self.fail_vector:
+                raise RuntimeError(self.OUTAGE)
+            return SimpleNamespace(points=[_scored_point(11, "vector hit")])
+        if self.fail_category:
+            raise RuntimeError(self.OUTAGE)
+        return SimpleNamespace(points=[_scored_point(12, "category hit")])
+
+    async def scroll(self, **kwargs):
+        if self.fail_trending:
+            raise RuntimeError(self.OUTAGE)
+        return ([_scored_point(13, "trending hit")], None)
+
+
+async def _personalized(qdrant, *, trending=None):
+    """Drive get_personalized_recommendations with a warm user profile."""
+    from app import recommender
+
+    trending = [{"article_id": 13}] if trending is None else trending
+    with (
+        patch.object(recommender, "state", {"qdrant": qdrant}),
+        patch.object(
+            recommender, "get_user_interactions",
+            AsyncMock(return_value=[(901, datetime.now(UTC).timestamp())]),
+        ),
+        # A category containing "industry" is required for a category filter
+        # to be built at all, otherwise the category leg short-circuits.
+        patch.object(
+            recommender, "get_user_profile_categories",
+            AsyncMock(return_value=[("software industry", 1.0)]),
+        ),
+        patch.object(
+            recommender, "get_trending_articles", AsyncMock(return_value=trending),
+        ),
+    ):
+        return await recommender.get_personalized_recommendations("user1", limit=5)
+
+
+def _leg_warnings(caplog, exc_message):
+    """Warning records on the recommender logger that carry the exception."""
+    return [
+        record for record in caplog.records
+        if record.name == "app.recommender"
+        and record.levelno == logging.WARNING
+        and exc_message in record.getMessage()
+    ]
+
+
+def _titles(result):
+    return {article["title"] for article in result}
+
+
+class TestCandidateLegObservability:
+    """Each candidate leg must be visible when its data source fails."""
+
+    def test_recommender_warnings_reach_caplog(self, caplog):
+        """Guard: caplog is only meaningful if WARNING propagates to root."""
+        logger = logging.getLogger("app.recommender")
+        assert logger.propagate is True
+        assert logger.getEffectiveLevel() <= logging.WARNING
+        with caplog.at_level(logging.WARNING):
+            logger.warning("probe warning")
+        assert "probe warning" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_vector_leg_failure_logs_warning_with_exception(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = await _personalized(_FakeQdrant(fail_vector=True))
+
+        assert _leg_warnings(caplog, _FakeQdrant.OUTAGE), caplog.records
+        # The other two legs still supply the feed.
+        assert _titles(result) == {"category hit", "trending hit"}
+
+    @pytest.mark.asyncio
+    async def test_category_leg_failure_logs_warning_with_exception(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = await _personalized(_FakeQdrant(fail_category=True))
+
+        assert _leg_warnings(caplog, _FakeQdrant.OUTAGE), caplog.records
+        assert _titles(result) == {"vector hit", "trending hit"}
+
+    @pytest.mark.asyncio
+    async def test_trending_leg_failure_logs_warning_with_exception(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            result = await _personalized(_FakeQdrant(fail_trending=True))
+
+        assert _leg_warnings(caplog, _FakeQdrant.OUTAGE), caplog.records
+        assert _titles(result) == {"vector hit", "category hit"}
+
+    @pytest.mark.asyncio
+    async def test_partial_outage_keeps_working_legs(self, caplog):
+        """A full Qdrant outage in every leg still returns a (here empty) feed
+        plus three warnings, rather than raising or logging nothing."""
+        qdrant = _FakeQdrant(fail_vector=True, fail_category=True, fail_trending=True)
+        with caplog.at_level(logging.WARNING):
+            result = await _personalized(qdrant)
+
+        assert result == []
+        assert len(_leg_warnings(caplog, _FakeQdrant.OUTAGE)) == 3, caplog.records
