@@ -120,9 +120,12 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   // escape therefore lands on an off-origin host *with* an `https:` protocol,
   // which is exactly what SAFE_PROTOCOLS below admits, so no amount of scheme
   // allowlisting catches it. Refusing backslashes outright is the third place
-  // this guard is stricter than the browser, and the cheapest one: a real
-  // article URL carries no raw backslash, because the parser consumes one as a
-  // separator in a special scheme and percent-encodes one in any other.
+  // this guard is stricter than the browser, and the cheapest one: `\` is not
+  // in the RFC 3986 URI character set at all, so a stored article URL carrying
+  // one is malformed. The parser either reinterprets it as a separator (special
+  // scheme) or emits it verbatim (`mailto:a\b@x.com` stays as it is; `\` is
+  // not in the path percent-encode set, so it is never escaped to `%5C`), and
+  // neither behaviour round-trips back to the stored string.
   if (raw.includes('\\')) return false
 
   if (PROTOCOL_RELATIVE_RE.test(raw)) return false

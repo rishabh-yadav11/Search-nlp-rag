@@ -257,11 +257,6 @@ describe('isSafeUrl — server/client parity', () => {
   // https://app.vccircle.com/) rejects them as off-origin. A parity assertion
   // alone would not catch that, because it only compares the two verdicts; the
   // explicit `false` pins the actual outcome.
-
-  // The single-backslash form `\ssr.invalid/x` is not in this list because it
-  // is a same-origin path in a browser, not an escape. It is still refused,
-  // by the backslash check rather than by the origin comparison, so it is
-  // pinned separately below instead of being implied by this block.
   it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
     'rejects the backslash escape %j aimed at the stand-in origin',
     (url) => {
@@ -270,21 +265,15 @@ describe('isSafeUrl — server/client parity', () => {
     }
   )
 
+  // The single-backslash form `\ssr.invalid/x` is absent from the list above
+  // because it is a same-origin path in a browser, not an escape. It is still
+  // refused, by the backslash check rather than by the origin comparison, so
+  // it gets its own pin: the CORPUS parity assertion above passes either way,
+  // and this is the assertion that would notice the strictness being lost.
   it('refuses the same-origin single-backslash path on both sides', () => {
-    // `\ssr.invalid/x` is one separator, not two, so the browser treats it as
-    // a local path and the guard is deliberately stricter here. Pinning the
-    // outcome is what stops the strictness being lost silently: the CORPUS
-    // parity assertion above still passes either way.
     expect(verdictIn('\\ssr.invalid/x', false)).toBe(false)
     expect(verdictIn('\\ssr.invalid/x', true)).toBe(false)
   })
-  it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
-    'rejects the backslash escape %j aimed at the stand-in origin',
-    (url) => {
-      expect(verdictIn(url, false)).toBe(false)
-      expect(verdictIn(url, true)).toBe(false)
-    }
-  )
 })
 
 describe('isSafeUrl — deliberate strictness on control characters', () => {
