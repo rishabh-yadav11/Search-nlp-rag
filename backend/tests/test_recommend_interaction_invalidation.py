@@ -23,11 +23,7 @@ OTHER_USER = "user-2"
 
 
 def _for_you_key(user_id: str, limit: int) -> str:
-    # Derived from the endpoint's own constants, not re-spelled here. These
-    # tests are about which keys the invalidation path deletes, so repeating the
-    # format string would let the writer and the invalidator drift apart again
-    # and still pass while leaving stale entries behind.
-    return f"recommend:for-you:{user_id}:{main.RECOMMEND_CACHE_VERSION}:{limit}"
+    return main._for_you_cache_key(user_id, limit)
 
 
 FOR_YOU_KEYS = [

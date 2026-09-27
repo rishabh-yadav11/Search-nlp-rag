@@ -1542,10 +1542,22 @@ FOR_YOU_MIN_LIMIT = 1
 FOR_YOU_MAX_LIMIT = 20
 
 
+def _for_you_cache_key(user_id: str, limit: int) -> str:
+    """The one place a /recommend/for-you cache key is spelled.
+
+    The writer in ``get_for_you`` and the invalidator in
+    ``record_user_interaction`` must agree on this string exactly. They used to
+    be f-strings written out twice, and a change to one silently stopped the
+    other from matching, leaving a user's feed served from a stale entry until
+    its TTL ran out. Both call this instead.
+    """
+    return f"recommend:for-you:{user_id}:{RECOMMEND_CACHE_VERSION}:{limit}"
+
+
 def _for_you_cache_keys(user_id: str) -> list[str]:
     """Every cache key /recommend/for-you can have written for ``user_id``."""
     return [
-        f"recommend:for-you:{user_id}:{RECOMMEND_CACHE_VERSION}:{limit}"
+        _for_you_cache_key(user_id, limit)
         for limit in range(FOR_YOU_MIN_LIMIT, FOR_YOU_MAX_LIMIT + 1)
     ]
 
@@ -1664,9 +1676,7 @@ async def get_for_you(
     """
     user_id = request.state.user_id
 
-    # The version segment sits after the user id so the delete_prefix in
-    # record_user_interaction keeps matching this key.
-    cached_key = f"recommend:for-you:{user_id}:{RECOMMEND_CACHE_VERSION}:{limit}"
+    cached_key = _for_you_cache_key(user_id, limit)
     cached = await cache.get(cached_key)
     if cached:
         return RecommendationsResponse(
