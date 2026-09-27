@@ -641,8 +641,8 @@ def test_client_ip_x_forwarded_for_and_fallback():
     req = _req({"x-forwarded-for": " 203.0.113.9 "})
     req.client = SimpleNamespace(host="::1")
     assert auth._client_ip(req) == "203.0.113.9"
-    # socket peer fallback: a loopback peer with no header keeps keying on the
-    # peer address rather than inventing one.
+    # No forwarded header at all: the socket peer is authoritative, so the
+    # caller keys on its own address rather than on anything it claims.
     req = _req({})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"

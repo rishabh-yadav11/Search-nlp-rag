@@ -176,18 +176,24 @@ _readiness_cache: tuple[float, bool, dict] | None = None
 # probe round. The rate limiter does not prevent that herd either: it bounds
 # arrival rate, not concurrency.
 #
-# Built eagerly at import, like _redis_init_lock. On 3.10+ an asyncio.Lock is
-# not tied to a loop at construction, so creating one at import is safe; it
-# binds to the running loop only when a caller actually contends for it, and
-# the cache-hit path never takes it. A gunicorn worker runs one event loop for
-# its whole life, so there is one binding in production.
-_readiness_probe_lock: asyncio.Lock = asyncio.Lock()
+# Built LAZILY, unlike _redis_init_lock, and that distinction is load-bearing.
+# _redis_init_lock guards a block that awaits nothing, so it is never
+# contended and acquire() always takes the fast path, which never binds the
+# lock to a loop. This one IS contended, and a contended acquire binds the lock
+# to the running loop for good -- a module-level instance would then raise
+# "is bound to a different event loop" the first time a later event loop
+# contended it, which the per-test event loops here guarantee. The lazy
+# check-then-assign below has no await between the check and the assignment,
+# so it cannot race, and reset_readiness_cache() drops it between tests.
+_readiness_probe_lock: asyncio.Lock | None = None
 
 
 def reset_readiness_cache() -> None:
-    """Drop the cached readiness report so the next poll re-probes."""
-    global _readiness_cache
+    """Drop the cached readiness report so the next poll re-probes, and the
+    single-flight lock with it so it is never carried across event loops."""
+    global _readiness_cache, _readiness_probe_lock
     _readiness_cache = None
+    _readiness_probe_lock = None
 
 
 async def _cached_readiness_report(state: dict) -> tuple[bool, dict]:
@@ -197,10 +203,14 @@ async def _cached_readiness_report(state: dict) -> tuple[bool, dict]:
     A miss is single-flight: concurrent callers that miss together run the
     probes once between them, and the waiters re-check the cache under the lock
     and reuse the entry the winner just wrote."""
-    global _readiness_cache
+    global _readiness_cache, _readiness_probe_lock
     cached = _readiness_cache
     if cached is not None and cached[0] > time.monotonic():
         return cached[1], cached[2]
+    # No await between the check and the assignment, so two callers arriving
+    # together cannot each build a lock and defeat the single-flight.
+    if _readiness_probe_lock is None:
+        _readiness_probe_lock = asyncio.Lock()
     async with _readiness_probe_lock:
         # Re-check: another caller may have refreshed the entry while this one
         # waited for the lock, in which case there is nothing left to probe.
