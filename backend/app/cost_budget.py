@@ -113,6 +113,18 @@ local new_id = ARGV[7]
 if hold_ttl < 1 then hold_ttl = 1 end
 if counter_ttl < 1 then counter_ttl = 1 end
 
+-- The holds hash and the holds-expiry zset must OUTLIVE the instant a hold
+-- first becomes sweepable. A hold's zset score is `now + hold_ttl` and the
+-- sweep predicate is `score <= now`, so the earliest moment the promotion of a
+-- crashed call is POSSIBLE is exactly hold_ttl after the reserve -- which is
+-- precisely when containers expired at hold_ttl are gone. Redis expires
+-- lazily, on the first command issued after the deadline, and that command is
+-- the sweep itself: the containers would be deleted in the same breath in
+-- which the promotion became observable, and a crashed billed call's spend
+-- would be silently lost. Two TTLs of slack leaves a full further hold_ttl
+-- window in which ANY budget call promotes the lapsed hold.
+local container_ttl = hold_ttl * 2
+
 -- Sweep lapsed holds first, in every mode. A turn that reserved and then
 -- crashed never settles, and an un-swept hold would keep eating budget until
 -- the day key rolled over. A lapsed hold is PROMOTED, not freed: the call it
@@ -154,8 +166,8 @@ if mode == 'reserve' then
   end
   redis.call('HSET', KEYS[2], new_id, amount)
   redis.call('ZADD', KEYS[3], now + hold_ttl, new_id)
-  redis.call('EXPIRE', KEYS[2], hold_ttl)
-  redis.call('EXPIRE', KEYS[3], hold_ttl)
+  redis.call('EXPIRE', KEYS[2], container_ttl)
+  redis.call('EXPIRE', KEYS[3], container_ttl)
   return 0
 end
 
@@ -218,8 +230,8 @@ if mode == 'settle' then
   -- The ledger is only as good as the day it belongs to; drop it with the day
   -- counter so tomorrow's reservations are never mistaken for today's.
   redis.call('EXPIRE', KEYS[4], counter_ttl)
-  redis.call('EXPIRE', KEYS[2], hold_ttl)
-  redis.call('EXPIRE', KEYS[3], hold_ttl)
+  redis.call('EXPIRE', KEYS[2], container_ttl)
+  redis.call('EXPIRE', KEYS[3], container_ttl)
   return 0
 end
 
@@ -232,8 +244,8 @@ if mode == 'release' then
     redis.call('HDEL', KEYS[2], ARGV[i])
     redis.call('ZREM', KEYS[3], ARGV[i])
   end
-  redis.call('EXPIRE', KEYS[2], hold_ttl)
-  redis.call('EXPIRE', KEYS[3], hold_ttl)
+  redis.call('EXPIRE', KEYS[2], container_ttl)
+  redis.call('EXPIRE', KEYS[3], container_ttl)
   return 0
 end
 

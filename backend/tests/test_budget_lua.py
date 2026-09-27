@@ -40,17 +40,53 @@ local SCRIPT = assert(loadfile('budget.lua'))
 
 local store, fails = nil, 0
 
-local function newstore() store = { c = 0, h = {}, z = {}, d = {} } end
+-- Real key expiry. Redis deletes a key at the instant its TTL runs out, and
+-- the first command issued after that deadline sees a MISSING key. Because
+-- expiry is LAZY, that command is usually the very one that needed the data.
+-- Modelling it is what makes the holds containers' TTLs observable at all:
+-- with EXPIRE a no-op, no scenario can tell a container that outlives the
+-- promotion window from one that dies in the same instant the promotion
+-- becomes possible -- and a crash that is never charged looks identical to
+-- one that is.
+--
+-- The clock is the one the SCRIPT is handed (ARGV[2]), so a scenario picks the
+-- instant a key dies by choosing `now`.
+local function newstore() store = { c = 0, h = {}, z = {}, d = {}, exp = {}, now = 0 } end
 local function hash(key) return key == 'd' and store.d or store.h end
 local function holdcount() local n = 0; for _ in pairs(store.h) do n = n + 1 end; return n end
 local function donecount() local n = 0; for _ in pairs(store.d) do n = n + 1 end; return n end
 
+-- Drop every key whose TTL has run out. A rolled-over day counter reads as
+-- zero, which is exactly how the script already treats a missing one.
+local function expire_due()
+  for k, at in pairs(store.exp) do
+    if at and at <= store.now then
+      store.exp[k] = nil
+      if k == 'c' then store.c = 0 else store[k] = {} end
+    end
+  end
+end
+
+-- Real Redis REJECTS a non-positive TTL with an error instead of storing the
+-- key forever. Without this, a scenario cannot tell a floored TTL from a
+-- missing floor.
+local function real_ttl(v, cmd)
+  if not v or v < 1 then error("invalid expire time in '" .. cmd .. "' command") end
+  return v
+end
+
 redis = {}
 
 function redis.call(cmd, key, ...)
+  expire_due()
   local a = { ... }
   if cmd == 'GET' then return tostring(store.c or 0) end
-  if cmd == 'SET' then store.c = tonumber(a[1]) return 'OK' end
+  if cmd == 'SET' then
+    for i = 1, #a do
+      if a[i] == 'EX' then store.exp[key] = store.now + real_ttl(tonumber(a[i + 1]), 'set') end
+    end
+    store.c = tonumber(a[1]) return 'OK'
+  end
   if cmd == 'INCRBY' then store.c = (store.c or 0) + tonumber(a[1]) return store.c end
   if cmd == 'HGET' then return hash(key)[a[1]] or false end
   if cmd == 'HSET' then hash(key)[a[1]] = tonumber(a[2]) return 1 end
@@ -68,16 +104,18 @@ function redis.call(cmd, key, ...)
     table.sort(out)
     return out
   end
-  if cmd == 'EXPIRE' then return true end
+  if cmd == 'EXPIRE' then store.exp[key] = store.now + real_ttl(tonumber(a[1]), 'expire') return 1 end
   error('stub missing command: ' .. tostring(cmd))
 end
 
--- run(mode, now, hold_ttl, budget, amount, new_id, ids) -> the script's return value
-local function run(mode, now, hold_ttl, budget, amount, new_id, ids)
+-- run(mode, now, hold_ttl, budget, amount, new_id, ids, counter_ttl) -> the script's return value
+local function run(mode, now, hold_ttl, budget, amount, new_id, ids, counter_ttl)
   KEYS = { 'c', 'h', 'z', 'd' }
-  local argv = { mode, tostring(now), tostring(hold_ttl), '604800', tostring(budget), tostring(amount), new_id or '' }
+  counter_ttl = counter_ttl or 604800
+  local argv = { mode, tostring(now), tostring(hold_ttl), tostring(counter_ttl), tostring(budget), tostring(amount), new_id or '' }
   for _, id in ipairs(ids or {}) do argv[#argv + 1] = id end
   ARGV = argv
+  store.now = tonumber(now)
   return SCRIPT()
 end
 
@@ -247,10 +285,54 @@ function S.disabled_cap_admits_everything()
   check(ok, 'cap disabled -> all 5 admitted')
 end
 
-function S.misconfigured_ttls_do_not_error()
+-- Acceptance criterion for #255: a CRASH is not free spend -- and the
+-- promotion has to be REACHABLE, not just arithmetically correct. Nothing
+-- here refreshes the holds containers between the reserve and the sweep: the
+-- one later call is the first command the store sees. A hold's score first
+-- satisfies `score <= now` exactly hold_ttl after the reserve, which is also
+-- when containers expired at hold_ttl are gone (Redis expires lazily, on the
+-- first command after the deadline -- the sweep). The spend then evaporates
+-- and nothing reports it.
+function S.crashed_hold_is_charged_without_a_keepalive()
+  newstore()
+  run('reserve', 1000, 900, 500000, 50000, 'crash')
+  check(store.c == 0, 'a live hold is not spend yet (got ' .. store.c .. ')')
+  run('reserve', 1900, 900, 500000, 1000, 'later')
+  check(store.c == 50000, 'the crashed turn is charged with no keepalive in between (got ' .. store.c .. ')')
+  check(store.d['crash'] == 50000, 'the charge is on the ledger (got ' .. tostring(store.d['crash']) .. ')')
+  -- Re-sweeping must not charge it a second time.
+  run('reserve', 1900, 900, 500000, 1000, 'later2')
+  check(store.c == 50000, 'a repeated sweep does not double charge (got ' .. store.c .. ')')
+  -- The containers outlived the promotion instead of dying with it, so the
+  -- live holds are still being counted against the cap.
+  check(holdcount() == 2, 'the two live holds are still held (got ' .. holdcount() .. ')')
+end
+
+-- The TTL floors, one per scenario. Real Redis REJECTS `EXPIRE key 0` and
+-- `SET key val EX 0` with an error, so a misconfigured
+-- COST_RESERVATION_TTL_SECONDS=0 or COST_DAY_TTL_SECONDS=0 would make every
+-- budget call fail closed and take chat down deployment-wide. Deleting either
+-- guard has to fail a test that exercises THAT floor.
+function S.zero_hold_ttl_is_floored()
   newstore()
   check(pcall(run, 'reserve', 1000, 0, 150000, 50000, 'ttl'), 'a zero hold_ttl does not error out')
-  check(pcall(run, 'settle', 1000, 0, 150000, 50000, '', { 'ttl' }), 'a zero counter_ttl does not error out')
+  -- The floor is one second, so the hold is due at 1001 and is still
+  -- promotable then: it was stored, not silently dropped.
+  run('reserve', 1001, 0, 150000, 1000, 'later')
+  check(store.c == 50000, 'the floored hold is charged when it lapses (got ' .. store.c .. ')')
+end
+
+function S.zero_counter_ttl_is_floored()
+  newstore()
+  -- The settle's own `SET KEYS[1] <total> EX counter_ttl` is the write that
+  -- records the day's spend; a rejected TTL would lose the cost of every turn.
+  check(pcall(run, 'settle', 1000, 900, 150000, 50000, '', { 'a' }, 0), 'a zero counter_ttl does not error out of a settle')
+  check(store.c == 50000, 'the settle still records the cost (got ' .. store.c .. ')')
+  -- The sweep re-arms the day counter with EXPIRE, which rejects 0 just the same.
+  newstore()
+  run('reserve', 1000, 900, 500000, 50000, 'crash')
+  check(pcall(run, 'reserve', 1900, 900, 500000, 1000, 'later', {}, 0), 'a zero counter_ttl does not error out of the sweep')
+  check(store.c == 50000, 'the promotion still lands (got ' .. store.c .. ')')
 end
 
 assert(SCENARIO, 'no scenario named on the command line')
@@ -271,6 +353,7 @@ SCENARIOS = [
     "settle_records_actual_once",
     "settle_overshoot_is_recorded",
     "crashed_hold_is_charged_when_it_lapses",
+    "crashed_hold_is_charged_without_a_keepalive",
     "settle_replaces_the_promoted_estimate",
     "settling_the_same_ids_twice_charges_once",
     "duplicate_ids_within_one_settle_charge_once",
@@ -280,7 +363,8 @@ SCENARIOS = [
     "zero_settle_is_a_noop",
     "settle_with_no_ids_still_bills",
     "disabled_cap_admits_everything",
-    "misconfigured_ttls_do_not_error",
+    "zero_hold_ttl_is_floored",
+    "zero_counter_ttl_is_floored",
 ]
 
 
