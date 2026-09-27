@@ -2301,7 +2301,16 @@ def _trim_history(history: list[MessageOut], max_chars: int) -> list[MessageOut]
 
 async def _start_turn(s: ChatStore, session_id: str, user_id: str, question: str) -> tuple[MessageOut, list[MessageOut]]:
     user_msg = await s.append_message(session_id, user_id, "user", question)
-    history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+    try:
+        history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
+    except asyncio.CancelledError:
+        # Both turn paths call this BEFORE their own rollback handlers are
+        # installed, so a cancel in this window would leave the row written
+        # above with no assistant reply and nobody to delete it -- the same
+        # dangling state the turn handlers exist to prevent, one step earlier.
+        # Nothing was ever streamed, so the rule's side is a clean rollback.
+        await _reconcile_cancelled_turn(lambda: s.delete_message(session_id, user_id, user_msg.id))
+        raise
     # Both caps apply: turns bound how many messages come back, chars bound how
     # many of them actually reach the prompt.
     return user_msg, _trim_history(history, config.CHAT_MAX_HISTORY_CHARS)

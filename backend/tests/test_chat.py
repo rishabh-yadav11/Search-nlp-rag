@@ -5406,3 +5406,50 @@ def test_stream_cancelled_after_the_gate_charges_the_billed_call(tmp_path, monke
         assert _turn_rows(store, sid) == []
     finally:
         _release_store(store)
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["json", "sse"])
+def test_turn_cancelled_before_its_own_handlers_roll_back_the_user_message(
+    tmp_path, monkeypatch, streaming
+):
+    """`_start_turn` writes the user message and then reads history, and BOTH
+    turn paths call it before their cancellation handlers exist. A cancel in
+    that window used to leave the row with no assistant reply and no handler
+    able to remove it; the shared helper now rolls it back itself."""
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        ready = asyncio.Event()
+        real_recent = store.recent_turns
+
+        async def stuck_recent_turns(session_id, user_id, max_turns):
+            ready.set()
+            await asyncio.sleep(3600)
+            return await real_recent(session_id, user_id, max_turns)
+
+        monkeypatch.setattr(store, "recent_turns", stuck_recent_turns)
+        request = _cancel_request()
+        if streaming:
+            endpoint = lambda: chat_module.send_message_stream(
+                sid, chat_module.MessageIn(content="what deals happened"), request
+            )
+        else:
+            endpoint = lambda: chat_module.send_message(
+                sid, chat_module.MessageIn(content="what deals happened"), request
+            )
+
+        async def run_it():
+            task = asyncio.create_task(endpoint())
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert _run(run_it()) is True
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
