@@ -143,18 +143,30 @@ Redis `from_url`/`ping` mocked (no live Redis), the module-global
 `_redis_client` reset between tests, and Qdrant faked with a `collection_exists`
 coroutine.
 
-- [x] **`/health`, `/live`** (lines 16, 21).
-- [x] **`_qdrant_ok` client absent** (lines 27-28) and **Qdrant call failing /
-      timing out** (lines 32-33) — `RuntimeError` and `asyncio.wait_for`
+- [x] **`/health`, `/live`** (lines 28, 124): liveness only, inspected once;
+      `/health` cannot fail by design, which is the property the deploy gate and
+      the watchdog are tested against.
+- [x] **`_qdrant_ok` client absent** (lines 129-130) and **Qdrant call failing /
+      timing out** (lines 135-136) — `RuntimeError` and `asyncio.wait_for`
       raising `TimeoutError` both → False. **ERROR PATH — Qdrant down.**
-- [x] **`_models_ok`** (line 37): all present → True; any key missing → False.
-- [x] **`_llm_ok`** (line 41): key set vs empty.
-- [x] **`_redis_status`** (lines 49-59): no REDIS_URL → `(True, "memory")`;
+- [x] **`_models_ok`** (line 149): all present → True; any key missing → False.
+- [x] **`_llm_status`** (line 153): a real-shaped key → `(True, "ok")`; the
+      shipped `.env.example` placeholder, every sentinel spelling, masked keys
+      and wrong-shape keys → `(False, "placeholder"/"malformed")`; unset →
+      `(False, "missing")`. It never returns the key itself. **ERROR PATH — the
+      literal `bool(config.GEMINI_API_KEY)` this replaced read every one of
+      those as healthy.**
+- [x] **`_redis_status`** (lines 166-189): no REDIS_URL → `(True, "memory")`;
       ping ok → `(True, "redis")` (plus client reuse, single `from_url`);
       ping fail / timeout → `(True, "degraded")`. **ERROR PATH — Redis down.**
-- [x] **`_readiness_report` + `/ready`/`/readyz`** (lines 62-93): report shape
-      asserted with mocked + real checks wired together; ready → 200,
-      not-ready → 503 on both endpoints.
+- [x] **`_readiness_report` + `/ready`/`/readyz`** (lines 278-303, 320, 351):
+      report shape asserted with mocked + real checks wired together; ready →
+      200, not-ready → 503 on both endpoints, and the verdict requires a usable
+      LLM key.
+- [x] **`/ready/deep`** (line 399) + **`_is_host_local_probe`** (line 370): the
+      uncached/unrated monitoring probe, its bypass of both the shared readiness
+      cache and the limiter, and its refusal of a non-loopback peer or a request
+      carrying `X-Forwarded-For` — each proved by mutation.
 
 ---
 
