@@ -1257,6 +1257,13 @@ def _history_fence(history: list[MessageOut]) -> str:
     character of its text. Below that no turn is kept and the reserved note
     stands alone; either way the turns left out are declared, never silent.
 
+    That threshold is not a constant — it is the reserved note (its length grows
+    with the number of turns dropped) plus the newest turn's fence, whose length
+    follows its label, plus the truncation mark plus one character. For a
+    10-turn history whose newest turn is labelled ``TURN 10 user`` that is
+    61 + 1 + 42 + 67 + 1 = 172, and for the same history ending in
+    ``TURN 10 assistant`` it is 61 + 1 + 52 + 67 + 1 = 182.
+
     When the limit is too small to hold that note there is no rendering that
     both reports the session and respects the bound, so the replay is empty —
     which fits any limit, zero and negative included. It is empty rather than
