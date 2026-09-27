@@ -290,12 +290,17 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
     // Network/transport failure: do NOT treat as "not authenticated" (preserve
     // the token so a later retry can succeed). Rethrow rather than return null
     // so callers can tell this apart from a definitive 401/logged-out null.
-    console.error(
-      deadline.timedOut()
-        ? 'getMe: /api/auth/me timed out'
-        : 'getMe: failed to reach the auth service',
-      err
-    )
+    //
+    // A caller-initiated abort (the dashboard unmounting, or giving up on its
+    // 10 s identity race) is a cancellation, not a backend fault. Logging it as
+    // "failed to reach the auth service" would report a perfectly healthy auth
+    // service as down on every page teardown, so only real transport failures
+    // and real timeouts are logged.
+    if (!deadline.timedOut() && (err as Error)?.name !== 'AbortError') {
+      console.error('getMe: failed to reach the auth service', err)
+    } else if (deadline.timedOut()) {
+      console.error('getMe: /api/auth/me timed out', err)
+    }
     throw err
   } finally {
     deadline.clear()

@@ -118,14 +118,23 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
     expect((await pending).ok).toBe(false)
   })
 
-  it('does not blame a caller abort on the backend', async () => {
+  it('does not log a caller abort as a backend failure', async () => {
     const caller = new AbortController()
     const pending = track(getMe(false, caller.signal))
 
     caller.abort()
     expect((await pending).ok).toBe(false)
-    // A cancelled load must not be logged as a backend timeout, or every
-    // dashboard unmount would look like a slow auth service.
+    // A cancelled load is a cancellation, not a fault. Logging it as
+    // "failed to reach the auth service" would report a healthy auth service
+    // as down on every dashboard unmount and every 10 s race timeout.
+    expect(console.error).not.toHaveBeenCalled()
+  })
+
+  it('still logs a genuine transport failure', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('Failed to fetch'))))
+
+    const pending = track(getMe(false, new AbortController().signal))
+    expect((await pending).ok).toBe(false)
     expect(console.error).toHaveBeenCalledWith('getMe: failed to reach the auth service', expect.anything())
   })
 

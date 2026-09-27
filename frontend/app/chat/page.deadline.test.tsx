@@ -75,7 +75,11 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
   it('aborts the hung session create and reports the failure instead of spinning', async () => {
     await submitFirstTurn('what happened to the deal?')
 
-    const createCall = signals[0]
+    // The mount-time session LIST is the first call; the create is the one
+    // issued by the submit click, so it must be picked out by index — picking
+    // signals[0] here would silently re-test the list call instead.
+    const createCall = signals[1]
+    expect(createCall).toBeTruthy()
     expect(createCall?.aborted).toBe(false)
 
     await advance(CHAT_API_DEADLINE_MS)
@@ -103,6 +107,47 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
     await advance(CHAT_API_DEADLINE_MS)
 
     expect(listCall?.aborted).toBe(true)
+  })
+
+  it('reports a failed delete instead of leaking an unhandled rejection', async () => {
+    // The session list resolves so a row exists to delete; the DELETE hangs.
+    const deleteSignals: (AbortSignal | null)[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/api/chat/sessions/') && init?.method === 'DELETE') {
+          deleteSignals.push(init.signal ?? null)
+          const { promise, reject } = Promise.withResolvers<StubResponse>()
+          init.signal?.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted')
+            err.name = 'AbortError'
+            reject(err)
+          })
+          return promise
+        }
+        if (url.endsWith('/api/chat/sessions')) {
+          return Promise.resolve(jsonResponse([{ id: 's1', title: 'Budget', created_at: 1_700_000_000, updated_at: 1_700_000_100 }]))
+        }
+        return Promise.resolve(jsonResponse({}))
+      })
+    )
+
+    render(<ChatPage />)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const del = screen.getAllByText('✕')[0]
+    await act(async () => {
+      fireEvent.click(del)
+    })
+
+    expect(deleteSignals).toHaveLength(1)
+    await advance(CHAT_API_DEADLINE_MS)
+
+    // The delete handler has no rethrow of its own, so this must land in the
+    // UI. An uncaught rejection here would fail the run instead.
+    expect(screen.getByRole('alert').textContent).toMatch(/timed out after 30s/)
   })
 })
 

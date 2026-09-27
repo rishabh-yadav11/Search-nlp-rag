@@ -589,6 +589,15 @@ export default function ChatPage() {
     async (id: string) => {
       try {
         await api(`/api/chat/sessions/${id}`, { method: 'DELETE' })
+      } catch (err) {
+        // The delete is bounded, so it can now reject on a timeout as well as
+        // on an HTTP error. It must not escape this click handler as an
+        // unhandled rejection, and the user deserves to know it did not land.
+        setError(
+          err instanceof RequestTimeoutError
+            ? err.message
+            : 'Could not delete this conversation.'
+        )
       } finally {
         if (id === activeId) newSession()
         await loadSessions()
