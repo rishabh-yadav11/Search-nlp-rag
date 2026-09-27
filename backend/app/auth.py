@@ -158,6 +158,45 @@ def validate_email(email: str) -> str:
     return email
 
 
+def _has_letter_and_digit(password: str) -> bool:
+    """The composition rule, in one place so ``validate_password`` and the
+    bootstrap guard cannot drift into disagreeing about what counts."""
+    return bool(re.search(r"[A-Za-z]", password)) and bool(re.search(r"\d", password))
+
+
+def _bootstrap_password_rejection(password: str, effective: str) -> str | None:
+    """Why the configured admin password is refused, or None if it is accepted.
+
+    The two classes of rule are deliberately judged against different values,
+    because they answer different questions:
+
+    - **Length** is a property of the credential that actually authenticates.
+      bcrypt only ever sees the first ``_BCRYPT_MAX_BYTES`` bytes, so nothing
+      beyond them can make a short password long. Judging length on the raw
+      string would reject a long passphrase whose effective form is perfectly
+      serviceable -- and ``bootstrap_admin`` is the only path that can ever
+      create an admin (signup hardcodes ``SIGNUP_ROLE``; a role change needs an
+      admin token that cannot exist yet), so that rejection would leave a fresh
+      deploy permanently unadministrable.
+
+    - **Letter+digit** is a property of the secret the operator configured, not
+      of the truncated prefix. It is a composition rule, not an entropy rule, so
+      there is nothing to gain by applying it to bytes that will never
+      authenticate -- and applying it there refuses credentials that both
+      ``main`` and ``login`` accepted: a passphrase whose only digit was
+      appended past byte 72 is long and usable, yet its 72-byte prefix has no
+      digit.
+
+    Both classes still come from ``validate_password`` (via
+    ``_has_letter_and_digit``), so there is one source of truth for the policy.
+    """
+    if len(effective) < config.AUTH_PASSWORD_MIN_LEN:
+        return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
+    if not _has_letter_and_digit(password):
+        return "password must contain a letter and a digit"
+    return None
+
+
 def validate_password(password: str) -> str:
     """Validate a password (length + letter/digit), raising 422 on violation."""
     if not password or len(password) < config.AUTH_PASSWORD_MIN_LEN:
@@ -170,7 +209,7 @@ def validate_password(password: str) -> str:
             status_code=422,
             detail=f"password too long (max {_BCRYPT_MAX_BYTES} bytes)",
         )
-    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+    if not _has_letter_and_digit(password):
         raise HTTPException(status_code=422, detail="password must contain a letter and a digit")
     return password
 
@@ -187,6 +226,7 @@ def _validator_rejection(validator, value: str) -> str | None:
     except HTTPException as exc:
         return str(exc.detail)
     return None
+
 
 def validate_name(name: str) -> str:
     """Trim + validate an optional display name, raising 422 on violation."""
@@ -922,8 +962,6 @@ async def bootstrap_admin() -> None:
     the whole API (and /health) down and leave nobody able to reach the service
     to fix it. An operator must correct the config and restart.
 
-    An admin account left behind by an earlier run with weak credentials is
-    deliberately NOT deleted here: this runs at startup, unauthenticated, and
     removing the only admin account would lock every operator out of their own
     deployment. Such an account is reported instead, so it gets rotated.
     """
@@ -965,7 +1003,7 @@ async def bootstrap_admin() -> None:
             "tail is not part of the credential.",
             _BCRYPT_MAX_BYTES, _BCRYPT_MAX_BYTES,
         )
-    password_error = _validator_rejection(validate_password, effective)
+    password_error = _bootstrap_password_rejection(password, effective)
     if password_error:
         await _reject_bootstrap(
             "AUTH_ADMIN_PASSWORD",
@@ -1023,7 +1061,21 @@ async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
             )
             existing = None
         if existing is not None and existing.role == "admin":
-            if verify_password(config.AUTH_ADMIN_PASSWORD or "", existing.password_hash):
+            # Rotation advice is a PASSWORD remedy, so it may only appear when a
+            # password is what was rejected. On the email axis a rejection says
+            # nothing about this account's password -- a dotless address can
+            # never validate, so demanding rotation here would fire on every
+            # worker start, forever, for an account that is perfectly healthy and
+            # whose only real fault is the configured address.
+            if _validator_name_for(variable) != "validate_password":
+                logger.error(
+                    "bootstrap admin NOT created: %s rejected the configured %s: %s. The "
+                    "pre-existing admin account (id %s) was left untouched and keeps its current "
+                    "password, so it needs no rotation -- the fault is the configured address, not "
+                    "the account. %s.",
+                    _validator_name_for(variable), variable, reason, existing.id, hint,
+                )
+            elif verify_password(config.AUTH_ADMIN_PASSWORD or "", existing.password_hash):
                 logger.error(
                     "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
                     "No account was created, and the pre-existing admin account (id %s) -- which was "
