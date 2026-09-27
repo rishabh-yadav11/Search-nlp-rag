@@ -328,13 +328,19 @@ def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeyp
 )
 def test_effective_password_is_a_byte_prefix_of_what_gets_hashed(pw):
     """Whatever the character width at the cut, the decoded value is a prefix of
-    the hashed bytes and never longer: a split character is dropped whole, so
-    the shortfall is that character's full encoded length, not a fixed byte."""
+    the hashed bytes and never longer. A split character is dropped whole, so the
+    shortfall is the number of that character's bytes that fall inside the
+    truncated buffer (1-3, not its full encoded length), and it is only nonzero
+    when the cut actually lands mid-character."""
     hashed = auth._password_bytes(pw)
     effective = auth._password_bytes(auth._effective_password(pw))
     assert len(hashed) == auth._BCRYPT_MAX_BYTES
     assert hashed.startswith(effective)
-    assert 0 <= len(hashed) - len(effective) <= 4
+    shortfall = len(hashed) - len(effective)
+    # each case must genuinely straddle the cut, not sit on a boundary
+    assert shortfall > 0
+    # at most a 4-byte char's lead plus its retained continuations
+    assert shortfall <= 3
 
 
 def test_bootstrap_admin_still_blocks_weak_password_despite_truncation(store, monkeypatch):
