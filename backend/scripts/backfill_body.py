@@ -23,15 +23,15 @@ import os
 import sys
 import time
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import aiomysql
+from _common import log, make_pool
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointVectors, SparseVector
 from update_index import EXTERNAL_URL_SQL, record_from_row
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _common import log, make_pool
 
 from app.config import config
 from app.index_text import compose_sparse_text
