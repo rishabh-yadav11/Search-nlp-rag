@@ -173,14 +173,35 @@ class HybridCache:
     async def delete_keys(self, keys: Iterable[str]) -> None:
         """Delete an explicitly known set of keys (Redis + memory).
 
-        This is the request-path invalidation primitive. Cost is O(len(keys))
-        -- a single ``DEL`` for the whole set -- because the caller derives the
-        key set from what it actually wrote instead of asking Redis to find it.
-        Use it whenever the key space of a cache entry is small and knowable,
-        which is the case for every per-user cache in this service.
+        This is THE invalidation primitive, and the one to use whenever a
+        cache's key space is small and knowable -- as it is for every per-user
+        cache in this service, where the caller derives the key set from what
+        it actually wrote rather than asking Redis to find it.
 
-        In-process entries are dropped first so the fallback cache cannot serve
-        a stale value even if the Redis round trip then fails.
+        Redis work is O(len(keys)): a single ``DEL`` for the whole set. The
+        only other cost is the in-process sweep, which iterates ``_mem``. That
+        tier is written at exactly one site -- the fall-through in ``set()``
+        after a Redis failure -- so while Redis is healthy ``_mem`` is empty
+        and the sweep is O(1); when Redis is down the sweep is bounded by
+        ``CACHE_MAX_SIZE`` and is doing the work Redis cannot.
+
+        The in-process purge runs unconditionally and BEFORE the Redis call,
+        so the fallback tier cannot keep serving a pre-invalidation value when
+        Redis is unreachable, and so an early abort part-way through the Redis
+        round trip (a cancelled request) cannot leave the memory tier stale
+        either. The guarantee does not depend on the Redis outcome: the
+        degraded path falls through to the same purge.
+
+        ``_mem`` is snapshotted before it is mutated, so a partially purged
+        set is not possible.
+
+        An empty set is a no-op that never opens a connection.
+
+        This replaced a ``delete_prefix`` helper, which matched keys with
+        ``SCAN``. SCAN walks *every* key in the database and applies ``MATCH``
+        only afterwards, so its cost scaled with the total number of keys
+        rather than the number that match. Nothing needs that; if something
+        ever does again, it belongs in an offline maintenance script, not here.
         """
         targets = set(keys)
         if not targets:
@@ -191,35 +212,6 @@ class HybridCache:
         client, is_new = self._acquire()
         try:
             await client.delete(*targets)
-        except _REDIS_ERRORS as exc:
-            if is_new:
-                await self._discard(client)
-            self._degraded(exc)
-        else:
-            await self._publish(client)
-
-    async def delete_prefix(self, prefix: str) -> None:
-        """Delete every cached key starting with ``prefix`` (Redis + memory).
-
-        O(keyspace): implemented with ``SCAN``, which walks *every* key in the
-        database server-side and filters by ``MATCH`` only after the fact. The
-        cost therefore scales with the total number of keys in the cache, not
-        with the number that match, and a single call can walk the whole
-        keyspace.
-
-        NEVER call this from a request handler. It has no production call site
-        left for exactly that reason: the per-user recommendation cache that
-        used to be purged this way has a knowable key set and is invalidated
-        with :meth:`delete_keys` instead. Reserve this for maintenance and
-        teardown paths, where a one-off full walk is acceptable.
-        """
-        for key in list(self._mem.keys()):
-            if key.startswith(prefix):
-                self._drop_mem(key)
-        client, is_new = self._acquire()
-        try:
-            async for key in client.scan_iter(match=f"{prefix}*", count=100):
-                await client.delete(key)
         except _REDIS_ERRORS as exc:
             if is_new:
                 await self._discard(client)
