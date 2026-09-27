@@ -585,7 +585,6 @@ def test_service_token_acts_as_admin(store, monkeypatch):
     assert e.value.status_code == 401
 
 
-
 def test_service_token_non_ascii_header_is_401_not_500(store, monkeypatch):
     """A header carrying bytes above 0x7F must be a mismatch, not a crash.
 
@@ -594,9 +593,11 @@ def test_service_token_non_ascii_header_is_401_not_500(store, monkeypatch):
     X-Service-Token turned an authentication failure into a 500. The token is
     therefore compared as bytes.
 
-    Driven through a raw ASGI scope rather than TestClient/httpx, which cannot
-    deliver such header bytes at all -- the ordinary client path would keep
-    passing with the bug in place.
+    Driven through a raw ASGI scope rather than a test client, so the header
+    is the exact bytes chosen here: an httpx/TestClient call cannot send a
+    non-ASCII header ``str`` at all (it raises on the ASCII encode), and a
+    client handed raw bytes re-encodes them, so neither reproduces what a
+    server actually receives off the wire.
     """
     from fastapi import FastAPI
 
@@ -670,6 +671,7 @@ def test_revoke_service_token_non_ascii_is_not_a_crash(store, monkeypatch):
         assert await store.service_token_for("svc-tok-123") is None
 
     asyncio.run(scenario())
+
 
 def test_rate_limit_429_and_reset(monkeypatch):
     calls = {"n": 0}
