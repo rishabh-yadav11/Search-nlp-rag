@@ -429,7 +429,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `EMBED_DENSE_CHAR_LIMIT` / `EMBED_CHAR_LIMIT` / `BODY_CHAR_LIMIT` | `1500` / `50000` / `50000` | Chars for the dense vector; sparse/lexical vector; body chars kept in the payload |
 | `INDEXER_WORKERS` / `EMBED_BATCH_SIZE` | `2` / `256` | Encode/upsert pipeline depth; embedder batch size (each in-flight batch peaks ~1-2GB on CPU) |
 | `EMBED_DEVICE` | `cpu` | `cuda` for a GPU |
-| `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `12` | Cross-encoder reranker; how many RRF candidates to re-score (12 keeps top-8 quality vs 16, faster on CPU) |
+| `RERANK_MODEL` / `RERANK_CANDIDATES` | `cross-encoder/ms-marco-MiniLM-L-6-v2` / `12` | Cross-encoder reranker; how many RRF candidates to re-score (12 keeps top-8 quality vs 16, faster on CPU). Clamped to `[5, 50]`: out-of-range values are clamped to the nearest bound and logged as a warning |
 | `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `LLM_MODEL` (`GEMINI_MODEL`) | — | Google Gemini (OpenAI-compatible endpoint) for chat |
 | `LLM_PRICE_INPUT_PER_1M` / `LLM_PRICE_OUTPUT_PER_1M` / `INR_PER_USD` | `0.25` / `1.50` / `95.60` | USD per 1M input/output tokens (for cost display); USD→INR rate |
 | `LLM_DAILY_BUDGET_USD` | `5.0` | Daily LLM spend cap; chat fails closed (refuses LLM calls) once today's cumulative cost reaches this value. Each turn reserves this cap atomically before a billed call, so concurrent turns contend for the same budget. Set `0` to deliberately disable the cap (see `app/cost_budget.py`) |

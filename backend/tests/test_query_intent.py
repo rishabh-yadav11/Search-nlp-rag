@@ -1,6 +1,8 @@
 
 
 import datetime as dt
+import re
+import time
 
 import pytest
 
@@ -511,3 +513,330 @@ def test_freeze_rejects_naive_datetime(monkeypatch):
     naive = dt.datetime(2023, 12, 31, 20, 0)  # noqa: DTZ001
     with pytest.raises(ValueError, match="aware datetime"):
         _freeze_utc(monkeypatch, naive)
+
+
+# --- issue #253: the connective-span patterns must stay linear-time ---------
+# The five patterns frozen below are the PRE-FIX versions, copied verbatim
+# from app/query_intent.py. They are the oracle: bounding the gap is a
+# semantic narrowing, so every change to the live patterns has to be shown not
+# to move the result on realistic input.
+_ORIG_BOTH_AND_RE = re.compile(r"\bboth\b.+?\band\b", re.IGNORECASE)
+_ORIG_ALL_OF_RE = re.compile(r"\ball (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
+_ORIG_ACQUIRED_BY_RE = re.compile(
+    r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b[^.?!]*?\b(who|whom)\b",
+    re.IGNORECASE,
+)
+_ORIG_BUYER_AUX_RE = re.compile(
+    r"\b(?:who|whom|what|which\s+\w+)\b[^.?!]*?\b(?:did|does|do|has|have|had|is|are|was|were)\b"
+    r"[^.?!]*?\b(acquir\w+|bought|buys?|buying|purchas\w+|take\s*over|taken\s*over|took\s*over|takeover)\b",
+    re.IGNORECASE,
+)
+_ORIG_BUYER_TRAILING_RE = re.compile(
+    r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b.*\b(what|whom|who)\b",
+    re.IGNORECASE,
+)
+
+# `_BOTH_AND_RE`/`_ALL_OF_RE` are applied as SUBSTITUTIONS by
+# `_multi_entity_scaffold` (the whole "both A and B" span is what gets removed
+# to leave the scaffold), so equivalence for those two is compared on
+# `.sub(" ", s)`. The other three are only ever asked as booleans by
+# `acquisition_relation`, so their equivalence is compared as match truthiness.
+_SUB_PAIRS = (
+    (query_intent._BOTH_AND_RE, _ORIG_BOTH_AND_RE),
+    (query_intent._ALL_OF_RE, _ORIG_ALL_OF_RE),
+)
+_SEARCH_PAIRS = (
+    (query_intent._ACQUIRED_BY_RE, _ORIG_ACQUIRED_BY_RE),
+    (query_intent._BUYER_AUX_RE, _ORIG_BUYER_AUX_RE),
+    (query_intent._BUYER_TRAILING_RE, _ORIG_BUYER_TRAILING_RE),
+)
+_ORACLES_BY_NAME = {
+    "_ACQUIRED_BY_RE": _ORIG_ACQUIRED_BY_RE,
+    "_BUYER_AUX_RE": _ORIG_BUYER_AUX_RE,
+    "_BUYER_TRAILING_RE": _ORIG_BUYER_TRAILING_RE,
+}
+
+# `_ALL_OF_RE` is written with a `\b` before "all" -- the literal is the word
+# "all", NOT `\a` + "ll" (a BEL escape, which would make the pattern unable to
+# match ordinary English).
+#
+# The corpus below carries inputs chosen to DISCRIMINATE the pre-fix patterns
+# from the bounded ones. The sharpest is a connective with nothing (or almost
+# nothing) between its two ends: `_ALL_OF_RE`'s prefix `\ball ` ends in a
+# literal space, so a zero-width gap would let `\b(?:and|with)\b` match
+# straight after it and the pattern would match "all and" -- which the pre-fix
+# one-or-more gap could not. That widened the matcher, changed the
+# `_multi_entity_scaffold` substitution and flipped `detect_multi_entity` from
+# 'comparison' to 'intersection'. These fixtures are in the corpus so that
+# widening turns the equivalence assertions below red instead of passing.
+_ZERO_GAP_FIXTURES = (
+    "all and",
+    "all with",
+    "all  and",
+    "all of and",
+    "all of with",
+    "all with revenue and both Acme and Beta",
+    "both and",
+    "both with",
+)
+_INTERSECTION_CORPUS = (
+    # Positives.
+    "companies backed by both SoftBank and Tiger Global",
+    "funds that have backed both Acme and Beta Capital",
+    "deals with all of A, B and C",
+    "investments common to all of these funds and their LPs",
+    "all of Acme, Beta and Gamma",
+    "all of the seed cohort and their angels",
+    "what do all of these investors have in common and who led them",
+    # Negatives: a connective with no closing "and"/"with" after it, or with
+    # the closing term only BEFORE it.
+    "both companies are large",
+    "all of the above",
+    "startups that SoftBank and Tiger Global have both backed",
+    # "all" inside a larger word must not trigger the literal.
+    "small allocations across the portfolio and the follow-on",
+)
+_INTERSECTION_CORPUS = _INTERSECTION_CORPUS + _ZERO_GAP_FIXTURES
+
+_ACQUISITION_CORPUS = (
+    # Target direction: the named company is the one that was acquired.
+    "who acquired Freshworks in 2024",
+    "which company bought Skio",
+    "who was acquired by SoftBank",
+    "the payments startup was bought by a consortium led by SoftBank, who will take the stake",
+    "Softbank's Vision Fund acquired a majority stake in the payments startup",
+    # Buyer direction: the named company is the one doing the acquiring.
+    "who did Freshworks acquire",
+    "what did Acme buy",
+    "which company was acquired by Beta",
+    "whom did the consortium take over last quarter",
+    "what company was bought by the consortium",
+    "the startup was bought by Acme, and the analysts asked who had advised on the deal",
+    # Negative: an acquire verb with no interrogative anywhere.
+    "the company acquired a stake in the market",
+    "Softbank acquired Accelgo for three billion dollars",
+)
+
+
+@pytest.mark.parametrize(
+    "new,orig", _SUB_PAIRS, ids=["both_and", "all_of"]
+)
+def test_intersection_substitutions_match_pre_fix_patterns(new, orig):
+    """The scaffold depends on the exact text the substitution removes, so the
+    bounded patterns have to remove precisely what the unbounded ones did."""
+    for text in _INTERSECTION_CORPUS:
+        assert new.sub(" ", text) == orig.sub(" ", text), text
+
+
+@pytest.mark.parametrize(
+    "new,orig", _SEARCH_PAIRS, ids=["acquired_by", "buyer_aux", "buyer_trailing"]
+)
+def test_acquisition_detection_matches_pre_fix_patterns(new, orig):
+    for text in _ACQUISITION_CORPUS:
+        assert bool(new.search(text)) == bool(orig.search(text)), text
+
+
+def test_intersection_corpus_exercises_both_polarities():
+    """Equivalence alone would pass if every pattern matched nothing, so pin
+    that the corpus really does produce hits *and* misses."""
+    both_hit = "companies backed by both SoftBank and Tiger Global"
+    assert _ORIG_BOTH_AND_RE.search(both_hit)
+    assert _ORIG_BOTH_AND_RE.sub(" ", both_hit) != both_hit
+    all_hit = "deals with all of A, B and C"
+    assert _ORIG_ALL_OF_RE.search(all_hit)
+    assert _ORIG_ALL_OF_RE.sub(" ", all_hit) != all_hit
+    for text in (
+        "both companies are large",
+        "all of the above",
+        "startups that SoftBank and Tiger Global have both backed",
+        # "all" embedded in a larger word must not fire the `\ball` literal.
+        "small allocations across the portfolio and the follow-on",
+    ):
+        assert _ORIG_BOTH_AND_RE.sub(" ", text) == text, text
+        assert _ORIG_ALL_OF_RE.sub(" ", text) == text, text
+
+
+def test_acquisition_corpus_exercises_both_polarities():
+    for _, orig in _SEARCH_PAIRS:
+        assert any(orig.search(t) for t in _ACQUISITION_CORPUS), orig.pattern
+    for text in (
+        "the company acquired a stake in the market",
+        "Softbank acquired Accelgo for three billion dollars",
+    ):
+        for _, orig in _SEARCH_PAIRS:
+            assert not orig.search(text), text
+
+
+# One realistic multi-clause query per pattern, a few hundred characters each
+# with a connective span in the tens of characters -- the shape of query this
+# code is actually asked about. A bound that were set too low, or an escaping
+# mistake in the f-string (`{{0,N}}` -> a literal brace), shows up here.
+_LONG_BOTH_AND = (
+    "Among the Series B rounds announced across India and Southeast Asia this quarter, "
+    "the two funds that showed up on the most term sheets were the ones backed by both "
+    "SoftBank's Vision Fund and Tiger Global, and the overlap with their earlier fintech "
+    "bets is the part investors keep asking about in the follow-up calls"
+)
+_LONG_ALL_OF = (
+    "all of the seed-stage accelerator programmes, the micro-SAT fund and the deep-tech "
+    "fellowship, and the shared pipeline is where the overlap between the three turns out "
+    "to be largest once the follow-on rounds from last year are taken out of the picture"
+)
+_LONG_ACQUIRED_BY = (
+    "According to two people familiar with the talks, the decade-old logistics startup, "
+    "founded in 2014 and rebranded twice since, was bought by a consortium of six mid-market "
+    "investors led by a domestic private equity firm, who are expected to keep the existing "
+    "management team in place through the transition"
+)
+_LONG_BUYER_AUX = (
+    "What did the Bengaluru-based payments company, which had spent two years trying to build "
+    "a credit book before pivoting back to merchant acquiring, acquire from the seller in the "
+    "carve-out that was announced on Tuesday evening"
+)
+_LONG_BUYER_TRAILING = (
+    "SoftBank acquired Greystone Digital Infrastructure's data centre portfolio, and the "
+    "buyer confirmed whom it will keep on the existing contracts, what capacity it will add "
+    "in the next two quarters, and which sites come under the same management team"
+)
+
+
+def test_long_realistic_queries_still_match_exactly_as_before():
+    assert len(_LONG_BOTH_AND) > 200
+    assert query_intent._BOTH_AND_RE.sub(" ", _LONG_BOTH_AND) == _ORIG_BOTH_AND_RE.sub(" ", _LONG_BOTH_AND)
+    assert _LONG_BOTH_AND != query_intent._BOTH_AND_RE.sub(" ", _LONG_BOTH_AND)
+
+    assert len(_LONG_ALL_OF) > 200
+    assert query_intent._ALL_OF_RE.sub(" ", _LONG_ALL_OF) == _ORIG_ALL_OF_RE.sub(" ", _LONG_ALL_OF)
+    assert _LONG_ALL_OF != query_intent._ALL_OF_RE.sub(" ", _LONG_ALL_OF)
+
+    for text, orig in (
+        (_LONG_ACQUIRED_BY, _ORIG_ACQUIRED_BY_RE),
+        (_LONG_BUYER_AUX, _ORIG_BUYER_AUX_RE),
+        (_LONG_BUYER_TRAILING, _ORIG_BUYER_TRAILING_RE),
+    ):
+        assert len(text) > 200, text
+        assert orig.search(text), text  # the fixture still drives the pattern
+        assert bool(query_intent._ACQUIRED_BY_RE.search(text)) == bool(_ORIG_ACQUIRED_BY_RE.search(text))
+        assert bool(query_intent._BUYER_AUX_RE.search(text)) == bool(_ORIG_BUYER_AUX_RE.search(text))
+        assert bool(query_intent._BUYER_TRAILING_RE.search(text)) == bool(_ORIG_BUYER_TRAILING_RE.search(text))
+
+
+def test_connective_gaps_are_bounded_and_groups_preserved():
+    """A stray `{{0,N}}` in an f-string would compile to a literal brace and
+    silently turn the gap back into a 1-char match, so assert the compiled
+    pattern really carries a bound, and that no unbounded gap survived.
+
+    The LOWER bound is per-pattern: `_ALL_OF_RE` needs `{1,N}` because its
+    pre-fix gap was one-or-more, and a zero floor there would widen the
+    matcher (see `_ALL_OF_RE`'s comment). The rest take `{0,N}`.
+    """
+    n = query_intent._MAX_CONNECTIVE_SPAN
+    for new, orig in _SUB_PAIRS + _SEARCH_PAIRS:
+        assert f"{{0,{n}}}" in new.pattern or f"{{1,{n}}}" in new.pattern, new.pattern
+        assert ".*" not in new.pattern, new.pattern
+        assert "*?" not in new.pattern, new.pattern
+        assert new.groups == orig.groups, new.pattern
+    # Pin which patterns use which lower bound, so a blanket "make them all {0,N}"
+    # edit cannot silently reintroduce the widening.
+    assert "{1," in query_intent._ALL_OF_RE.pattern
+    assert "{0," in query_intent._BOTH_AND_RE.pattern
+
+
+def test_oracles_reproduce_pre_fix_reachability():
+    """The equivalence assertions are only as good as the frozen oracles, so
+    pin the oracles' own behaviour on inputs that DISCRIMINATE them from the
+    live patterns.
+
+    A previous version of this derived the expected oracle source from the
+    live pattern by string substitution. That certified a *transformation*
+    rather than a behaviour, and it was blind to the real defect: the live
+    `_ALL_OF_RE` gap had been changed from one-or-more to zero-or-more, which
+    that substitution happily "undid" back to `+?`, so the test stayed green
+    while the matcher had silently widened to match "all and".
+
+    Checking behaviour means an oracle that drifts -- in either direction, or
+    in the same direction as the live pattern -- fails here instead.
+    """
+    # `_ALL_OF_RE`'s prefix ends in a literal space, so a zero-width gap lets
+    # `\b(?:and|with)\b` match immediately after it. The pre-fix gap was
+    # one-or-more, so neither of these matched before the gap was bounded.
+    # These two are the ONLY discriminating inputs: "all of and" and the
+    # longer fixtures DO match pre-fix, because their gap is at least one
+    # character, so asserting they do not match would fail on correct code.
+    for text in ("all and", "all with"):
+        assert not _ORIG_ALL_OF_RE.search(text), text
+        assert not query_intent._ALL_OF_RE.search(text), text
+
+    # ... and the over-tight-bound failure mode: matching nothing at all.
+    for text in ("deals with all of A, B and C", "all of Acme, Beta and Gamma"):
+        assert _ORIG_ALL_OF_RE.sub(" ", text) != text, text
+        assert query_intent._ALL_OF_RE.sub(" ", text) == _ORIG_ALL_OF_RE.sub(" ", text), text
+    for text in ("backed by both SoftBank and Tiger Global", "both Acme and Beta"):
+        assert _ORIG_BOTH_AND_RE.sub(" ", text) != text, text
+        assert query_intent._BOTH_AND_RE.sub(" ", text) == _ORIG_BOTH_AND_RE.sub(" ", text), text
+
+    # Each fixture is one the pre-fix pattern genuinely matched, so a broken
+    # oracle cannot hide behind "both sides are wrong in the same way".
+    _POSITIVES = {
+        "_ACQUIRED_BY_RE": (
+            "the payments startup was bought by a consortium led by SoftBank, "
+            "who will take the stake"
+        ),
+        "_BUYER_AUX_RE": "what did Acme buy",
+        "_BUYER_TRAILING_RE": (
+            "SoftBank acquired Greystone Digital's portfolio, and whom will they keep"
+        ),
+    }
+    for name, text in _POSITIVES.items():
+        oracle = _ORACLES_BY_NAME[name]
+        assert oracle.search(text), (name, text)
+        assert getattr(query_intent, name).search(text), (name, text)
+    for name in _POSITIVES:
+        assert not _ORACLES_BY_NAME[name].search("the company acquired a stake in the market"), name
+
+
+# Pathological inputs: the repeated connective with the closing term left out,
+# so every one of the k literal start positions has to scan to the end of the
+# string. That is exactly the shape the unbounded gaps made quadratic.
+_PATHOLOGICAL = (
+    ("both_and", query_intent._BOTH_AND_RE, lambda n: "both " * n),
+    ("all_of", query_intent._ALL_OF_RE, lambda n: "all bbbb " * n),
+    ("acquired_by", query_intent._ACQUIRED_BY_RE, lambda n: "acquired " * n),
+    ("buyer_aux", query_intent._BUYER_AUX_RE, lambda n: "who " * n),
+    ("buyer_trailing", query_intent._BUYER_TRAILING_RE, lambda n: "takeover " * n),
+)
+
+
+def _time_search(pat: re.Pattern, text: str, repeats: int) -> float:
+    start = time.perf_counter()
+    for _ in range(repeats):
+        pat.search(text)
+    return (time.perf_counter() - start) / repeats
+
+
+@pytest.mark.parametrize("name,pat,make", _PATHOLOGICAL, ids=[p[0] for p in _PATHOLOGICAL])
+def test_pathological_query_scales_linearly(name, pat, make):
+    """Each pattern is timed on its own: 8x the query must not cost ~64x the
+    time (quadratic). Bounding the gap caps the work per start position, so the
+    cost is linear in the query and the ratio sits near 8.
+
+    Per-pattern rather than summed -- summing lets four fixed patterns hide one
+    that is still quadratic, which is the exact regression this guards.
+
+    The small input is repeated so the denominator is a stable multi-call
+    number rather than a single sub-millisecond call, and the absolute ceiling
+    is seconds rather than milliseconds so a loaded CI box cannot fail on
+    scheduling noise. The growth ratio is the assertion that bites.
+    """
+    small, large = 256, 2048
+    _time_search(pat, make(8), 1)  # warm up
+    # min() over trials: a scheduler hiccup can only ever add time, so taking
+    # the minimum keeps it out of the ratio.
+    t_small = min(_time_search(pat, make(small), 3) for _ in range(3))
+    t_large = min(_time_search(pat, make(large), 1) for _ in range(3))
+    ratio = t_large / t_small
+    assert ratio < 20.0, (
+        f"{name}: 8x input cost {ratio:.1f}x ({t_small * 1e3:.3f}ms -> {t_large * 1e3:.3f}ms); "
+        f"an unbounded gap gives ~64x"
+    )
+    assert t_large < 20.0, f"{name}: pathological query took {t_large:.3f}s"

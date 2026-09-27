@@ -87,6 +87,20 @@ def test_search_over_the_limit_is_rejected_with_429(monkeypatch):
     assert over.headers["Retry-After"] == str(config.PUBLIC_RATE_WINDOW_SECONDS)
 
 
+def test_search_rejects_over_long_q_and_accepts_a_normal_one(monkeypatch):
+    """`q` reaches retrieval, query expansion and the reranker verbatim, so an
+    unbounded q is an unbounded amount of work per request. The bound is a
+    422 from validation, before any of that runs."""
+    _cached_search_client(monkeypatch)
+
+    ok = _client.get("/search", params={"q": "a" * config.SEARCH_QUERY_MAX_CHARS})
+    too_long = _client.get("/search", params={"q": "a" * (config.SEARCH_QUERY_MAX_CHARS + 1)})
+
+    assert ok.status_code == 200
+    assert too_long.status_code == 422
+    assert [e["loc"][-1] for e in too_long.json()["detail"]] == ["q"]
+
+
 def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
     """Two clients behind the reference proxy each get their own bucket.
 

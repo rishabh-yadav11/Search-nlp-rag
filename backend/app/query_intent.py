@@ -773,19 +773,44 @@ _WHO_ACQUIRED_RE = re.compile(
     rf"\b(?:who|which\s+(?:compan(?:y|ies)|firms?|business(?:es)?))\s+(?:{_ACTIVE_ACQ_PREDICATE})\b",
     re.IGNORECASE,
 )
+# Longest connective span the relation patterns below will scan between their
+# two fixed ends ("both" ... "and", an acquire verb ... "by" ... "who"). Each
+# of them only ever asks whether a connective spans a SHORT clause, and real
+# multi-clause queries put one in the tens of characters -- "companies backed
+# by both SoftBank and Tiger Global" spans 14 from "both" to "and" -- so the
+# bound is invisible on real input. 200 is several times the longest span any
+# sensible query needs and a large slice of the 512 characters /search accepts
+# for `q`, so a query whose connective really did span 200+ characters is
+# itself pathological. The gap has to be bounded because the input is the
+# caller's query: an unbounded `.*?` gap is rescanned from each of the k
+# literal start positions, so one search costs O(n^2) in query length and a
+# long /search query becomes a CPU burn (the /search endpoint bounds `q` to a
+# few hundred characters, which is what makes that blow-up reachable at all).
+# The LOWER bound is per-pattern and is not always 0: it must reproduce what
+# the pre-fix gap required. A gap that was `.+?` (one-or-more) must stay
+# one-or-more, because a zero floor widens the matcher whenever the prefix
+# ends in a consumable character rather than a zero-width `\b`. See
+# `_ALL_OF_RE` for the one pattern that needs `{1,N}?`; the rest take `{0,N}?`.
+_MAX_CONNECTIVE_SPAN = 200
+
+
 _ACQUIRED_BY_RE = re.compile(
-    r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b[^.?!]*?\bby\b[^.?!]*?\b(who|whom)\b",
+    rf"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b[^.?!]{{0,{_MAX_CONNECTIVE_SPAN}}}?"
+    rf"\bby\b[^.?!]{{0,{_MAX_CONNECTIVE_SPAN}}}?\b(who|whom)\b",
     re.IGNORECASE,
 )
 # "who did X acquire?" / "which company was acquired by X?": the interrogative
 # stands for the counterpart, so the named company X is the buyer.
 _BUYER_AUX_RE = re.compile(
-    r"\b(?:who|whom|what|which\s+\w+)\b[^.?!]*?\b(?:did|does|do|has|have|had|is|are|was|were)\b"
-    r"[^.?!]*?\b(acquir\w+|bought|buys?|buying|purchas\w+|take\s*over|taken\s*over|took\s*over|takeover)\b",
+    rf"\b(?:who|whom|what|which\s+\w+)\b[^.?!]{{0,{_MAX_CONNECTIVE_SPAN}}}?"
+    rf"\b(?:did|does|do|has|have|had|is|are|was|were)\b"
+    rf"[^.?!]{{0,{_MAX_CONNECTIVE_SPAN}}}?"
+    rf"\b(acquir\w+|bought|buys?|buying|purchas\w+|take\s*over|taken\s*over|took\s*over|takeover)\b",
     re.IGNORECASE,
 )
 _BUYER_TRAILING_RE = re.compile(
-    r"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b.*\b(what|whom|who)\b",
+    rf"\b(acquir\w+|bought|take\s*over|took\s*over|takeover)\b.{{0,{_MAX_CONNECTIVE_SPAN}}}"
+    rf"\b(what|whom|who)\b",
     re.IGNORECASE,
 )
 
@@ -819,8 +844,23 @@ _COMPARE_RE = re.compile(
 )
 # Intersection cues: a question that wants what is shared across entities
 # ("companies backed by both A and B", "deals with all of A, B and C").
-_BOTH_AND_RE = re.compile(r"\bboth\b.+?\band\b", re.IGNORECASE)
-_ALL_OF_RE = re.compile(r"\ball (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
+_BOTH_AND_RE = re.compile(
+    rf"\bboth\b.{{0,{_MAX_CONNECTIVE_SPAN}}}?\band\b", re.IGNORECASE
+)
+_ALL_OF_RE = re.compile(
+    # Lower bound 1, not 0: the pre-fix gap here was `.+?` (one-or-more), so
+    # `{0,N}?` would WIDEN the matcher. `\ball ` ends in a literal space, so a
+    # zero-length gap lets `\b(?:and|with)\b` match immediately after it --
+    # `search("all and")` flipped False -> True. That is not cosmetic: it
+    # changes the `_multi_entity_scaffold` output and flips
+    # `detect_multi_entity` from 'comparison' to 'intersection', which changes
+    # per-entity retrieval. The other four patterns here are unaffected by a
+    # zero floor because their prefixes end in a zero-width `\b` (so a word
+    # character cannot follow), or because their pre-fix gap was already
+    # `*?`/`.*` -- both zero-or-more, so `{0,N}?` is a faithful narrowing.
+    rf"\ball (?:of )?.{{1,{_MAX_CONNECTIVE_SPAN}}}?\b(?:and|with)\b",
+    re.IGNORECASE,
+)
 
 
 def _strip_entities(text: str, entities: list[str]) -> str:
