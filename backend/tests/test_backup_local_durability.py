@@ -117,6 +117,13 @@ class _SnapshotServer:
                     self.send_header("Content-Length", str(len(outer.body)))
                     self.end_headers()
                     time.sleep(3)
+                elif self.path.startswith("/unsized"):
+                    # No Content-Length: the body is delimited by the close.
+                    self.send_response(200)
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(outer.body)
+                    self.close_connection = True
                 elif self.path.startswith("/collections/"):
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(outer.body)))
@@ -241,6 +248,27 @@ def test_non_archive_download_is_rejected_and_removed(
     assert result.local_path is None
     assert os.listdir(tmp_path) == [], "an unverifiable snapshot file must be removed"
     assert "failed verification" in capsys.readouterr().out
+
+
+def test_unverifiable_download_warns_that_it_could_not_be_length_checked(
+    tmp_path, monkeypatch, snapshot_server, capsys
+):
+    """A response with no Content-Length cannot be checked for truncation, and
+    the archive check does not make up for it. The operator must be told, rather
+    than being left to assume the file was length-verified."""
+    srv = snapshot_server(_tar_bytes())
+    monkeypatch.setattr(
+        qdrant_backup, "_snapshot_download_url", lambda *a: srv.base + "/unsized"
+    )
+
+    result = qdrant_backup.create_and_download_snapshot(
+        _FakeClient(_FakeSnapshot("s")), "c", str(tmp_path)
+    )
+
+    out = capsys.readouterr().out
+    assert "sent no Content-Length" in out
+    assert "cannot be checked for truncation" in out
+    assert result.ok is True  # the archive is intact here, so it is accepted
 
 
 def test_entirely_empty_archive_is_rejected(tmp_path, monkeypatch):
@@ -560,6 +588,57 @@ def test_backup_cli_exits_nonzero_when_no_snapshot_landed_on_disk(
     out = capsys.readouterr().out
     assert "backup FAILED" in out
     assert "backup complete" not in out
+
+
+def test_backup_cli_exits_nonzero_when_nothing_at_all_was_written(backups_dir, monkeypatch, capsys):
+    """The other half of the CLI contract: no snapshot and no local artifacts,
+    so make_backup removes the directory and returns dest=None. Nothing was
+    written, so the exit status must not read as success either.
+
+    The sibling test above writes an articles.jsonl, so it takes the
+    `not backup.snapshot_ok` branch; this one deliberately reaches the earlier
+    `backup.dest is None` branch instead."""
+    import backup_qdrant
+
+    data_dir = backups_dir.parent / "data"
+    assert os.listdir(data_dir) == [], "this test must run with no local artifacts to copy"
+    monkeypatch.setattr(sys, "argv", ["backup_qdrant.py"])
+    monkeypatch.setattr(
+        backup_qdrant, "QdrantClient", lambda **kw: _FakeClient(raises=OSError("refused"))
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        backup_qdrant.main()
+
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "nothing was written" in out
+    assert "backup complete" not in out
+    assert list(backups_dir.iterdir()) == [], "the unusable backup dir must be gone"
+
+
+def test_backup_cli_prune_only_exits_zero_without_writing_a_snapshot(backups_dir, monkeypatch, capsys):
+    """--prune-only takes no backup, so the snapshot exit-status contract does
+    not apply to it: it must still succeed, and must not touch Qdrant."""
+    import backup_qdrant
+
+    created = []
+
+    class _Recording:
+        def create_snapshot(self, collection_name, wait=False):
+            created.append(collection_name)
+            return _FakeSnapshot()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sys, "argv", ["backup_qdrant.py", "--prune-only"])
+    monkeypatch.setattr(backup_qdrant, "QdrantClient", lambda **kw: _Recording())
+
+    assert backup_qdrant.main() is None  # no SystemExit: the script exits 0
+    assert created == [], "--prune-only must not create a snapshot"
+    assert list(backups_dir.iterdir()) == []
+    assert "no backups to prune" in capsys.readouterr().out
 
 
 def test_backup_cli_returns_cleanly_after_a_verified_backup(backups_dir, monkeypatch, capsys):

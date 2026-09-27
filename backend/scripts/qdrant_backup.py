@@ -152,8 +152,17 @@ def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
     ``IncompleteRead`` (only an un-sized ``read()`` does), so
     ``shutil.copyfileobj`` would happily write a truncated snapshot to disk and
     report success — the exact silent-data-loss shape this module exists to
-    prevent. A response served without a ``Content-Length`` cannot be counted,
-    which is why ``_local_snapshot_is_valid`` re-checks the archive afterwards.
+    prevent.
+
+    The count above is the *only* truncation defence. A response served without
+    a ``Content-Length`` (a close-delimited body) cannot be checked at all, and
+    ``_local_snapshot_is_valid`` does **not** make up for it: a half-delivered
+    tar can still parse as a complete archive, so nothing detects a truncated
+    un-sized response. Qdrant is expected to send ``Content-Length`` for
+    snapshot downloads, but that was not verifiable against a live Qdrant
+    here, so it is treated as an assumption rather than a guarantee: the
+    un-sized case logs a WARNING at the point it happens, so an operator is
+    never misled about what was actually verified.
 
     Nothing here needs ``requests``, which is not a declared dependency.
     """
@@ -167,6 +176,11 @@ def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
                 expected = int(header)
             except ValueError:
                 expected = None
+        else:
+            log(
+                f"WARNING: {_redact_url(url)} sent no Content-Length; this download "
+                f"cannot be checked for truncation, only for being a readable archive",
+            )
         while True:
             chunk = resp.read(DOWNLOAD_CHUNK)
             if not chunk:
@@ -180,10 +194,14 @@ def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
 def _local_snapshot_is_valid(path: str) -> tuple[bool, str]:
     """Check that ``path`` is a readable, non-empty Qdrant snapshot archive.
 
-    A Qdrant collection snapshot is a tar archive, so this walks the member
-    headers: a zero-byte file, a file of unrelated bytes, or a download that
-    was truncated mid-stream all fail here rather than being reported as a
-    backup. Returns ``(ok, detail)`` where ``detail`` is a human-readable size
+    A Qdrant collection snapshot is a tar archive — the Qdrant documentation
+    states "Snapshots are tar archive files"
+    (https://qdrant.tech/documentation/snapshots/) — so this walks the member
+    headers. A zero-byte file and a file of unrelated bytes both fail here and
+    are reported as failures rather than as a backup. This check is *not* a
+    truncation defence: a half-delivered tar can still parse cleanly, so
+    ``_download_to``'s ``Content-Length`` count is what catches truncation.
+    Returns ``(ok, detail)`` where ``detail`` is a human-readable size
     summary on success and the reason on failure.
     """
     if not os.path.isfile(path):
