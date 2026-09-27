@@ -428,3 +428,25 @@ def test_results_are_identical_with_and_without_a_warm_cache(monkeypatch):
     assert [(r.id, r.score) for r in again.results] == [
         (r.id, r.score) for r in cold.results
     ]
+
+
+def test_a_malformed_date_is_rejected_even_on_a_cache_hit(monkeypatch):
+    """Behaviour change, pinned deliberately.
+
+    Building the prefetch key needs the same facet filter the retrieval leg
+    builds, so `build_facet_filter` (and its 400 on an unparseable date) now
+    runs *before* the cache-hit early return. Previously the 400 only fired on
+    a miss, so a malformed date returned 200 on a warm cache and 400 on a cold
+    one. The request is now rejected consistently, which is the more correct
+    outcome, but it is a change and this test makes it deliberate rather than
+    accidental.
+    """
+    from fastapi import HTTPException
+
+    _wire_search(monkeypatch)
+    assert _search().cached is False
+    assert _search().cached is True, "precondition: the entry is warm"
+
+    with pytest.raises(HTTPException) as exc:
+        _search(from_date="not-a-date")
+    assert exc.value.status_code == 400
