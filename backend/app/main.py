@@ -1386,14 +1386,7 @@ def _for_you_cache_keys(user_id: str) -> list[str]:
     ]
 
 
-@app.post(
-    "/recommend/interaction",
-    # Per-IP bound on a loop-driving endpoint. See the note on
-    # PUBLIC_INTERACTION_RATE_PER_MIN in app/config.py.
-    dependencies=[
-        Depends(public_rate_limit("interaction", "PUBLIC_INTERACTION_RATE_PER_MIN", fail_closed=False))
-    ],
-)
+@app.post("/recommend/interaction")
 async def record_user_interaction(
     event: InteractionEvent,
     request: Request,
