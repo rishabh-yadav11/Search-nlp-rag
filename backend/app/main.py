@@ -1324,11 +1324,23 @@ async def get_analytics_summary(
 
 @app.get("/analytics/chat")
 async def get_analytics_chat(
+    request: Request,
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("analytics:read")),
 ):
-    """Cross-user chat usage (sessions, messages, tokens, cost). Admin-only."""
-    return await chat_module._require_store().global_stats()
+    """Cross-user chat usage (sessions, messages, tokens, cost). Admin-only.
+
+    Returns cross-user aggregates and per-session rows (opaque session id,
+    message count, cost/tokens, updated_at) — no user-authored text is ever
+    included. Each read is recorded in the durable admin audit trail; a failure
+    to record must not break the read itself.
+    """
+    store = chat_module._require_store()
+    try:
+        await store.record_admin_audit(request.state.user_id, "analytics.chat.read")
+    except Exception:
+        logger.exception("admin audit write failed for analytics.chat.read")
+    return await store.global_stats()
 
 
 # =============================================================================
