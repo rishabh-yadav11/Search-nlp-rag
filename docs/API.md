@@ -520,5 +520,7 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
   from `backend/` and treat the output as a local artefact — do not serve it.
 - **Host header**: requests whose `Host` is not in `ALLOWED_HOSTS` are rejected
   with 400 by `TrustedHostMiddleware`. The default list is derived from
-  `CORS_ORIGINS` plus `localhost`/`127.0.0.1`/`testserver`; set `ALLOWED_HOSTS`
-  to the hostnames your deployment answers to.
+  `CORS_ORIGINS`, this box's own hostname and IP addresses, and
+  `localhost`/`127.0.0.1`/`testserver`. Set `ALLOWED_HOSTS` to the hostnames
+  your deployment answers to if it is reachable under a name none of those
+  cover (a separately registered public domain, for instance).
