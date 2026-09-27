@@ -691,6 +691,64 @@ def test_best_body_window_tail_wins_on_tie():
     assert out == body[-50:]
 
 
+# --- _best_body_window window budget ---
+
+
+def test_effective_step_leaves_the_default_scan_alone():
+    """The default scan must be bit-for-bit unchanged by the budget.
+
+    A full 50,000-char body at win=1500/step=500 is 98 window starts,
+    comfortably inside the default budget of 200, so no operator upgrading
+    this branch sees a different body scan.
+    """
+    positions = 50_000 - 1500 + 1
+    assert main._effective_step(positions, 500, 200) == 500
+    assert -(-positions // main._effective_step(positions, 500, 200)) == 98
+
+
+def test_effective_step_widens_a_legal_but_expensive_stride():
+    """Clamping BODY_RESCUE_STEP alone does not bound the work: step=1 is
+    inside the clamp and still scores 48,501 windows of a 50K body (~117ms,
+    and body_rescue scans every body-bearing article before the candidate cap
+    applies, so 20 articles cost ~2.3s for one chat turn).
+    """
+    positions = 49_700 - 1500 + 1
+    widened = main._effective_step(positions, 1, 200)
+    assert widened > 1
+    assert -(-positions // widened) <= 200
+
+
+def test_effective_step_never_returns_a_zero_stride():
+    """`range(0, n, 0)` raises ValueError. The config clamp already rejects 0,
+    but `_best_body_window` is module-level and directly callable, so it must
+    not depend on every caller having gone through config."""
+    # A zero step is floored to 1 and then still widened to fit the budget;
+    # what matters is that the returned stride is always usable by range().
+    widened = main._effective_step(1000, 0, 200)
+    assert widened >= 1
+    assert -(-1000 // widened) <= 200
+    # A non-positive budget disables widening rather than producing stride 0.
+    assert main._effective_step(1000, 0, 0) == 1
+    out = main._best_body_window("filler " * 3000, {"alpha"}, 1500, 0)
+    assert isinstance(out, str) and out
+
+
+def test_best_body_window_still_finds_dense_region_under_a_widened_stride():
+    body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
+    out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1, max_windows=64)
+    low = out.lower()
+    assert "alpha" in low and "gamma" in low
+
+
+def test_best_body_window_survives_a_zero_step():
+    """`range(0, n, 0)` raises ValueError. The config clamp already rejects 0,
+    but this helper is module-level and directly callable, so it must not
+    depend on every caller having gone through config."""
+    body = "filler " * 3000
+    out = main._best_body_window(body, {"alpha"}, 1500, 0)
+    assert isinstance(out, str) and out
+
+
 # --- lifespan ---
 
 
