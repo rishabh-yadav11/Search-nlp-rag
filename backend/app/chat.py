@@ -1550,6 +1550,59 @@ def _select_turns(blocks: list[str], labels: list[str], turns: list[MessageOut],
     return kept
 
 
+def _body_char_limit(source_count: int) -> int:
+    """Per-source body budget for one turn's articles.
+
+    As the source count grows (a 'top N' request), trim each source's body
+    excerpt so the total stays within the budget: more articles to rank at the
+    same token cost, without blowing the LLM context window. ``max(1, ...)``
+    keeps the division safe on the empty-set case.
+    """
+    return min(config.CHAT_BODY_CHAR_LIMIT, config.CHAT_TOTAL_BODY_CHARS // max(1, source_count))
+
+
+def _prompt_turn(
+    *,
+    question: str,
+    history: list[MessageOut],
+    context_blocks: list[str],
+    sources: list,
+    k: int,
+    note: str | None,
+    comparison_instruction: str = "",
+) -> PreparedTurn:
+    """Assemble the LLM-ready turn from already-retrieved, already-fenced articles.
+
+    Both retrieval paths (single-entity and multi-entity) end in the same tail:
+    join the fenced article blocks, render the user prompt, render the system
+    prompt, and wrap the result. Only the retrieval that produced ``sources`` and
+    the multi-entity ``comparison_instruction`` differ, so they stay with the
+    caller. Keeping the single ``CHAT_PROMPT.format`` here is the point: a new
+    prompt field is added in ONE place, instead of at each call site where
+    forgetting the second made ``str.format`` raise ``KeyError`` at request time
+    on that path only.
+    """
+    from app.main import to_summary
+
+    context = "\n\n".join(context_blocks)
+    prompt = CHAT_USER_PROMPT.format(
+        history=_history_fence(history),
+        context=context,
+        question=_question_fence(question),
+    )
+    return PreparedTurn(
+        answer=prompt,
+        sources=[to_summary(s).model_dump() for s in sources],
+        note=note,
+        needs_llm=True,
+        system=CHAT_PROMPT.format(
+            dataviz_max_rows=k,
+            dataviz_view_instruction=_dataviz_view_instruction(question),
+            comparison_instruction=comparison_instruction,
+        ),
+    )
+
+
 async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTurn:
     smalltalk = _smalltalk_reply(question)
     if smalltalk is not None:
@@ -1632,28 +1685,17 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
             note=note,
         )
 
-    # As the source count grows (a 'top N' request), trim each source's body
-    # excerpt so the total stays within the budget: more articles to rank at the
-    # same token cost, without blowing the LLM context window.
-    body_limit = min(config.CHAT_BODY_CHAR_LIMIT, config.CHAT_TOTAL_BODY_CHARS // max(1, len(sources)))
-    context = "\n\n".join(
+    body_limit = _body_char_limit(len(sources))
+    context_blocks = [
         _article_fence(i + 1, source_context(s, i + 1, body_limit=body_limit)) for i, s in enumerate(sources)
-    )
-    prompt = CHAT_USER_PROMPT.format(
-        history=_history_fence(history),
-        context=context,
-        question=_question_fence(question),
-    )
-    return PreparedTurn(
-        answer=prompt,
-        sources=[to_summary(s).model_dump() for s in sources],
+    ]
+    return _prompt_turn(
+        question=question,
+        history=history,
+        context_blocks=context_blocks,
+        sources=sources,
+        k=k,
         note=note,
-        needs_llm=True,
-        system=CHAT_PROMPT.format(
-            dataviz_max_rows=k,
-            dataviz_view_instruction=_dataviz_view_instruction(question),
-            comparison_instruction="",
-        ),
     )
 
 
@@ -1674,7 +1716,6 @@ async def _prepare_multi_entity_turn(
         body_rescue,
         retrieve_with_auto_facet_fallback,
         source_context,
-        to_summary,
     )
 
     k = _effective_chat_k(" ".join(multi.entities + [multi.scaffold]))
@@ -1730,7 +1771,7 @@ async def _prepare_multi_entity_turn(
             note=note,
         )
 
-    body_limit = min(config.CHAT_BODY_CHAR_LIMIT, config.CHAT_TOTAL_BODY_CHARS // max(1, len(sources_models)))
+    body_limit = _body_char_limit(len(sources_models))
     blocks = []
     for i, s in enumerate(sources_models):
         block = source_context(s, i + 1, body_limit=body_limit)
@@ -1738,7 +1779,6 @@ async def _prepare_multi_entity_turn(
         # inside the article's untrusted fence rather than reading as ours.
         ents = ", ".join(id_entities[s.id])
         blocks.append(_article_fence(i + 1, f"{block}\nEntities: {ents}"))
-    context = "\n\n".join(blocks)
 
     # Entity names are extracted straight out of the user's question, so they
     # must not be interpolated into the instruction half of the prompt: an
@@ -1760,21 +1800,14 @@ async def _prepare_multi_entity_turn(
             f"cite which entity each claim refers to using the article numbers.\n{entity_block}"
         )
 
-    prompt = CHAT_USER_PROMPT.format(
-        history=_history_fence(history),
-        context=context,
-        question=_question_fence(question),
-    )
-    return PreparedTurn(
-        answer=prompt,
-        sources=[to_summary(s).model_dump() for s in sources_models],
+    return _prompt_turn(
+        question=question,
+        history=history,
+        context_blocks=blocks,
+        sources=sources_models,
+        k=k,
         note=note,
-        needs_llm=True,
-        system=CHAT_PROMPT.format(
-            dataviz_max_rows=k,
-            dataviz_view_instruction=_dataviz_view_instruction(question),
-            comparison_instruction=comparison_instruction,
-        ),
+        comparison_instruction=comparison_instruction,
     )
 
 
