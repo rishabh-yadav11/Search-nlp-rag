@@ -76,6 +76,19 @@ def fingerprint(rec: dict, include_body: bool = True) -> str:
             ",".join(rec.get("author_names") or []),
             ",".join(rec.get("industry_names") or []),
             ",".join(rec.get("dealtype_names") or []),
+            # content_type is part of the stored payload (see _common.make_point),
+            # so it MUST be part of the change fingerprint: without it a row
+            # whose content_type alone changed in MySQL hashes identically, is
+            # classified unchanged by sync_delta, and the indexed payload goes
+            # stale forever with nothing logged. Appending it (rather than
+            # inserting mid-list) keeps the existing field order stable.
+            rec.get("content_type") or "",
+            # content_type is part of the stored payload (see _common.make_point),
+            # so it MUST be part of the change fingerprint: without it a row
+            # whose content_type alone changed in MySQL hashes identically, is
+            # classified unchanged by sync_delta, and the indexed payload goes
+            # stale forever with nothing logged. Appending it (rather than
+            # inserting mid-list) keeps the existing field order stable.
         ]
     )
     return hashlib.md5(raw.encode("utf-8")).hexdigest()

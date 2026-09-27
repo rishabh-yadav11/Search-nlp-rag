@@ -15,6 +15,7 @@ def _rec(**overrides) -> dict:
         "author_names": ["Alice"],
         "industry_names": ["Fintech"],
         "dealtype_names": ["Series A"],
+        "content_type": "Interview",
     }
     base.update(overrides)
     return base
@@ -36,6 +37,7 @@ def test_fingerprint_stable_for_identical_records():
         "author_names",
         "industry_names",
         "dealtype_names",
+        "content_type",
     ],
 )
 def test_fingerprint_sensitive_to_each_field(field):
@@ -44,6 +46,68 @@ def test_fingerprint_sensitive_to_each_field(field):
     value = base[field]
     changed[field] = value + ["extra"] if isinstance(value, list) else f"{value}x"
     assert fingerprint(base) != fingerprint(changed), f"fingerprint should change when {field} changes"
+
+
+def _payload_rec(**overrides) -> dict:
+    """A record shaped like the one make_point actually stores."""
+    rec = _rec(**overrides)
+    rec.setdefault("content_type", "Interview")
+    return rec
+
+
+def test_fingerprint_sensitive_to_a_content_type_only_change():
+    """A content_type edit alone must be visible to the incremental indexer.
+
+    ``category`` does not cover this: record_from_row sets category to
+    dealtype_names when those exist, so on any row that HAS dealtype_names a
+    content_type-only change leaves the fingerprint identical and the indexed
+    payload goes stale forever with nothing logged.
+    """
+    before = _payload_rec(content_type="Interview")
+    after = _payload_rec(content_type="Video")
+
+    assert before["category"] == after["category"], "precondition: category is unchanged"
+    assert fingerprint(before) != fingerprint(after)
+
+
+def test_fingerprint_covers_every_field_the_payload_stores():
+    """Every key make_point writes must be covered by the change fingerprint.
+
+    The payload key set and the fingerprint field list are two halves of one
+    contract: a field stored in the payload but absent from the fingerprint is
+    silently frozen at whatever value it had when it was first indexed. The
+    keys are read from make_point itself so the two cannot drift apart.
+    """
+    from _common import make_point
+
+    class _Arr:
+        def __init__(self, v):
+            self.v = v
+
+        def tolist(self):
+            return self.v
+
+    class _Sparse:
+        indices = _Arr([1])
+        values = _Arr([0.5])
+
+    point = make_point(
+        _payload_rec(body="Body", summary="Summary"),
+        _Arr([0.1, 0.2]),
+        _Sparse(),
+    )
+
+    assert set(point.payload) == set(_payload_rec().keys()) - {"id"}, (
+        "fixture must supply exactly the fields the payload stores"
+    )
+
+    baseline = fingerprint(_payload_rec())
+
+    for key in point.payload:
+        original = _payload_rec()[key]
+        mutated = original + ["MUTATED"] if isinstance(original, list) else "MUTATED"
+        changed = fingerprint(_payload_rec(**{key: mutated}))
+        assert changed != baseline, f"fingerprint ignores {key!r}: a change to it is never re-indexed"
 
 
 def _state_for(records: dict[int, dict]) -> dict:
