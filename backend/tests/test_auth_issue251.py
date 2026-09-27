@@ -435,6 +435,25 @@ def test_service_token_honours_its_expiry(store, monkeypatch):
     assert e.value.status_code == 401, "an expired service token must not authenticate"
 
 
+def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch):
+    """The one in-repo consumer, backend/scripts/eval_runner.py, sends the raw
+    AUTH_SERVICE_TOKEN and only ever calls /api/chat, whose router requires
+    exactly `chat:use` (app/chat.py). Assert the shipped default scope admits
+    that and nothing more, so the script keeps working unchanged."""
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-from-env")
+    assert auth._service_token_scope() == frozenset({"chat:use"})
+
+    async def scenario():
+        req = _req({"x-service-token": "svc-from-env"})
+        await auth.require_auth(req)
+        # The dependency chat.py installs on every chat route.
+        await auth.require_permission("chat:use")(req)
+        return req.state.user_id
+
+    assert asyncio.run(scenario()) == auth.SERVICE_USER_ID
+
+
 def test_service_token_restart_does_not_extend_its_life(store, monkeypatch):
     """Seeding is INSERT OR IGNORE, so a worker restart must not push the
     expiry out -- otherwise the expiry would be theatre."""
