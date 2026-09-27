@@ -546,6 +546,20 @@ class Config:
     CHAT_RETENTION_DAYS = int(os.getenv("CHAT_RETENTION_DAYS", "180"))
     CHAT_MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "10"))
     CHAT_PURGE_INTERVAL_SECONDS = int(os.getenv("CHAT_PURGE_INTERVAL_SECONDS", "86400"))
+    # Messages returned by GET /api/chat/sessions/{id}. A session lives for
+    # CHAT_RETENTION_DAYS and each message deserialises its sources JSON, so an
+    # unbounded read of a long thread serialises the entire history into one
+    # response (#258). The read returns the MOST RECENT CHAT_SESSION_MESSAGE_LIMIT
+    # messages in chronological order, so the thread still renders as its tail,
+    # and flags the truncation in the response so the client can say so. This is
+    # deliberately looser than CHAT_MAX_HISTORY_TURNS/CHAT_MAX_HISTORY_CHARS
+    # (#255), which bound the *prompt*: the user can read further back in a
+    # thread than the model is given context for, and that is expected.
+    CHAT_SESSION_MESSAGE_LIMIT = int(os.getenv("CHAT_SESSION_MESSAGE_LIMIT", "200"))
+    # Sources returned per message on the same read. CHAT_MAX_SOURCES (20) caps
+    # what is *generated*; this caps what is *serialized back* per message, so a
+    # message stored with more sources than the cap cannot multiply the response.
+    CHAT_MESSAGE_SOURCE_LIMIT = int(os.getenv("CHAT_MESSAGE_SOURCE_LIMIT", "20"))
 
     # Recommendation engine
     ENABLE_RECOMMENDATIONS = os.getenv("ENABLE_RECOMMENDATIONS", "true").lower() in ("1", "true", "yes")

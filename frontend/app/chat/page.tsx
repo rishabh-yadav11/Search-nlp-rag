@@ -32,6 +32,14 @@ type Message = {
   latency_ms?: number
 }
 
+// Server response for GET /api/chat/sessions/{id}. The server returns only the
+// most recent CHAT_SESSION_MESSAGE_LIMIT messages and flags the rest, so a long
+// thread must be shown as a truncated tail rather than as the whole history.
+type SessionDetail = Session & {
+  truncated?: boolean
+  total_messages?: number
+}
+
 type Session = {
   id: string
   title: string
@@ -212,6 +220,8 @@ export default function ChatPage() {
   const [streaming, setStreaming] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
   const [note, setNote] = useState('')
+  // Set when the server dropped older messages from the loaded thread (#258).
+  const [historyTruncated, setHistoryTruncated] = useState<{ hidden: number } | null>(null)
   const [error, setError] = useState('')
   // Force a re-render each minute so relative timestamps ("5m ago") keep
   // advancing while the page stays open. No fetch — purely to recompute time.
@@ -285,13 +295,19 @@ export default function ChatPage() {
       try {
         const data = await api(`/api/chat/sessions/${id}`)
         const msgs = Array.isArray(data.messages) ? (data.messages as Message[]) : []
+        const detail = data as SessionDetail
+        const total = Number(detail.total_messages ?? msgs.length)
+        setHistoryTruncated(
+          detail.truncated && total > msgs.length ? { hidden: total - msgs.length } : null
+        )
         setMessages(msgs)
       } catch {
         setMessages([])
+        setHistoryTruncated(null)
         setError('Could not load this conversation.')
       }
     },
-    [],
+    []
   )
 
   const newSession = useCallback(() => {
@@ -302,6 +318,7 @@ export default function ChatPage() {
     setInput('')
     setError('')
     setNote('')
+    setHistoryTruncated(null)
   }, [])
 
   const send = useCallback(async () => {
@@ -513,6 +530,10 @@ export default function ChatPage() {
           if (activeIdRef.current === sessionId) {
             setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
             if (note) setNote(note)
+            // Each committed turn adds two messages to the stored thread, and
+            // the loaded window is a fixed-size tail, so the number of hidden
+            // messages grows by the same amount (#258).
+            setHistoryTruncated((h) => (h ? { hidden: h.hidden + 2 } : h))
           }
           setStreamingContent('')
           await loadSessions()
@@ -649,6 +670,12 @@ export default function ChatPage() {
         </header>
 
         <div className="chat-thread" ref={scrollRef} aria-live="polite">
+          {historyTruncated ? (
+            <div className="chat-note" role="status">
+              {historyTruncated.hidden} earlier message{historyTruncated.hidden === 1 ? '' : 's'} not shown —
+              this conversation is too long to display in full.
+            </div>
+          ) : null}
           {messages.length === 0 && !sending ? (
             <div className="chat-empty">
               <h1>Ask VCCircle</h1>

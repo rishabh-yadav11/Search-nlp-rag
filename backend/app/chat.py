@@ -99,6 +99,12 @@ class MessageOut(BaseModel):
 
 class SessionDetailOut(SessionOut):
     messages: list[MessageOut] = []
+    # Set when the stored thread is longer than CHAT_SESSION_MESSAGE_LIMIT and
+    # older messages were dropped, so the client can tell the user instead of
+    # silently showing a shorter thread (#258). `total_messages` is the real
+    # message count in the session, so the client can say how much is hidden.
+    truncated: bool = False
+    total_messages: int = 0
 
 
 class SessionStatsOut(BaseModel):
@@ -291,17 +297,41 @@ class ChatStore:
             id=row["id"], title=row["title"], created_at=row["created_at"], updated_at=row["updated_at"]
         )
 
-    async def messages(self, session_id: str, user_id: str) -> list[MessageOut]:
+    async def messages_page(
+        self, session_id: str, user_id: str
+    ) -> tuple[list[MessageOut], int]:
+        """The most recent CHAT_SESSION_MESSAGE_LIMIT messages, oldest first,
+        plus the session's true message count (#258).
+
+        Sessions are kept for CHAT_RETENTION_DAYS and every row deserialises its
+        `sources` JSON, so reading the whole thread put an unbounded number of
+        messages and embedded sources into one response. The inner query takes
+        the newest N and the outer one restores chronological order, so the
+        caller renders the tail of the thread rather than a prefix of it. The
+        COUNT(*) window runs before the LIMIT, so it reports the real total and
+        lets the caller flag truncation.
+        """
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
+        limit = max(1, config.CHAT_SESSION_MESSAGE_LIMIT)
         rows = await self._require_db().execute_fetchall(
             """
-            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted
-            FROM messages WHERE session_id = ? ORDER BY created_at ASC, id ASC
+            SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens,
+                   cost, latency_ms, aborted, total
+            FROM (
+                SELECT id, role, content, sources, created_at, prompt_tokens, completion_tokens,
+                       cost, latency_ms, aborted, COUNT(*) OVER () AS total
+                FROM messages WHERE session_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY created_at ASC, id ASC
             """,
-            (session_id,),
+            (session_id, limit),
         )
-        return [_row_to_message(r) for r in rows]
+        total = int(rows[0]["total"]) if rows else 0
+        source_limit = max(0, config.CHAT_MESSAGE_SOURCE_LIMIT)
+        return [_row_to_message(r, source_limit=source_limit) for r in rows], total
 
     async def append_message(
         self,
@@ -693,12 +723,23 @@ def json_loads(s: object, *, row_id: object = None) -> list[dict]:
     return rows
 
 
-def _row_to_message(r) -> MessageOut:
+def _row_to_message(r, *, source_limit: int | None = None) -> MessageOut:
+    """Map a `messages` row to a MessageOut.
+
+    `source_limit` caps how many of the stored sources are returned, so a
+    message carrying more sources than the cap cannot multiply the size of the
+    history read (#258). `None` means no cap, which is what the LLM prompt path
+    (`recent_turns`) uses — that path is bounded by CHAT_MAX_SOURCES already and
+    is deliberately left untouched here.
+    """
+    sources = json_loads(r["sources"], row_id=r["id"])
+    if source_limit is not None and len(sources) > max(0, source_limit):
+        sources = sources[: max(0, source_limit)]
     return MessageOut(
         id=r["id"],
         role=r["role"],
         content=r["content"],
-        sources=json_loads(r["sources"], row_id=r["id"]),
+        sources=sources,
         created_at=r["created_at"],
         prompt_tokens=int(r["prompt_tokens"] or 0),
         completion_tokens=int(r["completion_tokens"] or 0),
@@ -2203,8 +2244,13 @@ async def get_session(session_id: str, request: Request):
     session = await s.get_session(session_id, user_id)
     if session is None:
         raise HTTPException(status_code=404, detail="conversation not found")
-    messages = await s.messages(session_id, user_id)
-    return SessionDetailOut(**session.model_dump(), messages=messages)
+    messages, total = await s.messages_page(session_id, user_id)
+    return SessionDetailOut(
+        **session.model_dump(),
+        messages=messages,
+        truncated=total > len(messages),
+        total_messages=total,
+    )
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionOut)

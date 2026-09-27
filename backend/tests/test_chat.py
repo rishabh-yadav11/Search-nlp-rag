@@ -90,7 +90,7 @@ def test_ownership_isolation(tmp_path):
         assert _run(store.get_session(a.id, USER_A)) is not None
         assert _run(store.get_session(a.id, USER_B)) is None
         with pytest.raises(HTTPException) as exc:
-            _run(store.messages(a.id, USER_B))
+            _run(store.messages_page(a.id, USER_B))
         assert exc.value.status_code == 404
         with pytest.raises(HTTPException) as exc:
             _run(store.append_message(a.id, USER_B, "user", "hi"))
@@ -105,7 +105,8 @@ def test_append_and_read_messages(tmp_path):
         a = _run(store.create_session(USER_A))
         u = _run(store.append_message(a.id, USER_A, "user", "Hello"))
         m = _run(store.append_message(a.id, USER_A, "assistant", "Hi there", [{"id": 1, "title": "Src"}]))
-        msgs = _run(store.messages(a.id, USER_A))
+        msgs, total = _run(store.messages_page(a.id, USER_A))
+        assert total == 2
         assert [x.content for x in msgs] == ["Hello", "Hi there"]
         assert msgs[1].sources == [{"id": 1, "title": "Src"}]
         assert msgs[1].role == "assistant"
@@ -3400,9 +3401,7 @@ def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
 
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
-        msgs = _run(chat_store.messages(sid, USER_A)) if False else client.get(
-            f"/api/chat/sessions/{sid}", headers=h
-        ).json()["messages"]
+        msgs = client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"]
         roles = [m["role"] for m in msgs]
         # The user message survives: the client already saw its answer.
         assert roles == ["user", "assistant"]
@@ -3831,7 +3830,7 @@ def test_aborted_flag_round_trips_through_the_store(tmp_path):
         )
         assert aborted_msg.aborted is True
 
-        msgs = _run(store.messages(sid, USER_A))
+        msgs, _total = _run(store.messages_page(sid, USER_A))
         assert [m.aborted for m in msgs] == [False, True]
 
         recent = _run(store.recent_turns(sid, USER_A, 5))
@@ -4400,3 +4399,252 @@ def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, m
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
+
+
+def _seed_messages(store, sid, count, *, user_id=USER_A, sources_per_message=0, content_len=1):
+    """Append `count` messages directly, bypassing the turn pipeline, so a
+    thread can be made far longer than the read cap without invoking the LLM."""
+    for i in range(count):
+        sources = (
+            [{"id": j, "title": f"s{j}", "summary": "x" * 200, "score": 0.5} for j in range(sources_per_message)]
+            if sources_per_message
+            else None
+        )
+        _run(
+            store.append_message(
+                sid,
+                user_id,
+                "user" if i % 2 == 0 else "assistant",
+                f"msg-{i:04d}-" + "c" * content_len,
+                sources=sources,
+            )
+        )
+
+
+def test_session_read_returns_only_the_most_recent_messages(tmp_path, monkeypatch):
+    """#258: the history read returned every row of a session that is retained
+    for CHAT_RETENTION_DAYS. With a thread many times the cap, exactly the cap
+    is returned, in chronological order, and it is the *tail* of the thread."""
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 20)
+    store = _store(tmp_path)
+    try:
+        sid = _run(store.create_session(USER_A)).id
+        _seed_messages(store, sid, 200)
+
+        msgs, total = _run(store.messages_page(sid, USER_A))
+
+        assert total == 200
+        assert len(msgs) == 20
+        contents = [m.content for m in msgs]
+        # Chronological (oldest first) AND the newest 20, not the oldest 20.
+        assert contents == [f"msg-{i:04d}-c" for i in range(180, 200)]
+        assert [m.id for m in msgs] == sorted(m.id for m in msgs)
+    finally:
+        _run(store.close())
+
+
+def test_session_read_is_deterministic_when_timestamps_tie(tmp_path, monkeypatch):
+    """`ORDER BY created_at DESC` alone leaves the tail of a thread undefined
+    when rows share a timestamp — which happens whenever the clock resolution
+    is coarser than the write rate, or a backfill stamps whole seconds. The
+    `id` tiebreak is what makes the selection stable, so it is asserted here
+    rather than left resting on timestamps that never actually tie."""
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 5)
+    store = _store(tmp_path)
+    try:
+        sid = _run(store.create_session(USER_A)).id
+        _seed_messages(store, sid, 30)
+        _run(store._db.execute("UPDATE messages SET created_at = 1000.0 WHERE session_id = ?", (sid,)))
+        _run(store._db.commit())
+
+        msgs, total = _run(store.messages_page(sid, USER_A))
+
+        assert total == 30
+        assert [m.content for m in msgs] == [f"msg-{i:04d}-c" for i in range(25, 30)]
+        assert [m.id for m in msgs] == sorted(m.id for m in msgs)
+    finally:
+        _run(store.close())
+
+
+def test_session_read_under_the_cap_is_returned_completely_and_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 50)
+    store = _store(tmp_path)
+    try:
+        sid = _run(store.create_session(USER_A)).id
+        _seed_messages(store, sid, 7, sources_per_message=2)
+
+        msgs, total = _run(store.messages_page(sid, USER_A))
+
+        assert total == 7
+        assert total == len(msgs)
+        assert [m.content for m in msgs] == [f"msg-{i:04d}-c" for i in range(7)]
+        # Every field survives untouched, including sources and the counters.
+        assert msgs[0].role == "user"
+        assert msgs[1].role == "assistant"
+        assert msgs[1].sources == [
+            {"id": j, "title": f"s{j}", "summary": "x" * 200, "score": 0.5} for j in range(2)
+        ]
+        assert [m.aborted for m in msgs] == [False] * 7
+        assert [m.cost for m in msgs] == [0.0] * 7
+    finally:
+        _run(store.close())
+
+
+def test_session_read_caps_sources_per_message(tmp_path, monkeypatch):
+    """Each row deserialises its sources JSON, so an unbounded per-message
+    source list multiplies the response on top of the row cap (#258)."""
+    monkeypatch.setattr(chat_module.config, "CHAT_MESSAGE_SOURCE_LIMIT", 3)
+    store = _store(tmp_path)
+    try:
+        sid = _run(store.create_session(USER_A)).id
+        _seed_messages(store, sid, 2, sources_per_message=25)
+
+        msgs, _total = _run(store.messages_page(sid, USER_A))
+
+        assert [len(m.sources) for m in msgs] == [3, 3]
+        # The kept sources are the first ones, so the citation list stays stable.
+        assert [s["id"] for s in msgs[1].sources] == [0, 1, 2]
+    finally:
+        _run(store.close())
+
+
+def test_api_session_detail_flags_truncation_to_the_client(tmp_path, monkeypatch):
+    """A silently shortened thread is its own bug — the user sees history vanish.
+    The response must say so."""
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 5)
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        _seed_messages(chat_store, sid, 40, user_id=_run(auth_store.get_user_by_email(EMAIL_A)).id)
+
+        body = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+
+        assert len(body["messages"]) == 5
+        assert body["truncated"] is True
+        assert body["total_messages"] == 40
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_api_session_detail_under_the_cap_is_not_flagged_truncated(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 200)
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        _seed_messages(chat_store, sid, 12, user_id=_run(auth_store.get_user_by_email(EMAIL_A)).id)
+
+        body = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+
+        assert body["truncated"] is False
+        assert body["total_messages"] == 12
+        assert len(body["messages"]) == 12
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_session_read_response_size_is_bounded_by_the_caps(tmp_path, monkeypatch):
+    """The point of the caps: growing the thread must not grow the response.
+    A 4x longer thread, each message carrying 4x the sources, returns the same
+    number of bytes as the capped read of the smaller thread."""
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 20)
+    monkeypatch.setattr(chat_module.config, "CHAT_MESSAGE_SOURCE_LIMIT", 5)
+    store = _store(tmp_path)
+    try:
+        small = _run(store.create_session(USER_A)).id
+        _seed_messages(store, small, 20, sources_per_message=5, content_len=200)
+        big = _run(store.create_session(USER_A)).id
+        _seed_messages(store, big, 400, sources_per_message=5, content_len=200)
+
+        small_msgs, _ = _run(store.messages_page(small, USER_A))
+        big_msgs, big_total = _run(store.messages_page(big, USER_A))
+
+        assert big_total == 400
+        assert len(big_msgs) == len(small_msgs) == 20
+        assert sum(len(m.sources) for m in big_msgs) == 100
+        big_bytes = len(json.dumps([m.model_dump() for m in big_msgs]))
+        small_bytes = len(json.dumps([m.model_dump() for m in small_msgs]))
+        # Same per-message shape, so the sizes are equal up to the digits of
+        # differing ids/offsets; well under 2x either way.
+        assert big_bytes < small_bytes * 2
+    finally:
+        _run(store.close())
+
+
+def test_session_cap_does_not_touch_the_prompt_history_path(tmp_path, monkeypatch):
+    """The read cap and the prompt budget (#255) are deliberately different:
+    a user may read further back in a thread than the model is given context
+    for. Shrinking the read cap must not shrink the prompt."""
+    monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 2)
+    monkeypatch.setattr(chat_module.config, "CHAT_MAX_HISTORY_TURNS", 5)
+    store = _store(tmp_path)
+    try:
+        sid = _run(store.create_session(USER_A)).id
+        _seed_messages(store, sid, 6)
+
+        msgs, _total = _run(store.messages_page(sid, USER_A))
+        recent = _run(store.recent_turns(sid, USER_A, 5))
+
+        assert len(msgs) == 2
+        assert len(recent) == 6
+    finally:
+        _run(store.close())
+
+
+def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
+    """The knobs must be settable per deployment, not hard-coded constants.
+
+    The class body reads the environment at import time, so this loads a
+    STANDALONE copy of app/config.py under a throwaway module name: a plain
+    importlib.reload of `app.config` would rebind `app.config.config` to a new
+    object, so every module that already did `from app.config import config`
+    would silently keep the old one for the rest of the session.
+
+    Nothing here asserts against the live `app.config.config` singleton:
+    `app/config.py` calls `load_dotenv()` at import, so that object's values
+    come from whatever `backend/.env` a developer or deployment happens to
+    have. Asserting "== 200" on it would mean a deployment that legitimately
+    sets CHAT_SESSION_MESSAGE_LIMIT (the knob this adds) fails the suite. The
+    default is therefore proved from the source in a clean process, with
+    `load_dotenv` neutralised so the real .env cannot be picked up.
+    """
+    import importlib.util
+
+    import dotenv
+
+    from app import config as config_module
+
+    src = pathlib.Path(config_module.__file__)
+    # `app.config` does `from dotenv import load_dotenv` at import, so patching
+    # the attribute before exec_module keeps the real .env out. Patching the
+    # CWD is not enough: load_dotenv() searches upward from the *calling
+    # file*, which is inside the repo.
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+
+    def load(name: str):
+        spec = importlib.util.spec_from_file_location(name, src)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.config
+
+    monkeypatch.delenv("CHAT_SESSION_MESSAGE_LIMIT", raising=False)
+    monkeypatch.delenv("CHAT_MESSAGE_SOURCE_LIMIT", raising=False)
+
+    defaults = load("config_default_probe")
+    assert defaults.CHAT_SESSION_MESSAGE_LIMIT == 200
+    assert defaults.CHAT_MESSAGE_SOURCE_LIMIT == 20
+
+    monkeypatch.setenv("CHAT_SESSION_MESSAGE_LIMIT", "25")
+    monkeypatch.setenv("CHAT_MESSAGE_SOURCE_LIMIT", "4")
+    overridden = load("config_env_override_probe")
+    assert overridden.CHAT_SESSION_MESSAGE_LIMIT == 25
+    assert overridden.CHAT_MESSAGE_SOURCE_LIMIT == 4
+
+    # Both knobs are documented where an operator will actually set them
+    # (backend/.env.example, one level up from app/).
+    example = (src.parent.parent / ".env.example").read_text()
+    assert "CHAT_SESSION_MESSAGE_LIMIT=200" in example
+    assert "CHAT_MESSAGE_SOURCE_LIMIT=20" in example
