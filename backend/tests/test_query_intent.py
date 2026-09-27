@@ -550,13 +550,35 @@ _SEARCH_PAIRS = (
     (query_intent._BUYER_AUX_RE, _ORIG_BUYER_AUX_RE),
     (query_intent._BUYER_TRAILING_RE, _ORIG_BUYER_TRAILING_RE),
 )
+_ORACLES_BY_NAME = {
+    "_ACQUIRED_BY_RE": _ORIG_ACQUIRED_BY_RE,
+    "_BUYER_AUX_RE": _ORIG_BUYER_AUX_RE,
+    "_BUYER_TRAILING_RE": _ORIG_BUYER_TRAILING_RE,
+}
 
 # `_ALL_OF_RE` is written with a `\b` before "all" -- the literal is the word
 # "all", NOT `\a` + "ll" (a BEL escape, which would make the pattern unable to
-# match ordinary English). `_ORACLE_GAP` below is what mechanically ties each
-# oracle to its live counterpart so a hand-transcription slip in either cannot
-# hide a behaviour change: the equivalence assertions are only meaningful if
-# the two patterns are the same pattern apart from the gap bound.
+# match ordinary English).
+#
+# The corpus below carries inputs chosen to DISCRIMINATE the pre-fix patterns
+# from the bounded ones. The sharpest is a connective with nothing (or almost
+# nothing) between its two ends: `_ALL_OF_RE`'s prefix `\ball ` ends in a
+# literal space, so a zero-width gap would let `\b(?:and|with)\b` match
+# straight after it and the pattern would match "all and" -- which the pre-fix
+# one-or-more gap could not. That widened the matcher, changed the
+# `_multi_entity_scaffold` substitution and flipped `detect_multi_entity` from
+# 'comparison' to 'intersection'. These fixtures are in the corpus so that
+# widening turns the equivalence assertions below red instead of passing.
+_ZERO_GAP_FIXTURES = (
+    "all and",
+    "all with",
+    "all  and",
+    "all of and",
+    "all of with",
+    "all with revenue and both Acme and Beta",
+    "both and",
+    "both with",
+)
 _INTERSECTION_CORPUS = (
     # Positives.
     "companies backed by both SoftBank and Tiger Global",
@@ -574,6 +596,7 @@ _INTERSECTION_CORPUS = (
     # "all" inside a larger word must not trigger the literal.
     "small allocations across the portfolio and the follow-on",
 )
+_INTERSECTION_CORPUS = _INTERSECTION_CORPUS + _ZERO_GAP_FIXTURES
 
 _ACQUISITION_CORPUS = (
     # Target direction: the named company is the one that was acquired.
@@ -701,45 +724,75 @@ def test_long_realistic_queries_still_match_exactly_as_before():
 def test_connective_gaps_are_bounded_and_groups_preserved():
     """A stray `{{0,N}}` in an f-string would compile to a literal brace and
     silently turn the gap back into a 1-char match, so assert the compiled
-    pattern really carries the bound, and that no unbounded gap survived."""
-    bound = query_intent._MAX_CONNECTIVE_SPAN
+    pattern really carries a bound, and that no unbounded gap survived.
+
+    The LOWER bound is per-pattern: `_ALL_OF_RE` needs `{1,N}` because its
+    pre-fix gap was one-or-more, and a zero floor there would widen the
+    matcher (see `_ALL_OF_RE`'s comment). The rest take `{0,N}`.
+    """
+    n = query_intent._MAX_CONNECTIVE_SPAN
     for new, orig in _SUB_PAIRS + _SEARCH_PAIRS:
-        assert f"{{0,{bound}}}" in new.pattern, new.pattern
+        assert f"{{0,{n}}}" in new.pattern or f"{{1,{n}}}" in new.pattern, new.pattern
         assert ".*" not in new.pattern, new.pattern
         assert "*?" not in new.pattern, new.pattern
         assert new.groups == orig.groups, new.pattern
+    # Pin which patterns use which lower bound, so a blanket "make them all {0,N}"
+    # edit cannot silently reintroduce the widening.
+    assert "{1," in query_intent._ALL_OF_RE.pattern
+    assert "{0," in query_intent._BOTH_AND_RE.pattern
 
 
-def test_oracles_are_the_live_patterns_minus_the_gap_bound():
-    """The equivalence assertions above are only meaningful if each frozen
-    oracle really is the live pattern with the gap unbounded again.
+def test_oracles_reproduce_pre_fix_reachability():
+    """The equivalence assertions are only as good as the frozen oracles, so
+    pin the oracles' own behaviour on inputs that DISCRIMINATE them from the
+    live patterns.
 
-    Without this, a hand-transcription slip is invisible: a `\b` dropped from
-    BOTH the live pattern and its oracle leaves the two in perfect agreement
-    while both no longer match the text the pattern was written for -- which
-    is exactly the failure this test exists to make impossible. Deriving the
-    expected oracle text from the live pattern mechanically means the two can
-    only differ by the gap bound.
+    A previous version of this derived the expected oracle source from the
+    live pattern by string substitution. That certified a *transformation*
+    rather than a behaviour, and it was blind to the real defect: the live
+    `_ALL_OF_RE` gap had been changed from one-or-more to zero-or-more, which
+    that substitution happily "undid" back to `+?`, so the test stayed green
+    while the matcher had silently widened to match "all and".
+
+    Checking behaviour means an oracle that drifts -- in either direction, or
+    in the same direction as the live pattern -- fails here instead.
     """
-    n = query_intent._MAX_CONNECTIVE_SPAN
-    # The bounded forms, longest/most specific first so `[^.?!]{0,N}?` is not
-    # partially consumed by the bare `.{0,N}?` rule. `{0,N}` is "zero or more",
-    # so a char-class gap unwinds to `*?` and a `.` gap (always >= 1 char in
-    # the originals) to `+?`.
-    unwind = (
-        (f"[^.?!]{{0,{n}}}?", "[^.?!]*?"),
-        (f".{{0,{n}}}?", ".+?"),
-        (f".{{0,{n}}}", ".*"),
-    )
-    for new, orig in _SUB_PAIRS + _SEARCH_PAIRS:
-        unbounded = new.pattern
-        for bounded_form, original_form in unwind:
-            unbounded = unbounded.replace(bounded_form, original_form)
-        assert unbounded == orig.pattern, (
-            f"oracle drifted from the live pattern:\n"
-            f"  live (gap unbounded) = {unbounded!r}\n"
-            f"  frozen oracle         = {orig.pattern!r}"
-        )
+    # `_ALL_OF_RE`'s prefix ends in a literal space, so a zero-width gap lets
+    # `\b(?:and|with)\b` match immediately after it. The pre-fix gap was
+    # one-or-more, so neither of these matched before the gap was bounded.
+    # These two are the ONLY discriminating inputs: "all of and" and the
+    # longer fixtures DO match pre-fix, because their gap is at least one
+    # character, so asserting they do not match would fail on correct code.
+    for text in ("all and", "all with"):
+        assert not _ORIG_ALL_OF_RE.search(text), text
+        assert not query_intent._ALL_OF_RE.search(text), text
+
+    # ... and the over-tight-bound failure mode: matching nothing at all.
+    for text in ("deals with all of A, B and C", "all of Acme, Beta and Gamma"):
+        assert _ORIG_ALL_OF_RE.sub(" ", text) != text, text
+        assert query_intent._ALL_OF_RE.sub(" ", text) == _ORIG_ALL_OF_RE.sub(" ", text), text
+    for text in ("backed by both SoftBank and Tiger Global", "both Acme and Beta"):
+        assert _ORIG_BOTH_AND_RE.sub(" ", text) != text, text
+        assert query_intent._BOTH_AND_RE.sub(" ", text) == _ORIG_BOTH_AND_RE.sub(" ", text), text
+
+    # Each fixture is one the pre-fix pattern genuinely matched, so a broken
+    # oracle cannot hide behind "both sides are wrong in the same way".
+    _POSITIVES = {
+        "_ACQUIRED_BY_RE": (
+            "the payments startup was bought by a consortium led by SoftBank, "
+            "who will take the stake"
+        ),
+        "_BUYER_AUX_RE": "what did Acme buy",
+        "_BUYER_TRAILING_RE": (
+            "SoftBank acquired Greystone Digital's portfolio, and whom will they keep"
+        ),
+    }
+    for name, text in _POSITIVES.items():
+        oracle = _ORACLES_BY_NAME[name]
+        assert oracle.search(text), (name, text)
+        assert getattr(query_intent, name).search(text), (name, text)
+    for name in _POSITIVES:
+        assert not _ORACLES_BY_NAME[name].search("the company acquired a stake in the market"), name
 
 
 # Pathological inputs: the repeated connective with the closing term left out,

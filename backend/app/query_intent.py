@@ -786,6 +786,11 @@ _WHO_ACQUIRED_RE = re.compile(
 # literal start positions, so one search costs O(n^2) in query length and a
 # long /search query becomes a CPU burn (the /search endpoint bounds `q` to a
 # few hundred characters, which is what makes that blow-up reachable at all).
+# The LOWER bound is per-pattern and is not always 0: it must reproduce what
+# the pre-fix gap required. A gap that was `.+?` (one-or-more) must stay
+# one-or-more, because a zero floor widens the matcher whenever the prefix
+# ends in a consumable character rather than a zero-width `\b`. See
+# `_ALL_OF_RE` for the one pattern that needs `{1,N}?`; the rest take `{0,N}?`.
 _MAX_CONNECTIVE_SPAN = 200
 
 
@@ -843,7 +848,18 @@ _BOTH_AND_RE = re.compile(
     rf"\bboth\b.{{0,{_MAX_CONNECTIVE_SPAN}}}?\band\b", re.IGNORECASE
 )
 _ALL_OF_RE = re.compile(
-    rf"\ball (?:of )?.{{0,{_MAX_CONNECTIVE_SPAN}}}?\b(?:and|with)\b", re.IGNORECASE
+    # Lower bound 1, not 0: the pre-fix gap here was `.+?` (one-or-more), so
+    # `{0,N}?` would WIDEN the matcher. `\ball ` ends in a literal space, so a
+    # zero-length gap lets `\b(?:and|with)\b` match immediately after it --
+    # `search("all and")` flipped False -> True. That is not cosmetic: it
+    # changes the `_multi_entity_scaffold` output and flips
+    # `detect_multi_entity` from 'comparison' to 'intersection', which changes
+    # per-entity retrieval. The other four patterns here are unaffected by a
+    # zero floor because their prefixes end in a zero-width `\b` (so a word
+    # character cannot follow), or because their pre-fix gap was already
+    # `*?`/`.*` -- both zero-or-more, so `{0,N}?` is a faithful narrowing.
+    rf"\ball (?:of )?.{{1,{_MAX_CONNECTIVE_SPAN}}}?\b(?:and|with)\b",
+    re.IGNORECASE,
 )
 
 
