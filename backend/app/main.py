@@ -44,6 +44,7 @@ from app.encoders import DenseEncoder
 from app.health import close_redis as health_module_close_redis
 from app.health import router as health_router
 from app.health import warn_if_llm_key_unusable
+from app.logging_config import configure_logging
 from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
@@ -81,6 +82,12 @@ from app.user_profile import (
     invalidate_user_profile,
     record_interaction,
 )
+
+# Uvicorn's worker leaves the root logger at WARNING with no handlers, so every
+# module logger inherits WARNING and drops its INFO records (#293). Done at
+# import -- before the lifespan and before any request is served -- so boot
+# events and the background purge loops are emitted under the real startup path.
+configure_logging()
 
 state = {}
 
@@ -350,9 +357,8 @@ app.add_middleware(
 # A host that is missing from ALLOWED_HOSTS answers 400 to every request, which
 # looks like a broken app rather than a config mistake. Log the effective list
 # at import (before anything can fail) so the cause is visible in the worker
-# logs straight away. WARNING, not INFO: neither gunicorn nor uvicorn attaches a
-# handler to the root logger, so an INFO record here is silently dropped and the
-# one clue during such an outage would never appear.
+# logs straight away. WARNING, not INFO: this is the one clue during such an
+# outage, and it has to survive an operator who raised LOG_LEVEL to cut volume.
 logger.warning("TrustedHost allowed hosts: %s", ", ".join(config.ALLOWED_HOSTS))
 
 app.include_router(health_router)

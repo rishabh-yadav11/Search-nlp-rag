@@ -851,6 +851,15 @@ class Config:
         os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS + _machine_hosts()
     )
 
+    # Level for the app's own loggers, read by app/logging_config.py at startup.
+    # It exists because uvicorn's worker leaves the root logger at WARNING with
+    # no handlers, so every logger.info in the app was dropped (#293). Only the
+    # app's loggers take this level; the root logger's level is left alone, so a
+    # third-party logger's INFO output stays off at every setting. CRITICAL,
+    # ERROR, WARNING, INFO or DEBUG (case-insensitive); an unrecognised value
+    # falls back to INFO and says so in the log.
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
 
 # A real Google API key is "AIza" followed by 35 URL-safe characters. That shape
 # is only required against Google's own endpoint: GEMINI_BASE_URL is
