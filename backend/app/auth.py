@@ -175,6 +175,19 @@ def validate_password(password: str) -> str:
     return password
 
 
+def _validator_rejection(validator, value: str) -> str | None:
+    """Return why ``validator`` rejects ``value``, or None when it accepts it.
+
+    ``validate_email`` / ``validate_password`` are written for the signup
+    endpoints and signal failure by raising ``HTTPException``. Callers that
+    need the reason as text (rather than as a 422 response) use this.
+    """
+    try:
+        validator(value)
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
 def validate_name(name: str) -> str:
     """Trim + validate an optional display name, raising 422 on violation."""
     name = (name or "").strip()
@@ -872,10 +885,47 @@ async def bootstrap_admin() -> None:
     """Seed the bootstrap admin from config (once, at startup). Never overwrites
     an existing account's password. Safe under concurrent worker startups: the
     duplicate / write-lock races are handled instead of failing startup (which
-    would restart-loop the worker)."""
+    would restart-loop the worker).
+
+    The configured credentials go through the same ``validate_email`` /
+    ``validate_password`` guards as every other path into the user table. A
+    config value the validators reject is refused, loudly, and no account is
+    created -- but the process still starts, so a typo in one env var cannot take
+    the whole API (and /health) down and leave nobody able to reach the service
+    to fix it. An operator must correct the config and restart.
+
+    An admin account left behind by an earlier run with weak credentials is
+    deliberately NOT deleted here: this runs at startup, unauthenticated, and
+    removing the only admin account would lock every operator out of their own
+    deployment. Such an account is reported instead, so it gets rotated.
+    """
     email = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
     password = config.AUTH_ADMIN_PASSWORD or ""
     if not email or not password:
+        return
+    # The config values are the one remaining path into the user table that does
+    # not go through the validators, so a typo like AUTH_ADMIN_PASSWORD=x used to
+    # provision a full-admin account with a 1-character password that the signup
+    # endpoint would itself have rejected. Run both through those validators.
+    #
+    # The rejection is a permanent, config-level fault: retrying it five times
+    # inside the write-lock loop below would re-log the identical error five
+    # times and change nothing, so it returns before reaching that loop. The loop
+    # still retries genuine transient faults (SQLite write locks) as before.
+    email_error = _validator_rejection(validate_email, email)
+    if email_error:
+        await _reject_bootstrap(
+            "AUTH_ADMIN_EMAIL", email_error,
+            hint=f"set it to a valid address (max {config.AUTH_MAX_EMAIL_LEN} characters) and restart",
+        )
+        return
+    password_error = _validator_rejection(validate_password, password)
+    if password_error:
+        await _reject_bootstrap(
+            "AUTH_ADMIN_PASSWORD", password_error,
+            hint=f"set it to a password of at least {config.AUTH_PASSWORD_MIN_LEN} characters "
+                 "containing both a letter and a digit, then restart",
+        )
         return
     s = _require_auth_store()
     for attempt in range(5):
@@ -893,3 +943,44 @@ async def bootstrap_admin() -> None:
                 logger.error("bootstrap admin %s could not be created (write lock)", email)
                 return
             await asyncio.sleep(1)
+ 
+ 
+async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
+    """Log that the configured bootstrap admin credentials were refused, and
+    report (never delete) an account a previous run already created from the
+    same bad value.
+
+    Must stay loud and specific: the operator reading the log has to learn that
+    AUTH_ADMIN_PASSWORD -- not the login endpoint -- is the thing to fix, so the
+    message names the variable, the validator that rejected it, the validator's
+    own reason, and the fix.
+    """
+    # A weak admin may already exist from a run that predates the validators.
+    # Removing it here would be an unauthenticated, startup-time way to delete
+    # the only admin account and lock every operator out, so the row is left
+    # alone and surfaced loudly for out-of-band rotation instead.
+    if store is not None:
+        probe = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
+        try:
+            existing = await store.get_user_by_email(probe) if probe else None
+        except Exception:  # noqa: BLE001 - a probe must never break startup
+            existing = None
+        if existing is not None and existing.role == "admin":
+            logger.error(
+                "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
+                "No account was created, and the pre-existing admin account (id %s) -- which may "
+                "have been provisioned from this same non-compliant value before these checks "
+                "existed -- was left in place. Rotate that account's password out of band: %s.",
+                probe, _validator_name_for(variable), variable, reason, existing.id, hint,
+            )
+            return
+    logger.error(
+        "bootstrap admin NOT created: %s rejected the configured %s: %s. This is a configuration "
+        "error, not a transient fault, so it is not retried. Startup continues with no admin "
+        "account: %s. The service is up, so you can fix the config and restart.",
+        _validator_name_for(variable), variable, reason, hint,
+    )
+
+
+def _validator_name_for(variable: str) -> str:
+    return "validate_email" if variable.endswith("EMAIL") else "validate_password"
