@@ -301,9 +301,9 @@ without a failure.
 
 ---
 
-## app/chat.py — 91% (covered by tests/test_chat.py)
+## app/chat.py — 92% (covered by tests/test_chat.py)
 
-Measured: 841 statements, 72 missed. The entries below are the branches this
+Measured: 841 statements, 70 missed. The entries below are the branches this
 change added or re-pointed at. The residual is mostly
 `_prepare_multi_entity_turn` (lines 1330-1440), which this change did not
 touch, and none of the missed lines is new code — the shortfall predates it and
@@ -527,7 +527,7 @@ exhaustion/dead-code raises), `app/reranker.py`
 (was 92%) is now 100% via `tests/test_cost_budget.py`, `app/analytics.py`
 (was 74%) is now 100% via `tests/test_analytics.py`, `app/main.py`
 (was 72%) is now 100% via `tests/test_main_pipeline.py` +
-`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 91% via
+`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 92% via
 `tests/test_chat.py` (schema migration, error SSEs, budget/LLM HTTP paths,
 dataviz edge branches, nudge retries, the abort rule, and the retention loop),
 `app/auth.py`
