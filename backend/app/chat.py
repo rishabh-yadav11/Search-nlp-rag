@@ -1785,7 +1785,12 @@ async def _prepare_turn(question: str, history: list[MessageOut]) -> PreparedTur
         return PreparedTurn(answer=smalltalk, sources=[], note=None)
 
     multi = detect_multi_entity(question)
-    if multi is not None:
+    # A comparison turn costs one retrieval leg per entity, so the entity
+    # count -- which a question controls, bounded only by the 8000-char
+    # message limit -- is the turn's fan-out. Past the cap this is not a
+    # comparison anyone can read anyway, so answer it on the ordinary
+    # single-query path instead of fanning out one pipeline per entity.
+    if multi is not None and len(multi.entities) <= config.CHAT_MAX_MULTI_ENTITIES:
         return await _prepare_multi_entity_turn(multi, question, history)
 
     from app.answer_fallback import date_label, fallback_answer, results_are_weak, weak_results_note
@@ -1895,23 +1900,44 @@ async def _prepare_multi_entity_turn(
     )
 
     k = _effective_chat_k(" ".join(multi.entities + [multi.scaffold]))
-    per_entity: list[list[SourceArticle]] = []
-    for entity in multi.entities:
+    # Each leg is independent -- it only reads its own entity and the shared
+    # scaffold -- so they are gathered rather than awaited one at a time. The
+    # gather preserves input order, which the combine step below depends on:
+    # per_entity[i] must stay entity i's results, and id_entities records the
+    # entities in that order for the per-article "Entities:" annotation and the
+    # rank key. A leg's two awaits (retrieval, then body_rescue on ITS OWN
+    # results) stay sequential inside the leg: body_rescue re-scores the
+    # articles that leg's retrieval returned, so it cannot start before them.
+    #
+    # The semaphore bounds the fan-out. Concurrency here is not free: every
+    # leg takes the module-global inference_lock for its CPU rerank, so an
+    # unbounded gather would just queue them all on that one lock while holding
+    # N times the Qdrant connections and body fetches open. The depth trades
+    # that against the overlap actually bought -- the Qdrant I/O each leg does
+    # while the others wait for the lock.
+    sem = asyncio.Semaphore(max(1, config.CHAT_MULTI_ENTITY_CONCURRENCY))
+
+    async def _leg(entity: str) -> list[SourceArticle]:
         sub_query = (entity + " " + multi.scaffold).strip()
         rq, eff_from, eff_to, dealtype, industry = _effective_intent(sub_query, None, None)
-        reranked, final_dealtype, final_industry, final_content_type = await retrieve_with_auto_facet_fallback(
-            rq, k,
-            industry=None, dealtype=None, author=None,
-            eff_from=eff_from, eff_to=eff_to,
-            auto_industry=industry, auto_dealtype=dealtype,
-            auto_content_type=None,
-            need_body=True,
-        )
-        if config.ENABLE_BODY_RESCUE:
-            reranked = await body_rescue(sub_query, reranked)
+        async with sem:
+            reranked, final_dealtype, final_industry, final_content_type = await retrieve_with_auto_facet_fallback(
+                rq, k,
+                industry=None, dealtype=None, author=None,
+                eff_from=eff_from, eff_to=eff_to,
+                auto_industry=industry, auto_dealtype=dealtype,
+                auto_content_type=None,
+                need_body=True,
+            )
+            if config.ENABLE_BODY_RESCUE:
+                reranked = await body_rescue(sub_query, reranked)
         faceted = bool(final_dealtype or final_industry or final_content_type)
         gate = config.ASK_MIN_SCORE_FACETED if faceted else config.ASK_MIN_SCORE
-        per_entity.append([a for a in reranked if a.score >= gate])
+        return [a for a in reranked if a.score >= gate]
+
+    per_entity: list[list[SourceArticle]] = list(
+        await asyncio.gather(*(_leg(entity) for entity in multi.entities))
+    )
 
     by_id: dict[int, SourceArticle] = {}
     id_entities: dict[int, list[str]] = {}
