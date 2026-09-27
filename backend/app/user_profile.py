@@ -178,6 +178,10 @@ async def build_user_profile(user_id: str) -> list[float] | None:
             if not vector or not all(math.isfinite(value) for value in vector):
                 continue
             # Newer signals have higher influence while preserving determinism.
+            # The 30-day time constant is deliberate and matches the one in
+            # recommender._calculate_recency_score; it is a fixed constant
+            # rather than a config knob, so a stale environment variable cannot
+            # desynchronise the two decays.
             weight = math.exp(-max(0.0, now - timestamp) / (30 * 86400))
             weighted_values.append((vector, weight))
             payload = article.payload or {}
