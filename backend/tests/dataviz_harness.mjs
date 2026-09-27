@@ -42,9 +42,22 @@ for (const fixture of corpus.fixtures) {
 }
 
 const tokens = contract.MISSING_VALUE_TOKENS
+// Which characters the frontend trims off a cell. The backend spells its own
+// trim set out in Python; comparing them one character at a time catches a
+// divergence that an equal-looking string cannot (JS trim() eats U+FEFF, Python
+// str.strip() does not).
+const trimProbes = {}
+for (const cp of [0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000, 0x200b, 0x2028,
+  0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) {
+  const ch = String.fromCodePoint(cp)
+  trimProbes[cp.toString(16).padStart(4, '0')] = contract.trimCell(`x${ch}`) === 'x' && contract.trimCell(`${ch}x`) === 'x'
+}
+
 process.stdout.write(JSON.stringify({
   fence_src: contract.FENCE_SRC,
   numeric_literal_src: contract.NUMERIC_LITERAL_SRC,
+  trim_src: contract.TRIM_SRC,
+  trim_probes: trimProbes,
   missing_value_tokens: tokens instanceof Set ? [...tokens] : Object.keys(tokens),
   results,
 }))
