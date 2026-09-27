@@ -462,13 +462,15 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
-    # `location /ready` above is a PREFIX match, so without this block a public
-    # GET /ready/deep would be proxied to the API and held dark only by its
-    # in-process host-local check. That check refuses everything arriving through
-    # this vhost (nginx always sets X-Forwarded-For), but the endpoint is
+    # The "location /ready" block above is a PREFIX match, so without this block
+    # a public GET /ready/deep would be proxied to the API and held dark only by
+    # its in-process host-local check. That check refuses everything arriving
+    # through this vhost (nginx always sets X-Forwarded-For), but the endpoint is
     # deliberately uncached and unrated, so it gets a second, independent layer:
     # 404 at the proxy. The deploy gate in this script and the watchdog in
     # deploy/healthcheck.sh reach it on 127.0.0.1 directly and never come here.
+    # NB: no backticks in this comment -- the heredoc is unquoted, so they would
+    # be run as a command substitution.
     location /ready/deep { return 404; }
     location /facets {
         proxy_pass http://127.0.0.1:$API_PORT;

@@ -208,3 +208,14 @@ def test_the_cron_entry_probes_the_port_the_api_is_actually_bound_to():
     entry = cron_lines[0]
     assert "API_PORT" in entry, f"the cron entry must derive BASE from API_PORT: {entry!r}"
     assert "BASE=" in entry
+
+
+def test_the_nginx_vhost_heredoc_contains_no_backticks():
+    """The vhost is written through an UNQUOTED heredoc, so a backtick anywhere
+    in it is a command substitution: setup.sh prints "command not found" to the
+    operator and writes the mangled result into the deployed vhost. The fix is
+    plain text in the comment -- quoting the heredoc delimiter is not available,
+    since $API_PORT and the \\$remote_addr escapes depend on the unquoted form."""
+    body = SETUP_SH.read_text().split("<<NGINX\n", 1)[1].split("\nNGINX\n", 1)[0]
+
+    assert "`" not in body, "a backtick in the unquoted NGINX heredoc is executed"
