@@ -475,10 +475,64 @@
       "why": "a raw NaN literal is not a number; json.loads accepted it in Python"
     },
     {
+      "name": "num_json_overflow",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",1e999]],\"value_column\":1}\n```\n\nTrailing prose.",
+      "expect": "reject",
+      "why": "a bare JSON number that overflows to infinity is valid JSON syntax, so it survives json.loads; the finite check in _as_float is what stops it, and JSON.parse overflows it to Infinity which the browser already refused"
+    },
+    {
       "name": "num_json_infinity",
       "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",Infinity]],\"value_column\":1}\n```\n\nTrailing prose.",
       "expect": "reject",
       "why": "a raw Infinity literal is not a number"
+    },
+    {
+      "name": "json_nan_in_title",
+      "text": "```dataviz\n{\"columns\": [\"Deal\", \"Value\"], \"rows\": [[\"A\", 1]], \"value_column\": 1, \"title\": NaN}\n```",
+      "expect": "reject",
+      "why": "a bare NaN literal anywhere in the payload: json.loads accepts it, JSON.parse throws, so the server used to keep a block the browser could not parse"
+    },
+    {
+      "name": "json_infinity_in_title",
+      "text": "```dataviz\n{\"columns\": [\"Deal\", \"Value\"], \"rows\": [[\"A\", 1]], \"value_column\": 1, \"title\": Infinity}\n```",
+      "expect": "reject",
+      "why": "same for a bare Infinity literal in a key that is never otherwise inspected"
+    },
+    {
+      "name": "json_neg_infinity_value_column",
+      "text": "```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", 1]], \"value_column\": -Infinity}\n```",
+      "expect": "reject",
+      "why": "a bare -Infinity literal as the value column"
+    },
+    {
+      "name": "bom_in_label_cell",
+      "text": "```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"\\ufeff\", 1.0]], \"value_column\": 1}\n```",
+      "expect": "accept",
+      "why": "a BOM in a label cell: JavaScript trim() eats U+FEFF and Python str.strip() does not, so only the browser rejected it, treating the label as missing"
+    },
+    {
+      "name": "bom_around_value",
+      "text": "```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", \"\\ufeff1.5\"]], \"value_column\": 1}\n```",
+      "expect": "reject",
+      "why": "a BOM around a number is no longer trimmed away, so neither side reads a value out of it"
+    },
+    {
+      "name": "nbsp_only_cell",
+      "text": "```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", \"\\u00a0\"]], \"value_column\": 1}\n```",
+      "expect": "reject",
+      "why": "a non-breaking-space-only cell is not one of the missing-value tokens on either side"
+    },
+    {
+      "name": "nbsp_cell_beside_a_number",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",\" \"]],\"value_column\":1}\n```\n\nTrailing prose.",
+      "expect": "reject",
+      "why": "a non-breaking-space cell is not one of the missing-value tokens, so it is a non-numeric cell and the column fails; Python str.strip() used to erase it and treat the column as valid"
+    },
+    {
+      "name": "nbsp_only_cell",
+      "text": "```dataviz\\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", \"\\u00a0\"]], \"value_column\": 1}\\n```",
+      "expect": "reject",
+      "why": "a lone non-breaking-space cell leaves no valid value column"
     },
     {
       "name": "num_proto_cell",
