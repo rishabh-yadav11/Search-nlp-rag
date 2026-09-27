@@ -201,3 +201,56 @@ describe('ChatPage — settled answers are not re-parsed while a new answer stre
     expect(similarRenders.length).toBe(before)
   })
 })
+
+describe('ChatPage — a server-truncated thread is announced, not silently shortened', () => {
+  // The server returns only the most recent CHAT_SESSION_MESSAGE_LIMIT messages
+  // and flags the rest (issue #258). Dropping older messages without saying so
+  // would look like the user's history vanishing.
+  function stubSessionDetail(detail: Record<string, unknown>) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL): Promise<StubResponse> => {
+        const url = String(input)
+        if (url.endsWith('/api/chat/sessions')) return jsonResponse([SESSION])
+        if (url.includes('/api/chat/sessions/')) return jsonResponse({ ...SESSION, ...detail })
+        return jsonResponse({ similar_articles: [] })
+      })
+    )
+  }
+
+  async function openBudget() {
+    render(<ChatPage />)
+    fireEvent.click(await screen.findByLabelText('Open conversation: Budget'))
+    await screen.findByText('SETTLED_TWO answer')
+  }
+
+  it('tells the user how many earlier messages were not shown', async () => {
+    stubSessionDetail({
+      messages: SETTLED,
+      truncated: true,
+      total_messages: SETTLED.length + 135,
+    })
+
+    await openBudget()
+
+    const notice = await screen.findByRole('status')
+    expect(notice.textContent).toContain('135')
+    expect(notice.textContent?.toLowerCase()).toContain('not shown')
+  })
+
+  it('shows no notice when the server returned the whole thread', async () => {
+    stubSessionDetail({ messages: SETTLED, truncated: false, total_messages: SETTLED.length })
+
+    await openBudget()
+
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('shows no notice for a response from a server that does not report truncation', async () => {
+    stubSessionDetail({ messages: SETTLED })
+
+    await openBudget()
+
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+})
