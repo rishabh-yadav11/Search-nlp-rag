@@ -1365,8 +1365,35 @@ class TrendingResponse(BaseModel):
     limit: int
     window_days: int
 
+# /recommend/for-you caches one entry per distinct `limit`, and `limit` is
+# bounded, so a user's entire for-you cache is exactly
+# FOR_YOU_MAX_LIMIT - FOR_YOU_MIN_LIMIT + 1 knowable keys. Deriving that set is
+# what lets an interaction invalidate it with a single DEL; a prefix delete
+# would instead SCAN the whole keyspace, and SCAN ignores MATCH when deciding
+# how much work to do, so its cost tracks every key in the database rather than
+# the ~20 that match. Keep the two bounds below and the `Query` in get_for_you
+# in sync: widening the Query without widening this range would silently leave
+# cached entries behind.
+FOR_YOU_MIN_LIMIT = 1
+FOR_YOU_MAX_LIMIT = 20
 
-@app.post("/recommend/interaction")
+
+def _for_you_cache_keys(user_id: str) -> list[str]:
+    """Every cache key /recommend/for-you can have written for ``user_id``."""
+    return [
+        f"recommend:for-you:{user_id}:{limit}"
+        for limit in range(FOR_YOU_MIN_LIMIT, FOR_YOU_MAX_LIMIT + 1)
+    ]
+
+
+@app.post(
+    "/recommend/interaction",
+    # Per-IP bound on a loop-driving endpoint. See the note on
+    # PUBLIC_INTERACTION_RATE_PER_MIN in app/config.py.
+    dependencies=[
+        Depends(public_rate_limit("interaction", "PUBLIC_INTERACTION_RATE_PER_MIN", fail_closed=False))
+    ],
+)
 async def record_user_interaction(
     event: InteractionEvent,
     request: Request,
@@ -1385,7 +1412,7 @@ async def record_user_interaction(
         dwell_time_ms=event.dwell_time_ms,
     )
     await invalidate_user_profile(user_id)
-    await cache.delete_prefix(f"recommend:for-you:{user_id}:")
+    await cache.delete_keys(_for_you_cache_keys(user_id))
     return {"status": "ok", "article_id": event.article_id}
 
 
@@ -1428,7 +1455,7 @@ async def get_similar(
 
 @app.get("/recommend/for-you", response_model=RecommendationsResponse)
 async def get_for_you(
-    limit: int = Query(config.RECOMMEND_DEFAULT_LIMIT, ge=1, le=20),
+    limit: int = Query(config.RECOMMEND_DEFAULT_LIMIT, ge=FOR_YOU_MIN_LIMIT, le=FOR_YOU_MAX_LIMIT),
     _auth: None = Depends(require_auth),
     request: Request = None,
 ):
