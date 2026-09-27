@@ -33,9 +33,13 @@ jobs:
           cache-dependency-path: |
             backend/requirements.txt
             backend/requirements-dev.txt
-      # The full runtime stack is required: app/main.py, app/encoders.py and
-      # app/reranker.py import torch/transformers/fastembed at module scope, and
-      # tests/test_encoders.py + tests/test_reranker.py import them directly.
+      # The runtime stack is required, not just the dev tools. app/main.py does
+      # `from fastembed import SparseTextEmbedding` at module scope and six test
+      # modules import app.main, so the suite cannot even be collected without
+      # it. (app/encoders.py and app/reranker.py import fastembed and
+      # sentence_transformers lazily inside their constructors, and the tests
+      # for those fake them in sys.modules -- so the collection-time dependency
+      # is specifically app.main's module-scope import.)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
