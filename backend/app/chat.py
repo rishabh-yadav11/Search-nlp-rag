@@ -1,9 +1,9 @@
 """Per-user chat conversations stored in SQLite.
 
 Conversations survive restarts and are purged after CHAT_RETENTION_DAYS of
-inactivity. The caller must be authenticated (Bearer token, validated by the
-auth dependency at the router level); conversations are scoped to the
-authenticated account's user id.
+inactivity. The caller must be authenticated (the HttpOnly session cookie,
+validated by the auth dependency at the router level); conversations are
+scoped to the authenticated account's user id.
 
 The turn pipeline reuses the shared retrieval/rerank/fallback pipeline and
 builds a conversation-aware prompt so the model can follow up on prior turns.
