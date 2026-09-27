@@ -843,7 +843,7 @@ _BOTH_AND_RE = re.compile(
     rf"\bboth\b.{{0,{_MAX_CONNECTIVE_SPAN}}}?\band\b", re.IGNORECASE
 )
 _ALL_OF_RE = re.compile(
-    rf"\all (?:of )?.{{0,{_MAX_CONNECTIVE_SPAN}}}?\b(?:and|with)\b", re.IGNORECASE
+    rf"\ball (?:of )?.{{0,{_MAX_CONNECTIVE_SPAN}}}?\b(?:and|with)\b", re.IGNORECASE
 )
 
 
