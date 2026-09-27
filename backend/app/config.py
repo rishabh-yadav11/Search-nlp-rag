@@ -483,11 +483,19 @@ class Config:
     BODY_RESCUE_WINDOW = _clamped_int("BODY_RESCUE_WINDOW", 1500, 200, 8000)
     # STEP is the sliding-window stride over the body. A 0 is a hard crash —
     # `range(0, n, 0)` raises ValueError and 500s the chat turn — and a small
-    # step re-scans the whole body: step=1 costs ~116ms per 50K body versus
-    # ~0.25ms at the default 500, which is a 470x amplification of a knob whose
-    # value is supposed to be a cost saving. The window/step ratio is also
-    # capped implicitly by the 1500 ceiling (at most ~40x overlap).
+    # step re-scans the whole body: step=1 costs ~117ms per 50K body versus
+    # ~0.26ms at the default 500, a 450x amplification of a knob whose value
+    # is supposed to be a cost saving.
     BODY_RESCUE_STEP = _clamped_int("BODY_RESCUE_STEP", 500, 1, 1500)
+    # Hard budget on how many windows are scored per body, independent of the
+    # stride. Clamping STEP alone does NOT bound the work, because a small
+    # stride is legal: step=1 still scans 48,501 windows of a 50K body, and
+    # body_rescue scans every body-bearing article before the candidate cap
+    # applies, so 20 articles cost ~2.3s. `_best_body_window` widens the
+    # stride to fit this budget. 200 is above the 98 windows the defaults
+    # already scan, so the default scan is bit-for-bit unchanged and the budget
+    # only engages for a deliberately expensive stride.
+    BODY_RESCUE_MAX_WINDOWS = _clamped_int("BODY_RESCUE_MAX_WINDOWS", 200, 1, 5000)
     # Most candidates that may enter the second cross-encoder pass. The pass is
     # the dominant cost (one pair per candidate, under `inference_lock`) and
     # chat hands body_rescue up to CHAT_MAX_SOURCES (20) articles. 10 keeps the

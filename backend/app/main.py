@@ -720,15 +720,43 @@ def _query_content_tokens(query: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOPWORDS and len(w) > 1}
 
 
-def _best_body_window(body: str, tokens: set[str], win: int, step: int) -> str:
+def _effective_step(positions: int, step: int, max_windows: int) -> int:
+    """The stride to scan ``positions`` window starts with, honouring both a
+    minimum step of 1 and a hard budget of ``max_windows`` windows.
+
+    Clamping the configured stride alone does not bound the work, because a
+    small stride is a legal (and deceptively cheap-looking) setting: step=1
+    over a 50K body scores 48,501 windows and costs ~117ms per body, and
+    ``body_rescue`` scans every body-bearing article before the candidate cap
+    applies, so 20 articles cost ~2.3s for a single chat turn. Widening the
+    stride bounds the work by window COUNT instead of by the raw value.
+
+    The default scan (98 windows at win=1500/step=500 over a 50K body) is
+    already inside the default budget, so it is returned unchanged and the
+    budget only engages for a deliberately expensive stride.
+    """
+    step = max(1, step)
+    if max_windows > 0 and -(-positions // step) > max_windows:
+        step = max(1, -(-positions // max_windows))
+    return step
+
+
+def _best_body_window(body: str, tokens: set[str], win: int, step: int, max_windows: int = 200) -> str:
     """The body region with the most distinct query tokens, cheaply located by
     sliding a window over the lowercased body. Returns the window with the
-    original casing (falls back to the tail region on ties)."""
+    original casing (falls back to the tail region on ties).
+
+    ``max_windows`` bounds how many windows are scored per body, so the work
+    is capped by a window COUNT rather than by the raw stride value; see
+    ``_effective_step``.
+    """
     if not tokens or len(body) <= win:
         return body
     low = body.lower()
+    positions = len(body) - win + 1
+    step = _effective_step(positions, step, max_windows)
     best_score, best_start = -1, 0
-    for start in range(0, len(body) - win + 1, step):
+    for start in range(0, positions, step):
         score = sum(1 for t in tokens if t in low[start:start + win])
         if score > best_score:
             best_score, best_start = score, start
@@ -770,7 +798,11 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
     for i, a in enumerate(articles):
         if not a.body:
             continue
-        win = _best_body_window(a.body, tokens, config.BODY_RESCUE_WINDOW, config.BODY_RESCUE_STEP)
+        win = _best_body_window(
+            a.body, tokens,
+            config.BODY_RESCUE_WINDOW, config.BODY_RESCUE_STEP,
+            config.BODY_RESCUE_MAX_WINDOWS,
+        )
         # How many distinct query tokens the best window actually contains --
         # the same signal _best_body_window maximised, i.e. what the second
         # pass would have to work with.
