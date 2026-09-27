@@ -7,7 +7,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 
 from app import auth
 from app import config as config_module
@@ -583,6 +583,94 @@ def test_service_token_acts_as_admin(store, monkeypatch):
     with pytest.raises(HTTPException) as e:
         asyncio.run(wrong())
     assert e.value.status_code == 401
+
+
+def test_service_token_non_ascii_header_is_401_not_500(store, monkeypatch):
+    """A header carrying bytes above 0x7F must be a mismatch, not a crash.
+
+    ``secrets.compare_digest`` raises ``TypeError`` on non-ASCII ``str`` input,
+    and nothing on this path caught it, so a raw request with a non-ASCII
+    X-Service-Token turned an authentication failure into a 500. The token is
+    therefore compared as bytes.
+
+    Driven through a raw ASGI scope rather than a test client, so the header
+    is the exact bytes chosen here: an httpx/TestClient call cannot send a
+    non-ASCII header ``str`` at all (it raises on the ASCII encode), and a
+    client handed raw bytes re-encodes them, so neither reproduces what a
+    server actually receives off the wire.
+    """
+    from fastapi import FastAPI
+
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-tok-123")
+
+    app = FastAPI()
+
+    @app.get("/private")
+    async def private(_auth: None = Depends(auth.require_auth)):
+        return {"ok": True}
+
+    async def drive(raw_header: bytes) -> int:
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/private",
+            "raw_path": b"/private",
+            "query_string": b"",
+            "root_path": "",
+            "scheme": "http",
+            "client": ("127.0.0.1", 5000),
+            "server": ("test", 80),
+            "headers": [(b"host", b"test"), (b"x-service-token", raw_header)],
+        }
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        await app(scope, receive, send)  # a TypeError here propagates: that IS the bug
+        return next(m for m in sent if m["type"] == "http.response.start")["status"]
+
+    async def scenario():
+        # The configured token still authenticates, and a wrong ASCII one is
+        # still a plain 401: the fix is not "reject more".
+        assert await drive(b"svc-tok-123") == 200
+        assert await drive(b"nope") == 401
+        # latin-1 (what a server decodes a raw 0xE9 byte into) and utf-8 both
+        # reach the comparison as non-ASCII, and both are ordinary 401s.
+        assert await drive(b"svc-tok-\xe9") == 401
+        assert await drive("svc-tok-é".encode()) == 401
+        # Nothing was seeded for a value that did not match.
+        assert await store.service_token_for("svc-tok-\xe9") is None
+
+    asyncio.run(scenario())
+
+
+def test_revoke_service_token_non_ascii_is_not_a_crash(store, monkeypatch):
+    """The same non-ASCII comparison, on the other credential that has one.
+
+    Revoking names a token in the request body, which is equally
+    attacker-controlled, so a non-ASCII value must be a plain "revoked 0"
+    rather than raise out of the endpoint.
+    """
+    monkeypatch.setattr(auth, "store", store)
+    monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-tok-123")
+    body = auth.ServiceTokenRevokeIn(token="svc-tok-é")
+
+    async def scenario():
+        result = await auth.revoke_service_tokens(SimpleNamespace(), body, None, None)
+        assert result == {"revoked": 0}
+        # Not the configured token, so the ordinary path ran and the
+        # configured credential was left alone.
+        assert await store.service_token_for(body.token) is None
+        assert await store.service_token_for("svc-tok-123") is None
+
+    asyncio.run(scenario())
 
 
 def test_rate_limit_429_and_reset(monkeypatch):
