@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import Link from 'next/link'
+import SafeArticleLink from '../components/SafeArticleLink'
 import { API_BASE, authHeaders, getToken } from '../lib/auth'
 import type { MouseEvent } from 'react'
 import styles from './page.module.css'
@@ -164,7 +164,7 @@ function ArticleCard({
 }) {
   return (
     <div className={styles['article-card']} onClick={onInteraction}>
-      <Link href={article.url} target="_blank" rel="noopener noreferrer" className={styles['article-link']}>
+      <SafeArticleLink url={article.url} className={styles['article-link']}>
         <div className={styles['article-content']}>
           <h2 className={styles['article-title']}>{article.title}</h2>
           {article.summary && (
@@ -186,7 +186,7 @@ function ArticleCard({
             )}
           </div>
         </div>
-      </Link>
+      </SafeArticleLink>
     </div>
   )
 }

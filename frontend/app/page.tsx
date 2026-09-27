@@ -13,6 +13,7 @@ import {
   getToken,
   redirectToLogin,
 } from './lib/auth'
+import { isSafeUrl } from './lib/safe-url'
 
 type Result = {
   id: number | string
@@ -111,21 +112,6 @@ function sanitizeResponse(raw: unknown): ResponseData {
     cached: data.cached === true,
     latency_ms: typeof data.latency_ms === 'number' ? data.latency_ms : 0,
     note: typeof data.note === 'string' && data.note.length ? data.note : undefined,
-  }
-}
-
-function isSafeUrl(url: string): boolean {
-  if (!url) return false
-  // Reject protocol-relative URLs (`//evil.com`) before parsing, since
-  // `new URL('//evil.com', base)` would otherwise resolve to `https://evil.com/`
-  // and pass the scheme check.
-  if (url.trim().startsWith('//')) return false
-  try {
-    const base = typeof window !== 'undefined' ? window.location.href : undefined
-    const parsed = new URL(url, base)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
-  } catch {
-    return false
   }
 }
 
