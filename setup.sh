@@ -220,6 +220,14 @@ run_backend() {
     if ! grep -q '^REDIS_URL=' "$ENV_FILE"; then
         echo "REDIS_URL=redis://localhost:$REDIS_PORT/0" >> "$ENV_FILE"
     fi
+    # An .env that predates the per-IP public rate limits has no trust setting,
+    # so every proxied request would key on the nginx peer (127.0.0.1) and the
+    # whole site would share one rate-limit bucket. 'auto' trusts
+    # X-Forwarded-For only for a loopback peer, which is nginx here and not a
+    # directly-connecting client, so appending it cannot open a spoofing hole.
+    if ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
+        echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$ENV_FILE"
+    fi
     echo "backend ready"
 }
 
