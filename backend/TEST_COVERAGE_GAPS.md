@@ -1,7 +1,10 @@
 # Backend Test Coverage Gaps
 
-Measured with `pytest --cov=app` (100% overall, 449 passed). This is a checklist
-of functions and branches that have **no test coverage**, grouped by module.
+Measured with `pytest --cov=app`: **657 passed**, 86% overall (3652 statements,
+504 missed). This is a checklist of functions and branches that have **no test
+coverage**, grouped by module. The figures re-measured here are the ones for
+the modules this change rewrote (`app/cost_budget.py`, `app/chat.py`); the rest
+of the document is not re-audited here — issue #295 tracks a full accuracy pass.
 Items marked **ERROR PATH** are exactly the failure modes that matter in
 production: Qdrant down, Redis down, LLM timeout/retry exhaustion, and malformed
 SQLite rows (the project uses SQLite via aiosqlite, not MySQL — same concept:
@@ -175,20 +178,55 @@ degraded path).
 
 ---
 
-## app/cost_budget.py — 100% (covered by tests/test_cost_budget.py)
+## app/cost_budget.py — 100% (covered by tests/test_cost_budget.py + tests/test_budget_lua.py)
 
-- [x] **`close` resets `_redis`** (lines 48-50): `aclose` called, global set to
-      `None`; `close` no-op when no client.
-- [x] **`spend_today` Redis failure → 0.0** (lines 61-63): fail-open on read,
-      warn once, return `0.0`. **ERROR PATH — Redis down.**
-- [x] **`spend_today` counter read** (line 60): non-empty counter parsed to
-      float; `get` → None → `0.0`.
-- [x] **`record_cost` failure** (lines 87-88): skip recording, warn once, no
-      raise. **ERROR PATH — Redis down.**
-- [x] **`assert_within_budget` over-cap** (lines 75-76): confirmed spend ≥ cap
-      → `BudgetExceeded`; under-cap allowed; Redis-down never blocks.
-- [x] **`_client` lazy init + `_base_url`** (lines 29-43): `from_url` once,
-      DB index swapped to `ANALYTICS_REDIS_DB`, connection reused.
+The cap is RESERVE / SETTLE / RELEASE around every billed call; the whole
+read-modify-write lives in one Lua script (`_BUDGET_LUA`) over four keys
+(day counter, live holds, holds expiry zset, holds-accounted ledger). The
+Python side is covered against `FakeBudgetStore`, a model of that contract;
+the shipped script itself is EXECUTED by `tests/test_budget_lua.py` under
+`lua5.1` (skipped where lua5.1 is absent), so the two cannot drift apart
+without a failure.
+
+- [x] **`reserve` hold + rejection** (lines 365-394): hold written and counted
+      against the cap for the next caller; a rejected reserve leaves no hold
+      behind; cap disabled (`LLM_DAILY_BUDGET_USD <= 0`) touches no store;
+      hold floored at 1 micro-USD so a zero `LLM_CALL_RESERVE_USD` cannot turn
+      the cap into a no-op; first `BudgetExceeded` logs one warning.
+- [x] **`reserve` store down → `BudgetUnavailable`** (lines 338-350): fails
+      closed, is not a `BudgetExceeded`, and drops the cached script handle.
+      **ERROR PATH — Redis down.**
+- [x] **`settle` counter write** (lines 397-419): actual cost recorded whole
+      (hold was never counted), over-reserve recorded and blocking the next
+      call, zero-cost settle records nothing, empty id list still bills,
+      store-down leaves the holds in place. **ERROR PATH — Redis down.**
+- [x] **`settle` idempotency + crash promotion** (Lua sweep/settle arithmetic):
+      settling the same ids twice charges once, duplicate ids within one call
+      charge once, a hold that lapsed is CHARGED to the counter (a crash is
+      not free spend) and its later settle REPLACES the estimate with the real
+      cost rather than adding to it.
+- [x] **crash promotion is REACHABLE, not just arithmetically correct**: the
+      holds hash and the expiry zset are expired at twice the reservation TTL,
+      because a hold's zset score first satisfies the sweep predicate exactly
+      one TTL after the reserve — expiring the containers at one TTL killed them
+      in the same instant the promotion became observable, and the crash's spend
+      was silently lost. The Lua harness models key expiry (and rejects a
+      non-positive TTL, as Redis does) so this is enforced, not assumed.
+- [x] **`release` drops holds, never refunds** (lines 422-427): live hold
+      dropped with the counter untouched, a promoted (already charged) id not
+      refunded, store-down surfaces. **ERROR PATH — Redis down.**
+- [x] **`_client` lazy init + reuse**: `from_url` once, DB index swapped to
+      `ANALYTICS_REDIS_DB`, connection reused; `close` calls `aclose`, clears
+      the global, and is a no-op when no client.
+- [x] **TTL floors** (`hold_ttl` and `counter_ttl` floored at 1 second, in the
+      Lua): one scenario per floor, each executing that guard with a
+      non-positive value. Both floors used to be deletable with the suite still
+      green — the single scenario that claimed them passed `0` as `hold_ttl`
+      twice, and the harness let `EXPIRE key 0` succeed where Redis rejects it.
+- [x] **`to_usd` canonical unit** (lines 430-447): INR `LLMResult.cost()` → USD
+      before any accounting, and the 1.0 fallback rate on a nonsensical
+      configured rate — which warns once and not on every turn. Both branches
+      are executed; the fallback had none.
 
 ---
 
@@ -261,69 +299,144 @@ degraded path).
 
 ---
 
-## app/chat.py — 100% (covered by tests/test_chat.py)
+## app/chat.py — 92% (covered by tests/test_chat.py)
 
-- [x] **`ChatStore.connect` schema migration** (lines 147-152): legacy DBs
+Measured: 848 statements, 67 missed. The entries below are the branches this
+change added or re-pointed at. The residual is mostly
+`_prepare_multi_entity_turn` (lines 1330-1440), which this change did not
+touch. The missed lines inside the code this change added or edited are all
+pre-existing lines; the rest of the residual is unattributed here and the full
+accounting is #295's audit. Do not read this section as 100%.
+
+- [x] **`ChatStore.connect` schema migration** (lines 119-175): legacy DBs
       missing `prompt_tokens`/`completion_tokens`/`cost` and separately missing
-      `latency_ms` get the columns added with `0` defaults. **ERROR PATH —
-      malformed / legacy SQLite schema.**
-- [x] **`ChatStore.close`** (lines 155-158): close an open store and the
+      `latency_ms` get the columns added with `0` defaults, as does the `aborted`
+      column (line 174) that the abort rule needs. **ERROR PATH — malformed /
+      legacy SQLite schema.**
+- [x] **`ChatStore.close`** (lines 177-180): close an open store and the
       idempotent close-when-already-closed no-op.
-- [x] **`rename_session` / `delete_session` when session missing** (lines 269,
-      282) → 404.
-- [x] **`global_stats` exception handler** (lines 387-389): a failing query
+- [x] **`rename_session` / `delete_session` when session missing** (lines 321,
+      336) → 404.
+- [x] **`global_stats` exception handler** (lines 404-464): a failing query
       degrades to `{"error": "chat analytics unavailable"}`, never raises.
-- [x] **`json_loads` malformed JSON** (lines 399-400): bad JSON, `None`, and
+- [x] **`json_loads` malformed JSON** (lines 562-616): bad JSON, `None`, and
       non-string input all → `[]`. **ERROR PATH — malformed stored rows.**
-- [x] **`_row_to_message`** (lines 403-414): malformed/legacy row field
+- [x] **`_row_to_message`** (lines 616-628): malformed/legacy row field
       coercion — bad sources JSON and `NULL`/string token/cost fields fall back
-      to `0` defaults.
-- [x] **`_smalltalk_reply` non-smalltalk fallthrough** (line 436): empty /
+      to `0` defaults, and `aborted` coerces from a legacy `NULL`.
+- [x] **`_smalltalk_reply` non-smalltalk fallthrough** (line 645): empty /
       blank queries and >12-word messages are not small talk.
 - [x] **dataviz helpers edge branches**: `_as_float` non-numeric string, bool,
-      and `None` (line 491); `_missing_cell` token set incl. "not stated"/"—"
-      (line 499); `_valid_value_column` all-missing vs numeric vs non-numeric
-      (line 523); `_first_numeric_column` empty rows / empty first row
-      (line 528); `_has_label_content` no-label-cols vs all-empty labels
-      (line 541); `parse_dataviz` rejection paths — non-dict data, non-string
-      columns, non-list rows (lines 561, 565, 567); `_sanitize_dataviz` empty
-      text and no-fence passthrough (line 593).
-- [x] **`_dataviz_nudge` view pinning** (line 661): a named view appends the
+      and `None` (line 780); `_missing_cell` token set incl. "not stated"/"—"
+      (line 804); `_valid_value_column` all-missing vs numeric vs non-numeric
+      (line 815); `_first_numeric_column` empty rows / empty first row
+      (line 822); `_has_label_content` no-label-cols vs all-empty labels
+      (line 831); `parse_dataviz` rejection paths — non-dict data, non-string
+      columns, non-list rows (lines 845-884); `_sanitize_dataviz` empty
+      text and no-fence passthrough (line 887).
+- [x] **`_dataviz_nudge` view pinning** (line 1012): a named view appends the
       "exact type of data block" instruction; a generic chart ask does not.
-- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 712, 715-716, 718):
+- [x] **`_parse_dataviz_with_view` invalid inputs** (lines 1066-1080):
       no fence, invalid JSON, and non-dict data → `None`; dict data gets the
       view applied.
-- [x] **`_apply_requested_view` rewrite** (line 734): a block that fails to
+- [x] **`_apply_requested_view` rewrite** (line 1082): a block that fails to
       re-parse is left verbatim.
-- [x] **`_is_ranking_refusal`** (line 776): refusal signatures ("cannot be
+- [x] **`_is_ranking_refusal`** (line 1164): refusal signatures ("cannot be
       generated", "do not contain specific amounts") → True; empty text and
       genuine ranked answers → False.
-- [x] **`_answer_ranked` ranking-nudge retry** (lines 799-808): a refusal is
+- [x] **`_answer_ranked` ranking-nudge retry** (lines 1186-1214): a refusal is
       re-asked once with `_RANKING_NUDGE` and tokens summed; the
       `LLMUnavailableError` guard keeps the first answer; non-refusals make a
       single call.
-- [x] **`_prepare_turn` follow-up inheritance** (lines 856-859, 866, 876, 879):
-      vague-follow-up with a year range keeps the previous topic and pins the
-      new dates; `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources
-      short-circuit; weak fallback answer + note. **ERROR PATH — LLM/Qdrant/
-      Redis down during retrieval.**
-- [x] **`_run_turn` cost recording + finalize** (lines 917-920): budget check →
-      `_answer_ranked` → `record_cost(result.cost())` → finalized answer
-      (unrequested dataviz blocks stripped).
-- [x] **`send_message` `BudgetExceeded` → 429** (lines 1091-1095) and
-      **`LLMUnavailableError` → 503** (lines 1096-1100). **ERROR PATH — LLM
-      retry exhaustion / daily budget.**
-- [x] **`_require_store` uninitialized → 503** (line 1012) and **`_validate_question`
-      too-long → 400** (line 1021).
-- [x] **`send_message_stream` nudge retry branches** (lines 1169-1176,
-      1181-1188): a dataviz/ranking nudge that succeeds swaps the answer and
+- [x] **`_prepare_turn` follow-up inheritance** (lines 1226-1329): vague-follow-up
+      with a year range keeps the previous topic and pins the new dates;
+      `body_rescue` runs when `ENABLE_BODY_RESCUE`; no-sources short-circuit;
+      weak fallback answer + note. **ERROR PATH — LLM/Qdrant/Redis down during
+      retrieval.**
+- [x] **`_run_turn` cost recording + finalize** (lines 1443-1509): `reserve`
+      before the billed call → `_answer_ranked` → `settle(holds, cost_usd)`
+      (the turn's single counter write; `release(holds)` when no call was made)
+      → finalized answer (unrequested dataviz blocks stripped). Three money
+      rules live here and are tested:
+      a zero COMPUTED cost is not evidence that nothing was spent —
+      `generate_answer` returns a truthy zero-token `LLMResult` when the
+      response carries no usage, so a delivered, billed answer would settle as
+      free and leave the cap inert against such a provider — so the figure is
+      floored at `LLM_CALL_RESERVE_USD` (the same estimate the streaming path's
+      `mid_stream_estimate` uses), and that ONE figure is both settled and
+      returned for storage, so the reported cost and the budget cannot
+      disagree; an EMPTY hold list
+      (cap disabled) settles nothing at all, so an opted-out
+      deployment never depends on the counter; and a settle that cannot reach
+      the store is best-effort, because the answer exists and has been billed,
+      while the live hold is charged by the sweep either way. **ERROR PATH —
+      Redis down after a billed call.**
+- [x] **`send_message` `BudgetExceeded` → 429** (lines 1755-1759),
+      **`LLMUnavailableError` → 503** (lines 1760-1763), and
+      **`BudgetUnavailable` → 503** (lines 1764-1773) with the dangling user
+      message rolled back, so an unreadable counter is never reported as an
+      empty answer. **ERROR PATH — LLM retry exhaustion / daily budget / Redis
+      down.**
+- [x] **`_require_store` uninitialized → 503** (line 1644) and
+      **`_validate_question` too-long → 400** (line 1653).
+- [x] **`send_message_stream` nudge retry branches** (lines 2091-2100,
+      2123-2132): a dataviz/ranking nudge that succeeds appends its block and
       sums tokens; a failed nudge (`LLMUnavailableError`) keeps the streamed
-      answer. **`error` SSE handlers** (lines 1213, 1216-1218): mid-stream
-      `LLMUnavailableError` → "LLM temporarily unavailable" event; unexpected
-      exceptions → "Something went wrong" event, never a 500. **ERROR PATH —
-      LLMUnavailableError / BudgetExceeded mid-stream.**
-- [x] **`retention_loop`** (lines 1225-1233): a failing purge is swallowed and
+      answer. **`error` SSE handlers**: mid-stream `LLMUnavailableError` →
+      "LLM temporarily unavailable" (line 2181); `BudgetExceeded` → "Daily AI
+      budget reached" (line 2184); `BudgetUnavailable` → "AI budget service
+      unavailable" (line 2190); unexpected exceptions → "Something went wrong"
+      (line 2194), never a 500. The `BudgetUnavailable` handler is still
+      reachable: `reserve()` is called at the pre-call gate and by each nudge,
+      and a rejection there propagates before a byte is delivered. **ERROR PATH —
+      LLMUnavailableError / BudgetExceeded / BudgetUnavailable mid-stream.**
+- [x] **`retention_loop`** (lines 2207-2215): a failing purge is swallowed and
       the loop keeps ticking; the next tick purges expired conversations.
+
+Added by this change, all exercised end to end through the HTTP handlers:
+
+- [x] **the ONE abort rule** (lines 1927-1968): the client's disconnect is
+      checked at every gate, and a turn that streamed nothing is rolled back
+      while a turn that streamed anything is PERSISTED with
+      `[answer truncated]` and `aborted=True` — the server's history can never
+      contradict what is already on the client's screen. `persist_truncated_turn`
+      (lines 1903-1924) is the single writer for every partial turn, including
+      the mid-stream-failure path.
+- [x] **a billed call is charged, never refunded, on a disconnect** (lines
+      2030, 2091-2100, 2123-2132): a disconnect in the gate-to-first-delta
+      window settles the hold at the estimate the gate took it at, and the two
+      post-stream checks pass the finished stream's real cost instead of
+      storing the turn as free. A mid-stream FAILURE after deltas is charged
+      too (lines 2036-2069): `chunks` is non-empty there, so the provider
+      billed those tokens even though usage was never reported, and
+      `fail_turn` (lines 1970-1997) applies the same rule. A zero COMPUTED
+      cost is not evidence that nothing was spent — `stream_answer` appends a
+      truthy zero-token result when a provider sends no usage chunk — so every
+      abandon site ON THE STREAMING PATH routes through `billed_usd` (lines
+      1841-1857) and the completed streaming path floors at the estimate (lines
+      2145-2156); otherwise a provider that never reports usage would leave the
+      cap inert and every turn free. The non-streaming half of the same rule is
+      `_run_turn`'s cost floor above, which the streaming test pair
+      (`test_completed_turn_with_{no_usage_report,reported_usage}`) is mirrored
+      by at `tests/test_chat.py::test_api_json_turn_with_no_usage_report_is_still_charged`
+      and `::test_run_turn_with_reported_usage_still_uses_the_real_cost`. A turn
+      that made no billed call at all still releases.
+- [x] **a delivered answer survives a failed settle** (lines 1859-1892,
+      1481-1502): once deltas are on the wire, or the LLM has already answered,
+      an unreachable counter no longer converts a complete answer into a
+      truncated `aborted` row plus an `error` event.
+- [x] **`send_message` 499 on a client that disconnected** (lines 1786-1791): a
+      JSON client has seen nothing, so the turn is a clean rollback reported as
+      a non-success status rather than a completed `TurnOut`.
+- [x] **`_trim_history` / `CHAT_MAX_HISTORY_CHARS`** (lines 1657-1680, and
+      `_start_turn`): oldest-first, never splitting a message, a single
+      oversized message kept alone, `0`/negative disabling the cap, and the char
+      budget applied to what actually reaches the prompt.
+- [x] **frontend/backend dataviz fence parity** (`DATAVIZ_FENCE_PATTERN` line
+      750): the TSX's own `FENCE_SRC` and `stripOpenFence` are executed under
+      `node` and compared BEHAVIOURALLY with Python's, including the unclosed
+      fence where neither side may render raw JSON. A match-only comparison
+      would have asserted nothing there.
 
 ---
 
@@ -401,7 +514,12 @@ degraded path).
 
 ## Remaining small gaps
 
-None — every `app/*.py` module is at 100% coverage (2174 statements, 0 missed).
+None in `app/cost_budget.py` and `app/chat.py` beyond the entries listed above.
+The modules this change rewrote are measured and current; the document's other
+module sections are NOT re-audited here and several do not in fact sit at 100%
+(`app/recommender.py` 25%, `app/user_profile.py` 62%, `app/main.py` 86%,
+`app/query_intent.py` 86%, `app/redis_cache.py` 82%). Issue #295 is the full
+accuracy pass for this document.
 
 ---
 
@@ -427,9 +545,10 @@ exhaustion/dead-code raises), `app/reranker.py`
 (was 92%) is now 100% via `tests/test_cost_budget.py`, `app/analytics.py`
 (was 74%) is now 100% via `tests/test_analytics.py`, `app/main.py`
 (was 72%) is now 100% via `tests/test_main_pipeline.py` +
-`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 100% via
+`tests/test_main_http.py`, `app/chat.py` (was 84%) is now 92% via
 `tests/test_chat.py` (schema migration, error SSEs, budget/LLM HTTP paths,
-dataviz edge branches, nudge retries, and retention loop), `app/auth.py`
+dataviz edge branches, nudge retries, the abort rule, and the retention loop),
+`app/auth.py`
 (was 91%) is now 100% via `tests/test_auth.py` (malformed-hash handling,
 SQLite rollback paths, last-admin lockout guards, `_client_ip`, and the
 bootstrap write-lock retry loop), and the last three gaps —
