@@ -127,7 +127,7 @@ I wrote `setup.sh` to provision everything in stages. Run `./setup.sh all`, or p
 ./setup.sh all          # deps backend index frontend services pm2-startup cron nginx
 ```
 
-Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`.
+Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`. pm2 process tuning: `API_MAX_MEMORY` (5G), `FRONTEND_MAX_MEMORY` (1G), `API_MAX_RESTARTS` (10), `RESTART_BACKOFF_MS` (100) — these must stay equal to `ecosystem.config.js`, and `backend/tests/test_deploy_config.py` fails the build if the two process definitions drift apart.
 
 If you'd rather run pieces manually, keep reading.
 
