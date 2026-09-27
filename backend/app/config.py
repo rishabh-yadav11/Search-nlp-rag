@@ -284,6 +284,26 @@ class Config:
     # in X-Service-Token acts as an admin user. Leave empty to disable. Used by
     # the internal eval scripts; never expose it to browsers.
     AUTH_SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
+    # Lifetime and scope of a service token. A service token used to be a
+    # permanent, unscoped admin grant: it never expired, could not be revoked
+    # (logout only ever revoked bearer tokens), and matched any permission an
+    # admin has. It is now a row in auth_service_tokens carrying an explicit
+    # expiry and an explicit permission set, and the env var above is only the
+    # value that seeds that row at startup -- so the internal eval scripts keep
+    # working unchanged while the credential is no longer eternal.
+    #
+    # The expiry is NOT optional: a value <= 0 falls back to the default
+    # rather than meaning "never expires", because an eternal machine admin
+    # credential is exactly the hole this closes.
+    AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS = int(os.getenv("AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", "86400"))
+    # Permissions a service token may exercise. Defaults to chat:use, the only
+    # permission the in-repo consumer (scripts/eval_runner.py) needs, instead
+    # of every permission an admin holds.
+    AUTH_SERVICE_TOKEN_SCOPE: ClassVar[tuple[str, ...]] = tuple(
+        p.strip()
+        for p in os.getenv("AUTH_SERVICE_TOKEN_SCOPE", "chat:use").split(",")
+        if p.strip()
+    )
     # Bootstrap admin: created once at startup (role=admin) if no account with
     # this email exists. An existing account is never overwritten.
     AUTH_ADMIN_EMAIL = os.getenv("AUTH_ADMIN_EMAIL", "")
@@ -296,6 +316,23 @@ class Config:
     AUTH_SIGNUP_RATE_PER_MIN = int(os.getenv("AUTH_SIGNUP_RATE_PER_MIN", "5"))
     AUTH_LOGIN_RATE_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_MIN", "10"))
     AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+    # Per-ACCOUNT (submitted address) limit on login, counted in addition to
+    # the per-IP one above. Per-IP alone cannot bound credential stuffing from
+    # a botnet: every request arrives from a fresh address with a fresh bucket.
+    # The counter is keyed on the normalised submitted address alone -- no
+    # account lookup feeds it -- so its state, its 429 and its cost are the
+    # same whether or not the address has an account here, which is what keeps
+    # it from becoming an account-existence oracle (see the login docstring).
+    # 0 disables.
+    AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", "20"))
+    # Cap on simultaneously ACTIVE (unexpired) tokens per user. Every login
+    # mints one, and the periodic purge only removes EXPIRED rows, so the
+    # table grew with the number of logins rather than with the number of
+    # users -- an unbounded-growth / DoS vector on the auth store. Logging in
+    # past the cap REVOKES (deletes) the user's oldest active tokens, so the
+    # evicted credential stops working immediately rather than merely
+    # disappearing from a listing. 0 disables the cap.
+    AUTH_MAX_ACTIVE_TOKENS_PER_USER = int(os.getenv("AUTH_MAX_ACTIVE_TOKENS_PER_USER", "10"))
     # Redis-backed per-IP rate limits on the public search surface: /search,
     # /facets, /analytics/click and /ready were unauthenticated and unrated,
     # which allowed full-corpus scraping (top_k=50) and click-analytics
