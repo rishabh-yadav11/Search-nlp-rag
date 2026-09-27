@@ -92,6 +92,9 @@ async def fetch_records(
     for the rows that actually need (re)indexing).
     """
     pool = await make_pool(connect_timeout=10)
+    # Previously also passed read_timeout/write_timeout; aiomysql 0.3.0 rejects
+    # them (TypeError before any socket opens) and exposes no equivalent. Do not
+    # restore them — see make_pool in _common.py.
     body_select = "body," if with_body else ""
     where = "WHERE status = 1"
     params: list = []
