@@ -97,8 +97,12 @@ def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
     deployment the operator has to configure by hand, and would hide the
     single-bucket collapse that a default of "off" actually caused.
     """
-    assert "AUTH_TRUST_X_FORWARDED_FOR" not in os.environ, (
-        "this test asserts the shipped default; unset the override in your .env"
+    # Precondition, so this cannot silently degrade into asserting whatever the
+    # ambient config happens to be: the shipped value is "auto" (.env.example)
+    # or absent (config.py's default), and any explicit true/false override
+    # would make the assertion below prove something else.
+    assert os.environ.get("AUTH_TRUST_X_FORWARDED_FOR", "auto").lower() == "auto", (
+        "this test asserts the shipped default; unset AUTH_TRUST_X_FORWARDED_FOR or set it to 'auto'"
     )
     monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
     _cached_search_client(monkeypatch)
@@ -113,16 +117,20 @@ def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
 
 
 def test_search_limit_ignores_xff_from_a_client_that_is_not_behind_a_proxy(monkeypatch):
-    """A direct caller (its own routable peer) cannot forge X-Forwarded-For to
-    escape its rate-limit bucket -- the other side of trusting the header only
-    for a loopback peer."""
+    """A direct caller cannot forge X-Forwarded-For to escape its rate-limit
+    bucket -- the other side of trusting that header only for a loopback peer.
+
+    Each request carries a DIFFERENT forged address. Reusing one forged value
+    would prove nothing, since a client that always claims the same IP lands in
+    the same bucket whether or not the header is honored at all."""
     monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
     _cached_search_client(monkeypatch)
-    direct = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "9.9.9.9"})
+    first = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "9.9.9.9"})
+    second = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "8.8.8.8"})
 
-    assert direct.get("/search", params={"q": "test"}).status_code == 200
-    # Same peer, so still the same bucket: the forged header bought nothing.
-    assert direct.get("/search", params={"q": "test"}).status_code == 429
+    assert first.get("/search", params={"q": "test"}).status_code == 200
+    # Same socket peer, so still the same bucket despite the new claimed IP.
+    assert second.get("/search", params={"q": "test"}).status_code == 429
 
 
 def test_search_fails_closed_with_503_when_the_limiter_store_is_down(monkeypatch):
