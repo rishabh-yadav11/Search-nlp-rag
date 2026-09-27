@@ -12,11 +12,11 @@
  * than merely abandoning the promise) is what turns that hang into a failure
  * the UI can report.
  *
- * NOT in scope: the search page, login, signup and the dashboard's own
- * analytics fetches keep their existing inline `setTimeout(() => abort())`
- * deadlines, and the chat SSE stream keeps its separate 45 s watchdog. This
- * module is the budget set for the pages listed above, not a claim that every
- * fetch in the app is routed through here.
+ * This is a per-file budget set, not a claim that every fetch in the app is
+ * routed through here. The search page, login, signup and the chat SSE stream
+ * are untouched by this change and keep whatever bounds they already had; the
+ * search page's own fire-and-forget beacons and the dashboard's logout POST
+ * remain unbounded, as they were before.
  *
  * The pattern lives here as a small signal-level helper rather than a `fetch`
  * wrapper: each call site keeps its own `AbortController` for unmount
@@ -24,8 +24,11 @@
  * remain independently observable (call sites gate their state updates on
  * `base.aborted`, not on the composed signal).
  *
- * `AbortSignal.timeout` is intentionally not used: its timer lives outside
- * `setTimeout`, so fake timers in tests cannot drive it.
+ * `AbortSignal.timeout` would cover the plain "abort after N ms" case, and
+ * vitest's fake timers do drive it here. It is not used because it cannot be
+ * disarmed and cannot be told apart from a caller's own abort: this helper
+ * needs `clear()` to stop a timer for a request that already finished, and
+ * `timedOut()` to report a timeout without mislabelling an unmount.
  */
 
 /** `/recommend/*` is the one backend path that degrades silently. */
