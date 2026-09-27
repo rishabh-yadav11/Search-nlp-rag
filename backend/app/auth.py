@@ -783,12 +783,15 @@ class AuthStore:
         this waits out the same 5 s busy timeout rather than failing on a
         mid-transaction lock upgrade.
 
-        The statements are ALSO ordered revoke -> set hash -> mint, so the
-        change stays safe even where that atomicity is unavailable. An
+        The statements are ALSO ordered revoke -> set hash -> mint. That is
+        defence in depth, not the guarantee: it is what keeps the change safe
+        if this ever runs somewhere the transaction does not hold. An
         interruption after the revoke leaves the old password and no live
         tokens; one after the hash write leaves the new password and no live
         tokens. Either way the user logs back in, and no interruption point
         leaves a changed password standing next to a token minted before it.
+        The transaction above is what the tests pin, and on its own it holds
+        whatever order the statements are written in.
 
         The per-user token cap is deliberately not re-applied here: every other
         token was deleted in this same transaction, so the user can hold at

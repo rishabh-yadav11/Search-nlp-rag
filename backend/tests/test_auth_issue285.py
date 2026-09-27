@@ -175,14 +175,29 @@ def _unarm(monkeypatch):
 # --- an interruption at each point between the three writes ---
 
 
+def test_kill_at_the_first_write_changes_nothing(tmp_path, monkeypatch):
+    store, db_path, user, tokens = _seeded(tmp_path)
+    kill = _arm(monkeypatch, store, kill_at=1)  # the worker dies before any write lands
+    try:
+        with pytest.raises(_SimulatedKill):
+            _change(store, user.id)
+        reached = list(kill.steps)
+        _assert_no_partial_change(db_path, user.id, tokens, NEW_PW)
+        assert reached == [_STEP_REVOKE], reached
+    finally:
+        _unarm(monkeypatch)
+        asyncio.run(store.close())
+
+
 def test_kill_at_the_second_write_changes_nothing(tmp_path, monkeypatch):
     store, db_path, user, tokens = _seeded(tmp_path)
     kill = _arm(monkeypatch, store, kill_at=2)  # the worker dies at the second write
     try:
         with pytest.raises(_SimulatedKill):
             _change(store, user.id)
-        assert len(kill.steps) == 2 and set(kill.steps) == {_STEP_REVOKE, _STEP_HASH}, kill.steps
+        reached = list(kill.steps)
         _assert_no_partial_change(db_path, user.id, tokens, NEW_PW)
+        assert len(reached) == 2 and set(reached) == {_STEP_REVOKE, _STEP_HASH}, reached
     finally:
         _unarm(monkeypatch)
         asyncio.run(store.close())
@@ -194,8 +209,9 @@ def test_kill_at_the_third_write_changes_nothing(tmp_path, monkeypatch):
     try:
         with pytest.raises(_SimulatedKill):
             _change(store, user.id)
-        assert set(kill.steps) == {_STEP_REVOKE, _STEP_HASH, _STEP_MINT} and len(kill.steps) == 3, kill.steps
+        reached = list(kill.steps)
         _assert_no_partial_change(db_path, user.id, tokens, NEW_PW)
+        assert set(reached) == {_STEP_REVOKE, _STEP_HASH, _STEP_MINT} and len(reached) == 3, reached
     finally:
         _unarm(monkeypatch)
         asyncio.run(store.close())
@@ -207,30 +223,36 @@ def test_kill_before_commit_changes_nothing(tmp_path, monkeypatch):
     try:
         with pytest.raises(_SimulatedKill):
             _change(store, user.id)
-        assert kill.steps[-1] == _STEP_COMMIT and len(kill.steps) == 4, kill.steps
+        reached = list(kill.steps)
         _assert_no_partial_change(db_path, user.id, tokens, NEW_PW)
+        assert reached[-1] == _STEP_COMMIT and len(reached) == 4, reached
     finally:
         _unarm(monkeypatch)
         asyncio.run(store.close())
 
 
-def test_killed_change_leaves_the_shared_connection_writable(tmp_path, monkeypatch):
-    """The store's own connection must not be left holding a write transaction.
+def test_killed_change_does_not_lock_out_other_connections(tmp_path, monkeypatch):
+    """A change that died inside a transaction must not leave the file locked.
 
-    A change that borrowed the shared connection and died inside its
-    transaction would leave that connection mid-write for every later request
-    on this worker -- each of them then waits out the 5 s busy timeout and
-    fails. So: after a killed change the shared connection still writes.
+    If the writes ran on the shared connection and it was abandoned mid
+    transaction, that connection still holds SQLite's write lock, and every
+    other connection -- each later request in this worker, and every other
+    gunicorn worker -- waits out the 5 s busy timeout and then fails. A
+    connection never blocks on a lock it holds itself, so this has to be
+    probed from a *second* connection: create a user on one and see it through.
     """
-    store, _db_path, user, _tokens = _seeded(tmp_path)
+    store, db_path, user, _tokens = _seeded(tmp_path)
     _arm(monkeypatch, store, kill_at=3)
+    other = AuthStore(db_path)
     try:
         with pytest.raises(_SimulatedKill):
             _change(store, user.id)
-        fresh = asyncio.run(store.issue_token(user.id, 7))
-        assert asyncio.run(store.user_for_token(fresh)) is not None
+        asyncio.run(other.connect())
+        created = asyncio.run(other.create_user("b@x.co", OLD_PW, "B", "user"))
+        assert created.email == "b@x.co"
     finally:
         _unarm(monkeypatch)
+        asyncio.run(other.close())
         asyncio.run(store.close())
 
 
