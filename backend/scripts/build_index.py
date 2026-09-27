@@ -26,7 +26,6 @@ import os
 import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
 
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient
@@ -34,8 +33,6 @@ from qdrant_client.models import (
     Distance,
     Modifier,
     PayloadSchemaType,
-    PointStruct,
-    SparseVector,
     SparseVectorParams,
     VectorParams,
 )
@@ -43,16 +40,15 @@ from qdrant_client.models import models as qmodels
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _common import log, make_point
+
 from app.config import config
 from app.index_text import compose_dense_text, compose_sparse_text
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "articles.jsonl")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", ".checkpoint")
-
-
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def load_checkpoint() -> tuple[int, int]:
@@ -176,27 +172,6 @@ def create_collection(client: QdrantClient):
     print(f"Created collection '{config.QDRANT_COLLECTION}'")
 
 
-def to_point(row: dict, dvec, svec) -> PointStruct:
-    return PointStruct(
-        id=row["id"],
-        vector={
-            "dense": dvec.tolist(),
-            "sparse": SparseVector(indices=svec.indices.tolist(), values=svec.values.tolist()),
-        },
-        payload={
-            "title": row["title"],
-            "url": row["url"],
-            "published_date": row.get("published_date"),
-            "category": row.get("category"),
-            "summary": (row.get("summary") or ""),
-            "body": (row.get("body") or "")[: config.BODY_CHAR_LIMIT],
-            "author_names": row.get("author_names") or [],
-            "industry_names": row.get("industry_names") or [],
-            "dealtype_names": row.get("dealtype_names") or [],
-        },
-    )
-
-
 def main():
     if not os.path.exists(DATA_PATH):
         print(f"No data file at {DATA_PATH} — run scripts/fetch_data.py first.")
@@ -247,7 +222,7 @@ def main():
         end_line, future = pending.popleft()
         rows = batch_frames.pop(end_line)
         dense_vecs, sparse_vecs = future.result()
-        points = [to_point(row, dvec, svec) for row, dvec, svec in zip(rows, dense_vecs, sparse_vecs)]
+        points = [make_point(row, dvec, svec) for row, dvec, svec in zip(rows, dense_vecs, sparse_vecs)]
         try:
             client.upsert(collection_name=config.QDRANT_COLLECTION, points=points, wait=True)
         except Exception as e:

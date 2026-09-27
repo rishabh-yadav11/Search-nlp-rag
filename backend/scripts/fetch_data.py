@@ -17,7 +17,10 @@ import sys
 import aiomysql
 from tqdm import tqdm
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _common import make_pool
+
 from app.config import config
 from app.index_text import EXTERNAL_URL_SQL, record_from_row
 
@@ -73,19 +76,7 @@ async def fetch_all():
         print(f"Resuming from id > {last_id} ({total_written} rows already written)")
 
     pool = None
-    pool = await aiomysql.create_pool(
-        host=config.MYSQL_HOST,
-        port=config.MYSQL_PORT,
-        user=config.MYSQL_USER,
-        password=config.MYSQL_PASSWORD,
-        db=config.MYSQL_DATABASE,
-        autocommit=True,
-        minsize=1,
-        maxsize=5,
-        connect_timeout=10,
-        read_timeout=30,
-        write_timeout=30,
-    )
+    pool = await make_pool(maxsize=5, connect_timeout=10)
 
     # Only published content ('article'/'interview'/'video'); the table pk is `feid`.
     query = f"""
