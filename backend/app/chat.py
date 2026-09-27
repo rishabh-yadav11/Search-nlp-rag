@@ -1634,7 +1634,6 @@ async def _prepare_multi_entity_turn(
         ents = ", ".join(id_entities[s.id])
         blocks.append(_article_fence(i + 1, f"{block}\nEntities: {ents}"))
 
-
     # Entity names are extracted straight out of the user's question, so they
     # must not be interpolated into the instruction half of the prompt: an
     # attacker-supplied "entity" would otherwise sit in the system role. The
