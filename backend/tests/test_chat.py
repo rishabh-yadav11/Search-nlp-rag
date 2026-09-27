@@ -12,6 +12,8 @@ import subprocess
 import time
 from typing import ClassVar
 
+import httpx
+import openai
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
@@ -1683,6 +1685,38 @@ def _pin_budget_disabled(monkeypatch):
     monkeypatch.setattr(chat_module, "release", release)
 
 
+class _TimingOutCompletions:
+    def __init__(self, owner):
+        self._owner = owner
+
+    async def create(self, **_kwargs):
+        self._owner.calls += 1
+        raise openai.APITimeoutError(request=httpx.Request("POST", "http://llm.test/v1/chat/completions"))
+
+
+class _TimingOutLLM:
+    """A provider that never answers: every request it is sent times out, so the
+    REAL generate_answer / stream_answer retry loops run to exhaustion. The
+    `calls` counter is the number of requests the provider was actually sent, and
+    the provider bills the prompt of every one of them."""
+
+    def __init__(self):
+        self.calls = 0
+        self.chat = type("_Chat", (), {"completions": _TimingOutCompletions(self)})()
+
+
+def _pin_llm_outage(monkeypatch, retries, reserve_usd):
+    """Point chat at a provider that times out on every call, with the backoff
+    pinned to zero so the retry loop runs for real without sleeping. Returns the
+    _TimingOutLLM standing in for the model."""
+    monkeypatch.setattr(chat_module.config, "LLM_MAX_RETRIES", retries)
+    monkeypatch.setattr(chat_module.config, "LLM_RETRY_BACKOFF", 0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", reserve_usd)
+    client = _TimingOutLLM()
+    monkeypatch.setattr(chat_module, "state_llm", lambda: client)
+    return client
+
+
 def test_answer_with_dataviz_skips_nudge_when_turn_spend_exhausts_budget(monkeypatch):
     """Regression (#177, the ORDINARY single-turn case): the first call's cost
     only reaches the daily counter at the end of the turn, so the guard must
@@ -2301,28 +2335,56 @@ def test_run_turn_records_cost_and_finalizes(monkeypatch):
     assert (pt, ct) == (10, 5)
 
 
-def test_run_turn_releases_hold_when_llm_unavailable(monkeypatch):
-    """When the LLM cannot be reached nothing was billed, so the turn's hold is
-    RELEASED rather than settled: an unbilled hold that stayed live would block
-    later calls against spend that never happened."""
+def test_run_turn_charges_every_attempt_of_a_failed_call_and_reraises(monkeypatch):
+    """A total outage is a BILLED failure, and the turn FAILS (#280).
+
+    The provider is sent one request per retry and charges the prompt of every
+    one of them, so the hold this turn took is settled for all three attempts
+    rather than released. This path used to release it on the strength of a
+    comment claiming nothing had been billed, which hid the outage from the
+    daily cap and let the caller store a fabricated "no answer" as if the model
+    had replied -- so the exception must now escape to the 503 handler.
+    """
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+    llm = _pin_llm_outage(monkeypatch, retries=2, reserve_usd=0.02)
 
     async def fake_prepare(question, history):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note=None, needs_llm=True)
 
-    async def boom(question, prompt, holds, system_prompt=""):
-        raise chat_module.LLMUnavailableError()
+    monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+
+    with pytest.raises(chat_module.LLMUnavailableError) as excinfo:
+        _run(chat_module._run_turn("who invested in Ola?", []))
+
+    assert llm.calls == 3  # LLM_MAX_RETRIES + 1 requests, every one billed
+    assert excinfo.value.attempts == 3
+    # $0.02 held per call, settled once for the whole failed call.
+    assert budget.writes == [("settle", 60_000)]
+    assert budget.counter == 60_000
+    assert budget.holds == {}
+
+
+def test_run_turn_releases_the_hold_when_no_request_was_sent(monkeypatch):
+    """The counterpart, so the rule above cannot pass by charging unconditionally:
+    with LLM_MAX_RETRIES < 0 the retry loop never runs and the provider is sent
+    nothing, so there is nothing to bill -- the hold is released and the day's
+    total is untouched."""
+    budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+    llm = _pin_llm_outage(monkeypatch, retries=-1, reserve_usd=0.02)
+
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note=None, needs_llm=True)
 
     monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
-    monkeypatch.setattr(chat_module, "_answer_ranked", boom)
 
-    answer, _sources, _note, pt, ct, cost = _run(chat_module._run_turn("who invested in Ola?", []))
+    with pytest.raises(chat_module.LLMUnavailableError) as excinfo:
+        _run(chat_module._run_turn("who invested in Ola?", []))
 
-    assert budget.writes == []  # nothing billed -> nothing recorded
+    assert llm.calls == 0
+    assert excinfo.value.attempts == 0
+    assert budget.writes == []
     assert budget.counter == 0
-    assert budget.holds == {}  # the unbilled hold was released, not left eating cap
-    assert (pt, ct, cost) == (0, 0, 0.0)
-    assert "couldn't generate" in answer
+    assert budget.holds == {}  # released, not left eating the cap
 
 
 def test_run_turn_settles_summed_turn_cost_exactly_once(monkeypatch):
@@ -2483,21 +2545,51 @@ def test_api_send_message_budget_exceeded_429(tmp_path, monkeypatch):
         _run(chat_store.close())
 
 
-def test_api_send_message_llm_unavailable_503(tmp_path, monkeypatch):
-    """send_message returns 503 when the LLM cannot be reached after retries
-    (ERROR PATH — LLM retry exhaustion)."""
+def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path, monkeypatch):
+    """One outage, two chat paths, ONE answer (#280).
+
+    Both turns run through the real retry loop against a provider that times
+    out on every request. The JSON turn must answer 503 and the SSE turn must
+    emit an `error` event carrying the identical payload, with neither path
+    storing a message. Before this, _run_turn swallowed the outage and returned
+    a fabricated "no answer" as HTTP 200, so the 503 branch was unreachable
+    dead code and any uptime check saw total success while chat was broken.
+    """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        llm = _pin_llm_outage(monkeypatch, retries=2, reserve_usd=0.02)
 
-        async def boom(question, history):
-            raise chat_module.LLMUnavailableError()
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note=None, needs_llm=True)
 
-        monkeypatch.setattr(chat_module, "_run_turn", boom)
-        r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": "top deals"})
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+
+        expected = {
+            "error": "LLM temporarily unavailable",
+            "detail": "The language model could not be reached; please retry shortly.",
+        }
+
+        json_sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        r = client.post(f"/api/chat/sessions/{json_sid}/messages", headers=h, json={"content": "Who invested in fintech?"})
         assert r.status_code == 503
-        assert "LLM temporarily unavailable" in r.text
+        assert r.json()["detail"] == expected
+        # No fabricated answer is stored, and the failed turn leaves no dangling
+        # user message behind.
+        assert client.get(f"/api/chat/sessions/{json_sid}", headers=h).json()["messages"] == []
+
+        sse_sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        body = _stream_body(client, h, sse_sid, "Who invested in fintech?")
+        assert "event: error" in body
+        assert "event: done" not in body
+        assert json.loads(re.search(r"event: error\ndata: (.*)", body).group(1)) == expected
+        assert client.get(f"/api/chat/sessions/{sse_sid}", headers=h).json()["messages"] == []
+
+        # The outage cost money on both paths: 3 billed attempts x $0.02.
+        assert llm.calls == 6
+        assert budget.writes == [("settle", 60_000), ("settle", 60_000)]
+        assert budget.counter == 120_000
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -3639,39 +3731,38 @@ def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch)
         _run(chat_store.close())
 
 
-def test_stream_failure_before_any_delta_releases_the_hold(tmp_path, monkeypatch):
-    """The other side of the gate-window rule (#255): a turn that made NO
-    billed call releases its hold, so the fix above cannot charge for calls
-    that never happened.
+def test_stream_failure_before_any_delta_charges_every_attempt(tmp_path, monkeypatch):
+    """The other side of the gate-window rule (#255), corrected by #280: a turn
+    that made a call and produced NO text was still billed for it.
 
-    The LLM fails before emitting anything, so the provider billed nothing;
-    the hold is dropped rather than settled, and the day total is untouched."""
+    The provider is sent one request per retry and charges the prompt of each,
+    so the turn's hold is settled for all three attempts instead of being
+    released back to the cap -- releasing is what makes a billed outage free
+    spend. The turn still rolls back cleanly, because no answer was ever
+    produced: nothing is stored, and the client is told with an error event.
+    """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
 
+        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+        llm = _pin_llm_outage(monkeypatch, retries=2, reserve_usd=0.02)
+
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
-            raise chat_module.LLMUnavailableError()
-            yield  # pragma: no cover -- an async generator that never runs
-
-        budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
-
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
-        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
 
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
         assert "LLM temporarily unavailable" in body
         assert client.get(f"/api/chat/sessions/{sid}", headers=h).json()["messages"] == []
-        # Nothing was billed, so nothing is charged: the hold is released, and
-        # it is released rather than left eating budget.
+        assert llm.calls == 3  # LLM_MAX_RETRIES + 1 requests, every one billed
+        # $0.02 held per call, settled once for the whole failed call.
+        assert budget.writes == [("settle", 60_000)]
+        assert budget.counter == 60_000
         assert budget.holds == {}
-        assert budget.writes == []
-        assert budget.counter == 0
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
