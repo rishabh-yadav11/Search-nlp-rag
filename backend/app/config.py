@@ -487,6 +487,11 @@ class Config:
     PUBLIC_SEARCH_RATE_PER_MIN = int(os.getenv("PUBLIC_SEARCH_RATE_PER_MIN", "60"))
     PUBLIC_FACETS_RATE_PER_MIN = int(os.getenv("PUBLIC_FACETS_RATE_PER_MIN", "60"))
     PUBLIC_CLICK_RATE_PER_MIN = int(os.getenv("PUBLIC_CLICK_RATE_PER_MIN", "120"))
+    # /recommend/interaction is authenticated but not permission-gated, so any
+    # self-signup'd account could drive it in a loop. The limit bounds that per
+    # IP; it fails OPEN on a limiter outage (see auth.public_rate_limit) because
+    # a Redis outage is a degraded-but-serving state for this service.
+    PUBLIC_INTERACTION_RATE_PER_MIN = int(os.getenv("PUBLIC_INTERACTION_RATE_PER_MIN", "30"))
     # /ready is polled by load balancers and orchestrators, typically once a
     # second, and a 429 makes an LB treat the node as unhealthy and pull it
     # from rotation -- the exact outage the /ready limiter must not cause. The
