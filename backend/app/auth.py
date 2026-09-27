@@ -340,6 +340,25 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def tokens_match(presented: str, expected: str) -> bool:
+    """Constant-time equality of two credential strings.
+
+    ``secrets.compare_digest`` raises ``TypeError`` when a ``str`` argument
+    holds a non-ASCII character, and an ``X-Service-Token`` header is
+    attacker-controlled bytes: a raw request carrying one would turn the
+    comparison into an unhandled ``TypeError`` and the route into a 500.
+    Comparing the UTF-8 encodings keeps the property that matters -- both
+    sides go through the same constant-time bytes comparison, and a
+    difference in length is a plain mismatch rather than an early exit --
+    while a non-ASCII value is simply not the expected token. ``
+    surrogateescape`` makes the encode total, so no byte sequence a server
+    can decode into the header can raise here either.
+    """
+    return secrets.compare_digest(
+        presented.encode("utf-8", "surrogateescape"), expected.encode("utf-8", "surrogateescape")
+    )
+
+
 def _now() -> float:
     return time.time()
 
@@ -1224,7 +1243,7 @@ async def _resolve_service_token(raw: str) -> StoredServiceToken | None:
     record = await s.service_token_for(raw)
     if record is not None:
         return record
-    if config.AUTH_SERVICE_TOKEN and secrets.compare_digest(raw, config.AUTH_SERVICE_TOKEN):
+    if config.AUTH_SERVICE_TOKEN and tokens_match(raw, config.AUTH_SERVICE_TOKEN):
         await s.ensure_bootstrap_service_token(raw, set(_service_token_scope()), _service_token_ttl_seconds())
         return await s.service_token_for(raw)
     return None
@@ -1571,7 +1590,7 @@ async def revoke_service_tokens(
     s = _require_auth_store()
     configured = config.AUTH_SERVICE_TOKEN or ""
     if body and body.token:
-        if configured and secrets.compare_digest(body.token, configured):
+        if configured and tokens_match(body.token, configured):
             return {"revoked": await s.revoke_configured_service_token(body.token, set(_service_token_scope()))}
         return {"revoked": await s.revoke_service_token(body.token)}
     revoked = await s.revoke_all_service_tokens()
