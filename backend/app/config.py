@@ -557,7 +557,7 @@ class Config:
     USER_INTERACTION_TTL_DAYS = int(os.getenv("USER_INTERACTION_TTL_DAYS", "90"))
     RECOMMEND_DEFAULT_LIMIT = int(os.getenv("RECOMMEND_DEFAULT_LIMIT", "10"))
     # Width of the candidate pool each recommendation strategy fetches, which
-    # is deliberately wider than the result page so scoring and diversity
+    # is deliberately wider than the result page so scoring and exclusion
     # post-processing have something to choose from (see _candidate_pool in
     # app/recommender.py). A request asking for more than this still gets at
     # least `limit` candidates.

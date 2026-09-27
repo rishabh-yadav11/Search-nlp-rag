@@ -45,11 +45,12 @@ USER_RECOMMENDATIONS_TTL_SECONDS = 1800  # 30 minutes
 def _candidate_pool(limit: int) -> int:
     """How many candidates a strategy fetches to fill a page of ``limit``.
 
-    The pool is wider than the page on purpose: the hybrid scorer and the
-    exclusion/diversity filters in ``_format_articles`` drop candidates, so a
-    pool of exactly ``limit`` would return a short page. ``RECOMMEND_CANDIDATES_LIMIT``
-    sets that width; a caller asking for more than the pool (the API caps
-    ``limit`` at 20) still gets at least ``limit`` candidates.
+    The pool is wider than the page on purpose: the hybrid scorer keeps only the
+    best ``limit * 2`` candidates and ``_format_articles`` drops the excluded
+    ids and empty payloads, so a pool of exactly ``limit`` would return a short
+    page. ``RECOMMEND_CANDIDATES_LIMIT`` sets that width; a caller asking for
+    more than the pool (the API caps ``limit`` at 20) still gets at least
+    ``limit`` candidates.
     """
     return max(limit, config.RECOMMEND_CANDIDATES_LIMIT)
 
