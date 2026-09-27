@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import Link from 'next/link'
+import SafeArticleLink from './SafeArticleLink'
 import { API_BASE, authHeaders } from '../lib/auth'
 import styles from './SimilarArticles.module.css'
 
@@ -84,18 +84,16 @@ export default function SimilarArticles({
         <div className={styles['similar-heading']}>Similar articles</div>
         <div className={styles['similar-list']}>
           {displayArticles.map((article) => (
-            <Link
+            <SafeArticleLink
               key={article.id}
-              href={article.url}
-              target="_blank"
-              rel="noopener noreferrer"
+              url={article.url}
               className={styles['similar-item']}
             >
               <span className={styles['similar-title']}>{article.title}</span>
               {article.category && (
                 <span className={styles['similar-category']}>{article.category}</span>
               )}
-            </Link>
+            </SafeArticleLink>
           ))}
         </div>
         {articles.length > 3 && (
@@ -116,13 +114,7 @@ export default function SimilarArticles({
       <div className={styles['similar-heading']}>Similar articles</div>
       <div className={styles['similar-list']}>
         {displayArticles.map((article) => (
-          <Link
-            key={article.id}
-            href={article.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={styles['similar-card']}
-          >
+          <SafeArticleLink key={article.id} url={article.url} className={styles['similar-card']}>
             <div className={styles['similar-card-content']}>
               <span className={styles['similar-card-title']}>{article.title}</span>
               {article.summary && (
@@ -139,7 +131,7 @@ export default function SimilarArticles({
                 )}
               </div>
             </div>
-          </Link>
+          </SafeArticleLink>
         ))}
       </div>
       {articles.length > 3 && (
