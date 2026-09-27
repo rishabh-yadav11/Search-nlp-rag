@@ -220,12 +220,23 @@ run_backend() {
     if ! grep -q '^REDIS_URL=' "$ENV_FILE"; then
         echo "REDIS_URL=redis://localhost:$REDIS_PORT/0" >> "$ENV_FILE"
     fi
-    # An .env that predates the per-IP public rate limits has no trust setting,
-    # so every proxied request would key on the nginx peer (127.0.0.1) and the
-    # whole site would share one rate-limit bucket. 'auto' trusts
-    # X-Forwarded-For only for a loopback peer, which is nginx here and not a
-    # directly-connecting client, so appending it cannot open a spoofing hole.
-    if ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
+    # Per-IP rate limiting keys on the client IP, which behind nginx comes from
+    # X-Forwarded-For. Two stale states have to be repaired, not just a missing
+    # key:
+    #   * the key absent -- every proxied request keys on the nginx peer
+    #     (127.0.0.1) and the whole site shares one rate-limit bucket;
+    #   * the key =true, which .env.example used to ship, so any .env created
+    #     by the cp above already carries it. That trusts the header for EVERY
+    #     peer, letting a client connecting straight to :8001 forge one to land
+    #     in a fresh bucket per request and dodge the limit entirely.
+    # 'auto' trusts the header only for a loopback peer, which is nginx here and
+    # never a directly-connecting client, so it fixes both without opening a
+    # spoofing hole. An explicit false is left alone -- that is a deliberate
+    # local/direct-only choice. Re-run with true if your proxy is on another host.
+    if grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*true[[:space:]]*$' "$ENV_FILE"; then
+        echo "upgrading AUTH_TRUST_X_FORWARDED_FOR=true -> auto (re-apply true only if your proxy is not on this host)"
+        sed -i -E 's/^(AUTH_TRUST_X_FORWARDED_FOR=)[[:space:]]*[Tt][Rr][Uu][Ee][[:space:]]*$/\1auto/' "$ENV_FILE"
+    elif ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
         echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$ENV_FILE"
     fi
     echo "backend ready"

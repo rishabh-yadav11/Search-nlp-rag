@@ -398,3 +398,52 @@ def test_delete_prefix_purge_keeps_byte_total_in_sync():
             assert await cache.get(key) == value
 
     _run(scenario())
+
+
+def test_expired_entry_read_gives_its_bytes_back(monkeypatch):
+    """Reading an entry past its TTL must subtract it from the byte total.
+
+    The count-eviction and purge paths were pinned, but the expiry path was
+    not: a read that returns None while leaving the cost behind inflates
+    _mem_bytes on every expiry, and the byte budget then evicts live entries
+    far earlier than CACHE_MAX_BYTES says.
+    """
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(redis_cache, "time", clock)
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=100, max_bytes=1 << 20)
+    cache._redis = _FakeRedis()
+    values = {f"search:{i}": {"v": "x" * 40} for i in range(3)}
+
+    async def scenario():
+        for key, value in values.items():
+            await cache.set(key, value)
+        clock.advance(61.0)  # every entry is now past its 60s TTL
+
+        for key in values:
+            assert await cache.get(key) is None, f"{key} should have expired"
+
+        assert cache._mem_bytes == 0
+        assert not cache._mem
+
+    _run(scenario())
+
+
+def test_count_eviction_gives_evicted_bytes_back():
+    """Dropping an entry to satisfy the entry-count cap must subtract its cost.
+
+    The byte budget was checked after inserts, which is why a count eviction
+    that discards the entry but keeps its bytes went unnoticed: the total
+    drifts upward with every insert until the budget starts evicting live
+    entries for no reason.
+    """
+    cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=2, max_bytes=1 << 20)
+    cache._redis = _FakeRedis()
+
+    async def scenario():
+        for i in range(6):
+            await cache.set(f"search:{i}", {"v": "x" * (40 + i)})
+            assert len(cache._mem) <= 2, "the entry-count cap must hold"
+        assert cache._mem_bytes == sum(entry[2] for entry in cache._mem.values())
+        assert cache._mem_bytes <= sum(len(json.dumps({"v": "x" * (40 + i)}).encode()) for i in range(2, 6))
+
+    _run(scenario())

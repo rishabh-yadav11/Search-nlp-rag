@@ -972,6 +972,46 @@ def test_ready_over_the_limit_is_rejected_with_429(client, monkeypatch):
     assert over.headers["Retry-After"] == str(config.PUBLIC_RATE_WINDOW_SECONDS)
 
 
+def test_readyz_alias_is_also_rate_limited(client, monkeypatch):
+    """/readyz runs the identical readiness probe, so it must not be an
+    unrated path around /ready's limiter."""
+    monkeypatch.setattr(config, "PUBLIC_READY_RATE_PER_MIN", 2)
+    monkeypatch.setattr(health, "_readiness_report", _async((True, {})))
+
+    assert client.get("/readyz").status_code == 200
+    assert client.get("/readyz").status_code == 200
+    assert client.get("/readyz").status_code == 429
+
+
+def test_readyz_shares_the_ready_budget_rather_than_doubling_it(client, monkeypatch):
+    """The two aliases key the same bucket, so alternating between them cannot
+    buy a second allowance."""
+    monkeypatch.setattr(config, "PUBLIC_READY_RATE_PER_MIN", 2)
+    monkeypatch.setattr(health, "_readiness_report", _async((True, {"ready": True})))
+
+    assert client.get("/ready").status_code == 200
+    assert client.get("/readyz").status_code == 200
+    # The /ready allowance is spent; switching to the alias does not reset it.
+    assert client.get("/ready").status_code == 429
+    assert client.get("/readyz").status_code == 429
+
+
+def test_readyz_fails_open_when_the_limiter_store_is_down(client, monkeypatch):
+    """The alias keeps the same deliberate fail-open deviation as /ready."""
+    calls = {"set": 0}
+
+    class _BrokenRedis:
+        async def set(self, *args, **kwargs):
+            calls["set"] += 1
+            raise ConnectionError("redis down")
+
+    monkeypatch.setattr(auth, "_rate_client", _BrokenRedis())
+    monkeypatch.setattr(health, "_readiness_report", _async((True, {})))
+
+    assert client.get("/readyz").status_code == 200
+    assert calls["set"] == 1
+
+
 def test_ready_survives_a_sustained_one_hertz_probe(client, monkeypatch):
     """The default limit must sit above the poll rate it exists to absorb.
 
