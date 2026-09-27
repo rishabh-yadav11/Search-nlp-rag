@@ -1075,9 +1075,11 @@ def test_chart_intent_regex():
 
 def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
     calls = []
+    systems = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
+        systems.append(system_prompt or "")
         if len(calls) == 1:
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
         return chat_module.LLMResult(
@@ -1089,9 +1091,16 @@ def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT"))
+    result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", "SYSTEM"))
     assert len(calls) == 2
-    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") in calls[1]
+    # The retry instruction is ours, so it rides in the system role: the user
+    # message is the one the system prompt declares entirely untrusted, and
+    # trusted prose there would undercut the retry's authority.
+    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") in systems[1]
+    assert chat_module._dataviz_nudge("show me a chart of top 5 deals") not in calls[1]
+    assert calls[1] == "PROMPT"
+    assert systems[1].startswith("SYSTEM")
+    assert systems[0] == "SYSTEM"
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 13
     assert "dataviz" in result.content
@@ -1816,9 +1825,11 @@ def test_answer_ranked_nudges_after_refusal(monkeypatch):
     """A ranked-list answer that refuses must be re-asked once with the ranking
     nudge (lines 799-808)."""
     calls = []
+    systems = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
+        systems.append(system_prompt or "")
         if len(calls) == 1:
             return chat_module.LLMResult(
                 content="I cannot generate a ranked list [1].", prompt_tokens=10, completion_tokens=5
@@ -1828,9 +1839,14 @@ def test_answer_ranked_nudges_after_refusal(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT"))
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", "SYSTEM"))
     assert len(calls) == 2
-    assert chat_module._RANKING_NUDGE in calls[1]
+    # Our instruction goes to the instruction channel, never into the user
+    # message the system prompt declares untrusted.
+    assert chat_module._RANKING_NUDGE in systems[1]
+    assert chat_module._RANKING_NUDGE not in calls[1]
+    assert calls[1] == "PROMPT"
+    assert systems[1].startswith("SYSTEM")
     assert result.content == "Top deal: Zepto [1]."
     assert result.prompt_tokens == 30
     assert result.completion_tokens == 13
@@ -1917,9 +1933,11 @@ def test_answer_ranked_nudges_when_turn_spend_still_within_budget(monkeypatch):
     """Counterpart to the case above: with headroom left after this turn's first
     call, the ranking-nudge guard must NOT block the retry."""
     calls = []
+    systems = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
+        systems.append(system_prompt or "")
         if len(calls) == 1:
             return chat_module.LLMResult(
                 content="I cannot generate a ranked list [1].", prompt_tokens=1_000_000, completion_tokens=0
@@ -1931,9 +1949,10 @@ def test_answer_ranked_nudges_when_turn_spend_still_within_budget(monkeypatch):
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
-    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT"))
+    result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", "SYSTEM"))
     assert len(calls) == 2
-    assert chat_module._RANKING_NUDGE in calls[1]
+    assert chat_module._RANKING_NUDGE in systems[1]
+    assert chat_module._RANKING_NUDGE not in calls[1]
     assert result.content == "Top deal: Zepto [1]."
 
 
