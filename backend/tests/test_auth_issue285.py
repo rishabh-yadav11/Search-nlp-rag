@@ -13,6 +13,7 @@ reflects what a process surviving the kill would actually see.
 """
 
 import asyncio
+import contextlib
 import sqlite3
 from types import SimpleNamespace
 
@@ -394,7 +395,13 @@ def test_a_concurrent_login_cannot_publish_a_half_finished_change(tmp_path, monk
             # assertion that actually caught the mutation.
             pause.release()
             if change is not None:
-                await asyncio.gather(change, return_exceptions=True)
+                # Bounded, so a future mutation that wedges this task fails
+                # the test instead of hanging the suite. Timing out here is
+                # suppressed because this path is only ever load-bearing when
+                # an assertion above has already fired, and the failure worth
+                # reporting is that assertion, not the cleanup.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.gather(change, return_exceptions=True), 10)
             _unarm(monkeypatch)
             await reader.close()
             await store.close()
