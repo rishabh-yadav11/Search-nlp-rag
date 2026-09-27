@@ -1478,10 +1478,28 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
             0.0,
         )
     cost_usd = to_usd(result.cost())
-    # The turn's single counter write: it drops every hold and records what the
-    # turn actually cost, which may exceed the reserved estimates — already
-    # incurred spend is recorded, never silently dropped.
-    await settle(holds, cost_usd)
+    if holds:
+        # The turn's single counter write: it drops every hold and records what
+        # the turn actually cost, which may exceed the reserved estimates —
+        # already incurred spend is recorded, never silently dropped.
+        #
+        # An EMPTY hold list is the cap being disabled
+        # (LLM_DAILY_BUDGET_USD <= 0), where reserve() returned "" without
+        # touching the store. Settling there would make the counter a hard
+        # dependency of every chat turn for a deployment that deliberately
+        # opted out and meters spend elsewhere, and a Redis outage would 503 an
+        # answer the LLM had already produced (#255).
+        #
+        # Best-effort. The answer exists and has been billed, so a store that
+        # cannot record it must not destroy the turn: failing closed here would
+        # return a 503 and delete the user message for work that is already
+        # paid for, while preventing no spend -- the hold stays live and the
+        # sweep charges it either way (#255). The pre-call gate above is what
+        # fails closed, and it still does.
+        try:
+            await settle(holds, cost_usd)
+        except BudgetUnavailable as exc:
+            logger.warning("cost accounting unavailable after a billed call; leaving the hold for the sweep: %s", exc)
     return (
         _finalize_answer(result.content, question),
         turn.sources,
@@ -1821,15 +1839,33 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             settle() is the turn's only counter write; release() drops the holds
             without recording when no billed call completed. Either way each
             reservation leaves `holds` exactly once, and the guard makes a
-            second call a no-op so no path can double-count the day."""
+            second call a no-op so no path can double-count the day.
+
+            An EMPTY hold list is the cap being disabled
+            (LLM_DAILY_BUDGET_USD <= 0), where reserve() returns "" without
+            touching the store at all. Settling there anyway would give a dead
+            counter a veto over a deployment that deliberately opted out of the
+            cap and meters spend elsewhere (#255).
+
+            Never raises. Every caller runs after the turn's fate is already
+            decided — the answer is on the wire, or the user message has been
+            rolled back — so an unreachable store can only destroy work that
+            is done, while preventing no spend: the hold stays live and the
+            sweep charges it either way. The outage is logged instead.
+            """
             nonlocal holds_done
             if holds_done:
                 return
             holds_done = True
-            if charged_usd > 0:
-                await settle(holds, charged_usd)
-            else:
-                await release(holds)
+            if not holds:
+                return
+            try:
+                if charged_usd > 0:
+                    await settle(holds, charged_usd)
+                else:
+                    await release(holds)
+            except BudgetUnavailable as exc:
+                logger.warning("cost accounting unavailable; leaving the hold for the sweep: %s", exc)
             holds.clear()
 
         # ONE rule for a dropped client, applied at every check below (#255):
@@ -1880,11 +1916,23 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
 
             BOTH branches discharge the turn's holds before returning, and
             every call site returns immediately on True, so no path can return
-            with a reservation still live. That matters in the gate-to-first-
-            delta window: the billed call has happened but `streamed` is still
-            False, so the rollback branch runs — without the release the gate
-            hold would sit in the store for the full reservation TTL, billing
-            the day's budget against a call whose cost was never recorded."""
+            with a reservation still live.
+
+            What they discharge FOR depends on whether a billed call happened,
+            which is why `cost_usd` is a parameter and not a constant zero. The
+            rollback branch still rolls the user message back — nothing reached
+            the client — but a call that was already made and billed is
+            SETTLED, never released. That distinction is the money: the hold is
+            the only record that the spend happened, and letting it lapse is
+            precisely the mechanism that CHARGES a crashed call, so releasing
+            it is the one option that guarantees free spend. The gate-to-
+            first-delta window is exactly this case — the provider billed the
+            call, the loop saw a disconnect, and `streamed` is still False.
+
+            A turn that made no billed call passes 0.0 and is released.
+            release() on an empty list is a no-op, so the pre-gate call sites
+            cost nothing; finish_holds is guarded, so this cannot
+            double-discharge."""
             if not await request.is_disconnected():
                 return False
             if streamed:
@@ -1893,10 +1941,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 )
             else:
                 await s.delete_message(session_id, user_id, user_msg.id)
-                # release() on an empty list is a no-op, so the pre-gate call
-                # sites cost nothing; finish_holds is guarded, so this cannot
-                # double-discharge.
-                await finish_holds(0.0)
+                await finish_holds(cost_usd)
             return True
 
         async def fail_turn() -> None:
@@ -1954,9 +1999,15 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 holds.append(gate_hold)
             usage_holder: list = []
             chunks: list[str] = []
+            # The provider bills a call from the moment it starts emitting, and
+            # usage is only reported once the whole response has arrived. So
+            # while the stream runs, the best known figure for a call already
+            # made is the estimate the gate hold was taken at — the same figure
+            # the sweeper would charge if the hold were simply left to lapse.
+            mid_stream_estimate = config.LLM_CALL_RESERVE_USD
             try:
                 async for piece in stream_answer(state_llm(), turn.answer, config.LLM_MODEL, usage_holder):
-                    if await aborted("".join(chunks), turn.sources):
+                    if await aborted("".join(chunks), turn.sources, cost_usd=mid_stream_estimate):
                         return
                     chunks.append(piece)
                     streamed = True
@@ -2013,7 +2064,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # counts the spend this turn has already incurred.
                 nudge = None
                 if await _nudge_retry_allowed(holds):
-                    if await aborted("".join(chunks), turn.sources, prompt_tokens, completion_tokens):
+                    if await aborted(
+                        "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
+                        # The stream is finished and its usage is known, so a
+                        # disconnect here must still be charged for it.
+                        to_usd(usage.cost()) if usage else 0.0,
+                    ):
                         return
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _dataviz_nudge(question), config.LLM_MODEL)
@@ -2040,7 +2096,10 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # order, no numbers ever available) must never nudge.
                 nudge = None
                 if await _nudge_retry_allowed(holds):
-                    if await aborted("".join(chunks), turn.sources, prompt_tokens, completion_tokens):
+                    if await aborted(
+                        "".join(chunks), turn.sources, prompt_tokens, completion_tokens,
+                        to_usd(usage.cost()) if usage else 0.0,
+                    ):
                         return
                     try:
                         nudge = await generate_answer(state_llm(), turn.answer + _RANKING_NUDGE, config.LLM_MODEL)
