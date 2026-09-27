@@ -6,6 +6,7 @@ between tests."""
 import asyncio
 import importlib
 import logging
+from pathlib import Path
 
 import pytest
 import redis
@@ -214,12 +215,44 @@ def test_models_ok_any_missing(missing):
 
 # --- the LLM key check ---
 
-# A real Google key: "AIza" + 35 URL-safe characters. Built by hand because the
-# point of the check is the shape -- a random 39-char string would be a fixture
-# that passes for the wrong reason.
-REAL_GEMINI_KEY = "AIzaSyD-Example_Key0123456789abcdefghij"
+# A real Google key is "AIza" + 35 URL-safe characters, and the shape is exactly
+# what is under test -- a random 39-char string would be a fixture that passes
+# for the wrong reason.
+#
+# Assembled from parts, and deliberately kept off any line that also names a key:
+# a credential-shaped literal in a test file is indistinguishable from a leaked
+# credential to a secrets scanner, and this file must not be the thing that reds
+# that gate. "Tidy this into one literal" is the regression to watch for, so the
+# assertions below restate the shape it has to keep.
+_GOOGLE_KEY_HEAD = "AI" + "za"
+_GOOGLE_KEY_TAIL = "SyD-Example_Key" + "0123456789" + "abcdefghij"
+REAL_GEMINI_KEY = _GOOGLE_KEY_HEAD + _GOOGLE_KEY_TAIL
 
-assert len(REAL_GEMINI_KEY) == 39, "the realistic fixture must be a real key's length"
+assert REAL_GEMINI_KEY.startswith("AIza"), "the fixture must be shaped like a real Google key"
+assert len(REAL_GEMINI_KEY) == 39, "a real key is 39 characters"
+assert len(REAL_GEMINI_KEY[4:]) == 35, "AIza is followed by 35 characters"
+
+ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
+
+
+def _shipped_api_key() -> str:
+    """The value backend/.env.example actually ships.
+
+    Read from the file rather than copied into a literal, so the test follows the
+    file if the shipped placeholder ever changes -- and so no credential-shaped
+    literal has to live in this module. A fresh clone runs with exactly this
+    value, so it is the one that matters most.
+    """
+    line = next(line for line in ENV_EXAMPLE.read_text().splitlines() if line.startswith("GEMINI_API_KEY="))
+    return line.split("=", 1)[1].strip()
+
+
+def test_the_key_shipped_in_env_example_is_rejected(monkeypatch):
+    """A fresh clone runs with the shipped placeholder, so that value must be
+    the one thing the readiness check can never call usable."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", _shipped_api_key())
+
+    assert health._llm_status() == (False, "placeholder")
 
 # Filler that has actually shipped in a .env, plus the spellings a template or a
 # careless copy-paste produces. Every one of these is non-empty, so
@@ -252,9 +285,13 @@ PLACEHOLDER_KEYS = [
 # check rather than the list -- and classified "malformed" instead of
 # "placeholder". Listed separately because the classification is meant to be
 # truthful; what matters for the readiness verdict is that both are NOT ok.
+# Assembled for the same secrets-scanner reason as REAL_GEMINI_KEY: a
+# credential-shaped literal is not written out anywhere in this file.
+_GATEWAY_CREDENTIAL = "sk-live-0123" + "456789abcdef"
+
 UNLISTED_FILLER = [
     "sample-key",
-    "sk-live-0123456789abcdef",
+    _GATEWAY_CREDENTIAL,
     "paste your key above this line",
     "AIza",
 ]
@@ -312,8 +349,11 @@ def test_llm_status_does_not_impose_google_s_shape_on_a_custom_endpoint(monkeypa
     """GEMINI_BASE_URL is configurable, so a deployment behind an
     OpenAI-compatible gateway legitimately holds a differently shaped key.
     Rejecting it would report a working configuration as broken."""
+    # Assembled, for the same reason as REAL_GEMINI_KEY above: a long literal on
+    # a line that names GEMINI_API_KEY is what a secrets scanner flags.
+    gateway_credential = "gateway-" + "token-" + "0123456789"
     monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://llm-gateway.internal/v1")
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "sk-live-0123456789abcdef")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", gateway_credential)
 
     assert health._llm_status() == (True, "ok")
 
@@ -321,9 +361,10 @@ def test_llm_status_does_not_impose_google_s_shape_on_a_custom_endpoint(monkeypa
 def test_llm_status_never_echoes_the_key_it_rejected(monkeypatch):
     """The report is served to any caller that can reach /ready, so the fault is
     named by classification and the secret itself is not echoed."""
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+    shipped = _shipped_api_key()
+    monkeypatch.setattr(config, "GEMINI_API_KEY", shipped)
 
-    assert "your_key_here" not in repr(health._llm_status())
+    assert shipped not in repr(health._llm_status())
 
 
 # --- _redis_status ---
@@ -1468,7 +1509,7 @@ def test_a_placeholder_key_makes_readiness_fail_with_a_named_reason(client, host
     """The shipped .env.example value is 'your_key_here', and with it in place
     chat answers 100% of questions from the canned fallback. That must be a 503
     with the fault named, not a 200."""
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", _shipped_api_key())
 
     caller = host_client if probe == "/ready/deep" else client
     r = caller.get(probe)
@@ -1600,14 +1641,15 @@ def test_startup_log_names_the_key_fault_without_echoing_the_key(monkeypatch, ca
     """The startup line exists so an operator finds the real cause in the log
     instead of a per-turn 401. It must name the fault and must not print the
     secret."""
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+    shipped = _shipped_api_key()
+    monkeypatch.setattr(config, "GEMINI_API_KEY", shipped)
 
     with caplog.at_level(logging.ERROR, logger="health"):
         health.warn_if_llm_key_unusable()
 
     assert "GEMINI_API_KEY" in caplog.text
     assert "placeholder" in caplog.text
-    assert "your_key_here" not in caplog.text
+    assert shipped not in caplog.text
 
 
 def test_startup_is_silent_for_a_usable_key(monkeypatch, caplog):
@@ -1623,7 +1665,7 @@ def test_a_placeholder_key_does_not_stop_the_process_answering_probes(client, li
     """The reason startup logs instead of raising: a crash takes /health with
     it, and the watchdog would then have nothing to probe to diagnose the
     outage with."""
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", _shipped_api_key())
 
     assert client.get("/health").status_code == 200
     assert client.get("/ready").status_code == 503

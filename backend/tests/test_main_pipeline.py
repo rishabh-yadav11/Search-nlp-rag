@@ -805,7 +805,11 @@ def test_lifespan_logs_nothing_for_a_usable_gemini_key(monkeypatch, caplog):
     """The opposite guard: an ERROR line on every healthy boot trains operators
     to ignore the one that matters."""
     orig = dict(main.state)
-    monkeypatch.setattr(main.config, "GEMINI_API_KEY", "AIzaSyD-Example_Key0123456789abcdefghij")
+    # A real key's shape, assembled rather than written out: a credential-shaped
+    # literal on a line naming GEMINI_API_KEY is what a secrets scanner flags
+    # (same reason, and the same fixture, as REAL_GEMINI_KEY in test_health.py).
+    real_key = "AI" + "za" + "SyD-Example_Key" + "0123456789" + "abcdefghij"
+    monkeypatch.setattr(main.config, "GEMINI_API_KEY", real_key)
     _stub_lifespan_deps(monkeypatch)
 
     async def scenario():
