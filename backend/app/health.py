@@ -1,15 +1,16 @@
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import time
 
 import redis
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.auth import public_rate_limit
-from app.config import config
+from app.config import classify_gemini_api_key, config
 
 logger = logging.getLogger("health")
 
@@ -26,6 +27,21 @@ _REDIS_CLOSE_TIMEOUT = 2.0
 
 @router.get("/health")
 async def health() -> dict[str, str]:
+    """Liveness only: "this process is up and serving HTTP". Nothing more.
+
+    It touches no dependency on purpose, which is what makes it a valid liveness
+    probe -- it must keep answering while Qdrant is down, so a supervisor can
+    tell "restart the process" apart from "the process is fine and something it
+    depends on is not". It is deliberately NOT a readiness answer and must never
+    be used to gate a deploy, drive a load balancer, or decide whether to alert:
+    with no dependency inspected, a deployment holding a dead Qdrant client,
+    unloaded models or a placeholder API key answers 200 here.
+
+    Use /ready (a load balancer or orchestrator polling once per node, where
+    the short cache and the rate limit are welcome) or /ready/deep (host-local
+    monitoring: the deploy gate in setup.sh and the cron watchdog in
+    deploy/healthcheck.sh) whenever a real answer is required.
+    """
     return {"status": "ok"}
 
 
@@ -134,8 +150,17 @@ def _models_ok(state: dict) -> bool:
     return all(state.get(key) is not None for key in ("model", "sparse_model", "reranker"))
 
 
-def _llm_ok() -> bool:
-    return bool(config.GEMINI_API_KEY)
+def _llm_status() -> tuple[bool, str]:
+    """(usable, reason) for the configured Gemini key.
+
+    Delegates to config.classify_gemini_api_key so readiness and the startup
+    log can never disagree about the key. The old ``bool(config.GEMINI_API_KEY)``
+    answered "true" for any non-empty string, and the value shipped in
+    .env.example is the literal placeholder "your_key_here" -- so a backend
+    whose every chat answer is the canned fallback reported itself healthy.
+    """
+    reason = classify_gemini_api_key(config.GEMINI_API_KEY)
+    return reason == "ok", reason
 
 
 async def _redis_status() -> tuple[bool, str]:
@@ -264,15 +289,23 @@ async def _readiness_report(state: dict) -> tuple[bool, dict]:
             raise result
     qdrant_ok, (redis_ok, cache_mode) = qdrant_result, redis_result
     models_ok = _models_ok(state)
-    llm_ok = _llm_ok()
-    ready = qdrant_ok and models_ok
+    llm_ok, llm_reason = _llm_status()
+    # The LLM key gates readiness, not just the report. Without a usable key
+    # every chat answer is the canned fallback: search and indexing still serve,
+    # but the deployment cannot do the one thing it is deployed to do, and
+    # reporting that as ready is what let a placeholder key ship unnoticed.
+    # Redis stays out of this sum on purpose (see _redis_status): it degrades to
+    # an in-process cache rather than to a wrong answer.
+    ready = qdrant_ok and models_ok and llm_ok
     report = {
         "ready": ready,
         "checks": {
             "qdrant": {"ok": qdrant_ok},
             "models": {"ok": models_ok},
             "redis": {"ok": redis_ok, "cache": cache_mode},
-            "llm": {"ok": llm_ok},
+            # reason is a classification ("missing" / "placeholder" /
+            # "malformed" / "ok"), never the key itself.
+            "llm": {"ok": llm_ok, "reason": llm_reason},
         },
     }
     return ready, report
@@ -289,6 +322,18 @@ async def _readiness_report(state: dict) -> tuple[bool, dict]:
     dependencies=[Depends(public_rate_limit("ready", "PUBLIC_READY_RATE_PER_MIN", fail_closed=False))],
 )
 async def ready() -> JSONResponse:
+    """Readiness: 200 only when this node can actually serve, 503 otherwise.
+
+    This is the real answer -- Qdrant reachable, models loaded, and a usable
+    Gemini key configured -- and it is the endpoint a load balancer or an
+    orchestrator polls. The result is cached for READY_CACHE_TTL_SECONDS and the
+    probe is rate-limited, both of which are right for a 1 Hz prober and both of
+    which are wrong for a watchdog that must see an outage the moment it starts:
+    use /ready/deep for that.
+
+    Unlike /health, this endpoint CAN fail, and its answer is allowed to flip
+    from 200 to 503 while the process itself is perfectly healthy.
+    """
     from app.main import state  # lazy: avoid circular import at startup
 
     try:
@@ -320,3 +365,91 @@ async def readyz() -> Response:
         logger.exception("readiness probe raised unexpectedly")
         return Response(status_code=500)
     return Response(status_code=200 if ok else 503)
+
+
+def _is_host_local_probe(request: Request) -> bool:
+    """True for a direct loopback caller on this host, False for anything else.
+
+    /ready/deep runs uncached and unrated (see its docstring), which is safe
+    only if the internet cannot reach it, so the gate is deliberately narrow:
+
+    * the socket peer must be a loopback address, which is the shape of a
+      `curl` from setup.sh or deploy/healthcheck.sh running on this box; and
+    * the request must carry no X-Forwarded-For. A request that arrived through
+      the local reverse proxy (nginx on this host forwards every request with
+      that header) is an internet request wearing a loopback peer's address,
+      and is refused. A client cannot strip the header nginx sets.
+
+    A non-loopback peer -- a TestClient, a container on the docker bridge, a
+      different host -- is not host-local and is refused. Fail closed: a false
+    negative costs a watchdog that cannot probe, while a false positive exposes
+    an unrated, uncached dependency probe to the internet.
+    """
+    peer = request.client.host if request.client else None
+    if not peer:
+        return False
+    try:
+        if not ipaddress.ip_address(peer).is_loopback:
+            return False
+    except ValueError:
+        return False
+    return not request.headers.get("x-forwarded-for", "").strip()
+
+
+@router.get("/ready/deep")
+async def ready_deep(request: Request) -> Response:
+    """Uncached, unrated readiness for host-local monitoring (#279).
+
+    The same readiness contract as /ready -- same report, same 200/503 -- with
+    the two things a *watchdog* must not inherit deliberately removed:
+
+    * no cache. /ready may answer from an entry written up to
+      READY_CACHE_TTL_SECONDS ago, so a poll landing just after a dependency
+      died gets the pre-outage verdict. A watchdog acts on that answer, so this
+      one re-probes every time; it neither reads nor writes the shared entry.
+    * no rate limit. A 429 here would be indistinguishable from an outage to
+      every caller: deploy/healthcheck.sh treats any non-200 as "unhealthy" and
+      restarts the backend, so a prober sharing the public /ready budget could
+      make the watchdog restart a healthy service -- and a restart storm is
+      itself the outage. Such a prober also runs on a timer, far below the
+      600/60s budget /ready needs for a load balancer.
+
+    Neither property is safe to hand to the internet, so the route is refused
+    for any caller that is not a direct loopback request on this host
+    (_is_host_local_probe). This is the endpoint for deploy/healthcheck.sh and
+    for setup.sh's deploy gate; it is NOT a public status endpoint.
+    """
+    if not _is_host_local_probe(request):
+        logger.warning("refused a non-host-local /ready/deep probe")
+        return Response(status_code=403, content="host-local probe endpoint")
+    from app.main import state  # lazy: avoid circular import at startup
+
+    try:
+        ok, report = await _readiness_report(state)
+    except Exception:
+        # Same reasoning as /ready: a defect in the probe machinery must not be
+        # laundered into a verdict about the dependencies.
+        logger.exception("readiness probe raised unexpectedly")
+        return JSONResponse(status_code=500, content={"ready": False, "checks": {}, "error": "readiness probe failed"})
+    return JSONResponse(status_code=200 if ok else 503, content=report)
+
+
+def warn_if_llm_key_unusable() -> None:
+    """Log the LLM key's usability once at startup (#279).
+
+    Deliberately a log line, not a raised error. Crashing would take /health
+    with it, leaving the watchdog nothing to probe and turning a diagnosable
+    "GEMINI_API_KEY is still the .env.example placeholder" into an opaque boot
+    loop. /ready reports the same fault as not-ready with checks.llm.reason, and
+    the process stays up to answer both probes.
+    """
+    ok, reason = _llm_status()
+    if ok:
+        return
+    logger.error(
+        "GEMINI_API_KEY is %s: chat will answer every question with the canned fallback. "
+        "Set a real key (https://aistudio.google.com/apikey) in backend/.env; /ready reports "
+        "checks.llm.reason=%r until then.",
+        reason,
+        reason,
+    )

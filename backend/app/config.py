@@ -1,4 +1,5 @@
 import os
+import re
 from typing import ClassVar
 
 from dotenv import load_dotenv
@@ -109,6 +110,12 @@ class Config:
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
     # in GEMINI_API_KEY. Set GEMINI_MODEL to the model id you want to use.
+    # An absent key and a placeholder key are both "chat cannot work", but they
+    # are not the same fault and must be told apart: a placeholder makes 100% of
+    # answers the canned fallback while the process still looks healthy, so
+    # classify_gemini_api_key below is the single place that decides whether the
+    # configured value can actually reach the LLM, and both the readiness report
+    # and the startup log report through it.
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
     # Answer model. Kept separate from GEMINI_MODEL so the eval judge can be held
@@ -342,6 +349,84 @@ class Config:
         for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8001").split(",")
         if o.strip()
     )
+
+
+# A real Google API key is "AIza" followed by 35 URL-safe characters. That shape
+# is only required against Google's own endpoint: GEMINI_BASE_URL is
+# configurable, so a deployment pointing at an OpenAI-compatible gateway
+# legitimately holds a differently shaped key, and rejecting that would report a
+# working configuration as broken.
+_GOOGLE_KEY_RE = re.compile(r"^AIza[0-9A-Za-z_-]{35}$")
+_GOOGLE_API_HOST = "generativelanguage.googleapis.com"
+
+# Filler spellings that turn up in templates, docs and copy-pasted examples,
+# compared in normalised form: lowercased with every non-alphanumeric character
+# removed, so "your_key_here", "YOUR-KEY-HERE" and "<your key here>" all reduce
+# to the same token.
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "0",
+        "changeme",
+        "changethis",
+        "dummy",
+        "empty",
+        "example",
+        "insertkeyhere",
+        "key",
+        "na",
+        "nil",
+        "none",
+        "null",
+        "pastekeyhere",
+        "placeholder",
+        "putkeyhere",
+        "replaceme",
+        "sample",
+        "secret",
+        "tbd",
+        "test",
+        "todo",
+        "unset",
+        "yourapikey",
+        "yourapikeyhere",
+        "yourgeminiapikey",
+        "yourkey",
+        "yourkeyhere",
+        "yoursecret",
+    }
+)
+
+# A run of one repeated character ("xxxx", "aaaaaa") is filler, never a key.
+# Checked against the normalised form, so "x-x-x-x" is caught as well.
+_REPEATED_FILLER_RE = re.compile(r"(.)\1{3,}")
+
+
+def classify_gemini_api_key(value: str | None) -> str:
+    """Classify a configured GEMINI_API_KEY for readiness reporting.
+
+    Returns one of:
+      "ok"          -- a key that can plausibly be sent to the configured
+                       LLM endpoint.
+      "missing"     -- unset, empty, or whitespace only.
+      "placeholder" -- a known filler value ("your_key_here" and friends).
+      "malformed"   -- neither missing nor filler, but the wrong shape for the
+                       configured GEMINI_BASE_URL (a typo, or a truncated key).
+
+    A truthiness test cannot do this job: every non-empty string is truthy and
+    the value shipped in .env.example is the literal "your_key_here", so
+    ``bool(key)`` reported a chat-broken deployment as a healthy one. The value
+    itself is never returned or logged, only its classification, so a readiness
+    report or a log line can name the fault without leaking the secret.
+    """
+    if value is None or not value.strip():
+        return "missing"
+    stripped = value.strip()
+    normalised = re.sub(r"[^0-9a-z]+", "", stripped.lower())
+    if normalised in _PLACEHOLDER_API_KEYS or _REPEATED_FILLER_RE.fullmatch(normalised):
+        return "placeholder"
+    if _GOOGLE_API_HOST in config.GEMINI_BASE_URL and not _GOOGLE_KEY_RE.fullmatch(stripped):
+        return "malformed"
+    return "ok"
 
 
 config = Config()

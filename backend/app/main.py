@@ -40,6 +40,7 @@ from app.diversity import diversify
 from app.encoders import DenseEncoder
 from app.health import close_redis as health_module_close_redis
 from app.health import router as health_router
+from app.health import warn_if_llm_key_unusable
 from app.query_expand import expand_query
 from app.query_fix import fix_query, init_fixer
 from app.query_intent import (
@@ -255,6 +256,9 @@ async def lifespan(app: FastAPI):
     state["reranker"] = Reranker(config.RERANK_MODEL, backend=config.RERANK_BACKEND)
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
     await _load_facet_maps()
+    # Names the real cause (missing / placeholder / malformed GEMINI_API_KEY) in
+    # the log at boot, without taking the process down with it (#279).
+    warn_if_llm_key_unusable()
     state["llm"] = AsyncOpenAI(api_key=config.GEMINI_API_KEY, base_url=config.GEMINI_BASE_URL) if config.GEMINI_API_KEY else None
 
     chat_store = chat_module.ChatStore(config.CHAT_DB_PATH)

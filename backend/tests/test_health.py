@@ -211,14 +211,118 @@ def test_models_ok_any_missing(missing):
     assert health._models_ok({}) is False
 
 
-# --- _llm_ok ---
+# --- the LLM key check ---
+
+# A real Google key: "AIza" + 35 URL-safe characters. Built by hand because the
+# point of the check is the shape -- a random 39-char string would be a fixture
+# that passes for the wrong reason.
+REAL_GEMINI_KEY = "AIzaSyD-Example_Key0123456789abcdefghij"
+
+assert len(REAL_GEMINI_KEY) == 39, "the realistic fixture must be a real key's length"
+
+# Filler that has actually shipped in a .env, plus the spellings a template or a
+# careless copy-paste produces. Every one of these is non-empty, so
+# `bool(config.GEMINI_API_KEY)` -- the check this replaced -- called all of them
+# healthy while chat answered every question from the canned fallback.
+PLACEHOLDER_KEYS = [
+    "your_key_here",  # the literal value shipped in backend/.env.example
+    "YOUR_KEY_HERE",
+    "  your_key_here  ",
+    "your-api-key",
+    "your_api_key_here",
+    "<your key here>",
+    "YourKeyHere",
+    "changeme",
+    "CHANGE-ME",
+    "replace-me",
+    "TODO",
+    "tbd",
+    "none",
+    "null",
+    "N/A",
+    "dummy",
+    "xxxxx",
+    "x-x-x-x-x",
+    "secret",
+    "test",
+]
+
+# Filler that is not in the known-sentinel list, so it is caught by the shape
+# check rather than the list -- and classified "malformed" instead of
+# "placeholder". Listed separately because the classification is meant to be
+# truthful; what matters for the readiness verdict is that both are NOT ok.
+UNLISTED_FILLER = [
+    "sample-key",
+    "sk-live-0123456789abcdef",
+    "paste your key above this line",
+    "AIza",
+]
 
 
-def test_llm_ok(monkeypatch):
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "sk-test")
-    assert health._llm_ok() is True
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
-    assert health._llm_ok() is False
+@pytest.mark.parametrize("value", UNLISTED_FILLER)
+def test_llm_status_rejects_unlisted_filler_as_not_usable(monkeypatch, value):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    ok, reason = health._llm_status()
+
+    assert ok is False
+    assert reason in ("placeholder", "malformed")
+
+
+@pytest.mark.parametrize("value", PLACEHOLDER_KEYS)
+def test_llm_status_rejects_every_placeholder_spelling(monkeypatch, value):
+    """A placeholder is not a key. It must never read as a healthy LLM (#279)."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    ok, reason = health._llm_status()
+
+    assert ok is False
+    assert reason == "placeholder"
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_llm_status_reports_an_absent_key_as_missing(monkeypatch, value):
+    """Unset and empty are "missing", told apart from a placeholder so an
+    operator can see which fault they actually have."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    assert health._llm_status() == (False, "missing")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["sk-test", "AIzaTooShort", "AIza" + "a" * 34, "AIza" + "a" * 36, "AIza!a" * 8],
+)
+def test_llm_status_rejects_a_key_of_the_wrong_shape(monkeypatch, value):
+    """Non-empty and not filler, but not something Google would accept: a typo
+    or a truncated paste fails chat the same way a placeholder does."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", value)
+
+    assert health._llm_status() == (False, "malformed")
+
+
+def test_llm_status_accepts_a_real_shaped_key(monkeypatch):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
+
+    assert health._llm_status() == (True, "ok")
+
+
+def test_llm_status_does_not_impose_google_s_shape_on_a_custom_endpoint(monkeypatch):
+    """GEMINI_BASE_URL is configurable, so a deployment behind an
+    OpenAI-compatible gateway legitimately holds a differently shaped key.
+    Rejecting it would report a working configuration as broken."""
+    monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://llm-gateway.internal/v1")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "sk-live-0123456789abcdef")
+
+    assert health._llm_status() == (True, "ok")
+
+
+def test_llm_status_never_echoes_the_key_it_rejected(monkeypatch):
+    """The report is served to any caller that can reach /ready, so the fault is
+    named by classification and the secret itself is not echoed."""
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "your_key_here")
+
+    assert "your_key_here" not in repr(health._llm_status())
 
 
 # --- _redis_status ---
@@ -707,7 +811,7 @@ def test_readiness_report_ready(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", _async(True))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     ready, report = _run(health._readiness_report({}))
     assert ready is True
@@ -715,14 +819,14 @@ def test_readiness_report_ready(monkeypatch):
     assert report["checks"]["qdrant"] == {"ok": True}
     assert report["checks"]["models"] == {"ok": True}
     assert report["checks"]["redis"] == {"ok": True, "cache": "memory"}
-    assert report["checks"]["llm"] == {"ok": True}
+    assert report["checks"]["llm"] == {"ok": True, "reason": "ok"}
 
 
 def test_readiness_report_not_ready_qdrant_down(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", _async(False))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
     monkeypatch.setattr(health, "_redis_status", _async((True, "degraded")))
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     ready, report = _run(health._readiness_report({}))
     assert ready is False
@@ -734,17 +838,17 @@ def test_readiness_report_not_ready_models_missing(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", _async(True))
     monkeypatch.setattr(health, "_models_ok", lambda s: False)
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
-    monkeypatch.setattr(health, "_llm_ok", lambda: False)
+    monkeypatch.setattr(health, "_llm_status", lambda: (False, "missing"))
 
     ready, report = _run(health._readiness_report({}))
     assert ready is False
     assert report["checks"]["models"] == {"ok": False}
-    assert report["checks"]["llm"] == {"ok": False}
+    assert report["checks"]["llm"] == {"ok": False, "reason": "missing"}
 
 
 def test_readiness_report_wires_real_checks(monkeypatch):
     monkeypatch.setattr(config, "REDIS_URL", "")
-    monkeypatch.setattr(config, "GEMINI_API_KEY", "sk-test")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", REAL_GEMINI_KEY)
 
     class FakeQdrant:
         async def collection_exists(self, name):
@@ -811,7 +915,7 @@ def test_ready_503_when_dependency_down_and_200_when_all_up(client, monkeypatch)
     monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
     monkeypatch.setattr(health, "_redis_status", _async((True, "redis")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     r = client.get("/ready")
     assert r.status_code == 503
@@ -842,7 +946,7 @@ def test_ready_503_for_unexpected_qdrant_driver_error(client, monkeypatch):
     monkeypatch.setitem(app_main.state, "qdrant", BrokenQdrant())
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     tc = _raise_server_errors_client(client)
     try:
@@ -866,7 +970,7 @@ def test_readyz_503_for_unexpected_qdrant_driver_error(client, monkeypatch):
     monkeypatch.setitem(app_main.state, "qdrant", BrokenQdrant())
     monkeypatch.setattr(health, "_redis_status", _async((True, "memory")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
 
     tc = _raise_server_errors_client(client)
     try:
@@ -918,7 +1022,7 @@ def test_ready_second_poll_inside_ttl_is_served_from_cache(client, monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
     monkeypatch.setattr(health, "_redis_status", redis_probe)
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 30.0)
 
     first = client.get("/ready")
@@ -950,7 +1054,7 @@ def test_ready_reprobes_once_the_cache_ttl_has_passed(client, monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", qdrant_probe)
     monkeypatch.setattr(health, "_redis_status", redis_probe)
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 0.0)
 
     assert client.get("/ready").status_code == 200
@@ -1093,7 +1197,7 @@ def test_readiness_report_probes_dependencies_concurrently(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", recorder("qdrant", True))
     monkeypatch.setattr(health, "_redis_status", recorder("redis", (True, "memory")))
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_DEP_TIMEOUT_SECONDS", 5.0)
 
     ready, report = _run(health._readiness_report({}))
@@ -1245,7 +1349,7 @@ def test_readiness_report_probe_timeout_is_a_dependency_failure(monkeypatch):
     monkeypatch.setattr(health, "_qdrant_ok", never_returns)
     monkeypatch.setattr(health, "_redis_status", never_returns_redis)
     monkeypatch.setattr(health, "_models_ok", lambda s: True)
-    monkeypatch.setattr(health, "_llm_ok", lambda: True)
+    monkeypatch.setattr(health, "_llm_status", lambda: (True, "ok"))
     monkeypatch.setattr(config, "READY_DEP_TIMEOUT_SECONDS", 0.05)
 
     ready, report = _run(health._readiness_report({}))
