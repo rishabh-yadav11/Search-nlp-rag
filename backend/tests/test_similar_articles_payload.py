@@ -165,16 +165,20 @@ class TestSimilarResponseExcludesBody:
         for article in second.similar_articles:
             assert "body" not in article
 
-    def test_body_free_on_the_article_id_the_ui_does_not_render_for(self, wired):
-        """A point missing optional fields must not smuggle a body back in."""
+    def test_body_free_when_the_point_carries_only_a_title_and_url(self, wired):
+        """A point with no optional fields must not smuggle a body back in."""
         _cache, client = wired
-        client.query_points.return_value.points = [_point(7, body=_body(), title=None)]
+        # id 8, not the queried article: 7 is filtered out as the source, which
+        # would leave nothing to assert on.
+        client.query_points.return_value.points = [_point(8, body=_body())]
         client.query_points.return_value.points[0].payload = {
             "title": "Bare point", "url": "https://example.com/x", "body": _body(),
         }
+
         response = _call_similar()
-        for article in response.similar_articles:
-            assert "body" not in article
+
+        assert len(response.similar_articles) == 1, "the bare point should still be returned"
+        assert "body" not in response.similar_articles[0]
 
 
 class TestSimilarCacheEntryExcludesBody:
