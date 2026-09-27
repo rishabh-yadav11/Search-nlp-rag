@@ -438,11 +438,27 @@ Each `top_by_*` row is `[session_id, messages, cost | tokens, updated_at]`.
 
 Every read is recorded in the durable `admin_audit` table (`actor_id`,
 `action`, `created_at`), written by `ChatStore.record_admin_audit` before the
-response is returned and readable back with `ChatStore.admin_audit_log`. Rows
-older than `AUDIT_RETENTION_DAYS` (90) are dropped by the existing retention
-sweep, `ChatStore.purge_expired`, so recording a read stays a single INSERT
-despite this endpoint being polled every 30s. The trail is deliberately not
-exposed over HTTP.
+response is returned. Rows older than `AUDIT_RETENTION_DAYS` (90) are dropped by
+the existing retention sweep, `ChatStore.purge_expired`, so recording a read
+stays a single INSERT despite this endpoint being polled every 30s.
+
+**Reading the trail.** `ChatStore.admin_audit_log` is the reader, and it is a
+store method with no HTTP surface — recovering the trail means querying the
+chat SQLite database directly (or calling the method from a Python shell),
+which needs filesystem access. There is no admin UI or endpoint for it. That
+is a deliberate position, not an oversight: publishing cross-user read history
+over the API would create a second cross-user disclosure, in the endpoint
+this issue exists to harden. Be aware of the cost — a control nobody can
+easily read deters less than it appears to.
+
+**What the trail does and does not establish.** It answers "which admin read
+cross-user chat analytics, when, and how often". It does *not* support
+detecting a slow browse through individual conversations: `action` is a
+constant and no row records which sessions were returned, so a deliberate
+browse and an idle open dashboard tab look identical. Per-subject attribution
+was deliberately omitted rather than overlooked — it would put other users'
+session ids into the audit table, trading this fix's own privacy goal for a
+weaker signal.
 
 `actor_id` is the authenticated account's id, so human admin logins are
 attributed individually. A request authenticated with the shared
