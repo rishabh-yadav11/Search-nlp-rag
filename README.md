@@ -435,7 +435,8 @@ everything it branched off from. This branch scans clean (0 leaks).
 
 The scan reads committed history, not the working tree, so the gate was proved
 by committing a throwaway RSA private key on a scratch clone: gitleaks reported
-the leak and exited 1, and the identical command exits 0 without it. Worth
-knowing: gitleaks' built-in dummy allowlist swallows the canonical placeholder
-AWS key and a synthetic `ghp_` token, so a probe using those two strings is
-not evidence the gate works.
+the leak and exited 1, and the identical command exits 0 without it. Note that
+a bare `aws_access_key_id = AKIA...` line — placeholder *or* realistic — and a
+synthetic `ghp_` token are both **not** flagged by the default 8.28.0 rules in
+this shape, so neither is a valid probe for "the gate can fail". Only the
+private-key block actually flipped it.
