@@ -10,21 +10,22 @@ So this test runs ONE fixture corpus (fixtures/dataviz_corpus.json) through
 BOTH implementations — the backend's ``parse_dataviz`` in-process, and the
 frontend's real ``parseDataViz`` executed under node by importing
 frontend/app/chat/datavizContract.ts — and fails if they accept different
-fixtures, pick a different value column, or coerce a cell to a different number.
-The three lists and grammars that used to be copy-pasted between the two files
-(fence pattern, missing-value tokens, numeric-literal pattern) are asserted
-equal as strings/sets too, so a divergence cannot hide in a corner the corpus
-does not reach.
+fixtures, pick a different value column, coerce a cell to a different number, or
+match a different span of the answer.
 
-node is required (>= 22.6, for its built-in TypeScript support); without it the
-cross-language half skips loudly rather than passing quietly, and the Python
-half still runs.
+Running the frontend half needs a node that can import a ``.ts`` file, which is
+node 22.6+ (the built-in TypeScript support, unflagged from 22.18). The
+frontend itself still builds on node 18+, so that remains the documented
+requirement for the app; only this one test needs the newer node. Because this
+module is the only coverage of the browser-side validator, a node that cannot
+run it is a FAILURE under CI and a skip locally, never a silent pass.
 """
 
 import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -36,6 +37,27 @@ _HERE = pathlib.Path(__file__).resolve().parent
 CORPUS_PATH = _HERE / "fixtures" / "dataviz_corpus.json"
 HARNESS_PATH = _HERE / "dataviz_harness.mjs"
 CONTRACT_TS_PATH = pathlib.Path(__file__).resolve().parents[2] / "frontend" / "app" / "chat" / "datavizContract.ts"
+
+# The oldest node whose TypeScript support can import the .ts validator.
+MIN_NODE = (22, 6)
+
+
+def _node_version(executable: str) -> tuple[int, ...] | None:
+    """The node version as a comparable tuple, or None when it cannot be
+    determined — including when the executable does not exist, which
+    subprocess.run reports by raising rather than by a non-zero exit."""
+    try:
+        proc = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"v(\d+)\.(\d+)\.(\d+)", proc.stdout or "")
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
 
 
 def _plotted_values(data):
@@ -69,6 +91,18 @@ def _python_verdict(text):
     return {"accept": True, "value_column": data["value_column"], "values": _plotted_values(data)}
 
 
+def _utf16_units(text: str, index: int) -> int:
+    """``index`` (a Python codepoint offset) as a UTF-16 code-unit offset.
+
+    JavaScript string indices count UTF-16 code units, so a character outside
+    the BMP -- an emoji, say -- counts as TWO there and as ONE here. Comparing
+    the two spans without this conversion fabricates a divergence on any text
+    carrying a supplementary character, even though both sides captured the same
+    payload and agreed on the verdict. surrogatepass so a stray surrogate in a
+    fixture cannot make this helper raise."""
+    return len(text[:index].encode("utf-16-le", "surrogatepass")) // 2
+
+
 @pytest.fixture(scope="module")
 def corpus():
     return json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
@@ -78,25 +112,32 @@ def corpus():
 def frontend(corpus):
     """The shipped frontend validator's verdicts, by actually running it.
 
-    This module is the ONLY coverage of the browser-side validator — no frontend
-    test file touches it — so a silent skip here is not a small loss, it is the
-    loss of the whole issue's guarantee. Under CI, where node is expected and
-    can be installed, a missing node is therefore a FAILURE rather than a skip;
-    locally it still skips, because a developer without node should not be told
-    their backend is broken. The error names the version that can import a .ts
-    module, which is why the repo's documented Node 18+ is not enough for this."""
+    A node too old to import a .ts module is treated exactly like a missing one:
+    a failure under CI, a skip locally. A developer on node 18 should not be
+    told their backend is broken, but CI must not quietly lose the only coverage
+    of the browser-side validator."""
     node = shutil.which("node")
+    unusable = None
     if node is None:
+        unusable = f"node is not on PATH, or is older than {MIN_NODE[0]}.{MIN_NODE[1]}"
+    else:
+        version = _node_version(node)
+        if version is None or version < MIN_NODE:
+            usable = version and ".".join(str(p) for p in version) or "an unreadable version"
+            unusable = f"node {usable} cannot import a .ts module; {MIN_NODE[0]}.{MIN_NODE[1]}+ is required"
+    if unusable is not None:
         message = (
-            "node is not on PATH, so the shipped frontend dataviz validator "
-            "cannot be executed and the cross-language half of #267 is untested. "
-            "It needs node >= 22.6 for the built-in .ts import this harness uses."
+            f"{unusable}, so the shipped frontend dataviz validator cannot be executed and the "
+            "cross-language half of #267 is untested. It needs node >= 22.6 for the built-in "
+            "TypeScript support that imports frontend/app/chat/datavizContract.ts directly."
         )
         if os.environ.get("CI"):
-            pytest.fail(message + " Install node in CI rather than letting the suite pass without it.")
+            pytest.fail(message + " Install a new enough node in CI rather than letting the suite pass without it.")
         pytest.skip(message)
+    # The flag is what opts 22.6-22.17 into type stripping; newer node accepts it
+    # as a no-op, so it is always safe to pass and avoids a second version branch.
     proc = subprocess.run(
-        [node, str(HARNESS_PATH), str(CONTRACT_TS_PATH), str(CORPUS_PATH)],
+        [node, "--experimental-strip-types", str(HARNESS_PATH), str(CONTRACT_TS_PATH), str(CORPUS_PATH)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -106,6 +147,20 @@ def frontend(corpus):
         f"the frontend dataviz validator did not run (node {node}, exit {proc.returncode})\n{proc.stderr}"
     )
     return json.loads(proc.stdout)
+
+
+def test_node_probe_rejects_versions_that_cannot_import_typescript():
+    """The gate is the version, not merely `which node`.
+
+    The repo documents node 18+ for the app, and a node 18 or 20 box WOULD pass a
+    `shutil.which` check and then die inside the harness on an unknown .ts
+    extension — turning the whole backend suite red with a raw subprocess error
+    instead of a clean, explanatory skip. Pinning the minimum here keeps that
+    path honest, and is the reason the harness also passes
+    --experimental-strip-types: node 22.6-22.17 needs the flag to strip types,
+    while 22.18+ and every 23.x/24.x accept it as a no-op."""
+    assert MIN_NODE == (22, 6)
+    assert _node_version("definitely-not-a-real-node-binary") is None
 
 
 def test_frontend_and_backend_agree_on_every_fixture(corpus, frontend):
@@ -147,16 +202,16 @@ def test_every_fixture_has_the_verdict_both_sides_agree_on(corpus, frontend):
     assert not wrong, "verdicts the corpus says are wrong:\n" + "\n".join(wrong)
 
 
-def _utf16_units(text: str, index: int) -> int:
-    """``index`` (a Python codepoint offset) as a UTF-16 code-unit offset.
-
-    JavaScript string indices count UTF-16 code units, so a character outside
-    the BMP -- an emoji, say -- counts as TWO there and as ONE here. Comparing
-    the two spans without this conversion fabricates a divergence on any text
-    carrying a supplementary character, even though both sides captured the same
-    payload and agreed on the verdict. surrogatepass so a stray surrogate in a
-    fixture cannot make this helper raise."""
-    return len(text[:index].encode("utf-16-le", "surrogatepass")) // 2
+def test_fixture_names_are_unique(corpus):
+    """The harness keys its results by fixture name, so two fixtures sharing one
+    would leave the first shadowed -- its verdict compared against the second's --
+    and a real disagreement on it would never be looked at."""
+    seen, duplicates = set(), []
+    for fixture in corpus["fixtures"]:
+        if fixture["name"] in seen:
+            duplicates.append(fixture["name"])
+        seen.add(fixture["name"])
+    assert not duplicates, "fixture names used twice: " + ", ".join(sorted(duplicates))
 
 
 def test_both_sides_match_the_same_fence_text(corpus, frontend):
@@ -203,8 +258,8 @@ def test_deeply_nested_payload_is_dropped_not_raised():
 def test_view_pinning_applies_the_same_load_rules():
     """The view-pinning path re-loads the block itself, and that second load used
     to be laxer than parse_dataviz's: it let a block through that the
-    re-validation then rejected, so _apply_requested_view returned it unpinned and
-    a user who asked for a bar chart quietly lost the chart."""
+    re-validation below then rejected, so _apply_requested_view returned it
+    unpinned and a user who asked for a bar chart quietly lost the chart."""
     payload = '{"columns": ["A", "B"], "rows": [["x", 1e999]], "value_column": 1}'
     assert chat_module._parse_dataviz_with_view(f"```dataviz\n{payload}\n```", "bar") is None
     bare = '{"columns": ["A", "B"], "rows": [["x", 1]], "value_column": 1, "note": Infinity}'
@@ -213,18 +268,6 @@ def test_view_pinning_applies_the_same_load_rules():
     good = '{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}'
     pinned = chat_module._parse_dataviz_with_view(f"```dataviz\n{good}\n```", "bar")
     assert pinned is not None and pinned["view"] == "bar"
-
-
-def test_fixture_names_are_unique(corpus):
-    """The harness keys its results by fixture name, so two fixtures sharing one
-    would leave the first shadowed -- its verdict compared against the second's --
-    and a real disagreement on it would never be looked at."""
-    seen, duplicates = set(), []
-    for fixture in corpus["fixtures"]:
-        if fixture["name"] in seen:
-            duplicates.append(fixture["name"])
-        seen.add(fixture["name"])
-    assert not duplicates, "fixture names used twice: " + ", ".join(sorted(duplicates))
 
 
 def test_fence_grammar_is_one_string_on_both_sides(frontend):
@@ -238,6 +281,36 @@ def test_numeric_literal_grammar_is_one_string_on_both_sides(frontend):
     literal. The pattern is shared as a string so the frontend's Number() and
     the backend's float() cannot drift into accepting different spellings."""
     assert frontend["numeric_literal_src"] == chat_module._NUMERIC_LITERAL_SRC
+
+
+def test_trim_grammar_is_one_string_on_both_sides(frontend):
+    """The trim set is shared as a string, so the character class behind the
+    per-codepoint probe above can only be changed in both places at once."""
+    assert frontend["trim_src"] == chat_module._TRIM_SRC
+
+
+def test_payload_depth_limit_is_one_number_on_both_sides(frontend):
+    """The nesting depth past which a payload counts as malformed is shared, so
+    the frontend's recursive walk cannot give up where the backend's still
+    succeeds (or overflow V8's stack on a payload json.loads refused)."""
+    assert frontend["max_json_depth"] == chat_module._MAX_JSON_DEPTH
+
+
+def test_both_sides_trim_the_same_whitespace(frontend):
+    """Which characters get trimmed off a cell, checked one codepoint at a time.
+
+    The two languages disagree here and a string comparison cannot see it:
+    JavaScript's trim() removes U+FEFF and Python's str.strip() does not, so a
+    cell carrying a BOM read as "missing" in the browser and as a real value on
+    the server. Both sides now name ASCII whitespace explicitly, and this pins
+    every character either side might have an opinion about -- including the
+    ones that must NOT be trimmed."""
+    mismatched = [
+        f"U+{cp.upper()}: backend trims={backend_trims} frontend trims={frontend['trim_probes'].get(cp)}"
+        for cp, backend_trims in sorted(chat_module._TRIM_PROBES.items())
+        if frontend["trim_probes"].get(cp) != backend_trims
+    ]
+    assert not mismatched, "the two sides trim different characters:\n" + "\n".join(mismatched)
 
 
 def test_missing_value_tokens_are_identical_on_both_sides(corpus, frontend):
@@ -274,33 +347,3 @@ def test_corpus_exercises_every_missing_value_token(corpus):
         if tok not in cells:
             problems.append(f"{tok!r}: fixture {name} does not contain it as a cell (cells={cells!r})")
     assert not problems, "missing-value tokens no fixture really covers:\n" + "\n".join(problems)
-
-
-def test_both_sides_trim_the_same_whitespace(frontend):
-    """Which characters get trimmed off a cell, checked one codepoint at a time.
-
-    The two languages disagree here and a string comparison cannot see it:
-    JavaScript's trim() removes U+FEFF and Python's str.strip() does not, so a
-    cell carrying a BOM read as "missing" in the browser and as a real value on
-    the server. Both sides now name ASCII whitespace explicitly, and this pins
-    every character either side might have an opinion about -- including the
-    ones that must NOT be trimmed."""
-    mismatched = [
-        f"U+{cp.upper()}: backend trims={backend_trims} frontend trims={frontend['trim_probes'].get(cp)}"
-        for cp, backend_trims in sorted(chat_module._TRIM_PROBES.items())
-        if frontend["trim_probes"].get(cp) != backend_trims
-    ]
-    assert not mismatched, "the two sides trim different characters:\n" + "\n".join(mismatched)
-
-
-def test_trim_grammar_is_one_string_on_both_sides(frontend):
-    """The trim set is shared as a string, so the character class behind the
-    per-codepoint probe above can only be changed in both places at once."""
-    assert frontend["trim_src"] == chat_module._TRIM_SRC
-
-
-def test_payload_depth_limit_is_one_number_on_both_sides(frontend):
-    """The nesting depth past which a payload counts as malformed is shared, so
-    the frontend's recursive walk cannot give up where the backend's still
-    succeeds (or overflow V8's stack on a payload json.loads refused)."""
-    assert frontend["max_json_depth"] == chat_module._MAX_JSON_DEPTH
