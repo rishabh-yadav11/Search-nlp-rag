@@ -182,3 +182,14 @@ def test_the_backend_deploy_gate_waits_on_readiness_not_on_the_health_stub():
 
     assert 'wait_http "http://localhost:$API_PORT/ready/deep"' in source
     assert 'wait_http "http://localhost:$API_PORT/health"' not in source
+
+
+def test_the_nginx_vhost_refuses_the_uncached_probe():
+    """`location /ready` is a PREFIX match, so without an explicit block a public
+    GET /ready/deep is proxied to the API and is held dark only by the app's
+    host-local check. /ready/deep is uncached and unrated by design, so a
+    public dependency-probe amplifier deserves a second layer that does not live
+    in the same file as the code it protects."""
+    source = SETUP_SH.read_text()
+
+    assert "location /ready/deep { return 404; }" in source

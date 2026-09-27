@@ -117,9 +117,9 @@ needing a real answer uses `/ready` (load balancer, cached and rate limited) or
 `/ready/deep` (the deploy gate and the cron watchdog, uncached and unrated so
 they cannot read a stale verdict or be throttled into a false outage).
 `/ready/deep` answers only a direct loopback request with no
-`X-Forwarded-For`, and is deliberately **not** given an nginx `location` below:
-it is unrated and uncached, so exposing it publicly would be a free
-dependency-probe amplifier.
+`X-Forwarded-For`, and the vhost below additionally returns `404` for it, so the
+unrated, uncached probe has two independent layers in front of it rather than
+depending on one line of application check.
 
 ## Prerequisites
 
@@ -317,10 +317,12 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
-    # /ready/deep is deliberately NOT proxied: it is uncached and unrated (it is
-    # the watchdog's probe), so the API refuses any caller that is not a direct
-    # loopback request without X-Forwarded-For -- which every request that came
-    # through this block has.
+    # `location /ready` is a PREFIX match, so a public GET /ready/deep would
+    # otherwise be proxied here and refused only by the API's own host-local
+    # check. /ready/deep is uncached and unrated (it is the watchdog's probe), so
+    # it gets a second, independent layer and simply does not exist on the public
+    # surface. setup.sh and deploy/healthcheck.sh reach it on 127.0.0.1 directly.
+    location /ready/deep { return 404; }
     location /api {
         proxy_pass http://127.0.0.1:8001;
         proxy_read_timeout 300s;
