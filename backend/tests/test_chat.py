@@ -3369,11 +3369,22 @@ def test_dataviz_valid_fence_survives_the_unclosed_rule():
     assert chat_module.parse_dataviz(finalized) is not None
 
 
+# The dataviz grammar (fence regex, unclosed-fence truncation and the whole
+# block validator) lives in this ONE module, so the backend can execute the
+# shipped frontend rules under node instead of re-typing them (#267).
+_DATAVIZ_CONTRACT_TS = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "frontend"
+    / "app"
+    / "chat"
+    / "datavizContract.ts"
+)
+
+
 def test_fence_src_matches_python_fence_pattern():
     """The frontend and the backend must use the SAME grammar string, so a fence
     the UI renders is the fence the server finalized (#255)."""
-    tsx = pathlib.Path(__file__).resolve().parents[2] / "frontend" / "app" / "chat" / "DataViz.tsx"
-    raw = re.search(r"const FENCE_SRC = '([^']*)'", tsx.read_text()).group(1)
+    raw = re.search(r"const FENCE_SRC = '([^']*)'", _DATAVIZ_CONTRACT_TS.read_text()).group(1)
     # The literal is single-quoted TS, where \S is written \\S; unescape it the
     # way JS would before comparing to the Python source string.
     js_runtime = json.loads('"' + raw + '"')
@@ -3391,9 +3402,10 @@ _FENCE_FIXTURES = {
 def _node_strip_open_fence(fixtures):
     """Run the TSX's own regex + truncation rule under node.
 
-    `stripOpenFence` and `FENCE_SRC` are copied verbatim out of DataViz.tsx so
-    this exercises the shipped frontend rule, not a re-typed approximation."""
-    tsx = (pathlib.Path(__file__).resolve().parents[2] / "frontend" / "app" / "chat" / "DataViz.tsx").read_text()
+    `stripOpenFence` and `FENCE_SRC` are read verbatim out of the frontend
+    contract module so this exercises the shipped frontend rule, not a re-typed
+    approximation."""
+    tsx = _DATAVIZ_CONTRACT_TS.read_text()
     fence_src = re.search(r"const FENCE_SRC = '([^']*)'", tsx).group(1)
     strip = re.search(r"(function stripOpenFence\(md: string\): string \{.*?\n\})", tsx, re.DOTALL).group(1)
     # Drop the TS type annotation; the body is plain JS.
