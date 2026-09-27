@@ -439,6 +439,15 @@ that range is clamped to the nearest bound, so every reported bucket is one the
 backend can record. `top_queries` returns at most `TOP_QUERIES_N` (20) entries
 and `click_top_queries` at most `TOP_CLICKED_QUERIES_N` (10).
 
+### Errors
+
+`503` with `{"error": "analytics unavailable", "detail": "the analytics store
+could not be read"}` when the analytics Redis cannot be reached. A failed read is
+never served as a `200` with zeroed counters — an all-zero report and a dead
+store are indistinguishable, which is exactly how a Redis outage used to look
+like a quiet day. Clients must treat `503` (or an `error` key in the body) as
+"no data", never as a report.
+
 ---
 
 ## `GET /analytics/chat`
@@ -479,6 +488,13 @@ Every read is recorded in the durable `admin_audit` table (`actor_id`,
 response is returned. Rows older than `AUDIT_RETENTION_DAYS` (90) are dropped by
 the existing retention sweep, `ChatStore.purge_expired`, so recording a read
 stays a single INSERT despite this endpoint being polled every 30s.
+
+### Errors
+
+`503` with `{"error": "chat analytics unavailable", "detail": "the analytics
+store could not be read"}` when the chat store cannot be queried. As with
+`/analytics/summary`, a store that cannot be read is reported as a failed
+request rather than as a `200` whose totals happen to be zero.
 
 **Reading the trail.** `ChatStore.admin_audit_log` is the reader, and it is a
 store method with no HTTP surface — recovering the trail means querying the

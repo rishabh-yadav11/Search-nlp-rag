@@ -205,6 +205,17 @@ describe('AnalyticsDashboardPage — a store that cannot be read is not a quiet 
     expect(document.body.textContent).not.toMatch(/Updated \d/)
   })
 
+  it('treats a 503 with no error key as a failure on the status line alone', async () => {
+    // An intermediary (nginx, a gateway) can answer 503 with an HTML error
+    // page or an empty body, so the status line has to be load-bearing on its
+    // own — not only the `error` key.
+    await renderFeeds(statusResponse(503, '<html>502 Bad Gateway</html>'), statusResponse(200, CHAT))
+
+    expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
+    expect(screen.getByText(/HTTP 503/)).toBeTruthy()
+    expect(screen.queryByText('Searches today')).toBeNull()
+  })
+
   it('still detects the legacy 200-with-error body the backend used to send', async () => {
     // Status 200 + an `error` key is byte-for-byte what the old backend sent
     // during a Redis outage; treating it as data is what produced the all-zero
