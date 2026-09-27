@@ -9,11 +9,30 @@
  */
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TOKEN_KEY } from '../lib/auth'
 import { CHAT_API_DEADLINE_MS } from '../lib/deadline'
 import ChatPage from './page'
 
-let signals: (AbortSignal | null)[] = []
+/**
+ * Every fetch the page issues, with the signal it was given. The page's mount
+ * now opens with a `/api/auth/me` identity check — the cookie is httpOnly, so
+ * that request is the only way to tell a signed-in visitor from a signed-out
+ * one — which means the calls can no longer be told apart by position. They
+ * are selected by endpoint instead, so a call added at the front cannot make a
+ * test quietly re-test its neighbour.
+ */
+let calls: { url: string; method: string; signal: AbortSignal | null }[] = []
+
+/** The first (and only) call to `path` with `method`, or a test failure. */
+function callTo(path: string, method = 'GET') {
+  const found = calls.find((c) => c.url.includes(path) && c.method === method)
+  if (!found) {
+    throw new Error(
+      `no ${method} ${path} among the page's calls: ` +
+        calls.map((c) => `${c.method} ${c.url}`).join(', ')
+    )
+  }
+  return found
+}
 
 type StubResponse = {
   ok: boolean
@@ -28,9 +47,9 @@ function jsonResponse(data: unknown): StubResponse {
 
 /** Every chat API call hangs until its signal aborts. */
 function hangingApi() {
-  return vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+  return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const signal = init?.signal ?? null
-    signals.push(signal)
+    calls.push({ url: String(input), method: init?.method ?? 'GET', signal })
     const { promise, reject } = Promise.withResolvers<StubResponse>()
     if (signal) {
       signal.addEventListener('abort', () => {
@@ -45,8 +64,7 @@ function hangingApi() {
 
 beforeEach(() => {
   vi.useFakeTimers()
-  signals = []
-  localStorage.setItem(TOKEN_KEY, 'test-token')
+  calls = []
   Element.prototype.scrollTo = function scrollTo() {}
   vi.stubGlobal('fetch', hangingApi())
 })
@@ -75,16 +93,15 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
   it('aborts the hung session create and reports the failure instead of spinning', async () => {
     await submitFirstTurn('what happened to the deal?')
 
-    // The mount-time session LIST is the first call; the create is the one
-    // issued by the submit click, so it must be picked out by index — picking
-    // signals[0] here would silently re-test the list call instead.
-    const createCall = signals[1]
-    expect(createCall).toBeTruthy()
-    expect(createCall?.aborted).toBe(false)
+    // The mount-time session LIST and the session CREATE both go to
+    // /api/chat/sessions; only the method tells them apart.
+    const createCall = callTo('/api/chat/sessions', 'POST')
+    expect(createCall.signal).toBeTruthy()
+    expect(createCall.signal?.aborted).toBe(false)
 
     await advance(CHAT_API_DEADLINE_MS)
 
-    expect(createCall?.aborted).toBe(true)
+    expect(createCall.signal?.aborted).toBe(true)
     // The caller's generic copy is replaced by the deadline's own message, so a
     // timeout is distinguishable from any other failure the user can retry.
     expect(screen.getByRole('alert').textContent).toMatch(/timed out after 30s/)
@@ -94,19 +111,19 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
     await submitFirstTurn('what happened to the deal?')
     await advance(CHAT_API_DEADLINE_MS)
 
-    const before = signals.length
+    const before = calls.length
     await submitFirstTurnAgain('trying once more')
-    expect(signals.length).toBeGreaterThan(before)
+    expect(calls.length).toBeGreaterThan(before)
   })
 
   it('aborts the hung sidebar session list at the deadline', async () => {
     render(<ChatPage />)
-    const listCall = signals[0]
-    expect(listCall?.aborted).toBe(false)
+    const listCall = callTo('/api/chat/sessions', 'GET')
+    expect(listCall.signal?.aborted).toBe(false)
 
     await advance(CHAT_API_DEADLINE_MS)
 
-    expect(listCall?.aborted).toBe(true)
+    expect(listCall.signal?.aborted).toBe(true)
   })
 
   it('reports a failed delete instead of leaking an unhandled rejection', async () => {

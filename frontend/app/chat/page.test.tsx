@@ -9,7 +9,6 @@
  */
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TOKEN_KEY } from '../lib/auth'
 import type * as DataVizModule from './DataViz'
 import ChatPage from './page'
 
@@ -40,6 +39,11 @@ vi.mock('../components/SimilarArticles', () => ({
 
 const SESSION = { id: 's1', title: 'Budget', created_at: 1_700_000_000, updated_at: 1_700_000_100 }
 
+// The signed-in user the /api/auth/me stub reports. The page decides whether to
+// redirect based on this, and there is no longer any storage-based session to
+// seed.
+const ME_USER = { id: 'u1', email: 'user@example.com', name: 'User', role: 'user', is_active: true }
+
 // Two settled turns. The first assistant message deliberately carries NO
 // `sources`, which is what makes the `sources={m.sources ?? []}` prop literal
 // on the hot render path allocate a fresh array on every tick.
@@ -66,6 +70,10 @@ const FINAL_ANSWER = 'LIVE abcdef done'
 
 let streamCtrl: ReadableStreamDefaultController<Uint8Array> | null = null
 
+// Every RequestInit the streaming fetch was called with, so the tests below can
+// assert on the request the page actually issued.
+let streamInits: RequestInit[] = []
+
 // The fetch stub is used both for JSON endpoints and for the SSE response, so
 // its shape is pinned explicitly: without it TS cannot infer the callbacks
 // and reports them as implicit `any` (TS7023).
@@ -85,14 +93,15 @@ beforeEach(() => {
   splitCalls.length = 0
   similarRenders.length = 0
   streamCtrl = null
-  localStorage.setItem(TOKEN_KEY, 'test-token')
+  streamInits = []
   // jsdom implements neither; ChatPage scrolls the thread on every message.
   Element.prototype.scrollTo = function scrollTo() {}
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (input: RequestInfo | URL): Promise<StubResponse> => {
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<StubResponse> => {
       const url = String(input)
       if (url.includes('/messages/stream')) {
+        streamInits.push(init ?? {})
         return {
           ok: true,
           status: 200,
@@ -105,6 +114,10 @@ beforeEach(() => {
           }),
         }
       }
+      // The session is an httpOnly cookie now, so the page's "am I signed in?"
+      // check goes through /api/auth/me. Answer it with a user so the guard
+      // passes; the test never fakes a session via storage.
+      if (url.endsWith('/api/auth/me')) return jsonResponse(ME_USER)
       if (url.endsWith('/api/chat/sessions')) return jsonResponse([SESSION])
       if (url.includes('/api/chat/sessions/')) return jsonResponse({ ...SESSION, messages: SETTLED })
       return jsonResponse({ similar_articles: [] })
@@ -281,5 +294,28 @@ describe('ChatPage — a server-truncated thread is announced, not silently shor
     // One more turn = one more user message and one more answer stored, and
     // the loaded window is a fixed-size tail, so 10 hidden becomes 12.
     expect(screen.getByRole('status').textContent).toContain('12')
+  })
+})
+
+describe('ChatPage — the session cookie rides on every session-bearing request', () => {
+  it('sends credentials on the streaming message fetch', async () => {
+    await openConversation()
+    await streamABurst()
+
+    expect(streamInits.length).toBeGreaterThan(0)
+    for (const init of streamInits) {
+      // Omitting this is a silent 401 on every single message.
+      expect(init.credentials).toBe('include')
+    }
+  })
+
+  it('sends no Authorization header on the streaming message fetch', async () => {
+    await openConversation()
+    await streamABurst()
+
+    expect(streamInits.length).toBeGreaterThan(0)
+    for (const init of streamInits) {
+      expect(new Headers(init.headers).has('Authorization')).toBe(false)
+    }
   })
 })

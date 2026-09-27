@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from 'react'
 import SafeArticleLink from './SafeArticleLink'
+// Auth travels via the shared httpOnly session cookie through
+// `fetchSimilarArticles` (lib/similar.ts), which applies `authRequestInit`.
 import { formatArticleDate } from '../lib/format'
 import { fetchSimilarArticles, peekSimilarArticles } from '../lib/similar'
 import type { SimilarArticle } from '../lib/similar'

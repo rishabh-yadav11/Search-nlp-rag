@@ -10,7 +10,7 @@
  */
 import { act, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TOKEN_KEY, clearMeCache } from '../../lib/auth'
+import { clearMeCache } from '../../lib/auth'
 import { formatEpochDateTime } from '../../lib/format'
 import AnalyticsDashboardPage from './page'
 
@@ -101,7 +101,6 @@ function renderedAt(ts: number): string {
 
 beforeEach(() => {
   clearMeCache()
-  localStorage.setItem(TOKEN_KEY, 'test-token')
 })
 
 afterEach(() => {

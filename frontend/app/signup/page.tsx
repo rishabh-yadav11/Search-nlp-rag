@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { API_BASE, getToken } from '../lib/auth'
+import { API_BASE, getMe } from '../lib/auth'
 import { isSafeRedirect } from '../lib/safe-url'
 
 function SignupForm() {
@@ -24,7 +24,16 @@ function SignupForm() {
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    if (getToken()) router.replace(next)
+    // The session is an httpOnly cookie, so `/api/auth/me` is the only way to
+    // know whether someone is already signed in. A network failure is not a
+    // logout, so it must not redirect.
+    getMe()
+      .then((me) => {
+        if (me) router.replace(next)
+      })
+      .catch(() => {
+        /* offline or backend down: show the form */
+      })
   }, [router, next])
 
   useEffect(() => {
