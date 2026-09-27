@@ -537,7 +537,28 @@ def test_search_retrieve_error_returns_500(monkeypatch, fake_cache):
 
 
 def test_search_cache_error_returns_500(monkeypatch, fake_cache):
+    """A cache read that raises must surface as a 500.
+
+    Retrieval is stubbed to succeed, so the only thing that can turn this
+    request into a 500 is the cache raising. With a working cache the very same
+    wiring answers 200, which is what makes the 500 attributable to the cache
+    instead of to whatever the unstubbed pipeline would have done.
+    """
+
+    async def fake_retrieve(*args, **kwargs):
+        return [_article(1, 0.9)]
+
     monkeypatch.setattr(main, "cache", fake_cache(get_error=RuntimeError("redis down")))
+    monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
+    monkeypatch.setattr(main, "expand_query", lambda q: q)
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "apply_click_boost", _passthrough_boost)
+    monkeypatch.setattr(main, "diversify", lambda results, **kwargs: results)
+    monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
+    monkeypatch.setattr(main, "record_search", _noop_async)
+    monkeypatch.setattr(main.config, "ENABLE_CLICK_BOOST", False)
+    monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
 
     r = _client.get("/search", params={"q": "test"})
     assert r.status_code == 500
