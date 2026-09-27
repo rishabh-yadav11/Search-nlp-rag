@@ -244,8 +244,13 @@ const ME_CACHE_TTL_MS = Number.isNaN(ME_CACHE_TTL_RAW) ? 60000 : ME_CACHE_TTL_RA
  *  response. On a network/transport failure the token is preserved (not
  *  cleared) so a later retry can recover — the fetch error is rethrown so
  *  callers can distinguish a transient network failure from a definitive
- *  "logged out" (null) and MUST NOT treat it as a logout. Never redirects. */
-export async function getMe(force = false): Promise<AuthUser | null> {
+ *  "logged out" (null) and MUST NOT treat it as a logout. Never redirects.
+ *
+ *  `signal` is an optional caller signal — the analytics dashboard passes its
+ *  load controller so abandoning the dashboard's own 10 s race really does
+ *  cancel the socket. Aborting it leaves `timedOut()` false, so it is never
+ *  reported as a backend timeout. */
+export async function getMe(force = false, signal?: AbortSignal | null): Promise<AuthUser | null> {
   const token = getToken()
   if (!token) {
     clearToken()
@@ -253,17 +258,34 @@ export async function getMe(force = false): Promise<AuthUser | null> {
   }
   const fresh = meCache !== undefined && meCacheToken === token && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
   if (!force && fresh) return meCache ?? null
-  let res: Response
   // Deadline so a hung auth service actually cancels the request instead of
   // leaking one in-flight `/api/auth/me` per poll tick. The dashboard races
   // this with its own 10 s guard and abandons the promise, which never
   // cancelled the underlying fetch; aborting here is what makes that safe.
-  const deadline = createDeadline(ME_DEADLINE_MS)
+  //
+  // The deadline must stay armed across `res.json()` too, not just the header
+  // read: a response whose headers arrive but whose body never completes
+  // would otherwise hang forever with the timer already disarmed. So the whole
+  // exchange lives inside the try, and `clear()` happens once, in `finally`.
+  const deadline = createDeadline(ME_DEADLINE_MS, signal ?? null)
   try {
-    res = await fetch(`${API_BASE}/api/auth/me`, {
+    const res = await fetch(`${API_BASE}/api/auth/me`, {
       headers: authHeaders(),
       signal: deadline.signal,
     })
+    if (res.status === 401) {
+      clearToken()
+      return null
+    }
+    if (!res.ok) return null
+    try {
+      meCache = (await res.json()) as AuthUser
+    } catch {
+      // Malformed/non-JSON 200 response: don't throw (callers may lack a
+      // .catch); treat as an unexpected payload and return null safely.
+      console.error('getMe: failed to parse /api/auth/me response')
+      return null
+    }
   } catch (err) {
     // Network/transport failure: do NOT treat as "not authenticated" (preserve
     // the token so a later retry can succeed). Rethrow rather than return null
@@ -277,19 +299,6 @@ export async function getMe(force = false): Promise<AuthUser | null> {
     throw err
   } finally {
     deadline.clear()
-  }
-  if (res.status === 401) {
-    clearToken()
-    return null
-  }
-  if (!res.ok) return null
-  try {
-    meCache = (await res.json()) as AuthUser
-  } catch {
-    // Malformed/non-JSON 200 response: don't throw (callers may lack a
-    // .catch); treat as an unexpected payload and return null safely.
-    console.error('getMe: failed to parse /api/auth/me response')
-    return null
   }
   meCacheToken = token
   meCacheTs = Date.now()

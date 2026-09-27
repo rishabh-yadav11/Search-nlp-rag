@@ -1,15 +1,23 @@
 /**
- * Request deadlines for the frontend's `fetch` call sites.
+/**
+ * Request deadlines for the frontend's user-visible, state-bearing `fetch`
+ * call sites — the ones whose pending state can strand a spinner.
  *
  * A backend that accepts the connection but never answers leaves a promise
  * pending forever: no rejection, so every `catch`/`finally` downstream is never
  * reached and any `loading` flag stays true — the user gets a spinner with no
- * error and no way out. Every request the browser issues therefore has to carry
- * a deadline that aborts the underlying socket, not just a timeout that
- * abandons the promise.
+ * error and no way out. A deadline that aborts the underlying socket (rather
+ * than merely abandoning the promise) is what turns that hang into a failure
+ * the UI can report.
+ *
+ * Scope note: this is the whole per-page budget set — the four state-bearing
+ * call sites the issue named, plus the two fire-and-forget beacons in those
+ * same files (click tracking, logout) that would otherwise hold a socket open
+ * with nothing to release it. Fetches on pages this issue does not touch
+ * (search, login, signup) keep their own existing inline deadlines.
  *
  * The per-page `setTimeout(() => controller.abort(), MS)` idiom was open-coded
- * at five call sites with four different budgets; a sixth through ninth copy
+ * at five call sites with four different budgets; copies six through nine
  * would make the envelope impossible to audit in one place, so the pattern
  * lives here as a small signal-level helper. It is deliberately NOT a `fetch`
  * wrapper: each call site keeps its own `AbortController` for unmount
@@ -25,7 +33,18 @@
 export const RECOMMEND_DEADLINE_MS = 15_000
 /** Chat session CRUD and the non-stream send: a full LLM round trip. */
 export const CHAT_API_DEADLINE_MS = 30_000
-/** `/api/auth/me`, polled every 30 s by the analytics dashboard. */
+/**
+ * `/api/auth/me`, polled every 30 s by the analytics dashboard.
+ *
+ * Must stay ABOVE the dashboard's own 10 s identity race. `getMe` reports a
+ * transport failure by rethrowing, and the dashboard's catch ignores an
+ * `AbortError` by design; if this deadline fired first it would win that race
+ * with exactly that error, and the user would get no message at all — the same
+ * silent-hang symptom this helper exists to remove. At 15 s the dashboard's
+ * race always settles first and reports "identity check timed out", and the
+ * request is cancelled by the caller aborting its own signal, so nothing is
+ * left in flight once the caller has stopped caring.
+ */
 export const ME_DEADLINE_MS = 15_000
 
 export interface Deadline {

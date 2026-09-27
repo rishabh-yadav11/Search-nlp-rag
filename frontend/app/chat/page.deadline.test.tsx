@@ -106,6 +106,40 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
   })
 })
 
+describe('ChatPage — the logout beacon is bounded too', () => {
+  it('aborts a hung logout POST instead of leaving the socket open', async () => {
+    const captured: { signal: AbortSignal | null } = { signal: null }
+    const hangOthers = hangingApi()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes('/api/auth/logout')) {
+          captured.signal = init?.signal ?? null
+          const { promise, reject } = Promise.withResolvers<StubResponse>()
+          init?.signal?.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted')
+            err.name = 'AbortError'
+            reject(err)
+          })
+          return promise
+        }
+        return hangOthers(input, init)
+      })
+    )
+
+    render(<ChatPage />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
+    })
+
+    expect(captured.signal).toBeTruthy()
+    expect(captured.signal?.aborted).toBe(false)
+
+    await advance(CHAT_API_DEADLINE_MS)
+    expect(captured.signal?.aborted).toBe(true)
+  })
+})
+
 /** Re-render into a fresh send on the already-rendered page. */
 async function submitFirstTurnAgain(question: string) {
   fireEvent.change(screen.getByLabelText('Message'), { target: { value: question } })

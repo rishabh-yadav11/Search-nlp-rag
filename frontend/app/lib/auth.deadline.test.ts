@@ -58,10 +58,6 @@ afterEach(() => {
   clearMeCache()
 })
 
-/** Resolves 'pending' if `p` has not settled by the time this returns. */
-function settledOrPending<T>(p: Promise<T>) {
-  return Promise.race([p.then(() => 'settled' as const), Promise.resolve('pending' as const)])
-}
 /** Advance the clock, then flush the microtasks the rejection schedules. */
 async function advance(ms: number) {
   await vi.advanceTimersByTimeAsync(ms)
@@ -69,14 +65,22 @@ async function advance(ms: number) {
 
 describe('getMe — a hung auth service is cancelled, not leaked', () => {
   it('passes a deadline signal to fetch and holds the request open before it', async () => {
-    const pending = track(getMe())
+    let settled = false
+    const pending = track(getMe()).then((r) => {
+      settled = true
+      return r
+    })
     expect(signals).toHaveLength(1)
     expect(signals[0]).toBeTruthy()
     expect(signals[0]?.aborted).toBe(false)
 
     await advance(1)
+    // Both halves matter: a live, un-aborted signal AND a promise that is
+    // genuinely still pending. Asserting only the signal would pass even if
+    // `getMe` were governed by no deadline at all.
     expect(signals[0]?.aborted).toBe(false)
-    expect(await settledOrPending(pending)).toBe('pending')
+    expect(settled).toBe(false)
+    void pending
   })
 
   it('aborts the in-flight request at the deadline', async () => {
@@ -99,17 +103,61 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
     expect(localStorage.getItem(TOKEN_KEY)).toBe('test-token')
   })
 
-  it('still cancels the request when the dashboard abandons its race at 10 s', async () => {
-    // The dashboard gives up on `getMe()` at 10 s. The request must still die
-    // before the next 30 s poll tick, rather than surviving as a leaked fetch.
-    const pending = track(getMe())
+  it('is cancelled by the caller aborting its own signal, as the dashboard does', async () => {
+    // The dashboard gives up on `getMe()` at 10 s and aborts its load
+    // controller. That must cancel the socket, so nothing outlives the race.
+    const caller = new AbortController()
+    const pending = track(getMe(false, caller.signal))
     const signal = signals[0]
 
-    await advance(10_000)
+    await advance(9_000)
     expect(signal?.aborted).toBe(false)
 
-    await advance(ME_DEADLINE_MS - 10_000)
+    caller.abort()
     expect(signal?.aborted).toBe(true)
     expect((await pending).ok).toBe(false)
+  })
+
+  it('does not blame a caller abort on the backend', async () => {
+    const caller = new AbortController()
+    const pending = track(getMe(false, caller.signal))
+
+    caller.abort()
+    expect((await pending).ok).toBe(false)
+    // A cancelled load must not be logged as a backend timeout, or every
+    // dashboard unmount would look like a slow auth service.
+    expect(console.error).toHaveBeenCalledWith('getMe: failed to reach the auth service', expect.anything())
+  })
+
+  it('aborts a response whose headers arrived but whose body never completes', async () => {
+    // The deadline must stay armed across the body read, not just the header
+    // read: otherwise this leaks the socket and hangs getMe() forever.
+    const bodySignal = new AbortController()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        signals = [init?.signal ?? null]
+        init?.signal?.addEventListener('abort', () => bodySignal.abort())
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          // A body stream that never produces and never errors.
+          json: () => new Promise<never>(() => {}),
+        } as unknown as Response)
+      })
+    )
+
+    const pending = track(getMe())
+    let settled = false
+    void pending.then(() => {
+      settled = true
+    })
+
+    await advance(ME_DEADLINE_MS - 1)
+    expect(settled).toBe(false)
+
+    await advance(1)
+    expect(signals[0]?.aborted).toBe(true)
+    expect(bodySignal.signal.aborted).toBe(true)
   })
 })

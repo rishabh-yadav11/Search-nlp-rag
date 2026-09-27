@@ -5,11 +5,10 @@
  * The stub below never settles on its own: it holds the request open until the
  * signal it was handed aborts, which is exactly what a backend that accepts the
  * connection and never responds looks like to `fetch`. If the page has no
- * deadline, the test hangs at "Loading..." and the assertions below fail; with a
  * deadline the socket is cancelled, the catch runs, and the user gets a message
  * plus a Retry.
  */
-import { act, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RECOMMEND_DEADLINE_MS } from '../lib/deadline'
 import ForYouPage from './page'
@@ -100,5 +99,50 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
     // Nothing to assert on the DOM (it is gone); the guard is that no state
     // update is attempted, which the absence of an act() warning proves.
     await advance(RECOMMEND_DEADLINE_MS)
+  })
+})
+
+describe('ForYouPage — the click-tracking beacon is bounded too', () => {
+  it('aborts a hung interaction POST instead of leaving the socket open', async () => {
+    // Feed resolves so a card renders; the interaction POST then hangs.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        captures.push({ url, signal: init?.signal ?? null })
+        if (url.includes('/recommend/interaction')) {
+          const { promise, reject } = Promise.withResolvers<Response>()
+          init?.signal?.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted')
+            err.name = 'AbortError'
+            reject(err)
+          })
+          return promise
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            articles: [{ id: 1, title: 'Deal 1', url: 'https://vccircle.com/news/deal-1' }],
+          }),
+        } as unknown as Response)
+      })
+    )
+
+    render(<ForYouPage />)
+    // Fake timers are installed, so `findBy*` would wait on a clock that is
+    // not moving. Flush the feed's microtasks explicitly instead.
+    await advance(0)
+    const link = screen.getByText('Deal 1')
+    await act(async () => {
+      fireEvent.click(link)
+    })
+
+    const beacon = captures.find((c) => c.url.includes('/recommend/interaction'))
+    expect(beacon).toBeTruthy()
+    expect(beacon?.signal?.aborted).toBe(false)
+
+    await advance(RECOMMEND_DEADLINE_MS)
+    expect(beacon?.signal?.aborted).toBe(true)
   })
 })

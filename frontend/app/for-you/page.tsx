@@ -104,14 +104,20 @@ export default function ForYouPage() {
       },
     })
 
+    // Fire-and-forget, but still bounded: a hung beacon would otherwise hold
+    // its socket open indefinitely, and nothing here would ever release it.
+    const deadline = createDeadline(RECOMMEND_DEADLINE_MS)
     try {
       await fetch(`${API_BASE}/recommend/interaction`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ article_id: articleId, interaction_type: 'click' }),
+        signal: deadline.signal,
       })
     } catch (err) {
-      console.error('Failed to record interaction:', err)
+      if (!deadline.timedOut()) console.error('Failed to record interaction:', err)
+    } finally {
+      deadline.clear()
     }
   }
 
