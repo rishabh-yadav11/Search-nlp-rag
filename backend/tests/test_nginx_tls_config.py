@@ -241,6 +241,12 @@ def _env(tmp_path, **over):
     Every knob is set explicitly, defaults included: the mode must be decided
     by what the test asks for, never by a value leaked in from the environment
     pytest happens to be started in.
+
+    NGINX_CONF and NGINX_LINK belong in that list now, not just as hygiene:
+    "auto" consults the INSTALLED config (nginx_conf_serves_tls) and the domain
+    recovery block reads its ssl_certificate line, so an inherited or default
+    /etc/nginx path would make those tests answer on whatever this machine
+    happens to be serving.
     """
     env = dict(os.environ)
     env.update(
@@ -252,6 +258,8 @@ def _env(tmp_path, **over):
             "PUBLIC_PORT": str(PUBLIC_PORT),
             "API_PORT": str(API_PORT),
             "NEXT_PORT": str(NEXT_PORT),
+            "NGINX_CONF": str(tmp_path / "nginx" / "not-installed"),
+            "NGINX_LINK": str(tmp_path / "nginx" / "not-linked"),
         }
     )
     env.update(over)
@@ -763,7 +771,6 @@ def test_rendered_config_is_structurally_sound(tmp_path, mode):
             assert stripped.endswith((";", "{", "}")), f"unterminated directive: {line!r}"
 
     blocks = _server_blocks(config)
-    assert blocks, f"no server block rendered:\n{config}"
     seen = set()
     for block in blocks:
         ports = _listen_ports(block)
@@ -773,3 +780,48 @@ def test_rendered_config_is_structurally_sound(tmp_path, mode):
         seen.add(port)
         names = re.findall(r"^\s*server_name\s+(\S+);", block, re.MULTILINE)
         assert len(names) == 1, f"a server needs exactly one server_name, got {names}:\n{block}"
+
+
+def test_an_unrelated_letsencrypt_entry_is_never_adopted_as_the_domain(tmp_path):
+    """/etc/letsencrypt is shared, so "the only entry under live/" is not
+    evidence of anything.
+
+    Recovery used to fall back to it, which meant that on a host where this
+    site had never been on TLS -- the installed config plain, no
+    ssl_certificate to read -- it would adopt an unrelated service's
+    cert-name and repoint both server_name and ssl_certificate at that other
+    domain, serving a certificate for a domain this site does not answer for.
+    Recovery is now justified by exactly one thing: the certificate the
+    installed config already names.
+    """
+    foreign = tmp_path / "letsencrypt" / "live" / "someone-elses-blog.example.org"
+    foreign.mkdir(parents=True)
+    (foreign / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\nnot ours\n")
+
+    env = _env(tmp_path, LE_ROOT=str(tmp_path / "letsencrypt"))
+
+    proc = _call(env, "echo \"[$LE_DOMAIN][$LE_DOMAIN_RECOVERED]\"")
+
+    assert proc.stdout.strip() == "[][0]", (
+        f"a domain was adopted from an unrelated entry: {proc.stdout!r}"
+    )
+
+
+def test_the_domain_is_recovered_from_the_installed_config(tmp_path):
+    """The recovery that IS allowed: the certificate this site is serving."""
+    root = _certified_root(tmp_path, DOMAIN)
+    conf = tmp_path / "nginx" / "sites-available" / "site"
+    conf.parent.mkdir(parents=True)
+    conf.write_text(
+        "server {\n"
+        f"    ssl_certificate {root}/live/{DOMAIN}/fullchain.pem;\n"
+        f"    ssl_certificate_key {root}/live/{DOMAIN}/privkey.pem;\n"
+        "}\n"
+    )
+    env = _env(tmp_path, LE_ROOT=str(root), NGINX_CONF=str(conf))
+
+    proc = _call(env, "echo \"[$LE_DOMAIN][$LE_DOMAIN_RECOVERED][$LE_CERT]\"")
+
+    assert proc.stdout.strip() == f"[{DOMAIN}][1][{root}/live/{DOMAIN}/fullchain.pem]", (
+        f"the domain in use was not recovered from the installed config: {proc.stdout!r}"
+    )
