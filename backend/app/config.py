@@ -396,6 +396,14 @@ class Config:
     # newest turns first. 12000 fits several full question/answer turns.
     CHAT_HISTORY_CHAR_LIMIT = int(os.getenv("CHAT_HISTORY_CHAR_LIMIT", "12000"))
 
+    # Ceiling on the raw query embedded in a Redis cache key. A query longer
+    # than this is replaced by a truncated sha256 digest (see
+    # main._cache_query_component) so the key stays short and bounded while
+    # remaining deterministic — a long query must not silently share a key
+    # with a different long query, which is why the digest replaces the text
+    # rather than the text being cut.
+    CACHE_KEY_QUERY_MAX_CHARS = int(os.getenv("CACHE_KEY_QUERY_MAX_CHARS", "128"))
+
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch
     # must fit in RAM (the pipeline's value is overlapping encode with upsert,
