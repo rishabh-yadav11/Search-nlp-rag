@@ -103,17 +103,25 @@ class BrokenDedupeRedis(FakeRedis):
         raise RuntimeError("redis write failed")
 
 
-class FailingPipelineRedis(FakeRedis):
-    """Redis that accepts the dedupe claim but then fails the write that was
-    supposed to record it, standing in for a failure between the two."""
+class FlakyPipelineRedis(FakeRedis):
+    """Redis that accepts the dedupe claim but can be made to fail the write
+    that was supposed to record it, standing in for a failure between the two.
+    The claim and any release of it hit the same state, as they would in Redis.
+    """
+
+    def __init__(self, fail_pipeline: bool = True):
+        super().__init__()
+        self.fail_pipeline = fail_pipeline
 
     def pipeline(self):
-        return _FailingPipeline(self)
+        return _FlakyPipeline(self)
 
 
-class _FailingPipeline(_Pipeline):
+class _FlakyPipeline(_Pipeline):
     async def execute(self):
-        raise RuntimeError("redis pipeline failed")
+        if self.redis.fail_pipeline:
+            raise RuntimeError("redis pipeline failed")
+        return []
 
 
 def _run(coro):
@@ -358,7 +366,7 @@ def test_a_failed_write_gives_the_click_vote_back(store, index, monkeypatch):
     """If the write that a claim unlocks never lands, the claim is released, so
     a transient Redis failure does not silence that user's click for the rest of
     the dedupe window."""
-    flaky = FailingPipelineRedis()
+    flaky = FlakyPipelineRedis()
     monkeypatch.setattr(analytics, "_client", lambda: flaky)
 
     assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200
@@ -369,3 +377,21 @@ def test_a_failed_write_gives_the_click_vote_back(store, index, monkeypatch):
     monkeypatch.setattr(analytics, "_client", lambda: healthy)
     assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200
     assert healthy.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+
+
+def test_a_lost_claim_is_never_released_for_its_owner(store, index, monkeypatch):
+    """A repeat click that LOSES the claim race owns no claim, so a write failure
+    on its behalf must not release the claim the winner holds -- otherwise a
+    client could free its own vote by making the write fail."""
+    flaky = FlakyPipelineRedis(fail_pipeline=False)
+    monkeypatch.setattr(analytics, "_client", lambda: flaky)
+
+    assert _beacon("ola ipo", 1, 42, ip="10.6.6.6").status_code == 200
+    (claim,) = list(flaky.nx_keys)
+    assert flaky.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+
+    flaky.fail_pipeline = True
+    assert _beacon("ola ipo", 1, 42, ip="10.6.6.6").status_code == 200
+
+    assert claim in flaky.nx_keys, "the winner's claim must survive a loser's failed write"
+    assert flaky.sets["analytics:query_click:ola ipo"] == {"42": 1.0}, "and still count once"

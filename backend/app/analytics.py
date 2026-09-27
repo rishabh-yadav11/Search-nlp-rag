@@ -134,7 +134,10 @@ async def _claim_click_signal(client_ip: str | None, query: str, article_id: int
     digest = hashlib.sha256(f"{client_ip}\x00{query}\x00{article_id}".encode()).hexdigest()
     key = f"analytics:click:seen:{digest}"
     try:
-        return bool(await _client().set(key, 1, nx=True, ex=window)), key
+        # Only a claim we actually won may be released later: returning the key
+        # on a lost claim would let a client that merely *lost* the race delete
+        # the winner's claim if the write then failed, and vote twice.
+        return (True, key) if await _client().set(key, 1, nx=True, ex=window) else (False, None)
     except Exception:
         logger.warning("click-signal dedupe unavailable; dropping ranking signal", exc_info=True)
         return False, None
