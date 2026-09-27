@@ -93,14 +93,18 @@ class Config:
     # trimming latency (measured 8/8 overlap on representative queries).
     RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
     RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "12"))
-    # Reranker execution backend: 'torch' (sentence-transformers CrossEncoder)
-    # is the default. The ONNX backend ('onnx', via optimum/onnxruntime) is no
-    # longer installable: optimum-onnx requires transformers<4.58, which
-    # conflicts with the pinned transformers 5.x (CVE-fix) version.
+    # Reranker execution backend. 'torch' (sentence-transformers CrossEncoder)
+    # is the only backend: the ONNX backend ('onnx', via optimum/onnxruntime)
+    # is not installable — optimum-onnx requires transformers<4.58, which
+    # conflicts with the pinned transformers 5.x (CVE-fix) version — so its
+    # code path was removed from app/reranker.py. This knob is kept so existing
+    # deployments that set RERANK_BACKEND keep working; any value other than
+    # 'torch' logs a warning and uses torch.
     RERANK_BACKEND = os.getenv("RERANK_BACKEND", "torch")
-    # Local dir where the ONNX cross-encoder is exported on first use and
-    # reloaded on later startups (relative paths resolve against the backend
-    # working dir, where gunicorn runs).
+    # Inert: local dir that held the exported ONNX cross-encoder cache when the
+    # ONNX backend existed. Nothing reads it now; kept as a documented
+    # placeholder (it is still listed in .env.example) rather than an env var
+    # that silently disappears from deployed setups.
     RERANK_ONNX_DIR = os.getenv("RERANK_ONNX_DIR", "data/reranker_onnx")
 
     # LLM (Google Gemini via OpenAI-compatible endpoint). Provide the API key
