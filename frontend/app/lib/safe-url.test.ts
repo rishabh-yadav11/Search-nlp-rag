@@ -149,6 +149,14 @@ describe('isSafeUrl — server/client parity', () => {
     '\x00//evil.com',
     '\x00//localhost',
     '\x00//localhost:443',
+    '\x00//ssr.invalid',
+    '\x00//app.vccircle.com',
+    '\x00/\\evil.com',
+    '\x00\\/ssr.invalid',
+    '\x01//evil.com',
+    '\x1f//evil.com',
+    '\x00javascript:alert(1)',
+    '\x00data:text/html,x',
     '//ssr.invalid/x',
     '/\\evil.com',
     '\\/evil.com',
@@ -168,6 +176,18 @@ describe('isSafeUrl — server/client parity', () => {
     ' javascript:alert(1)',
     'data:text/html,<script>alert(1)</script>',
   ]
+
+  // Browsers strip leading C0 controls before parsing, so these look
+  // schemeless on the raw string yet resolve as real protocol-relative
+  // escapes. They are the class that used to make the two environments
+  // disagree, and each must be refused outright rather than left to parsing.
+  it.each(['\x00//evil.com', '\x00//ssr.invalid', '\x01//evil.com', '\x1f//localhost'])(
+    'rejects the control-prefixed escape %j before parsing',
+    (url) => {
+      expect(verdictIn(url, false)).toBe(false)
+      expect(verdictIn(url, true)).toBe(false)
+    }
+  )
 
   it.each(CORPUS)('returns the same verdict for %j on the server and the client', (url) => {
     expect(verdictIn(url, false)).toBe(verdictIn(url, true))
