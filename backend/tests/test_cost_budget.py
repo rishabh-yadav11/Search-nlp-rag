@@ -333,6 +333,31 @@ def test_to_usd_canonical_unit(monkeypatch):
     assert abs(cost_budget.to_usd(0.0) - 0.0) < 1e-9
 
 
+def test_to_usd_falls_back_to_one_rate_and_warns_once(monkeypatch, caplog):
+    """An unconfigured INR_PER_USD must not silently rescale every recorded
+    cost. The module falls back to a 1.0 rate -- so the recorded USD is the raw
+    INR figure rather than a wrong conversion -- and warns, but only ONCE: a
+    misconfigured deploy would otherwise emit a warning on every turn for the
+    life of the process.
+
+    The checked "1.0 fallback rate" claim in TEST_COVERAGE_GAPS.md referred to
+    this branch, and nothing executed it."""
+    monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 0.0)
+    monkeypatch.setattr(cost_budget, "_inr_fallback_warned", False)
+
+    with caplog.at_level("WARNING", logger="cost_budget"):
+        assert cost_budget.to_usd(42.0) == 42.0
+        assert cost_budget.to_usd(0.0) == 0.0
+        assert cost_budget.to_usd(7.5) == 7.5
+
+    assert caplog.text.count("INR_PER_USD") == 1
+    # A configured rate must NOT warn -- the fallback is a misconfiguration path.
+    monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 100.0)
+    caplog.clear()
+    assert cost_budget.to_usd(100.0) == 1.0
+    assert caplog.text == ""
+
+
 def test_close_resets_redis(monkeypatch):
     class FakeRedis:
         def __init__(self):
