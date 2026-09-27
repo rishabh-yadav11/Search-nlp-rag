@@ -347,9 +347,9 @@ def _leg_warnings(caplog, leg, exc_message):
     ]
 
 
-_VECTOR_LEG = "Vector candidate lookup failed"
-_CATEGORY_LEG = "Category candidate lookup failed"
-_TRENDING_LEG = "Trending candidate lookup failed"
+_VECTOR_LEG = "Error getting vector candidates"
+_CATEGORY_LEG = "Error getting category candidates"
+_TRENDING_LEG = "Error getting trending candidates"
 
 
 def _titles(result):
