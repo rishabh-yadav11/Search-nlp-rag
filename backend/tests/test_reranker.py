@@ -10,6 +10,7 @@ default-backend test to prove construction does not take an ONNX path even when
 optimum *is* importable.
 """
 
+import inspect
 import logging
 import sys
 import types
@@ -73,6 +74,12 @@ def _fake_onnx_importable(monkeypatch):
     monkeypatch.setitem(sys.modules, "optimum.onnxruntime", optimum_ort)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     return calls
+
+
+def test_backend_parameter_defaults_to_torch():
+    # Pins the signature default itself: flipping it back to "onnx" (with the
+    # ONNX branch gone) must fail here rather than silently degrading to torch.
+    assert inspect.signature(Reranker.__init__).parameters["backend"].default == "torch"
 
 
 def test_default_backend_is_torch_even_when_optimum_is_importable(monkeypatch, caplog):
