@@ -443,7 +443,10 @@ def test_signup_ignores_role_in_request_payload(tmp_path):
     """A self-declared role in the signup body is not honoured."""
     client, s = _auth_app(tmp_path)
     try:
-        _signup(client, "sneaky@x.co", name="S")
+        # One signup carrying role=admin. The account must NOT pre-exist: a
+        # duplicate POST short-circuits into the swallowed DuplicateEmailError
+        # branch and never reaches create_user, so the payload-role guard this
+        # test exists for would go unexercised.
         r = client.post(
             "/api/auth/signup",
             json={"email": "sneaky@x.co", "password": "secret12", "name": "S", "role": "admin"},
@@ -517,7 +520,7 @@ def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
         asyncio.run(s.close())
 
 
-def test_login_unknown_vs_wrong_password_timing_comparable(tmp_path):
+def test_login_unknown_vs_wrong_password_timing_comparable(tmp_path, monkeypatch):
     """Loose statistical guard on the wall-clock side of #276.
 
     The mechanism is asserted in the test above; this one samples real bcrypt
@@ -525,7 +528,13 @@ def test_login_unknown_vs_wrong_password_timing_comparable(tmp_path):
     if the mechanism changes shape. Medians over several iterations, and only
     one-sided: the bug made the unknown address *faster*, so requiring the
     unknown path to cost at least half of a real verify fails on the old code
-    (a few ms vs ~100ms) while tolerating a loaded CI box."""
+    (a few ms vs ~100ms) while tolerating a loaded CI box.
+
+    The per-IP limiter is switched off: this fires 14 logins against a default
+    AUTH_LOGIN_RATE_PER_MIN of 10, so wherever Redis is reachable the tail of
+    the samples would be fast 429s and both the medians and the 401 assertion
+    would be wrong. A rate limiter has no bearing on the oracle under test."""
+    monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_MIN", 0)
     client, s = _auth_app(tmp_path)
     try:
         _signup(client, "known@x.co")
