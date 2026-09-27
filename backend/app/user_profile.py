@@ -12,12 +12,129 @@ import json
 import logging
 import math
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 import redis.asyncio as aioredis
 
 from app.config import config
 
 logger = logging.getLogger(__name__)
+
+
+# Interaction types are a CLOSED set. ``article:interactions:{id}`` is a Redis
+# hash whose FIELD NAME is the interaction type, so every distinct type a caller
+# supplies mints a new field that only the key TTL ever expires.
+#
+# Basis for the set, from the real callers rather than guesswork:
+#   * the only sender in the repo is the for-you page, which posts "click";
+#   * the three kinds are the ones the request model has always documented
+#     ("# 'view', 'click', 'read'").
+# It is therefore a deliberate SUPERSET of what is sent today, so no client
+# that works today breaks, while anything outside the set is refused.
+class InteractionType(StrEnum):
+    VIEW = "view"
+    CLICK = "click"
+    READ = "read"
+
+
+_INTERACTION_TYPE_VALUES = frozenset(t.value for t in InteractionType)
+
+
+class InteractionResult(StrEnum):
+    """Why one ``record_interaction`` call did or did not write.
+
+    Every decline mode is distinct because the caller must answer each one
+    truthfully: reporting a rejected interaction type or a spent quota as
+    "unknown article" would be a false statement about a real article.
+    """
+
+    RECORDED = "recorded"
+    INVALID_TYPE = "invalid_type"
+    UNKNOWN_ARTICLE = "unknown_article"
+    CAP_REACHED = "cap_reached"
+    UNAVAILABLE = "unavailable"
+
+
+class UnknownArticleError(ValueError):
+    """Raised when an interaction names an article that is not in the index."""
+
+
+def _coerce_interaction_type(value: str) -> str:
+    """Return the canonical interaction type, or raise for anything unknown.
+
+    Last line of defence at the write layer: the HTTP model validates the field
+    too, but ``record_interaction`` is what chooses a Redis hash field, so an
+    unrecognised value must never reach HINCRBY even if some future or internal
+    caller skips the model. The value is MATCHED against the enum, not merely
+    length-capped -- a cap alone would still admit an unbounded number of
+    distinct fields, which is the amplification being closed.
+    """
+    normalised = (value or "").strip().lower()
+    if normalised not in _INTERACTION_TYPE_VALUES:
+        raise ValueError(f"unknown interaction type: {value!r}")
+    return normalised
+
+
+# How long a CONFIRMED article is remembered, so a reader clicking the same
+# article repeatedly does not re-query the index on every event.
+_ARTICLE_EXISTS_TTL_SECONDS = 300
+_ARTICLE_EXISTS_KEY = "user_profile:article_exists"
+
+
+async def _require_known_article(client: aioredis.Redis, article_id: int) -> None:
+    """Raise UnknownArticleError unless article_id is a real indexed article.
+
+    Every distinct id would otherwise mint an ``article:interactions:{id}`` hash
+    plus a per-user detail key that outlives the request by
+    USER_INTERACTION_TTL_DAYS, so an integer loop turns into unbounded key
+    growth. Qdrant is asked with the same retrieve-by-id call the recommender
+    already uses (recommender.get_trending_feed).
+
+    Only a CONFIRMED article is cached. Caching a rejection would key it to the
+    caller-chosen id, so the flood this check exists to stop would still grow
+    the keyspace -- one key per probed id -- and an index blip would be latched
+    as "absent" for the whole TTL, 404ing genuine articles long after recovery.
+    An unreachable index therefore propagates (reported as UNAVAILABLE) instead
+    of being mistaken for a negative answer.
+    """
+    key = f"{_ARTICLE_EXISTS_KEY}:{article_id}"
+    if await client.get(key) == "1":
+        return
+
+    from app.main import state  # lazy import avoids a startup cycle
+
+    points = await state["qdrant"].retrieve(
+        collection_name=config.QDRANT_COLLECTION,
+        ids=[article_id],
+        with_payload=False,
+        with_vectors=False,
+    )
+    if not points:
+        raise UnknownArticleError(article_id)
+    await client.set(key, "1", ex=_ARTICLE_EXISTS_TTL_SECONDS)
+
+
+async def _has_interaction_slot(client: aioredis.Redis, user_id: str, article_id: int) -> bool:
+    """Whether this user may mint one more distinct article-interaction key.
+
+    The user's existing ``user:interactions:{user_id}`` sorted set already holds
+    exactly the distinct article ids they have interacted with, so it doubles as
+    the ledger instead of introducing a second, parallel counter with its own
+    TTL to reason about. Re-interacting with a known article is always allowed:
+    it rewrites existing keys, mints nothing new, and is what a reader returning
+    to an article actually does.
+    """
+    cap = config.USER_MAX_DISTINCT_INTERACTIONS
+    if cap <= 0:
+        return True
+    key = f"user:interactions:{user_id}"
+    pipe = client.pipeline()
+    pipe.zcard(key)
+    pipe.zscore(key, str(article_id))
+    distinct, already_seen = await pipe.execute()
+    if already_seen is not None:
+        return True
+    return int(distinct) < cap
 
 # Redis DB for user profiles (separate from analytics DB to survive deploy flushes).
 _PROFILE_REDIS_DB = config.USER_PROFILE_REDIS_DB
@@ -52,17 +169,45 @@ def _redis_client() -> aioredis.Redis:
 async def record_interaction(
     user_id: str,
     article_id: int,
-    interaction_type: str = "click",
+    interaction_type: str = InteractionType.CLICK,
     dwell_time_ms: int | None = None,
-) -> None:
-    """Record a user-article interaction in Redis.
+) -> InteractionResult:
+    """Record a user-article interaction in Redis, reporting why if it did not.
 
     Stores:
       - A sorted set of interactions: user:interactions:{user_id} -> article_id scored by timestamp
       - Individual article interaction details for dwell-time analysis
+      - An article-level counter per interaction kind, for trending
+
+    Rejects an unknown ``interaction_type``, an ``article_id`` that is not in
+    the article index, and a user who has already interacted with
+    USER_MAX_DISTINCT_INTERACTIONS distinct articles. Each is checked BEFORE
+    the pipeline is built, so a declined call writes nothing at all.
     """
+    # Validate the kind before anything is queued: this value becomes a Redis
+    # hash FIELD name, so an unchecked string is an unbounded field mint.
     try:
-        client = _redis_client()
+        kind = _coerce_interaction_type(interaction_type)
+    except ValueError:
+        logger.warning("Rejected interaction with unknown type %r", interaction_type)
+        return InteractionResult.INVALID_TYPE
+
+    client = _redis_client()
+    try:
+        await _require_known_article(client, article_id)
+    except UnknownArticleError:
+        logger.warning("Rejected interaction for unknown article %s", article_id)
+        return InteractionResult.UNKNOWN_ARTICLE
+    except Exception as exc:  # noqa: BLE001
+        # The index could not be reached, so the id is unverified. That is NOT
+        # the same answer as "not indexed" and must not be reported as one.
+        logger.warning("Interaction article check unavailable: %s", exc)
+        return InteractionResult.UNAVAILABLE
+
+    try:
+        if not await _has_interaction_slot(client, user_id, article_id):
+            logger.warning("User %s hit the distinct-interaction cap", user_id)
+            return InteractionResult.CAP_REACHED
         now = datetime.now(UTC).timestamp()
         pipe = client.pipeline()
 
@@ -73,7 +218,7 @@ async def record_interaction(
         # Record interaction type for potential future dwell-time analysis
         detail_key = f"user:interaction_detail:{user_id}:{article_id}"
         pipe.hset(detail_key, mapping={
-            "type": interaction_type,
+            "type": kind,
             "timestamp": str(now),
             "dwell_time_ms": str(dwell_time_ms or 0),
         })
@@ -81,7 +226,7 @@ async def record_interaction(
 
         # Update article-level interaction counts (for future popularity scoring)
         article_key = f"article:interactions:{article_id}"
-        pipe.hincrby(article_key, interaction_type, 1)
+        pipe.hincrby(article_key, kind, 1)
         pipe.hset(article_key, "last_timestamp", str(now))
         pipe.expire(article_key, config.USER_INTERACTION_TTL_DAYS * 86400)
 
@@ -93,8 +238,10 @@ async def record_interaction(
         )
 
         await pipe.execute()
+        return InteractionResult.RECORDED
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to record user interaction: %s", exc)
+        return InteractionResult.UNAVAILABLE
 
 
 async def get_user_interactions(user_id: str, limit: int = _PROFILE_MAX_INTERACTIONS) -> list[tuple[int, float]]:
@@ -277,7 +424,19 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
                 if not key.startswith("article:interactions:"):
                     continue
                 counts = await client.hgetall(key)
-                total = sum(int(v) for v in counts.values() if v.isdigit())
+                # Sum ONLY the known interaction kinds, by name. Summing every
+                # digit-valued field is name-blind, so it also credits junk
+                # fields: any kind minted before the write-side enum landed
+                # still scores for the full USER_INTERACTION_TTL_DAYS (90 by
+                # default), letting an attacker inflate a chosen article's
+                # trending score. Allow-listing on READ contains that legacy
+                # residue, as well as anything a future writer might add.
+                # ``last_timestamp`` is excluded by name -- it is not a counter.
+                total = sum(
+                    int(counts[kind_name])
+                    for kind_name in _INTERACTION_TYPE_VALUES
+                    if kind_name in counts and counts[kind_name].isdigit()
+                )
                 if total > 0:
                     article_scores[article_id] = float(total)
             if cursor == 0:
