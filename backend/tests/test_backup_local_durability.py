@@ -397,6 +397,11 @@ class _FakeQdrant:
     def get_collections(self):
         return type("R", (), {"collections": [type("C", (), {"name": n})() for n in self._collections]})()
 
+    def create_snapshot(self, collection_name, wait=False):
+        # A real server-side snapshot, so a test using the real make_backup gets
+        # as far as the download instead of failing at the create step.
+        return _FakeSnapshot()
+
     def delete_collection(self, collection_name):
         self._calls.append(collection_name)
 
@@ -457,9 +462,12 @@ def test_reset_drops_the_collection_when_a_verified_backup_exists(
     assert f"backup before reset: {dest}" in capsys.readouterr().out
 
 
-def test_reset_never_touches_the_network_with_a_failed_download(reset_env, monkeypatch, tmp_path, capsys):
-    """End to end through the real make_backup: force the download to fail the
-    way the undeclared `requests` import did, and check the gate still holds."""
+def test_reset_end_to_end_with_a_failed_download_refuses_to_delete(
+    reset_env, monkeypatch, tmp_path, capsys
+):
+    """End to end through the real make_backup, with a client that *does* create a
+    server-side snapshot: force the download to fail the way the undeclared
+    `requests` import did, and check the reset still refuses to delete."""
     monkeypatch.setattr(
         qdrant_backup,
         "_download_to",
@@ -476,7 +484,11 @@ def test_reset_never_touches_the_network_with_a_failed_download(reset_env, monke
 
     assert reset_env == []
     assert rc == 1
-    assert "aborting reset to avoid irreversible loss" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # The download itself failed, rather than the run dying somewhere earlier.
+    assert "NO local copy was written" in out
+    assert "No module named 'requests'" in out
+    assert "aborting reset to avoid irreversible loss" in out
 
 
 def test_skip_backup_still_deletes(reset_env, monkeypatch, capsys):
