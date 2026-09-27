@@ -20,6 +20,10 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.abspath("."))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from _common import make_pool
 
 from app.config import config
 from app.index_text import clean
@@ -32,10 +36,7 @@ def fetch_rows():
     import aiomysql
 
     async def _go():
-        pool = await aiomysql.create_pool(
-            host=config.MYSQL_HOST, port=config.MYSQL_PORT,
-            user=config.MYSQL_USER, password=config.MYSQL_PASSWORD,
-            db=config.MYSQL_DATABASE, autocommit=True)
+        pool = await make_pool(maxsize=10)
         try:
             async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
                 # config.MYSQL_TABLE is a trusted config identifier, not user

@@ -29,15 +29,15 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _common import log
+
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUPS_DIR = os.path.join(BACKEND_DIR, "backups")
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
 
 TS_RE = re.compile(r"^\d{8}-\d{6}-\d{6}$")
-
-
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def _parse_retention() -> int:

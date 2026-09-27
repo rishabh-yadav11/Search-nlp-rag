@@ -16,6 +16,7 @@ which acts as an admin user. All inputs are validated server-side.
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -42,6 +44,10 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 store: "AuthStore | None" = None
 
 VALID_ROLES = ("admin", "user")
+
+# The only role public self-service signup can ever grant. Not configurable:
+# see the signup docstring.
+SIGNUP_ROLE = "user"
 
 # Role -> permissions. Single source of truth for access control; add a
 # resource-scoped permission here and assert it on the route that needs it.
@@ -447,28 +453,80 @@ async def token_purge_loop() -> None:
         await asyncio.sleep(interval)
 
 
+def _peer_is_local_proxy(peer: str | None) -> bool:
+    """True when the socket peer is a reverse proxy on this same host, i.e. a
+    loopback address. A peer that is not a real IP (a test ASGI transport, for
+    instance) is not loopback, so it never widens the trust."""
+    if not peer:
+        return False
+    try:
+        return ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        return False
+
+
+def _trust_forwarded_for(peer: str | None) -> bool:
+    """Whether X-Forwarded-For may be trusted for this request's peer.
+
+    ``config.AUTH_TRUST_X_FORWARDED_FOR`` forces the answer when set to true or
+    false. The shipped default is None ("auto"), which trusts the header only
+    for a loopback peer: the reference deployment (setup.sh) always runs behind
+    nginx forwarding from 127.0.0.1, so its clients get correct per-IP rate
+    limiting out of the box, while a client connecting straight to the API
+    port is its own non-loopback peer and cannot forge a header to escape its
+    own bucket.
+    """
+    configured = config.AUTH_TRUST_X_FORWARDED_FOR
+    if configured is not None:
+        return configured
+    return _peer_is_local_proxy(peer)
+
+
 def _client_ip(request: Request) -> str:
-    """Client IP. The X-Forwarded-For header is only honored when the API is
-    deployed behind a configured reverse proxy, so a raw client cannot spoof
-    its IP (e.g. for bypassing rate limits). Otherwise the socket peer wins.
+    """Client IP. The X-Forwarded-For header is only honored when the request
+    came through a trusted reverse proxy (see ``_trust_forwarded_for``), so a
+    raw client cannot spoof its IP (e.g. for bypassing rate limits). Otherwise
+    the socket peer wins.
 
     nginx ``$proxy_add_x_forwarded_for`` APPENDS ``$remote_addr`` (the real
     peer) to any client-supplied X-Forwarded-For list, so the *rightmost* hop
     is the one added by the trusted proxy while the leftmost is attacker
     controlled; take the rightmost."""
-    if config.AUTH_TRUST_X_FORWARDED_FOR:
+    peer = request.client.host if request.client else None
+    if _trust_forwarded_for(peer):
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
             return forwarded.split(",")[-1].strip()
-    return request.client.host if request.client else "unknown"
+    return peer or "unknown"
 
 
-async def _check_rate_limit(request: Request, action: str, limit_per_min: int) -> None:
-    """Enforce a per-IP rate limit with Redis INCR+EXPIRE. Fails open (no 429)
-    when Redis is unreachable so auth availability never depends on it."""
+async def _check_rate_limit(
+    request: Request,
+    action: str,
+    limit_per_min: int,
+    *,
+    key_prefix: str = "auth:rl",
+    window_seconds: int | None = None,
+    fail_closed: bool = False,
+) -> None:
+    """Enforce a per-IP rate limit with Redis INCR+EXPIRE.
+
+    ``fail_closed`` selects what happens when the limiter's Redis is
+    unreachable. The auth endpoints keep the historical fail-OPEN behaviour
+    (the default): login and signup availability must not depend on the limiter
+    being up, and a caller merely gets an unrated attempt. The public search
+    surface passes ``fail_closed=True`` and is answered 503 instead, because an
+    unrated request against ``/search`` or ``/analytics/click`` is precisely
+    the full-corpus scraping and analytics-poisoning vector these limits exist
+    to close -- there, no answer is not an acceptable fallback.
+
+    ``window_seconds`` defaults to the auth window so the existing auth call
+    sites keep their current 60s window; the public limits pass their own.
+    """
     if limit_per_min <= 0:
         return
-    key = f"auth:rl:{action}:{_client_ip(request)}"
+    window = config.AUTH_RATE_WINDOW_SECONDS if window_seconds is None else window_seconds
+    key = f"{key_prefix}:{action}:{_client_ip(request)}"
     try:
         rc = _rate_redis()
         # Establish the sliding window atomically on the first hit: SET NX EX sets
@@ -476,18 +534,62 @@ async def _check_rate_limit(request: Request, action: str, limit_per_min: int) -
         # exist, so the key always has a TTL. A later crash can never leave a
         # counter with no expiry (which would block the IP forever under the old
         # INCR + separate EXPIRE). Subsequent hits just increment.
-        await rc.set(key, 0, nx=True, ex=config.AUTH_RATE_WINDOW_SECONDS)
+        await rc.set(key, 0, nx=True, ex=window)
         n = await rc.incr(key)
         if n > limit_per_min:
             raise HTTPException(
                 status_code=429,
                 detail="Too many attempts. Please try again shortly.",
-                headers={"Retry-After": str(config.AUTH_RATE_WINDOW_SECONDS)},
+                headers={"Retry-After": str(window)},
             )
     except HTTPException:
         raise
     except Exception:
-        logger.warning("auth rate limiter unavailable for %s", action, exc_info=True)
+        if not fail_closed:
+            logger.warning("auth rate limiter unavailable for %s", action, exc_info=True)
+            return
+        logger.exception("rate limiter unavailable for %s; failing closed", action)
+        raise HTTPException(
+            status_code=503,
+            detail="Rate limiter unavailable",
+            headers={"Retry-After": str(window)},
+        ) from None
+
+
+def public_rate_limit(
+    action: str,
+    limit_attr: str,
+    *,
+    fail_closed: bool = True,
+) -> Callable[[Request], Awaitable[None]]:
+    """Build the FastAPI dependency that rate-limits one public endpoint.
+
+    ``limit_attr`` names a ``config`` attribute (e.g.
+    ``"PUBLIC_SEARCH_RATE_PER_MIN"``) and is resolved per request rather than
+    captured at import time, so the limit stays tunable -- and overridable in a
+    test -- without rebuilding the app.
+
+    ``fail_closed`` defaults to True because every current caller is on the
+    public search surface. ``/ready`` is the one deliberate exception: it is
+    polled by load balancers and orchestrators, and this service treats a Redis
+    outage as a degraded-but-serving state (the HybridCache falls back to an
+    in-process cache), so failing its limiter closed would pull healthy nodes
+    out of rotation for a dependency the service does not require to be ready.
+    It still counts and still answers 429 -- only a broken limiter store is
+    tolerated there.
+    """
+
+    async def dependency(request: Request) -> None:
+        await _check_rate_limit(
+            request,
+            action,
+            int(getattr(config, limit_attr)),
+            key_prefix="public:rl",
+            window_seconds=config.PUBLIC_RATE_WINDOW_SECONDS,
+            fail_closed=fail_closed,
+        )
+
+    return dependency
 
 
 # --- dependencies ---
@@ -551,7 +653,13 @@ def require_permission(permission: str):
 @router.post("/signup", response_model=AuthOut)
 async def signup(body: SignupIn, request: Request):
     """Create an account (public). Returns a bearer token. Validated server-side:
-    email format + uniqueness, password strength, name limits."""
+    email format + uniqueness, password strength, name limits.
+
+    The role is hardcoded to 'user': public signups always land with the least
+    privilege. There is deliberately no configuration knob here — a role that
+    can be flipped by an env var (or a request field) turns a config mistake
+    into a full account compromise. Privilege is granted only by an
+    authenticated admin via PATCH /api/auth/users/{id}."""
     await _check_rate_limit(request, "signup", config.AUTH_SIGNUP_RATE_PER_MIN)
     email = validate_email(body.email)
     password = validate_password(body.password)
@@ -560,7 +668,7 @@ async def signup(body: SignupIn, request: Request):
     if await s.get_user_by_email(email) is not None:
         raise HTTPException(status_code=409, detail="an account with this email already exists")
     try:
-        user = await s.create_user(email, password, name, role=config.AUTH_DEFAULT_ROLE)
+        user = await s.create_user(email, password, name, role=SIGNUP_ROLE)
     except DuplicateEmailError:
         # lost the concurrent-creation race; report it as a plain duplicate
         raise HTTPException(status_code=409, detail="an account with this email already exists") from None

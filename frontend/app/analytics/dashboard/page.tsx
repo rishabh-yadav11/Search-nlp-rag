@@ -289,9 +289,10 @@ export default function AnalyticsDashboardPage() {
                         </tr>
                       </thead>
                       <tbody>
+                        {/* The backend owns this bound: it returns exactly
+                            CLICK_POSITION_MIN..CLICK_POSITION_MAX, so don't cap here. */}
                         {Object.entries(d.click_positions)
                           .sort(([a], [b]) => Number(a) - Number(b))
-                          .slice(0, 10)
                           .map(([k, n]) => (
                             <tr key={k}>
                               <td>Position {k}</td>
