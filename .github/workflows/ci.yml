@@ -138,5 +138,11 @@ jobs:
           echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum --check --strict
           tar xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
       # gitleaks exits non-zero when it finds a leak, so this step fails the job.
+      # The scan is pinned to HEAD instead of gitleaks' default `--all`: a
+      # fetch-depth-0 checkout has every branch in the object store, and
+      # `--all` would report secrets committed on unrelated branches, turning
+      # this job red for code the PR never touched. HEAD's history is complete
+      # for this purpose -- a pull_request checkout is the merge commit, so it
+      # contains both the PR branch and every commit it branched off from.
       - name: Secret scan
-        run: gitleaks detect --source . --redact --no-banner
+        run: gitleaks detect --source . --redact --no-banner --log-opts="-p -U0 --full-history HEAD"
