@@ -132,6 +132,37 @@ def test_every_fixture_has_the_verdict_both_sides_agree_on(corpus, frontend):
     assert not wrong, "verdicts the corpus says are wrong:\n" + "\n".join(wrong)
 
 
+def test_both_sides_match_the_same_fence_text(corpus, frontend):
+    """Same regex, same match extent, same captured payload — for every fixture.
+
+    Comparing only the accept/reject verdict cannot see a whitespace class the
+    two engines read differently: the class after the closing fence changes how
+    much text a side swallows, not whether the block is valid, so the two could
+    drift apart on every fixture while all the verdicts still agreed."""
+    mismatched = []
+    for fixture in corpus["fixtures"]:
+        result = frontend["results"][fixture["name"]]
+        match = chat_module._DATAVIZ_FENCE_RE.search(fixture["text"])
+        expected = ([list(match.span()), match.group(1)] if match else [None, None])
+        if [result["span"], result["captured"]] != expected:
+            mismatched.append(
+                f"{fixture['name']}: backend {expected} frontend {[result['span'], result['captured']]}"
+            )
+    assert not mismatched, "the two sides match the fence differently:\n" + "\n".join(mismatched)
+
+
+def test_fixture_names_are_unique(corpus):
+    """The harness keys its results by fixture name, so two fixtures sharing one
+    would leave the first shadowed -- its verdict compared against the second's --
+    and a real disagreement on it would never be looked at."""
+    seen, duplicates = set(), []
+    for fixture in corpus["fixtures"]:
+        if fixture["name"] in seen:
+            duplicates.append(fixture["name"])
+        seen.add(fixture["name"])
+    assert not duplicates, "fixture names used twice: " + ", ".join(sorted(duplicates))
+
+
 def test_fence_grammar_is_one_string_on_both_sides(frontend):
     """The fence pattern is a single string, copied verbatim rather than
     re-derived, so it cannot drift while still meaning the same thing."""

@@ -758,7 +758,7 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
 # carrying U+0085 was the other way round. Equal strings, unequal grammars. The
 # carriage return keeps a CRLF answer working, and the newline is the OPTIONAL
 # \n? below, so a fence written as ```dataviz{...}``` is still the same grammar.
-DATAVIZ_FENCE_PATTERN = r"```dataviz[ \t\r]*\n?([\s\S]*?)\n?```\s*"
+DATAVIZ_FENCE_PATTERN = r"```dataviz[ \t\r]*\n?([\s\S]*?)\n?```[\t\n\v\f\r ]*"
 _DATAVIZ_FENCE_RE = re.compile(DATAVIZ_FENCE_PATTERN, re.DOTALL)
 
 
@@ -853,7 +853,18 @@ def _as_float(v: object) -> float | None:
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return float(v) if math.isfinite(v) else None
+        # A bare integer literal wider than float can hold arrives as an
+        # unbounded-precision int, and both float() and math.isfinite() raise
+        # OverflowError on it -- which used to escape parse_dataviz, and with it
+        # _sanitize_dataviz and _finalize_answer, turning one malformed block
+        # into a failed chat request. JSON.parse overflows the same literal to
+        # Infinity, which the frontend rejects as not finite, so refusing it
+        # here is also what makes the two sides agree (#267).
+        try:
+            as_float = float(v)
+        except OverflowError:
+            return None
+        return as_float if math.isfinite(as_float) else None
     if isinstance(v, str):
         cleaned = v.replace(",", "").strip(_TRIM_CHARS)
         if _NUMERIC_LITERAL_RE.fullmatch(cleaned) is None:

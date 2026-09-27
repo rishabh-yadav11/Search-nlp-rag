@@ -35,10 +35,19 @@ function plottedValues(block) {
 
 const results = {}
 for (const fixture of corpus.fixtures) {
+  const m = new RegExp(contract.FENCE_SRC).exec(fixture.text)
   const block = contract.parseDataViz(fixture.text)
-  results[fixture.name] = block
-    ? { accept: true, value_column: block.value_column, values: plottedValues(block) }
-    : { accept: false, value_column: null, values: [] }
+  results[fixture.name] = {
+    // The full match extent and the captured payload, not just the verdict: a
+    // whitespace class that the two regex engines read differently changes how
+    // much text a side swallows after the closing fence without changing
+    // whether the block is accepted, so a verdict-only comparison cannot see it.
+    span: m ? [m.index, m.index + m[0].length] : null,
+    captured: m ? m[1] : null,
+    accept: !!block,
+    value_column: block ? block.value_column : null,
+    values: block ? plottedValues(block) : [],
+  }
 }
 
 const tokens = contract.MISSING_VALUE_TOKENS

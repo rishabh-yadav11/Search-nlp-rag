@@ -475,6 +475,30 @@
       "why": "a raw NaN literal is not a number; json.loads accepted it in Python"
     },
     {
+      "name": "huge_integer_cell",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000]], \"value_column\": 1}\n```\n\nTrailing prose.",
+      "expect": "reject",
+      "why": "a bare integer literal too wide for a float: JSON.parse overflows it to Infinity and the browser refuses it, while Python's float() and math.isfinite() RAISE OverflowError, which used to escape parse_dataviz and fail the whole chat request"
+    },
+    {
+      "name": "huge_integer_value_column",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", 1]], \"value_column\": 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000}\n```\n\nTrailing prose.",
+      "expect": "accept",
+      "why": "a huge integer index is out of range, so both sides fall back to the first numeric column instead of choking on it"
+    },
+    {
+      "name": "huge_integer_in_unused_key",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", 1]], \"value_column\": 1, \"note\": 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000}\n```\n\nTrailing prose.",
+      "expect": "accept",
+      "why": "a huge integer in a key nothing reads is harmless on both sides"
+    },
+    {
+      "name": "trailing_exotic_whitespace",
+      "text": "Prose.\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",1.0],[\"MUFG\",4.4]],\"value_column\":1}\n```﻿\nNext paragraph.",
+      "expect": "accept",
+      "why": "exotic whitespace after the closing fence: it changes how much text a side consumes, which is why the contract test compares the match span and not only the verdict"
+    },
+    {
       "name": "num_json_overflow",
       "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",1e999]],\"value_column\":1}\n```\n\nTrailing prose.",
       "expect": "reject",
@@ -529,10 +553,22 @@
       "why": "a non-breaking-space cell is not one of the missing-value tokens, so it is a non-numeric cell and the column fails; Python str.strip() used to erase it and treat the column as valid"
     },
     {
-      "name": "nbsp_only_cell",
-      "text": "```dataviz\\n{\"columns\": [\"A\", \"B\"], \"rows\": [[\"x\", \"\\u00a0\"]], \"value_column\": 1}\\n```",
+      "name": "nbsp_padded_value",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",\"1.5 \"]],\"value_column\":1}\n```\n\nTrailing prose.",
       "expect": "reject",
-      "why": "a lone non-breaking-space cell leaves no valid value column"
+      "why": "a non-breaking space is not trimmed off a value, so this cell is not a plain numeric literal on either side; Python str.strip() used to erase it and read 1.5"
+    },
+    {
+      "name": "nbsp_padded_token",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",\"n/a \"]],\"value_column\":1}\n```\n\nTrailing prose.",
+      "expect": "reject",
+      "why": "a token with a trailing non-breaking space is not one of the missing-value tokens, so the cell is a non-numeric value and the column fails"
+    },
+    {
+      "name": "nbsp_padded_number",
+      "text": "Prose [1].\n\n```dataviz\n{\"columns\":[\"Deal\",\"Value\"],\"rows\":[[\"Zepto\",5],[\"MUFG\",\" 1.5\"]],\"value_column\":1}\n```\n\nTrailing prose.",
+      "expect": "reject",
+      "why": "the same at the front of the cell"
     },
     {
       "name": "num_proto_cell",

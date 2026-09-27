@@ -54,8 +54,16 @@ export type ContentPart =
  * carriage return is there for CRLF answers; the newline itself is the
  * optional `\n?` below, so a fence written as ```dataviz{...}``` is still the
  * same grammar (#255, #267).
+ *
+ * The same reasoning applies to the whitespace swallowed AFTER the closing
+ * fence: it was left as `\s*` and so stayed engine-dependent even while the two
+ * pattern strings matched, because Python's `\s` eats U+001C-U+001F and U+0085
+ * where JavaScript's does not, and vice versa for U+FEFF. That class changes how
+ * much trailing text a side consumes rather than the verdict, which is why the
+ * contract test compares the full match SPAN on every fixture and not just the
+ * accept/reject outcome.
  */
-export const FENCE_SRC = '```dataviz[ \\t\\r]*\\n?([\\s\\S]*?)\\n?```\\s*'
+export const FENCE_SRC = '```dataviz[ \\t\\r]*\\n?([\\s\\S]*?)\\n?```[\\t\\n\\v\\f\\r ]*'
 export const KINDS = ['bar', 'line', 'pie'] as const
 export const VIEWS = ['table', 'bar', 'line', 'pie'] as const
 
