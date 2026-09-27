@@ -254,30 +254,30 @@ export async function getMe(force = false): Promise<AuthUser | null> {
   const fresh = meCache !== undefined && meCacheToken === token && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
   if (!force && fresh) return meCache ?? null
   let res: Response
-    // Deadline so a hung auth service actually cancels the request instead of
-    // leaking one in-flight `/api/auth/me` per poll tick. The dashboard races
-    // this with its own 10 s guard and abandons the promise, which never
-    // cancelled the underlying fetch; aborting here is what makes that safe.
-    const deadline = createDeadline(ME_DEADLINE_MS)
-    try {
-      res = await fetch(`${API_BASE}/api/auth/me`, {
-        headers: authHeaders(),
-        signal: deadline.signal,
-      })
-    } catch (err) {
-      // Network/transport failure: do NOT treat as "not authenticated" (preserve
-      // the token so a later retry can succeed). Rethrow rather than return null
-      // so callers can tell this apart from a definitive 401/logged-out null.
-      console.error(
-        deadline.timedOut()
-          ? 'getMe: /api/auth/me timed out'
-          : 'getMe: failed to reach the auth service',
-        err
-      )
-      throw err
-    } finally {
-      deadline.clear()
-    }
+  // Deadline so a hung auth service actually cancels the request instead of
+  // leaking one in-flight `/api/auth/me` per poll tick. The dashboard races
+  // this with its own 10 s guard and abandons the promise, which never
+  // cancelled the underlying fetch; aborting here is what makes that safe.
+  const deadline = createDeadline(ME_DEADLINE_MS)
+  try {
+    res = await fetch(`${API_BASE}/api/auth/me`, {
+      headers: authHeaders(),
+      signal: deadline.signal,
+    })
+  } catch (err) {
+    // Network/transport failure: do NOT treat as "not authenticated" (preserve
+    // the token so a later retry can succeed). Rethrow rather than return null
+    // so callers can tell this apart from a definitive 401/logged-out null.
+    console.error(
+      deadline.timedOut()
+        ? 'getMe: /api/auth/me timed out'
+        : 'getMe: failed to reach the auth service',
+      err
+    )
+    throw err
+  } finally {
+    deadline.clear()
+  }
   if (res.status === 401) {
     clearToken()
     return null
