@@ -1,7 +1,9 @@
 /**
-/**
- * Request deadlines for the frontend's user-visible, state-bearing `fetch`
- * call sites — the ones whose pending state can strand a spinner.
+ * Request deadlines for the `fetch` call sites on the pages this helper
+ * governs: the For You feed, SimilarArticles, chat's JSON `api()` helper and
+ * `getMe()` — plus the two fire-and-forget beacons in those same files
+ * (click tracking, logout) that would otherwise hold a socket open with
+ * nothing to release it.
  *
  * A backend that accepts the connection but never answers leaves a promise
  * pending forever: no rejection, so every `catch`/`finally` downstream is never
@@ -10,16 +12,13 @@
  * than merely abandoning the promise) is what turns that hang into a failure
  * the UI can report.
  *
- * Scope note: this is the whole per-page budget set — the four state-bearing
- * call sites the issue named, plus the two fire-and-forget beacons in those
- * same files (click tracking, logout) that would otherwise hold a socket open
- * with nothing to release it. Fetches on pages this issue does not touch
- * (search, login, signup) keep their own existing inline deadlines.
+ * NOT in scope: the search page, login, signup and the dashboard's own
+ * analytics fetches keep their existing inline `setTimeout(() => abort())`
+ * deadlines, and the chat SSE stream keeps its separate 45 s watchdog. This
+ * module is the budget set for the pages listed above, not a claim that every
+ * fetch in the app is routed through here.
  *
- * The per-page `setTimeout(() => controller.abort(), MS)` idiom was open-coded
- * at five call sites with four different budgets; copies six through nine
- * would make the envelope impossible to audit in one place, so the pattern
- * lives here as a small signal-level helper. It is deliberately NOT a `fetch`
+ * The pattern lives here as a small signal-level helper rather than a `fetch`
  * wrapper: each call site keeps its own `AbortController` for unmount
  * cancellation and passes that signal in as `base`, so unmount and deadline
  * remain independently observable (call sites gate their state updates on
