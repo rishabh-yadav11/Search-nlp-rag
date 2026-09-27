@@ -771,17 +771,25 @@ class AuthStore:
         inside a single ``BEGIN IMMEDIATE`` .. ``COMMIT``: SQLite keeps an
         uncommitted transaction invisible to every other connection and
         discards it outright if the process dies, so the database is always on
-        one side of the change or the other and never inside it. The shared
-        connection cannot provide that: it serialises every request in the
-        worker, so another coroutine's ``commit()`` could land between two of
-        these statements and make a half-finished password change durable (and
-        its ``rollback()`` could throw this one away) -- the very "one
-        connection is never shared across concurrent coroutines" hazard
-        ``create_user`` already rolls back on. Hence a short-lived dedicated
-        connection to the same file; WAL lets it read and write alongside the
-        shared one, and ``BEGIN IMMEDIATE`` takes the write lock up front so
-        this waits out the same 5 s busy timeout rather than failing on a
-        mid-transaction lock upgrade.
+        one side of the change or the other and never inside it.
+
+        The shared connection would in fact hold these three writes in a single
+        implicit transaction -- sqlite3 opens one at the first DML and keeps it
+        until ``commit()``, and the three separate commits this replaced were
+        exactly what cut it into three. What it cannot do is hold one open
+        safely for the length of this change: that connection serialises every
+        request in the worker, so another coroutine's ``commit()`` landing
+        between two of these statements would publish a half-finished password
+        change early, and its ``rollback()`` would throw this one away -- the
+        very "one connection is never shared across concurrent coroutines"
+        hazard ``create_user`` already rolls back on. Hence a short-lived
+        dedicated connection to the same file: WAL lets it read and write
+        alongside the shared one, SQLite's own write lock serialises it against
+        other writers, and ``BEGIN IMMEDIATE`` takes that lock up front so this
+        waits out the same 5 s busy timeout rather than failing on a
+        mid-transaction lock upgrade. It is opened with
+        ``isolation_level=None`` so this ``BEGIN`` is the connection's only
+        transaction, not a nested one sqlite3 would refuse.
 
         The statements are ALSO ordered revoke -> set hash -> mint. That is
         defence in depth, not the guarantee: it is what keeps the change safe
@@ -793,9 +801,10 @@ class AuthStore:
         The transaction above is what the tests pin, and on its own it holds
         whatever order the statements are written in.
 
-        The per-user token cap is deliberately not re-applied here: every other
-        token was deleted in this same transaction, so the user can hold at
-        most the single row inserted below.
+        The per-user token cap is not re-applied here: every other token was
+        deleted in this same transaction, so the user can hold at most the one
+        row inserted below. Measured rather than assumed -- with the cap set to
+        0, 1, 2 and 10 the user holds exactly one live row after the change.
         """
         if self._db is None:
             raise RuntimeError("auth store is not connected")
