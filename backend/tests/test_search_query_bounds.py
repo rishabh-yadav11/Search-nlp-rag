@@ -152,6 +152,13 @@ def _article(id_: int, score: float) -> SourceArticle:
     )
 
 
+def _body_article(id_: int, body: str, score: float = 0.1) -> SourceArticle:
+    return SourceArticle(
+        id=id_, title=f"T{id_}", url=f"https://example.com/{id_}",
+        body=body, score=score,
+    )
+
+
 def _wire_encoders(monkeypatch, dense=None, sparse=None, reranker=None):
     """Install recording encoders and a Qdrant stand-in on the app state."""
     dense = dense or _RecordingDense()
@@ -352,6 +359,27 @@ def test_cross_encoder_never_sees_more_than_the_limit(monkeypatch):
     assert reranker.pairs
     for query_side, _passage in reranker.pairs:
         assert len(query_side) == config.SEARCH_QUERY_MAX_CHARS
+
+
+def test_body_rescue_never_sees_more_than_the_limit(monkeypatch):
+    """body_rescue is a SECOND cross-encoder call site, driven by chat with a
+    message of up to MAX_CONTENT_LEN (8000). The clamp in rerank() is a local
+    and cannot reach it, so it needs its own bound and its own assertion."""
+    reranker = _RecordingReranker()
+    monkeypatch.setitem(main.state, "reranker", reranker)
+    monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.9)
+    # Only articles with a body are scored, and the top score must be under the
+    # threshold or body_rescue returns before it ever builds a pair.
+    articles = [_body_article(1, "alpha body"), _body_article(2, "beta body")]
+
+    _run(main.body_rescue("alpha " + "A" * 8000, articles))
+
+    assert reranker.pairs, "body_rescue must actually have reached the reranker"
+    for query_side, passage in reranker.pairs:
+        assert len(query_side) <= config.SEARCH_QUERY_MAX_CHARS
+        # The passage side is the article window and is never truncated by this
+        # bound — clamping the query must not cost the window its context.
+        assert "body" in passage
 
 
 def test_a_normal_query_reaches_the_encoders_unharmed(monkeypatch):

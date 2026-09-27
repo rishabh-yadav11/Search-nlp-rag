@@ -850,6 +850,13 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
         return articles
     if max((a.score for a in articles), default=0.0) >= config.BODY_RESCUE_THRESHOLD:
         return articles
+    # Same bound as rerank(), and for the same reason: this is the second
+    # cross-encoder call site, and the clamp in rerank() is a local that cannot
+    # reach here. Chat drives this with a message of up to MAX_CONTENT_LEN
+    # (8000) plus query expansion, so the query side of each pair here is
+    # genuinely unbounded without it. Clamped before the tokenization below so
+    # the lexical window and the rerank agree on the same string.
+    query = query[: config.SEARCH_QUERY_MAX_CHARS]
     tokens = _query_content_tokens(query)
     if not tokens:
         return articles
