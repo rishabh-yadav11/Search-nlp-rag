@@ -212,7 +212,11 @@ async def get_personalized_recommendations(
                         with_vectors=False,
                     )
                     results.extend(pts.points)
-                except Exception:  # noqa: BLE001, S112
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Vector candidate lookup failed for user %s article %s: %s",
+                        user_id, article_id, exc,
+                    )
                     continue
             return results
 
@@ -230,7 +234,8 @@ async def get_personalized_recommendations(
                     with_vectors=False,
                 )
                 return pts.points
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Category candidate lookup failed for user %s: %s", user_id, exc)
                 return []
 
         # 3. Trending candidates
@@ -252,7 +257,8 @@ async def get_personalized_recommendations(
                 # Match by ID, preserving the trending score order
                 id_set = set(ids)
                 return [p for p in pts if isinstance(p.id, int) and p.id in id_set][:len(ids)]
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Trending candidate lookup failed for user %s: %s", user_id, exc)
                 return []
 
         # Fetch all candidate sources in parallel
