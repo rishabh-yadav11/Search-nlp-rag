@@ -26,6 +26,7 @@ I built this as a hybrid retrieval + RAG search system over the VCCircle article
 - [5. Run the API](#5-run-the-api)
 - [6. Run the Frontend](#6-run-the-frontend)
 - [Deployment (nginx)](#deployment-nginx)
+- [TLS (HTTPS)](#tls-https)
 - [Security](#security)
 - [Supported Settings](#supported-settings)
 - [Testing and CI](#testing-and-ci)
@@ -124,10 +125,13 @@ I wrote `setup.sh` to provision everything in stages. Run `./setup.sh all`, or p
 ./setup.sh pm2-startup  # systemd unit so services restore on reboot
 ./setup.sh cron         # 15-min incremental sync
 ./setup.sh nginx        # reverse proxy + security headers on :80
+./setup.sh tls          # HTTPS: certbot + :443 + http->https redirect (needs a domain; see [TLS](#tls-https))
 ./setup.sh all          # deps backend index frontend services pm2-startup cron nginx
 ```
 
-Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`.
+`tls` is deliberately not part of `./setup.sh all`: it needs a domain name, a contact address and network access that an unattended bootstrap must not require. Run it once, on purpose.
+
+Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`, plus the TLS knobs `NGINX_TLS` (`auto`/`on`/`off`), `LE_DOMAIN`, `LE_EMAIL`, `LE_ROOT`, `CERTBOT_WEBROOT`, `NGINX_CONF`, `NGINX_LINK`.
 
 If you'd rather run pieces manually, keep reading.
 
@@ -259,7 +263,7 @@ The frontend guards against malformed responses, times out and cancels in-flight
 
 ## Deployment (nginx)
 
-Port map: Qdrant `6333` (internal), API `8001` (internal), Next.js `3000` (internal), nginx `80` (public). nginx serves the app and proxies the API paths on the same origin so the UI works with zero CORS setup:
+Port map: Qdrant `6333` (internal), API `8001` (internal), Next.js `3000` (internal), nginx `80` (public, plus `443` once TLS is enabled). nginx serves the app and proxies the API paths on the same origin so the UI works with zero CORS setup. `setup.sh nginx` writes this file and is the source of truth — the excerpt below is the plain-HTTP shape, not something to hand-maintain:
 
 ```nginx
 server {
@@ -269,6 +273,14 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Always served over plain HTTP, in both modes: Let's Encrypt validates
+    # over http, so redirecting the challenge away would break renewal. The
+    # "^~" makes this win over the catch-all "location /" below.
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type text/plain;
+    }
 
     # The per-IP rate limiter on /search, /facets, /analytics/click and /ready
     # keys on the client IP these headers carry. Without them every proxied
@@ -331,6 +343,49 @@ server {
 }
 ```
 
+### TLS (HTTPS)
+
+Out of the box the site is served over plain HTTP on port 80. Passwords, bearer tokens, the `X-Service-Token` and chat content all cross the wire in cleartext. The `Strict-Transport-Security` header the frontend sets (`next.config.ts`: `max-age=63072000; includeSubDomains; preload`) is ignored by browsers unless it arrives over https, so until TLS is on that header does nothing at all.
+
+`./setup.sh tls` enables it. It requires:
+
+- **A domain name** whose `A`/`AAAA` record points at this host. Let's Encrypt issues certificates for domain names, never for a bare IP, so this cannot be enabled on a host that is reached by IP alone.
+- **Ports 80 and 443 open** to the internet (host firewall *and* cloud security group). Port 80 must stay open even after TLS is on — issuance and renewal both validate over plain HTTP.
+- **certbot** on the host: `sudo apt-get install -y certbot`.
+- **An ACME contact address** — expiry warnings go there.
+
+```bash
+LE_DOMAIN=search.example.com LE_EMAIL=you@example.com ./setup.sh tls
+```
+
+The stage is written to be safe to re-run and safe to interrupt:
+
+- It issues with certbot's **webroot** plugin against `CERTBOT_WEBROOT` (default `/var/www/certbot`) and never `--standalone`. `--standalone` needs port 80 to be free, so on a live site it would either fail outright or force nginx to stop and take the site down.
+- `--keep-until-expiring` makes a re-run a no-op instead of consuming Let's Encrypt's rate limits.
+- The config is installed only after `nginx -t` accepts it; if nginx rejects it, the previous config is restored. nginx is then **reloaded**, not restarted, so in-flight requests survive.
+- If certbot fails, the plain-HTTP config is left in place and still serving, and the stage exits non-zero.
+- nginx is never handed a config that references a certificate which does not exist: the `443` server block is only rendered once `/etc/letsencrypt/live/<domain>/fullchain.pem` is readable, and the generator refuses to emit a config at all otherwise.
+
+Once it runs, port 80 keeps serving `/.well-known/acme-challenge/` and redirects everything else to `https://$host$request_uri`, and a matching `listen 443 ssl http2` server (TLSv1.2/1.3) is added. Both servers share one location body, so they cannot drift apart.
+
+**Renewal.** certbot renews roughly 30 days before expiry. The stage installs a `--deploy-hook` that reloads nginx, and uses the `certbot.timer` systemd unit when it is enabled, otherwise a daily `certbot renew` crontab line. Verify the whole path without touching real certificates:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+**Rollback to plain HTTP** — one flag, no other moving parts:
+
+```bash
+NGINX_TLS=off ./setup.sh nginx
+```
+
+`NGINX_TLS` defaults to `auto`: TLS turns on only when `LE_DOMAIN` is set *and* its certificate is on disk, so a host without a domain keeps serving plain HTTP exactly as before. `NGINX_TLS=on` refuses to write anything if the certificate is missing. If you set `LE_DOMAIN` and the certificate is not there yet, the `nginx` stage prints a loud warning that traffic is still unencrypted, and the last line it prints states which one is live (`serving: https via <domain>` or `serving: http only (...)`).
+
+**State of this repository: TLS is supported but NOT enabled.** No domain name is configured for this deployment, so `./setup.sh nginx` still writes the plain-HTTP config and the credentials-in-cleartext risk is unchanged until someone with the domain runs `./setup.sh tls`. Enabling it is an infrastructure decision, not a code one.
+
+**Recommendation (not done here).** The header already carries `max-age=63072000` (two years, the commonly recommended minimum) and the `preload` token, but those only take effect over https. Submitting a domain to hstspreload.org is effectively irreversible — removal takes months — and `includeSubDomains` means every subdomain must serve HTTPS for the whole `max-age`. Do not submit until TLS is live on the apex *and* every subdomain, and treat it as its own change.
+
 ### Security
 
 Hardening I baked into `setup.sh`:
@@ -346,7 +401,7 @@ sudo ufw --force enable
 
   Also restrict the cloud security group (e.g. AWS) to ports 22/80.
 
-- **nginx security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin` on every location. CSP is set by the frontend (`middleware.ts`, per-request nonce), so I don't duplicate it at nginx. Plain HTTP only.
+- **nginx security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Referrer-Policy: strict-origin-when-cross-origin` on every location. CSP is set by the frontend (`middleware.ts`, per-request nonce), so I don't duplicate it at nginx. Transport security is opt-in: plain HTTP by default, `./setup.sh tls` to switch (see [TLS](#tls-https) above). HSTS is deliberately **not** set at nginx level — `next.config.ts` is the single source for that header, and two `max-age` values drift.
 - **Pinned images** — Qdrant/Redis run from pinned, digest-resolvable tags (`QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057e...d1fc`, `REDIS_IMAGE=redis:7-alpine`). If you override Qdrant, keep it >= the version that wrote any existing collection — older releases can't read newer storage formats.
 - **API note** — CORS is restricted to the origins in `CORS_ORIGINS` (localhost dev origins by default; production is same-origin through nginx). **Auth** uses opaque bearer tokens with RBAC roles (see `app/auth.py`), and signup/login endpoints are rate-limited per client IP (Redis-backed). LLM spend is bounded by `LLM_DAILY_BUDGET_USD` (see `app/cost_budget.py`).
 - **Health monitoring** — `deploy/healthcheck.sh` probes `/health` (I run it from cron every few minutes), restarts `vccircle-backend` when unhealthy, and posts an alert to `HEALTHCHECK_WEBHOOK_URL` if a restart doesn't recover the app. Logs to `logs/healthcheck.log`.
