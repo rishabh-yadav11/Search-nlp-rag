@@ -345,7 +345,7 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
 | `ANALYTICS_REDIS_DB` | `1` | Analytics aggregates live in Redis DB N (cache is DB 0); read endpoints are gated by the auth layer (admin role) |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8001` | Comma-separated allowed origins for CORS (production is same-origin through nginx) |
-| `ALLOWED_HOSTS` | derived from `CORS_ORIGINS` + this box's hostname/IPs + `localhost,127.0.0.1,testserver` | Comma-separated hostnames the API answers to; a request with any other `Host` gets 400 (`TrustedHostMiddleware`), and the effective list is logged at startup. A wrong value here 400s the whole site; `*` is rejected. Set it when the API is reachable under a name none of the defaults cover, e.g. a registered public domain. The API also serves no `/docs`, `/redoc` or `/openapi.json` — see `docs/API.md` |
+| `ALLOWED_HOSTS` | derived from `CORS_ORIGINS` + this box's hostname/addresses (including its default-route address) + `localhost,127.0.0.1,testserver` | Comma-separated hostnames the API answers to; a request with any other `Host` gets 400 (`TrustedHostMiddleware`), and the effective list is logged at startup. A wrong value here 400s the whole site; `*` is rejected. Set it when the API is reachable under a name none of the defaults cover, e.g. a registered public domain. The API also serves no `/docs`, `/redoc` or `/openapi.json` — see `docs/API.md` |
 
 ## Testing and CI
 
