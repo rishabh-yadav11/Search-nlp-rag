@@ -57,6 +57,12 @@ class _RecordingCache:
         self.gets.append(key)
         return self.store.get(key)
 
+    async def get_many(self, keys):
+        """Positional MGET, faithful to HybridCache.get_many: a batched read is
+        still a read of every key, so it is recorded in ``gets`` exactly as
+        separate ``get`` calls would be, and falls back to the same store."""
+        return [await self.get(key) for key in keys]
+
     async def set(self, key, value, ttl=None):
         self.store[key] = value
         self.sets.append(key)
@@ -138,9 +144,16 @@ def test_colliding_facet_sets_get_distinct_cache_entries(monkeypatch):
     # must not be answered from the first request's cache entry.
     assert retrieved == [("a", "b|c"), ("a|b", "c")]
     assert second.json()["cached"] is False
-    assert len(cache.gets) == 2
-    assert cache.gets[0] != cache.gets[1], "the two facet sets share one cache key"
-    assert len(cache.store) == 2, "one cache entry was written for two different filters"
+    # /search reads both its own summary entry and the underlying retrieval
+    # entry in one MGET (#266), so keys are compared per namespace rather than
+    # as a flat count: the property is that the two colliding facet sets never
+    # land on one key, not how many round trips the read took.
+    search_keys = [k for k in cache.gets if k.startswith("search:")]
+    retrieve_keys = [k for k in cache.gets if k.startswith("retrieve:")]
+    assert len(set(search_keys)) == 2, "the two facet sets share one search key"
+    assert len(set(retrieve_keys)) == 2, "the two facet sets share one retrieve key"
+    stored_search = [k for k in cache.store if k.startswith("search:")]
+    assert len(stored_search) == 2, "one cache entry was written for two different filters"
 
 
 def test_colliding_facet_sets_get_distinct_results(monkeypatch):
@@ -238,6 +251,40 @@ def test_facet_bomb_is_rejected_rather_than_truncated():
     # Refused, not trimmed: an error, so the caller learns the facet was dropped
     # rather than receiving results for the first ten values only.
     assert "industry" in excinfo.value.detail
+
+
+def test_eleven_values_is_rejected_at_the_shipped_cap():
+    """A LITERAL boundary test, on purpose.
+
+    Every other cap test builds its input from MAX_FACET_VALUES
+    (``range(MAX_FACET_VALUES + 1)``) and then asserts against the same
+    constant, so input and expectation scale together and the test passes
+    whatever the constant is. A mutation that raised the cap to 10 ** 9 was
+    sitting in the working tree of this branch, unnoticed, for exactly that
+    reason. These tests hold the boundary at fixed numbers so changing the
+    constant has to break something.
+    """
+    with pytest.raises(HTTPException) as excinfo:
+        split_facet_values("industry", ",".join(f"v{i}" for i in range(11)))
+    assert excinfo.value.status_code == 400
+
+
+def test_ten_values_is_accepted_at_the_shipped_cap():
+    """The other side of the literal boundary: 10 is in bounds, so the cap is a
+    bound and not a blanket refusal that would break a real UI selection."""
+    assert len(split_facet_values("industry", ",".join(f"v{i}" for i in range(10)))) == 10
+
+
+def test_a_101_character_value_is_rejected_at_the_shipped_cap():
+    """The literal length boundary. Scaling from MAX_FACET_VALUE_LEN has the
+    same tautology as above."""
+    with pytest.raises(HTTPException) as excinfo:
+        split_facet_values("author", "n" * 101)
+    assert excinfo.value.status_code == 400
+
+
+def test_a_100_character_value_is_accepted_at_the_shipped_cap():
+    assert split_facet_values("author", "n" * 100) == ["n" * 100]
 
 
 def test_facet_filter_never_builds_an_oversized_match_any():
@@ -453,9 +500,14 @@ def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
     values = ",".join("v" * MAX_FACET_VALUE_LEN for _ in range(MAX_FACET_VALUES))
     response = _client.get("/search", params={"q": "test", "industry": values})
     assert response.status_code == 200
+    # The request also builds the retrieve: prefetch key (#266); only the
+    # search: key is the one this test is about, but both must stay bounded.
+    search_keys = [k for k in cache.gets if k.startswith("search:")]
+    assert search_keys, "expected the request to build a search cache key"
     for key in cache.gets:
-        assert key.startswith("search:")
         assert len(key) <= MAX_KEY_LEN
+    for key in search_keys:
+        assert key.startswith("search:")
 
 
 def test_retrieve_cache_key_is_bounded_and_control_free(monkeypatch):
@@ -491,19 +543,110 @@ def test_normalised_filter_values_reach_qdrant_clean(monkeypatch):
 
 def test_click_analytics_key_carries_no_control_characters():
     """The click beacon is unauthenticated, so its query is the least trusted
-    string in the app and it lands straight in a Redis key."""
-    key = analytics._click_query_key("test\x00\r\nINJECTED: admin")
+    string in the app. It reaches Redis as a keyed digest rather than as text,
+    and the digest is taken over the normalised form, so a NUL/CRLF can neither
+    appear in the key nor make two spellings of one query into two keys."""
+    key = analytics._click_query_key("test\x00\r\nINJECTED: admin", "k")
     assert "\x00" not in key
     assert "\r" not in key and "\n" not in key
+    assert "INJECTED" not in key
 
 
 def test_click_analytics_key_aggregates_equivalent_spellings():
-    assert analytics._click_query_key("ＴＥＳＴ deals") == \
-        analytics._click_query_key("TEST deals")
+    assert analytics._click_query_key("ＴＥＳＴ deals", "k") == \
+        analytics._click_query_key("TEST deals", "k")
 
 
 def test_click_analytics_key_stays_length_bounded():
-    """Normalising must not have displaced the existing length bound -- that
-    bound is what stops unbounded key growth from the unauthenticated beacon."""
-    key = analytics._click_query_key("q" * 100_000)
+    """Canonicalising must not have displaced the bound -- what stops unbounded
+    key growth from the unauthenticated beacon."""
+    key = analytics._click_query_key("q" * 100_000, "k")
     assert len(key) < 1000
+
+
+def test_click_analytics_key_is_scoped_by_the_digest_key():
+    """Two deployments must not read each other's click signal, so the secret is
+    mixed in rather than the key being a bare hash of the query."""
+    assert analytics._click_query_key("TEST deals", "k1") != \
+        analytics._click_query_key("TEST deals", "k2")
+
+
+class _MemberRedis:
+    """Records the ZSET members analytics actually writes."""
+
+    def __init__(self):
+        self.members: list[tuple[str, str]] = []
+
+    def pipeline(self):
+        return self
+
+    def zincrby(self, key, amount, member):
+        self.members.append((key, member))
+        return self
+
+    def incr(self, *a, **k):
+        return self
+
+    def expire(self, *a, **k):
+        return self
+
+    async def execute(self):
+        return []
+
+
+def _use_fixed_digest_key(monkeypatch, fake):
+    """Pin the analytics digest secret so the recorders take the keyed path
+    without needing a real Redis to persist a generated key into."""
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics.config, "ANALYTICS_QUERY_KEY", "test-digest-key")
+    monkeypatch.setattr(analytics, "_QUERY_DIGEST_KEY", None)
+
+
+@pytest.mark.parametrize("call", ["search", "click"])
+def test_analytics_sorted_set_members_carry_no_user_text(monkeypatch, call):
+    """The top-query ZSETs store a keyed digest, never the query.
+
+    ``_click_query_key`` normalised before building its key, and the members
+    written beside it are derived from the same canonical form, so a control
+    character cannot reach Redis as a member and no spelling of the query is
+    stored as text. This drives the real recorders and inspects what they would
+    really write, because the property is about the bytes on the wire, not
+    about a helper's return value.
+    """
+    fake = _MemberRedis()
+    _use_fixed_digest_key(monkeypatch, fake)
+    raw = "ＴＥＳＴ deals\x00\r\n"
+    if call == "search":
+        asyncio.run(analytics.record_search(raw, 1, False, False, 10.0, False))
+        target = "analytics:top_queries"
+    else:
+        asyncio.run(analytics.record_click(raw, 0, 7))
+        # record_click writes two members: the query digest in
+        # click_top_queries, and the article id in the per-query set.
+        target = "analytics:click_top_queries"
+
+    written = [m for key, m in fake.members if key == target]
+    assert written, f"expected a member under {target}"
+    for member in written:
+        assert "\x00" not in member and "\r" not in member and "\n" not in member
+        # Not merely scrubbed: the query itself is not recoverable from the
+        # member, so the ZSET cannot be walked back into a corpus of what
+        # every user typed.
+        assert "deals" not in member.lower()
+        assert member == analytics.query_digest(raw, analytics._QUERY_DIGEST_KEY)
+
+
+def test_equivalent_spellings_aggregate_into_one_top_query_row(monkeypatch):
+    """The point of canonicalising the member, not merely hiding it: two
+    spellings of one query are one row, so the top-query list is not split by
+    presentation. The digest is taken over the normalised form, so this holds
+    for the opaque members too."""
+    fake = _MemberRedis()
+    _use_fixed_digest_key(monkeypatch, fake)
+    spellings = ("ＴＥＳＴ deals", "TEST  deals", "TEST deals\x00")
+    for spelling in spellings:
+        asyncio.run(analytics.record_search(spelling, 1, False, False, 10.0, False))
+    members = [m for key, m in fake.members if key == "analytics:top_queries"]
+    assert len(set(members)) == 1, f"split across rows: {members}"
+    assert members[0] == analytics.query_digest("TEST deals", analytics._QUERY_DIGEST_KEY)
+
