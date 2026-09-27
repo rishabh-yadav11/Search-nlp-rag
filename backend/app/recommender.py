@@ -258,7 +258,13 @@ async def get_personalized_recommendations(
         async def _trending_candidates():
             """Get trending articles."""
             try:
-                trending = await get_trending_articles(_candidate_pool(limit))
+                # Bare limit, deliberately not _candidate_pool:
+                # get_trending_articles caches the ranked list under a key that
+                # carries no limit and returns the cached depth verbatim, so the
+                # depth this leg gets is decided by whichever caller warmed that
+                # key, not by what was asked for. Widening it here would buy no
+                # reliable recall and would multiply the scroll below by 5.
+                trending = await get_trending_articles(limit)
                 if not trending:
                     return []
                 ids = [t["article_id"] for t in trending]

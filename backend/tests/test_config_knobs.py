@@ -58,19 +58,25 @@ def _config_knobs() -> dict[str, int]:
 
 
 def _source_files() -> list[Path]:
-    """Every shipped Python file, minus this test and config.py itself.
+    """Every shipped runtime file: the app package and the CLI scripts.
 
-    config.py is excluded because it mentions every knob in its own
-    ``os.getenv`` call, and this test because its allowlist spells knob names out
-    in plain text -- either would make every knob look referenced.
+    Deliberately NOT ``BACKEND.rglob("*.py")``. A test is not a reader: a knob
+    that only a test mentions is still inert in production, and including tests/
+    would let ``patch.object(config, "SOME_KNOB", ...)`` in a test vouch for a
+    knob the app ignores -- exactly the failure this guard exists to catch.
+    config.py itself is excluded because every knob appears in its own
+    ``os.getenv`` call, and this test because its allowlist spells knob names
+    out in plain text.
     """
     files = [
         path
-        for path in BACKEND.rglob("*.py")
+        for root in ("app", "scripts")
+        for path in (BACKEND / root).rglob("*.py")
         if not _SKIP_DIRS.intersection(path.parts)
         and path.resolve() not in (CONFIG_PY.resolve(), THIS_FILE)
     ]
     assert files, "no python files found -- the scan is not looking anywhere"
+    assert not any("tests" in path.parts for path in files), "tests must not count as readers"
     return files
 
 

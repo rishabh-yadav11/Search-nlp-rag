@@ -444,23 +444,19 @@ class _PoolQdrant:
 
     The leg named by ``fresh_leg`` hands out ids from its own base range with an
     age that *shrinks* down the pool, so its deepest candidates are the
-    freshest; every other leg is STALE_DAYS old. The trending leg, when the
-    driver is given a trending count, serves that many ids from
-    TRENDING_BASE, freshest last. Disjoint id ranges per leg plus recency in the
-    hybrid score mean the page is filled from whichever candidates the pool
-    actually reached, which is what makes the pool width visible in the response
-    instead of being an internal fetch detail.
+    freshest; the other leg is STALE_DAYS old. Disjoint id ranges per leg plus
+    recency in the hybrid score mean the page is filled from whichever
+    candidates the pool actually reached, which is what makes the pool width
+    visible in the response instead of being an internal fetch detail.
     """
 
     VECTOR_BASE = 100
     CATEGORY_BASE = 200
-    TRENDING_BASE = 300
     STALE_DAYS = 90
 
-    def __init__(self, *, fresh_leg="vector", trending_ids=()):
+    def __init__(self, *, fresh_leg="vector"):
         self.now = datetime.now(UTC)
         self.fresh_leg = fresh_leg
-        self.trending_ids = list(trending_ids)
 
     def _leg_points(self, base, width, fresh):
         return [
@@ -480,13 +476,7 @@ class _PoolQdrant:
         return SimpleNamespace(points=points)
 
     async def scroll(self, **kwargs):
-        """Serve the trending leg: the same points, freshest at the end."""
-        count = len(self.trending_ids)
-        points = [
-            _point_at(pid, self.now - timedelta(days=count - i))
-            for i, pid in enumerate(self.trending_ids)
-        ]
-        return (points, None)
+        return ([], None)
 
 
 class _ScrollQdrant:
@@ -510,26 +500,13 @@ class _ScrollQdrant:
         return (points, None)
 
 
-async def _pooled_page(candidates_limit, *, limit=5, fresh_leg="vector", trending=0):
-    """Personalized feed for a warm user, with the candidate pool pinned.
-
-    ``trending`` is the number of trending candidates the Redis double will
-    serve; it honours whatever count it is asked for, so the trending leg's
-    pool width is driven by the knob exactly like the other legs.
-    """
+async def _pooled_page(candidates_limit, *, limit=5, fresh_leg="vector"):
+    """Personalized feed for a warm user, with the candidate pool pinned."""
     from app import recommender
 
     now = datetime.now(UTC).timestamp()
-    trending_ids = [_PoolQdrant.TRENDING_BASE + i for i in range(trending)]
-
-    async def _redis_trending(count):
-        return [{"article_id": pid, "score": 1.0} for pid in trending_ids[:count]]
-
     with (
-        patch.object(
-            recommender, "state",
-            {"qdrant": _PoolQdrant(fresh_leg=fresh_leg, trending_ids=trending_ids)},
-        ),
+        patch.object(recommender, "state", {"qdrant": _PoolQdrant(fresh_leg=fresh_leg)}),
         patch.object(recommender.config, "RECOMMEND_CANDIDATES_LIMIT", candidates_limit),
         patch.object(
             recommender, "get_user_interactions",
@@ -541,7 +518,7 @@ async def _pooled_page(candidates_limit, *, limit=5, fresh_leg="vector", trendin
             recommender, "get_user_profile_categories",
             AsyncMock(return_value=[("software industry", 1.0)]),
         ),
-        patch.object(recommender, "get_trending_articles", _redis_trending),
+        patch.object(recommender, "get_trending_articles", AsyncMock(return_value=[])),
     ):
         return await recommender.get_personalized_recommendations("user1", limit=limit)
 
@@ -613,23 +590,6 @@ class TestCandidatePoolWidth:
         assert len(_of_leg(_ids(narrow), _PoolQdrant.CATEGORY_BASE)) == 5
         assert _of_leg(_ids(narrow), _PoolQdrant.VECTOR_BASE), "the stale leg fills the rest"
         assert len(_of_leg(_ids(wide), _PoolQdrant.CATEGORY_BASE)) == 10
-
-    @pytest.mark.asyncio
-    async def test_trending_leg_pool_width_reaches_the_page(self):
-        """The trending leg inside the personalized feed is wired as well.
-
-        Its Redis rank is discarded -- the leg is scored by recency like the
-        others -- so the only way its pool width shows is through how many
-        trending candidates it can offer. With the other two legs stale, a
-        3-wide trending pool fills 3 of the 10 slots and a 20-wide pool fills
-        all ten.
-        """
-        narrow = await _pooled_page(3, fresh_leg="none", trending=20)
-        wide = await _pooled_page(20, fresh_leg="none", trending=20)
-
-        assert len(narrow) == len(wide) == 10
-        assert len(_of_leg(_ids(narrow), _PoolQdrant.TRENDING_BASE)) == 5
-        assert len(_of_leg(_ids(wide), _PoolQdrant.TRENDING_BASE)) == 10
 
     @pytest.mark.asyncio
     async def test_cold_start_scroll_depth_comes_from_the_knob(self):
