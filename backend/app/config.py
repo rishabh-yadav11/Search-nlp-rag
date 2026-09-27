@@ -129,9 +129,23 @@ class Config:
     LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "1.50"))
     # Conversion for displaying cost in Indian Rupees (INR). Approx market rate.
     INR_PER_USD = float(os.getenv("INR_PER_USD", "95.60"))
-    # Daily LLM spend cap in USD; 0 disables it. Chat fails closed (no LLM calls)
-    # once today's cumulative spend reaches this value (see app/cost_budget.py).
-    LLM_DAILY_BUDGET_USD = float(os.getenv("LLM_DAILY_BUDGET_USD", "0"))
+    # Daily LLM spend cap in USD. Chat fails closed (no LLM calls) once today's
+    # cumulative spend reaches this value (see app/cost_budget.py). 0 is a
+    # deliberate opt-out for deployments that meter spend elsewhere; it is not
+    # the default, because an unset cap is how unbilled spend happens.
+    LLM_DAILY_BUDGET_USD = float(os.getenv("LLM_DAILY_BUDGET_USD", "5.0"))
+    # Per-billed-call hold taken against the cap BEFORE the call runs, so
+    # concurrent turns contend for the same budget instead of each reading a
+    # stale counter (see reserve() in app/cost_budget.py).
+    LLM_CALL_RESERVE_USD = float(os.getenv("LLM_CALL_RESERVE_USD", "0.05"))
+    # Lifetime of an unsettled hold. Bounds the damage a crashed or cancelled
+    # turn does to the budget: after this long the hold is swept and CHARGED to
+    # the spend counter at its reserved amount, so a crashed billed call stays
+    # charged for the rest of the day instead of becoming free spend.
+    COST_RESERVATION_TTL_SECONDS = int(os.getenv("COST_RESERVATION_TTL_SECONDS", "900"))
+    # Total-character cap on conversation history sent to the LLM. Turns the
+    # cap is needed most (long histories) into the turns that cost the most.
+    CHAT_MAX_HISTORY_CHARS = int(os.getenv("CHAT_MAX_HISTORY_CHARS", "24000"))
 
     # Search
     TOP_K = int(os.getenv("TOP_K", "8"))

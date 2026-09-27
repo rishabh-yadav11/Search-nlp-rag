@@ -410,7 +410,7 @@ export default function ChatPage() {
       // initial fetch. Refresh it on genuine activity — every chunk the reader
       // returns and the final 'done' event — so a normally-streaming answer, or
       // the backend's substantial post-delta work (nudge/ranking retries that
-      // re-invoke the LLM, _auto_title, record_cost) before emitting 'done',
+      // re-invoke the LLM, _auto_title, settle) before emitting 'done',
       // never trips it. A stream that produced nothing at all for SSE_TIMEOUT_MS
       // (a hung connection) is aborted; a silent gap after content has already
       // streamed cancels the reader so the turn finalizes with the accumulated

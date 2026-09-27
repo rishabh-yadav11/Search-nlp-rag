@@ -152,11 +152,23 @@ export function splitContent(text: string): ContentPart[] {
   )
 }
 
+/**
+ * Truncate an UNCLOSED dataviz fence: everything from its opening marker to
+ * the end of the markdown chunk is dropped, so the raw JSON behind a fence the
+ * model never finished is never rendered as text.
+ *
+ * This is the frontend half of the ONE fence rule shared with the backend
+ * (`DATAVIZ_FENCE_PATTERN` in backend/app/chat.py, compiled to
+ * `_strip_unclosed_fence`): both truncate from the marker to the end, so the
+ * stored answer and the rendered answer never disagree (#255).
+ *
+ * A closed, valid fence never reaches here — `splitContent` consumes those in
+ * the matching loop above — so any marker left in a markdown chunk is by
+ * definition the start of an unclosed block.
+ */
 function stripOpenFence(md: string): string {
   const open = md.indexOf('```dataviz')
   if (open < 0) return md
-  const close = md.indexOf('```', open + 3)
-  if (close >= 0) return md
   return md.slice(0, open)
 }
 
