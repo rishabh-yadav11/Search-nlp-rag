@@ -430,8 +430,9 @@ class ChatStore:
         message body, or any other user-written string is ever selected or
         returned here — the top-N queries project `sessions.id` only. Every
         read of this data is written to the admin audit trail by
-        `record_admin_audit` (readable via `admin_audit_log`).
-        """
+        `record_admin_audit`; `admin_audit_log` reads it back. Both are
+        ChatStore methods — the trail is deliberately not exposed over HTTP,
+        so exposing cross-user read history cannot itself become a leak."""
         try:
             sessions_row = await self._fetchone(
                 "SELECT COUNT(*) AS n FROM sessions"
