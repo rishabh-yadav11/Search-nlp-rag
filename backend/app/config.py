@@ -30,14 +30,15 @@ def _normalize_host(entry: str) -> str:
 
 
 def _machine_hosts() -> tuple[str, ...]:
-    """Hostnames this box itself answers to: its own name and its IP addresses.
+    """Hostnames and addresses this box itself answers to.
 
     Production is same-origin through nginx behind a `server_name _` catch-all
     vhost that forwards whatever `Host` the client used, and the documented
     posture leaves CORS_ORIGINS at its localhost default — so neither CORS nor
     a hardcoded domain covers a site reached by IP or by the box's own name.
-    Without these, every public request 400s. A separately registered public
-    domain still has to be added to ALLOWED_HOSTS by the operator.
+    These are the box's name, the addresses bound to it and its default-route
+    address; without them, every public request 400s. A separately registered
+    public domain still has to be added to ALLOWED_HOSTS by the operator.
 
     Best effort by design: this runs at import, so a name-resolution failure
     must degrade to "fewer allowed hosts", never take the whole API down.
@@ -46,15 +47,44 @@ def _machine_hosts() -> tuple[str, ...]:
     for getter in (socket.gethostname, socket.getfqdn):
         try:
             name = getter()
-        except OSError:
+        except (OSError, ValueError):
+            # Narrow on purpose: gaierror is an OSError and a non-decodable
+            # hostname raises UnicodeDecodeError, which is a ValueError. A
+            # best-effort identity probe that loses one hostname beats refusing
+            # to boot the API.
             continue
         if name:
             hosts.append(name)
     try:
         hosts.extend({info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)})
-    except OSError:
+    except (OSError, ValueError):
         pass
+    hosts.extend(_default_route_addresses())
     return tuple(h for h in dict.fromkeys(hosts) if h)
+
+
+def _default_route_addresses() -> tuple[str, ...]:
+    """The address this box would source outbound traffic from.
+
+    `getaddrinfo(gethostname())` only yields the addresses bound to the box's
+    own name, which on a NAT'd cloud host is the private one — but the site is
+    reached at the public address, and nginx forwards the client's `Host`
+    through (`server_name _;` plus `proxy_set_header Host $host`). Without the
+    public address in the allow-list, every public request answers 400.
+
+    A connected UDP socket sends no packets: it only asks the routing table
+    which source address it would pick. Any failure (no route, no IPv6, a
+    sandboxed import) just means one fewer allowed host.
+    """
+    addresses: list[str] = []
+    for family, peer in ((socket.AF_INET, "8.8.8.8"), (socket.AF_INET6, "2001:4860:4860::8888")):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as probe:
+                probe.connect((peer, 53))
+                addresses.append(probe.getsockname()[0])
+        except (OSError, ValueError):
+            continue
+    return tuple(addresses)
 
 
 def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> tuple[str, ...]:
@@ -344,9 +374,10 @@ class Config:
     )
 
     # Hostnames this API answers to, enforced by TrustedHostMiddleware. The
-    # default is derived from CORS_ORIGINS, this box's own name and IP
-    # addresses, and the local dev/test hosts, so a site reached by IP or by the
-    # box's own name keeps working with no configuration at all. Set
+    # default is derived from CORS_ORIGINS, this box's own name and addresses
+    # (bound ones plus its default-route address), and the local dev/test
+    # hosts, so a site reached by IP or by the box's own name keeps working
+    # with no configuration at all. Set
     # ALLOWED_HOSTS explicitly (comma separated hostnames) when the API is
     # reachable under a name none of those cover — a separately registered
     # public domain, for instance. A wrong value here answers 400 to every
