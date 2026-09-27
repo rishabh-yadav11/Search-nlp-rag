@@ -292,7 +292,21 @@ def test_absent_request_id_is_generated_and_echoed(log):
     assert resp.json()["request_id"] == rid
 
 
-@pytest.mark.parametrize("hostile", ["a" * 200, "x\nFAKE ERROR forged", "has space", ""])
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "a" * 200,
+        "x\nFAKE ERROR forged",
+        "has space",
+        "",
+        # Newline/CR on their own, with NO other disqualifying character: the
+        # cases above are rejected partly for their spaces, so they would still
+        # pass if someone widened the character class to admit CR/LF. These two
+        # are the log-forgery guard, tested by the guard alone.
+        "x\n",
+        "x\rFORGED",
+    ],
+)
 def test_hostile_inbound_request_id_is_replaced_and_never_echoed(log, hostile):
     assert not is_valid_request_id(hostile)
     app = _build_app()
@@ -355,7 +369,35 @@ def test_a_normal_200_logs_exactly_one_access_record(log):
     assert "200" in message
     assert re.search(r"in \d+\.\d+ms", message)
     assert resp.headers[REQUEST_ID_HEADER] in message
+    # The field the shipped formatter interpolates, not just the text: the
+    # access line is emitted from the middleware's `finally`, where the
+    # ContextVar is already reset, so the id has to be passed explicitly or
+    # every access line would render the "no id" placeholder.
+    assert access[0].request_id == resp.headers[REQUEST_ID_HEADER]
     assert _errors(log) == []
+
+
+def test_the_no_id_placeholder_is_not_usable_as_a_real_id(log):
+    """NO_REQUEST_ID means "no id bound" everywhere it is rendered.
+
+    A hyphen is inside the allowed character class, so the class alone does not
+    exclude it: without an explicit refusal a caller could label a live request
+    `-` and make it indistinguishable from a record emitted outside any request.
+    """
+    assert not is_valid_request_id(NO_REQUEST_ID)
+    app = _build_app()
+
+    @app.get("/boom")
+    async def boom():
+        raise _Boom(_OUTAGE)
+
+    resp = TestClient(app, raise_server_exceptions=False).get("/boom", headers={REQUEST_ID_HEADER: NO_REQUEST_ID})
+
+    rid = resp.headers[REQUEST_ID_HEADER]
+    assert _GENERATED_ID_RE.match(rid)
+    assert rid != NO_REQUEST_ID
+    assert resp.json()["request_id"] == rid
+    assert NO_REQUEST_ID not in _errors(log)[0].getMessage()
 
 
 def test_no_contextvar_leak_between_requests(log):
@@ -376,13 +418,11 @@ def test_no_contextvar_leak_between_requests(log):
     ours = [r for r in log if r.name.startswith("app.")]
     assert ours
     # The ContextVar is already reset when the access line is emitted from the
-    # middleware's `finally`, so that record's *field* is NO_REQUEST_ID -- which
-    # is exactly why the access line repeats the id in its message. What matters
-    # is that no record is stamped with, or names, the previous request's id.
-    assert {r.request_id for r in ours} <= {"second-id", NO_REQUEST_ID}
+    # middleware's `finally`, so that record carries its id explicitly. What
+    # matters is that no record is stamped with, or names, the previous
+    # request's id.
+    assert {r.request_id for r in ours} == {"second-id"}
     assert "first-id" not in "".join(r.getMessage() for r in log)
-    for record in ours:
-        assert record.request_id == "second-id" or "second-id" in record.getMessage()
     assert current_request_id() == NO_REQUEST_ID
 
 

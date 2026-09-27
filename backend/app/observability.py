@@ -134,8 +134,12 @@ class RequestIdMiddleware:
             with bound_request_id(request_id):
                 await self.app(scope, receive, send_with_request_id)
         finally:
-            # The local `request_id`, not current_request_id(): an exception
-            # unwinding through here has already reset the ContextVar.
+            # `extra` rather than the ContextVar: the id is a local here because
+            # an exception unwinding through this `finally` has already reset
+            # the ContextVar, and the RequestIdFilter never overwrites a field
+            # the caller set. Without it the most frequent record in the
+            # process -- this one -- would render its `request_id` field as the
+            # "no id" placeholder while carrying the real id only in the text.
             access_logger.info(
                 "%s %s -> %s in %.1fms request_id=%s user_id=%s",
                 scope.get("method", "-"),
@@ -144,6 +148,7 @@ class RequestIdMiddleware:
                 (time.perf_counter() - started_at) * 1000,
                 request_id,
                 _user_id(scope),
+                extra={"request_id": request_id},
             )
 
 

@@ -23,8 +23,10 @@ from typing import Any
 REQUEST_ID_HEADER = "X-Request-ID"
 REQUEST_ID_MAX_LEN = 64
 # Stands in for "no id bound", so a formatter can interpolate the field
-# unconditionally. It is a placeholder, NOT an id: `scope_request_id` returns
-# the empty string instead so a caller can tell "absent" from "present".
+# unconditionally. It is a placeholder, NOT an id: `is_valid_request_id` refuses
+# it (a hyphen is inside the allowed character class, so the class alone does
+# not exclude it) and `scope_request_id` returns the empty string instead, so a
+# caller can tell "absent" from "present" everywhere.
 NO_REQUEST_ID = "-"
 
 _REQUEST_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
@@ -36,10 +38,13 @@ def is_valid_request_id(value: object) -> bool:
 
     Non-strings, empty strings, anything with whitespace/CR/LF/colon and
     anything longer than 64 chars are rejected -- see the module docstring.
+    So is the ``NO_REQUEST_ID`` placeholder itself: accepting it would let a
+    caller label a live request with the very value that means "no id", making
+    the two indistinguishable in a log field.
     """
     if not isinstance(value, str):
         return False
-    if not value or len(value) > REQUEST_ID_MAX_LEN:
+    if not value or len(value) > REQUEST_ID_MAX_LEN or value == NO_REQUEST_ID:
         return False
     return _REQUEST_ID_RE.match(value) is not None
 
