@@ -315,20 +315,24 @@ def make_backup(client, collection_name: str) -> BackupResult:
             f"ERROR: no verified snapshot and no local artifacts to back up for "
             f"'{collection_name}'; the backup directory was removed",
         )
-        return BackupResult(None, False, result.name, copied)
-
-    if not result.ok:
+        outcome = BackupResult(None, False, result.name, copied)
+    elif not result.ok:
         log(
             f"ERROR: backup for '{collection_name}' is INCOMPLETE — the collection "
             f"snapshot was not written to disk ({result.detail}); only the local "
             f"artifacts {copied} are in this directory",
         )
-        return BackupResult(dest, False, result.name, copied)
+        outcome = BackupResult(dest, False, result.name, copied)
+    else:
+        log(
+            f"backup written to {os.path.relpath(dest, BACKEND_DIR)} "
+            f"(snapshot=ok, artifacts={copied or 'none'})",
+        )
+        outcome = BackupResult(dest, True, result.name, copied)
 
-    log(
-        f"backup written to {os.path.relpath(dest, BACKEND_DIR)} "
-        f"(snapshot=ok, artifacts={copied or 'none'})",
-    )
+    # Retention runs on every path, including a failed backup: a run of
+    # failing backups creates a directory each time, and those directories are
+    # exactly what would fill backend/backups/ if pruning only ran on success.
     for removed in prune_backups(collection_name):
         log(f"pruned old backup {os.path.relpath(removed, BACKUPS_DIR)}")
-    return BackupResult(dest, True, result.name, copied)
+    return outcome
