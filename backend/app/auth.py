@@ -187,8 +187,12 @@ def _bootstrap_password_rejection(password: str, effective: str) -> str | None:
       appended past byte 72 is long and usable, yet its 72-byte prefix has no
       digit.
 
-    Both classes still come from ``validate_password`` (via
-    ``_has_letter_and_digit``), so there is one source of truth for the policy.
+    The composition class is shared verbatim with ``validate_password`` through
+    ``_has_letter_and_digit``, so the two cannot disagree about what counts. The
+    length class is re-stated here because it is the one rule that must be
+    applied to a different value than ``validate_password`` applies it to, and
+    its message is kept identical so an operator sees the same wording whichever
+    path rejected them.
     """
     if len(effective) < config.AUTH_PASSWORD_MIN_LEN:
         return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
@@ -962,6 +966,8 @@ async def bootstrap_admin() -> None:
     the whole API (and /health) down and leave nobody able to reach the service
     to fix it. An operator must correct the config and restart.
 
+    An admin account left behind by an earlier run with weak credentials is
+    deliberately NOT deleted: this runs at startup, unauthenticated, and
     removing the only admin account would lock every operator out of their own
     deployment. Such an account is reported instead, so it gets rotated.
     """
@@ -978,37 +984,44 @@ async def bootstrap_admin() -> None:
     # inside the write-lock loop below would re-log the identical error five
     # times and change nothing, so it returns before reaching that loop. The loop
     # still retries genuine transient faults (SQLite write locks) as before.
-    email_error = _validator_rejection(validate_email, email)
-    if email_error:
-        await _reject_bootstrap(
-            "AUTH_ADMIN_EMAIL",
-            email_error,
-            hint=f"set it to a valid address (max {config.AUTH_MAX_EMAIL_LEN} characters) and restart",
-        )
-        return
-    # The password is validated as it will actually be used. bcrypt only ever
-    # sees the first _BCRYPT_MAX_BYTES bytes (hash_password and verify_password
-    # both truncate), so those bytes ARE the credential. Validating the raw
-    # string instead would reject a long passphrase whose effective form is
-    # perfectly strong -- and because bootstrap_admin is the only path that can
-    # ever create an admin (signup hardcodes SIGNUP_ROLE, and a role change
-    # needs an admin token that cannot exist yet), that rejection would leave a
-    # fresh deploy permanently unadministrable. The original password is still
-    # what gets stored, so the row and its hash are byte-identical to before.
+    # The password is validated first, and unconditionally, so that the advice
+    # given for an EMAIL fault can still say whether the account sitting behind
+    # it is on a weak password. A deploy that ran pre-validator main can have
+    # both faults at once, and reporting only the address would hide a live
+    # 1-character admin password.
+    #
+    # Length is judged on what will actually authenticate. bcrypt only ever sees
+    # the first _BCRYPT_MAX_BYTES bytes (hash_password and verify_password both
+    # truncate), so those bytes ARE the credential. The original password is
+    # still what gets stored, so the row and its hash are byte-identical to
+    # before. See _bootstrap_password_rejection for why letter+digit is judged
+    # on the whole value instead.
     effective = _effective_password(password)
     if effective != password:
         logger.warning(
             "AUTH_ADMIN_PASSWORD exceeds bcrypt's %d-byte limit; the trailing bytes are dropped "
             "and only the first %d bytes will ever authenticate. Shorten it, or accept that the "
             "tail is not part of the credential.",
-            _BCRYPT_MAX_BYTES, _BCRYPT_MAX_BYTES,
+            _BCRYPT_MAX_BYTES,
+            _BCRYPT_MAX_BYTES,
         )
     password_error = _bootstrap_password_rejection(password, effective)
+
+    email_error = _validator_rejection(validate_email, email)
+    if email_error:
+        await _reject_bootstrap(
+            "AUTH_ADMIN_EMAIL",
+            email_error,
+            hint=f"set it to a valid address (max {config.AUTH_MAX_EMAIL_LEN} characters) and restart",
+            password_rejected=password_error,
+        )
+        return
     if password_error:
         await _reject_bootstrap(
             "AUTH_ADMIN_PASSWORD",
             password_error,
             hint=_password_hint(password_error),
+            password_rejected=password_error,
         )
         return
     s = _require_auth_store()
@@ -1029,7 +1042,9 @@ async def bootstrap_admin() -> None:
             await asyncio.sleep(1)
 
 
-async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
+async def _reject_bootstrap(
+    variable: str, reason: str, *, hint: str, password_rejected: str | None
+) -> None:
     """Log that the configured bootstrap admin credentials were refused, and
     report (never delete) an account a previous run already created from the
     same bad value.
@@ -1061,27 +1076,42 @@ async def _reject_bootstrap(variable: str, reason: str, *, hint: str) -> None:
             )
             existing = None
         if existing is not None and existing.role == "admin":
-            # Rotation advice is a PASSWORD remedy, so it may only appear when a
-            # password is what was rejected. On the email axis a rejection says
-            # nothing about this account's password -- a dotless address can
-            # never validate, so demanding rotation here would fire on every
-            # worker start, forever, for an account that is perfectly healthy and
-            # whose only real fault is the configured address.
-            if _validator_name_for(variable) != "validate_password":
+            # Rotation is warranted by a conjunction of two facts about the
+            # ACCOUNT, neither of which is "which variable failed": the stored
+            # password must actually be the configured one (proving this account
+            # was provisioned from the bad config), AND the password must itself
+            # have failed validation. Requiring both means an email fault on a
+            # healthy admin never nags, while a pre-validator deploy carrying
+            # both faults is still told to rotate -- a live 1-character admin
+            # password is exactly what an operator must hear about.
+            if password_rejected and verify_password(
+                config.AUTH_ADMIN_PASSWORD or "", existing.password_hash
+            ):
+                # The remedy here is a PASSWORD rotation, so the hint must be the
+                # password one. Passing through `hint` unchanged would pair
+                # "Rotate that account's password" with an email remedy
+                # ("set it to a valid address") on the email axis, sending the
+                # operator to fix the wrong variable.
+                logger.error(
+                    "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
+                    "No account was created, and the pre-existing admin account (id %s) -- whose "
+                    "current password IS the rejected AUTH_ADMIN_PASSWORD, so it was provisioned "
+                    "from this non-compliant value before these checks existed -- was left in place. "
+                    "Rotate that account's password out of band, and also correct %s: %s. "
+                    "To rotate the password: %s.",
+                    probe, _validator_name_for(variable), variable, reason, existing.id, variable,
+                    hint, _password_hint("password must contain a letter and a digit"),
+                )
+            elif _validator_name_for(variable) != "validate_password":
+                # The account is on a different, valid password, so the fault is
+                # purely the configured address: say that, and do not send the
+                # operator to rotate a password that is not the problem.
                 logger.error(
                     "bootstrap admin NOT created: %s rejected the configured %s: %s. The "
                     "pre-existing admin account (id %s) was left untouched and keeps its current "
                     "password, so it needs no rotation -- the fault is the configured address, not "
                     "the account. %s.",
                     _validator_name_for(variable), variable, reason, existing.id, hint,
-                )
-            elif verify_password(config.AUTH_ADMIN_PASSWORD or "", existing.password_hash):
-                logger.error(
-                    "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
-                    "No account was created, and the pre-existing admin account (id %s) -- which was "
-                    "provisioned from this same non-compliant value before these checks existed -- "
-                    "was left in place. Rotate that account's password out of band: %s.",
-                    probe, _validator_name_for(variable), variable, reason, existing.id, hint,
                 )
             else:
                 logger.error(
