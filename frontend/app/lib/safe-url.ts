@@ -122,10 +122,10 @@ export function isSafeUrl(url: unknown, base?: string): boolean {
   // allowlisting catches it. Refusing backslashes outright is the third place
   // this guard is stricter than the browser, and the cheapest one: `\` is not
   // in the RFC 3986 URI character set at all, so a stored article URL carrying
-  // one is malformed. The parser either reinterprets it as a separator (special
-  // scheme) or emits it verbatim (`mailto:a\b@x.com` stays as it is; `\` is
-  // not in the path percent-encode set, so it is never escaped to `%5C`), and
-  // neither behaviour round-trips back to the stored string.
+  // one is malformed. The parser either reinterprets it as a separator
+  // (special scheme) or emits it verbatim — `mailto:a\b@x.com` comes back
+  // unchanged — and `\` is not in the path percent-encode set, so it is
+  // never escaped to `%5C` either way.
   if (raw.includes('\\')) return false
 
   if (PROTOCOL_RELATIVE_RE.test(raw)) return false
