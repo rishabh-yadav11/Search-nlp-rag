@@ -161,27 +161,6 @@ def test_missing_key_is_appended_and_an_existing_value_is_never_rewritten():
         assert line == append_line, f"setup.sh must not rewrite the operator's value: {line!r}"
 
 
-# --- the deploy gate must wait on readiness, not on the liveness stub (#279) ---
-
-
-def test_the_backend_deploy_gate_waits_on_readiness_not_on_the_health_stub():
-    """./setup.sh services declares the deploy done from what `wait_http` can
-    reach. It used to wait on /health, which cannot fail: a backend holding the
-    placeholder GEMINI_API_KEY from .env.example, a dead Qdrant client or
-    unloaded models answered 200 there, so the script reported a successful
-    deploy of a backend that could not answer a single chat question.
-
-    /ready/deep is the readiness answer, uncached so a warm cache cannot pass
-    the gate, unrated so the gate cannot be throttled into a false negative,
-    and loopback-only -- which is what a deploy gate on this host is. (The
-    watchdog that consumes the same endpoint is exercised for real, against
-    stub binaries, in test_healthcheck_script.py; this one can only be read,
-    because running setup.sh would build venvs and register pm2 processes.)
-    """
-    source = SETUP_SH.read_text()
-
-    assert 'wait_http "http://localhost:$API_PORT/ready/deep"' in source
-    assert 'wait_http "http://localhost:$API_PORT/health"' not in source
 
 
 def test_the_nginx_vhost_refuses_the_uncached_probe():
@@ -219,3 +198,168 @@ def test_the_nginx_vhost_heredoc_contains_no_backticks():
     body = SETUP_SH.read_text().split("<<NGINX\n", 1)[1].split("\nNGINX\n", 1)[0]
 
     assert "`" not in body, "a backtick in the unquoted NGINX heredoc is executed"
+
+
+# --- the deploy gate must wait on readiness, and must not destroy the deploy
+# --- to find out (#279) ---------------------------------------------------
+#
+# `run_services` is EXECUTED here rather than grepped. Asserting the source
+# contains a URL is the vacuous-test class this project keeps policing: it
+# passes just as well with the gate moved in front of the teardown, which is
+# precisely the regression a reviewer found -- a gate that can now legitimately
+# fail, placed after `pm2 delete` of both services under `set -e`, turned a
+# misconfigured key into a destroyed deployment with the frontend never coming
+# back. The functions are extracted verbatim from setup.sh, so this cannot drift
+# from the script it is policing.
+
+CURL_STUB = """\
+#!/usr/bin/env bash
+url="${@: -1}"
+printf '%s\\n' "$url" >>"$CURL_LOG"
+case "$url" in
+*/ready/deep) code="$READY_DEEP_CODE" ;;
+*) code=200 ;;
+esac
+printf '%s' "$code"
+[ "$code" -ge 400 ] 2>/dev/null && exit 22
+exit 0
+"""
+
+PM2_STUB = """\
+#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"$PM2_LOG"
+exit 0
+"""
+
+REAL_KEY = "AI" + "za" + "SyD-Example_Key" + "0123456789" + "abcdefghij"
+PLACEHOLDER_KEY = "your" + "_key_here"
+
+
+def _extract_function(name):
+    """Pull one shell function out of setup.sh, verbatim."""
+    lines = SETUP_SH.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith(f"{name}() {{"))
+    end = next(i for i, line in enumerate(lines[start:], start) if line == "}")
+    return "\n".join(lines[start : end + 1])
+
+
+def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200):
+    """Run the real run_services against stub pm2/curl. Returns (rc, pm2_log,
+    stdout+stderr)."""
+    home = tmp_path / "host"
+    (home / "backend").mkdir(parents=True)
+    (home / "frontend").mkdir(parents=True)
+    (home / "logs").mkdir()
+    (home / "pid").mkdir()
+    (home / "bin").mkdir()
+    env_lines = [f"GEMINI_API_KEY={env_key}"]
+    if env_base:
+        env_lines.append(f"GEMINI_BASE_URL={env_base}")
+    (home / "backend" / ".env").write_text("\n".join(env_lines) + "\n")
+    for name, body in (("curl", CURL_STUB), ("pm2", PM2_STUB)):
+        stub = home / "bin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+
+    pm2_log = tmp_path / "pm2.log"
+    curl_log = tmp_path / "curl.log"
+    harness = "\n".join(
+        [
+            "set -euo pipefail",
+            f"cd {home}",
+            'API_PORT=8001; NEXT_PORT=3000; GUNICORN_WORKERS=4',
+            'API_MAX_MEMORY=5G; API_MAX_RESTARTS=10; FRONTEND_MAX_MEMORY=1G; RESTART_BACKOFF_MS=100',
+            f'LOGS={home}/logs; PID_DIR={home}/pid; ENV_FILE={home}/backend/.env',
+            f'VENV_PY={home}/bin/python; SCRIPT_DIR={home}',
+            "sleep() { :; }",  # wait_http's 1s backoff would cost 30s per run
+            "stage() { :; }",
+            "ensure_pm2() { :; }",
+            _extract_function("api_key_preflight"),
+            _extract_function("report_readiness_reason"),
+            _extract_function("wait_http"),
+            _extract_function("run_services"),
+            'run_services && echo "RUN_SERVICES_RC=0" || echo "RUN_SERVICES_RC=$?"',
+        ]
+    )
+    proc = subprocess.run(
+        ["bash", "-c", harness],
+        env={
+            **os.environ,
+            "PATH": f"{home}/bin:{os.environ['PATH']}",
+            "PM2_LOG": str(pm2_log),
+            "CURL_LOG": str(curl_log),
+            "READY_DEEP_CODE": str(ready_deep_code),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    return proc, (pm2_log.read_text() if pm2_log.exists() else "")
+
+
+def curl_log_text(tmp_path):
+    path = tmp_path / "curl.log"
+    return path.read_text() if path.exists() else ""
+
+
+def _started(pm2_log, service):
+    return any("start" in line and f"--name {service}" in line for line in pm2_log.splitlines())
+
+
+def test_a_failing_readiness_gate_does_not_leave_the_frontend_stopped(tmp_path):
+    """The regression a review found: with the gate in front of the frontend
+    start, a not-ready deploy took the frontend down with it and `set -e`
+    aborted before bringing it back. Both services must be started, and the
+    dump saved, before anything is allowed to fail the deploy."""
+    proc, pm2_log = run_services(tmp_path, ready_deep_code=503)
+
+    assert "RUN_SERVICES_RC=1" in proc.stdout
+    assert _started(pm2_log, "vccircle-backend")
+    assert _started(pm2_log, "vccircle-frontend"), "a failed readiness gate must not stop the frontend from being deployed"
+    assert "save" in pm2_log, "the pm2 dump must be saved before the gate can abort"
+    assert "not ready after" in proc.stderr + proc.stdout
+
+
+def test_the_gate_is_not_satisfied_by_the_liveness_stub(tmp_path):
+    """A backend that answers 200 on /health and 503 on readiness is exactly
+    the deployment this issue is about: it must not be declared done."""
+    proc, pm2_log = run_services(tmp_path, ready_deep_code=503)
+
+    assert "RUN_SERVICES_RC=1" in proc.stdout
+    assert _started(pm2_log, "vccircle-frontend")
+
+
+def test_a_shipped_placeholder_key_aborts_before_anything_is_touched(tmp_path):
+    """The common cause is caught before the teardown, so a host still holding
+    the value .env.example ships loses nothing at all."""
+    proc, pm2_log = run_services(tmp_path, env_key=PLACEHOLDER_KEY)
+
+    assert "RUN_SERVICES_RC=1" in proc.stdout
+    assert pm2_log == "", f"nothing may be deleted or started: {pm2_log!r}"
+    assert "placeholder" in proc.stderr
+    assert "/ready/deep" not in curl_log_text(tmp_path), "the pre-flight must decide this, not the gate"
+
+
+def test_a_ready_deployment_still_succeeds(tmp_path):
+    """The control: the reordering must not have broken the happy path."""
+    proc, pm2_log = run_services(tmp_path, ready_deep_code=200)
+
+    assert "RUN_SERVICES_RC=0" in proc.stdout, proc.stdout + proc.stderr
+    assert _started(pm2_log, "vccircle-backend")
+    assert _started(pm2_log, "vccircle-frontend")
+
+
+def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
+    """GEMINI_BASE_URL is configurable, so the pre-flight's shape rule applies
+    only to Google's endpoint -- exactly as app.config.classify_gemini_api_key
+    does. A false rejection here would block a working deploy."""
+    home_key = "gateway-" + "token-0123456789"
+    proc, _pm2_log = run_services(
+        tmp_path,
+        env_key=home_key,
+        env_base="https://llm-gateway.internal/v1",
+        ready_deep_code=200,
+    )
+
+    assert "RUN_SERVICES_RC=0" in proc.stdout, proc.stdout + proc.stderr

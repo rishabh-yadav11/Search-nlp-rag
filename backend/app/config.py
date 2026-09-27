@@ -401,14 +401,18 @@ _PLACEHOLDER_API_KEYS = frozenset(
 # Checked against the normalised form, so "x-x-x-x" is caught as well.
 _REPEATED_FILLER_RE = re.compile(r"(.)\1{3,}")
 
-# ...but that check cannot see inside a correctly shaped key: a MASKED key is
-# usually written with its real prefix and its length, as in the docs' example
-# "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", and that is precisely a key whose
+# ...but that check cannot see inside a correctly shaped key: a MASKED key keeps
+# its real prefix and its real length and fills the rest with filler, which is
+# how documentation writes an example ("AIza" + "Sy" + a run of X's) and how an
+# operator redacts a key they are not sure about. That is precisely a key whose
 # shape is right and whose content is filler. So the tail after the prefix is
 # also required to look random: a real 35-character tail drawn from a 64-symbol
 # alphabet has ~27 distinct characters, and the chance of a genuine key having
 # fewer than _MIN_DISTINCT_KEY_CHARS of them is vanishingly small, while every
 # masking style (all X, all digits, all dashes, a padded word) lands far below.
+# NB: the example above is described, never written out -- a contiguous
+# 39-character "AIza..." string anywhere in this repository, comment included,
+# is indistinguishable from a leaked credential to a secrets scanner.
 _MIN_DISTINCT_KEY_CHARS = 12
 
 
