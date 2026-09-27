@@ -3,6 +3,7 @@
 error mapping, and analytics beacons)."""
 
 import asyncio
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +17,19 @@ from app.main import SourceArticle, SourceSummary
 async def _noop_async(*args, **kwargs):
     return None
 
+
+
+def _via_local_proxy(app):
+    """Present requests to `app` as if they arrived from a reverse proxy on this
+    host -- nginx forwarding to 127.0.0.1, as the reference deploy in setup.sh
+    does -- instead of the TestClient's default non-IP peer."""
+
+    async def wrapper(scope, receive, send):
+        if scope["type"] == "http":
+            scope = {**scope, "client": ("127.0.0.1", 40000)}
+        await app(scope, receive, send)
+
+    return wrapper
 
 
 _client = TestClient(main.app, raise_server_exceptions=False)
@@ -74,18 +88,41 @@ def test_search_over_the_limit_is_rejected_with_429(monkeypatch):
 
 
 def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
-    # Trust the proxy header so the two clients below resolve to different IPs,
-    # exactly as they do behind the nginx config in setup.sh.
-    monkeypatch.setattr(config, "AUTH_TRUST_X_FORWARDED_FOR", True)
+    """Two clients behind the reference proxy each get their own bucket.
+
+    AUTH_TRUST_X_FORWARDED_FOR is deliberately NOT stubbed: this asserts the
+    SHIPPED default, which is what a real host runs. Behind the loopback peer
+    nginx presents, the forwarded client IP is honored without any .env edit;
+    stubbing the flag true here would only prove the code works under a
+    deployment the operator has to configure by hand, and would hide the
+    single-bucket collapse that a default of "off" actually caused.
+    """
+    assert "AUTH_TRUST_X_FORWARDED_FOR" not in os.environ, (
+        "this test asserts the shipped default; unset the override in your .env"
+    )
     monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
     _cached_search_client(monkeypatch)
-    client_a = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "1.1.1.1"})
-    client_b = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "2.2.2.2"})
+    proxied = _via_local_proxy(main.app)
+    client_a = TestClient(proxied, raise_server_exceptions=False, headers={"x-forwarded-for": "1.1.1.1"})
+    client_b = TestClient(proxied, raise_server_exceptions=False, headers={"x-forwarded-for": "2.2.2.2"})
 
     assert client_a.get("/search", params={"q": "test"}).status_code == 200
     assert client_a.get("/search", params={"q": "test"}).status_code == 429
     # A different client IP must still be served: its own first request.
     assert client_b.get("/search", params={"q": "test"}).status_code == 200
+
+
+def test_search_limit_ignores_xff_from_a_client_that_is_not_behind_a_proxy(monkeypatch):
+    """A direct caller (its own routable peer) cannot forge X-Forwarded-For to
+    escape its rate-limit bucket -- the other side of trusting the header only
+    for a loopback peer."""
+    monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
+    _cached_search_client(monkeypatch)
+    direct = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "9.9.9.9"})
+
+    assert direct.get("/search", params={"q": "test"}).status_code == 200
+    # Same peer, so still the same bucket: the forged header bought nothing.
+    assert direct.get("/search", params={"q": "test"}).status_code == 429
 
 
 def test_search_fails_closed_with_503_when_the_limiter_store_is_down(monkeypatch):

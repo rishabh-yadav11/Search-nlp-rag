@@ -273,6 +273,11 @@ server {
     # The per-IP rate limiter on /search, /facets, /analytics/click and /ready
     # keys on the client IP these headers carry. Without them every proxied
     # request looks like 127.0.0.1 and the whole site shares one rate-limit bucket.
+    # These headers are trusted by default here: with the peer being loopback
+    # the API reads the forwarded client IP (AUTH_TRUST_X_FORWARDED_FOR=auto,
+    # the shipped default). A client hitting :8001 directly is its own
+    # non-loopback peer, so the same header is ignored for it and cannot be
+    # used to dodge a rate limit.
     location /search {
         proxy_pass http://127.0.0.1:8001;
         proxy_set_header X-Real-IP $remote_addr;

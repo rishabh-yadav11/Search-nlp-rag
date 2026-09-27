@@ -16,6 +16,7 @@ which acts as an admin user. All inputs are validated server-side.
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 import re
@@ -448,20 +449,51 @@ async def token_purge_loop() -> None:
         await asyncio.sleep(interval)
 
 
+def _peer_is_local_proxy(peer: str | None) -> bool:
+    """True when the socket peer is a reverse proxy on this same host, i.e. a
+    loopback address. A peer that is not a real IP (a test ASGI transport, for
+    instance) is not loopback, so it never widens the trust."""
+    if not peer:
+        return False
+    try:
+        return ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        return False
+
+
+def _trust_forwarded_for(peer: str | None) -> bool:
+    """Whether X-Forwarded-For may be trusted for this request's peer.
+
+    ``config.AUTH_TRUST_X_FORWARDED_FOR`` forces the answer when set to true or
+    false. The shipped default is None ("auto"), which trusts the header only
+    for a loopback peer: the reference deployment (setup.sh) always runs behind
+    nginx forwarding from 127.0.0.1, so its clients get correct per-IP rate
+    limiting out of the box, while a client connecting straight to the API
+    port is its own non-loopback peer and cannot forge a header to escape its
+    own bucket.
+    """
+    configured = config.AUTH_TRUST_X_FORWARDED_FOR
+    if configured is not None:
+        return configured
+    return _peer_is_local_proxy(peer)
+
+
 def _client_ip(request: Request) -> str:
-    """Client IP. The X-Forwarded-For header is only honored when the API is
-    deployed behind a configured reverse proxy, so a raw client cannot spoof
-    its IP (e.g. for bypassing rate limits). Otherwise the socket peer wins.
+    """Client IP. The X-Forwarded-For header is only honored when the request
+    came through a trusted reverse proxy (see ``_trust_forwarded_for``), so a
+    raw client cannot spoof its IP (e.g. for bypassing rate limits). Otherwise
+    the socket peer wins.
 
     nginx ``$proxy_add_x_forwarded_for`` APPENDS ``$remote_addr`` (the real
     peer) to any client-supplied X-Forwarded-For list, so the *rightmost* hop
     is the one added by the trusted proxy while the leftmost is attacker
     controlled; take the rightmost."""
-    if config.AUTH_TRUST_X_FORWARDED_FOR:
+    peer = request.client.host if request.client else None
+    if _trust_forwarded_for(peer):
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:
             return forwarded.split(",")[-1].strip()
-    return request.client.host if request.client else "unknown"
+    return peer or "unknown"
 
 
 async def _check_rate_limit(

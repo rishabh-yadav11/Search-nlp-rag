@@ -625,26 +625,41 @@ def test_require_auth_store_uninitialized_503(monkeypatch):
 def test_client_ip_x_forwarded_for_and_fallback():
     """_client_ip honors X-Forwarded-For only behind a trusted proxy, else the
     real socket peer, then 'unknown'."""
-    # Default (no trusted proxy): XFF is ignored, the socket peer is authoritative.
+    # Auto (the shipped default) with a client that is not behind a local
+    # proxy: the header is ignored and the socket peer stays authoritative,
+    # so a direct caller cannot forge an IP to escape its own rate-limit bucket.
     req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"
-    # Behind a trusted proxy: the rightmost (nginx-appended) XFF hop wins, so a
-    # client cannot spoof its IP by prepending a forged address.
-    auth.config.AUTH_TRUST_X_FORWARDED_FOR = True
-    try:
-        req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
-        assert auth._client_ip(req) == "10.0.0.1"
-        req = _req({"x-forwarded-for": " 203.0.113.9 "})
-        assert auth._client_ip(req) == "203.0.113.9"
-    finally:
-        auth.config.AUTH_TRUST_X_FORWARDED_FOR = False
-    # socket peer fallback
+    # Auto with a loopback peer -- the reference deploy, where nginx on this
+    # host forwards to 127.0.0.1. The rightmost (nginx-appended) XFF hop wins,
+    # so a client cannot spoof its IP by prepending a forged address.
+    req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
+    req.client = SimpleNamespace(host="127.0.0.1")
+    assert auth._client_ip(req) == "10.0.0.1"
+    req = _req({"x-forwarded-for": " 203.0.113.9 "})
+    req.client = SimpleNamespace(host="::1")
+    assert auth._client_ip(req) == "203.0.113.9"
+    # socket peer fallback: a loopback peer with no header keeps keying on the
+    # peer address rather than inventing one.
     req = _req({})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"
     # no peer at all -> "unknown"
     assert auth._client_ip(_req({})) == "unknown"
+
+
+def test_client_ip_trust_setting_overrides_the_auto_peer_check(monkeypatch):
+    """An explicit true/false forces the behaviour whatever the peer is."""
+    req = _req({"x-forwarded-for": "10.0.0.1"})
+    req.client = SimpleNamespace(host="127.0.0.1")
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", False)
+    assert auth._client_ip(req) == "127.0.0.1"
+
+    req = _req({"x-forwarded-for": "10.0.0.1"})
+    req.client = SimpleNamespace(host="203.0.113.9")
+    monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
+    assert auth._client_ip(req) == "10.0.0.1"
 
 
 def _promote_to_admin(client, s, email):
