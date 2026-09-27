@@ -52,6 +52,34 @@ function pct(v: number | null | undefined): string {
   return v == null ? '0%' : `${v}%`
 }
 
+// One analytics feed, or the reason it could not be read. A degraded feed is
+// never rendered as data: the backend's counters are legitimately all zero on a
+// quiet day, so a feed that failed to load must be shown as failed (#281).
+type Feed<T> = { data: T } | { degraded: string }
+
+/**
+ * Classify one analytics response. The 503 status is the primary signal; the
+ * `error` key in the body is checked as well, because a body carrying `error`
+ * with a 200 is precisely the failure this guards against, and because an
+ * intermediary may rewrite the status line.
+ */
+async function readFeed<T>(res: Response, label: string): Promise<Feed<T>> {
+  if (!res.ok) return { degraded: `${label} (HTTP ${res.status})` }
+  let body: unknown
+  try {
+    body = await res.json()
+  } catch {
+    return { degraded: `${label} returned an unreadable response` }
+  }
+  if (body && typeof body === 'object' && 'error' in body) {
+    const detail = body.error
+    return {
+      degraded: `${label}: ${typeof detail === 'string' ? detail : 'unavailable'}`,
+    }
+  }
+  return { data: body as T }
+}
+
 function Card({ label, value, hint, warn }: { label: string; value: string; hint?: string; warn?: boolean }) {
   return (
     <div className="dash-card">
@@ -135,6 +163,14 @@ export default function AnalyticsDashboardPage() {
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
 
+  // Which feeds the last poll could not read, and why. A feed listed here is
+  // NOT rendered as zeros: the page shows an explicit unavailable state in its
+  // place, so a dead store is never mistaken for a quiet day (#281).
+  const [degraded, setDegraded] = useState<{ summary: string | null; chat: string | null }>({
+    summary: null,
+    chat: null,
+  })
+
   // Tracks the in-flight load so a polling tick can't race a previous
   // load still running, and so we can abort the request on unmount.
   const inFlight = useRef(false)
@@ -208,13 +244,26 @@ export default function AnalyticsDashboardPage() {
         redirectToLogin('/analytics/dashboard')
         return
       }
-      if (!sRes.ok) throw new Error(`summary returned HTTP ${sRes.status}`)
-      if (!cRes.ok) throw new Error(`chat returned HTTP ${cRes.status}`)
       if (!mountedRef.current) return
-      setSummary((await sRes.json()) as Summary)
-      setChat((await cRes.json()) as ChatStats)
+      const [sFeed, cFeed] = await Promise.all([
+        readFeed<Summary>(sRes, 'Search analytics'),
+        readFeed<ChatStats>(cRes, 'Chat analytics'),
+      ])
+      if (!mountedRef.current) return
+      // A feed that failed is dropped, not kept: stale figures from an earlier
+      // poll must not sit under a fresh-looking "Updated" stamp either.
+      setSummary('data' in sFeed ? sFeed.data : null)
+      setChat('data' in cFeed ? cFeed.data : null)
+      setDegraded({
+        summary: 'degraded' in sFeed ? sFeed.degraded : null,
+        chat: 'degraded' in cFeed ? cFeed.degraded : null,
+      })
       setError('')
-      setUpdated(`Updated ${new Date().toLocaleTimeString()}`)
+      if ('degraded' in sFeed || 'degraded' in cFeed) {
+        setUpdated('Unavailable — live figures are missing, not zero')
+      } else {
+        setUpdated(`Updated ${new Date().toLocaleTimeString()}`)
+      }
     } catch (e) {
       // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.
       if ((e as Error).name === 'AbortError') return
@@ -272,6 +321,24 @@ export default function AnalyticsDashboardPage() {
           <div className="dash-error">
             {error}
             <div className="dash-error-hint">Admin access required. Sign in with an admin account to view analytics.</div>
+          </div>
+        ) : null}
+        {degraded.summary || degraded.chat ? (
+          <div className="dash-error" role="status">
+            Analytics unavailable — some feeds could not be read.
+            <div className="dash-error-hint">
+              Unavailable: {[degraded.summary, degraded.chat].filter(Boolean).join('; ')}. Their
+              figures are missing, not zero — nothing is shown for a feed that failed to load.
+            </div>
+          </div>
+        ) : null}
+
+        {degraded.summary ? (
+          <div className="dash-panel">
+            <h2>Search analytics (unavailable)</h2>
+            <div className="dash-empty">
+              Unavailable — the analytics store could not be read. These figures are not zero.
+            </div>
           </div>
         ) : null}
 
@@ -349,6 +416,15 @@ export default function AnalyticsDashboardPage() {
               </div>
             </div>
           </>
+        ) : null}
+
+        {degraded.chat ? (
+          <div className="dash-panel">
+            <h2 className="dash-section">Chat usage (unavailable)</h2>
+            <div className="dash-empty">
+              Unavailable — the chat store could not be read. These figures are not zero.
+            </div>
+          </div>
         ) : null}
       </div>
     </div>

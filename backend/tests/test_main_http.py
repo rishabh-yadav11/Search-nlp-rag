@@ -3,13 +3,16 @@
 error mapping, and analytics beacons)."""
 
 import asyncio
+import json
 import os
 
 import pytest
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from qdrant_client.models import Filter
 
 from app import auth, main
+from app.analytics import AnalyticsUnavailableError
 from app.config import config
 from app.main import SourceArticle, SourceSummary
 
@@ -650,3 +653,19 @@ def test_analytics_summary(monkeypatch):
     monkeypatch.setattr(main, "analytics_data", fake_analytics_data)
 
     assert _run(main.get_analytics_summary()) == {"searches_total": 5}
+
+
+def test_analytics_summary_endpoint_maps_store_failure_to_503(monkeypatch):
+    """When the analytics store fails, the handler must return a 503 response
+    whose body carries the error — not the error dict as a 200, which the
+    dashboard rendered as a legitimate all-zero report (#281)."""
+    async def failing_analytics_data():
+        raise AnalyticsUnavailableError("analytics unavailable")
+
+    monkeypatch.setattr(main, "analytics_data", failing_analytics_data)
+
+    res = _run(main.get_analytics_summary())
+
+    assert isinstance(res, JSONResponse)
+    assert res.status_code == 503
+    assert json.loads(res.body)["error"] == "analytics unavailable"

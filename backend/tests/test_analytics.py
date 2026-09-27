@@ -257,7 +257,11 @@ def test_recording_never_raises_when_redis_down(monkeypatch):
     assert analytics._warned is True
 
 
-def test_summary_returns_error_dict_when_redis_down(monkeypatch):
+def test_summary_raises_when_redis_is_down(monkeypatch):
+    """A failed analytics read must be a failure, not a payload the caller
+    cannot tell from a report whose counters are legitimately all zero
+    (#281). The HTTP layer turns this into 503."""
+
     class _BrokenRedis:
         async def mget(self, keys):
             raise ConnectionError("redis unreachable")
@@ -270,8 +274,100 @@ def test_summary_returns_error_dict_when_redis_down(monkeypatch):
 
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
 
-    s = _run(analytics.summary())
-    assert "error" in s
+    with pytest.raises(analytics.AnalyticsUnavailableError):
+        _run(analytics.summary())
+
+
+@pytest.fixture
+def analytics_client(tmp_path):
+    """An admin-authenticated TestClient over the real app, with both SQLite
+    stores on throwaway files. Yields (client, admin_headers, chat_store)."""
+    from fastapi.testclient import TestClient
+
+    from app import auth as auth_module
+    from app import chat as chat_module
+    from app import main
+    from app.auth import AuthStore
+    from app.chat import ChatStore
+
+    auth_store = AuthStore(str(tmp_path / "auth.db"))
+    _run(auth_store.connect())
+    chat_store = ChatStore(str(tmp_path / "chat.db"))
+    _run(chat_store.connect())
+    auth_module.store = auth_store
+    chat_module.store = chat_store
+    try:
+        user = _run(auth_store.create_user("admin@example.com", "secret1", "admin", "admin"))
+        token = _run(auth_store.issue_token(user.id, 7))
+        client = TestClient(main.app, raise_server_exceptions=False)
+        yield client, {"Authorization": f"Bearer {token}"}, chat_store
+    finally:
+        auth_module.store = None
+        chat_module.store = None
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+class _UnreachableRedis:
+    async def mget(self, keys):
+        raise ConnectionError("redis unreachable")
+
+    async def get(self, key):
+        raise ConnectionError("redis unreachable")
+
+    async def zrevrange(self, key, start, stop, withscores=False):
+        raise ConnectionError("redis unreachable")
+
+
+def test_analytics_summary_endpoint_is_503_when_redis_is_down(analytics_client, monkeypatch):
+    """/analytics/summary must not answer 200 while the analytics store is
+    down: the status has to agree with the body, or the dashboard renders an
+    all-zero report during an outage (#281)."""
+    client, headers, _ = analytics_client
+    monkeypatch.setattr(analytics, "_client", lambda: _UnreachableRedis())
+
+    res = client.get("/analytics/summary", headers=headers)
+
+    assert res.status_code == 503
+    body = res.json()
+    assert body["error"]
+    # A degraded body must not be mistakable for a report.
+    assert "searches_total" not in body
+
+
+def test_analytics_chat_endpoint_is_503_when_chat_store_is_down(analytics_client, monkeypatch):
+    """/analytics/chat must answer 503 when the chat store cannot be read, for
+    the same reason as /analytics/summary (#281)."""
+    client, headers, chat_store = analytics_client
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("chat db gone")
+
+    monkeypatch.setattr(chat_store, "_fetchone", boom)
+    monkeypatch.setattr(chat_store, "_fetchall", boom)
+
+    res = client.get("/analytics/chat", headers=headers)
+
+    assert res.status_code == 503
+    body = res.json()
+    assert body["error"]
+    assert "sessions" not in body
+
+
+def test_analytics_endpoints_still_serve_200_when_stores_are_up(analytics_client, monkeypatch):
+    """The healthy path is unchanged: a 200 whose body is a real report. Pins
+    that the 503 mapping did not swallow working reads."""
+    client, headers, _ = analytics_client
+    monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
+
+    summary_res = client.get("/analytics/summary", headers=headers)
+    chat_res = client.get("/analytics/chat", headers=headers)
+
+    assert summary_res.status_code == 200
+    assert "searches_total" in summary_res.json()
+    assert chat_res.status_code == 200
+    # A real (empty) report: zero sessions is genuine data, not a degraded body.
+    assert chat_res.json()["sessions"] == 0
 
 
 # --- _client / _degraded / close ---

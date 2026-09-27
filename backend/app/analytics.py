@@ -18,6 +18,16 @@ from app.config import config
 
 logger = logging.getLogger("analytics")
 
+
+class AnalyticsUnavailableError(RuntimeError):
+    """The analytics store could not be read.
+
+    Raised by :func:`summary` instead of returning an error-shaped payload, so
+    the HTTP layer can answer 503. Returning ``{"error": ...}`` as a 200 was
+    indistinguishable from a report whose counters are legitimately all zero.
+    """
+
+
 # Click positions are bucketed 1..CLICK_POSITION_MAX in the summary view, so an
 # unauthenticated beacon can only poison within this range (never create
 # arbitrarily-named ``analytics:click:pos:{n}`` keys).
@@ -240,7 +250,11 @@ def _pct(part: int, total: int) -> float:
 
 
 async def summary() -> dict:
-    """Aggregated metrics since the analytics DB was last cleared. Never raises."""
+    """Aggregated metrics since the analytics DB was last cleared.
+
+    Raises :class:`AnalyticsUnavailableError` if the analytics Redis cannot be
+    read; callers must surface that as a failed request rather than as data.
+    """
     try:
         c = _client()
         day = f"analytics:search:day:{_today()}"
@@ -294,5 +308,5 @@ async def summary() -> dict:
         }
     except Exception as exc:
         _degraded(exc)
-        logger.exception("analytics summary failed; returning generic error to client")
-        return {"error": "analytics unavailable"}
+        logger.exception("analytics summary failed; analytics store unavailable")
+        raise AnalyticsUnavailableError("analytics unavailable") from exc
