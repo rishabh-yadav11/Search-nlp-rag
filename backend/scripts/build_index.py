@@ -32,17 +32,15 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     Modifier,
-    PayloadSchemaType,
     SparseVectorParams,
     VectorParams,
 )
 from qdrant_client.models import models as qmodels
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _common import log, make_point
+from _common import create_payload_indexes, log, make_point
 
 from app.config import config
 from app.index_text import compose_dense_text, compose_sparse_text
@@ -164,11 +162,7 @@ def create_collection(client: QdrantClient):
         sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
         hnsw_config=qmodels.HnswConfigDiff(m=32, ef_construct=256),
     )
-    client.create_payload_index(config.QDRANT_COLLECTION, "category", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(config.QDRANT_COLLECTION, "published_date", PayloadSchemaType.DATETIME)
-    client.create_payload_index(config.QDRANT_COLLECTION, "author_names", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(config.QDRANT_COLLECTION, "industry_names", PayloadSchemaType.KEYWORD)
-    client.create_payload_index(config.QDRANT_COLLECTION, "dealtype_names", PayloadSchemaType.KEYWORD)
+    create_payload_indexes(client)
     print(f"Created collection '{config.QDRANT_COLLECTION}'")
 
 
@@ -177,6 +171,13 @@ def main():
         print(f"No data file at {DATA_PATH} — run scripts/fetch_data.py first.")
         return
 
+    # Imported here, not at module scope: sentence_transformers pulls in torch,
+    # so importing this module should not require it. That keeps
+    # ensure_collection / create_payload_indexes / the checkpoint helpers
+    # importable and testable in an environment without the model stack. Same
+    # lazy pattern as apply_delta in update_index.py.
+    from sentence_transformers import SentenceTransformer
+
     print(f"Loading dense embedding model {config.EMBED_MODEL} on {config.EMBED_DEVICE}...")
     model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
     print(f"Loading sparse embedding model {config.SPARSE_MODEL}...")
@@ -184,6 +185,21 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, timeout=60)
     recreated = ensure_collection(client)
+
+    # Index the payload fields on a resumed collection too. create_collection
+    # only runs when the collection is (re)created, so without this a collection
+    # that predates a new field keeps that field unfilterable until a full
+
+    # Index the payload fields on a resumed collection too. create_collection
+    # only runs when the collection is (re)created, so without this a collection
+    # that predates a new field keeps that field unfilterable until a full
+    # destructive rebuild -- which is why content_type stayed unfilterable even
+    # for points that carry it. create_payload_index is idempotent for a field
+    # that already has an index, so this costs nothing on a re-run.
+    try:
+        create_payload_indexes(client)
+    except Exception as e:
+        log(f"WARNING: could not create payload indexes: {e}")
 
     if recreated:
         save_checkpoint(0, 0)

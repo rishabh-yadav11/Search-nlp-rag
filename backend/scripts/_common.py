@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 # module is importable on its own (``app`` lives one directory up).
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qdrant_client.models import PointStruct, SparseVector
+from qdrant_client.models import PayloadSchemaType, PointStruct, SparseVector
 
 from app.config import config
 
@@ -43,15 +43,23 @@ def make_point(rec: dict, dvec, svec) -> PointStruct:
 
     This is the single definition of the indexed payload, shared by every write
     path, so two scripts can no longer store a different set of keys for the
-    same article. The key set is deliberately fixed at the nine fields the
+    same article. The key set is deliberately fixed at the ten fields the
     search read path uses; a field that is not stored here is not stored by any
     script.
+
+    ``content_type`` is the tenth key, and every value is normalised to ``str``
+    (never ``None``): it carries a KEYWORD payload index, and a field that is
+    ``str`` on some points and ``None`` on others is a mixed-type field that
+    Qdrant indexes inconsistently. The read side maps a falsy value back to
+    ``None`` (``payload.get("content_type") or None``), so an article with no
+    content type in MySQL round-trips as absent exactly as before.
     """
     payload = {
         "title": rec["title"],
         "url": rec["url"],
         "published_date": rec.get("published_date"),
         "category": rec.get("category"),
+        "content_type": rec.get("content_type") or "",
         "summary": rec.get("summary") or "",
         "body": (rec.get("body") or "")[: config.BODY_CHAR_LIMIT],
         "author_names": rec.get("author_names") or [],
@@ -66,6 +74,35 @@ def make_point(rec: dict, dvec, svec) -> PointStruct:
         },
         payload=payload,
     )
+
+
+def create_payload_indexes(client):
+    """Create the payload index for every field the search read path filters on.
+
+    A stored field is not filterable until its payload index exists, so this
+    list must cover every field ``main.build_facet_filter`` builds a condition
+    on. It lives beside ``make_point`` on purpose: the payload key set and the
+    index set are two halves of one contract, and keeping them in one module is
+    what stops a field being stored but left unfilterable — the exact state
+    ``content_type`` was in, requested on every read and written by nobody.
+
+    Safe to call on a collection that already exists (re-creating an existing
+    field's index is a no-op in Qdrant), which is why ``build_index.py`` calls
+    it on a resumed build and not only on collection creation: otherwise a field
+    added after the collection was built stays unfilterable until a full
+    destructive rebuild.
+    """
+    for field, schema in (
+        ("category", PayloadSchemaType.KEYWORD),
+        ("published_date", PayloadSchemaType.DATETIME),
+        ("author_names", PayloadSchemaType.KEYWORD),
+        ("industry_names", PayloadSchemaType.KEYWORD),
+        ("dealtype_names", PayloadSchemaType.KEYWORD),
+        # content_type is single-valued, so it gets a plain KEYWORD index (the
+        # *_names fields are keyword too, but they hold lists).
+        ("content_type", PayloadSchemaType.KEYWORD),
+    ):
+        client.create_payload_index(config.QDRANT_COLLECTION, field, schema)
 
 
 async def make_pool(*, maxsize: int = 3, connect_timeout: int | None = None):

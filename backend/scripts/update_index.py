@@ -8,8 +8,17 @@ or removed, never bulk-recreated).
 
 State lives in data/index_state.json: {updated_at, fingerprints}.
 A fingerprint is the md5 of the *indexed* row values (title, summary, url,
-published_date, category, body and the facet lists), so any edit that would
-change the payload or the embedded text is caught.
+published_date, category, content_type, body and the facet lists), so any edit
+that would change the payload or the embedded text is caught.
+
+Operator note — one-time re-seed: content_type was added to the fingerprint when
+it became a stored payload field. That changed the hash of EVERY record, so an
+index_state.json written by the previous version no longer matches any row and
+the first normal run would re-embed the whole corpus. Run
+`python scripts/update_index.py --init` ONCE after deploying that change to
+re-seed from current MySQL state and avoid it; main() logs a WARNING when it
+sees this signature. This is not a recurring requirement — after the re-seed the
+hashes are stable again.
 
 Durability & reconciliation:
   * Upserts are acknowledged (wait=True); state fingerprints are
@@ -76,6 +85,21 @@ def fingerprint(rec: dict, include_body: bool = True) -> str:
             ",".join(rec.get("author_names") or []),
             ",".join(rec.get("industry_names") or []),
             ",".join(rec.get("dealtype_names") or []),
+            rec.get("content_type") or "",
+            # content_type is part of the stored payload (see _common.make_point),
+            # so it MUST be part of the change fingerprint: without it a row
+            # whose content_type alone changed in MySQL hashes identically, is
+            # classified unchanged by sync_delta, and the indexed payload goes
+            # stale forever with nothing logged.
+            #
+            # Adding a term changes the hash of EVERY record, so every
+            # fingerprint in an index_state.json written by the previous
+            # 9-field version now mismatches: the first incremental run after
+            # this ships sees the whole corpus as "changed" and re-embeds it.
+            # Field order is irrelevant to that — it is a content change, not a
+            # reordering. The remedy is `python scripts/update_index.py --init`
+            # once after deploy, which re-seeds the fingerprints from current
+            # MySQL state and returns before any embedding work.
         ]
     )
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -353,6 +377,20 @@ async def main():
         f"delta: {len(new)} new, {len(changed)} changed, {len(deleted)} deleted, "
         f"{len(records) - len(new) - len(changed) - len(deleted)} unchanged"
     )
+
+    # A fingerprint-scheme change (a field added to or removed from
+    # fingerprint()) re-hashes every record, so a state file written by the
+    # previous version matches nothing and the whole corpus looks changed. That
+    # is indistinguishable from "every row really was edited", and the cost is a
+    # full re-embed, so say so explicitly rather than quietly re-embedding.
+
+    if len(records) > 1 and len(changed) == len(records):
+        log(
+            f"WARNING: all {len(records)} rows read as changed. If the index was just "
+            "rebuilt, or a field was added to/removed from fingerprint(), this is the "
+            "one-time re-hash: run 'python scripts/update_index.py --init' to re-seed "
+            "state and skip the full re-embed.",
+        )
 
     if not new and not changed and not deleted:
         log(f"index current ({time.perf_counter() - start:.2f}s, models not loaded)")
