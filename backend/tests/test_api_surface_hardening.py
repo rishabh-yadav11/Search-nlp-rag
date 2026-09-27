@@ -142,3 +142,26 @@ def test_wildcard_env_fails_at_config_load():
     )
     assert proc.returncode != 0
     assert "ALLOWED_HOSTS" in proc.stderr
+
+
+def test_allow_list_is_logged_without_logging_config():
+    """The effective allow-list must actually reach stderr in a worker.
+
+    This is the only clue an operator gets when ALLOWED_HOSTS is wrong and every
+    request answers 400, so it has to survive the process manager's logging
+    setup: gunicorn and uvicorn configure only their own loggers, leaving the
+    root logger without a handler, where anything below WARNING is dropped.
+    A bare subprocess import is exactly that environment.
+    """
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run(
+        [sys.executable, "-c", "import app.main"],
+        check=False,
+        cwd=backend_dir,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "TrustedHost allowed hosts: " in proc.stderr
+    for host in config.ALLOWED_HOSTS:
+        assert host in proc.stderr
