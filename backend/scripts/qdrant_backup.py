@@ -51,6 +51,7 @@ DATA_DIR = os.path.join(BACKEND_DIR, "data")
 TS_RE = re.compile(r"^\d{8}-\d{6}-\d{6}$")
 
 DOWNLOAD_TIMEOUT = 300
+DOWNLOAD_CHUNK = 1 << 20
 
 
 class SnapshotResult(NamedTuple):
@@ -142,14 +143,38 @@ def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
     ``urllib.request.urlopen`` follows 3xx redirects through the default
     opener and raises ``HTTPError`` on any non-2xx status (the equivalent of
     ``requests``' ``raise_for_status()``), and applies ``timeout`` to both the
-    connect and each socket read. A transfer that dies part-way raises out of
-    ``shutil.copyfileobj`` (``http.client.IncompleteRead``), so a truncated
-    download can never be mistaken for a complete one. Nothing here needs
-    ``requests``, which is not a declared dependency of this project.
+    connect and each socket read. The body is streamed in chunks rather than
+    read whole, so a multi-gigabyte snapshot never lands in memory.
+
+    The bytes received are counted and compared with the advertised
+    ``Content-Length``. This is not optional: ``http.client`` returns a short
+    read as plain ``b""`` and closes the connection rather than raising
+    ``IncompleteRead`` (only an un-sized ``read()`` does), so
+    ``shutil.copyfileobj`` would happily write a truncated snapshot to disk and
+    report success — the exact silent-data-loss shape this module exists to
+    prevent. A response served without a ``Content-Length`` cannot be counted,
+    which is why ``_local_snapshot_is_valid`` re-checks the archive afterwards.
+
+    Nothing here needs ``requests``, which is not a declared dependency.
     """
     req = urllib.request.Request(url, method="GET")
+    expected = None
+    written = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
-        shutil.copyfileobj(resp, f)
+        header = resp.headers.get("Content-Length")
+        if header is not None:
+            try:
+                expected = int(header)
+            except ValueError:
+                expected = None
+        while True:
+            chunk = resp.read(DOWNLOAD_CHUNK)
+            if not chunk:
+                break
+            f.write(chunk)
+            written += len(chunk)
+    if expected is not None and written != expected:
+        raise OSError(f"download truncated: received {written} of {expected} bytes")
 
 
 def _local_snapshot_is_valid(path: str) -> tuple[bool, str]:
@@ -203,6 +228,10 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str) ->
         _download_to(url, dest)
     except Exception as e:
         err = str(e).replace(url, _redact_url(url)) if url else str(e)
+        # A half-written file is not a backup either: remove it so the backup
+        # directory can never be mistaken for holding a snapshot.
+        if os.path.exists(dest):
+            os.remove(dest)
         log(
             f"ERROR: snapshot '{name}' was created server-side but NO local copy was "
             f"written ({err}); it survives only inside the Qdrant container and is "
