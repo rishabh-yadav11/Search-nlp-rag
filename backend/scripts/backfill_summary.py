@@ -9,23 +9,19 @@ import asyncio
 import os
 import sys
 import traceback
-from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from collections.abc import Iterator
 
+from _common import log
 from qdrant_client import QdrantClient
 from update_index import fetch_records
 
 from app.config import config
 
 BATCH_SIZE = 200
-
-
-def log(msg: str):
-    print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 
 def scroll_empty_points(client: QdrantClient) -> Iterator[int]:

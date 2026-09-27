@@ -23,14 +23,45 @@ class HybridCache:
     the API keeps working.
     """
 
-    def __init__(self, redis_url: str, ttl: int, maxsize: int):
+    def __init__(self, redis_url: str, ttl: int, maxsize: int, max_bytes: int | None = None):
         self._url = redis_url
         self._ttl = ttl
         self._maxsize = maxsize
-        self._mem: OrderedDict[str, tuple[object, float]] = OrderedDict()
+        # Byte ceiling for the in-process fallback. Entries are wildly
+        # different sizes (small search-result payloads vs ~15KB embedding
+        # vectors), so an entry-count cap alone lets a handful of vectors
+        # thrash out every small entry. ``None``/<=0 means unbounded.
+        self._max_bytes = max_bytes
+        self._mem: OrderedDict[str, tuple[object, float, int]] = OrderedDict()
+        self._mem_bytes = 0
         self._redis: aioredis.Redis | None = None
         self._decode_warned = False
         self._conn_warned = False
+
+    def _drop_mem(self, key: str) -> None:
+        """Remove one in-process entry, keeping the byte total in sync."""
+        entry = self._mem.pop(key, None)
+        if entry is not None:
+            self._mem_bytes -= entry[2]
+
+    def _evict_mem(self) -> None:
+        """Enforce both capacity caps on the in-process fallback.
+
+        Entry count first (oldest first), then the byte budget, evicting the
+        largest entries first so big vectors are sacrificed before the many
+        small search results they would otherwise evict.
+        """
+        while len(self._mem) > self._maxsize:
+            self._drop_mem(next(iter(self._mem)))
+        if not self._max_bytes or self._max_bytes <= 0:
+            return
+        while self._mem and self._mem_bytes > self._max_bytes:
+            # max() by (cost, -position) picks the largest entry and, among
+            # equal costs, the oldest one.
+            key = max(
+                enumerate(self._mem.items()), key=lambda pair: (pair[1][1][2], -pair[0])
+            )[1][0]
+            self._drop_mem(key)
 
     def _new_client(self) -> aioredis.Redis:
         return aioredis.from_url(
@@ -104,15 +135,14 @@ class HybridCache:
         entry = self._mem.get(key)
         if entry is None:
             return None
-        value, expires_at, ttl = entry
-        now = time.monotonic()
-        if expires_at <= now:
-            self._mem.pop(key, None)
+        value, expires_at, _cost = entry
+        if expires_at <= time.monotonic():
+            self._drop_mem(key)
             return None
-        # Slide the expiry on hit so a hot key doesn't expire mid-traffic: each
-        # read restarts its sliding window, mirroring the Redis TTL semantics the
-        # memory cache stands in for.
-        self._mem[key] = (value, now + ttl, ttl)
+        # The expiry is fixed when the entry is created: a read must never
+        # extend it, or a hot key would live forever during a Redis outage and
+        # the fallback would serve unbounded stale data. Redis itself does not
+        # slide its TTL, so this keeps the fallback faithful to it.
         self._mem.move_to_end(key)
         return value
 
@@ -129,10 +159,15 @@ class HybridCache:
             await self._publish(client)
             return
         effective_ttl = self._ttl if ttl is None else ttl
-        self._mem[key] = (value, time.monotonic() + effective_ttl, effective_ttl)
+        cost = len(payload.encode())
+        # Re-caching an existing key replaces the old entry, so its bytes must
+        # come back before the new cost is added or the total inflates on every
+        # refresh until the budget evicts good entries early.
+        self._drop_mem(key)
+        self._mem[key] = (value, time.monotonic() + effective_ttl, cost)
         self._mem.move_to_end(key)
-        while len(self._mem) > self._maxsize:
-            self._mem.popitem(last=False)
+        self._mem_bytes += cost
+        self._evict_mem()
 
     async def delete_prefix(self, prefix: str) -> None:
         """Delete every cached key starting with ``prefix`` (Redis + memory).
@@ -144,7 +179,7 @@ class HybridCache:
         """
         for key in list(self._mem.keys()):
             if key.startswith(prefix):
-                self._mem.pop(key, None)
+                self._drop_mem(key)
         client, is_new = self._acquire()
         try:
             async for key in client.scan_iter(match=f"{prefix}*", count=100):
@@ -162,4 +197,6 @@ class HybridCache:
             self._redis = None
 
 
-cache = HybridCache(config.REDIS_URL, config.CACHE_TTL_SECONDS, config.CACHE_MAX_SIZE)
+cache = HybridCache(
+    config.REDIS_URL, config.CACHE_TTL_SECONDS, config.CACHE_MAX_SIZE, config.CACHE_MAX_BYTES
+)
