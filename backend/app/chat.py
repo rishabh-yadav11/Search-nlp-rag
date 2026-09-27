@@ -12,6 +12,7 @@ builds a conversation-aware prompt so the model can follow up on prior turns.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -740,14 +741,24 @@ def _previous_user_question(history: list[MessageOut]) -> str | None:
 
 
 # The ONE dataviz fence grammar, shared verbatim with the frontend renderer
-# (FENCE_SRC in frontend/app/chat/DataViz.tsx). The pattern is written in the
-# JavaScript regex form on purpose: under re.DOTALL the JS class [\s\S] is
-# exactly Python's ".", so the two grammars are provably identical instead of
+# (FENCE_SRC in frontend/app/chat/datavizContract.ts, the module that holds the
+# whole browser-side validator and is executed by tests/test_dataviz_contract.py
+# so the two grammars are compared fixture by fixture). The pattern is written
+# in the JavaScript regex form on purpose: under re.DOTALL the JS class [\s\S]
+# is exactly Python's ".", so the two grammars are provably identical instead of
 # merely similar — a fence the UI strips must never be left in the stored
-# answer, and vice versa (#255). Note the leading newline is OPTIONAL, matching
-# the frontend; the old backend pattern required one and so disagreed with the
-# UI on a fence written as ```dataviz{...}```. Group 1 is the JSON payload.
-DATAVIZ_FENCE_PATTERN = r"```dataviz[^\S\n]*\n?([\s\S]*?)\n?```\s*"
+# answer, and vice versa (#255). Group 1 is the JSON payload.
+#
+# The whitespace the tag may be followed by is an explicit ASCII class, spaces,
+# tabs and a carriage return, and NOT the ``[^\S\n]`` this used to use. Python's
+# \s and JavaScript's \s cover DIFFERENT Unicode whitespace — \S matches U+FEFF in
+# JavaScript but not in Python, and U+0085 in Python but not in JavaScript — so
+# the identical pattern strings consumed different characters: a fence carrying a
+# BOM after the tag was stripped by the server and kept by the browser, and one
+# carrying U+0085 was the other way round. Equal strings, unequal grammars. The
+# carriage return keeps a CRLF answer working, and the newline is the OPTIONAL
+# \n? below, so a fence written as ```dataviz{...}``` is still the same grammar.
+DATAVIZ_FENCE_PATTERN = r"```dataviz[ \t\r]*\n?([\s\S]*?)\n?```[\t\n\v\f\r ]*"
 _DATAVIZ_FENCE_RE = re.compile(DATAVIZ_FENCE_PATTERN, re.DOTALL)
 
 
@@ -757,7 +768,7 @@ _DATAVIZ_FENCE_RE = re.compile(DATAVIZ_FENCE_PATTERN, re.DOTALL)
 # the raw JSON behind it would otherwise be rendered to the user as text. The
 # documented rule is to truncate from the marker to the end of the answer; the
 # frontend applies the identical rule in stripOpenFence.
-_OPEN_DATAVIZ_FENCE_RE = re.compile(r"```dataviz[^\S\n]*\n?")
+_OPEN_DATAVIZ_FENCE_RE = re.compile(r"```dataviz[ \t\r]*\n?")
 
 
 def _strip_unclosed_fence(text: str) -> str:
@@ -777,21 +788,129 @@ def _strip_unclosed_fence(text: str) -> str:
     return text
 
 
+# A plain decimal numeric literal, in FULL. ASCII-only ([0-9], not \d, which
+# also matches non-ASCII digits) so it means the same in Python and in
+# JavaScript, where \d is ASCII-only. Kept as one string so the frontend twin
+# and this one can be asserted equal by the dataviz contract test.
+_NUMERIC_LITERAL_SRC = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+_NUMERIC_LITERAL_RE = re.compile(_NUMERIC_LITERAL_SRC)
+
+
+# The whitespace trimmed off a cell, spelled out. NOT str.strip()'s default:
+# JavaScript's trim() also removes U+FEFF, Python's str.strip() does not, so a
+# cell carrying a BOM was "missing" in the browser and a real value on the
+# server. ASCII whitespace is named explicitly so both sides trim the same
+# characters; the contract test probes them one by one.
+# The nesting depth past which a payload is treated as malformed, and it is
+# deliberately SMALL: json.loads raises RecursionError on a deeply nested
+# payload a couple of thousand levels down, and this walk must refuse those
+# before reaching a depth that would overflow the stack walking them -- the same
+# way a bare RecursionError escaping into a 500 would. The frontend walks with
+# the same limit, because V8's JSON.parse tolerates far more nesting than either
+# side should.
+_MAX_JSON_DEPTH = 100
+
+_TRIM_CHARS = " \t\n\r\v\f"
+_TRIM_SRC = "\\t\\n\\v\\f\\r "
+
+
+def _trims(ch: str) -> bool:
+    return f"x{ch}".strip(_TRIM_CHARS) == "x"
+
+
+# Every codepoint either language has an opinion about, and whether the backend
+# trims it. The contract test compares this against the same probe run under
+# node, so a whitespace class that means different things in the two languages
+# is caught even though the two source strings are identical.
+_TRIM_PROBES: dict[str, bool] = {
+    f"{cp:04x}": _trims(chr(cp))
+    for cp in (
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000, 0x200B,
+        0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF,
+    )
+}
+
+
+def _reject_json_constant(name: str) -> None:
+    """Refuse the bare JSON literals ``NaN``, ``Infinity`` and ``-Infinity``.
+
+    json.loads accepts them, JSON.parse throws on them, so a block carrying one
+    anywhere -- in a cell, but equally in ``title`` or any other key -- was kept
+    by the server and unparseable in the browser (#267)."""
+    raise ValueError(f"not a JSON literal: {name}")
+
+
+def _has_non_finite(value: object, depth: int = 0) -> bool:
+    """True when ANY number in the payload is not a finite double, or when the
+    payload nests deeper than _MAX_JSON_DEPTH.
+
+    A non-finite number disqualifies the block wherever it sits, not only in the
+    value column: a LABEL cell reading 1e999 survives every value check but can
+    never be displayed, and a literal too wide for Python's int conversion
+    (>4300 digits) makes json.loads raise and reject the whole payload while
+    JSON.parse quietly yields Infinity. The frontend applies the identical walk,
+    so both sides reject the same blocks rather than the server dropping one the
+    browser happily renders (#267)."""
+    if depth > _MAX_JSON_DEPTH:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        # A number counts only if it is a finite double, which is exactly what
+        # the other side sees: an integer literal too wide for a double is a
+        # perfectly good Python int but reaches JavaScript as Infinity, so
+        # math.isfinite raising OverflowError means "not finite" here too.
+        try:
+            return not math.isfinite(value)
+        except OverflowError:
+            return True
+    if isinstance(value, dict):
+        return any(_has_non_finite(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_non_finite(v, depth + 1) for v in value)
+    return False
+
 def _as_float(v: object) -> float | None:
-    """Coerce a cell to float (ints, floats, or digit strings), else None.
+    """Coerce a cell to a FINITE float, else None.
 
     Bools are rejected first: bool subclasses int, so the int/float branch below
     would otherwise turn True/False into 1.0/0.0 and make a yes/no column look
-    numeric (#176)."""
+    numeric (#176).
+
+    A number must be finite. json.loads accepts the bare literals ``NaN`` and
+    ``Infinity`` and float("inf") accepts the strings, so an unplottable value
+    used to reach the value column and poison the chart's min/max. The frontend
+    already refused both (Number.isFinite, and JSON.parse throws on the bare
+    literals), so the two sides disagreed on such a block (#267).
+
+    A string counts as a stated number only when the whole comma-stripped,
+    trimmed cell is a plain numeric literal. float() alone is too lenient: it
+    reads "1_000" as 1000 and "inf"/"nan" as a float, while the frontend's
+    Number() does not. _NUMERIC_LITERAL_SRC is the character-for-character
+    twin of NUMERIC_LITERAL in frontend/app/chat/datavizContract.ts, so both
+    sides accept the same spellings ("1,200", " 1.5 ", "+3", "1e3") and reject
+    the same impostors ("12abc", "0x10", "1_000", "inf", "nan", "")."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
+        # A bare integer literal wider than float can hold arrives as an
+        # unbounded-precision int, and both float() and math.isfinite() raise
+        # OverflowError on it -- which used to escape parse_dataviz, and with it
+        # _sanitize_dataviz and _finalize_answer, turning one malformed block
+        # into a failed chat request. JSON.parse overflows the same literal to
+        # Infinity, which the frontend rejects as not finite, so refusing it
+        # here is also what makes the two sides agree (#267).
         try:
-            return float(v.replace(",", ""))
-        except ValueError:
+            as_float = float(v)
+        except OverflowError:
             return None
+        return as_float if math.isfinite(as_float) else None
+    if isinstance(v, str):
+        cleaned = v.replace(",", "").strip(_TRIM_CHARS)
+        if _NUMERIC_LITERAL_RE.fullmatch(cleaned) is None:
+            return None
+        parsed = float(cleaned)
+        return parsed if math.isfinite(parsed) else None
     return None
 
 
@@ -808,7 +927,7 @@ def _missing_cell(v: object) -> bool:
     if v is None:
         return True
     if isinstance(v, str):
-        return v.strip().lower() in _MISSING_VALUE_TOKENS
+        return v.strip(_TRIM_CHARS).lower() in _MISSING_VALUE_TOKENS
     return False
 
 
@@ -854,10 +973,18 @@ def parse_dataviz(text: str) -> dict | None:
     if not m:
         return None
     try:
-        data = json.loads(m.group(1))
-    except (ValueError, TypeError):
+        data = json.loads(m.group(1), parse_constant=_reject_json_constant)
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError: a payload nested thousands deep makes json.loads raise
+        # rather than return, and it used to escape parse_dataviz, then
+        # _sanitize_dataviz and _finalize_answer, failing the whole request
+        # instead of dropping the block (the same shape as the OverflowError
+        # above). JSON.parse tolerates that depth, so refusing it is also what
+        # keeps the two sides agreeing.
         return None
     if not isinstance(data, dict):
+        return None
+    if _has_non_finite(data):
         return None
     columns = data.get("columns")
     rows = data.get("rows")
@@ -868,7 +995,20 @@ def parse_dataviz(text: str) -> dict | None:
     if any(len(r) != len(columns) for r in rows):
         return None
     vc = data.get("value_column")
-    if not isinstance(vc, int) or isinstance(vc, bool) or not (0 <= vc < len(columns)):
+    # An explicit index wins when it is a whole number in range — including one
+    # written as a JSON float ("value_column": 2.0), which is what the model
+    # means and what the browser already read as 2. Rejecting it and silently
+    # re-picking the first numeric column made the server validate the Year
+    # column while the browser plotted the Value column (#267). Everything else
+    # (missing, bool, string, fractional, out of range) falls back, exactly as
+    # the frontend's Number.isInteger check does. float('nan').is_integer() and
+    # float('inf').is_integer() are both False, so those fall back too.
+    explicit_index = (isinstance(vc, int) and not isinstance(vc, bool)) or (
+        isinstance(vc, float) and vc.is_integer()
+    )
+    if explicit_index and 0 <= vc < len(columns):
+        vc = int(vc)  # 2.0 and 2 are the same column; keep the index an int
+    else:
         vc = _first_numeric_column(rows)
     # A table (view='table' or explicit table ask) may have no numeric column at
     # all (e.g. every item's value is 'not stated'): value_column stays None and
@@ -1084,8 +1224,14 @@ def _parse_dataviz_with_view(text: str, view: str) -> dict | None:
     if not m:
         return None
     try:
-        data = json.loads(m.group(1))
-    except (ValueError, TypeError):
+        # The SAME rules as parse_dataviz: a second, laxer copy of this load
+        # used to let a block through that the re-validation below then
+        # rejected, so _apply_requested_view silently returned it unpinned and
+        # a user who asked for a bar chart quietly lost it (#267).
+        data = json.loads(m.group(1), parse_constant=_reject_json_constant)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if _has_non_finite(data):
         return None
     if not isinstance(data, dict):
         return None

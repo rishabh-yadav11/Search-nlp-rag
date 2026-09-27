@@ -110,6 +110,12 @@ setup.sh               one-command deploy (deps, services, index, nginx, cron)
 
 - Python 3.11–3.12 (warned-but-tolerated on 3.13/3.14; set `ALLOW_UNSUPPORTED_PY=1` to silence)
 - Node.js 18+ (22 recommended for the frontend)
+- Node >= 22.6 to run the backend test suite's cross-language dataviz
+  contract test (`backend/tests/test_dataviz_contract.py`): it imports the
+  shipped `frontend/app/chat/datavizContract.ts` directly, which needs the
+  built-in TypeScript support in node. Without it that test skips locally
+  and FAILS under CI, so the browser-side validator can never go untested
+  silently.
 - Docker (for Qdrant and Redis)
 - MySQL source database
 
