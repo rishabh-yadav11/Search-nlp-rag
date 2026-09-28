@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
-import { API_BASE, authHeaders, getMe, getToken, logout, redirectToLogin } from '../../lib/auth'
+import { API_BASE, authRequestInit, getMe, logout, redirectToLogin } from '../../lib/auth'
 import { formatClockTime, formatCost, formatEpochDateTime } from '../../lib/format'
 
 interface Summary {
@@ -207,10 +207,6 @@ export default function AnalyticsDashboardPage() {
     // Skip a poll if a previous load is still in flight; we never want
     // two overlapping fetches overwriting each other.
     if (inFlight.current) return
-    if (!getToken()) {
-      redirectToLogin('/analytics/dashboard')
-      return
-    }
     inFlight.current = true
     const controller = new AbortController()
     controllerRef.current = controller
@@ -229,8 +225,9 @@ export default function AnalyticsDashboardPage() {
       }
       const me = meResult.value
       if (!me) {
-        // Genuine auth rejection (401/expired token) or a network failure:
-        // send the user to login, restoring the original behavior.
+        // A genuine auth rejection (401 / no session). A network failure never
+        // reaches here: getMe rethrows it, and it is surfaced as an error below
+        // rather than being mistaken for a logout.
         redirectToLogin('/analytics/dashboard')
         return
       }
@@ -243,8 +240,8 @@ export default function AnalyticsDashboardPage() {
         return
       }
       const [sRes, cRes] = await Promise.all([
-        fetch(`${API_BASE}/analytics/summary`, { headers: authHeaders(), signal: controller.signal }),
-        fetch(`${API_BASE}/analytics/chat`, { headers: authHeaders(), signal: controller.signal }),
+        fetch(`${API_BASE}/analytics/summary`, authRequestInit({ signal: controller.signal })),
+        fetch(`${API_BASE}/analytics/chat`, authRequestInit({ signal: controller.signal })),
       ])
       if (sRes.status === 401 || cRes.status === 401) {
         redirectToLogin('/analytics/dashboard')

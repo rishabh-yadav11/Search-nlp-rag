@@ -18,7 +18,9 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from conftest import auth_cookie
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.testclient import TestClient
 
 from app import auth
@@ -295,14 +297,18 @@ def test_endpoint_killed_mid_change_keeps_the_old_session_working(tmp_path, monk
     _arm(monkeypatch, store, kill_at=3)
     try:
         request = SimpleNamespace(state=SimpleNamespace(user=user))
+        response = Response()
         body = auth.ChangePasswordIn(current_password=OLD_PW, new_password=NEW_PW)
         with pytest.raises(_SimulatedKill):
-            asyncio.run(auth.change_password(body=body, request=request, _=None))
+            asyncio.run(
+                auth.change_password(body=body, request=request, response=response, _=None)
+            )
 
         _assert_no_partial_change(db_path, user.id, tokens, NEW_PW)
-        # and the account is still reachable for real: the old token works and
-        # a fresh login with the old password succeeds.
-        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {tokens[0]}"}).status_code == 200
+        # and the account is still reachable for real: the pre-existing
+        # session cookie still authenticates, and a fresh login with the old
+        # password succeeds.
+        assert client.get("/api/auth/me", cookies=auth_cookie(tokens[0])).status_code == 200
         login = client.post("/api/auth/login", json={"email": "a@x.co", "password": OLD_PW})
         assert login.status_code == 200, login.text
         assert client.post("/api/auth/login", json={"email": "a@x.co", "password": NEW_PW}).status_code == 401

@@ -940,6 +940,41 @@ class Config:
     # hashes to a different row, so it seeds a fresh one), or mint one with
     # POST /api/auth/service-tokens. A machine client that runs longer than
     # that must be given a freshly rotated value, not the original.
+    # Session cookie. The credential is no longer read from an
+    # `Authorization: Bearer` header: a header the app writes into a JSON body is
+    # reachable by any script that runs on the page, so an XSS bug exfiltrates a
+    # durable account takeover. The token now travels only in an HttpOnly
+    # cookie, which script cannot read. See app/auth.py for the contract.
+    #
+    # No Domain attribute is ever set on the cookie: host-only is deliberate so
+    # the same image works on a bare-IP deployment (`http://10.0.0.7`) where a
+    # Domain would have to encode an address the operator may not control.
+    AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "vccircle_session")
+    # Defaulted off from the old localStorage key name on purpose: keeping the
+    # old name would let a stale credential silently authenticate through a
+    # different transport.
+    #
+    # SameSite=Lax still sends the cookie on top-level GET navigations, which is
+    # what keeps deep links working, while blocking the cookie on cross-site
+    # POSTs (the CSRF shape). `strict` is tighter but breaks in-app navigation
+    # from an external link, so it is an operator choice, not a default.
+    AUTH_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "lax")
+    # Secure defaults to TRUE unless an operator explicitly sets it false.
+    # Defaulting on is deliberate: a session cookie that crosses plaintext HTTP
+    # is trivially captured by anything on the path, which is a worse failure
+    # than a login that does not persist. A plain-HTTP deployment (setup.sh with
+    # NGINX_TLS=off) MUST set AUTH_COOKIE_SECURE=false or login will silently
+    # not persist. That is a deployment dependency, not something to auto-
+    # detect: the app sits behind TLS termination and cannot trust
+    # request.url.scheme or X-Forwarded-Proto to work it out, so a guess here
+    # could go either way silently.
+    AUTH_COOKIE_SECURE = _env_tristate("AUTH_COOKIE_SECURE") is not False
+    # Not configurable. It must stay "/": the API serves /api/... , and a
+    # narrower path would silently stop the cookie from ever reaching it.
+    AUTH_COOKIE_PATH = "/"
+    # Derived from the token TTL so the cookie and the server-side record expire
+    # together; not independently configurable, or the two could drift apart.
+    AUTH_COOKIE_MAX_AGE_SECONDS = AUTH_TOKEN_TTL_DAYS * 86400
     AUTH_SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
     # Lifetime of a service token. Not optional: a value <= 0 falls back to
     # the default rather than meaning "never expires", because an eternal

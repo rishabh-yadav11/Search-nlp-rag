@@ -8,7 +8,6 @@ import {
   API_BASE_TRUSTED,
   AuthUser,
   getMe,
-  getToken,
   logout,
 } from './lib/auth'
 import { formatDate, parseLocalDate } from './lib/format'
@@ -183,7 +182,7 @@ export default function Page() {
   const requestSeqRef = useRef(0)
   const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
   const configError = !API_BASE_TRUSTED
-    ? 'API base is configured to an untrusted host. Requests will be sent without the auth Bearer token. If you are using a custom backend, ensure NEXT_PUBLIC_TRUSTED_API_HOSTS includes the host and that NEXT_PUBLIC_API_BASE uses https.'
+    ? 'API base is configured to an untrusted host. Requests will be sent without session credentials. If you are using a custom backend, ensure NEXT_PUBLIC_TRUSTED_API_HOSTS includes the host and that NEXT_PUBLIC_API_BASE uses https.'
     : ''
 
   useEffect(() => {

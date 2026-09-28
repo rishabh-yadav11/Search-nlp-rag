@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { API_BASE, getToken, setToken } from '../lib/auth'
+import { API_BASE, authRequestInit, clearLegacyToken, clearMeCache, getMe } from '../lib/auth'
 import { isSafeRedirect } from '../lib/safe-url'
 
 function LoginForm() {
@@ -23,7 +23,16 @@ function LoginForm() {
 
   useEffect(() => {
     mountedRef.current = true
-    if (getToken()) router.replace(next)
+    // There is no synchronous "logged in" flag any more: the session is an
+    // httpOnly cookie that JS cannot read, so `/api/auth/me` is the only way to
+    // know. A network failure is not a logout, so it must not redirect.
+    getMe()
+      .then((me) => {
+        if (me) router.replace(next)
+      })
+      .catch(() => {
+        /* offline or backend down: show the form rather than redirect */
+      })
     return () => {
       mountedRef.current = false
       abortRef.current?.abort()
@@ -46,26 +55,27 @@ function LoginForm() {
     const timeout = setTimeout(() => controller.abort(), 15000)
 
     try {
-      const res = await fetch(`${API_BASE}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: trimmed, password }),
-        signal: controller.signal,
-      })
+      const res = await fetch(
+        `${API_BASE}/api/auth/login`,
+        authRequestInit({
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: trimmed, password }),
+          signal: controller.signal,
+        })
+      )
       clearTimeout(timeout)
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         setError((body as { detail?: string }).detail ?? `Login failed (${res.status}).`)
         return
       }
-      const data = (await res.json()) as { token: string }
-      // SECURITY: The JWT is persisted in localStorage, which is readable by any
-      // script on the origin — a single XSS can exfiltrate it. This is a known
-      // risk and must be fixed by a BACKEND change: issue the token as an
-      // httpOnly, Secure, SameSite cookie instead of returning it in JSON, so
-      // JS never sees it. Do NOT log, print, or include the token in error
-      // payloads. Keep this comment until the cookie migration lands.
-      setToken(data.token)
+      // The session arrives as an httpOnly cookie on the response, so there is
+      // nothing to read from the body and nothing to persist in JS. Drop any
+      // cached user from a previous session and delete any token left behind by
+      // a pre-cookie build before continuing to the app.
+      clearMeCache()
+      clearLegacyToken()
       router.replace(next)
       // Navigate away immediately; no further state updates after this.
       return

@@ -1,4 +1,4 @@
-import { API_BASE, authHeaders } from './auth'
+import { API_BASE, authRequestInit } from './auth'
 import {
   createDeadline,
   RECOMMEND_DEADLINE_MS,
@@ -303,12 +303,20 @@ async function requestBatch(
   limit: number,
   deadline: Deadline
 ): Promise<Map<string, SimilarArticle[]>> {
-  const response = await fetch(`${API_BASE}/recommend/similar/batch`, {
-    method: 'POST',
-    headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
-    body: JSON.stringify({ article_ids: ids, limit }),
-    signal: deadline.signal,
-  })
+  // The session is an httpOnly cookie, so this batch POST is credentialed
+  // rather than header-bearing: `authRequestInit` attaches the cookie when
+  // API_BASE is a trusted backend and omits `credentials` when it is not, so
+  // a runtime-injected attacker base never receives the session. There is no
+  // `Authorization` header any more.
+  const response = await fetch(
+    `${API_BASE}/recommend/similar/batch`,
+    authRequestInit({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ article_ids: ids, limit }),
+      signal: deadline.signal,
+    })
+  )
   if (!response.ok) throw new BatchRequestError(response.status)
   const data = (await response.json()) as {
     results?: { article_id: number | string; similar_articles?: SimilarArticle[] }[]

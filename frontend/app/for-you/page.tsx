@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import SafeArticleLink from '../components/SafeArticleLink'
-import { API_BASE, authHeaders, getToken } from '../lib/auth'
+import { API_BASE, authRequestInit } from '../lib/auth'
 import { formatArticleDate } from '../lib/format'
 import { createDeadline, RECOMMEND_DEADLINE_MS } from '../lib/deadline'
 import type { MouseEvent } from 'react'
@@ -46,7 +46,6 @@ export default function ForYouPage() {
 
       try {
         let url: string
-        const headers = authHeaders()
 
         switch (feedType) {
           case 'trending':
@@ -59,11 +58,7 @@ export default function ForYouPage() {
           default:
             url = `${API_BASE}/recommend/for-you?limit=${limit}`
         }
-
-        const res = await fetch(url, {
-          signal: deadline.signal,
-          headers,
-        })
+        const res = await fetch(url, authRequestInit({ signal: deadline.signal }))
 
         if (!res.ok) {
           throw new Error(`Failed to load feed: ${res.status}`)
@@ -98,22 +93,24 @@ export default function ForYouPage() {
   }, [feedType, limit, retryCount])
 
   const handleInteraction = async (articleId: number | string, e: MouseEvent) => {
-    const headers = authHeaders({
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    })
-
     // Fire-and-forget, but still bounded: a hung beacon would otherwise hold
     // its socket open indefinitely, and nothing here would ever release it.
+    // The session is an httpOnly cookie, so this POST is credentialed rather
+    // than header-bearing: `authRequestInit` attaches the cookie when API_BASE
+    // is a trusted backend and omits `credentials` when it is not.
     const deadline = createDeadline(RECOMMEND_DEADLINE_MS)
     try {
-      await fetch(`${API_BASE}/recommend/interaction`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ article_id: articleId, interaction_type: 'click' }),
-        signal: deadline.signal,
-      })
+      await fetch(
+        `${API_BASE}/recommend/interaction`,
+        authRequestInit({
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ article_id: articleId, interaction_type: 'click' }),
+          signal: deadline.signal,
+        })
+      )
     } catch (err) {
       if (!deadline.timedOut()) console.error('Failed to record interaction:', err)
     } finally {

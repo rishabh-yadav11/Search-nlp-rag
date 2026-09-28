@@ -14,6 +14,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from conftest import auth_cookie, session_cookie_value
 from fastapi import HTTPException
 
 from app import auth
@@ -21,10 +22,18 @@ from app.auth import AuthStore
 
 
 def _req(headers: dict, ip: str | None = "9.9.9.9") -> SimpleNamespace:
+    """A stand-in Request.
+
+    ``cookies`` and ``method`` are real attributes, not conveniences: the
+    credential is a session cookie and ``require_auth`` runs the same-origin
+    guard, which is scoped to unsafe methods and so reads ``method``.
+    """
     return SimpleNamespace(
         headers=headers,
         client=SimpleNamespace(host=ip) if ip else None,
         state=SimpleNamespace(),
+        cookies={},
+        method="GET",
     )
 
 
@@ -579,7 +588,7 @@ def test_active_token_cap_revokes_the_oldest_token(store, monkeypatch):
     assert asyncio.run(store.active_token_count(user.id)) == 3
 
     def usable(token: str) -> int:
-        return client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code
+        return client.get("/api/auth/me", cookies=auth_cookie(token)).status_code
 
     # The three oldest were revoked; the newest three still work.
     assert [usable(t) for t in tokens[:3]] == [401, 401, 401]
@@ -657,13 +666,13 @@ def test_login_stays_under_the_token_cap(store, monkeypatch):
     client.post("/api/auth/signup", json={"email": "a@b.co", "password": "secret12", "name": "A"})
 
     tokens = [
-        client.post("/api/auth/login", json={"email": "a@b.co", "password": "secret12"}).json()["token"]
+        session_cookie_value(client.post("/api/auth/login", json={"email": "a@b.co", "password": "secret12"}))
         for _ in range(5)
     ]
     user = asyncio.run(store.get_user_by_email("a@b.co"))
     assert asyncio.run(store.active_token_count(user.id)) == 2
-    assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {tokens[0]}"}).status_code == 401
-    assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {tokens[-1]}"}).status_code == 200
+    assert client.get("/api/auth/me", cookies=auth_cookie(tokens[0])).status_code == 401
+    assert client.get("/api/auth/me", cookies=auth_cookie(tokens[-1])).status_code == 200
 
 
 # --- 5. the service token ---
@@ -876,7 +885,7 @@ def test_cold_start_tombstone_survives_the_reaper(store, monkeypatch):
     killed = client.post(
         "/api/auth/service-tokens/revoke",
         json={"token": "cold-svc"},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        cookies=auth_cookie(admin_token),
     )
     assert killed.json()["revoked"] == 1
 
@@ -960,7 +969,7 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
 
     admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
     admin_token = asyncio.run(store.issue_token(admin.id, 7))
-    hdr = {"Authorization": f"Bearer {admin_token}"}
+    hdr = auth_cookie(admin_token)
 
     app = FastAPI()
     app.include_router(auth.router)
@@ -971,7 +980,7 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 200
 
     # 1. Mint the replacement. Both work, so nothing has an outage.
-    minted = client.post("/api/auth/service-tokens", headers=hdr)
+    minted = client.post("/api/auth/service-tokens", cookies=hdr)
     assert minted.status_code == 200, minted.text
     new_token = minted.json()["token"]
     assert new_token
@@ -980,7 +989,7 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
     assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 200
 
     # 2. Retire the old one BY VALUE. This must not take the new one with it.
-    retired = client.post("/api/auth/service-tokens/revoke", json={"token": "old-svc"}, headers=hdr)
+    retired = client.post("/api/auth/service-tokens/revoke", json={"token": "old-svc"}, cookies=hdr)
     assert retired.status_code == 200, retired.text
     assert retired.json()["revoked"] == 1
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 401
@@ -1006,7 +1015,7 @@ def test_kill_switch_works_before_the_configured_token_is_ever_used(store, monke
 
     admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
     admin_token = asyncio.run(store.issue_token(admin.id, 7))
-    hdr = {"Authorization": f"Bearer {admin_token}"}
+    hdr = auth_cookie(admin_token)
 
     app = FastAPI()
     app.include_router(auth.router)
@@ -1018,7 +1027,7 @@ def test_kill_switch_works_before_the_configured_token_is_ever_used(store, monke
     # Never presented: no row exists, so there is nothing for an UPDATE to hit.
     assert asyncio.run(row_count()) == 0
 
-    killed = client.post("/api/auth/service-tokens/revoke", json={"token": "cold-svc"}, headers=hdr)
+    killed = client.post("/api/auth/service-tokens/revoke", json={"token": "cold-svc"}, cookies=hdr)
     assert killed.status_code == 200, killed.text
     assert killed.json()["revoked"] == 1, "a cold configured token must be killable, not a silent no-op"
     assert asyncio.run(row_count()) == 1, "a revoked tombstone must exist to block re-seeding"
@@ -1047,7 +1056,7 @@ def test_kill_everything_also_kills_an_unused_configured_token(store, monkeypatc
     app.include_router(auth.router)
     client = TestClient(app)
 
-    killed = client.post("/api/auth/service-tokens/revoke", headers={"Authorization": f"Bearer {admin_token}"})
+    killed = client.post("/api/auth/service-tokens/revoke", cookies=auth_cookie(admin_token))
     assert killed.status_code == 200, killed.text
     assert killed.json()["revoked"] == 1
     assert client.get("/api/auth/me", headers={"X-Service-Token": "cold-svc"}).status_code == 401
@@ -1066,18 +1075,18 @@ def test_revoke_all_service_tokens_kills_every_one(store, monkeypatch):
 
     admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
     admin_token = asyncio.run(store.issue_token(admin.id, 7))
-    hdr = {"Authorization": f"Bearer {admin_token}"}
+    hdr = auth_cookie(admin_token)
 
     app = FastAPI()
     app.include_router(auth.router)
     client = TestClient(app)
 
     asyncio.run(store.ensure_bootstrap_service_token("old-svc", {"chat:use"}, 3600))
-    new_token = client.post("/api/auth/service-tokens", headers=hdr).json()["token"]
+    new_token = client.post("/api/auth/service-tokens", cookies=hdr).json()["token"]
 
     # A POST with NO body at all must mean revoke-everything -- that is the
     # form the docs give -- so it must not be a 422 for a missing body.
-    revoked = client.post("/api/auth/service-tokens/revoke", headers=hdr)
+    revoked = client.post("/api/auth/service-tokens/revoke", cookies=hdr)
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["revoked"] == 2
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 401
@@ -1099,19 +1108,19 @@ def test_revoke_reports_what_it_actually_revoked(store, monkeypatch):
 
     admin = asyncio.run(store.create_user("admin@b.co", "secret12", "A", "admin"))
     admin_token = asyncio.run(store.issue_token(admin.id, 7))
-    hdr = {"Authorization": f"Bearer {admin_token}"}
+    hdr = auth_cookie(admin_token)
 
     app = FastAPI()
     app.include_router(auth.router)
     client = TestClient(app)
 
-    minted = client.post("/api/auth/service-tokens", headers=hdr).json()["token"]
-    first = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, headers=hdr)
+    minted = client.post("/api/auth/service-tokens", cookies=hdr).json()["token"]
+    first = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, cookies=hdr)
     assert first.json()["revoked"] == 1
     # Same token again, and a token that never existed: nothing changed.
-    again = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, headers=hdr)
+    again = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, cookies=hdr)
     assert again.json()["revoked"] == 0
-    never = client.post("/api/auth/service-tokens/revoke", json={"token": "never-existed"}, headers=hdr)
+    never = client.post("/api/auth/service-tokens/revoke", json={"token": "never-existed"}, cookies=hdr)
     assert never.json()["revoked"] == 0
 
 
@@ -1128,6 +1137,9 @@ def test_service_token_logout_actually_revokes(store, monkeypatch):
     app = FastAPI()
     app.include_router(auth.router)
     client = TestClient(app)
+    # A machine credential is a HEADER, and deliberately still one: the cookie
+    # migration is about the browser credential, and a browser cannot be made
+    # to attach this.
     hdr = {"X-Service-Token": "svc-abc"}
 
     assert client.get("/api/auth/me", headers=hdr).status_code == 200

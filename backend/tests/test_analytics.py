@@ -5,6 +5,7 @@ import logging
 
 import pytest
 from _support import run_sync as _run
+from conftest import auth_cookie
 
 from app import analytics
 from app.degraded import REANNOUNCE_SECONDS, DegradedLatch
@@ -420,7 +421,7 @@ def test_summary_raises_when_redis_is_down(monkeypatch):
 @pytest.fixture
 def analytics_client(tmp_path):
     """An admin-authenticated TestClient over the real app, with both SQLite
-    stores on throwaway files. Yields (client, admin_headers, chat_store)."""
+    stores on throwaway files. Yields (client, admin_session_cookie, chat_store)."""
     from fastapi.testclient import TestClient
 
     from app import auth as auth_module
@@ -439,7 +440,7 @@ def analytics_client(tmp_path):
         user = _run(auth_store.create_user("admin@example.com", "secret1", "admin", "admin"))
         token = _run(auth_store.issue_token(user.id, 7))
         client = TestClient(main.app, raise_server_exceptions=False)
-        yield client, {"Authorization": f"Bearer {token}"}, chat_store
+        yield client, auth_cookie(token), chat_store
     finally:
         auth_module.store = None
         chat_module.store = None
@@ -468,10 +469,10 @@ def test_analytics_summary_endpoint_is_503_when_redis_is_down(analytics_client, 
     """/analytics/summary must not answer 200 while the analytics store is
     down: the status has to agree with the body, or the dashboard renders an
     all-zero report during an outage (#281)."""
-    client, headers, _ = analytics_client
+    client, cookie, _ = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _UnreachableRedis())
 
-    res = client.get("/analytics/summary", headers=headers)
+    res = client.get("/analytics/summary", cookies=cookie)
 
     assert res.status_code == 503
     body = res.json()
@@ -483,7 +484,7 @@ def test_analytics_summary_endpoint_is_503_when_redis_is_down(analytics_client, 
 def test_analytics_chat_endpoint_is_503_when_chat_store_is_down(analytics_client, monkeypatch):
     """/analytics/chat must answer 503 when the chat store cannot be read, for
     the same reason as /analytics/summary (#281)."""
-    client, headers, chat_store = analytics_client
+    client, cookie, chat_store = analytics_client
 
     async def boom(*args, **kwargs):
         raise RuntimeError("chat db gone")
@@ -491,7 +492,7 @@ def test_analytics_chat_endpoint_is_503_when_chat_store_is_down(analytics_client
     monkeypatch.setattr(chat_store, "_fetchone", boom)
     monkeypatch.setattr(chat_store, "_fetchall", boom)
 
-    res = client.get("/analytics/chat", headers=headers)
+    res = client.get("/analytics/chat", cookies=cookie)
 
     assert res.status_code == 503
     body = res.json()
@@ -502,11 +503,11 @@ def test_analytics_chat_endpoint_is_503_when_chat_store_is_down(analytics_client
 def test_analytics_endpoints_still_serve_200_when_stores_are_up(analytics_client, monkeypatch):
     """The healthy path is unchanged: a 200 whose body is a real report. Pins
     that the 503 mapping did not swallow working reads."""
-    client, headers, _ = analytics_client
+    client, cookie, _ = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
 
-    summary_res = client.get("/analytics/summary", headers=headers)
-    chat_res = client.get("/analytics/chat", headers=headers)
+    summary_res = client.get("/analytics/summary", cookies=cookie)
+    chat_res = client.get("/analytics/chat", cookies=cookie)
 
     assert summary_res.status_code == 200
     assert "searches_total" in summary_res.json()
@@ -519,11 +520,11 @@ def test_summary_read_is_recorded_in_the_admin_audit_trail(analytics_client, mon
     """The cross-user read leaves a trail, as #273 established for
     /analytics/chat. Without one, an admin reading these aggregates is
     indistinguishable from nobody having looked."""
-    client, headers, chat_store = analytics_client
+    client, cookie, chat_store = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
 
     before = len(_run(chat_store.admin_audit_log(limit=1000)))
-    res = client.get("/analytics/summary", headers=headers)
+    res = client.get("/analytics/summary", cookies=cookie)
     assert res.status_code == 200
 
     log = _run(chat_store.admin_audit_log(limit=1000))
@@ -534,14 +535,14 @@ def test_summary_read_is_recorded_in_the_admin_audit_trail(analytics_client, mon
 def test_summary_serves_text_free_rows_over_http(analytics_client, monkeypatch):
     """End-to-end: what the admin dashboard actually receives contains no
     search text, only digests."""
-    client, headers, _ = analytics_client
+    client, cookie, _ = analytics_client
     secret = "who bought northwind capital"
     fake = _SummaryRedis()
     fake.store["analytics:search:total"] = 12
     fake.zsets["analytics:top_queries"] = {analytics.query_digest(secret, "k"): 12}
     monkeypatch.setattr(analytics, "_client", lambda: fake)
 
-    body = client.get("/analytics/summary", headers=headers).json()
+    body = client.get("/analytics/summary", cookies=cookie).json()
 
     assert secret not in json.dumps(body)
     assert body["top_queries"] == [[analytics.query_digest(secret, "k"), 12]]
@@ -551,7 +552,7 @@ def test_summary_still_serves_when_the_audit_write_fails(analytics_client, monke
     """The audit is best-effort: if it cannot be written the (text-free) read
     must still succeed, or a broken audit table would take the dashboard down
     with it."""
-    client, headers, chat_store = analytics_client
+    client, cookie, chat_store = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
 
     async def boom(*args, **kwargs):
@@ -559,7 +560,7 @@ def test_summary_still_serves_when_the_audit_write_fails(analytics_client, monke
 
     monkeypatch.setattr(chat_store, "record_admin_audit", boom)
 
-    res = client.get("/analytics/summary", headers=headers)
+    res = client.get("/analytics/summary", cookies=cookie)
 
     assert res.status_code == 200
     assert "searches_total" in res.json()

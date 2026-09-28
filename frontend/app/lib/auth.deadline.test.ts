@@ -9,7 +9,7 @@
  * can tell a transport failure from a definitive 401.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { clearMeCache, getMe, TOKEN_KEY } from './auth'
+import { clearMeCache, getMe } from './auth'
 import { ME_DEADLINE_MS } from './deadline'
 
 let signals: (AbortSignal | null)[] = []
@@ -44,7 +44,7 @@ function track(promise: Promise<unknown>) {
 beforeEach(() => {
   vi.useFakeTimers()
   signals = []
-  localStorage.setItem(TOKEN_KEY, 'test-token')
+
   clearMeCache()
   vi.stubGlobal('fetch', hangingFetch())
   vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -54,7 +54,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
-  localStorage.removeItem(TOKEN_KEY)
+
   clearMeCache()
 })
 
@@ -95,12 +95,19 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
     expect((await pending).ok).toBe(false)
   })
 
-  it('preserves the auth token on timeout instead of treating it as a logout', async () => {
+  it('leaves the session alone on a timeout instead of treating it as a logout', async () => {
+    // There is no stored session left to preserve: the credential is an
+    // httpOnly cookie JS cannot read or clear. What a timeout must NOT do is
+    // resolve `null` — this function's "definitive logged out" sentinel — or
+    // leave one cached, because a cancelled read that reads as a logout is a
+    // forced logout. So the call has to reject, and the NEXT one has to go
+    // back to the network rather than be served a cached "logged out".
     const pending = track(getMe())
     await advance(ME_DEADLINE_MS)
     expect((await pending).ok).toBe(false)
 
-    expect(localStorage.getItem(TOKEN_KEY)).toBe('test-token')
+    track(getMe())
+    expect(signals).toHaveLength(2)
   })
 
   it('is cancelled by the caller aborting its own signal, as the dashboard does', async () => {

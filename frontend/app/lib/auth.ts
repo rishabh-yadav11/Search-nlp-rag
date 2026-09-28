@@ -3,9 +3,7 @@ import { devApiBase, parseApiBaseUrl, readApiBaseEnv } from './api-base'
 import { isSafeRedirect } from './safe-url'
 import { createDeadline, LOGOUT_DEADLINE_MS, ME_DEADLINE_MS } from './deadline'
 
-export const TOKEN_KEY = 'vccircle_auth_token'
-
-// Hosts explicitly allowed to receive the auth Bearer token. This only matters
+// Hosts explicitly allowed to receive the session cookie. This only matters
 // for a runtime-injected `window.API_BASE` (see below); build-time config is
 // operator-controlled and trusted. Set NEXT_PUBLIC_TRUSTED_API_HOSTS to a
 // comma-separated list (e.g. "api.example.com") to permit runtime overrides to
@@ -39,7 +37,7 @@ function isSameOrigin(url: URL): boolean {
 }
 
 /** True when `url` uses the https scheme. Required for any cross-origin trusted
- *  base so the Bearer token is never sent over cleartext http. */
+ *  base so session credentials are never sent over cleartext http. */
 function isHttps(url: URL): boolean {
   return url.protocol === 'https:'
 }
@@ -88,14 +86,14 @@ function baseFromUrl(url: URL): string {
   return url.origin + url.pathname
 }
 
-/** Trust rule: a base is trusted (allowed to receive the Bearer token) when it
- *  is first-party — i.e. empty (relative → window.location.origin), same-origin
+/** Trust rule: a base is trusted (allowed to receive the session cookie) when
+ *  it is first-party — i.e. empty (relative → window.location.origin), same-origin
  *  (http allowed for local dev), or a loopback address (e.g. http://localhost:
  *  8000; cross-origin but never a network cleartext risk). An explicit
  *  cross-origin host in NEXT_PUBLIC_TRUSTED_API_HOSTS is trusted only over
- *  https. A non-loopback cross-origin http base is NEVER trusted so the token
- *  is never sent over an unencrypted channel. Any other cross-origin host is
- *  untrusted and must NOT receive the token. */
+ *  https. A non-loopback cross-origin http base is NEVER trusted so session
+ *  credentials are never sent over an unencrypted channel. Any other
+ *  cross-origin host is untrusted and must NOT receive credentials. */
 function isTrustedBase(base: string, url: URL | null): boolean {
   if (!base) return true // empty relative base → same-origin first-party
   if (!url) return false
@@ -143,7 +141,7 @@ function resolveApiBase(): { base: string; trusted: boolean } {
   // rule as any other source. A cross-origin base is trusted ONLY over https
   // AND when explicitly allow-listed; a cross-origin http base (e.g. an
   // operator setting `NEXT_PUBLIC_API_BASE=http://host`) must NEVER be trusted,
-  // so the Bearer token is not attached over cleartext.
+  // so session credentials are not sent over cleartext.
   const trustedSource = ENV_API_BASE || DEV_API_BASE
   if (trustedSource) {
     const url = parseApiBaseUrl(trustedSource, currentOrigin)
@@ -156,7 +154,7 @@ function resolveApiBase(): { base: string; trusted: boolean } {
     const trusted = isTrustedBase(trustedSource, url)
     if (!trusted) {
       console.error(
-        `[auth] Configured API base "${trustedSource}" is cross-origin and not trusted (https + NEXT_PUBLIC_TRUSTED_API_HOSTS required); the Bearer token will NOT be attached.`
+        `[auth] Configured API base "${trustedSource}" is cross-origin and not trusted (https + NEXT_PUBLIC_TRUSTED_API_HOSTS required); the session cookie will NOT be sent.`
       )
     }
     return { base: baseFromUrl(url), trusted }
@@ -171,55 +169,47 @@ const RESOLVED_API_BASE = resolveApiBase()
 
 /** The validated API base. Empty string means same-origin relative requests. */
 export const API_BASE = RESOLVED_API_BASE.base
-/** True only when API_BASE is a trusted backend allowed to receive the token. */
+/** True only when API_BASE is a trusted backend allowed to receive the session.
+ *  Since the session now lives in an httpOnly cookie, the browser attaches it
+ *  to any request made with `credentials: 'include'` — this flag is what
+ *  decides whether we set that mode at all. An untrusted base therefore MUST
+ *  NEVER receive credentials: `authRequestInit` omits `credentials` there so a
+ *  runtime-injected attacker base cannot harvest the session cookie. */
 export const API_BASE_TRUSTED = RESOLVED_API_BASE.trusted
 
 
-export function getToken(): string | null {
-  try {
-    return window.localStorage.getItem(TOKEN_KEY)
-  } catch {
-    return null
-  }
-}
+/** The pre-cookie localStorage key, kept ONLY to delete any token written by an
+ *  older build. The session is an httpOnly cookie; a live localStorage copy of
+ *  it is exactly the XSS-exfiltratable credential this design removed, so any
+ *  leftover value is deleted on sight rather than read. */
+const LEGACY_TOKEN_KEY = 'vccircle_auth_token'
 
-export function setToken(token: string): void {
-  // SECURITY: localStorage is XSS-exfiltratable — any script on the page can
-  // read this token, so a single XSS easily steals the session. The correct fix
-  // is a backend-set httpOnly + Secure + SameSite cookie (backend change, out of
-  // scope). This comment marks the token-storage site: the token MUST move to an
-  // httpOnly cookie. Until then, NEVER write the token value to logs, console,
-  // errors, analytics, or any outbound payload. This path is a known risk.
+/** Delete the legacy `vccircle_auth_token` localStorage entry, if present.
+ *  Storage can throw (private mode, disabled cookies, sandboxed iframe), so
+ *  every access is guarded. Called from getMe() and after a successful login so
+ *  a pre-cookie session token cannot linger and be re-read. */
+export function clearLegacyToken(): void {
+  if (typeof window === 'undefined') return
   try {
-    window.localStorage.setItem(TOKEN_KEY, token)
+    window.localStorage.removeItem(LEGACY_TOKEN_KEY)
   } catch {
     /* storage unavailable */
   }
-  // Login (or re-login) may change role/is_active; drop any stale cached user.
-  clearMeCache()
 }
 
-export function clearToken(): void {
-  try {
-    window.localStorage.removeItem(TOKEN_KEY)
-  } catch {
-    /* storage unavailable */
-  }
-  // Logout invalidates the cached user so it is never served stale.
-  clearMeCache()
-}
-
-export function authHeaders(init?: RequestInit): Headers {
-  const headers = new Headers(init?.headers)
-  const token = getToken()
-  // SECURITY: the Bearer token is only attached when API_BASE is a trusted
-  // backend (same-origin or an explicitly allow-listed host). Attaching it to
-  // an attacker-controlled/untrusted base would leak the credential
-  // cross-origin. See API_BASE_TRUSTED / resolveApiBase above. If the base is
-  // untrusted, requests are still sent (unauthenticated) but the token never
-  // leaves the first party.
-  if (token && API_BASE_TRUSTED) headers.set('Authorization', `Bearer ${token}`)
-  return headers
+/** Build the RequestInit for a session-bearing API call.
+ *  SECURITY: `credentials: 'include'` makes the browser attach the httpOnly
+ *  session cookie, so it is set ONLY when API_BASE is a trusted backend
+ *  (same-origin or an explicitly allow-listed host). Sending it to an
+ *  attacker-controlled/untrusted base would leak the session cross-origin.
+ *  See API_BASE_TRUSTED / resolveApiBase above. When the base is untrusted the
+ *  init is returned UNCHANGED — deliberately no `credentials`, so the request
+ *  stays unauthenticated rather than carrying the cookie to a foreign host.
+ *  There is deliberately no `Authorization` header any more: the backend no
+ *  longer accepts bearer tokens, and JS cannot read the cookie at all. */
+export function authRequestInit(init?: RequestInit): RequestInit {
+  if (!API_BASE_TRUSTED) return init ?? {}
+  return { ...init, credentials: 'include' }
 }
 
 export interface AuthUser {
@@ -231,7 +221,6 @@ export interface AuthUser {
 }
 
 let meCache: AuthUser | null | undefined
-let meCacheToken: string | null = null
 let meCacheTs = 0
 
 // Configurable TTL so role/is_active changes are eventually picked up even if
@@ -239,24 +228,33 @@ let meCacheTs = 0
 const ME_CACHE_TTL_RAW = Number(process.env.NEXT_PUBLIC_ME_CACHE_TTL_MS || 60000)
 const ME_CACHE_TTL_MS = Number.isNaN(ME_CACHE_TTL_RAW) ? 60000 : ME_CACHE_TTL_RAW
 
-/** Fetch the current authenticated user (`/api/auth/me`), cached per token.
- *  Returns null when the token is missing/rejected (401) or on a non-2xx
- *  response. On a network/transport failure the token is preserved (not
- *  cleared) so a later retry can recover — the fetch error is rethrown so
- *  callers can distinguish a transient network failure from a definitive
- *  "logged out" (null) and MUST NOT treat it as a logout. Never redirects.
+/** Fetch the current authenticated user (`/api/auth/me`) by sending the
+ *  httpOnly session cookie. Returns null when the session is missing/rejected
+ *  (401) or on a non-2xx response. On a network/transport failure the session
+ *  is left alone (the cookie is untouched) so a later retry can recover — the
+ *  fetch error is rethrown so callers can distinguish a transient network
+ *  failure from a definitive "logged out" (null) and MUST NOT treat it as a
+ *  logout. Never redirects.
+ *
+ *  This is the ONLY "am I logged in?" predicate: JS cannot read the cookie, so
+ *  there is no synchronous stored flag to consult.
  *
  *  `signal` is an optional caller signal — the analytics dashboard passes its
  *  load controller so abandoning the dashboard's own 10 s race really does
- *  cancel the socket. Aborting it leaves `timedOut()` false, so it is never
- *  reported as a backend timeout. */
+ *  cancel the socket. Aborting it leaves `deadline.timedOut()` false, so it is
+ *  never reported as a backend timeout.
+ *
+ *  CACHE INVARIANT: a cached record belongs to whichever session was live when
+ *  it was stored, and the only events that can swap the session under a live
+ *  page are a login and a 401/logout. So the cache is keyed on TIME alone, and
+ *  every identity-changing event — login success and 401 — calls
+ *  clearMeCache(). That is what guarantees user A's record is never served to
+ *  user B after B signs in on the same tab. */
 export async function getMe(force = false, signal?: AbortSignal | null): Promise<AuthUser | null> {
-  const token = getToken()
-  if (!token) {
-    clearToken()
-    return null
-  }
-  const fresh = meCache !== undefined && meCacheToken === token && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
+  // A pre-cookie build may have left a readable session token behind; delete it
+  // rather than let it sit in localStorage exfiltratable.
+  clearLegacyToken()
+  const fresh = meCache !== undefined && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
   if (!force && fresh) return meCache ?? null
   // Deadline so a hung auth service actually cancels the request instead of
   // leaking one in-flight `/api/auth/me` per poll tick. The dashboard races
@@ -269,12 +267,20 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
   // exchange lives inside the try, and `clear()` happens once, in `finally`.
   const deadline = createDeadline(ME_DEADLINE_MS, signal ?? null)
   try {
-    const res = await fetch(`${API_BASE}/api/auth/me`, {
-      headers: authHeaders(),
-      signal: deadline.signal,
-    })
+    // The session is an httpOnly cookie the browser attaches for us and JS
+    // cannot read, so this call is credentialed rather than header-bearing:
+    // `authRequestInit` attaches the cookie when API_BASE is a trusted backend
+    // and omits `credentials` when it is not. There is no `Authorization`
+    // header any more.
+    const res = await fetch(
+      `${API_BASE}/api/auth/me`,
+      authRequestInit({ signal: deadline.signal })
+    )
     if (res.status === 401) {
-      clearToken()
+      // Definitive "logged out": drop the cached user so neither a stale record
+      // nor a previous session's legacy token survives the rejection.
+      clearMeCache()
+      clearLegacyToken()
       return null
     }
     if (!res.ok) return null
@@ -285,7 +291,7 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
       // cancellation or a timeout, NOT a malformed payload. Swallowing it
       // would resolve `null` — this function's "definitive logged out"
       // sentinel — and the outer classification below would never run, so a
-      // hung auth service would masquerade as a rejected token. This is the
+      // hung auth service would masquerade as a rejected session. This is the
       // same guard `api()` in chat/page.tsx and the For You page apply to
       // their own reads.
       if (deadline.timedOut() || (err as Error)?.name === 'AbortError') throw err
@@ -295,9 +301,10 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
       return null
     }
   } catch (err) {
-    // Network/transport failure: do NOT treat as "not authenticated" (preserve
-    // the token so a later retry can succeed). Rethrow rather than return null
-    // so callers can tell this apart from a definitive 401/logged-out null.
+    // Network/transport failure: do NOT treat as "not authenticated" (the
+    // session cookie is left intact so a later retry can succeed). Rethrow
+    // rather than return null so callers can tell this apart from a definitive
+    // 401/logged-out null.
     //
     // A caller-initiated abort (the dashboard unmounting, or giving up on its
     // 10 s identity race) is a cancellation, not a backend fault. Logging it as
@@ -313,14 +320,12 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
   } finally {
     deadline.clear()
   }
-  meCacheToken = token
   meCacheTs = Date.now()
   return meCache
 }
 
 export function clearMeCache(): void {
   meCache = undefined
-  meCacheToken = null
   meCacheTs = 0
 }
 
@@ -330,34 +335,45 @@ export function clearMeCache(): void {
  * dashboard all call this instead of each open-coding the same POST plus
  * redirect.
  *
- * `redirectToLogin` already clears the stored token and the cached identity,
- * so neither is repeated here. The logout request is fire-and-forget on
- * purpose: the local session is dropped whether or not the backend call
- * succeeds, so a network failure cannot leave the user stuck on an
- * authenticated page.
+ * The request is CREDENTIALED, not header-bearing: the session is an httpOnly
+ * cookie that the browser attaches for us and JS cannot read, so there is no
+ * `Authorization` header to set. `authRequestInit` attaches the cookie only
+ * when API_BASE is a trusted backend. `redirectToLogin` already clears the
+ * cached identity and any legacy localStorage token, so neither is repeated
+ * here. The logout request is fire-and-forget on purpose: the page moves on
+ * whether or not the backend call succeeds, so a network failure cannot leave
+ * the user stuck on an authenticated page.
+ *
+ * `keepalive: true` is load-bearing, not decoration. `redirectToLogin` calls
+ * `window.location.replace`, which tears the page down; an ordinary fetch is
+ * cancelled with it and the revocation never reaches the server. That used to
+ * be survivable: the credential lived in localStorage and `clearToken()` had
+ * already destroyed it synchronously, so a lost POST cost nothing. An httpOnly
+ * cookie cannot be cleared by script at all, so a lost POST means the session
+ * stays live in the browser AND in the store — the user lands on /login still
+ * authenticated, and a shared machine stays signed in. `keepalive` lets the
+ * request outlive the navigation.
  *
  * Bounded like every other request here (#287): a backend that accepts the
- * connection and never answers would otherwise hold the socket open forever,
- * since the caller has already navigated away and nothing is left to release
- * it. The bound only ever releases that socket — it never delays the
- * redirect, and a failure is swallowed either way.
+ * connection and never answers would otherwise hold the socket open forever.
+ * The bound only ever releases that socket, and only at 10 s — long after the
+ * redirect that `keepalive` has to outlive — so it never costs the revocation
+ * its window. A failure is swallowed either way.
  */
 export function logout(): void {
   const deadline = createDeadline(LOGOUT_DEADLINE_MS)
-  fetch(`${API_BASE}/api/auth/logout`, {
-    method: 'POST',
-    headers: authHeaders(),
-    signal: deadline.signal,
-  })
+  fetch(
+    `${API_BASE}/api/auth/logout`,
+    authRequestInit({ method: 'POST', keepalive: true, signal: deadline.signal })
+  )
     .catch(() => {})
     .finally(() => deadline.clear())
   redirectToLogin()
 }
 
-/** Redirect to the login page (used when the backend rejects an expired token).
+/** Redirect to the login page (used when the backend rejects the session).
  *  `next` (a path) is preserved so the user is sent back after signing in. */
 export function redirectToLogin(next?: string): void {
-  clearToken()
   clearMeCache()
   if (typeof window !== 'undefined') {
     // Only preserve `next` when it is a safe, root-relative path. A value like
