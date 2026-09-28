@@ -93,6 +93,15 @@ def _article(id_, score=0.9):
     )
 
 
+def _summary(id_, score=0.9):
+    """A ``SourceSummary`` payload, i.e. the shape the ``search:`` entry holds."""
+    return main.SourceSummary(
+        id=id_, title=f"t{id_}", url=f"u{id_}", published_date="2025-01-10",
+        category="News", summary="s", score=score,
+        author_names=["A"], industry_names=["F"], dealtype_names=["D"],
+    ).model_dump()
+
+
 class _CountingRedis:
     """Redis double recording every command, i.e. every round trip."""
 
@@ -445,22 +454,39 @@ def test_results_are_identical_with_and_without_a_warm_cache(monkeypatch):
     ]
 
 
-def test_a_malformed_date_is_rejected_even_on_a_cache_hit(monkeypatch):
+def test_a_malformed_date_is_rejected_even_on_a_warm_entry(monkeypatch):
     """Behaviour change, pinned deliberately.
 
     Building the prefetch key needs the same facet filter the retrieval leg
     builds, so `build_facet_filter` (and its 400 on an unparseable date) now
     runs *before* the cache-hit early return. Previously the 400 only fired on
-    a miss, so a malformed date returned 200 on a warm cache and 400 on a cold
-    one. The request is now rejected consistently, which is the more correct
-    outcome, but it is a change and this test makes it deliberate rather than
-    accidental.
+    a miss, so a malformed date that matched a warm entry returned 200 while a
+    cold one returned 400. It is now rejected either way, which is the more
+    correct outcome, but it is an observable change and this test makes it
+    deliberate rather than accidental.
+
+    The entry is warmed under the key the malformed request itself computes.
+    Warming an unrelated (well-formed) entry instead would let the base commit
+    pass this test too, because it would simply miss and 400 on the retrieval
+    leg -- which is exactly the discrimination this test exists to provide.
     """
     from fastapi import HTTPException
 
-    _wire_search(monkeypatch)
-    assert _search().cached is False
-    assert _search().cached is True, "precondition: the entry is warm"
+    cache = _wire_search(monkeypatch)
+
+    q_fixed, _ = main.fix_query("fintech funding")
+    retrieval_q, eff_from, eff_to, auto_dealtype, _auto_industry = main._effective_intent(
+        q_fixed, "not-a-date", None
+    )
+    content_type = main.extract_content_type(q_fixed)
+    warm_key = main.search_cache_key(
+        retrieval_q,
+        8,
+        main.facet_cache_token(
+            None, auto_dealtype, None, eff_from, eff_to, content_type
+        ),
+    )
+    asyncio.run(cache.set(warm_key, [_summary(1, 0.9)]))
 
     with pytest.raises(HTTPException) as exc:
         _search(from_date="not-a-date")
