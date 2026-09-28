@@ -250,9 +250,11 @@ without a failure.
 - [x] **`_degraded` warn-once** (lines 43-47): only the first failure logs.
 - [x] **`close`** (lines 52-54): `aclose` called, global reset to `None`;
       no-op when no client.
-- [x] **`record_click` with `article_id`** (line 102): per-query per-article
-      `analytics:query_click:{q}` sorted-set tally (repeated clicks stack);
-      without `article_id` the key is never created.
+- [x] **`record_click` with `article_id`**: per-query per-article
+      `analytics:query_click:{q}` sorted-set tally on the canonicalised query
+      (repeated clicks from the *same* client are deduped, see
+      `_claim_click_signal`); without `article_id` the key is never created.
+      Covered by `tests/test_analytics_click_guard.py`.
 - [x] **`click_signals`** (lines 111-129): no raw → None; below
       `CLICK_BOOST_MIN_CLICKS` → None; success dict build (zero-count members
       filtered, `total` = sum of per-article counts). **ERROR PATH —
@@ -309,9 +311,11 @@ without a failure.
 - [x] **`_facet_values`** (lines 618-626) and **`facets` cache hit/miss**
       (lines 633-642): sorted string-only values; empty/None results; cache
       hit skips the Qdrant call. **ERROR PATH — facet API raising → 500.**
-- [x] **`analytics_click`** (line 656) and **`get_analytics_summary`**
-      (line 666): click beacon forwards query/position/id; summary returns
-      `analytics_data()`.
+- [x] **`analytics_click`** and **`get_analytics_summary`**: the beacon
+      forwards query/position/id and the client IP, drops an id that is not in
+      the collection, and the summary returns `analytics_data()`. Covered by
+      `tests/test_analytics_click_guard.py` (plus the 429 rate-limit case in
+      `tests/test_main_http.py`).
 
 ---
 
