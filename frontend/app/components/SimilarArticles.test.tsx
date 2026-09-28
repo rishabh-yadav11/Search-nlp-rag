@@ -200,9 +200,9 @@ describe('SimilarArticles — a view costs one request, not one per card', () =>
 
   it('a view wider than the server cap asks again rather than dropping its tail', async () => {
     const fetchMock = mockBatch(oneNear)
-    // Disjoint from the ids the cases above used, so none of these are
-    // already answered from the cache the client keeps between tests.
-    const ids = Array.from({ length: 25 }, (_, i) => i + 1000)
+    // Far outside the range the cases above hand out, so this can never be
+    // answered from their cache entries whatever limit they used.
+    const ids = Array.from({ length: 25 }, (_, i) => i + 900000)
 
     render(
       <>
@@ -221,5 +221,43 @@ describe('SimilarArticles — a view costs one request, not one per card', () =>
       JSON.parse(String(init.body)).article_ids
     )
     expect(asked).toEqual(ids)
+  })
+
+  it('a server that refuses the whole batch is retried in smaller pieces', async () => {
+    // The id cap is a number on the other side of the wire, so it can drift.
+    // A 422 must not be the whole view's answer failing at once.
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const { article_ids: ids } = JSON.parse(String(init.body)) as { article_ids: number[] }
+      if (ids.length > 2) return { ok: false, status: 422, json: async () => ({}) }
+      return {
+        ok: true,
+        json: async () => ({
+          results: ids.map((articleId) => ({
+            article_id: articleId,
+            similar_articles: oneNear(articleId),
+          })),
+        }),
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const ids = [7001, 7002, 7003, 7004]
+
+    render(
+      <>
+        {ids.map((id) => (
+          <SimilarArticles key={id} articleId={id} limit={3} compact />
+        ))}
+      </>
+    )
+    await waitFor(() => expect(screen.getAllByText(/^Near \d+$/)).toHaveLength(4))
+
+    // The view is tried whole first -- that is the request that is refused --
+    // and the retries are what has to come back in pieces.
+    const [, first] = fetchMock.mock.calls[0]
+    expect(JSON.parse(String(first.body)).article_ids).toEqual(ids)
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1)
+    for (const [, retry] of fetchMock.mock.calls.slice(1)) {
+      expect(JSON.parse(String(retry.body)).article_ids.length).toBeLessThanOrEqual(2)
+    }
   })
 })

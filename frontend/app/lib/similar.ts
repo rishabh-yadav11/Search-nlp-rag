@@ -43,13 +43,29 @@ interface Waiter {
   articleId: number | string
   limit: number
   resolve: (articles: SimilarArticle[]) => void
-  reject: (error: Error) => void
+  reject: (error: unknown) => void
+}
+
+/** A batch the server refused, carrying the status so the caller can decide. */
+class BatchRequestError extends Error {
+  readonly status: number
+
+  constructor(status: number) {
+    super(`Failed to load (${status})`)
+    this.status = status
+  }
 }
 
 /** Client-side lifetime for a similar list. The server holds its own copy for an hour. */
 const CLIENT_TTL_MS = 5 * 60 * 1000
 
-/** The most ids the server accepts in one batch (SIMILAR_BATCH_MAX_IDS). */
+/**
+ * How many ids to put in one request. This mirrors the server's
+ * SIMILAR_BATCH_MAX_IDS, which is the one number on the other side of the
+ * wire that has to agree -- so `requestBatch` splits and retries rather than
+ * trusting it: if the two ever drift, a view is answered in more requests
+ * instead of going blank.
+ */
 const MAX_BATCH_IDS = 20
 
 /** Ceiling on cached lists, so a long session cannot grow the cache without bound. */
@@ -63,16 +79,30 @@ const waiting = new Map<string, Waiter>()
 let flushScheduled = false
 
 /**
- * Store an answer, dropping the oldest entry when the cache is full.
+ * Store an answer, making room if the cache is full.
  *
- * Entries expire on read, but a session that only ever moves forward would
- * never read the old ones, so without a ceiling this map would hold every
- * article anyone searched for until the tab closed.
+ * Two bounds, because either alone leaks. Entries expire on read, but a
+ * session that only ever moves forward never reads the old ones again, so
+ * expired keys are swept when a new entry is written rather than left to
+ * pile up. And a sweep cannot help a session that reads faster than it
+ * expires, so the ceiling is the backstop: past it, the oldest entry goes
+ * regardless of whether it is still fresh.
  */
 function remember(key: string, articles: SimilarArticle[], expiresAt: number): void {
   if (!cache.has(key) && cache.size >= CLIENT_CACHE_MAX_ENTRIES) {
-    const oldest = cache.keys().next()
-    if (!oldest.done) cache.delete(oldest.value)
+    const now = Date.now()
+    for (const [stale, entry] of cache) {
+      if (cache.size < CLIENT_CACHE_MAX_ENTRIES) break
+      // Insertion order is age order, so the first live entry means the rest
+      // are live too and there is nothing left worth sweeping.
+      if (entry.expiresAt > now) break
+      cache.delete(stale)
+    }
+    // Still full of live entries: the ceiling wins, oldest out.
+    if (cache.size >= CLIENT_CACHE_MAX_ENTRIES) {
+      const oldest = cache.keys().next()
+      if (!oldest.done) cache.delete(oldest.value)
+    }
   }
   cache.set(key, { articles, expiresAt })
 }
@@ -188,7 +218,7 @@ async function send(waiters: Waiter[]): Promise<void> {
   }
 
   try {
-    const answers = await Promise.all(chunks.map((chunk) => requestBatch(chunk, limit)))
+    const answers = await Promise.all(chunks.map((chunk) => fetchChunk(chunk, limit)))
     const byArticle = new Map<string, SimilarArticle[]>()
     for (const answer of answers) {
       for (const [articleId, list] of answer) byArticle.set(articleId, list)
@@ -209,7 +239,38 @@ async function send(waiters: Waiter[]): Promise<void> {
     // Drop the in-flight entry so a later mount retries rather than replaying
     // this failure from memory for the rest of the session.
     for (const waiter of waiters) inFlight.delete(cacheKey(waiter.articleId, waiter.limit))
-    for (const waiter of waiters) waiter.reject(error as Error)
+    for (const waiter of waiters) waiter.reject(error)
+  }
+}
+
+/**
+ * Ask for one chunk, splitting it if the server will not take it whole.
+ *
+ * The cap is a number on the other side of the wire, so the two copies can
+ * drift. If the server ever accepts fewer ids than MAX_BATCH_IDS, a 422 is
+ * not one card failing -- it is every card in the view failing at once, and
+ * the results page goes blank over a configuration detail. Halving and
+ * retrying on that one status costs a few extra round trips in a case that
+ * should never arise. Every other failure is a real failure and is reported
+ * as one: splitting those would turn an outage into a storm of requests.
+ */
+async function fetchChunk(
+  ids: number[],
+  limit: number
+): Promise<Map<string, SimilarArticle[]>> {
+  try {
+    return await requestBatch(ids, limit)
+  } catch (error) {
+    if (!(error instanceof BatchRequestError) || error.status !== 422 || ids.length < 2) {
+      throw error
+    }
+    const middle = Math.ceil(ids.length / 2)
+    const [head, tail] = await Promise.all([
+      fetchChunk(ids.slice(0, middle), limit),
+      fetchChunk(ids.slice(middle), limit),
+    ])
+    for (const [articleId, list] of tail) head.set(articleId, list)
+    return head
   }
 }
 
@@ -222,7 +283,7 @@ async function requestBatch(
     headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
     body: JSON.stringify({ article_ids: ids, limit }),
   })
-  if (!response.ok) throw new Error('Failed to load')
+  if (!response.ok) throw new BatchRequestError(response.status)
   const data = (await response.json()) as {
     results?: { article_id: number | string; similar_articles?: SimilarArticle[] }[]
   }
