@@ -1612,7 +1612,7 @@ def test_failed_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
 
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
-    budget = _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
+    _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
 
     spend = chat_module._FailedCallSpend()
@@ -1655,6 +1655,8 @@ def test_failed_ranking_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
         )
     )
     assert len(calls) == 2
+    # The refusal answer is still served, so the turn is not an error...
+    assert "cannot be generated" in result.content
     assert spend.usd == pytest.approx(2 * 0.02)
 
 
