@@ -1225,6 +1225,14 @@ def _stub_lifespan_deps(monkeypatch, chat_connect_error=None, auth_connect_error
 
     monkeypatch.setattr(main.auth_module, "bootstrap_admin", _bootstrap_admin)
 
+    reported = []
+
+    async def _report_legacy_password_hashes():
+        reported.append(True)
+        return 0
+
+    monkeypatch.setattr(main.auth_module, "report_legacy_password_hashes", _report_legacy_password_hashes)
+
     fixer_calls = []
     monkeypatch.setattr(main, "init_fixer", lambda *a, **k: fixer_calls.append((a, k)))
 
@@ -1246,6 +1254,7 @@ def _stub_lifespan_deps(monkeypatch, chat_connect_error=None, auth_connect_error
         "cache": cache,
         "fixer_calls": fixer_calls,
         "closed": closed,
+        "reported": reported,
     }
 
 
@@ -1270,6 +1279,9 @@ def test_lifespan_startup_and_teardown(monkeypatch):
             assert main.auth_module.store is deps["auth_store"]
             assert deps["fixer_calls"][0][1]["max_edit"] == main.config.QUERY_FIX_MAX_EDIT
             assert "chat_retention" in main.state
+            # the pre-migration password-hash count is reported at startup, so
+            # the operator can see the credential migration draining (#387)
+            assert deps["reported"] == [True]
 
     try:
         _run(scenario())
