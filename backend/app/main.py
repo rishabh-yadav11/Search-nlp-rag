@@ -36,7 +36,7 @@ from app.analytics import AnalyticsUnavailableError, record_click, record_search
 from app.analytics import close as close_analytics
 from app.analytics import summary as analytics_data
 from app.answer_fallback import date_label, weak_results_note
-from app.auth import public_rate_limit, require_auth, require_permission, user_rate_limit
+from app.auth import _client_ip, public_rate_limit, require_auth, require_permission, user_rate_limit
 from app.chat import ChatAnalyticsUnavailableError
 from app.click_boost import apply_click_boost
 from app.config import config, ensure_data_paths_ready
@@ -1452,15 +1452,57 @@ class ClickEvent(BaseModel):
     id: int | None = None
 
 
+async def _article_in_index(article_id: int | None) -> bool:
+    """True when ``article_id`` is a point in the Qdrant collection.
+
+    The beacon's ``id`` is client-supplied, so it is only ever a claim. Without
+    this check an unauthenticated caller mints a click-boost record for any
+    integer it likes: the record is inert until that id shows up in someone's
+    results, and until then it is pure Redis growth under a key nothing reads.
+    Existence is a single indexed point lookup. Fails CLOSED (Qdrant down,
+    collection missing, or an id of an unusable type) because a click whose
+    article cannot be confirmed must not become a ranking vote; the raw click
+    counters are still recorded by ``record_click``.
+    """
+    if article_id is None:
+        return False
+    client = state.get("qdrant")
+    if client is None:
+        return False
+    try:
+        points = await client.retrieve(
+            collection_name=config.QDRANT_COLLECTION,
+            ids=[article_id],
+            with_payload=False,
+            with_vectors=False,
+        )
+        return bool(points)
+    except Exception:
+        logger.warning("click-beacon article existence check failed for id %s", article_id, exc_info=True)
+        return False
+
+
 @app.post(
     "/analytics/click",
     dependencies=[Depends(public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN"))],
 )
-async def analytics_click(event: ClickEvent):
+async def analytics_click(event: ClickEvent, request: Request):
     """Anonymous result-click beacon from the public search page (no data
     returned, so it stays open to keep collecting interaction analytics). The
-    optional ``id`` is the clicked article's feid, used by click-driven learning."""
-    await record_click(event.query, event.position, event.id)
+    optional ``id`` is the clicked article's feid, used by click-driven learning.
+
+    Deliberately still unauthenticated: it is a fire-and-forget beacon fired by
+    anonymous search traffic, and gating it on a session would drop the clicks
+    of every logged-out visitor and add a 401 retry path to the frontend. The
+    write amplification it invited is closed from the other side instead -- a
+    per-IP rate limit (the dependency above), a per-client dedupe of the ranking
+    vote in ``record_click``, and the index check below. Only the id is
+    validated; the click itself is always counted.
+    """
+    article_id = event.id if await _article_in_index(event.id) else None
+    if event.id is not None and article_id is None:
+        logger.info("click beacon id %s is not in the collection; recorded without a ranking vote", event.id)
+    await record_click(event.query, event.position, article_id, client_ip=_client_ip(request))
     return {"ok": True}
 
 

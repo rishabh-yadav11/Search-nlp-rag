@@ -9,6 +9,7 @@ itself plus an anonymous ``/analytics/click`` beacon from the frontend.
 Recording is best-effort: a Redis outage never raises into the request path,
 it only logs a warning once and stops recording until Redis returns.
 """
+import hashlib
 import logging
 from datetime import UTC, datetime
 
@@ -82,6 +83,20 @@ def _today() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
+def _normalise_query(q: str) -> str:
+    """Canonical form of a query for the click-boost key: casefolded, with every
+    run of whitespace collapsed to a single space, then length-bounded.
+
+    Applied on BOTH the write path (``record_click``) and the read path
+    (``click_signals``), so a stored key is always retrievable. Without it the
+    unauthenticated beacon mints a separate boost key per spelling of one
+    logical query (``"ola ipo"``, ``"OLA  IPO "``, ``"ola  IPO"``), which both
+    splits the real signal and lets a client grow Redis with keys nothing ever
+    reads. Truncate rather than hash to keep the key human-readable.
+    """
+    return " ".join((q or "").split())[: config.CLICK_QUERY_MAX_LEN].casefold()
+
+
 def _click_query_key(q: str) -> str:
     # Normalize identically on the read and write paths so a stored key is
     # always retrievable. The beacon is unauthenticated, so bound the query
@@ -90,8 +105,54 @@ def _click_query_key(q: str) -> str:
     # in diagnostics. NOTE: two distinct queries sharing a 256-char prefix
     # collide into one aggregated key; that is acceptable for top-query
     # analytics, where the signal is intentionally coarse.
-    q = (q or "").strip()[: config.CLICK_QUERY_MAX_LEN]
-    return f"analytics:query_click:{q}"
+    return f"analytics:query_click:{_normalise_query(q)}"
+
+
+async def _claim_click_signal(client_ip: str | None, query: str, article_id: int) -> tuple[bool, str | None]:
+    """Whether ``client_ip`` may contribute a click to (query, article_id) now,
+    plus the claim key to release if the tally it unlocks does not land.
+
+    True the first time within the dedupe window, False for every repeat. The
+    beacon is anonymous, so the only thing separating a real click from a forged
+    one is where it came from. Counting every beacon verbatim lets a single host
+    cross ``CLICK_BOOST_MIN_ARTICLE_CLICKS`` in a handful of requests and boost
+    an article of its choosing, poisoning the ranking every other user sees. One
+    click per client per (query, article) keeps the signal meaningful --
+    re-opening the same result carries no new ranking information -- while
+    requiring genuinely distinct clients to reach the threshold.
+
+    The claim key is a digest, so no query text or client IP is recoverable
+    from it, and it carries a TTL so the dedupe set cannot grow unbounded. Fails
+    CLOSED on a Redis error: a dropped click only slows the learning signal
+    down, whereas a skipped claim re-opens the forging hole.
+    """
+    window = config.CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS
+    if window <= 0 or not client_ip:
+        # No window configured, or a caller with no client to attribute the
+        # click to: there is nothing to deduplicate against.
+        return True, None
+    digest = hashlib.sha256(f"{client_ip}\x00{query}\x00{article_id}".encode()).hexdigest()
+    key = f"analytics:click:seen:{digest}"
+    try:
+        # Only a claim we actually won may be released later: returning the key
+        # on a lost claim would let a client that merely *lost* the race delete
+        # the winner's claim if the write then failed, and vote twice.
+        return (True, key) if await _client().set(key, 1, nx=True, ex=window) else (False, None)
+    except Exception:
+        logger.warning("click-signal dedupe unavailable; dropping ranking signal", exc_info=True)
+        return False, None
+
+
+async def _release_click_signal(key: str | None) -> None:
+    """Give a spent claim back when the tally it unlocked never landed, so a
+    transient Redis failure between the claim and the write does not silence a
+    real user's click for the rest of the window. Never raises."""
+    if key is None:
+        return
+    try:
+        await _client().delete(key)
+    except Exception:
+        logger.warning("could not release click-signal claim", exc_info=True)
 
 
 async def record_search(
@@ -131,19 +192,56 @@ async def record_search(
         _degraded(exc)
 
 
-async def record_click(query: str, position: int, article_id: int | None = None) -> None:
+async def record_click(
+    query: str,
+    position: int,
+    article_id: int | None = None,
+    client_ip: str | None = None,
+) -> None:
     """Count one result click from the frontend beacon. Never raises.
 
     Also tallies per-query per-article clicks (keyed ``analytics:query_click:{q}``
     as a sorted set of {article_id: count}) so the click-boost layer can learn
     which results users actually open for a query.
+
+    ``client_ip`` is the resolved client address. It gates only the ranking
+    signal (one click per client per query/article per window, see
+    ``_claim_click_signal``); the raw click counters and position buckets are
+    recorded either way, so the admin-facing analytics are unaffected by the
+    dedupe. ``article_id`` is expected to have been checked against the
+    collection by the caller -- recording an id that is not in the index would
+    mint a boost record nothing can ever match.
     """
+    claim_key = None
     try:
-        # Defensive: the beacon is unauthenticated, so an attacker could send an
-        # arbitrarily long query. Bound it before it becomes a sorted-set member
-        # (unbounded member size = unbounded memory growth). Keep the key stable
-        # by truncating rather than hashing.
-        query = (query or "").strip()[: config.CLICK_QUERY_MAX_LEN]
+        # Two forms of the query, because the two consumers need different things.
+        #
+        # ``canonical`` feeds the click-signal dedupe digest, so every spelling of
+        # one logical query claims the same vote. It must NOT be passed to
+        # ``_click_query_key``: that applies ``_normalise_query`` itself, and
+        # normalising twice is not a no-op -- the length bound can land on a space,
+        # which a second pass strips, so the two results differ. The read path
+        # (``click_signals``) hands a raw query to ``_click_query_key``, so the
+        # write path does too: both keys then come from the same call on the same
+        # input, structurally, rather than from an invariant to be maintained.
+        # (Bounding the raw query first, as this did before, is what made the two
+        # orders disagree for any over-length query containing a whitespace run --
+        # the vote landed on a key the ranking path never reads.)
+        raw_query = query or ""
+        canonical = _normalise_query(raw_query)
+        # KNOWN LIMITATION (pre-existing, #242): /search boosts on the
+        # typo-corrected query (apply_click_boost(q_fixed, ...)), while the beacon
+        # posts the raw one. With no vocab artifact built, fix_query is a
+        # documented no-op and the two agree; an operator who HAS built the
+        # vocab will see typo'd traffic's votes stranded under the raw key. Not
+        # fixed here: it is signal loss, not write amplification, and routing the
+        # beacon through fix_query would put a query-correction dependency (and
+        # its failure modes) in the analytics write path, where a raise costs the
+        # whole click.
+        # The human-facing top-queries aggregate keeps the client's original casing
+        # and is bounded here, because an unauthenticated beacon could otherwise
+        # store an arbitrarily long sorted-set member.
+        query = raw_query.strip()[: config.CLICK_QUERY_MAX_LEN]
         # Clamp position into the valid display range so a poisoned beacon cannot
         # create arbitrary ``analytics:click:pos:{n}`` keys. Position 0 or
         # negative collapses to the first slot; values above the max cap at the
@@ -169,13 +267,19 @@ async def record_click(query: str, position: int, article_id: int | None = None)
         # unauthenticated beacon doesn't accumulate forever; refreshed on each click.
         p.expire("analytics:click_top_queries", config.CLICK_QUERY_TTL_SECONDS)
         if q_article_id is not None:
-            qkey = _click_query_key(query)
-            p.zincrby(qkey, 1, str(q_article_id))
-            # Expire the per-query set so distinct-query sets don't accumulate
-            # forever; refreshed on each click.
-            p.expire(qkey, config.CLICK_QUERY_TTL_SECONDS)
+            qkey = _click_query_key(raw_query)
+            claimed, claim_key = await _claim_click_signal(client_ip, canonical, q_article_id)
+            if claimed:
+                p.zincrby(qkey, 1, str(q_article_id))
+                # Expire the per-query set so distinct-query sets don't accumulate
+                # forever; refreshed on each click.
+                p.expire(qkey, config.CLICK_QUERY_TTL_SECONDS)
         await p.execute()
+        claim_key = None  # the vote landed, so the claim is now genuinely spent
     except Exception as exc:
+        # A claim that unlocked a tally which never landed would otherwise
+        # silence this client for the whole window; give it back.
+        await _release_click_signal(claim_key)
         _degraded(exc)
 
 

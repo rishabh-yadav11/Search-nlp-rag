@@ -738,6 +738,19 @@ class Config:
     CLICK_BOOST_MIN_SHARE = float(os.getenv("CLICK_BOOST_MIN_SHARE", "0.3"))
     CLICK_BOOST_MULT = float(os.getenv("CLICK_BOOST_MULT", "1.3"))
 
+    # Window over which one client IP contributes at most one click to a given
+    # (query, article) pair to the click-boost signal. An hour is long enough
+    # that a real user re-opening the same result does not cast a second vote,
+    # and short enough that genuine later interest still registers. 0 disables
+    # the dedupe.
+    #
+    # This is the control #242 actually relies on. The click-boost THRESHOLDS
+    # above are deliberately left at their shipped 5/3/0.3: raising them would
+    # also blunt a forged burst, but it would blunt legitimate signal just as
+    # hard, and that is a ranking-tuning decision to be made on measurement
+    # rather than shipped inside a security fix.
+    CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS = int(os.getenv("CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS", "3600"))
+
     # Bounds on stored query strings so a hostile client can't grow Redis
     # without limit: cap the stored query length and expire the per-query click
     # sorted sets (and the /search top_queries aggregate) a few days after the
