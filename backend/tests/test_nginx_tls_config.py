@@ -166,6 +166,7 @@ API_LOCATIONS = (
     "/readyz",
     "/facets",
     "/api",
+    "/api/chat/",
     "/recommend/",
     "/analytics/click",
     "/analytics/summary",
