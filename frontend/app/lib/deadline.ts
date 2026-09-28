@@ -1,9 +1,9 @@
 /**
- * Request deadlines for the `fetch` call sites on the pages this helper
- * governs: the For You feed, SimilarArticles, chat's JSON `api()` helper and
- * `getMe()` — plus the two fire-and-forget beacons in those same files
- * (click tracking, logout) that would otherwise hold a socket open with
- * nothing to release it.
+ * Request deadlines for the `fetch` call sites this helper now governs: the
+ * For You feed, the shared similar-articles batch, chat's JSON `api()`
+ * helper and `getMe()` — plus the two fire-and-forget beacons in those same
+ * files (click tracking, sign-out) that would otherwise hold a socket open
+ * with nothing to release it.
  *
  * A backend that accepts the connection but never answers leaves a promise
  * pending forever: no rejection, so every `catch`/`finally` downstream is never
@@ -14,15 +14,19 @@
  *
  * This is a per-file budget set, not a claim that every fetch in the app is
  * routed through here. The search page, login, signup and the chat SSE stream
- * are untouched by this change and keep whatever bounds they already had; the
- * search page's own fire-and-forget beacons and the dashboard's logout POST
- * remain unbounded, as they were before.
+ * are untouched by this change and keep whatever bounds they already had, and
+ * the search page's own fire-and-forget beacons keep the unbounded behaviour
+ * they always had.
  *
- * The pattern lives here as a small signal-level helper rather than a `fetch`
- * wrapper: each call site keeps its own `AbortController` for unmount
- * cancellation and passes that signal in as `base`, so unmount and deadline
- * remain independently observable (call sites gate their state updates on
- * `base.aborted`, not on the composed signal).
+ * Where the bound is armed depends on who owns the request. A page that owns
+ * its own socket creates the deadline at the call site and passes its unmount
+ * controller in as `base`, so unmount and deadline stay independently
+ * observable (call sites gate their state updates on `base.aborted`, not on
+ * the composed signal). A request SHARED across a view — the similar-articles
+ * batch, and the sign-out every page's log-out button triggers — is bounded
+ * inside the module that owns it, with no `base` at all: one card unmounting
+ * must not take the rest of the view's request down with it, so a timeout is
+ * the only thing that may abort it.
  *
  * `AbortSignal.timeout` would cover the plain "abort after N ms" case, and
  * vitest's fake timers do drive it here. It is not used because it cannot be
