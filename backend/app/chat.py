@@ -490,16 +490,28 @@ class ChatStore:
         await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         await db.commit()
 
-    async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
-        """Remove a single message (used to roll back a dangling user message
-        when the rest of the turn fails). No-op if the session is gone."""
-        if await self.get_session(session_id, user_id) is None:
-            return
+    async def _delete_authorized(self, session: SessionOut, message_id: int) -> None:
+        """Roll back a message in a session whose ownership the caller has
+        ALREADY proven, for the same reason _append_authorized does not
+        re-check: a turn that proved it may keep using the proof.
+
+        A conversation deleted mid-turn is still a no-op. delete_session
+        removes that conversation's messages before its own row, so by the
+        time this DELETE runs the message is already gone and it matches
+        nothing -- the same end state the pre-check used to produce, without
+        the serialized SELECT it took to get there."""
         db = self._require_db()
         await db.execute(
-            "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session_id)
+            "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session.id)
         )
         await db.commit()
+
+    async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
+        """Remove a single message. No-op if the session is gone."""
+        session = await self.get_session(session_id, user_id)
+        if session is None:
+            return
+        await self._delete_authorized(session, message_id)
 
     async def recent_turns(self, session_id: str, user_id: str, max_turns: int) -> list[MessageOut]:
         """The most recent `max_turns` user/assistant message pairs (oldest
@@ -2581,7 +2593,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
     except (BudgetExceeded, LLMUnavailableError) as exc:
         # Roll back the user message so a failed turn never leaves a dangling
         # user message with no assistant reply.
-        await s.delete_message(session_id, user_id, user_msg.id)
+        await s._delete_authorized(session, user_msg.id)
         if isinstance(exc, BudgetExceeded):
             raise HTTPException(
                 status_code=429,
@@ -2597,7 +2609,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # rather than running an unbudgeted LLM call or returning a silently
         # empty answer: an unmeasured call is exactly the spend this cap exists
         # to prevent (#255).
-        await s.delete_message(session_id, user_id, user_msg.id)
+        await s._delete_authorized(session, user_msg.id)
         raise HTTPException(
             status_code=503,
             detail={"error": "AI budget service unavailable", "detail": f"The daily chat budget could not be verified; please retry shortly. ({exc})"},
@@ -2615,7 +2627,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # Any other failure during the turn (DB error, retrieval error, etc.)
         # must also roll back the dangling user message — the stream path deletes
         # on every error. Re-raise so the caller still surfaces the 500.
-        await s.delete_message(session_id, user_id, user_msg.id)
+        await s._delete_authorized(session, user_msg.id)
         raise
 
     # A JSON client receives the whole answer at once, so unlike the SSE path
@@ -2627,7 +2639,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # conventional "client closed request") so it can never be mistaken
         # for a completed turn.
         if await request.is_disconnected():
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await s._delete_authorized(session, user_msg.id)
             raise HTTPException(
                 status_code=499,
                 detail={"error": "Client disconnected", "detail": "The request was cancelled before the answer could be delivered."},
@@ -2852,7 +2864,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer, sources, prompt_tokens, completion_tokens, cost_usd, aborted=True
                 )
             else:
-                await s.delete_message(session_id, user_id, user_msg.id)
+                await s._delete_authorized(session, user_msg.id)
                 await finish_holds(cost_usd)
             return True
 
@@ -2881,7 +2893,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             if await _reply_is_stored(s, session_id, user_id, user_msg.id):
                 return
             if not streamed:
-                await s.delete_message(session_id, user_id, user_msg.id)
+                await s._delete_authorized(session, user_msg.id)
                 await finish_holds(charged_usd)
                 return
             # Deltas already sent: persist what the client is still showing.

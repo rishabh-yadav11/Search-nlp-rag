@@ -432,6 +432,50 @@ def test_one_turn_makes_fewer_round_trips_and_authorises_once(tmp_path, monkeypa
         _run(chat_store.close())
 
 
+def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monkeypatch):
+    """The rollback paths are the ones the happy-path counter cannot see.
+
+    Every way a turn can fail -- provider error, budget exceeded, budget
+    unavailable, client disconnect, and the SSE fail_turn -- rolled the user
+    message back through delete_message(), which re-ran the same
+    `id AND user_id` SELECT the turn had just passed. A failed turn is
+    precisely the turn worth making cheap: it is the one that must not also
+    hold the shared connection open for a redundant read. The turn has
+    already proved it owns the row by the time it is able to fail, so the
+    rollback is authorised by that same proof."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(question, history):
+            raise RuntimeError("the provider is on fire")
+
+        monkeypatch.setattr(chat_module, "_run_turn", boom)
+
+        counter = _RoundTripCounter(chat_store._db)
+        chat_store._db = counter
+
+        with pytest.raises(RuntimeError):
+            client.post(
+                f"/api/chat/sessions/{sid}/messages", headers=h,
+                json={"content": "Who invested in fintech?"},
+            )
+
+        # Asserted before the GET below, which is itself a session-authorising
+        # read and would otherwise be counted as part of the turn.
+        session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
+        assert len(session_selects) == 1, [e[1] for e in session_selects]
+
+        # And the rollback still happened: no dangling user message survives a
+        # failed turn. The authorisation was removed, not the cleanup.
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert detail["messages"] == []
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
 def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypatch):
     """#259 deleted three of the four `id AND user_id` SELECTs a turn made.
     The one survivor is the only thing keeping a user out of another user's
