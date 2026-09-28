@@ -66,9 +66,24 @@ ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
 SERVICE_USER_ID = "service-token"
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-# bcrypt silently truncates its input at 72 bytes; cap there so validation
-# matches what bcrypt actually hashes (otherwise two distinct long passwords
-# can collide on their shared 72-byte prefix).
+# bcrypt silently truncates its input at 72 bytes, so this is the width of the
+# credential that actually authenticates. Password validation judges the
+# minimum against it rather than the raw string, which is what makes the floor
+# mean anything (#334).
+#
+# This is NOT a cap on what a caller may submit. The policy deliberately has no
+# maximum, because refusing over-long values is what stopped bootstrap_admin --
+# the only path that can create an admin -- from seeding one (#290, #334).
+#
+# The accepted consequence is a prefix collision: once two passwords share a
+# 72-byte prefix, the bytes after it are not part of either credential, so the
+# shorter prefix authenticates the longer password. That is inherent to bcrypt's
+# truncation, not introduced here, and it was already true of every
+# bootstrap_admin-seeded admin on main. What changed is that a user may now
+# CHOOSE a password that has such a tail; _warn_truncated_password records it at
+# every set path. Removing the root cause means hashing a pre-image (SHA-256
+# before bcrypt) instead of truncating, which invalidates every stored hash and
+# so needs a migration of its own -- tracked separately, not smuggled in here.
 _BCRYPT_MAX_BYTES = 72
 
 

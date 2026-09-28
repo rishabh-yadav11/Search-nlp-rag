@@ -492,13 +492,33 @@ def test_all_three_set_paths_agree_on_one_policy():
         for stray in ("AUTH_PASSWORD_MIN_LEN", "_effective_password", "too long", "at least"):
             assert stray not in src, f"{name} restates a bound ({stray}); it must delegate only"
 
-
     boot = inspect.getsource(auth.bootstrap_admin)
     assert "_password_rejection(" in boot and "validate_password(" not in boot
     # and the raising form delegates rather than restating the rules
     vp = inspect.getsource(auth.validate_password)
     assert "_password_rejection(" in vp
     assert "too long" not in vp, "the raw 72-byte cap must not come back"
+
+
+def test_a_truncated_passwords_prefix_still_authenticates_it():
+    """The documented consequence of having no maximum, pinned so it is a known
+    property rather than a surprise (#334).
+
+    bcrypt truncates, so two passwords sharing a 72-byte prefix are the same
+    credential. This is why a user must be TOLD that a tail is being dropped
+    (``_warn_truncated_password``), and why the real fix is hashing a pre-image
+    instead of truncating. Pinning it here means a future change that alters the
+    truncation semantics has to confront this rather than change it silently.
+    """
+    long_pw = "Passphrase1234" + "a" * 89
+    prefix = long_pw[: auth._BCRYPT_MAX_BYTES]
+    stored = auth.hash_password(long_pw)
+    # the prefix is itself an acceptable password...
+    assert auth._password_rejection(prefix) is None
+    # ...and it authenticates the longer one. Inherent to bcrypt truncation.
+    assert auth.verify_password(prefix, stored)
+    # a difference INSIDE the window is still a different credential
+    assert not auth.verify_password("Z" + prefix[1:], stored)
 
 
 def test_minimum_is_judged_on_the_effective_credential_not_the_raw_string(monkeypatch):
