@@ -402,7 +402,11 @@ class Config:
     # remaining deterministic — a long query must not silently share a key
     # with a different long query, which is why the digest replaces the text
     # rather than the text being cut.
-    CACHE_KEY_QUERY_MAX_CHARS = int(os.getenv("CACHE_KEY_QUERY_MAX_CHARS", "128"))
+    # Clamped like every other operator-tunable bound (_clamped_int): a value
+    # of 0 here would digest EVERY key, and a huge one would hand the raw text
+    # back to Redis. The default, 128, leaves a normal query spelled out and
+    # only digests the genuinely long ones.
+    CACHE_KEY_QUERY_MAX_CHARS = _clamped_int("CACHE_KEY_QUERY_MAX_CHARS", 128, 8, 4096)
 
     # Ceiling on the query text the SHARED retrieval path hands to the
     # transformers (hybrid_search's dense/sparse encode, rerank's
@@ -417,7 +421,11 @@ class Config:
     # not a performance trade. The default therefore matches what chat already
     # accepts, which keeps the prompt and the retrieval query in agreement, and
     # still bounds every tokenizer against the megabyte input #241 reported.
-    RETRIEVAL_QUERY_MAX_CHARS = int(os.getenv("RETRIEVAL_QUERY_MAX_CHARS", "8000"))
+    # Clamped, not read raw: this is the one knob whose misconfiguration fails
+    # as a WRONG ANSWER rather than as wasted CPU. A 0 would slice every query
+    # to "" at all three clamp sites and silently empty every result set --
+    # clamped-and-warned to 64 instead, with the bad value named in the log.
+    RETRIEVAL_QUERY_MAX_CHARS = _clamped_int("RETRIEVAL_QUERY_MAX_CHARS", 8000, 64, 65536)
 
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch

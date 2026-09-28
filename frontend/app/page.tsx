@@ -87,13 +87,14 @@ function friendlyMessage(status: number, detail?: string): string {
   }
 }
 
-// Mirrors the backend's SEARCH_QUERY_MAX_CHARS DEFAULT. It is used only to
-// render a number for the user; the PREDICATE below keys on the backend's own
-// 422 body ("String should have at most 512 characters" on a loc naming `q`),
-// so the two cannot silently disagree about WHICH failure happened even if
-// the limit is retuned. The number itself can still go stale if an operator
-// raises the server bound, which is why the message is worded to stand on its
-// own rather than to be the authoritative statement of the limit.
+// Mirrors the backend's SEARCH_QUERY_MAX_CHARS DEFAULT, and is used in two
+// places: the input's maxLength below, and the number in the 422 message. The
+// PREDICATE keys on neither -- it reads the backend's own 422 body ("String
+// should have at most 512 characters" on a loc naming `q`), so the frontend
+// cannot silently disagree with the server about WHICH failure happened even
+// if the limit is retuned. The displayed number is display-only: it goes stale
+// if an operator raises the server bound, which is why maxLength stays a
+// courtesy and the server bound stays authoritative.
 const SEARCH_QUERY_MAX_CHARS = 512
 
 function isQueryTooLong(detail?: string): boolean {
@@ -344,7 +345,7 @@ export default function Page() {
             // cut off in the browser instead of coming back as a 422 the user
             // would only see as "Something went wrong". The server bound stays
             // authoritative — this is a courtesy, not the control.
-            maxLength={512}
+            maxLength={SEARCH_QUERY_MAX_CHARS}
             placeholder="e.g. fintech startups that raised Series A"
             aria-label="Search query"
             autoComplete="off"

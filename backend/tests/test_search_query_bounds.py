@@ -191,6 +191,17 @@ def test_search_rejects_an_over_long_query_and_names_the_limit(length):
     assert str(config.SEARCH_QUERY_MAX_CHARS) in body
     # The error must point at `q` itself, not some unrelated field.
     assert any("q" in loc for err in resp.json()["detail"] for loc in err["loc"])
+    # The wire contract the frontend's 422 classifier keys on: it decides
+    # "too long" from `type == "string_too_long"` AND `loc` naming `q`, so
+    # those two fields are pinned here. Without this, a change to the
+    # validation-error shape (or a pydantic rename) would not fail anything
+    # backend-side -- it would silently downgrade every over-long-query UI
+    # message to the generic "not valid" 422, which is what page.tsx's
+    # isQueryTooLong() cannot see.
+    assert any(
+        err.get("type") == "string_too_long" and "q" in err.get("loc", [])
+        for err in resp.json()["detail"]
+    ), resp.json()["detail"]
 
 
 def test_search_accepts_a_query_at_the_limit(monkeypatch):
