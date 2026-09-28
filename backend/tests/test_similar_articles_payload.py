@@ -8,20 +8,21 @@ an hour, and back out on every subsequent read. The search page renders one
 ``SimilarArticles`` per result, so a single top_k=8 search dragged >3MB per
 page view to display a title and a category.
 
-Measured against the real code path with bodies at ``BODY_CHAR_LIMIT``:
-``get_similar_articles`` puts the source article in ``must_not``, so Qdrant
-filters it server-side and returns ``limit*3 = 9`` *other* articles; nothing
-truncates to ``limit``. The search page renders one
-``<SimilarArticles limit={3}>`` per result, so a top_k=8 search fires 8
-requests and serializes 9 x 8 = 72 articles. That page view went from
-3,627,784 B to 26,920 B.
+``TestMeasuredPageViewPayload`` measures this on the production path rather
+than asserting a remembered figure: it drives the real ``main.get_similar``
+handler and sums ``model_dump_json()`` over the eight requests a top_k=8
+search page fires. ``get_similar_articles`` puts the source article in
+``must_not``, so Qdrant filters it server-side and returns ``limit*3 = 9``
+*other* articles; nothing truncates to ``limit`` afterwards. Eight requests
+therefore serialize 9 x 8 = 72 articles, and with bodies at
+``BODY_CHAR_LIMIT`` that page view measured **3,624,126 B -> 24,126 B**,
+a **~149x** reduction, against the ~3.6MB the issue reported.
 
-The before-figure is robust -- it is dominated by seventy-two 50k bodies, and
-two independent recomputes landed at 3,627,784 B and 3,644,296 B (0.5% apart),
-matching the ~3.6MB the issue reported. The after-figure scales with the
-synthetic title/summary text of the measuring fixture, so recomputes range
-from ~27 kB to ~44 kB, i.e. a **~84x to ~135x** reduction. Either way the
-3.6MB per page view is gone.
+The test enforces that number two ways rather than pinning it exactly: the
+page view must serialize under 100 kB, and under a tenth of the body bytes
+the store actually held. Both hold by two orders of magnitude, and both fail
+by roughly the same factor the moment ``body`` re-enters the response, so the
+figure cannot drift with the fixture's synthetic text.
 
 Nothing renders the body. ``SimilarArticles.tsx`` reads id/title/url/category,
 summary and published_date; the for-you card reads the same plus
@@ -342,3 +343,100 @@ class TestQdrantRequestIsNarrowed:
         for selector in selectors:
             assert selector is not WHOLE_PAYLOAD, "with_payload=True re-introduces the body transfer"
             assert "body" not in selector, f"body re-requested via {selector}"
+
+
+# What one top_k=8 search view costs the browser. The search page renders one
+# <SimilarArticles articleId={r.id} limit={3}> per result, so a top_k=8 page
+# fires eight authenticated /recommend/similar requests.
+RESULTS_PER_SEARCH = 8
+SIMILAR_LIMIT = 3
+# get_similar_articles asks Qdrant for limit*3 and the source article is in
+# must_not, so Qdrant filters it server-side: every request returns limit*3
+# *other* articles and nothing truncates down to `limit` afterwards.
+ARTICLES_PER_REQUEST = SIMILAR_LIMIT * 3
+
+
+class TestMeasuredPageViewPayload:
+    """Measure the bytes, on the production path, rather than asserting a figure.
+
+    Every other test here pins a contract (no body on the wire, no body in the
+    cache, the request is narrowed). This one measures the consequence: it drives
+    the real ``main.get_similar`` handler with Qdrant points whose bodies sit at
+    ``BODY_CHAR_LIMIT``, serializes each response through the real response
+    model, and adds up what a single top_k=8 page view actually puts on the
+    wire. Nothing is hand-written into the total -- if ``body`` reappears in
+    ``_format_articles`` the measured number rises by 72 x 50k characters and
+    both bounds below are blown.
+    """
+
+    def _page_view_bytes(self, monkeypatch):
+        cache = _RecordingCache()
+        monkeypatch.setattr(main, "cache", cache)
+
+        # One client serves all eight requests, as the real singleton does.
+        points = [
+            _point(SOURCE_ID + i, body=_body())
+            for i in range(RESULTS_PER_SEARCH + ARTICLES_PER_REQUEST)
+        ]
+        # Honour the two things the real Qdrant does that a hand-fed list does
+        # not: apply `limit` server-side, and drop the ids in `must_not`. Both
+        # decide how many articles a page view actually serializes, so a fake
+        # that ignores them would not be measuring the endpoint.
+        client = _qdrant(points)
+        real_query_points = client.query_points
+
+        async def query_points(**kwargs):
+            excluded = {
+                cond.match.value
+                for cond in (kwargs.get("query_filter").must_not if kwargs.get("query_filter") else [])
+            }
+            allowed = [p for p in points if p.id not in excluded]
+            response = await real_query_points(**kwargs)
+            response.points = allowed[: kwargs["limit"]]
+            return response
+
+        client.query_points = AsyncMock(side_effect=query_points)
+        monkeypatch.setattr(recommender, "state", {"qdrant": client})
+
+        total = 0
+        articles = 0
+        for i in range(RESULTS_PER_SEARCH):
+            # A different source article per result, exactly as the search page
+            # does -- which also means a different cache key, so each of the
+            # eight really does a fresh fetch rather than a cache hit.
+            response = _run(
+                main.get_similar(
+                    article_id=SOURCE_ID + i,
+                    limit=SIMILAR_LIMIT,
+                    same_category=False,
+                )
+            )
+            total += len(response.model_dump_json().encode())
+            articles += len(response.similar_articles)
+
+        return total, articles
+
+    def test_a_top_k_8_page_view_serializes_far_below_the_bodies_it_stores(self, wired, monkeypatch):
+        measured, articles = self._page_view_bytes(monkeypatch)
+
+        assert articles == RESULTS_PER_SEARCH * ARTICLES_PER_REQUEST, (
+            f"expected {RESULTS_PER_SEARCH * ARTICLES_PER_REQUEST} articles per page view, "
+            f"got {articles}; the measurement no longer models the endpoint"
+        )
+
+        # What the store held for those same articles. Pre-fix, every one of
+        # them was copied into the response, so this is the floor the old
+        # behaviour paid on its own.
+        stored_body_bytes = articles * config.BODY_CHAR_LIMIT
+
+        # A bound no pre-fix build could meet: 72 x 50k characters is ~3.6MB,
+        # the figure the issue reported. Display fields are a few hundred bytes
+        # each, so a body-free page view lands in the tens of kilobytes.
+        assert measured < 100_000, f"a top_k=8 page view serialized to {measured} B"
+
+        # And the reduction itself, against the real stored bodies rather than
+        # a re-spelled constant. Re-adding `body` to the formatter puts these
+        # bytes straight back into `measured` and fails this by ~10x.
+        assert measured < stored_body_bytes / 10, (
+            f"page view is {measured} B against {stored_body_bytes} B of stored bodies"
+        )
