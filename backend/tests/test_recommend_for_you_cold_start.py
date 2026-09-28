@@ -153,7 +153,10 @@ def test_cold_start_response_is_cached_under_the_authenticated_user_id(client, e
     body = second.json()
     assert body["cached"] is True
     assert body["user_id"] == USER
-    assert f"recommend:for-you:{USER}:5" in env.store, "precondition: the entry is cached"
+    # Built by the endpoint's own helper, not re-spelled here: the key carries a
+    # cache-version segment (#257), and repeating the format string is how the
+    # writer and the reader of this key drift apart while both stay green.
+    assert main._for_you_cache_key(USER, 5) in env.store, "precondition: the entry is cached"
 
 
 def test_response_is_never_attributed_to_anonymous(monkeypatch, client, env):
