@@ -1,6 +1,7 @@
 'use client'
 import { devApiBase, parseApiBaseUrl, readApiBaseEnv } from './api-base'
 import { isSafeRedirect } from './safe-url'
+import { createDeadline, LOGOUT_DEADLINE_MS, ME_DEADLINE_MS } from './deadline'
 
 export const TOKEN_KEY = 'vccircle_auth_token'
 
@@ -243,8 +244,13 @@ const ME_CACHE_TTL_MS = Number.isNaN(ME_CACHE_TTL_RAW) ? 60000 : ME_CACHE_TTL_RA
  *  response. On a network/transport failure the token is preserved (not
  *  cleared) so a later retry can recover — the fetch error is rethrown so
  *  callers can distinguish a transient network failure from a definitive
- *  "logged out" (null) and MUST NOT treat it as a logout. Never redirects. */
-export async function getMe(force = false): Promise<AuthUser | null> {
+ *  "logged out" (null) and MUST NOT treat it as a logout. Never redirects.
+ *
+ *  `signal` is an optional caller signal — the analytics dashboard passes its
+ *  load controller so abandoning the dashboard's own 10 s race really does
+ *  cancel the socket. Aborting it leaves `timedOut()` false, so it is never
+ *  reported as a backend timeout. */
+export async function getMe(force = false, signal?: AbortSignal | null): Promise<AuthUser | null> {
   const token = getToken()
   if (!token) {
     clearToken()
@@ -252,28 +258,60 @@ export async function getMe(force = false): Promise<AuthUser | null> {
   }
   const fresh = meCache !== undefined && meCacheToken === token && (ME_CACHE_TTL_MS <= 0 || Date.now() - meCacheTs < ME_CACHE_TTL_MS)
   if (!force && fresh) return meCache ?? null
-  let res: Response
+  // Deadline so a hung auth service actually cancels the request instead of
+  // leaking one in-flight `/api/auth/me` per poll tick. The dashboard races
+  // this with its own 10 s guard and abandons the promise, which never
+  // cancelled the underlying fetch; aborting here is what makes that safe.
+  //
+  // The deadline must stay armed across `res.json()` too, not just the header
+  // read: a response whose headers arrive but whose body never completes
+  // would otherwise hang forever with the timer already disarmed. So the whole
+  // exchange lives inside the try, and `clear()` happens once, in `finally`.
+  const deadline = createDeadline(ME_DEADLINE_MS, signal ?? null)
   try {
-    res = await fetch(`${API_BASE}/api/auth/me`, { headers: authHeaders() })
+    const res = await fetch(`${API_BASE}/api/auth/me`, {
+      headers: authHeaders(),
+      signal: deadline.signal,
+    })
+    if (res.status === 401) {
+      clearToken()
+      return null
+    }
+    if (!res.ok) return null
+    try {
+      meCache = (await res.json()) as AuthUser
+    } catch (err) {
+      // The body read is inside the deadline's scope, so an abort here is a
+      // cancellation or a timeout, NOT a malformed payload. Swallowing it
+      // would resolve `null` — this function's "definitive logged out"
+      // sentinel — and the outer classification below would never run, so a
+      // hung auth service would masquerade as a rejected token. This is the
+      // same guard `api()` in chat/page.tsx and the For You page apply to
+      // their own reads.
+      if (deadline.timedOut() || (err as Error)?.name === 'AbortError') throw err
+      // Genuine malformed/non-JSON 200: don't throw (callers may lack a
+      // .catch); treat as an unexpected payload and return null safely.
+      console.error('getMe: failed to parse /api/auth/me response')
+      return null
+    }
   } catch (err) {
     // Network/transport failure: do NOT treat as "not authenticated" (preserve
     // the token so a later retry can succeed). Rethrow rather than return null
     // so callers can tell this apart from a definitive 401/logged-out null.
-    console.error('getMe: failed to reach the auth service', err)
+    //
+    // A caller-initiated abort (the dashboard unmounting, or giving up on its
+    // 10 s identity race) is a cancellation, not a backend fault. Logging it as
+    // "failed to reach the auth service" would report a perfectly healthy auth
+    // service as down on every page teardown, so only real transport failures
+    // and real timeouts are logged.
+    if (!deadline.timedOut() && (err as Error)?.name !== 'AbortError') {
+      console.error('getMe: failed to reach the auth service', err)
+    } else if (deadline.timedOut()) {
+      console.error('getMe: /api/auth/me timed out', err)
+    }
     throw err
-  }
-  if (res.status === 401) {
-    clearToken()
-    return null
-  }
-  if (!res.ok) return null
-  try {
-    meCache = (await res.json()) as AuthUser
-  } catch {
-    // Malformed/non-JSON 200 response: don't throw (callers may lack a
-    // .catch); treat as an unexpected payload and return null safely.
-    console.error('getMe: failed to parse /api/auth/me response')
-    return null
+  } finally {
+    deadline.clear()
   }
   meCacheToken = token
   meCacheTs = Date.now()
@@ -297,9 +335,22 @@ export function clearMeCache(): void {
  * purpose: the local session is dropped whether or not the backend call
  * succeeds, so a network failure cannot leave the user stuck on an
  * authenticated page.
+ *
+ * Bounded like every other request here (#287): a backend that accepts the
+ * connection and never answers would otherwise hold the socket open forever,
+ * since the caller has already navigated away and nothing is left to release
+ * it. The bound only ever releases that socket — it never delays the
+ * redirect, and a failure is swallowed either way.
  */
 export function logout(): void {
-  fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
+  const deadline = createDeadline(LOGOUT_DEADLINE_MS)
+  fetch(`${API_BASE}/api/auth/logout`, {
+    method: 'POST',
+    headers: authHeaders(),
+    signal: deadline.signal,
+  })
+    .catch(() => {})
+    .finally(() => deadline.clear())
   redirectToLogin()
 }
 

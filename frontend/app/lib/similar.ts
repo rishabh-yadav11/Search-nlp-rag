@@ -1,4 +1,10 @@
 import { API_BASE, authHeaders } from './auth'
+import {
+  createDeadline,
+  RECOMMEND_DEADLINE_MS,
+  RequestTimeoutError,
+  type Deadline,
+} from './deadline'
 
 /**
  * Similar articles for one article, batched across every caller that asks in
@@ -216,9 +222,18 @@ async function send(waiters: Waiter[]): Promise<void> {
     if (open && open.length < MAX_BATCH_IDS) open.push(articleId)
     else chunks.push([articleId])
   }
-
+  // One deadline for the whole batch, armed here rather than in the card: the
+  // request is shared by every SimilarArticles in the view (that is the point
+  // of this module), so a backend that accepts the connection and never
+  // answers would otherwise pin all of them on "Loading..." forever. No
+  // caller signal is composed in — a single card unmounting must not take the
+  // rest of the view's request down with it — so a timeout is the only thing
+  // that can abort this.
+  const deadline = createDeadline(RECOMMEND_DEADLINE_MS)
   try {
-    const answers = await Promise.all(chunks.map((chunk) => fetchChunk(chunk, limit)))
+    const answers = await Promise.all(
+      chunks.map((chunk) => fetchChunk(chunk, limit, deadline))
+    )
     const byArticle = new Map<string, SimilarArticle[]>()
     for (const answer of answers) {
       for (const [articleId, list] of answer) byArticle.set(articleId, list)
@@ -239,7 +254,15 @@ async function send(waiters: Waiter[]): Promise<void> {
     // Drop the in-flight entry so a later mount retries rather than replaying
     // this failure from memory for the rest of the session.
     for (const waiter of waiters) inFlight.delete(cacheKey(waiter.articleId, waiter.limit))
-    for (const waiter of waiters) waiter.reject(error)
+    // Callers distinguish this from a transport failure, so a card can say the
+    // request ran out of time instead of surfacing an opaque AbortError.
+    for (const waiter of waiters) {
+      waiter.reject(
+        deadline.timedOut() ? new RequestTimeoutError(RECOMMEND_DEADLINE_MS) : error
+      )
+    }
+  } finally {
+    deadline.clear()
   }
 }
 
@@ -256,18 +279,19 @@ async function send(waiters: Waiter[]): Promise<void> {
  */
 async function fetchChunk(
   ids: number[],
-  limit: number
+  limit: number,
+  deadline: Deadline
 ): Promise<Map<string, SimilarArticle[]>> {
   try {
-    return await requestBatch(ids, limit)
+    return await requestBatch(ids, limit, deadline)
   } catch (error) {
     if (!(error instanceof BatchRequestError) || error.status !== 422 || ids.length < 2) {
       throw error
     }
     const middle = Math.ceil(ids.length / 2)
     const [head, tail] = await Promise.all([
-      fetchChunk(ids.slice(0, middle), limit),
-      fetchChunk(ids.slice(middle), limit),
+      fetchChunk(ids.slice(0, middle), limit, deadline),
+      fetchChunk(ids.slice(middle), limit, deadline),
     ])
     for (const [articleId, list] of tail) head.set(articleId, list)
     return head
@@ -276,12 +300,14 @@ async function fetchChunk(
 
 async function requestBatch(
   ids: number[],
-  limit: number
+  limit: number,
+  deadline: Deadline
 ): Promise<Map<string, SimilarArticle[]>> {
   const response = await fetch(`${API_BASE}/recommend/similar/batch`, {
     method: 'POST',
     headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
     body: JSON.stringify({ article_ids: ids, limit }),
+    signal: deadline.signal,
   })
   if (!response.ok) throw new BatchRequestError(response.status)
   const data = (await response.json()) as {
