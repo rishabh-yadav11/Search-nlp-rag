@@ -32,7 +32,7 @@ from app.config import config
 
 
 def main():
-    client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
     try:
         if "--prune-only" in sys.argv:
             removed = prune_backups(config.QDRANT_COLLECTION)

@@ -15,6 +15,26 @@ GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/search-nlp-rag}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/search-nlp-rag}"
+# nginx rate limit for the SSE chat stream only. The application already
+# limits /search, /facets, /analytics/click and /ready per IP
+# (public_rate_limit) and the auth endpoints (_check_rate_limit); adding a
+# second limiter on those would mean two layers emitting 429 with different
+# bodies and would make PUBLIC_*_RATE_PER_MIN / AUTH_*_RATE_PER_MIN
+# unreachable. The chat stream has no application-layer limit at all, so the
+# edge is the only place that can count it.
+NGINX_CHAT_LIMIT_RATE="${NGINX_CHAT_LIMIT_RATE:-10r/m}"
+NGINX_CHAT_LIMIT_BURST="${NGINX_CHAT_LIMIT_BURST:-10}"
+# pm2 is the process manager for both long-running services, so an unpinned
+# 'npm install -g pm2' means a new release can land on the box unattended and
+# change how processes are started, restarted and reported. The version is an
+# exact one, overridable so an operator can move it deliberately.
+PM2_VERSION="${PM2_VERSION:-7.0.4}"
+# The logrotate policy is host-specific: it names this machine's log
+# directories and the account logrotate must drop privileges to, and both are
+# wrong the instant the repo template is copied somewhere else. It is therefore
+# rendered per host by the logrotate stage rather than copied, and this is
+# where that render is installed.
+LOGROTATE_CONF="${LOGROTATE_CONF:-/etc/logrotate.d/vccircle}"
 CERTBOT_WEBROOT="${CERTBOT_WEBROOT:-/var/www/certbot}"
 LE_ROOT="${LE_ROOT:-/etc/letsencrypt}"
 LE_DOMAIN="${LE_DOMAIN:-}"
@@ -88,21 +108,47 @@ fi
 
 # pm2 process tuning. These MUST stay equal to the values in
 # ecosystem.config.js — backend/tests/test_deploy_config.py fails if the two
-# process definitions disagree, because `./setup.sh services` re-registers
-# pm2 from this file and would otherwise silently drop the OOM auto-restart
-# guard that ecosystem.config.js declares.
+# process definitions disagree. `./setup.sh services` starts pm2 from
+# ecosystem.config.js and EXPORTS these to it, rather than passing them as
+# `pm2 start` flags, so a default that differs here would produce a different
+# process on the same host depending on which path started it.
+#
+# min_uptime needs a precise statement because the obvious one is wrong. pm2 is
+# not missing the option by default: min_uptime defaults to 1000ms. At 1s, a
+# Next.js frontend that starts cleanly and then dies four seconds later -- a
+# port it cannot rebind after a half-dead previous process, a missing .next
+# build, an OOM on the first render -- has comfortably cleared the bar, so pm2
+# scores every one of those restarts as STABLE. Stable restarts never count
+# toward max_restarts and never trigger exp_backoff_restart_delay, so pm2
+# hot-loops the broken process forever, restarting it as fast as it can die, and
+# the only symptom is a log file that fills up. Raising the bar to 30s is what
+# reclassifies those restarts as unstable, which is the state pm2's backoff and
+# restart limit actually act on. 30s also has to be long enough to cover a cold
+# first render, or a healthy slow start would be treated as a crash.
+#
+# These are exported rather than passed as flags because pm2's CLI has no
+# `--min-uptime` in any released version; see the comment in run_services.
 API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"
 API_MAX_RESTARTS="${API_MAX_RESTARTS:-10}"
 FRONTEND_MAX_MEMORY="${FRONTEND_MAX_MEMORY:-1G}"
 RESTART_BACKOFF_MS="${RESTART_BACKOFF_MS:-100}"
+MIN_UPTIME_MS="${MIN_UPTIME_MS:-30000}"
 
 
-# Pinned docker images with digests for reproducibility. IMPORTANT: the Qdrant
-# version must be >= the version that wrote an existing collection (older
-# versions cannot deserialize newer storage formats). Current default matches
-# the deployment that created the live collection.
+# Pinned docker images by digest. IMPORTANT: the Qdrant version must be >= the
+# version that wrote an existing collection (older versions cannot deserialize
+# newer storage formats). Current default matches the deployment that created
+# the live collection.
+#
+# Both images are pinned by DIGEST, not merely tagged, and that is a
+# supply-chain control rather than a reproducibility nicety. A tag is a mutable
+# name: whoever controls the registry account can re-point the redis tag at a
+# different image tomorrow, and the next unattended `./setup.sh backend` pulls
+# it and runs it. The digest names one immutable OCI image index, so a
+# re-pushed tag no longer decides what runs. The redis digest is a multi-arch
+# index, so the same pin still resolves on an arm64 host as on amd64.
 QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc}"
-REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499}"
 
 VENV="$SCRIPT_DIR/backend/venv"
 VENV_PY="$VENV/bin/python"
@@ -127,15 +173,23 @@ stages (run in order):
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
   tls        get a Let's Encrypt cert (webroot) and add the :443 server
+  logrotate  render deploy/logrotate.conf for THIS host + install the policy
 
   all        deps backend index frontend services pm2-startup cron nginx
 
 env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
   API_MAX_MEMORY API_MAX_RESTARTS FRONTEND_MAX_MEMORY RESTART_BACKOFF_MS
+  MIN_UPTIME_MS
      pm2 process tuning; must match ecosystem.config.js (tests enforce it)
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
-  QDRANT_IMAGE REDIS_IMAGE   pinned docker image tags (defaults qdrant/qdrant:v1.19.0, redis:7-alpine)
+  QDRANT_IMAGE REDIS_IMAGE   docker images pinned by digest (defaults
+              qdrant/qdrant:v1.19.0@sha256:057ee3a8..., redis:7-alpine@sha256:858f009f...)
+  LOGROTATE_CONF   where the logrotate stage installs the rendered policy
+              (default /etc/logrotate.d/vccircle)
+  NGINX_CHAT_LIMIT_RATE NGINX_CHAT_LIMIT_BURST   nginx rate limit for the SSE
+              chat stream only (defaults 10r/m burst 10)
+  PM2_VERSION   exact pm2 version to install (default 7.0.4)
   ALLOW_UNSUPPORTED_PY   set to 1 to silence the python >= 3.13 warning
   NGINX_TLS   off | on | auto (default auto: on once LE_DOMAIN has a *usable*
               certificate: non-empty fullchain+privkey, not expired)
@@ -168,7 +222,43 @@ ensure_node() {
     ARCH="$(uname -m)"; [ "$ARCH" = "x86_64" ] && ARCH="x64"
     VER="$(curl -fsSL --max-time 20 https://nodejs.org/dist/index.json | python3 -c \
         "import sys,json; print(next(v['version'] for v in json.load(sys.stdin) if v.get('lts') and v['version'].startswith('v22.')))")"
-    curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/$VER/node-$VER-linux-$ARCH.tar.xz"
+    TARBALL="node-$VER-linux-$ARCH.tar.xz"
+    BASE="https://nodejs.org/dist/$VER"
+    # nodejs.org publishes SHASUMS256.txt alongside every release, listing the
+    # sha256 of each artifact in it. Downloading the tarball and extracting it
+    # without checking that file means a truncated download, a CDN serving the
+    # wrong bytes, or a tampered mirror all get installed into the Node that
+    # builds and runs the frontend. The expected digest is read from the
+    # published manifest rather than hardcoded here, so the check stays correct
+    # across the auto-discovered version above.
+    #
+    # Both the tarball and the manifest come from the same origin, so this
+    # verifies INTEGRITY -- the download arrived intact and is the artifact
+    # that was published -- not AUTHENTICITY. Closing that gap needs a
+    # signature or a hardcoded digest, which would freeze the version and defeat
+    # the deliberate LTS auto-discovery, so it is called out rather than faked.
+    if ! have sha256sum; then
+        echo "ERROR: sha256sum not found; refusing to install an unverified node." >&2
+        return 1
+    fi
+    curl -fsSL --max-time 20 -o /tmp/node.tar.xz "$BASE/$TARBALL"
+    curl -fsSL --max-time 20 -o /tmp/node-shasums.txt "$BASE/SHASUMS256.txt"
+    expected="$(awk -v f="$TARBALL" '$2 == f {print $1}' /tmp/node-shasums.txt)"
+    if [ -z "$expected" ]; then
+        echo "ERROR: $TARBALL is not listed in $BASE/SHASUMS256.txt" >&2
+        echo "       Nothing installed; refusing to run an unverified node." >&2
+        rm -f /tmp/node.tar.xz /tmp/node-shasums.txt
+        return 1
+    fi
+    if ! printf '%s  %s\n' "$expected" /tmp/node.tar.xz | sha256sum -c - >/dev/null 2>&1; then
+        echo "ERROR: checksum mismatch for $TARBALL" >&2
+        echo "       expected $expected" >&2
+        echo "       Nothing installed; remove /tmp/node.tar.xz and re-run." >&2
+        rm -f /tmp/node.tar.xz /tmp/node-shasums.txt
+        return 1
+    fi
+    rm -f /tmp/node-shasums.txt
+    echo "node $VER sha256 verified ($expected)"
     tar -xJf /tmp/node.tar.xz -C /tmp
     mkdir -p ~/.local/node ~/.local/bin
     rm -rf ~/.local/node/* && cp -r "/tmp/node-$VER-linux-$ARCH/"* ~/.local/node/
@@ -180,8 +270,13 @@ ensure_node() {
 
 ensure_pm2() {
     if ! have pm2; then
-        echo "installing pm2..."
-        npm install -g pm2 >/tmp/pm2-install.log 2>&1 || {
+        echo "installing pm2@$PM2_VERSION..."
+        # Pinned, because pm2 is what starts, restarts and supervises both
+        # services. An unpinned install pulls whatever is newest when the stage
+        # runs, so an unattended bootstrap can land a new major on a live box
+        # and change restart/backoff behaviour with no code change to point at.
+        # --no-audit/--no-fund only quieten the output.
+        npm install -g --no-audit --no-fund "pm2@$PM2_VERSION" >/tmp/pm2-install.log 2>&1 || {
             echo "pm2 install failed:" >&2; tail -3 /tmp/pm2-install.log >&2; return 1
         }
         local nbin
@@ -189,6 +284,18 @@ ensure_pm2() {
         mkdir -p ~/.local/bin
         ln -sf "$nbin/pm2" ~/.local/bin/pm2
         ln -sf "$nbin/pm2-dev" ~/.local/bin/pm2-dev
+    fi
+    # The install above is pinned, but `have pm2` short-circuits when pm2 is
+    # already on PATH, so on an upgraded host the pin alone does not make the
+    # running version match. Say so rather than letting the pin read as a
+    # guarantee it is not: this stage installs, it does not downgrade, because
+    # moving a live process manager under a running backend is an operator
+    # decision.
+    local installed
+    installed="$(pm2 -v 2>/dev/null || echo unknown)"
+    if [ "$installed" != "$PM2_VERSION" ]; then
+        echo "WARNING: pm2 $installed is installed but the pin is $PM2_VERSION." >&2
+        echo "         To move it: npm install -g pm2@$PM2_VERSION && ./setup.sh services" >&2
     fi
     if have pm2; then
         echo "pm2 $(pm2 -v) available"
@@ -236,23 +343,98 @@ container_binds_localhost() {
     fi
     return 0
 }
+# A random secret, generated from the OS CSPRNG. This is not a token anyone
+# sends over the network, so hex is fine and is the one encoding that survives
+# being pasted into a URL, a docker argv and a shell without quoting rules.
+random_secret() {
+    if have openssl; then
+        openssl rand -hex 32
+        return
+    fi
+    "$VENV_PY" -c 'import secrets; print(secrets.token_hex(32))'
+}
+
+# The data stores' credentials, resolved ONCE and then reused.
+#
+# Both are read from backend/.env first and only generated when absent, and
+# that ordering is the whole point. Regenerating either value on a re-run would
+# change the password the running container was started with, so the very next
+# request from the application would be rejected and the site would look broken
+# for a reason that is invisible from the outside. So the value that is already
+# in .env is the value that is used, and the container is only recreated when
+# what it is actually running disagrees with it.
+#
+# The container, not .env, is the thing that can be stale: a box that was
+# provisioned before this existed has an unauthenticated redis and qdrant
+# running, and their .env has no credential for them. Storing a generated
+# secret there is what lets the next step detect the gap and fix it.
+store_secrets() {
+    local redis_pass qdrant_key
+    redis_pass="$(env_value "$ENV_FILE" REDIS_PASSWORD)"
+    qdrant_key="$(env_value "$ENV_FILE" QDRANT_API_KEY)"
+    if [ -z "$redis_pass" ]; then
+        redis_pass="$(random_secret)"
+        echo "REDIS_PASSWORD=$redis_pass" >> "$ENV_FILE"
+        echo "generated REDIS_PASSWORD in $ENV_FILE"
+    fi
+    if [ -z "$qdrant_key" ]; then
+        qdrant_key="$(random_secret)"
+        echo "QDRANT_API_KEY=$qdrant_key" >> "$ENV_FILE"
+        echo "generated QDRANT_API_KEY in $ENV_FILE"
+    fi
+    REDIS_PASSWORD="$redis_pass"
+    QDRANT_API_KEY="$qdrant_key"
+}
 
 # Bound docker json-file logs so they can't fill the disk (20MB x 3 files each).
 DOCKER_LOG_OPTS="--log-driver json-file --log-opt max-size=20m --log-opt max-file=3"
 
+# Does the container's OWN configuration carry this exact string?
+#
+# Read from `docker inspect` (what the container was created with), not from
+# anything this script believes. It exists to answer one question on an upgraded
+# host: is the running container the one this .env describes? A box provisioned
+# before credentials existed has an unauthenticated redis/qdrant running, and
+# .env now carries a password for it. Without this check the container looks
+# healthy, is left alone, and the application then fails every request with
+# NOAUTH because it is now correctly sending a password the server never asked
+# for. The reverse case matters too: a password edited in .env must not be
+# silently ignored either, and the same check catches that.
+#
+# Cmd and Env are both searched because the two containers express auth
+# differently: redis takes a command flag, qdrant an environment variable.
+container_config_has() {
+    docker inspect -f '{{.Config.Cmd}}{{.Config.Env}}' "$1" 2>/dev/null | grep -qF -- "$2"
+}
+
 rebind_container_ports() {
-    local name="$1" image="$2" ports="$3" volume="$4"
+    local name="$1" image="$2" ports="$3" volume="$4" envargs="$5" cmd="$6"
     echo "container '$name' exists with non-localhost port bindings; recreating bound to 127.0.0.1..."
     docker stop "$name" >/dev/null 2>&1 || true
     docker rm "$name" >/dev/null 2>&1 || true
     echo "pulling + starting '$name'..."
-    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $DOCKER_LOG_OPTS "$image"
+    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $envargs $DOCKER_LOG_OPTS "$image" $cmd
     echo "container '$name' recreated (bound to 127.0.0.1 only)"
 }
 
+# ensure_docker_container <name> <image> <ports> <volume> <envargs> <cmd> <auth-needle>
+#
+# envargs/cmd are the credential plumbing (empty for a container that needs
+# none) and auth-needle is the string whose presence in the existing container
+# proves its auth settings already match this run -- empty disables the check
+# for a container that has no credentials to drift on.
 ensure_docker_container() {
-    local name="$1" image="$2" ports="$3" volume="$4"
+    local name="$1" image="$2" ports="$3" volume="$4" envargs="$5" cmd="$6" needle="$7"
     if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+        if [ -n "$needle" ] && ! container_config_has "$name" "$needle"; then
+            echo "container '$name' is running with different credentials than this .env; recreating..."
+            docker stop "$name" >/dev/null 2>&1 || true
+            docker rm "$name" >/dev/null 2>&1 || true
+            echo "pulling + starting '$name'..."
+            docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $envargs $DOCKER_LOG_OPTS "$image" $cmd
+            echo "container '$name' recreated with the configured credentials"
+            return
+        fi
         if container_binds_localhost "$name"; then
             if [ "$(docker inspect -f '{{.State.Running}}' "$name")" = "true" ]; then
                 echo "container '$name' already running (bound to 127.0.0.1)"
@@ -262,13 +444,14 @@ ensure_docker_container() {
             docker start "$name"
             return
         fi
-        rebind_container_ports "$name" "$image" "$ports" "$volume"
+        rebind_container_ports "$name" "$image" "$ports" "$volume" "$envargs" "$cmd"
         return
     fi
     echo "pulling + starting '$name'..."
-    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $DOCKER_LOG_OPTS "$image"
+    docker run -d --name "$name" -p "$ports" --restart unless-stopped $volume $envargs $DOCKER_LOG_OPTS "$image" $cmd
     echo "container '$name' started (bound to 127.0.0.1 only)"
 }
+
 
 wait_http() {
     local url="$1" tries="${2:-30}"
@@ -282,6 +465,88 @@ wait_http() {
     return 1
 }
 
+# One KEY from a KEY=VALUE .env file, with the optional surrounding quotes an
+# operator may have used and a trailing CR stripped. Prints nothing when the
+# key is absent, which is the caller's signal to fall back to the application's
+# own default. Last match wins, matching how python-dotenv resolves a repeated
+# key.
+env_value() {
+    local file="$1" key="$2" line value
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+    line="$(grep -E "^${key}=" "$file" | tail -n 1 || true)"
+    if [ -z "$line" ]; then
+        return 0
+    fi
+    value="${line#*=}"
+    value="${value%$'\r'}"
+    case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+# Secrets and user data at rest, tightened. backend/.env carries the JWT secret
+# and the database credentials, and the two SQLite files carry every account and
+# every chat message the site holds; both are world-readable by default, so any
+# local account -- or any process running as another user on the same box --
+# can read them. The backups directory gets 700 for the same reason: it holds
+# copies of exactly those two files.
+#
+# The database paths are read out of .env rather than hard-coded because the
+# application honours the same overrides (config.py reads CHAT_DB_PATH and
+# AUTH_DB_PATH through load_dotenv) and resolves a relative one against the
+# backend working directory. Hard-coding data/chat.db here would silently
+# skip a host that moved its databases, which is the one host whose databases
+# most need tightening.
+#
+# Called from BOTH ends of the lifecycle on purpose. run_backend is where .env
+# is created or migrated, so that is the only place the file is guaranteed to
+# exist afterwards; run_services is where a database that was already on disk
+# before this change existed gets tightened on an upgraded host, since ./setup.sh
+# services never re-runs the backend stage. One call would leave one of the two
+# upgrade paths unprotected.
+harden_permissions() {
+    local root="${1:-$SCRIPT_DIR}"
+    local backend="$root/backend"
+    local env_file="$backend/.env"
+    local backups="$backend/backups"
+    local chat auth db
+
+    chat="$(env_value "$env_file" CHAT_DB_PATH)"
+    auth="$(env_value "$env_file" AUTH_DB_PATH)"
+    chat="${chat:-data/chat.db}"
+    auth="${auth:-data/auth.db}"
+    case "$chat" in /*) ;; *) chat="$backend/$chat" ;; esac
+    case "$auth" in /*) ;; *) auth="$backend/$auth" ;; esac
+
+    if [ -f "$env_file" ]; then
+        chmod 600 "$env_file"
+        echo "chmod 600 $env_file"
+    else
+        echo "skip (no .env yet): $env_file"
+    fi
+
+    for db in "$chat" "$auth"; do
+        # A database that does not exist is not an error. A fresh install has
+        # not served a request, and the first request is what creates the file;
+        # failing here would make the bootstrap fail on the host that most needs
+        # it to succeed. The next stage, or the next boot, catches it.
+        if [ -f "$db" ]; then
+            chmod 600 "$db"
+            echo "chmod 600 $db"
+        else
+            echo "skip (not created yet): $db"
+        fi
+    done
+
+    mkdir -p "$backups"
+    chmod 700 "$backups"
+    echo "chmod 700 $backups"
+}
+
 run_deps() {
     stage "deps"
     ensure_node
@@ -291,25 +556,74 @@ run_backend() {
     stage "backend"
     check_python python3
     docker_up
-    ensure_docker_container qdrant "$QDRANT_IMAGE" \
-        "127.0.0.1:$QDRANT_PORT:6333" "-v $SCRIPT_DIR/qdrant_data:/qdrant/storage"
-    ensure_docker_container redis "$REDIS_IMAGE" "127.0.0.1:$REDIS_PORT:6379" ""
-    wait_http "http://localhost:$QDRANT_PORT/healthz"
 
-    if [ ! -x "$VENV_PY" ]; then
-        echo "creating venv..."
-        python3 -m venv "$VENV"
-    fi
-    "$VENV_PY" -m pip install -q --upgrade pip
-    "$VENV_PY" -m pip install -q -r backend/requirements.txt
-
+    # .env first, then the venv, then the secrets, then the containers.
+    #
+    # The order is load-bearing and each step depends on the one before it.
+    # The containers need the credentials to be started AT ALL, so they cannot
+    # come first. The credentials go in .env and are generated with the
+    # interpreter (openssl is not guaranteed on a minimal host), so the venv has
+    # to exist before they are generated. And .env has to exist before either,
+    # since store_secrets reads what is already there and only generates when
+    # the key is absent -- that read is what keeps a re-run from rotating the
+    # password out from under a running container.
     if [ ! -f "$ENV_FILE" ]; then
         echo "creating backend/.env from example (fill in credentials!)"
         cp backend/.env.example "$ENV_FILE"
     fi
-    if ! grep -q '^REDIS_URL=' "$ENV_FILE"; then
-        echo "REDIS_URL=redis://localhost:$REDIS_PORT/0" >> "$ENV_FILE"
+    if [ ! -x "$VENV_PY" ]; then
+        echo "creating venv..."
+        python3 -m venv "$VENV"
     fi
+    store_secrets
+    # The secrets are in the file now, so it stops being world-readable
+    # immediately rather than at the end of the stage.
+    chmod 600 "$ENV_FILE"
+
+    # qdrant takes its API key as an environment variable; redis takes its
+    # password as a command flag, which is why these two differ in shape. The
+    # needle passed to each is the literal the container must already be
+    # carrying, so a container started before credentials existed is detected
+    # and recreated instead of being left in a state where the application
+    # sends a password the server never asked for.
+    ensure_docker_container qdrant "$QDRANT_IMAGE" \
+        "127.0.0.1:$QDRANT_PORT:6333" "-v $SCRIPT_DIR/qdrant_data:/qdrant/storage" \
+        "-e QDRANT__SERVICE__API_KEY=$QDRANT_API_KEY" "" \
+        "QDRANT__SERVICE__API_KEY=$QDRANT_API_KEY"
+    ensure_docker_container redis "$REDIS_IMAGE" "127.0.0.1:$REDIS_PORT:6379" "" "" \
+        "redis-server --requirepass $REDIS_PASSWORD" \
+        "--requirepass $REDIS_PASSWORD"
+    # The qdrant healthz endpoint is unauthenticated by design, so this probe
+    # still works with the key set.
+    wait_http "http://localhost:$QDRANT_PORT/healthz"
+
+    "$VENV_PY" -m pip install -q --upgrade pip
+    "$VENV_PY" -m pip install -q -r backend/requirements.txt
+
+    # The password is carried IN the URL rather than beside it, because every
+    # redis client in the app (cache, rate limiter, analytics, cost budget,
+    # health, profiles) is built from config.REDIS_URL and none of them take a
+    # separate password argument. Putting it in the URL is the single place that
+    # makes all six authenticate, and redis-py parses the userinfo segment
+    # natively. A URL that already carries credentials is left alone, so an
+    # operator's hand-written password is never overwritten by the generated
+    # one.
+    if ! grep -qE '^REDIS_URL=redis://[^/@]*@' "$ENV_FILE"; then
+        if grep -q '^REDIS_URL=' "$ENV_FILE"; then
+            # Rewrite the existing line in place: it has no credentials, so it
+            # cannot be one the operator chose deliberately. sed -i keeps the
+            # line where it is instead of appending a second REDIS_URL that
+            # python-dotenv would resolve to whichever it read last.
+            local escaped="$REDIS_PASSWORD"
+            escaped="${escaped//\//\\/}"
+            escaped="${escaped//&/\\&}"
+            sed -i -E "s#^REDIS_URL=(.*)\$#REDIS_URL=redis://:${escaped}@\\1#" "$ENV_FILE"
+            echo "REDIS_URL now carries the redis password"
+        else
+            echo "REDIS_URL=redis://:$REDIS_PASSWORD@localhost:$REDIS_PORT/0" >> "$ENV_FILE"
+        fi
+    fi
+
     # Per-IP rate limiting keys on the client IP, which behind nginx comes from
     # X-Forwarded-For. An .env that predates the per-IP public rate limits has
     # no trust setting at all, so every proxied request keys on the nginx peer
@@ -337,6 +651,7 @@ run_backend() {
         echo "         proxy runs on another host." >&2
     fi
     echo "backend ready"
+    harden_permissions
 }
 
 run_index() {
@@ -400,27 +715,44 @@ report_readiness_reason() {
 run_services() {
     stage "services"
     mkdir -p "$LOGS" "$PID_DIR"
+    harden_permissions
     ensure_pm2
     pm2 delete vccircle-backend >/dev/null 2>&1 || true
     pm2 delete vccircle-frontend >/dev/null 2>&1 || true
     sleep 2
 
-    (cd backend && pm2 start "$VENV_PY" \
-        --name vccircle-backend \
-        --max-memory-restart "$API_MAX_MEMORY" \
-        --max-restarts "$API_MAX_RESTARTS" \
-        --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
-        -- -m gunicorn \
-        -k uvicorn.workers.UvicornWorker \
-        --workers "$GUNICORN_WORKERS" --bind "127.0.0.1:$API_PORT" \
-        --timeout 120 app.main:app)
-    (cd frontend && pm2 start "$SCRIPT_DIR/frontend/node_modules/.bin/next" \
-        --name vccircle-frontend \
-        --max-memory-restart "$FRONTEND_MAX_MEMORY" \
-        --max-restarts "$API_MAX_RESTARTS" \
-        --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
-        -- start -H 127.0.0.1 -p "$NEXT_PORT")
+    # Start from ecosystem.config.js, which is the single definition of these two
+    # processes, rather than from inline `pm2 start` lines.
+    #
+    # The reason is min_uptime, and it is not a preference. pm2's CLI has no
+    # `--min-uptime` flag in ANY released version -- 4.x, 5.x, 6.x and 7.x all
+    # print "error: unknown option `--min-uptime'" and exit 1 -- while
+    # `min_uptime` in an ecosystem file IS honoured at runtime (pm2 reads it in
+    # lib/God.js when deciding whether a restart was stable). An inline start
+    # cannot express the option at all, and because this script runs under
+    # `set -e`, passing the flag would abort the services stage and leave the box
+    # with neither service running. Verified against 4.5.0, 5.4.3, 6.0.14 and
+    # 7.0.4 for the rejection, and against 7.0.4 for the ecosystem route storing
+    # the value.
+    #
+    # Every knob setup.sh has always accepted is exported rather than left to
+    # chance, so the overrides keep working on the path that actually starts the
+    # services. ecosystem.config.js falls back to the same defaults when a
+    # variable is absent, so a bare `pm2 start ecosystem.config.js` produces the
+    # same two processes.
+    (cd "$SCRIPT_DIR" && \
+        VCCIRCLE_ROOT="$SCRIPT_DIR" \
+        GUNICORN_WORKERS="$GUNICORN_WORKERS" \
+        API_PORT="$API_PORT" \
+        NEXT_PORT="$NEXT_PORT" \
+        MIN_UPTIME_MS="$MIN_UPTIME_MS" \
+        API_MAX_MEMORY="$API_MAX_MEMORY" \
+        FRONTEND_MAX_MEMORY="$FRONTEND_MAX_MEMORY" \
+        API_MAX_RESTARTS="$API_MAX_RESTARTS" \
+        RESTART_BACKOFF_MS="$RESTART_BACKOFF_MS" \
+        pm2 start ecosystem.config.js)
     pm2 save >/dev/null 2>&1
+    wait_http "http://localhost:$API_PORT/health"
     wait_http "http://localhost:$NEXT_PORT/"
 
     # Readiness, not liveness (#279): /health is a stub that answers 200 with a
@@ -576,6 +908,92 @@ run_cron() {
     rm -f "$tmp"
     echo "cron installed: */15 * * * * update_index.py"
     echo "cron installed: */5  * * * * healthcheck.sh"
+}
+
+# The logrotate policy is machine-specific: it names this host's log
+# directories and the account logrotate has to drop privileges to, and neither is
+# knowable when the file is written. deploy/logrotate.conf is therefore a
+# TEMPLATE carrying the placeholder paths, and this renders it for the host it
+# runs on, which is what makes the installed policy correct on any host instead
+# of only on the one the paths were written for.
+#
+# The three rewrites are anchored to the whole line, and that is the safety
+# argument rather than a style preference. A free-floating substitution would
+# happily "rewrite" a line that had been edited into something else and leave a
+# half-correct policy installed, which is worse than no rotation at all because
+# the operator has no reason to look again. So the patterns match the exact
+# lines, and the guard inside the renderer asserts that the TEMPLATE still
+# contains each of the three values those patterns match on: if one is gone,
+# nothing was rewritten, and refusing to emit is the only safe answer.
+#
+# The third rewrite also UNCOMMENTS the `su` directive. It ships commented out
+# (backend/tests/test_deploy_paths.py fails a shipped deploy file that carries an
+# active `su` pinning one account, because that file is copied by hand as well as
+# rendered), but an installed policy that names no account runs every rotation as
+# root, so the renderer activates it with the account that invoked setup.sh.
+LOGROTATE_TEMPLATE="$SCRIPT_DIR/deploy/logrotate.conf"
+
+render_logrotate_conf() {
+    local rendered user group
+    if [ ! -f "$LOGROTATE_TEMPLATE" ]; then
+        echo "ERROR: logrotate template not found: $LOGROTATE_TEMPLATE" >&2
+        return 1
+    fi
+    user="$(id -un)"
+    group="$(id -gn)"
+    if ! rendered="$(sed \
+        -e "s#^/path/to/search-nlp-rag/logs/\\*\\.log#$LOGS/*.log#" \
+        -e "s#^/path/to/\\.pm2/logs/\\*\\.log#$HOME/.pm2/logs/*.log#" \
+        -e "s|^\( *\)# su deploy-user deploy-group\$|\1su $user $group|" \
+        "$LOGROTATE_TEMPLATE")"; then
+        echo "ERROR: could not read $LOGROTATE_TEMPLATE" >&2
+        return 1
+    fi
+    # The guard is on the TEMPLATE, never on the output. The reason is the same
+    # one the rewrites are anchored to: what can actually go wrong is the
+    # template drifting away from the three values the rewrites above match on.
+    # If a value is gone, no line was rewritten, and a half-substituted policy
+    # would be installed that rotates nothing while logrotate reports success.
+    local expected
+    for expected in \
+        '/path/to/search-nlp-rag/logs/*.log' \
+        '/path/to/.pm2/logs/*.log' \
+        'su deploy-user deploy-group'
+    do
+        if ! grep -qF -- "$expected" "$LOGROTATE_TEMPLATE"; then
+            echo "ERROR: $LOGROTATE_TEMPLATE no longer contains" >&2
+            echo "         $expected" >&2
+            echo "       which render_logrotate_conf rewrites. Nothing installed;" >&2
+            echo "       update the template and the renderer together." >&2
+            return 1
+        fi
+    done
+    printf '%s\n' "$rendered"
+}
+
+run_logrotate() {
+    stage "logrotate"
+    if ! have logrotate; then
+        echo "ERROR: logrotate is not installed (e.g. apt install logrotate)." >&2
+        echo "       Nothing installed; logs will grow unrotated." >&2
+        return 1
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    # Both exit paths remove the temp file: the render can fail, and a failed
+    # render must not leave a copy of the policy lying in /tmp.
+    trap 'rm -f "$tmp"' RETURN
+    if ! render_logrotate_conf > "$tmp"; then
+        echo "ERROR: could not render the logrotate policy; nothing installed." >&2
+        return 1
+    fi
+    # The source operand is the rendered file. install takes SOURCE DEST, so
+    # this is what actually creates $LOGROTATE_CONF.
+    sudo install -m 644 "$tmp" "$LOGROTATE_CONF"
+    rm -f "$tmp"
+    trap - RETURN
+    echo "logrotate installed: $LOGROTATE_CONF (mode 644, root)"
+    echo "inspect it with: sudo logrotate -d $LOGROTATE_CONF"
 }
 
 nginx_server_name() {
@@ -737,6 +1155,46 @@ nginx_locations() {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
+    # The SSE chat stream, and only the SSE chat stream.
+    #
+    # This is the one expensive path with no application-layer limit: an open
+    # stream holds a gunicorn worker and a client connection for up to 300s,
+    # and nothing anywhere counts those. /search, /facets, /analytics/click and
+    # /ready are already limited inside the application (public_rate_limit) and
+    # the auth endpoints by _check_rate_limit, so a limiter on them here would
+    # mean two layers emitting 429 with different bodies, and would make
+    # PUBLIC_*_RATE_PER_MIN / AUTH_*_RATE_PER_MIN unreachable knobs.
+    #
+    # Keyed on \$binary_remote_addr because this is the edge: nginx is the only
+    # layer that still has the real client address, and the application's own
+    # limiter has to trust X-Forwarded-For to recover it.
+    #
+    # nodelay, because a burst here is a client starting a few streams at once
+    # (regenerate, retry) rather than a flood. Without it nginx holds the burst
+    # in a queue and releases it later, which delays exactly the requests that
+    # are legitimate, while still leaving the worker pool pinned for as long as
+    # the streams run.
+    #
+    # limit_req_status 429 rather than nginx's default 503: 429 is what the
+    # application limiter already returns, so a client sees one status for "you
+    # are going too fast" no matter which layer said it.
+    #
+    # proxy_read_timeout 300s is not optional -- the stream IS a 300s SSE
+    # response, and nginx's 60s default would cut every single one of them
+    # open, which breaks chat outright rather than merely failing to rate limit.
+    #
+    # "^~" so this prefix wins over the "location /api" below, which is the
+    # longest matching prefix for the same requests and would otherwise be used.
+    location ^~ /api/chat/ {
+        limit_req zone=vccircle_chat_stream burst=$NGINX_CHAT_LIMIT_BURST nodelay;
+        limit_req_status 429;
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_read_timeout 300s;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
     location /api {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_read_timeout 300s;
@@ -782,6 +1240,20 @@ render_nginx_config() {
         # validates over plain HTTP, so redirecting it away would break renewal.
         # certbot's webroot plugin reads the token from CERTBOT_WEBROOT, which
         # must therefore be PUBLIC_PORT-reachable.
+        # limit_req_zone is http-scope: it is declared once, outside every
+        # server block, and this file is included from inside nginx's http block
+        # (sites-enabled/*), so top level HERE is http scope. Declaring it per
+        # server would give the plain-HTTP and TLS servers two independent
+        # buckets, so a client could double its rate by switching schemes.
+        #
+        # It covers the chat stream only, for the reason spelled out on the
+        # location below: every other rate-limited route is already limited
+        # inside the application, and a second limiter there would shadow those
+        # knobs.
+        cat <<NGINX
+limit_req_zone \$binary_remote_addr zone=vccircle_chat_stream:10m rate=$NGINX_CHAT_LIMIT_RATE;
+
+NGINX
         cat <<NGINX
 server {
     listen $PUBLIC_PORT;
@@ -1098,7 +1570,7 @@ main() {
         case "$1" in
             all) ALL=1 ;;
             -h|--help) usage; return 0 ;;
-            deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx|tls) STAGES+=("$1") ;;
+            deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx|tls|logrotate) STAGES+=("$1") ;;
             *) echo "unknown stage: $1"; usage; return 1 ;;
         esac
         shift
@@ -1107,6 +1579,11 @@ main() {
     if [ "$ALL" -eq 1 ]; then
         # tls is deliberately not part of "all": it needs a domain, an email and
         # network access that an unattended bootstrap must not require.
+        # logrotate is deliberately not part of "all" either: it needs the
+        # logrotate binary, and a host that does not have it installed (a
+        # container, a fresh CI box) must still be able to run the full
+        # bootstrap. Unattended rotation is also the wrong default -- the
+        # policy is host-specific, so it is an operator step, run once.
         STAGES=(deps backend index frontend services pm2-startup cron nginx)
     fi
     if [ ${#STAGES[@]} -eq 0 ]; then
@@ -1128,6 +1605,7 @@ main() {
             cron) run_cron ;;
             nginx) run_nginx ;;
             tls) run_tls ;;
+            logrotate) run_logrotate ;;
         esac
     done
 

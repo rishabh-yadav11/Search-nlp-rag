@@ -62,6 +62,9 @@ from app.lexical import jaccard
 CHAT_BASE = os.getenv("EVAL_CHAT_BASE", "http://localhost:8001/api/chat")
 SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+# None when the store runs unauthenticated; the same rule config.py applies, so
+# an empty env var does not turn into an empty api-key header.
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "vccircle_articles")
 RESULTS_DIR = os.getenv("EVAL_RESULTS_DIR", "eval_results")
 DEFAULT_INPUT = "prompts_with_variations_flat.json"
@@ -502,7 +505,7 @@ def run_eval(
         "orphan_session_risk": 0,
     }
     store = ResultStore(os.path.join(RESULTS_DIR, f"{run_id}.json"), meta)
-    qdrant = QdrantClient(url=QDRANT_URL, timeout=30)
+    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
     index = start
     resume_at = start
     interrupted = False

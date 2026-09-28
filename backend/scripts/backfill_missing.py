@@ -54,7 +54,7 @@ async def fetch_records() -> dict[int, dict]:
 def qdrant_ids() -> set[int]:
     from qdrant_client import QdrantClient
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
     try:
         ids: set[int] = set()
         offset = None
@@ -76,7 +76,7 @@ def backfill(records: dict[int, dict], missing: list[int]):
     from qdrant_client import QdrantClient
     from sentence_transformers import SentenceTransformer
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     model = SentenceTransformer(config.EMBED_MODEL, device=config.EMBED_DEVICE)
     sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
     batch_size = config.EMBED_BATCH_SIZE

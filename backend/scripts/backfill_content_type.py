@@ -100,7 +100,7 @@ def main():
         log("ERROR: MYSQL_PASSWORD not set; refusing to run (would fetch nothing)")
         return 1
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     try:
         # A stored field is not filterable until it is indexed, and a collection
         # built before this field existed has no index for it. Creating the

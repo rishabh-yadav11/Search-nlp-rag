@@ -216,7 +216,7 @@ def main() -> None:
         from fastembed import SparseTextEmbedding
 
         sparse_m = SparseTextEmbedding(config.SPARSE_MODEL)
-        client = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
+        client = AsyncQdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
         try:
             groups = []
             for q in QUERIES:

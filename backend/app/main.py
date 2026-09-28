@@ -307,7 +307,7 @@ async def lifespan(app: FastAPI):
     state["model"] = DenseEncoder(config.EMBED_MODEL, config.EMBED_DEVICE, config.TORCH_THREADS)
     state["sparse_model"] = SparseTextEmbedding(config.SPARSE_MODEL)
     state["reranker"] = Reranker(config.RERANK_MODEL, backend=config.RERANK_BACKEND)
-    state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, timeout=30)
+    state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
     await _load_facet_maps()
     # Names the real cause (missing / placeholder / malformed GEMINI_API_KEY) in
     # the log at boot, without taking the process down with it (#279).

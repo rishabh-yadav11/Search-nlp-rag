@@ -66,7 +66,7 @@ def main():
         log("ERROR: MYSQL_PASSWORD not set; refusing to run (would fetch nothing)")
         return 1
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     try:
         records = asyncio.run(fetch_records())
         log(f"fetched {len(records)} MySQL rows for id->summary mapping")

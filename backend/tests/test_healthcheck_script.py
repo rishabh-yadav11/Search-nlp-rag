@@ -21,8 +21,11 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy/healthcheck.sh"
 
-# Both doubles live in $HOME/.local/bin, which the script puts first on PATH
-# precisely because cron has a minimal one.
+# Both doubles live in $HOME/.local/bin -- the location cron would have them in,
+# and the one the script APPENDS to PATH so cron can still find pm2. Appended,
+# not prepended: a PATH the caller set up deliberately stays in charge, so these
+# stubs are put at the FRONT of the PATH handed to the script below rather than
+# relying on the script to promote them.
 CURL_STUB = """\
 #!/usr/bin/env bash
 url="${@: -1}"
@@ -42,7 +45,12 @@ case "$url" in
     if [ -f "$RESTARTED_MARKER" ]; then code="$HEALTH_AFTER_RESTART"; else code="$HEALTH_CODE"; fi
     ;;
 */ready/deep) code="$READY_CODE" ;;
-*) code="000" ;;
+    # The frontend has no health endpoint: it is probed at `/` leniently, and
+    # any status that came back over the wire means the listener is up. 200 is
+    # what a live Next.js answers, and a test that cares about the frontend says
+    # so with frontend=; the default keeps every backend-only test describing a
+    # host whose frontend is also fine.
+    *) code="$FRONTEND_CODE" ;;
 esac
 printf '%s' "$code"
 # -f semantics: a non-2xx answer is an error for the caller, even though the
@@ -94,6 +102,8 @@ def run_watchdog(
     state_file=None,
     cooldown="3600",
     webhook_fails="",
+    frontend="200",
+    frontend_after_restart=None,
 ):
     _RUN_COUNTER[0] += 1
     home = tmp_path / f"run{_RUN_COUNTER[0]}" / "home"
@@ -110,10 +120,16 @@ def run_watchdog(
     marker = tmp_path / "restarted"
     env = {
         **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(home),
         "BASE": "http://localhost:8001",
         "LOG": str(log),
         "CURL_LOG": str(curl_log),
+        "FRONTEND_BASE": "http://localhost:3000",
+        "FRONTEND_CODE": str(frontend),
+        "FRONTEND_CODE_AFTER_RESTART": str(
+            frontend if frontend_after_restart is None else frontend_after_restart
+        ),
         "PM2_LOG": str(pm2_log),
         "RESTARTED_MARKER": str(marker),
         "HEALTH_CODE": str(health),
