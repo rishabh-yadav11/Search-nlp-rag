@@ -419,7 +419,7 @@ run_services() {
         --max-memory-restart "$FRONTEND_MAX_MEMORY" \
         --max-restarts "$API_MAX_RESTARTS" \
         --exp-backoff-restart-delay "$RESTART_BACKOFF_MS" \
-        -- start -p "$NEXT_PORT")
+        -- start -H 127.0.0.1 -p "$NEXT_PORT")
     pm2 save >/dev/null 2>&1
     wait_http "http://localhost:$NEXT_PORT/"
 
