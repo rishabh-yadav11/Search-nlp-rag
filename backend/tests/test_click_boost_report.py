@@ -266,8 +266,8 @@ def test_a_scan_that_finds_only_empty_tallies_is_called_unmeasured(store):
         (7, {"1": 1, "2": 1, "3": 1, "4": 1, "5": 1, "6": 1, "7": 1}),  # no majority
         (5, {"9": 2, "8": 2, "7": 1}),    # exact MIN_CLICKS, no majority
         (20, {"1": 11, "2": 9}),          # a bare majority at the top
-        (200, {**{"1": 61}, **{str(i): 1 for i in range(2, 140)}}),  # minority
         (13, {"1": 3, "2": 2, "3": 2, "4": 2, "5": 2, "6": 2}),  # gate is 3.9: rounds to 4
+        (200, {"1": 61, **{str(i): 1 for i in range(2, 140)}}),  # 61 of 200: a minority
     ],
 )
 def test_the_report_scores_a_tally_exactly_as_the_boost_would(total, counts, monkeypatch):
