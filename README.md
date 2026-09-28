@@ -515,12 +515,15 @@ an explicit timeout.
 covering starlette advisories (PYSEC-2026-1943/1941/161/2281/2280/249/248) that
 were reachable only through `fastapi==0.115.0`, which capped starlette below 0.39
 and made every fixed release (0.40.0 → 1.3.1) unreachable. Issue #331 raised
-fastapi to 0.141.1 — the first line whose starlette constraint is uncapped
-(`starlette>=0.46.0`) — and pinned `starlette==1.7.0` explicitly. Pinning the
-transitive directly is deliberate: starlette used to float, so the fix would
-otherwise depend on whatever the resolver happened to pick rather than on a
-reviewed value. `pip-audit -r backend/requirements.txt` is clean with no ignore
-list, and a new advisory anywhere fails the build immediately.
+fastapi to 0.141.1 and pinned `starlette==1.7.0` explicitly. 0.141.1 is the
+current release; the pin is safe because its starlette constraint is uncapped
+(`starlette>=0.46.0`), so every fixed release is reachable. (0.133.0 was the
+first release to drop the `<1.0.0` cap; 0.141.1 is simply the newest, and its
+newer floor keeps it off starlette releases the advisories predate.)
+Pinning the transitive directly is deliberate: starlette used to float, so the
+fix would otherwise depend on whatever the resolver happened to pick rather
+than on a reviewed value. `pip-audit -r backend/requirements.txt` is clean
+with no ignore list, and a new advisory anywhere fails the build immediately.
 
 The `transformers==5.10.1` pin (which fixes CVE-2026-4372 / CVE-2026-5241 /
 CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits
