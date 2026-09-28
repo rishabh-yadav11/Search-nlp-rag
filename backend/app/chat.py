@@ -354,10 +354,9 @@ class ChatStore:
         source_limit = max(0, config.CHAT_MESSAGE_SOURCE_LIMIT)
         return [_row_to_message(r, source_limit=source_limit) for r in rows], total
 
-    async def append_message(
+    async def _append_authorized(
         self,
-        session_id: str,
-        user_id: str,
+        session: SessionOut,
         role: str,
         content: str,
         sources: list[dict] | None = None,
@@ -367,18 +366,38 @@ class ChatStore:
         latency_ms: float = 0.0,
         aborted: bool = False,
     ) -> MessageOut:
-        if await self.get_session(session_id, user_id) is None:
-            raise HTTPException(status_code=404, detail="conversation not found")
+        """Append to a session whose ownership the caller has ALREADY proven.
+        Writes the message and the sessions.updated_at bump as one transaction,
+        exactly as before; it just does not re-run the authorisation SELECT.
+        Any entry point that has not proven ownership must go through
+        append_message(), which does.
+
+        The INSERT is guarded by WHERE EXISTS rather than preceded by a
+        re-read: a conversation deleted between the turn's authorisation and
+        this write must still fail as a clean 404, and folding the test into
+        the statement keeps that at zero extra round trips. It also stays
+        atomic, so no SELECT-then-INSERT window opens up.
+
+        The INSERT, the updated_at UPDATE and the COMMIT are deliberately NOT
+        merged into fewer statements (#259). aiosqlite runs one statement per
+        call, and the COMMIT is what makes the message and the bump atomic and
+        visible together; the INSERT's lastrowid is also returned to the
+        caller. Merging would trade a durability guarantee for one await."""
         db = self._require_db()
         ts = _now()
         cur = await db.execute(
             "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted)),
+            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+            " WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
+            (session.id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted), session.id),
         )
+        if cur.rowcount == 0:
+            # The conversation went away mid-turn (the user deleted it). The
+            # guarded INSERT wrote nothing, so there is nothing to roll back.
+            raise HTTPException(status_code=404, detail="conversation not found")
         await db.execute(
             "UPDATE sessions SET updated_at = ? WHERE id = ?",
-            (ts, session_id),
+            (ts, session.id),
         )
         await db.commit()
         return MessageOut(
@@ -394,21 +413,74 @@ class ChatStore:
             aborted=aborted,
         )
 
-    async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
+    async def append_message(
+        self,
+        session_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        sources: list[dict] | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost: float = 0.0,
+        latency_ms: float = 0.0,
+        aborted: bool = False,
+    ) -> MessageOut:
         session = await self.get_session(session_id, user_id)
         if session is None:
             raise HTTPException(status_code=404, detail="conversation not found")
+        return await self._append_authorized(
+            session,
+            role,
+            content,
+            sources,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost=cost,
+            latency_ms=latency_ms,
+            aborted=aborted,
+        )
+
+    async def _rename_authorized(self, session: SessionOut, title: str) -> SessionOut:
+        """Rename a session the caller has ALREADY proven it owns. The UPDATE
+        carries no user_id predicate, so this is only safe behind the
+        authorisation done by rename_session() or _start_turn()."""
         clean = (title or "").strip()[:200]
         db = self._require_db()
         ts = _now()
-        await db.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (clean, ts, session_id))
+        await db.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (clean, ts, session.id))
         await db.commit()
         return SessionOut(
-            id=session_id,
+            id=session.id,
             title=clean,
             created_at=session.created_at,
             updated_at=ts,
         )
+
+    async def _rename_if_untitled(self, session: SessionOut, title: str) -> None:
+        """Name a conversation ONLY while it is still untitled, decided by the
+        UPDATE's own WHERE clause rather than by a title read earlier. That is
+        what makes auto-titling safe while a turn is in flight: a rename the
+        user made in the meantime has already changed the row, so the guard no
+        longer matches and the user's name wins instead of this late write
+        clobbering it. It costs the same single UPDATE + COMMIT that the
+        re-read it replaces was guarding. Titles are always stored stripped
+        (see rename_session), so matching the two untitled spellings exactly
+        covers every reachable value."""
+        clean = (title or "").strip()[:200]
+        db = self._require_db()
+        ts = _now()
+        await db.execute(
+            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND title IN ('', 'New chat')",
+            (clean, ts, session.id),
+        )
+        await db.commit()
+
+    async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
+        session = await self.get_session(session_id, user_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        return await self._rename_authorized(session, title)
 
     async def delete_session(self, session_id: str, user_id: str) -> None:
         if await self.get_session(session_id, user_id) is None:
@@ -418,16 +490,28 @@ class ChatStore:
         await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         await db.commit()
 
-    async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
-        """Remove a single message (used to roll back a dangling user message
-        when the rest of the turn fails). No-op if the session is gone."""
-        if await self.get_session(session_id, user_id) is None:
-            return
+    async def _delete_authorized(self, session: SessionOut, message_id: int) -> None:
+        """Roll back a message in a session whose ownership the caller has
+        ALREADY proven, for the same reason _append_authorized does not
+        re-check: a turn that proved it may keep using the proof.
+
+        A conversation deleted mid-turn is still a no-op. delete_session
+        removes that conversation's messages before its own row, so by the
+        time this DELETE runs the message is already gone and it matches
+        nothing -- the same end state the pre-check used to produce, without
+        the serialized SELECT it took to get there."""
         db = self._require_db()
         await db.execute(
-            "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session_id)
+            "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session.id)
         )
         await db.commit()
+
+    async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
+        """Remove a single message. No-op if the session is gone."""
+        session = await self.get_session(session_id, user_id)
+        if session is None:
+            return
+        await self._delete_authorized(session, message_id)
 
     async def recent_turns(self, session_id: str, user_id: str, max_turns: int) -> list[MessageOut]:
         """The most recent `max_turns` user/assistant message pairs (oldest
@@ -2343,35 +2427,63 @@ def _trim_history(history: list[MessageOut], max_chars: int) -> list[MessageOut]
     return kept
 
 
-async def _start_turn(s: ChatStore, session_id: str, user_id: str, question: str) -> tuple[MessageOut, list[MessageOut]]:
+async def _start_turn(
+    s: ChatStore, session_id: str, user_id: str, question: str
+) -> tuple[MessageOut, list[MessageOut], SessionOut]:
+    """The single authorisation point for a turn. get_session() is the only
+    place that proves this user owns this session, and the verified row is
+    handed back so the rest of the turn reuses it instead of repeating the
+    same `WHERE id = ? AND user_id = ?` SELECT. The proof stays valid for the
+    whole turn: nothing in this module ever writes sessions.user_id, so a
+    session cannot change hands between the check and the later writes.
+
+    Both turn paths call this BEFORE their own cancellation handlers exist, so
+    a cancel anywhere in it would leave the user message with no assistant
+    reply and nobody able to delete it -- the dangling state the turn handlers
+    exist to prevent, one step earlier. Every await of this function that
+    can leave a row behind is therefore guarded, and every guard re-raises.
+    Nothing is ever streamed before a turn starts, so the rule's side of a
+    cancel here is always the clean rollback.
+
+    The authorisation is the one await that is NOT guarded, and that is the
+    point of running it first: the INSERT that writes the user message has not
+    been issued yet, so a cancel delivered at that read leaves nothing to
+    reconcile and simply propagates. A cancel requested during that read is
+    delivered at the INSERT's first await, which IS guarded.
+    """
+    session = await s.get_session(session_id, user_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
     try:
-        user_msg = await s.append_message(session_id, user_id, "user", question)
+        user_msg = await s._append_authorized(session, "user", question)
     except asyncio.CancelledError:
-        # Both turn paths call this BEFORE their own cancellation handlers are
-        # installed, so a cancel anywhere in it would leave the row with no
-        # assistant reply and nobody to delete it -- the dangling state the
-        # turn handlers exist to prevent, one step earlier. Nothing is ever
-        # streamed before a turn starts, so the rule's side is a clean
-        # rollback. In the INSERT's own COMMIT there is no id to delete by
-        # (`user_msg` was never bound), so the row is found instead.
+        # In the INSERT's own COMMIT there is no id to delete by (`user_msg`
+        # was never bound), so the row is found instead.
         await _reconcile_cancelled_turn(
-            lambda: _drop_unbound_user_row(s, session_id, user_id, question)
+            lambda: _drop_unbound_user_row(s, session, user_id, question)
         )
         raise
     try:
         history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
     except asyncio.CancelledError:
-        await _reconcile_cancelled_turn(lambda: s.delete_message(session_id, user_id, user_msg.id))
+        await _reconcile_cancelled_turn(lambda: s._delete_authorized(session, user_msg.id))
         raise
     # Both caps apply: turns bound how many messages come back, chars bound how
     # many of them actually reach the prompt.
-    return user_msg, _trim_history(history, config.CHAT_MAX_HISTORY_CHARS)
+    return user_msg, _trim_history(history, config.CHAT_MAX_HISTORY_CHARS), session
 
 
-async def _auto_title(s: ChatStore, session_id: str, user_id: str, question: str) -> None:
-    session = await s.get_session(session_id, user_id)
-    if session is not None and session.title.strip() in ("", "New chat"):
-        await s.rename_session(session_id, user_id, question[:60] or "New chat")
+async def _auto_title(s: ChatStore, session: SessionOut, question: str) -> None:
+    """Name a still-untitled conversation after its first question. Reads
+    nothing: the untitled test that matters is re-evaluated by the UPDATE
+    itself (_rename_if_untitled), so a rename the user made while the turn was
+    in flight is never clobbered, and a conversation deleted mid-turn no-ops."""
+    # A conversation that already had a real name at turn start is left alone
+    # without touching the database. The only way that name could have become
+    # untitled is the user deliberately blanking it mid-turn, which is no
+    # reason to overwrite it with the question.
+    if session.title.strip() in ("", "New chat"):
+        await s._rename_if_untitled(session, question[:60] or "New chat")
 
 
 @router.post("/sessions", response_model=SessionOut)
@@ -2484,18 +2596,24 @@ async def _reply_is_stored(s: ChatStore, session_id: str, user_id: str, after_id
     return bool(rows) and rows[-1].role == "assistant" and rows[-1].id > after_id
 
 
-async def _drop_unbound_user_row(s: ChatStore, session_id: str, user_id: str, question: str) -> None:
+async def _drop_unbound_user_row(s: ChatStore, session: SessionOut, user_id: str, question: str) -> None:
     """Remove a user message row whose id was never returned to the caller.
 
-    `_start_turn` can be cancelled inside the INSERT's own COMMIT, before
-    `append_message` hands back a MessageOut, so there is no id to delete by.
-    The newest message in the session is the row being written if it is a user
-    message carrying exactly this question; anything else is some other
-    turn's row and is left alone.
+    `_start_turn` can be cancelled inside the INSERT's own COMMIT, before the
+    append hands back a MessageOut, so there is no id to delete by. The newest
+    message in the session is the row being written if it is a user message
+    carrying exactly this question; anything else is some other turn's row and
+    is left alone.
+
+    `session` is the row `_start_turn` already authorised, so the delete that
+    follows is authorised by the turn's own proof rather than by another
+    `id AND user_id` SELECT on the connection the rollback is competing for.
+    `user_id` is still passed because `recent_turns` takes it, not because the
+    read needs it: the query is scoped by session id alone.
     """
-    rows = await s.recent_turns(session_id, user_id, 1)
+    rows = await s.recent_turns(session.id, user_id, 1)
     if rows and rows[-1].role == "user" and rows[-1].content == question:
-        await s.delete_message(session_id, user_id, rows[-1].id)
+        await s._delete_authorized(session, rows[-1].id)
 
 
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
@@ -2504,7 +2622,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
     s = _require_store()
     question = _validate_question(body)
 
-    user_msg, history = await _start_turn(s, session_id, user_id, question)
+    user_msg, history, session = await _start_turn(s, session_id, user_id, question)
     start = time.perf_counter()
 
     async def rollback_unreplied_turn() -> None:
@@ -2517,14 +2635,14 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         "did the append return" flag cannot decide this -- see
         `_reply_is_stored`."""
         if not await _reply_is_stored(s, session_id, user_id, user_msg.id):
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await s._delete_authorized(session, user_msg.id)
 
     try:
         answer, sources, note, prompt_tokens, completion_tokens, cost = await _run_turn(question, history)
     except (BudgetExceeded, LLMUnavailableError) as exc:
         # Roll back the user message so a failed turn never leaves a dangling
         # user message with no assistant reply.
-        await s.delete_message(session_id, user_id, user_msg.id)
+        await s._delete_authorized(session, user_msg.id)
         if isinstance(exc, BudgetExceeded):
             raise HTTPException(
                 status_code=429,
@@ -2540,7 +2658,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # rather than running an unbudgeted LLM call or returning a silently
         # empty answer: an unmeasured call is exactly the spend this cap exists
         # to prevent (#255).
-        await s.delete_message(session_id, user_id, user_msg.id)
+        await s._delete_authorized(session, user_msg.id)
         raise HTTPException(
             status_code=503,
             detail={"error": "AI budget service unavailable", "detail": f"The daily chat budget could not be verified; please retry shortly. ({exc})"},
@@ -2558,7 +2676,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # Any other failure during the turn (DB error, retrieval error, etc.)
         # must also roll back the dangling user message — the stream path deletes
         # on every error. Re-raise so the caller still surfaces the 500.
-        await s.delete_message(session_id, user_id, user_msg.id)
+        await s._delete_authorized(session, user_msg.id)
         raise
 
     # A JSON client receives the whole answer at once, so unlike the SSE path
@@ -2570,7 +2688,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         # conventional "client closed request") so it can never be mistaken
         # for a completed turn.
         if await request.is_disconnected():
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await s._delete_authorized(session, user_msg.id)
             raise HTTPException(
                 status_code=499,
                 detail={"error": "Client disconnected", "detail": "The request was cancelled before the answer could be delivered."},
@@ -2578,9 +2696,8 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
 
         latency_ms = (time.perf_counter() - start) * 1000
 
-        assistant_msg = await s.append_message(
-            session_id,
-            user_id,
+        assistant_msg = await s._append_authorized(
+            session,
             "assistant",
             answer,
             sources,
@@ -2589,7 +2706,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
             cost=cost,
             latency_ms=latency_ms,
         )
-        await _auto_title(s, session_id, user_id, question)
+        await _auto_title(s, session, question)
         return TurnOut(user=user_msg, assistant=assistant_msg, note=note, latency_ms=latency_ms)
     except asyncio.CancelledError:
         # Cancelled rather than failed. A turn whose reply is already in the
@@ -2614,7 +2731,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
     s = _require_store()
     question = _validate_question(body)
 
-    user_msg, history = await _start_turn(s, session_id, user_id, question)
+    user_msg, history, session = await _start_turn(s, session_id, user_id, question)
 
     # The turn's reconciliation, published so the response's background task
     # can reach it: see `finish_unfinished_turn` below. Empty until the body
@@ -2749,12 +2866,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             latency_ms = (time.perf_counter() - start) * 1000
             answer = _finalize_answer(answer, question).rstrip() + "\n\n[answer truncated]"
             await finish_holds(cost_usd)
-            assistant_msg = await s.append_message(
-                session_id, user_id, "assistant", answer, sources,
+            assistant_msg = await s._append_authorized(
+                session, "assistant", answer, sources,
                 prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                 cost=cost_usd, latency_ms=latency_ms, aborted=aborted,
             )
-            await _auto_title(s, session_id, user_id, question)
+            await _auto_title(s, session, question)
             return assistant_msg
 
         async def aborted(
@@ -2796,7 +2913,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                     answer, sources, prompt_tokens, completion_tokens, cost_usd, aborted=True
                 )
             else:
-                await s.delete_message(session_id, user_id, user_msg.id)
+                await s._delete_authorized(session, user_msg.id)
                 await finish_holds(cost_usd)
             return True
 
@@ -2825,7 +2942,7 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             if await _reply_is_stored(s, session_id, user_id, user_msg.id):
                 return
             if not streamed:
-                await s.delete_message(session_id, user_id, user_msg.id)
+                await s._delete_authorized(session, user_msg.id)
                 await finish_holds(charged_usd)
                 return
             # Deltas already sent: persist what the client is still showing.
@@ -2887,12 +3004,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 if await aborted():
                     return
                 latency_ms = (time.perf_counter() - start) * 1000
-                assistant_msg = await s.append_message(
-                    session_id, user_id, "assistant", turn.answer, turn.sources,
+                assistant_msg = await s._append_authorized(
+                    session, "assistant", turn.answer, turn.sources,
                     prompt_tokens=turn.prompt_tokens, completion_tokens=turn.completion_tokens,
                     cost=turn.cost, latency_ms=latency_ms,
                 )
-                await _auto_title(s, session_id, user_id, question)
+                await _auto_title(s, session, question)
                 yield _sse("done", {"message": assistant_msg.model_dump(), "note": turn.note, "latency_ms": latency_ms})
                 return
 
@@ -3070,14 +3187,14 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             # the stream plus any nudges really cost, which may exceed the
             # reserved estimates — incurred spend is recorded, never dropped.
             await finish_holds(cost_usd)
-            assistant_msg = await s.append_message(
-                session_id, user_id, "assistant", answer, turn.sources,
+            assistant_msg = await s._append_authorized(
+                session, "assistant", answer, turn.sources,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
                 cost=cost_usd,
                 latency_ms=latency_ms,
             )
-            await _auto_title(s, session_id, user_id, question)
+            await _auto_title(s, session, question)
             yield _sse(
                 "done",
                 {
