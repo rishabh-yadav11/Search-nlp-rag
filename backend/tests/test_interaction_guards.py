@@ -83,6 +83,11 @@ class _FakeProfileRedis:
             self.ttls[key] = ex
         return True
 
+    async def exists(self, key):
+        # Read by the trending-index bootstrap (#261) to decide whether the
+        # one-time backfill has already run.
+        return int(key in self.key_dump())
+
     async def delete(self, *keys):
         removed = 0
         for key in keys:
@@ -124,6 +129,12 @@ class _FakeProfileRedis:
             added += int(str(member) not in target)
             target[str(member)] = float(score)
         return added
+
+    async def zincrby(self, key, amount, member):
+        # Advances the trending index (#261) by the article's interaction total.
+        target = self.zsets.setdefault(key, {})
+        target[str(member)] = target.get(str(member), 0.0) + float(amount)
+        return target[str(member)]
 
     async def zcard(self, key):
         return len(self.zsets.get(key, {}))
@@ -182,6 +193,9 @@ class _FakePipeline:
 
     def zadd(self, *args, **kwargs):
         return self._queue(self._client.zadd, *args, **kwargs)
+
+    def zincrby(self, *args, **kwargs):
+        return self._queue(self._client.zincrby, *args, **kwargs)
 
     def zcard(self, *args, **kwargs):
         return self._queue(self._client.zcard, *args, **kwargs)
