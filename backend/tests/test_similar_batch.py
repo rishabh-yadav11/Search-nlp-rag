@@ -70,11 +70,20 @@ def _near(article_id):
     }
 
 
+def _key(article_id, limit=3, same_category=False):
+    """The production cache key, spelled out here.
+
+    The version is read from the module rather than pasted, so bumping it does
+    not break this file; the rest is written out, so a change to the rest of
+    the key is visible here instead of being quietly absorbed.
+    """
+    version = main.RECOMMEND_CACHE_VERSION
+    return f"recommend:similar:{version}:{article_id}:{limit}:{same_category}"
+
+
 def _seed(store, article_id, limit=3, same_category=False):
     """Warm one entry the way a real Redis holds it: as a JSON string."""
-    store[f"recommend:similar:{article_id}:{limit}:{same_category}"] = json.dumps(
-        [_near(article_id)]
-    )
+    store[_key(article_id, limit, same_category)] = json.dumps([_near(article_id)])
 
 
 @pytest.fixture
@@ -130,7 +139,7 @@ def test_a_whole_view_is_read_from_cache_in_one_command(client, env):
     response = client.post("/recommend/similar/batch", json={"article_ids": ids, "limit": 3})
 
     assert response.status_code == 200, response.text
-    assert env.redis.mgets == [[f"recommend:similar:{i}:3:False" for i in ids]]
+    assert env.redis.mgets == [[_key(i) for i in ids]]
     assert env.redis.gets == [], "a batched read must not fall back to per-key GETs"
 
     groups = _groups(response)
@@ -248,6 +257,31 @@ def test_an_empty_result_is_not_cached(client, env, monkeypatch):
     assert first.status_code == 200 and second.status_code == 200
     assert _groups(first)[5]["similar_articles"] == []
     assert env.redis.sets == [], "an empty result must not be written to the cache"
+
+
+def test_a_legacy_unversioned_entry_is_not_served(client, env):
+    """The batch route must honour the payload version too, not just the single one.
+
+    ``test_similar_articles_payload`` pins this for ``/recommend/similar/{id}``
+    (#257): entries written before the payload narrowed still carry the full
+    article body, and the handler returns a cached value verbatim. The batched
+    route reads a cache too, so a key of its own that omitted the version
+    would serve those bodies for the rest of their TTL -- a regression that
+    only the batched surface would have had, and that no other test here
+    would notice.
+    """
+    env.redis.store["recommend:similar:3:3:False"] = json.dumps(
+        [{"id": 3, "title": "stale", "url": "https://x/y", "body": "x" * 4000}]
+    )
+
+    response = client.post("/recommend/similar/batch", json={"article_ids": [3], "limit": 3})
+
+    assert response.status_code == 200, response.text
+    group = _groups(response)[3]
+    assert group["cached"] is False, "served a similar entry written by the previous shape"
+    assert group["similar_articles"], "expected a fresh fetch instead"
+    for article in group["similar_articles"]:
+        assert "body" not in article
 
 
 def test_a_different_limit_is_a_different_cache_entry(client, env):

