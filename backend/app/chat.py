@@ -1382,6 +1382,36 @@ def _apply_requested_view(text: str, question: str) -> str:
     return _DATAVIZ_FENCE_RE.sub(_rewrite, text)
 
 
+class _FailedCallSpend:
+    """What this turn's calls that reported no answer still cost.
+
+    A nudge that exhausts its retries is a real billed call: `generate_answer`
+    sent `LLM_MAX_RETRIES + 1` requests and the provider billed the prompt of
+    every one of them, even though the turn keeps the first answer instead of
+    erroring. Swallowing that failure without recording it made the daily cap
+    under-count exactly when the provider is flaky and retries are most likely
+    -- and invisibly, since no error is raised anywhere (#347).
+
+    Each failure records its attempts here at the per-call estimate the gate
+    holds, and the turn's SINGLE settle charges the total. The nudge's own hold
+    stays in `holds` and is therefore settled, never released, which is the
+    distinction #255 stopped blurring.
+
+    Zero attempts is the honest exception: `LLM_MAX_RETRIES < 0` sends no
+    request at all, so there is nothing to charge.
+    """
+
+    __slots__ = ("usd",)
+
+    def __init__(self) -> None:
+        self.usd = 0.0
+
+    def charge(self, attempts: int) -> None:
+        """Add what ``attempts`` billed-but-unanswered requests cost."""
+        if attempts > 0:
+            self.usd += attempts * config.LLM_CALL_RESERVE_USD
+
+
 async def _nudge_retry_allowed(holds: list[str]) -> bool:
     """True when the daily LLM spend cap still permits one more nudge call.
 
@@ -1413,12 +1443,21 @@ async def _nudge_retry_allowed(holds: list[str]) -> bool:
 
 
 async def _answer_with_dataviz(
-    question: str, prompt: str, holds: list[str], system_prompt: str = ""
+    question: str,
+    prompt: str,
+    holds: list[str],
+    system_prompt: str = "",
+    *,
+    spend: _FailedCallSpend | None = None,
 ) -> LLMResult:
     """Call the LLM once, nudging it to include a dataviz data block when the
     question explicitly asks for a chart/graph/plot/table and the model skipped
     the block. One extra call at most; token usage is summed. A failed nudge
-    retry keeps the first answer instead of erroring the turn."""
+    retry keeps the first answer instead of erroring the turn.
+
+    ``spend`` accumulates what a failed retry cost so the caller's single settle
+    records it. It is keyword-only and optional because a caller with no
+    turn-level cost accounting to do has nowhere to put the figure."""
     result = await generate_answer(state_llm(), prompt, config.LLM_MODEL, system_prompt)
     if parse_dataviz(result.content) is None and _CHART_INTENT_RE.search(question):
         if not await _nudge_retry_allowed(holds):
@@ -1427,7 +1466,12 @@ async def _answer_with_dataviz(
             nudge = await generate_answer(
                 state_llm(), prompt, config.LLM_MODEL, _retry_system(system_prompt, _dataviz_nudge(question))
             )
-        except LLMUnavailableError:
+        except LLMUnavailableError as exc:
+            # The provider billed the prompt of every attempt the nudge made, so
+            # the failed retry is charged to the turn rather than forgiven; the
+            # first answer is still served (#347).
+            if spend is not None:
+                spend.charge(exc.attempts)
             return result
         result.content = nudge.content
         result.prompt_tokens += nudge.prompt_tokens
@@ -1472,13 +1516,19 @@ _RANKING_NUDGE = (
 
 
 async def _answer_ranked(
-    question: str, prompt: str, holds: list[str], system_prompt: str = ""
+    question: str,
+    prompt: str,
+    holds: list[str],
+    system_prompt: str = "",
+    *,
+    spend: _FailedCallSpend | None = None,
 ) -> LLMResult:
     """Call the LLM for a chat answer, applying the dataviz nudge (when a chart
     was asked) and the ranking-refusal nudge (when a ranked list came back as a
     refusal). At most one extra call for each; a failed retry keeps the first
-    answer instead of erroring the turn."""
-    result = await _answer_with_dataviz(question, prompt, holds, system_prompt)
+    answer instead of erroring the turn, and bills its attempts to ``spend`` so
+    the caller does not record that spend as free (#347)."""
+    result = await _answer_with_dataviz(question, prompt, holds, system_prompt, spend=spend)
     if _is_ranking_question(question) and _is_ranking_refusal(result.content):
         # The retry is a second billed call, so it takes its own hold against
         # the cap the same way the dataviz nudge does — and that hold counts
@@ -1489,7 +1539,9 @@ async def _answer_ranked(
             nudge = await generate_answer(
                 state_llm(), prompt, config.LLM_MODEL, _retry_system(system_prompt, _RANKING_NUDGE)
             )
-        except LLMUnavailableError:
+        except LLMUnavailableError as exc:
+            if spend is not None:
+                spend.charge(exc.attempts)
             return result
         result.content = nudge.content
         result.prompt_tokens += nudge.prompt_tokens
@@ -1993,11 +2045,16 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         return turn.answer, turn.sources, turn.note, turn.prompt_tokens, turn.completion_tokens, turn.cost
 
     holds: list[str] = []
+    # Billed calls this turn made that never reported usage — a nudge retry that
+    # exhausted its retries. The provider billed every one of those attempts, so
+    # the figure joins the single settle below instead of being forgiven
+    # (#347).
+    spend = _FailedCallSpend()
     gate_hold = await reserve()
     if gate_hold:
         holds.append(gate_hold)
     try:
-        result = await _answer_ranked(question, turn.answer, holds, turn.system)
+        result = await _answer_ranked(question, turn.answer, holds, turn.system, spend=spend)
     except LLMUnavailableError as exc:
         # A total outage is NOT a free call. generate_answer sends up to
         # LLM_MAX_RETRIES + 1 requests and the provider bills the prompt of
@@ -2026,6 +2083,12 @@ async def _run_turn(question: str, history: list[MessageOut]) -> tuple[str, list
         # number so the stored message cost and the budget cannot disagree
         # (#255).
         cost_usd = config.LLM_CALL_RESERVE_USD
+    # A nudge retry that failed after billing real attempts carries no tokens,
+    # so `result.cost()` cannot see it. Adding it here — and returning the very
+    # same `cost_usd` that is settled below — keeps the #255 invariant intact:
+    # the accounting figure and the stored figure are one number, and that
+    # number is positive whenever any call was billed.
+    cost_usd += spend.usd
     await _discharge_turn_holds(holds, cost_usd)
     return (
         _finalize_answer(result.content, question),
@@ -2405,6 +2468,11 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
         # fail_turn() reads it, and fail_turn() can run for a failure that
         # happened before the loop was ever entered.
         mid_stream_estimate = config.LLM_CALL_RESERVE_USD
+        # Billed calls this turn made that never reported usage — a nudge retry
+        # that exhausted its retries. The provider billed every one of those
+        # attempts even though the streamed answer is kept, so the figure joins
+        # this turn's single settle instead of being forgiven (#347).
+        spend = _FailedCallSpend()
 
         def billed_usd(usage: list) -> float:
             """What a turn whose LLM call has already been made is charged.
@@ -2421,8 +2489,8 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             if usage:
                 reported = to_usd(usage[0].cost())
                 if reported > 0:
-                    return reported
-            return mid_stream_estimate
+                    return reported + spend.usd
+            return mid_stream_estimate + spend.usd
 
         async def finish_holds(charged_usd: float) -> None:
             """Settle every hold this turn took, recording what it really cost.
@@ -2673,9 +2741,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
-            # No pending-spend accumulator is needed: each billed call holds
-            # its own budget up front, and the end-of-turn settle below records
-            # the summed token cost.
+            # Each billed call holds its own budget up front, and the
+            # end-of-turn settle below records the summed token cost. A nudge
+            # that exhausts its retries is the exception the token sum cannot
+            # see: the provider billed every attempt but none of them reported
+            # usage, so those attempts are accumulated in `spend` and added to
+            # the same single settle (#347).
             if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
                 # The user explicitly asked for a chart/graph/plot/table but the
                 # answer streamed without one; ask once more so visual requests
@@ -2700,7 +2771,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                             config.LLM_MODEL,
                             _retry_system(turn.system, _dataviz_nudge(question)),
                         )
-                    except LLMUnavailableError:
+                    except LLMUnavailableError as exc:
+                        # Every attempt the nudge made was billed by the
+                        # provider, so the failure is charged to this turn
+                        # rather than refunded into the cap; the streamed answer
+                        # is still delivered (#347).
+                        spend.charge(exc.attempts)
                         nudge = None
                 if nudge is not None:
                     # Preserve the already-streamed prose; only append the
@@ -2732,7 +2808,8 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                         nudge = await generate_answer(
                             state_llm(), turn.answer, config.LLM_MODEL, _retry_system(turn.system, _RANKING_NUDGE)
                         )
-                    except LLMUnavailableError:
+                    except LLMUnavailableError as exc:
+                        spend.charge(exc.attempts)
                         nudge = None
                 if nudge is not None:
                     # Append the corrected list; never overwrite the prose the
@@ -2758,6 +2835,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
                 # and store the same figure so the reported cost and the
                 # budget cannot disagree (#255).
                 cost_usd = mid_stream_estimate
+            # A nudge retry that failed after billing real attempts carries no
+            # tokens, so the token cost above cannot see it. Adding it here --
+            # and using the very same `cost_usd` for finish_holds() and the
+            # stored message below -- keeps the #255 invariant that the
+            # accounting figure and the stored figure are one number.
+            cost_usd += spend.usd
             if await aborted(answer, turn.sources, result.prompt_tokens, result.completion_tokens, cost_usd):
                 return
             # The turn's single counter write: drops every hold and records what
