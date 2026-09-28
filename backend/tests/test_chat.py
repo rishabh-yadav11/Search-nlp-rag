@@ -368,6 +368,420 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
         _run(chat_store.close())
 
 
+class _RoundTripCounter:
+    """Proxy over the shared aiosqlite connection that records every round
+    trip a turn makes. Each execute / execute_fetchall / commit is its own
+    await onto aiosqlite's single worker thread -- that serialization behind
+    one connection per worker is what #259 was paying for."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.log = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def execute(self, sql, *a, **kw):
+        self.log.append(("execute", " ".join(sql.split())))
+        return await self._inner.execute(sql, *a, **kw)
+
+    async def execute_fetchall(self, sql, *a, **kw):
+        self.log.append(("select", " ".join(sql.split())))
+        return await self._inner.execute_fetchall(sql, *a, **kw)
+
+    async def commit(self):
+        self.log.append(("commit", ""))
+        return await self._inner.commit()
+
+
+SESSION_AUTH_SELECT = "FROM sessions WHERE id = ? AND user_id = ?"
+# Measured on this code before #259: one chat turn issued 13 serialized round
+# trips, FOUR of them this exact SELECT (once per append_message, once in
+# _auto_title, once more inside rename_session).
+TURN_ROUND_TRIPS_BEFORE_259 = 13
+
+
+async def _ok_turn(question, history):
+    return f"Answer to {question} [1].", [{"id": 1, "title": "Src"}], None, 10, 5, 0.001
+
+
+def test_one_turn_makes_fewer_round_trips_and_authorises_once(tmp_path, monkeypatch):
+    """A turn re-read the same session row four times. Three were pure
+    re-reads of a row the turn already held, each one a serialized await on
+    the single connection while 4 gunicorn workers contend for the WAL."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        monkeypatch.setattr(chat_module, "_run_turn", _ok_turn)
+
+        counter = _RoundTripCounter(chat_store._db)
+        chat_store._db = counter
+
+        r = client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "Who invested in fintech?"},
+        )
+        assert r.status_code == 200
+
+        assert len(counter.log) < TURN_ROUND_TRIPS_BEFORE_259
+        session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
+        assert len(session_selects) == 1  # the turn's single authorisation check
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monkeypatch):
+    """The rollback paths are the ones the happy-path counter cannot see.
+
+    Every way a turn can fail -- provider error, budget exceeded, budget
+    unavailable, client disconnect, and the SSE fail_turn -- rolled the user
+    message back through delete_message(), which re-ran the same
+    `id AND user_id` SELECT the turn had just passed. A failed turn is
+    precisely the turn worth making cheap: it is the one that must not also
+    hold the shared connection open for a redundant read. The turn has
+    already proved it owns the row by the time it is able to fail, so the
+    rollback is authorised by that same proof."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def boom(question, history):
+            raise RuntimeError("the provider is on fire")
+
+        monkeypatch.setattr(chat_module, "_run_turn", boom)
+
+        counter = _RoundTripCounter(chat_store._db)
+        chat_store._db = counter
+
+        with pytest.raises(RuntimeError):
+            client.post(
+                f"/api/chat/sessions/{sid}/messages", headers=h,
+                json={"content": "Who invested in fintech?"},
+            )
+
+        # Asserted before the GET below, which is itself a session-authorising
+        # read and would otherwise be counted as part of the turn.
+        session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
+        assert len(session_selects) == 1, [e[1] for e in session_selects]
+
+        # And the rollback still happened: no dangling user message survives a
+        # failed turn. The authorisation was removed, not the cleanup.
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert detail["messages"] == []
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+
+@pytest.mark.parametrize(
+    "parked_at", ["user_insert", "history_read", "in_the_turn"]
+)
+def test_a_cancelled_turn_rolls_back_without_a_second_authorisation(
+    tmp_path, monkeypatch, parked_at
+):
+    """A cancellation reconciles through the proof the turn already holds.
+
+    #292 made a cancelled turn roll itself back, and #259 removed the
+    per-operation `id AND user_id` re-reads. On the cancel path the two meet:
+    the reconcilers (_start_turn's own guards, `_drop_unbound_user_row` and
+    `rollback_unreplied_turn`) are the most expensive place to leave a second
+    authorisation, because that is a serialized await on the one connection
+    every worker contends for, taken on the disconnect path. Whichever of the
+    three awaits the cancel lands on, the whole turn is exactly one
+    `id AND user_id` SELECT -- and the row is still gone afterwards, so the
+    cheap write removed the re-read and not the cleanup.
+    """
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+        ready = asyncio.Event()
+        parked = {"done": False}
+        real_append = store._append_authorized
+        real_recent = store.recent_turns
+
+        async def park():
+            parked["done"] = True
+            ready.set()
+            await asyncio.sleep(3600)
+
+        if parked_at == "user_insert":
+            async def slow_append(session, role, *args, **kwargs):
+                result = await real_append(session, role, *args, **kwargs)
+                if role == "user" and not parked["done"]:
+                    await park()
+                return result
+
+            monkeypatch.setattr(store, "_append_authorized", slow_append)
+        elif parked_at == "history_read":
+            async def slow_recent(session_id, user_id, max_turns):
+                if not parked["done"]:
+                    await park()
+                return await real_recent(session_id, user_id, max_turns)
+
+            monkeypatch.setattr(store, "recent_turns", slow_recent)
+        else:
+            async def stuck_turn(question, history):
+                await park()
+
+            monkeypatch.setattr(chat_module, "_run_turn", stuck_turn)
+
+        counter = _RoundTripCounter(store._db)
+        store._db = counter
+        request = _cancel_request()
+
+        async def run_it():
+            task = asyncio.create_task(
+                chat_module.send_message(sid, chat_module.MessageIn(content="what deals happened"), request)
+            )
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert _run(run_it()) is True
+
+        # Asserted before reading the rows back, which is itself a
+        # session-authorising read.
+        session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
+        assert len(session_selects) == 1, [e[1] for e in session_selects]
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
+
+
+def test_cancel_at_the_authorisation_read_writes_nothing(tmp_path, monkeypatch):
+    """The ordering inside `_start_turn`: authorise, THEN write.
+
+    The authorisation is deliberately the one await the cancellation guards
+    do not wrap, and that is only sound because it runs first: the INSERT that
+    writes the user message has not been issued, so a cancel delivered at that
+    read has nothing to reconcile and simply propagates. Move the write ahead
+    of the proof -- or read the session again after it -- and this turn would
+    park on a statement that already left a row behind. The statement log
+    pins both halves: one read, and no write at all.
+    """
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+        ready = asyncio.Event()
+        parked = {"done": False}
+        real_get = store.get_session
+
+        async def slow_get(session_id, user_id):
+            # Parked AFTER the read returns, the way aiosqlite resolves a
+            # statement on its worker thread: the SELECT is in the log and the
+            # turn is cancelled before it can issue anything else.
+            result = await real_get(session_id, user_id)
+            if not parked["done"]:
+                parked["done"] = True
+                ready.set()
+                await asyncio.sleep(3600)
+            return result
+
+        monkeypatch.setattr(store, "get_session", slow_get)
+
+        counter = _RoundTripCounter(store._db)
+        store._db = counter
+
+        async def run_it():
+            task = asyncio.create_task(
+                chat_module.send_message(
+                    sid, chat_module.MessageIn(content="what deals happened"), _cancel_request()
+                )
+            )
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        # The cancel still reaches the client of the request: swallowing it
+        # would end the task normally and hide the disconnect.
+        assert _run(run_it()) is True
+        assert [kind for kind, _sql in counter.log] == ["select"]
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
+
+
+def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypatch):
+    """#259 deleted three of the four `id AND user_id` SELECTs a turn made.
+    The one survivor is the only thing keeping a user out of another user's
+    conversation, so it must still run before any write -- on both the JSON
+    and the SSE turn -- and must still reject."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h_a = _auth_headers(auth_store, email=EMAIL_A)
+        h_b = _auth_headers(auth_store, email=EMAIL_B)
+        sid = client.post("/api/chat/sessions", headers=h_a).json()["id"]
+
+        async def must_not_run(question, history):
+            raise AssertionError("the LLM was reached for a session the user does not own")
+
+        monkeypatch.setattr(chat_module, "_run_turn", must_not_run)
+
+        assert client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h_b,
+            json={"content": "what did they invest in?"},
+        ).status_code == 404
+        assert client.post(
+            f"/api/chat/sessions/{sid}/messages/stream", headers=h_b,
+            json={"content": "what did they invest in?"},
+        ).status_code == 404
+
+        # The rejected turns wrote nothing into the victim's conversation.
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h_a).json()
+        assert detail["messages"] == []
+        assert detail["title"] == "New chat"
+
+        # And the owner is unaffected.
+        monkeypatch.setattr(chat_module, "_run_turn", _ok_turn)
+        assert client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h_a,
+            json={"content": "Who invested in fintech?"},
+        ).status_code == 200
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
+    """The observable turn is unchanged by the authorisation rework: both
+    messages land in order, the conversation is named after the FIRST
+    question, the next turn's prompt carries this turn's history, and a
+    second turn must not clobber that title."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        seen = []
+
+        async def fake_turn(question, history):
+            seen.append((question, [m.content for m in history]))
+            return f"Answer to {question} [1].", [{"id": 1, "title": "Src"}], None, 10, 5, 0.001
+
+        monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
+
+        assert client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "Who invested in fintech?"},
+        ).status_code == 200
+
+        assert client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "And in mobility?"},
+        ).status_code == 200
+
+        # The second turn was prompted with the first turn's exchange.
+        assert seen == [
+            ("Who invested in fintech?", ["Who invested in fintech?"]),
+            (
+                "And in mobility?",
+                [
+                    "Who invested in fintech?",
+                    "Answer to Who invested in fintech? [1].",
+                    "And in mobility?",
+                ],
+            ),
+        ]
+
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert detail["title"] == "Who invested in fintech?"  # named once, then left alone
+        assert [m["role"] for m in detail["messages"]] == [
+            "user", "assistant", "user", "assistant",
+        ]
+        assert [m["content"] for m in detail["messages"]] == [
+            "Who invested in fintech?",
+            "Answer to Who invested in fintech? [1].",
+            "And in mobility?",
+            "Answer to And in mobility? [1].",
+        ]
+        assert detail["messages"][1]["prompt_tokens"] == 10
+        assert detail["messages"][1]["cost"] == 0.001
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, monkeypatch):
+    """#259 stopped re-reading the session before auto-titling, so the untitled
+    test now has to come from the UPDATE itself. A rename that lands while the
+    answer is being produced must survive: the user's chosen name wins, not the
+    question text. Before #259 the pre-write re-read gave this for free; this
+    pins it so the cheap path cannot quietly give it back."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def rename_mid_turn(question, history):
+            # The user renames the conversation while the answer is in flight.
+            await chat_store.rename_session(sid, user_id, "My carefully chosen name")
+            return "An answer [1].", [], None, 1, 1, 0.0
+
+        monkeypatch.setattr(chat_module, "_run_turn", rename_mid_turn)
+
+        r = client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "Who invested in fintech?"},
+        )
+        assert r.status_code == 200
+
+        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        assert detail["title"] == "My carefully chosen name"
+        # The turn itself still completed and persisted normally.
+        assert [m["content"] for m in detail["messages"]] == [
+            "Who invested in fintech?", "An answer [1].",
+        ]
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkeypatch):
+    """The `get_session` a turn used to re-run was doing double duty: not only
+    authorisation, but existence. If the owner deletes the conversation while
+    the answer is in flight, the assistant INSERT must still fail the way it
+    always did -- a 404, not an unhandled FOREIGN KEY error from the
+    messages.session_id constraint. The existence test now lives in the
+    INSERT's own WHERE clause so this costs no extra round trip."""
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+
+        async def delete_mid_turn(question, history):
+            await chat_store.delete_session(sid, user_id)
+            return "An answer [1].", [], None, 1, 1, 0.0
+
+        monkeypatch.setattr(chat_module, "_run_turn", delete_mid_turn)
+
+        r = client.post(
+            f"/api/chat/sessions/{sid}/messages", headers=h,
+            json={"content": "Who invested in fintech?"},
+        )
+        assert r.status_code == 404
+        assert "conversation not found" in r.text
+        # The cascade really did remove the user message written this turn;
+        # nothing was resurrected by the failed assistant write.
+        assert _run(chat_store.get_session(sid, user_id)) is None
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
 def test_api_usage_stats(tmp_path, monkeypatch):
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
@@ -616,8 +1030,9 @@ def _seeded_titled_sessions(store):
     Returns (session_ids, titles)."""
     ids, titles = [], []
     for user in (USER_A, USER_B):
-        sid = _run(store.create_session(user)).id
-        _run(chat_module._auto_title(store, sid, user, PRIVATE_QUESTION))
+        session = _run(store.create_session(user))
+        sid = session.id
+        _run(chat_module._auto_title(store, session, PRIVATE_QUESTION))
         _run(store.append_message(sid, user, "user", PRIVATE_QUESTION))
         _run(store.append_message(
             sid, user, "assistant", "here is a generic answer",
@@ -3936,7 +4351,7 @@ def test_start_turn_applies_the_char_cap(tmp_path, monkeypatch):
         monkeypatch.setattr(chat_module.config, "CHAT_MAX_HISTORY_TURNS", 10)
         monkeypatch.setattr(chat_module.config, "CHAT_MAX_HISTORY_CHARS", 12_000)
 
-        _user_msg, history = _run(chat_module._start_turn(store, sid, USER_A, "next question"))
+        _user_msg, history, _session = _run(chat_module._start_turn(store, sid, USER_A, "next question"))
 
         # 6 x 5000 = 30000 chars of history, trimmed to at most 12000 + the
         # newly appended question. The cap really bound the prompt.
@@ -5508,26 +5923,31 @@ def _park_at_first_assistant_commit(monkeypatch, store, parked):
 
     aiosqlite runs each statement on a worker thread and only then resolves an
     independently cancellable future, so a cancellation delivered at a row's own
-    COMMIT finds the write already done while `append_message` never returns.
+    COMMIT finds the write already done while the append never returns.
     A local "did the append return" flag is still False in that window, which
     is what used to make the rollback delete the user message under a stored
     reply (JSON) or store a SECOND assistant row for the same turn (SSE).
+
+    Parked on `_append_authorized`, not on `append_message`: a turn that has
+    already proved it owns the conversation writes through the authorised
+    entry point (#259), so parking the authorising wrapper would never be
+    reached and the window would go untested.
 
     Only the first assistant append parks, so a reconciliation's own write
     still completes and the test measures the fix, not a deadlock.
     """
     ready = asyncio.Event()
-    real_append = store.append_message
+    real_append = store._append_authorized
 
-    async def slow_append(session_id, user_id, role, *args, **kwargs):
-        result = await real_append(session_id, user_id, role, *args, **kwargs)
+    async def slow_append(session, role, *args, **kwargs):
+        result = await real_append(session, role, *args, **kwargs)
         if role == "assistant" and not parked["done"]:
             parked["done"] = True
             ready.set()
             await asyncio.sleep(3600)
         return result
 
-    monkeypatch.setattr(store, "append_message", slow_append)
+    monkeypatch.setattr(store, "_append_authorized", slow_append)
     return ready
 
 
@@ -5605,27 +6025,29 @@ def test_stream_cancelled_at_the_reply_commit_stores_no_second_row(tmp_path, mon
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["json", "sse"])
 def test_turn_cancelled_at_the_user_insert_commit_rolls_back(tmp_path, monkeypatch, streaming):
-    """A cancel inside the INSERT that writes the user message, before
-    `append_message` returns an id: the row exists but nothing knows its id.
+    """A cancel inside the INSERT that writes the user message, before the
+    append returns an id: the row exists but nothing knows its id.
     `_start_turn` finds it instead, so neither path leaves a dangling user
-    message."""
+    message. Parked on `_append_authorized`, the write the turn makes once it
+    has authorised the session (#259); parking `append_message` would never
+    be reached."""
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)
         monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
         ready = asyncio.Event()
-        real_append = store.append_message
+        real_append = store._append_authorized
         parked = {"done": False}
 
-        async def slow_append(session_id, user_id, role, *args, **kwargs):
-            result = await real_append(session_id, user_id, role, *args, **kwargs)
+        async def slow_append(session, role, *args, **kwargs):
+            result = await real_append(session, role, *args, **kwargs)
             if role == "user" and not parked["done"]:
                 parked["done"] = True
                 ready.set()
                 await asyncio.sleep(3600)
             return result
 
-        monkeypatch.setattr(store, "append_message", slow_append)
+        monkeypatch.setattr(store, "_append_authorized", slow_append)
         request = _cancel_request()
         if streaming:
             endpoint = lambda: chat_module.send_message_stream(
