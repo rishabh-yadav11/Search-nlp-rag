@@ -54,7 +54,19 @@ class _FakeRedis:
         self.last_pipe = []
         return []
 
-    async def mget(self, keys):
+    async def mget(self, keys, *_rest):
+
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+
+        if isinstance(keys, str):
+
+            keys = [keys, *_rest]
+
+        else:
+
+            keys = [*keys, *_rest]
         return [self.store.get(k) for k in keys]
 
     async def get(self, key):
@@ -201,7 +213,19 @@ class _SummaryRedis:
         self.zsets: dict = {}
         self.calls: list = []
 
-    async def mget(self, keys):
+    async def mget(self, keys, *_rest):
+
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+
+        if isinstance(keys, str):
+
+            keys = [keys, *_rest]
+
+        else:
+
+            keys = [*keys, *_rest]
         return [str(self.store[k]) if k in self.store else None for k in keys]
 
     async def get(self, key):
@@ -328,7 +352,13 @@ def test_summary_raises_when_redis_is_down(monkeypatch):
     (#281). The HTTP layer turns this into 503."""
 
     class _BrokenRedis:
-        async def mget(self, keys):
+        async def mget(self, keys, *_rest):
+            # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+            # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+            if isinstance(keys, str):
+                keys = [keys, *_rest]
+            else:
+                keys = [*keys, *_rest]
             raise ConnectionError("redis unreachable")
 
         async def get(self, key):
@@ -374,7 +404,13 @@ def analytics_client(tmp_path):
 
 
 class _UnreachableRedis:
-    async def mget(self, keys):
+    async def mget(self, keys, *_rest):
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        if isinstance(keys, str):
+            keys = [keys, *_rest]
+        else:
+            keys = [*keys, *_rest]
         raise ConnectionError("redis unreachable")
 
     async def get(self, key):

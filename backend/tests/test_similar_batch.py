@@ -39,7 +39,19 @@ class _StubRedis:
         self.gets.append(key)
         return self.store.get(key)
 
-    async def mget(self, *keys):
+    async def mget(self, keys, *_rest):
+
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+
+        if isinstance(keys, str):
+
+            keys = [keys, *_rest]
+
+        else:
+
+            keys = [*keys, *_rest]
         self.mgets.append(list(keys))
         return [self.store.get(key) for key in keys]
 
