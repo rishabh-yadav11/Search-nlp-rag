@@ -218,8 +218,12 @@ export default function AnalyticsDashboardPage() {
     try {
       // Guard against a hung getMe: race it with a timeout, and release
       // inFlight below regardless of how this resolves.
-      const meResult = await withTimeout(getMe(), GETME_TIMEOUT_MS)
+      const meResult = await withTimeout(getMe(false, controller.signal), GETME_TIMEOUT_MS)
       if (meResult.timedOut) {
+        // Abandoning the promise is not enough: abort so the in-flight
+        // `/api/auth/me` socket actually closes. Without this the request
+        // outlives the race while `inFlight` is already released below.
+        controller.abort()
         if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
         return
       }

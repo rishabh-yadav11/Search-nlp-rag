@@ -8,7 +8,7 @@
  * These tests drive the real page against a stubbed `fetch`, so they hold
  * whether the value rendered is the id or the question text.
  */
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TOKEN_KEY, clearMeCache } from '../../lib/auth'
 import { formatEpochDateTime } from '../../lib/format'
@@ -252,5 +252,49 @@ describe('AnalyticsDashboardPage — a store that cannot be read is not a quiet 
     expect(cardText('Searches today')).toContain('4')
     expect(cardText('Chat users')).toContain('2')
     expect(document.body.textContent).toMatch(/Updated \d/)
+  })
+})
+
+describe('AnalyticsDashboardPage — a hung identity check is cancelled, not abandoned', () => {
+  it('aborts the in-flight /api/auth/me when the 10 s race gives up', async () => {
+    vi.useFakeTimers()
+    // getMe logs the cancelled identity check; that is expected here, and the
+    // assertion below is on the abort itself, not on the log.
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const captured: { signal: AbortSignal | null } = { signal: null }
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).includes('/api/auth/me')) {
+            captured.signal = init?.signal ?? null
+            const { promise, reject } = Promise.withResolvers<StubResponse>()
+            init?.signal?.addEventListener('abort', () => {
+              const err = new Error('The operation was aborted')
+              err.name = 'AbortError'
+              reject(err)
+            })
+            return promise
+          }
+          return Promise.resolve(jsonResponse(ADMIN))
+        })
+      )
+
+      render(<AnalyticsDashboardPage />)
+      expect(captured.signal).toBeTruthy()
+      expect(captured.signal?.aborted).toBe(false)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000)
+      })
+
+      // Giving up on the promise is not enough: the socket must be closed, or
+      // the request outlives the race while `inFlight` is already released.
+      expect(captured.signal?.aborted).toBe(true)
+      expect(screen.getByText('Analytics unavailable: identity check timed out')).toBeTruthy()
+    } finally {
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    }
   })
 })

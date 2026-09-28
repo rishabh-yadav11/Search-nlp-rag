@@ -126,3 +126,27 @@
   color: var(--muted);
   font-style: italic;
 }
+
+.similar-error {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  color: #a13a2e;
+}
+
+.similar-retry {
+  padding: 0.2rem 0.5rem;
+  background: none;
+  border: 1px solid var(--line-dark);
+  border-radius: 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.similar-retry:hover {
+  background: var(--card-bg);
+  color: var(--ink);
+}
