@@ -663,3 +663,35 @@ def test_a_broken_measurement_is_never_tolerated(summary, counts, why):
     than no gate, so every other reason a run can be red has to be refused.
     """
     assert gate.staleness_failures(summary, counts) is None, why
+
+
+def test_gate_refuses_to_run_off_the_target_interpreter(monkeypatch, capsys):
+    """A block measured elsewhere does not describe this source.
+
+    Statement counts are interpreter-dependent -- 3.11 and 3.14 disagree on
+    byte-identical source -- so a `--write` from the wrong interpreter produces
+    a document that passes locally and is rejected by CI. That is how this gate
+    stayed red on every push to main, so the refusal is checked here rather
+    than left to a comment describing an intent the code does not enforce.
+    """
+    monkeypatch.setattr(gate.sys, "version_info", (3, 14, 7, "final", 0))
+    assert gate.main([]) == 3
+    assert gate.main(["--write"]) == 3
+    errors = capsys.readouterr().err
+    assert "python3.11" in errors
+    assert "3.14.7" in errors
+
+
+def test_measured_with_comparison_ignores_the_coverage_version():
+    """Only the interpreter decides a match; the tool version is provenance.
+
+    The coverage.py version is recorded so a reader can tell what produced the
+    block, but it was measured to make no difference to statement counts, so
+    comparing it would report a mismatch that is not one.
+    """
+    matched = gate.MEASURED_WITH_RE.match("Measured with: Python 3.11.16, coverage 7.16.2")
+    assert matched is not None
+    assert matched.group("interp") == "Python 3.11.16"
+    assert matched.group("interp") == gate.MEASURED_WITH_RE.match(
+        "Measured with: Python 3.11.16, coverage 7.15.4"
+    ).group("interp")
