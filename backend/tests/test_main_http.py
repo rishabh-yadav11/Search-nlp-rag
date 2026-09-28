@@ -4,6 +4,7 @@ error mapping, and analytics beacons)."""
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 from _support import FakeCache, make_article
@@ -607,13 +608,30 @@ def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
 # --- /analytics/summary ---
 
 
+class _NoopStore:
+    async def record_admin_audit(self, actor_id, action):
+        return None
+
+
+class _AuditReq:
+    """Minimal Request stand-in: the handler reads only ``state.user_id``."""
+
+    state = SimpleNamespace(user_id="admin-1")
+
+
 def test_analytics_summary(monkeypatch):
+    # The handler takes a Request and resolves a store because it records the
+    # read in the admin audit trail, as /analytics/chat does (#348). A bare
+    # call supplies neither, so both are provided here; the end-to-end route
+    # (including a real audit row) is covered in test_analytics.py.
+    monkeypatch.setattr(main.chat_module, "_require_store", lambda: _NoopStore())
+
     async def fake_analytics_data():
         return {"searches_total": 5}
 
     monkeypatch.setattr(main, "analytics_data", fake_analytics_data)
 
-    assert _run(main.get_analytics_summary()) == {"searches_total": 5}
+    assert _run(main.get_analytics_summary(_AuditReq(), None, None)) == {"searches_total": 5}
 
 
 def test_analytics_summary_endpoint_maps_store_failure_to_503(monkeypatch):
@@ -624,8 +642,9 @@ def test_analytics_summary_endpoint_maps_store_failure_to_503(monkeypatch):
         raise AnalyticsUnavailableError("analytics unavailable")
 
     monkeypatch.setattr(main, "analytics_data", failing_analytics_data)
+    monkeypatch.setattr(main.chat_module, "_require_store", lambda: _NoopStore())
 
-    res = _run(main.get_analytics_summary())
+    res = _run(main.get_analytics_summary(_AuditReq(), None, None))
 
     assert isinstance(res, JSONResponse)
     assert res.status_code == 503

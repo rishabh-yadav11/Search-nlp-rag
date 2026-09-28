@@ -527,9 +527,9 @@ the `analytics:read` permission (`Authorization: Bearer <token>`).
   "cache_hit_rate": 61.0,
   "avg_latency_ms": 214.3,
   "clicks_total": 33,
-  "top_queries": [["fintech funding", 22], ...],
+  "top_queries": [["q1:3f2a91c0b4d5e6f7a8b9c0d1e2f3a4b", 22], ...],
   "click_positions": { "1": 12, "2": 8, ... },
-  "click_top_queries": [["fintech funding", 9], ...]
+  "click_top_queries": [["q1:3f2a91c0b4d5e6f7a8b9c0d1e2f3a4b", 9], ...]
 }
 ```
 
@@ -541,6 +541,49 @@ Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`)
 that range is clamped to the nearest bound, so every reported bucket is one the
 backend can record. `top_queries` returns at most `TOP_QUERIES_N` (20) entries
 and `click_top_queries` at most `TOP_CLICKED_QUERIES_N` (10).
+
+### Query identifiers are digests, never query text
+
+The first element of each `top_queries` / `click_top_queries` row is an opaque
+**query digest** (`q1:` + 32 hex characters), not the search text. A search
+query is user-authored content and these sets aggregate by query text, so
+returning it verbatim made this a cross-user read of every user's search
+history for any account holding `analytics:read`.
+
+The digest is a function of the query's *canonical* form — casefolded, internal
+whitespace collapsed, then length-bounded — which is the same canonical form the
+click-signal dedupe claim uses. So a query still aggregates into one row however
+it is spelled, and the dashboard can still rank and compare them — but it is a
+keyed HMAC, so it cannot be turned back into the query by anyone who sees the
+digest without the key. This is the same treatment `/analytics/chat` gives
+session titles.
+
+The query text is **never written** — not as a sorted-set member, and not
+inside the `analytics:query_click:{...}` key — so no reader of these
+aggregates, present or future, can hand the text back. The key is
+`ANALYTICS_QUERY_KEY` when set; otherwise the app generates a random one on
+first use and persists it **in the analytics Redis** (DB 1), so all workers
+and restarts share it with no operator action. Changing it invalidates existing
+digests, which empties the two top-query lists but leaks nothing.
+
+That last point is the operational caveat: by default the digest key sits in
+the same DB as the data it keys, so **direct read access to the analytics
+Redis DB is a stronger capability than `analytics:read`** — such a reader can
+recompute a digest for any candidate query and confirm the match offline. This
+endpoint's fix is about the HTTP surface, where an ordinary admin account is
+not entitled to read users' search history. Treat DB 1 as sensitive data
+(which it already is: it holds the aggregates), or set `ANALYTICS_QUERY_KEY` to
+keep the key outside the database.
+
+Rows recorded **before** this change hold verbatim queries. They are never
+returned — the read path drops any member that is not a digest — and they are
+also **deleted from the store** on the first read of this endpoint after the
+upgrade, because the write path re-arms the whole key's TTL on every event and
+a pre-upgrade member would otherwise never expire. An upgraded deployment
+therefore both stops reporting them immediately and stops retaining them.
+
+Each read of this endpoint is recorded in the admin audit trail as
+`analytics.summary.read`, as `/analytics/chat` is.
 
 ### Errors
 

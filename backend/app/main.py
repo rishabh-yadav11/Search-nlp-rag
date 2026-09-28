@@ -1523,14 +1523,29 @@ def _analytics_unavailable(message: str) -> JSONResponse:
 
 @app.get("/analytics/summary")
 async def get_analytics_summary(
+    request: Request,
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("analytics:read")),
 ):
     """Aggregated search/click metrics. Admin-only (analytics:read).
 
+    The ``top_queries`` / ``click_top_queries`` lists carry an opaque per-query
+    digest, never the query text: a search query is user-authored content, and
+    aggregating by text made this a cross-user read of everyone's search
+    history. Each read is recorded in the durable admin audit trail, as
+    /analytics/chat is; a failure to record must not break the read.
+
     Answers 503 when the analytics Redis is unreachable, so a degraded read is
     never served as a 200 all-zero report.
     """
+    # The chat store is only here to hold the audit trail, so resolving it is
+    # part of the best-effort audit, not of the read: a deployment with no chat
+    # store must still serve the (text-free) summary rather than 500 on it.
+    try:
+        store = chat_module._require_store()
+        await store.record_admin_audit(request.state.user_id, "analytics.summary.read")
+    except Exception:
+        logger.exception("admin audit write failed for analytics.summary.read")
     try:
         return await analytics_data()
     except AnalyticsUnavailableError as exc:

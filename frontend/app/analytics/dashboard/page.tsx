@@ -19,6 +19,13 @@ interface Summary {
   click_top_queries: [string, number][]
 }
 
+// The first element of each top-query row is an opaque per-query DIGEST
+// (`q1:` + 32 hex chars), never the search text. A query is user-authored
+// content and these sets aggregate by query text, so the backend used to hand
+// this table a harvested corpus of what every user searched (#348). Counts and
+// ranking still work because the digest is stable per query; there is no text
+// to show and none to "helpfully" recover.
+
 // The first element of each chat row is the OPAQUE session id, never the
 // session title. The title is the first 60 characters of the user's own
 // question, so surfacing it here would leak one user's message text to every
@@ -92,7 +99,7 @@ function TopTable({ rows }: { rows: [string, number][] | undefined }) {
     <table>
       <thead>
         <tr>
-          <th scope="col">Query</th>
+          <th scope="col">Query id</th>
           <th scope="col" className="num">Count</th>
           <th scope="col"></th>
         </tr>
