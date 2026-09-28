@@ -849,8 +849,9 @@ def _seeded_titled_sessions(store):
     Returns (session_ids, titles)."""
     ids, titles = [], []
     for user in (USER_A, USER_B):
-        sid = _run(store.create_session(user)).id
-        _run(chat_module._auto_title(store, sid, user, PRIVATE_QUESTION))
+        session = _run(store.create_session(user))
+        sid = session.id
+        _run(chat_module._auto_title(store, session, PRIVATE_QUESTION))
         _run(store.append_message(sid, user, "user", PRIVATE_QUESTION))
         _run(store.append_message(
             sid, user, "assistant", "here is a generic answer",
