@@ -1188,3 +1188,282 @@ def test_lifespan_startup_failure_propagates(monkeypatch):
         _restore_state(orig)
 
     assert deps["chat_store"].closed is False
+
+
+# --- lifespan teardown resilience (#284) ---
+#
+# The teardown releases ten unrelated resources. As a bare statement chain, one
+# step raising or hanging strands every resource after it -- the Qdrant client
+# and five Redis pools then leak for the rest of the process' life. Each step
+# is therefore individually bounded and individually guarded.
+#
+# The teardown step names below double as the assertion list, so they must stay
+# in step with the teardown_steps tuple in app/main.py.
+_TEARDOWN_STEPS = (
+    "chat retention task",
+    "chat store",
+    "auth token purge task",
+    "auth store",
+    "qdrant client",
+    "cache client",
+    "analytics redis",
+    "cost budget redis",
+    "auth rate-limit redis",
+    "readiness redis",
+)
+
+# The two background-task steps are the odd ones out: the lifespan cancels a
+# task there rather than calling a close, so they are indexed into main.state
+# instead of reached through an attribute.
+_TASK_STEPS = {
+    "chat retention task": "chat_retention",
+    "auth token purge task": "auth_token_purge",
+}
+
+# Upper bound on how long a fixture that refuses to die is left running. It must
+# be well under the test's own deadline: asyncio.run() cancels and gathers every
+# pending task on the way out, so a task that ignores cancellation would stall
+# teardown of the entire suite rather than fail one test.
+_STUBBORN_MAX_SECONDS = 2.0
+
+
+class _IgnoresCancellation:
+    """A real asyncio.Task whose coroutine swallows CancelledError and keeps
+    running: the in-process shape of a teardown step stuck on a socket that
+    never answers.
+
+    This is the one hang ``asyncio.wait_for`` does not save you from -- it
+    waits for the cancellation to land before returning, so a task that refuses
+    to unwind makes it block forever. Hence ``asyncio.wait`` in
+    _cancel_and_wait. Self-terminating, so it can never outlive its test.
+    """
+
+    def __init__(self):
+        self._task = None
+
+    async def start(self):
+        """Return the Task itself -- the one placed in main.state.
+
+        A wrapper object would not do: ``_cancel_and_wait`` hands the value
+        straight to ``asyncio.wait``, which needs a real Task/Future and
+        raises AttributeError on anything else. That raise is swallowed by the
+        step guard, so a wrapper silently turned the hang case into a copy of
+        the raise case while still going green.
+        """
+        self._task = asyncio.get_running_loop().create_task(self._run())
+        # Yielded to, so the coroutine is genuinely inside its sleep loop
+        # before teardown cancels it. A task cancelled before its first step
+        # never runs at all, which would make this fixture a no-op.
+        await asyncio.sleep(0)
+        return self._task
+
+    async def _run(self):
+        # Sliced sleeps, not one long one: the deadline has to be re-checked
+        # often, because each cancel re-arms the sleep. A single 3600s sleep
+        # would be re-entered after every CancelledError and the deadline
+        # would never be reached -- leaving an immortal task that stalls
+        # asyncio.run's own shutdown.
+        deadline = asyncio.get_running_loop().time() + _STUBBORN_MAX_SECONDS
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+
+    async def aclose(self):
+        """Force it to stop, on the loop that created it (a task awaited from a
+        second asyncio.run() belongs to a closed loop and raises)."""
+        self._task.cancel()
+        done, _pending = await asyncio.wait({self._task}, timeout=_STUBBORN_MAX_SECONDS + 5)
+        assert self._task in done, "stubborn task outlived its own deadline"
+
+
+async def _cancel_explodes():
+    """A background task whose cancel() itself raises, killing the teardown step
+    that owns it before it can await anything."""
+    try:
+        await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        raise RuntimeError("cancel exploded") from None
+
+
+def _record_teardown(monkeypatch, deps, released, faults):
+    """Make every lifespan teardown step observable, and fault the one named in
+    ``faults`` (``{step_name: "raise" | "hang"}``).
+
+    A step appends its name to ``released`` only after it has actually
+    completed, so a name missing from the list means the resource was NOT
+    released -- not merely that the step was entered. That distinction is what
+    makes the ordering assertions below meaningful.
+    """
+    holdouts = []
+    exploding = []
+
+    async def _nothing():
+        return None
+
+    async def _run_step(name, close_it):
+        if faults.get(name) == "hang":
+            await asyncio.Event().wait()  # never set: this step never returns
+        if faults.get(name) == "raise":
+            raise RuntimeError(f"{name} exploded")
+        await close_it()
+        released.append(name)
+
+    def _wrap_attribute(name, holder, attr="close"):
+        original = getattr(holder, attr)
+
+        async def close():
+            await _run_step(name, original)
+
+        monkeypatch.setattr(holder, attr, close)
+
+    _wrap_attribute("chat store", deps["chat_store"])
+    _wrap_attribute("auth store", deps["auth_store"])
+    _wrap_attribute("qdrant client", deps["qdrant"])
+    _wrap_attribute("cache client", deps["cache"])
+
+    for owner, attr, name in (
+        (main, "close_analytics", "analytics redis"),
+        (main, "close_cost_budget", "cost budget redis"),
+        (main.auth_module, "close_rate_redis", "auth rate-limit redis"),
+        (main, "health_module_close_redis", "readiness redis"),
+    ):
+
+        async def closer(name=name):
+            await _run_step(name, _nothing)
+
+        monkeypatch.setattr(owner, attr, closer)
+
+    # The stub's own background loops are swapped for observable ones. This runs
+    # after startup because the lifespan reads main.state when it builds the
+    # teardown step list.
+    async def install_task_recorders():
+        for name, state_key in _TASK_STEPS.items():
+            original = main.state[state_key]
+            original.cancel()
+            await asyncio.gather(original, return_exceptions=True)
+
+            if faults.get(name) == "hang":
+                holdout = _IgnoresCancellation()
+                replacement = await holdout.start()
+                holdouts.append(holdout)
+            elif faults.get(name) == "raise":
+                # A real Task whose cancel() raises, for the same reason: the
+                # value in main.state is handed to asyncio.wait. Retrieved
+                # below so the raise does not surface as an unretrieved-task
+                # error when the loop closes.
+                replacement = asyncio.get_running_loop().create_task(_cancel_explodes())
+                exploding.append(replacement)
+                # Started, so teardown's cancel() actually reaches it: a task
+                # cancelled before its first step never runs, which would make
+                # this a clean release instead of the raise under test.
+                await asyncio.sleep(0)
+            else:
+
+                async def _loop(name=name):
+                    try:
+                        await asyncio.sleep(3600)
+                    finally:
+                        released.append(name)
+
+                replacement = asyncio.get_running_loop().create_task(_loop())
+                # Let it actually reach its sleep: a task cancelled before its
+                # first step never enters the coroutine body, so the `finally`
+                # that records the release would never run.
+                await asyncio.sleep(0)
+            main.state[state_key] = replacement
+
+    return install_task_recorders, holdouts, exploding
+
+
+def test_lifespan_teardown_releases_every_resource_in_order(monkeypatch):
+    """The complete, ordered release list on a clean shutdown.
+
+    This is what makes the fault tests below trustworthy: a teardown step
+    missing from the lifespan, or released out of order, fails here first -- so
+    the subsets the fault tests assert are known to be real subsets of a
+    working shutdown.
+    """
+    orig = dict(main.state)
+    monkeypatch.setattr(main.config, "GEMINI_API_KEY", "sk-test")
+    deps = _stub_lifespan_deps(monkeypatch)
+    released = []
+
+    async def scenario():
+        async with main.lifespan(None):
+            install, holdouts, _exploding = _record_teardown(monkeypatch, deps, released, {})
+            await install()
+        for holdout in holdouts:
+            await holdout.aclose()
+
+    try:
+        _run(scenario())
+    finally:
+        _restore_state(orig)
+
+    assert tuple(released) == _TEARDOWN_STEPS
+
+
+@pytest.mark.parametrize("kind", ["raise", "hang"])
+@pytest.mark.parametrize("faulty", _TEARDOWN_STEPS)
+def test_lifespan_teardown_survives_a_broken_step(monkeypatch, caplog, faulty, kind):
+    """One teardown step in turn is made to raise, then to hang. Every resource
+    after it must still be released.
+
+    The broken step is the only expected loss -- a close that raises is by
+    definition not a close that released anything. What is under test is the
+    tail: without per-step guarding, `cache client` (say) and the four Redis
+    pools after it are skipped outright, and without a bound the hanging case
+    never reaches them at all.
+    """
+    orig = dict(main.state)
+    monkeypatch.setattr(main.config, "GEMINI_API_KEY", "sk-test")
+    deps = _stub_lifespan_deps(monkeypatch)
+    released = []
+    # A short bound keeps the suite fast; it is the same code path as the 2s
+    # production value and the hang is real either way.
+    monkeypatch.setattr(main, "_TEARDOWN_CLOSE_TIMEOUT", 0.05)
+
+    async def scenario():
+        holdouts = []
+        exploding = []
+        try:
+            async with main.lifespan(None):
+                install, _h, exploding = _record_teardown(monkeypatch, deps, released, {faulty: kind})
+                holdouts.extend(_h)
+                await install()
+        finally:
+            # Same loop as the tasks' creator, and unconditional: leaving an
+            # immortal pending task behind would stall asyncio.run()'s own
+            # shutdown and hang the suite rather than fail this test.
+            for holdout in holdouts:
+                await holdout.aclose()
+            # Retrieve the raises, so they are not reported a second time as
+            # unretrieved task exceptions when the loop closes.
+            for task in exploding:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*exploding, return_exceptions=True)
+
+    # Ten steps at 0.05s cannot approach this. It exists so that a genuinely
+    # unbounded step fails here instead of hanging the run.
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.main"):
+            _run(asyncio.wait_for(scenario(), timeout=30.0))
+    finally:
+        _restore_state(orig)
+
+    # Every step except the broken one, in the original order: the steps before
+    # it ran normally, and the ones after it must still run despite it.
+    assert tuple(released) == tuple(step for step in _TEARDOWN_STEPS if step != faulty)
+    # The operator can tell which resource leaked, without a debugger.
+    assert faulty in caplog.text
+    if kind == "hang" and faulty in _TASK_STEPS:
+        # A hanging background task is abandoned by the inner asyncio.wait
+        # budget inside _cancel_and_wait. Loosening that budget past the outer
+        # one makes the outer wait_for fire first, so the step is reported as a
+        # generic close timeout and this line never appears -- which is how the
+        # halving stays pinned. Teardown would still reach the later steps;
+        # what changes is that the refusal goes unreported.
+        assert "ignored cancellation" in caplog.text

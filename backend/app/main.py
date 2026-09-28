@@ -39,6 +39,7 @@ from app.answer_fallback import date_label, weak_results_note
 from app.auth import _client_ip, public_rate_limit, require_auth, require_permission, user_rate_limit
 from app.chat import ChatAnalyticsUnavailableError
 from app.click_boost import apply_click_boost
+from app.close_guard import DEFAULT_CLOSE_TIMEOUT, close_quietly
 from app.config import config, ensure_data_paths_ready
 from app.cost_budget import close as close_cost_budget
 from app.diversity import diversify
@@ -272,6 +273,14 @@ async def _load_facet_maps() -> None:
             _CONTENT_TYPE_FACETS = facets
 
 
+# Per-resource budget for one lifespan teardown step: the same 2s the readiness
+# probe gives its own client release. Worst case all ten steps time out, for
+# 20s of the 30s gunicorn graceful_timeout (the deploy's `--timeout 120` is
+# the worker-alive limit, a different knob), so a step stuck on a dead socket
+# costs a bounded slice of the window instead of all of it.
+_TEARDOWN_CLOSE_TIMEOUT = DEFAULT_CLOSE_TIMEOUT
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # First, before any store is opened or any request can be served: prove the
@@ -320,18 +329,74 @@ async def lifespan(app: FastAPI):
     recommender.state = state
 
     yield
-    state["chat_retention"].cancel()
-    await asyncio.gather(state["chat_retention"], return_exceptions=True)
-    await chat_store.close()
-    state["auth_token_purge"].cancel()
-    await asyncio.gather(state["auth_token_purge"], return_exceptions=True)
-    await auth_store.close()
-    await state["qdrant"].close()
-    await cache.close()
-    await close_analytics()
-    await close_cost_budget()
-    await auth_module.close_rate_redis()
-    await health_module_close_redis()
+
+    # Shutdown is a sequence of unrelated releases. Run as a bare statement
+    # chain, one raising or hanging step strands every resource after it -- the
+    # Qdrant client and five Redis pools leak for the rest of the process' life.
+    # Each step therefore goes through close_guard: bounded by
+    # _TEARDOWN_CLOSE_TIMEOUT, failures logged with the resource named, and the
+    # next step always attempted. Cancellation still propagates, so a cancelled
+    # shutdown unwinds.
+    teardown_steps = (
+        ("chat retention task", lambda: _cancel_and_wait("chat retention task", state["chat_retention"])),
+        ("chat store", chat_store.close),
+        ("auth token purge task", lambda: _cancel_and_wait("auth token purge task", state["auth_token_purge"])),
+        ("auth store", auth_store.close),
+        ("qdrant client", state["qdrant"].close),
+        ("cache client", lambda: cache.close()),
+        ("analytics redis", close_analytics),
+        ("cost budget redis", close_cost_budget),
+        ("auth rate-limit redis", auth_module.close_rate_redis),
+        ("readiness redis", health_module_close_redis),
+    )
+    for resource_name, close_step in teardown_steps:
+        await close_quietly(
+            resource_name,
+            close_step,
+            timeout=_TEARDOWN_CLOSE_TIMEOUT,
+            suppress=Exception,
+            log=logger,
+        )
+
+
+async def _cancel_and_wait(resource_name: str, task: asyncio.Task) -> None:
+    """Cancel a background loop and wait for it to unwind.
+
+    ``asyncio.wait`` rather than ``wait_for``/``gather``, for one concrete
+    reason verified against this interpreter: a task that swallows its
+    ``CancelledError`` never completes, and ``wait_for`` -- which waits for
+    the cancellation to land before returning -- then blocks forever instead
+    of timing out. ``asyncio.wait`` returns with the task merely *pending*
+    once the timeout expires, so a loop that refuses to die delays only this
+    one step and every later resource is still released.
+
+    The inner budget is strictly shorter than the ``_TEARDOWN_CLOSE_TIMEOUT``
+    the caller wraps this in, and that ordering is load-bearing rather than
+    cosmetic. Both timers start within microseconds of each other, so with the
+    two equal the outer ``wait_for`` always wins: it cancels this coroutine
+    before the inner wait can report anything, and ``wait_for`` surfaces that
+    as ``TimeoutError``, which ``close_quietly`` catches and logs as a generic
+    close timeout. Teardown still continues to the later steps in that case --
+    but the step is misreported, and the "ignored cancellation" line an
+    operator needs never appears. Halving the inner budget keeps this
+    coroutine's own decision the one that happens, so a task that refuses to
+    die is named as such. Verified by mutation: setting this budget to 10x the
+    outer one fails the two task-step hang tests in tests/test_main_pipeline.py,
+    which assert that abandon message. Do not "simplify" the ratio. The
+    abandoned task is left to the loop's own cancellation.
+
+    """
+    task.cancel()
+    done, _pending = await asyncio.wait({task}, timeout=_TEARDOWN_CLOSE_TIMEOUT / 2)
+    if not done:
+        logger.warning("Background task for %s ignored cancellation; abandoning it", resource_name)
+    elif not task.cancelled() and (exc := task.exception()) is not None:
+        # asyncio.wait does not re-raise, so a background loop that died with
+        # an exception would otherwise disappear silently: this is the only
+        # trace that a retention or purge loop failed on its way out. A task
+        # that unwound normally is cancelled() and its .exception() would
+        # raise, so it is excluded first.
+        logger.warning("Background task for %s failed during shutdown", resource_name, exc_info=exc)
 
 
 app = FastAPI(
