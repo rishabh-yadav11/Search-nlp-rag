@@ -88,13 +88,21 @@ def measured_with_line() -> str:
     return f"{MEASURED_WITH_PREFIX}Python {platform.python_version()}, coverage {coverage_version()}"
 
 
-MEASURED_WITH_RE = re.compile(rf"^{re.escape(MEASURED_WITH_PREFIX)}(?P<detail>.+)$")
+# Captures the interpreter alone (`Python 3.11.16`) so a comparison can ignore
+# the coverage.py version that follows it, which does not affect the counts.
+MEASURED_WITH_RE = re.compile(
+    rf"^{re.escape(MEASURED_WITH_PREFIX)}(?P<interp>Python [\d.]+)(?:, .*)?$"
+)
 
-# The interpreter the committed block is expected to have been measured under.
-# It is the one CI uses (actions/setup-python, python-version "3.11"), the one
-# backend/ruff.toml targets (py311) and the one the README documents, so the
-# block is written under it rather than under whatever the author's box has.
+# The interpreter the committed block is measured under, and the one the gate
+# refuses to run on anything else. It is the one CI uses
+# (actions/setup-python, python-version "3.11"), the one backend/ruff.toml
+# targets (py311) and the one the README documents. The check in main() is
+# what makes this true rather than merely intended: statement counts are
+# interpreter-dependent, so a block written on 3.14 measures differently on a
+# 3.11 runner, which is why this gate was red on every push to main.
 TARGET_PYTHON = "python3.11"
+TARGET_VERSION = (3, 11)
 
 # Run by the gate itself (with the JSON report swapped in, so nothing has to be
 # parsed out of a terminal report) and echoed in the document as `Command:`.
@@ -483,6 +491,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # Enforced in BOTH modes, before any measurement runs. Without this a
+    # developer on a different interpreter can --write a block for their own
+    # interpreter, see it pass locally, and hand CI a document that measures
+    # differently on the runner -- the exact 53-red-run failure this constant
+    # exists to prevent. Recording the interpreter is not enough on its own.
+    if sys.version_info[:2] != TARGET_VERSION:
+        # Report the version the guard actually tested, not a second lookup of
+        # the same fact: platform.python_version() and sys.version_info can
+        # disagree under a monkeypatched interpreter, and an error message that
+        # names the wrong version sends the reader to the wrong place.
+        running = ".".join(str(part) for part in sys.version_info[:3])
+        print(
+            f"error: this gate must be measured under {TARGET_PYTHON} "
+            f"({TARGET_VERSION[0]}.{TARGET_VERSION[1]}), and this is {running}.",
+            file=sys.stderr,
+        )
+        print(
+            "Statement counts are interpreter-dependent, so a block measured "
+            "elsewhere does not describe the same source. Install the pinned "
+            "dependencies under the target interpreter and re-run: "
+            f"{TARGET_PYTHON} -m pip install -r requirements.txt -r requirements-dev.txt",
+            file=sys.stderr,
+        )
+        return 3
+
     try:
         document = DOCUMENT.read_text(encoding="utf-8")
         current = extract_block(document, COVERAGE_BEGIN, COVERAGE_END)
@@ -544,15 +577,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     # different interpreter the diff is a wall of per-module statement counts
     # with nothing in common, and the only useful fact -- that no amount of
     # editing the document will fix it -- is not visible anywhere in it.
-    committed = next(
-        (m.group("detail") for line in current.splitlines() if (m := MEASURED_WITH_RE.match(line))),
+    # Compare the interpreter only. The coverage.py version is recorded for
+    # provenance but is deliberately NOT part of the comparison: it was
+    # measured to make no difference to statement counts (identical 5137/5075
+    # under both 7.15.4 and 7.16.2), so gating on it would report a mismatch
+    # that is not one and send the reader after a cause that does not exist.
+    committed_interp = next(
+        (m.group("interp") for line in current.splitlines() if (m := MEASURED_WITH_RE.match(line))),
         None,
     )
-    running = measured_with_line()[len(MEASURED_WITH_PREFIX) :]
-    if committed is not None and committed != running:
+    running_interp = f"Python {platform.python_version()}"
+    if committed_interp is not None and committed_interp != running_interp:
         print(
-            f"error: the committed block was measured with {committed}, but this run is "
-            f"measuring with {running}.",
+            f"error: the committed block was measured with {committed_interp}, but this "
+            f"run is measuring with {running_interp}.",
             file=sys.stderr,
         )
         print(
