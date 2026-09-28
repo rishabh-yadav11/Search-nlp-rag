@@ -15,9 +15,13 @@ bearer token issued by `POST /api/auth/login`
 is role-based: `user` (the only role public signup can grant — it is not
 configurable) may use chat; `admin` also has
 analytics read + user management. `/search`, `/facets`, `/analytics/click` and
-the auth endpoints are public. Signup/login are rate-limited per IP and, for
-login, per submitted address counting failed attempts only (a correct password
-is never rate-limited); all inputs are validated server-side.
+the auth endpoints are public. The five public data/auth endpoints are all
+rate limited per client IP; signup/login fall back to an in-process limiter
+during a Redis outage, while `/search`, `/facets` and `/analytics/click` answer
+`503` instead. Among the health probes only `/ready` and `/readyz` are limited
+(see [Rate limits](#3-rate-limits)). Login is additionally limited per
+submitted address, counting failed attempts only (a correct password is never
+rate-limited); all inputs are validated server-side.
 Internal machine clients may authenticate with `X-Service-Token` (config
 `AUTH_SERVICE_TOKEN`) — a scoped, expiring credential, not an open admin grant.
 
@@ -37,7 +41,8 @@ Internal machine clients may authenticate with `X-Service-Token` (config
 | `POST /api/auth/users/{id}/tokens/revoke` | `admin` | Revoke all of a user's tokens |
 
 Signup validation: `email` (format, ≤254, lowercased),
-`password` (8–128 chars, must contain a letter and a digit), `name` (optional,
+`password` (8–72 **bytes** UTF-8, must contain a letter and a digit; the upper
+bound is bcrypt's, and over-long → `422`), `name` (optional,
 ≤60, no control characters). Signup always returns `200`
 `{"message": "If this email is not already registered, your account is ready. Sign in with your email and password to continue; if you already have an account, sign in with your existing password."}`
 and never a token, so a fresh address and an already-registered one (including
@@ -76,8 +81,12 @@ role carries all three.
 | Access | Endpoints |
 |---|---|
 | **Public** (no token) | `GET /search`, `GET /facets`, `POST /analytics/click`, `POST /api/auth/signup`, `POST /api/auth/login`, health (`/health`, `/live`, `/ready`, `/readyz`) |
-| **Any authenticated user** (`user` role, default) | `POST/GET/PATCH/DELETE /api/chat/...`, `POST /api/auth/logout`, `POST /api/auth/change-password` |
+| **Any authenticated user** (`user` role, default) | `POST/GET/PATCH/DELETE /api/chat/...`, `POST /api/auth/logout`, `POST /api/auth/change-password`, `GET /recommend/similar/{article_id}`, `GET /recommend/for-you`, `GET /recommend/trending` |
 | **Admin only** | `GET /analytics/summary`, `GET /analytics/chat`, all `GET/PATCH/DELETE /api/auth/users...` |
+
+The three `GET /recommend/...` routes are authenticated but carry **no rate
+limit**, as the `/api/chat/...` routes do. Throttle them in the client if that
+matters to you.
 
 Chat conversations are scoped to the account that created them — a token can
 never see or modify another account's conversations. `403` means the token is
@@ -119,8 +128,10 @@ route carries a limiter, and this is a decision rather than an oversight: chat
 turns are bounded by the global LLM daily budget instead (see
 `LLM_DAILY_BUDGET_USD`), which bounds spend. Other `/api/chat/...` routes are
 bounded by authentication and per-account ownership checks instead. Do not
-expect a `429` from a chat route; if you need to throttle chat clients, do it
-in the client.
+expect a *rate-limit* `429` from a chat route; the only `429` chat can return is
+the daily-budget one, `{"detail": {"error": "Daily AI budget reached", …}}` on
+`POST /api/chat/sessions/{id}/messages` and an `error` event on the SSE route.
+If you need to throttle chat clients, do it in the client.
 
 #### Which client IP is counted
 
@@ -175,6 +186,7 @@ rotating addresses. The two counters are keyed separately and cannot collide.
 written for it**. Other decline statuses: `429` when the account has already
 interacted with `USER_MAX_DISTINCT_INTERACTIONS` (500) distinct articles, and
 `503` when the article index is unreachable.
+
 ### 4. Consuming the chat SSE stream
 
 `POST /api/chat/sessions/{id}/messages/stream` returns Server-Sent Events.
@@ -195,10 +207,18 @@ chart or strip the fence before showing raw markdown.
 
 ### 5. Errors & conventions
 
-- Errors are uniform JSON: `{"detail": "<message>"}` (FastAPI default).
+- Errors are usually `{"detail": "<message>"}` (the FastAPI default), but two
+  families are not: a chat failure returns `detail` as an **object**
+  (`{"detail": {"error": ..., "detail": ...}}`), and a `/ready` or `/readyz`
+  probe that raises unexpectedly answers `500` with `ready` / `checks` / `error`
+  and **no** `detail` key. Read `detail` defensively.
 - Status codes: `401` auth required/expired, `403` role forbidden, `404` session
-  not found, `409` duplicate email, `422` input validation, `429` rate limit or
-  daily LLM budget reached, `503` LLM/model unavailable.
+  not found, `422` input validation, `429` rate limit (with `Retry-After`) or
+  daily LLM budget reached, `503` LLM/model or budget store unavailable
+  **or rate limiter unavailable** on the fail-closed surfaces listed in
+  [Rate limits](#3-rate-limits). A duplicate email is **not** a `409`: signup
+  answers the same `200` for a new and an already-registered address, so the
+  response cannot be used to test whether an account exists.
 - All `GET /search` responses carry `cached`, `latency_ms`, and `note` fields.
 - The internal eval scripts authenticate with an `X-Service-Token` header. It is
   a scoped, expiring credential: it may only exercise
@@ -219,6 +239,11 @@ chart or strip the fence before showing raw markdown.
 
 Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involved.
 
+Public (no token) and rate limited per client IP by
+`PUBLIC_SEARCH_RATE_PER_MIN` (60) over a `PUBLIC_RATE_WINDOW_SECONDS` (60)
+window — exceed → `429`. Answers `503` when the limiter's Redis is
+unreachable. See [Rate limits](#3-rate-limits).
+
 ### Query parameters
 
 | Param       | Type   | Required | Default | Notes |
@@ -228,6 +253,7 @@ Hybrid semantic search (dense + sparse BM25, RRF-fused, reranked). No LLM involv
 | `industry`  | string | no       | —       | Comma-separated industry values (filter) |
 | `dealtype`  | string | no       | —       | Comma-separated deal-type values (filter) |
 | `author`    | string | no       | —       | Comma-separated author names (filter) |
+| `content_type` | string | no     | —       | Comma-separated content-type values (filter); part of the cache key |
 | `from_date` | string | no       | —       | `YYYY-MM-DD`, inclusive |
 | `to_date`   | string | no       | —       | `YYYY-MM-DD`, inclusive (end of day) |
 
@@ -439,6 +465,11 @@ Notes:
 
 Distinct values for filter autocomplete. Cached in Redis.
 
+Public (no token) and rate limited per client IP by
+`PUBLIC_FACETS_RATE_PER_MIN` (60) over the same `PUBLIC_RATE_WINDOW_SECONDS`
+(60) window — exceed → `429`, and `503` when the limiter's Redis is
+unreachable. See [Rate limits](#3-rate-limits).
+
 ### Response
 
 ```json
@@ -469,8 +500,11 @@ Anonymous result-click beacon sent by the frontend when a user opens a result
 
 ### Response
 
-`200` with `{"ok": true}`. Recording is best-effort; a Redis outage never
-affects search.
+`200` with `{"ok": true}`. The *recording* is best-effort and never raises, so
+a dead analytics store does not turn into a `500`. The endpoint itself is
+still bounded: it answers `429` past `PUBLIC_CLICK_RATE_PER_MIN` (120), and
+`503` when the limiter's Redis is unreachable — it fails closed, unlike the
+auth endpoints (see Rate limits).
 
 ---
 
@@ -606,11 +640,19 @@ endpoints below with the bearer token, and refreshes every 30s.
 
 | Endpoint | Purpose | Status |
 |----------|---------|--------|
-| `GET /health` | Liveness (checks nothing) | always `200` if the process is up |
-| `GET /live`   | Liveness alias | `200` |
-| `GET /ready`  | Readiness (JSON report) | `200` when ready, `503` if Qdrant/models unavailable or `GEMINI_API_KEY` is missing/placeholder/malformed |
-| `GET /readyz` | Readiness (bare) | `200` / `503` |
+| `GET /health` | Liveness (checks nothing), unrated | always `200` if the process is up |
+| `GET /live`   | Liveness alias, unrated | `200` |
+| `GET /ready`  | Readiness (JSON report), rate limited | `200` when ready, `503` if Qdrant/models unavailable or `GEMINI_API_KEY` is missing/placeholder/malformed, `429` past `PUBLIC_READY_RATE_PER_MIN` |
+| `GET /readyz` | Readiness (bare), rate limited | `200` / `503` / `429` |
 | `GET /ready/deep` | Readiness, uncached + unrated, local monitoring only | `200` / `503`; `403` for a non-loopback or proxied caller |
+
+`/ready` and `/readyz` share **one** rate-limit bucket (`PUBLIC_READY_RATE_PER_MIN`,
+600 per `PUBLIC_RATE_WINDOW_SECONDS`, keyed on client IP), so probing both
+costs one budget, not two. Their limiter **fails open**: a `429` there makes a
+load balancer pull a healthy node from rotation, so a broken limiter store
+falls back to the bounded in-process counter instead of `503`. The default sits
+an order of magnitude above a 1 Hz prober for the same reason. `/health`,
+/live` and `/ready/deep` carry no limiter at all.
 
 `/ready` example:
 
@@ -626,7 +668,9 @@ endpoints below with the bearer token, and refreshes every 30s.
 }
 ```
 
-Redis down does not fail readiness (the API degrades to an in-process cache).
+Redis down does not fail readiness (the API degrades to an in-process cache),
+and `/ready`'s own rate limiter fails open to the in-process limiter rather
+than `503` for the same reason.
 A missing, placeholder or malformed `GEMINI_API_KEY` does: chat would answer
 every question from the canned fallback, so `checks.llm.reason` is `missing`,
 `placeholder` or `malformed` and readiness is `false`. `reason` is a
@@ -683,20 +727,22 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
 
 - **Auth**: bearer tokens (7-day expiry, revocable) gate chat, analytics and
   user management; `/search`, `/facets`, `/analytics/click` and the auth
-  endpoints are public. Signup/login are rate-limited per IP via Redis and login
-  additionally per submitted address, counting failed logins only so the
-  per-address limit cannot be used to lock a known account out. The
-  per-address limit caps the *rate* of attempts on one account, not an
-  attacker's cost — it is checked after the password verify, so being refused
-  is free; the per-IP limit is what bounds cost. When Redis is unreachable
-  these limits fall back to a bounded in-process limiter rather than switching
-  off. A user
+  endpoints are public. Signup/login are rate-limited per IP via Redis and login additionally per
+  submitted address, counting failed logins only so the per-address limit
+  cannot be used to lock a known account out. The per-address limit caps the
+  *rate* of attempts on one account, not an attacker's cost — it is checked
+  after the password verify, so being refused is free; the per-IP limit is
+  what bounds cost. `/search`, `/facets` and `/analytics/click` are rate
+  limited per IP too (60/60/120 per minute) and, unlike the auth endpoints,
+  **fail closed** with `503` when the limiter's Redis is unreachable. See
+  [Rate limits](#3-rate-limits) for the full table and the outage posture of
+  each surface. A user
   holds at most `AUTH_MAX_ACTIVE_TOKENS_PER_USER` active tokens; logging in
   past that revokes the oldest. `AUTH_SERVICE_TOKEN` lets internal scripts
   authenticate as a scoped, expiring machine user.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
-- **Caching**: `/search` responses are cached (TTL `CACHE_TTL_SECONDS`, default 300s) keyed by effective query + filters. `cached: true` indicates a cache hit. Chat turns are not cached. When Redis is unreachable, the cache degrades to an in-process store so the API keeps working.
+- **Caching**: `/search` responses are cached (TTL `CACHE_TTL_SECONDS`, default 300s) keyed by effective query + filters. `cached: true` indicates a cache hit. Chat turns are not cached. When Redis is unreachable the *cache* degrades to an in-process store, so search keeps working — but the *rate limiter* is a separate dependency on the same Redis and fails closed, so `/search` still answers `503` in that state (see [Rate limits](#3-rate-limits)).
 - **Retention**: conversations idle for 180 days are purged daily.
 - **No interactive docs**: `/docs`, `/redoc` and `/openapi.json` are disabled in
   every environment. They publish the full route list, the request/response
