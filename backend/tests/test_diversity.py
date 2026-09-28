@@ -1,13 +1,14 @@
 """Diversity tests: MMR `diversify` short-circuit, the greedy MMR loop
 (sim_thresh floor, lam weighting, multi-chosen max_sim), the NaN early-stop,
-and the `_tokens`/`_jaccard` helpers."""
+and the `_tokens` helper plus the shared `jaccard` it is paired with."""
 
 import itertools
 import logging
 import random
 from types import SimpleNamespace
 
-from app.diversity import _jaccard, _tokens, diversify
+from app.diversity import _tokens, diversify
+from app.lexical import jaccard
 
 
 def _res(title, score):
@@ -27,7 +28,7 @@ def _legacy_diversify(results, n, lam=0.7, sim_thresh=0.4):
     def max_sim(i, chosen_idx):
         best = 0.0
         for j in chosen_idx:
-            s = _jaccard(tok[i], tok[j])
+            s = jaccard(tok[i], tok[j])
             if s >= sim_thresh and s > best:
                 best = s
         return best
@@ -75,17 +76,17 @@ def test_tokens_empty_or_none_title_returns_empty():
     assert _tokens(None) == frozenset()
 
 
-# --- _jaccard ---
+# --- jaccard ---
 
 
 def test_jaccard_empty_set_returns_zero():
-    assert _jaccard(frozenset(), frozenset({"a"})) == 0.0
-    assert _jaccard(frozenset({"a"}), frozenset()) == 0.0
-    assert _jaccard(frozenset(), frozenset()) == 0.0
+    assert jaccard(frozenset(), frozenset({"a"})) == 0.0
+    assert jaccard(frozenset({"a"}), frozenset()) == 0.0
+    assert jaccard(frozenset(), frozenset()) == 0.0
 
 
 def test_jaccard_overlap_ratio():
-    assert _jaccard(frozenset({"a", "b", "c"}), frozenset({"b", "c", "d"})) == 2 / 4
+    assert jaccard(frozenset({"a", "b", "c"}), frozenset({"b", "c", "d"})) == 2 / 4
 
 
 # --- diversify short-circuit (line 34) ---
