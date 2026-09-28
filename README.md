@@ -29,6 +29,7 @@ I built this as a hybrid retrieval + RAG search system over the VCCircle article
 - [TLS (HTTPS)](#tls-https)
 - [Security](#security)
 - [Supported Settings](#supported-settings)
+- [Measuring the click boost](#measuring-the-click-boost)
 - [Testing and CI](#testing-and-ci)
 
 ## Architecture
@@ -482,9 +483,25 @@ All optional (`backend/.env`), see `.env.example` for the full list:
 | `WEAK_RESULT_SCORE` / `WEAK_RESULT_MIN_STRONG` | `0.3` / `3` | A hit counts as strong above `WEAK_RESULT_SCORE`; a result list with fewer than `WEAK_RESULT_MIN_STRONG` strong hits is reported as weakly answered (capped at the list length, floored at 1). Moves the `/search` weak note; chat's fallback only ever sees one source, where the count is always 1 |
 | `DATE_FILLER_SCORE` | `0.2` | Relevance floor for date-only fallback fillers (temporal queries whose lexical signal is too weak to fill the window). Independent of `ASK_MIN_SCORE` — keep it at or above that gate, or the fillers are dropped before the model sees them |
 | `ENABLE_QUERY_EXPANSION` / `ENABLE_ENTITY_BOOST` / `ENABLE_WEAK_FALLBACK` | `true` / `true` / `true` | Query-synonym expansion; entity-mention rerank boost; honest weak-result fallback (see `app/query_expand.py`, `app/rerank_boost.py`, `app/answer_fallback.py`) |
+| `ENABLE_CLICK_BOOST` / `CLICK_BOOST_MIN_CLICKS` / `CLICK_BOOST_MIN_ARTICLE_CLICKS` / `CLICK_BOOST_MIN_SHARE` / `CLICK_BOOST_MULT` | `true` / `5` / `3` / `0.3` / `1.3` | Click-driven learning (`app/click_boost.py`): a result is re-ranked when one article holds at least `MIN_ARTICLE_CLICKS` of a query's clicks *and* at least `MIN_SHARE` of them, on a query with at least `MIN_CLICKS` clicks. Counts are per-client votes, so one visitor counts once. See [Measuring the click boost](#measuring-the-click-boost) before changing them |
+| `CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS` | `3600` | How long one client counts once per (query, article) for the click signal. This is the control that stops a forged `/analytics/click` burst from moving the ranking — it works at any threshold above. `0` disables it |
 | `ANALYTICS_REDIS_DB` | `1` | Analytics aggregates live in Redis DB N (cache is DB 0); read endpoints are gated by the auth layer (admin role) |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8001` | Comma-separated allowed origins for CORS (production is same-origin through nginx) |
 | `ALLOWED_HOSTS` | derived from `CORS_ORIGINS` + this box's hostname/addresses (including its default-route address) + `localhost,127.0.0.1,testserver` | Comma-separated hostnames the API answers to; a request with any other `Host` gets 400 (`TrustedHostMiddleware`), and the effective list is logged at startup. A wrong value here 400s the whole site; `*` is rejected. Set it when the API is reachable under a name none of the defaults cover, e.g. a registered public domain. The API also serves no `/docs`, `/redoc` or `/openapi.json` — see `docs/API.md` |
+
+### Measuring the click boost
+
+The click-boost thresholds are a ranking-tuning decision, not a security control. The forged-beacon attack they were once bundled with is stopped by `CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS` at *any* threshold; raising the thresholds does not harden anything further, it only makes the boost harder to fire for real signal — and a bar real traffic never reaches switches the feature off silently, with no symptom other than ranking that quietly stops learning. So measure before changing them:
+
+```bash
+cd backend
+python scripts/click_boost_report.py            # add --top N to list the busiest tallies
+```
+
+Read-only, and safe to point at production. It scores every per-query click tally still in the analytics Redis under the policy this deployment is actually running *and* under the stricter alternative, on the same data, and prints the distribution behind both: each query's total clicks, its top article's count and share, and how far the closest genuine article is from clearing the gate. With no click data at all it says so and draws no conclusion. It exits `2` if it cannot reach Redis, so an unmeasurable run is never mistaken for a quiet deployment.
+
+Two things to know about what it measures. Tallies are deduped votes accumulated since each query was last quiet for `CLICK_QUERY_TTL_SECONDS` (7 days), and they never decay — a query that stops receiving clicks loses its history entirely, so this is a rolling window over recently-active queries, not a per-day rate. And `backend/.env` wins over the code default, so a retune in `config.py` does not reach a deployment whose `.env` sets these keys; the report prints the policy in force and warns when it differs from the shipped default.
+
 
 ## Testing and CI
 
