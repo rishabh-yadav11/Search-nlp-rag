@@ -1,7 +1,7 @@
 'use client'
 import { devApiBase, parseApiBaseUrl, readApiBaseEnv } from './api-base'
 import { isSafeRedirect } from './safe-url'
-import { createDeadline, ME_DEADLINE_MS } from './deadline'
+import { createDeadline, LOGOUT_DEADLINE_MS, ME_DEADLINE_MS } from './deadline'
 
 export const TOKEN_KEY = 'vccircle_auth_token'
 
@@ -285,7 +285,10 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
       // cancellation or a timeout, NOT a malformed payload. Swallowing it
       // would resolve `null` — this function's "definitive logged out"
       // sentinel — and the outer classification below would never run, so a
-      // hung auth service would masquerade as a rejected token.
+      // hung auth service would masquerade as a rejected token. This is the
+      // same guard `api()` in chat/page.tsx and the For You page apply to
+      // their own reads.
+      if (deadline.timedOut() || (err as Error)?.name === 'AbortError') throw err
       // Genuine malformed/non-JSON 200: don't throw (callers may lack a
       // .catch); treat as an unexpected payload and return null safely.
       console.error('getMe: failed to parse /api/auth/me response')
@@ -332,9 +335,22 @@ export function clearMeCache(): void {
  * purpose: the local session is dropped whether or not the backend call
  * succeeds, so a network failure cannot leave the user stuck on an
  * authenticated page.
+ *
+ * Bounded like every other request here (#287): a backend that accepts the
+ * connection and never answers would otherwise hold the socket open forever,
+ * since the caller has already navigated away and nothing is left to release
+ * it. The bound only ever releases that socket — it never delays the
+ * redirect, and a failure is swallowed either way.
  */
 export function logout(): void {
-  fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: authHeaders() }).catch(() => {})
+  const deadline = createDeadline(LOGOUT_DEADLINE_MS)
+  fetch(`${API_BASE}/api/auth/logout`, {
+    method: 'POST',
+    headers: authHeaders(),
+    signal: deadline.signal,
+  })
+    .catch(() => {})
+    .finally(() => deadline.clear())
   redirectToLogin()
 }
 

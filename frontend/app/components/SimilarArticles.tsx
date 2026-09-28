@@ -61,7 +61,6 @@ export default function SimilarArticles({
           setLoading(false)
         }
       })
-      .finally(() => deadline.clear())
 
     return () => {
       active = false

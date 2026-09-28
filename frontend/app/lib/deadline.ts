@@ -48,6 +48,13 @@ export const CHAT_API_DEADLINE_MS = 30_000
  * left in flight once the caller has stopped caring.
  */
 export const ME_DEADLINE_MS = 15_000
+/**
+ * The sign-out POST. Fire-and-forget behind an immediate redirect, so nobody
+ * is waiting on the answer — the bound only exists to release the socket.
+ * Short on purpose: the user has already left the page, and the request is
+ * only worth keeping alive for as long as a normal auth round trip takes.
+ */
+export const LOGOUT_DEADLINE_MS = 10_000
 
 export interface Deadline {
   /** Pass to `fetch({ signal })`. Aborts on the deadline or on `base`. */

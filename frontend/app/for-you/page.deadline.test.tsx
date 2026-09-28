@@ -89,16 +89,59 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
     expect(captures[1].signal?.aborted).toBe(true)
   })
 
-  it('aborts the request on unmount without reporting a timeout', async () => {
-    const view = render(<ForYouPage />)
-    expect(captures[0].signal?.aborted).toBe(false)
+  it('keeps a still-mounted feed out of the cancelled request’s error path', async () => {
+    // The observable form of "unmounting does not report a timeout". Unmounting
+    // destroys the DOM, so an assertion afterwards can only ever see a
+    // torn-down tree — it passes whether or not the page misbehaved, which is
+    // why the old unmount test here asserted nothing. The feed type is switched
+    // instead, which cancels request #1 and starts request #2 while the page
+    // stays mounted: a stray timeout message from the abandoned request has a
+    // live component to render into and cannot hide.
+    //
+    // #1 hangs until the deadline and #2 answers, so exactly one request
+    // fails: if the page painted the abandoned one, the text would show.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        captures.push({ url, signal: init?.signal ?? null })
+        if (captures.length > 1) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              articles: [{ id: 9, title: 'Trending deal', url: 'https://vccircle.com/news/trending' }],
+            }),
+          } as unknown as Response)
+        }
+        const { promise, reject } = Promise.withResolvers<Response>()
+        init?.signal?.addEventListener('abort', () => {
+          const err = new Error('The operation was aborted')
+          err.name = 'AbortError'
+          reject(err)
+        })
+        return promise
+      })
+    )
 
-    view.unmount()
+    render(<ForYouPage />)
+    await advance(0)
+    expect(captures).toHaveLength(1)
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Trending' }))
+    })
+    expect(captures).toHaveLength(2)
+
+    // Past the deadline, so the abandoned request #1 fails for real.
+    await advance(RECOMMEND_DEADLINE_MS)
     expect(captures[0].signal?.aborted).toBe(true)
 
-    // Nothing to assert on the DOM (it is gone); the guard is that no state
-    // update is attempted, which the absence of an act() warning proves.
-    await advance(RECOMMEND_DEADLINE_MS)
+    // The feed the user is actually on moved on, so #1's timeout must not be
+    // reported...
+    expect(screen.queryByText(/did not respond in time/)).toBeNull()
+    // ...and #2's answer is what the page shows.
+    expect(screen.getByText('Trending deal')).toBeTruthy()
   })
 })
 

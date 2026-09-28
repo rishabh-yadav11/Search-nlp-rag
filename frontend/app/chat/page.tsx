@@ -303,10 +303,19 @@ export default function ChatPage() {
           detail.truncated && total > msgs.length ? { hidden: total - msgs.length } : null
         )
         setMessages(msgs)
-      } catch {
+      } catch (err) {
         setMessages([])
         setHistoryTruncated(null)
-        setError('Could not load this conversation.')
+        // Same treatment as `newSession` and `deleteSession`: a hung backend
+        // must say so. Leaving this generic meant the one session load that
+        // can block a whole conversation read reported the same "could not
+        // load" for a 30 s deadline and for a 404, and the user had no way to
+        // tell a retry worth making from a session that is simply gone.
+        setError(
+          err instanceof RequestTimeoutError
+            ? err.message
+            : 'Could not load this conversation.'
+        )
       }
     },
     []

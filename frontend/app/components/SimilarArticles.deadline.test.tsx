@@ -1,15 +1,25 @@
 /**
- * Issue #287 — a hung `/recommend/similar/*` response must not pin a
+ * Issue #287 — a hung `/recommend/similar/batch` response must not pin a
  * SimilarArticles card in "Loading..." forever. The stub holds the request open
  * until its signal aborts, which is what a silent backend looks like to
  * `fetch`: without a deadline the card is stuck on the loading branch forever.
+ *
+ * The deadline lives in `app/lib/similar.ts`, on the shared batch request
+ * (#353 moved the fetch there), so these tests drive the card but assert on the
+ * signal that module handed to `fetch`.
+ *
+ * The component is imported fresh per test because `similar.ts` keeps its cache
+ * and in-flight map at module scope: without a reset, a card from an earlier
+ * test is served from memory and never issues a request, and every assertion
+ * here would pass or fail on the wrong one.
  */
 import { act, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RECOMMEND_DEADLINE_MS } from '../lib/deadline'
-import SimilarArticles from './SimilarArticles'
+import type SimilarArticlesComponent from './SimilarArticles'
 
 let signals: (AbortSignal | null)[] = []
+let SimilarArticles: typeof SimilarArticlesComponent
 
 function hangingFetch() {
   return vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
@@ -27,10 +37,12 @@ function hangingFetch() {
   })
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.useFakeTimers()
   signals = []
   vi.stubGlobal('fetch', hangingFetch())
+  vi.resetModules()
+  ;({ default: SimilarArticles } = await import('./SimilarArticles'))
 })
 
 afterEach(() => {
@@ -60,6 +72,8 @@ describe('SimilarArticles — a hung request does not pin the loading state', ()
 
   it('aborts the in-flight request on timeout instead of leaving it open', async () => {
     render(<SimilarArticles articleId={1} compact />)
+    // The batch flush is a macrotask, so the request only exists after a tick.
+    await advance(0)
     expect(signals[0]?.aborted).toBe(false)
 
     await advance(RECOMMEND_DEADLINE_MS)
@@ -83,17 +97,93 @@ describe('SimilarArticles — a hung request does not pin the loading state', ()
     await act(async () => {
       screen.getByRole('button', { name: 'Retry' }).click()
     })
+    // The batch flush is a macrotask (see `similar.ts`), so fake timers have
+    // to be moved for request #2 to actually leave.
+    await advance(0)
     expect(signals).toHaveLength(2)
     expect(signals[1]?.aborted).toBe(false)
     await advance(RECOMMEND_DEADLINE_MS)
     expect(signals[1]?.aborted).toBe(true)
   })
+})
 
-  it('aborts the request on unmount without reporting a timeout', async () => {
+describe('SimilarArticles — a cancelled card is silent while a live one is not', () => {
+  // The observable form of "unmounting does not report a timeout". Unmounting
+  // destroys the DOM, so an assertion after `unmount()` can only ever see a
+  // torn-down tree — it passes whether or not the component misbehaved. This
+  // keeps the card MOUNTED and swaps its articleId instead: the old request is
+  // abandoned and a new one starts, so a stray "did not load in time" from the
+  // abandoned request has a live component to render into and cannot hide.
+  it('renders no timeout message for a request the card stopped waiting on', async () => {
+    // Request #1 hangs until the deadline; #2 answers. That asymmetry is what
+    // makes the assertion observable: exactly one of the two requests fails,
+    // so if the card painted #1's failure the text would be on screen.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const signal = init?.signal ?? null
+        signals.push(signal)
+        if (signals.length > 1) {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              results: [
+                {
+                  article_id: 2,
+                  similar_articles: [
+                    { id: 20, title: 'Answered', url: 'https://vccircle.com/news/answered' },
+                  ],
+                },
+              ],
+            }),
+          } as unknown as Response)
+        }
+        const { promise, reject } = Promise.withResolvers<Response>()
+        signal?.addEventListener('abort', () => {
+          const err = new Error('The operation was aborted')
+          err.name = 'AbortError'
+          reject(err)
+        })
+        return promise
+      })
+    )
+
     const view = render(<SimilarArticles articleId={1} compact />)
-    view.unmount()
+    await advance(0)
+    expect(signals).toHaveLength(1)
+
+    view.rerender(<SimilarArticles articleId={2} compact />)
+    expect(screen.getByText('Loading...')).toBeTruthy()
+    // As above: the second id joins the next batch flush, a macrotask.
+    await advance(0)
+    expect(signals).toHaveLength(2)
+
+    // Past the deadline, so the abandoned request #1 fails for real.
+    await advance(RECOMMEND_DEADLINE_MS)
     expect(signals[0]?.aborted).toBe(true)
 
+    // The card moved on, so #1's timeout must not be reported to the user...
+    expect(screen.queryByText(/did not load in time/)).toBeNull()
+    // ...and #2's answer must be what it actually shows.
+    expect(screen.getByText('Answered')).toBeTruthy()
+  })
+
+  it('still reports the timeout on the card that is actually waiting', async () => {
+    // The control for the test above: a single mounted card DOES surface the
+    // same elapsed time as an error, so the silence there is the unmount's
+    // doing and not an inert assertion.
+    const view = render(<SimilarArticles articleId={1} compact />)
+    await advance(0)
+    expect(signals).toHaveLength(1)
+
     await advance(RECOMMEND_DEADLINE_MS)
+    expect(screen.getByText(/did not load in time/)).toBeTruthy()
+
+    // And the card recovers on Retry rather than staying broken.
+    await act(async () => {
+      screen.getByRole('button', { name: 'Retry' }).click()
+    })
+    expect(screen.queryByText(/did not load in time/)).toBeNull()
   })
 })
