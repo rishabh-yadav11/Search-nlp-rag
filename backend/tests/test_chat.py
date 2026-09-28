@@ -11,8 +11,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+from functools import partial
 from typing import ClassVar
 
+import anyio
 import httpx
 import openai
 import pytest
@@ -5238,8 +5240,14 @@ def test_json_turn_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(
         _release_store(store)
 
 
-def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas):
-    """Run the real ASGI stack and drop the connection mid-provider-stream.
+def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=False):
+    """Run the real ASGI stack and drop the connection mid-response.
+
+    `park_in_send` decides where the turn is when the disconnect lands: by
+    default inside the provider stream, which is a `stream_answer` await the
+    turn's own polling gate never reaches; with it set, inside Starlette's own
+    `send()` between two deltas, where the cancellation reaches the CONSUMER
+    and the generator is finalised with GeneratorExit instead.
 
     This is the production shape, not a stub: FastAPI hands the request to
     Starlette's StreamingResponse, which runs the body iterator in an anyio task
@@ -5289,6 +5297,12 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas):
             sent["bodies"].append(message.get("body", b"")[:80])
         if message["type"] == "http.response.body" and b"event: delta" in message.get("body", b""):
             sent["deltas"] += 1
+            if park_in_send and sent["deltas"] >= n_deltas:
+                # Park HERE, inside Starlette's send(): the generator is
+                # suspended at its yield, so the cancellation lands on the
+                # consumer and no handler inside the generator can run.
+                state["drop"] = True
+                await asyncio.sleep(3600)
 
     async def receive():
         # FastAPI reads the request body through this same callable, so the
@@ -5330,19 +5344,25 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas):
         assert sent["deltas"] == n_deltas, sent["bodies"]
 
     def run():
-        """Drive the app on its own event loop in a daemon thread.
+        """Drive the app, and read the turn back, on one daemon thread.
 
-        A turn whose cancellation rollback is missing does not merely fail: anyio
-        re-raises the cancellation at every await, so the app task can spin
-        without ever yielding long enough for an in-loop timer to fire, and the
-        whole suite wedges instead of reporting. Joining the thread with a
-        timeout turns that stall into a plain test failure.
+        Both halves live on the worker so the join timeout covers both. A turn
+        whose cancellation rollback is missing does not merely get the wrong
+        rows: the abandoned in-flight commit leaves the aiosqlite connection
+        unusable, so a read issued from the main thread blocks forever and the
+        whole suite wedges instead of reporting. Joining with a timeout turns
+        that stall into a plain failure.
         """
         outcome: dict = {}
 
+        async def call_and_read():
+            await call_app()
+            rows, _total = await chat_store.messages_page(sid, user_id)
+            return rows
+
         def worker():
             try:
-                asyncio.run(call_app())
+                outcome["rows"] = asyncio.run(call_and_read())
             except BaseException as exc:  # noqa: BLE001 - re-raised below
                 outcome["error"] = exc
 
@@ -5351,11 +5371,12 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas):
         thread.join(timeout=20)
         if thread.is_alive():
             raise AssertionError(
-                "the ASGI call never finished: a cancelled turn with no rollback "
-                "can stall the app task rather than fail it"
+                "the ASGI turn never finished: a cancelled turn with no rollback "
+                "can stall the app task, and its store, rather than fail"
             )
         if "error" in outcome:
             raise outcome["error"]
+        return [(m.role, m.content, m.aborted) for m in outcome["rows"]]
 
     return run, chat_store, auth_store, sid, user_id
 
@@ -5365,10 +5386,9 @@ def test_real_disconnect_before_any_delta_rolls_back_the_turn(tmp_path, monkeypa
     the user message is rolled back and no assistant row is written. Fails
     outright if the rollback is unshielded -- the level cancellation would
     interrupt it before the delete lands."""
-    run, chat_store, auth_store, sid, user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 0)
+    run, chat_store, auth_store, _sid, _user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 0)
     try:
-        run()
-        assert _turn_rows(chat_store, sid, user_id) == []
+        assert run() == []
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -5380,10 +5400,9 @@ def test_real_disconnect_after_deltas_persists_the_truncated_turn(tmp_path, monk
     """The same real disconnect, once a delta is on the wire: the ONE abort
     rule persists the truncated turn flagged aborted and keeps the user
     message, instead of erasing what the client is still displaying."""
-    run, chat_store, auth_store, sid, user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 1)
+    run, chat_store, auth_store, _sid, _user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 1)
     try:
-        run()
-        rows = _turn_rows(chat_store, sid, user_id)
+        rows = run()
         assert [role for role, _c, _a in rows] == ["user", "assistant"]
         assert rows[1][2] is True
         assert "[answer truncated]" in rows[1][1]
@@ -5479,6 +5498,242 @@ def test_turn_cancelled_before_its_own_handlers_roll_back_the_user_message(
             return False
 
         assert _run(run_it()) is True
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
+
+
+def _park_at_first_assistant_commit(monkeypatch, store, parked):
+    """Make the turn's own reply write look cancelled the instant it commits.
+
+    aiosqlite runs each statement on a worker thread and only then resolves an
+    independently cancellable future, so a cancellation delivered at a row's own
+    COMMIT finds the write already done while `append_message` never returns.
+    A local "did the append return" flag is still False in that window, which
+    is what used to make the rollback delete the user message under a stored
+    reply (JSON) or store a SECOND assistant row for the same turn (SSE).
+
+    Only the first assistant append parks, so a reconciliation's own write
+    still completes and the test measures the fix, not a deadlock.
+    """
+    ready = asyncio.Event()
+    real_append = store.append_message
+
+    async def slow_append(session_id, user_id, role, *args, **kwargs):
+        result = await real_append(session_id, user_id, role, *args, **kwargs)
+        if role == "assistant" and not parked["done"]:
+            parked["done"] = True
+            ready.set()
+            await asyncio.sleep(3600)
+        return result
+
+    monkeypatch.setattr(store, "append_message", slow_append)
+    return ready
+
+
+def test_json_turn_cancelled_at_the_reply_commit_keeps_the_completed_turn(tmp_path, monkeypatch):
+    """The reply row is committed, then the task is cancelled before
+    `append_message` returns. The turn is complete, so nothing is rolled back:
+    deleting the user message here would orphan a reply the client can read."""
+    store, sid = _store_with_session(tmp_path)
+    parked = {"done": False}
+    try:
+        _pin_budget_disabled(monkeypatch)
+
+        async def quick_turn(question, history):
+            return ("A full answer.", [], None, 0, 0, 0.0)
+
+        monkeypatch.setattr(chat_module, "_run_turn", quick_turn)
+        ready = _park_at_first_assistant_commit(monkeypatch, store, parked)
+
+        async def run_it():
+            task = asyncio.create_task(
+                chat_module.send_message(sid, chat_module.MessageIn(content="q"), _cancel_request())
+            )
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert _run(run_it()) is True
+        rows = _turn_rows(store, sid)
+        assert [role for role, _c, _a in rows] == ["user", "assistant"]
+        assert rows[1][1] == "A full answer."
+    finally:
+        _release_store(store)
+
+
+def test_stream_cancelled_at_the_reply_commit_stores_no_second_row(tmp_path, monkeypatch):
+    """Same window on the SSE path, with the worse outcome: a rollback that
+    only trusted a local flag would persist a truncated SECOND assistant row
+    for a turn that already has its complete reply, so the client would see
+    the answer twice."""
+    store, sid = _store_with_session(tmp_path)
+    parked = {"done": False}
+    try:
+        _pin_budget_disabled(monkeypatch)
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def short_stream(client, prompt, model, usage_holder=None, system_prompt=None):
+            yield "The whole answer."
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=5, completion_tokens=2))
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", short_stream)
+        ready = _park_at_first_assistant_commit(monkeypatch, store, parked)
+
+        response = _run(
+            chat_module.send_message_stream(
+                sid, chat_module.MessageIn(content="q"), _cancel_request()
+            )
+        )
+        assert _run(_cancel_while_consuming(response.body_iterator, ready)) is True
+
+        rows = _turn_rows(store, sid)
+        assert [role for role, _c, _a in rows] == ["user", "assistant"]
+        assert rows[1][1] == "The whole answer."
+        assert rows[1][2] is False
+    finally:
+        _release_store(store)
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["json", "sse"])
+def test_turn_cancelled_at_the_user_insert_commit_rolls_back(tmp_path, monkeypatch, streaming):
+    """A cancel inside the INSERT that writes the user message, before
+    `append_message` returns an id: the row exists but nothing knows its id.
+    `_start_turn` finds it instead, so neither path leaves a dangling user
+    message."""
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+        monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
+        ready = asyncio.Event()
+        real_append = store.append_message
+        parked = {"done": False}
+
+        async def slow_append(session_id, user_id, role, *args, **kwargs):
+            result = await real_append(session_id, user_id, role, *args, **kwargs)
+            if role == "user" and not parked["done"]:
+                parked["done"] = True
+                ready.set()
+                await asyncio.sleep(3600)
+            return result
+
+        monkeypatch.setattr(store, "append_message", slow_append)
+        request = _cancel_request()
+        if streaming:
+            endpoint = lambda: chat_module.send_message_stream(
+                sid, chat_module.MessageIn(content="what deals happened"), request
+            )
+        else:
+            endpoint = lambda: chat_module.send_message(
+                sid, chat_module.MessageIn(content="what deals happened"), request
+            )
+
+        async def run_it():
+            task = asyncio.create_task(endpoint())
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert _run(run_it()) is True
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
+
+
+def test_real_disconnect_while_starlette_is_sending_persists_the_turn(tmp_path, monkeypatch):
+    """A disconnect delivered while Starlette is inside its own `send()`.
+
+    `stream_response` iterates the generator and awaits `send()` between
+    deltas, so at that moment the generator is suspended at its `yield` and the
+    CANCELLATION reaches the consumer, not the generator: the generator is
+    never resumed and is later finalised with GeneratorExit, which no
+    `except CancelledError` or `except Exception` can catch. One delta was on
+    the wire, so the ONE abort rule applies -- persist the truncated turn,
+    flagged aborted -- and the response's background task is what does it.
+    """
+    run, chat_store, auth_store, _sid, _user_id = _asgi_disconnect_after_deltas(
+        tmp_path, monkeypatch, 1, park_in_send=True
+    )
+    try:
+        rows = run()
+        assert [role for role, _c, _a in rows] == ["user", "assistant"]
+        assert rows[1][2] is True
+        assert "[answer truncated]" in rows[1][1]
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+        chat_module.store = None
+        auth_module.store = None
+
+
+def test_cancelled_inside_the_body_iterator_finishes_its_own_rollback(tmp_path, monkeypatch):
+    """The cancellation lands INSIDE the generator, under a live anyio cancel
+    scope, with nothing to fall back on.
+
+    This is Starlette's `stream_response` loop -- `async for chunk in
+    body_iterator` inside a task group whose scope is cancelled on disconnect
+    -- with the response wrapper (and its background task) left out, so the
+    generator's own handler is the only thing that can finish the turn. It has
+    to: anyio re-raises the cancellation at every await while the scope is
+    live, so the delete lands only if the handler's write is shielded. This is
+    the one test that can catch that shield being removed.
+    """
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        state = {"parked": False}
+
+        async def parked_stream(client, prompt, model, usage_holder=None, system_prompt=None):
+            state["parked"] = True
+            await asyncio.sleep(3600)
+            yield "never delivered"
+
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", parked_stream)
+
+        response = _run(
+            chat_module.send_message_stream(
+                sid, chat_module.MessageIn(content="what deals happened"), _cancel_request()
+            )
+        )
+        body_iterator = response.body_iterator
+
+        async def stream_response():
+            async for _chunk in body_iterator:
+                pass
+
+        async def listen_for_disconnect():
+            while not state["parked"]:
+                await asyncio.sleep(0)
+            return {"type": "http.disconnect"}
+
+        async def drive():
+            async with anyio.create_task_group() as task_group:
+
+                async def wrap(func):
+                    await func()
+                    task_group.cancel_scope.cancel()
+
+                task_group.start_soon(wrap, partial(stream_response))
+                await wrap(partial(listen_for_disconnect))
+
+        _run(asyncio.wait_for(drive(), timeout=10))
         assert _turn_rows(store, sid) == []
     finally:
         _release_store(store)
