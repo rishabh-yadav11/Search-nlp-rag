@@ -52,6 +52,14 @@ TOP_CLICKED_QUERIES_N = 10
 # sum of all member scores (the top-50 window otherwise undercounts).
 _ZSUM_BATCH = 200
 
+# Prefix of the per-query click-signal sorted set (see ``_click_query_key``).
+# Named, not spelled inline at the one place it is built, because the ops report
+# in ``scripts/click_boost_report.py`` has to SCAN for these keys: a report
+# holding its own copy of the prefix would silently find nothing if the prefix
+# ever changed, and would report the click boost as inert -- the one answer
+# that must never be wrong.
+CLICK_SIGNAL_KEY_PREFIX = "analytics:query_click:"
+
 # Shape of a query digest as stored in Redis and returned by ``summary()``.
 # The prefix makes a digest self-describing (a member that does not match it is
 # a verbatim query, and is dropped on read) and gives the truncation a
@@ -302,7 +310,7 @@ def _click_query_key(q: str, digest_key: str) -> str:
     # Both call sites hand this function the RAW query and let it normalize
     # internally, so read and write cannot drift into two different orders of
     # bounding the input.
-    return f"analytics:query_click:{query_digest(q, digest_key)}"
+    return f"{CLICK_SIGNAL_KEY_PREFIX}{query_digest(q, digest_key)}"
 
 
 async def _claim_click_signal(client_ip: str | None, query: str, article_id: int) -> tuple[bool, str | None]:
