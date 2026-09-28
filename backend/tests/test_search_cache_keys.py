@@ -291,8 +291,9 @@ def test_every_retrieval_config_knob_changes_the_search_key(monkeypatch, knob):
 def test_config_knobs_that_cannot_change_results_keep_the_same_key(monkeypatch, knob):
     """The digest must cover exactly the retrieval-affecting config, no more.
 
-    An over-broad key (folding in the cache TTL or the Redis URL) would silently
-    split one cache into many and make every entry colder.
+    An over-broad key (folding in the cache TTL, the cache size cap or the CORS
+    allowlist) would silently split one cache into many and make every entry
+    colder.
     """
     before = main.retrieve_cache_key("q", 8, None)
     monkeypatch.setattr(config, knob, _flipped(getattr(config, knob)))
