@@ -140,9 +140,13 @@ def test_oversized_stream_is_rejected_before_the_stream_opens(tmp_path):
 
 def test_oversized_rename_is_rejected_and_leaves_the_title_alone(tmp_path):
     """The rename route writes client text through the same model and used to
-    have no length check of its own: the store clipped the title to 200 chars,
-    so a rename came back 200 with a title the user never typed. It is now
-    refused, and the stored title is untouched."""
+    have no length check of its own, so an oversized title came back 200 with
+    the store's clip already applied to it. Above MAX_CONTENT_LEN it is now
+    refused outright, and the stored title is left exactly as it was.
+
+    The 200-char clip the store applies to titles that are SHORTER than the
+    bound is pre-existing and untouched by this fix; only the over-the-bound
+    window changes here."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_headers(auth_store)
