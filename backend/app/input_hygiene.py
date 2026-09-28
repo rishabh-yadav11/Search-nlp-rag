@@ -10,6 +10,10 @@ rather than at each sink, so a new call site is safe by default:
   ``test\\x00\\r\\n"`` one spelling, so the same query stops producing a fresh
   cache entry (and a fresh embedding) per variation. It also means no NUL or
   CRLF can reach a cache key or a log line from here.
+  The whitespace-bearing controls (TAB, LF, CR, ...) are turned into spaces
+  rather than deleted, so two questions that differ only in their line
+  structure stay two questions instead of fusing into one that was never
+  asked.
 * **Unbounded growth.** Facet params are comma-separated lists with no limit on
   how many values, or how long each value, a caller may send. Both feed a
   Qdrant ``MatchAny`` *and* a cache key, so one request can be made to build a
@@ -48,9 +52,16 @@ MAX_FACET_VALUE_LEN = 100
 # is bounded instead of becoming an arbitrarily long key.
 MAX_KEY_LEN = 256
 
-# C0 controls plus DEL. These are what let an attacker break a log line in two
-# (CRLF), truncate a key at the first NUL, or smuggle a field separator into a
-# value. None of them are meaningful in a search query or a facet name.
+# The whitespace-bearing C0 controls. These are word separators, not noise:
+# deleting ``"Ola\tIPO"``'s tab would fuse it into ``"OlaIPO"`` and canonicalise
+# two *different* questions onto one spelling, which is the collision class this
+# module exists to remove (and it would silently answer the fused question).
+# They are mapped to a space first and collapsed below, so no control character
+# still reaches a key or a log line.
+_WHITESPACE_CONTROLS = re.compile(r"[\t\n\v\f\r]")
+
+# Every other C0 control, plus DEL: NUL truncates a C string at the first byte,
+# and none of the rest separates words in a query or a facet name.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 # Whitespace runs, including the separators NFKC leaves behind (e.g. the
@@ -63,12 +74,16 @@ _DIGEST_PREFIX = "sha256:"
 def normalize_text(value: str) -> str:
     """Return ``value`` in the canonical spelling used for keys, filters and logs.
 
-    Applies NFKC, drops control characters, collapses whitespace runs to a single
-    space and strips the ends. Case is preserved on purpose: folding it would
-    change the text handed to the embedder, and therefore what a query
+    Applies NFKC, maps the whitespace-bearing control characters to spaces,
+    drops the remaining control characters, collapses whitespace runs to a
+    single space and strips the ends. Case is preserved on purpose: folding it
+    would change the text handed to the embedder, and therefore what a query
     retrieves, which is a search-semantics change rather than a hygiene one.
     """
     text = unicodedata.normalize("NFKC", value)
+    # Space first, strip second: dropping TAB/LF/CR outright would merge the
+    # words around them into a spelling no caller sent.
+    text = _WHITESPACE_CONTROLS.sub(" ", text)
     text = _CONTROL_CHARS.sub("", text)
     return _WHITESPACE_RUN.sub(" ", text).strip()
 

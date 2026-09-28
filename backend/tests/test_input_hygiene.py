@@ -300,6 +300,50 @@ def test_equivalent_spellings_share_one_search_cache_key(monkeypatch):
     assert len(set(keys)) == 2, f"expected one entry per question, got {keys}"
 
 
+def test_a_long_legal_query_is_normalised_and_keyed_within_the_request_clamp(monkeypatch):
+    """The #252 x #241 seam, which is the one place this branch and the
+    request-level clamp can disagree about the same query.
+
+    #241 refuses `q` past SEARCH_QUERY_MAX_CHARS (512) with a 422, and #252
+    bounds the key instead. The window between them -- a query long enough that
+    it is a digest in the key, short enough that the request is legal -- is
+    where "normalise the query" and "reject the query" would meet. A query
+    there must be accepted, canonicalised, and keyed once, with the key
+    carrying its digest and none of its text.
+    """
+    # Already canonical (no trailing space, ASCII, single spaces) so the digest
+    # expectation below is about the key, not about canonicalisation; the
+    # variant spelling is what proves normalisation ran on this path.
+    long_q = ("fintech funding roundup " * 12)[:300].strip()
+    assert normalize_text(long_q) == long_q
+    assert 256 <= len(long_q) <= config.SEARCH_QUERY_MAX_CHARS - 1, len(long_q)
+    # The same question in a compatibility spelling, which is the only way to
+    # see that normalisation actually ran on this path rather than the key
+    # merely being short.
+    fullwidth = "".join(chr(ord(c) + 0xFEE0) if "a" <= c <= "z" else c for c in long_q)
+
+    cache, retrieved, _recorded = _wire(monkeypatch)
+    ascii_response = _client.get("/search", params={"q": long_q})
+    fullwidth_response = _client.get("/search", params={"q": fullwidth})
+
+    assert ascii_response.status_code == 200
+    assert fullwidth_response.status_code == 200
+    assert fullwidth_response.json()["cached"] is True, "the variant spelling re-ran the pipeline"
+    assert len(retrieved) == 1, "the variant spelling re-ran the whole retrieval"
+
+    keys = {k for k in cache.gets if k.startswith("search:")}
+    assert len(keys) == 1, f"one question, one entry: {keys}"
+    (key,) = keys
+    assert len(key) <= MAX_KEY_LEN, f"key grew to {len(key)} chars: {key[:80]!r}"
+    assert main._cache_key_component(long_q) in key, "the query must be digested, not spelled out"
+    assert long_q[:60] not in key, "the raw query reached the key"
+
+    # And the clamp is still the one that answers above the window: a query
+    # this fix must not have shadowed with a bound of its own.
+    too_long = _client.get("/search", params={"q": "A" * (config.SEARCH_QUERY_MAX_CHARS + 1)})
+    assert too_long.status_code == 422, too_long.status_code
+
+
 # --- facet bounds -----------------------------------------------------------
 
 
@@ -478,7 +522,9 @@ def test_invalid_date_error_body_is_bounded(monkeypatch):
     ("ﬁntech", "fintech"),                    # fi ligature
     ("café", "café"),                    # NFD composed by NFKC
     ("test\x00injected", "testinjected"),      # NUL removed
-    ("test\r\nINJECTED", "testINJECTED"),      # CRLF removed
+    ("test\r\nINJECTED", "test INJECTED"),    # CRLF -> space, never fused
+    ("test\x01INJECTED", "testINJECTED"),     # other C0 removed
+    ("Ola\tIPO", "Ola IPO"),                  # a tab separates words
     ("test \t\n q", "test q"),                 # whitespace runs collapse
     ("test 　 q", "test q"),           # ideographic space
     ("  padded  ", "padded"),                 # stripped
@@ -581,6 +627,13 @@ def test_search_cache_key_is_bounded(monkeypatch):
     past that is a 422 before any key exists). The key bound is the second,
     independent line of defence and has to hold within the range that actually
     reaches it, not only past a limit that rejects the request first.
+
+    Two bounds compose on this key and the test has to hold for both: the query
+    segment is digested per CACHE_KEY_QUERY_MAX_CHARS (#241), and the whole key
+    is digested once it passes MAX_KEY_LEN (#252, asserted by
+    ``test_search_cache_key_stays_bounded_with_a_max_sized_facet``). A query
+    that is long enough to trip the second but short enough to be digested by
+    the first never spells itself out either way.
     """
     over = MAX_KEY_LEN
     under_clamp = config.SEARCH_QUERY_MAX_CHARS - 1
@@ -592,9 +645,13 @@ def test_search_cache_key_is_bounded(monkeypatch):
     response = _client.get("/search", params={"q": "q" * over})
     assert response.status_code == 200
     assert cache.gets, "expected the request to build a cache key"
+    digest = main._cache_key_component("q" * over)
+    assert digest.startswith("h:"), "the query is long enough to be digested"
     for key in cache.gets:
-        assert key.startswith("search:sha256:"), "an over-long query must be digested"
-        assert len(key) == len("search:sha256:") + 64
+        assert key.startswith("search:")
+        assert len(key) <= MAX_KEY_LEN, f"key grew to {len(key)} chars: {key[:80]!r}"
+        assert digest in key or key.startswith("search:sha256:")
+        assert "q" * 100 not in key, "the raw query reached the key"
 
 
 def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
@@ -612,9 +669,15 @@ def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
     search_keys = [k for k in cache.gets if k.startswith("search:")]
     assert search_keys, "expected the request to build a search cache key"
     for key in cache.gets:
-        assert len(key) <= MAX_KEY_LEN
-    for key in search_keys:
-        assert key.startswith("search:")
+        assert len(key) <= MAX_KEY_LEN, f"key grew to {len(key)} chars: {key[:80]!r}"
++    # A max-sized facet is ~1 KB, so the facet component is the part that has to
++    # be digested: it reaches the key as a sha256 rather than as a kilobyte of
++    # caller text, and the key as a whole still stays inside the bound --
++    # bounded, but not a raw echo of the request.
++    for key in search_keys:
++        assert key.startswith("search:")
++        assert ":sha256:" in key, "a max-sized facet must be digested, not spelled out"
++        assert "v" * 100 not in key, "the raw facet reached the key"
 
 
 def test_retrieve_cache_key_is_bounded_and_control_free(monkeypatch):

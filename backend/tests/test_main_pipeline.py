@@ -346,8 +346,13 @@ def test_vector_cache_key_is_bounded_for_a_long_query(monkeypatch, fake_cache):
     _run(main.hybrid_search("q" * 1000, 8))
 
     key, _value, _ttl = cache.sets[0]
-    assert key.startswith("vec:sha256:")
-    assert len(key) == len("vec:sha256:") + 64
+    assert key.startswith("vec:")
+    assert len(key) <= 256, f"vec key grew to {len(key)} chars: {key[:80]!r}"
+    # The query itself is digested per CACHE_KEY_QUERY_MAX_CHARS (#241) and the
+    # key is length-prefixed (#252), so a 1000-char query costs 34 characters
+    # of digest plus a length prefix, not 1000 characters of query text.
+    assert main._cache_key_component("q" * 1000) in key
+    assert "q" * 200 not in key, "the raw query reached the key"
 
 
 def test_vector_cache_key_carries_no_control_characters(monkeypatch, fake_cache):
