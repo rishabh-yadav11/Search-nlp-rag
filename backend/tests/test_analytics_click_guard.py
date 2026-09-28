@@ -180,6 +180,43 @@ class _FlakyPipeline(_Pipeline):
 def _run(coro):
     return asyncio.run(coro)
 
+# The secret every query digest is keyed with in this file. Pinned rather than
+# minted so the expected Redis key is a fixed, checkable value, and so none of
+# the fakes above has to implement the ``analytics:query_digest_key`` read that
+# ``_digest_key`` would otherwise make. The stored key is an opaque digest, not
+# the query text (#348) -- the click-boost signal is addressed the same way,
+# which is what these guards still exercise.
+_TEST_DIGEST_KEY = "click-guard-test-digest-key"
+
+
+@pytest.fixture(autouse=True)
+def pinned_query_digest_key():
+    """Install a fixed query-digest key for every test in this file.
+
+    ``_QUERY_DIGEST_KEY`` is cached process-wide by design (it is the secret
+    shared by every gunicorn worker), so it must be seeded and cleared per test
+    or one test's key leaks into the next. Pinning it also keeps these
+    expectations independent of whatever ``ANALYTICS_QUERY_KEY`` this machine's
+    .env names, and -- because the key is resolved without a Redis round trip
+    -- leaves ``nx_keys`` holding only dedupe CLAIMS, which is what the claim
+    assertions below read.
+    """
+    analytics._QUERY_DIGEST_KEY = _TEST_DIGEST_KEY
+    yield
+    analytics._QUERY_DIGEST_KEY = None
+
+
+def _digest(query):
+    """The opaque id a query is stored and looked up under."""
+    return analytics.query_digest(query, _TEST_DIGEST_KEY)
+
+
+def _qkey(query):
+    """The per-query click sorted-set key for ``query``."""
+    return f"analytics:query_click:{_digest(query)}"
+
+
+
 
 
 @pytest.fixture(autouse=True)
@@ -318,10 +355,10 @@ def test_forged_beacon_burst_does_not_move_ranking(store, index):
     for i in range(filler):
         _beacon("ola ipo", 2, 99, ip=f"10.4.4.{i}")
 
-    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0, "99": float(filler)}, (
+    assert store.sets[_qkey("ola ipo")] == {"42": 1.0, "99": float(filler)}, (
         "5 beacons, one vote"
     )
-    assert sum(store.sets["analytics:query_click:ola ipo"].values()) == total
+    assert sum(store.sets[_qkey("ola ipo")].values()) == total
     assert _boosted(store) == _results()
     assert index.asked[:5] == [[42]] * 5, "the id is looked up in the index on every beacon"
 
@@ -354,7 +391,7 @@ def test_forged_beacons_from_distinct_clients_still_cannot_boost_one_article(sto
 
     # The signal really is live -- the target is not spared by a quiet query.
     assert total == forged + filler >= config.CLICK_BOOST_MIN_CLICKS
-    tally = store.sets["analytics:query_click:ola ipo"]
+    tally = store.sets[_qkey("ola ipo")]
     assert tally["42"] == forged, "every forged beacon is a distinct client's vote"
     assert round(sum(tally.values()) * config.CLICK_BOOST_MIN_SHARE) > forged, (
         "the forged votes are a minority of the query's clicks"
@@ -381,7 +418,7 @@ def test_one_client_cannot_manufacture_click_share(store, index):
     for i in range(filler):
         _beacon("ola ipo", 3, 123, ip=f"10.1.2.{i}")
 
-    tally = store.sets["analytics:query_click:ola ipo"]
+    tally = store.sets[_qkey("ola ipo")]
     assert tally["42"] == 1.0 and tally["99"] == 1.0, "one client, one vote per article"
     assert sum(tally.values()) == total >= config.CLICK_BOOST_MIN_CLICKS
     assert _boosted(store) == _results()
@@ -453,7 +490,7 @@ def test_a_clients_repeat_click_adds_no_second_vote_but_others_still_count(store
         _beacon("ola ipo", 1, 42, ip="10.0.0.1")
     _beacon("ola ipo", 1, 42, ip="10.0.0.2")
 
-    assert store.sets["analytics:query_click:ola ipo"] == {"42": 2.0}
+    assert store.sets[_qkey("ola ipo")] == {"42": 2.0}
 
 
 def test_raw_click_analytics_are_untouched_by_the_dedupe(store, index):
@@ -469,9 +506,9 @@ def test_raw_click_analytics_are_untouched_by_the_dedupe(store, index):
     assert {k: v for k, v in store.counters.items() if k.startswith("analytics:click:pos:")} == {
         f"analytics:click:pos:{i}": 1 for i in range(1, fired + 1)
     }
-    assert store.sets["analytics:click_top_queries"] == {"ola ipo": float(fired)}
+    assert store.sets["analytics:click_top_queries"] == {_digest("ola ipo"): float(fired)}
     # ...while the ranking vote is one.
-    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+    assert store.sets[_qkey("ola ipo")] == {"42": 1.0}
 
 
 def test_position_outside_the_display_range_is_clamped_not_a_new_bucket(store, index):
@@ -556,12 +593,12 @@ def test_query_spellings_collapse_to_a_single_boost_key(store, index):
         _beacon(spelling, 1, 42, ip="10.2.2.2")
 
     assert [k for k in store.sets if k.startswith("analytics:query_click:")] == [
-        "analytics:query_click:ola ipo"
+        _qkey("ola ipo")
     ]
     # All five came from ONE client, so the canonicalised claim must collapse
     # them to a single vote -- a per-spelling claim would let one client buy
     # five votes just by varying its whitespace and case.
-    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+    assert store.sets[_qkey("ola ipo")] == {"42": 1.0}
 
 
 def test_normalisation_is_identical_on_the_read_path(store, index):
@@ -609,7 +646,11 @@ def test_over_long_query_is_stored_bounded_and_expires(store, index):
     _beacon(huge, 1, 42, ip="10.3.3.3")
 
     (key,) = [k for k in store.sets if k.startswith("analytics:query_click:")]
-    assert len(key) <= len("analytics:query_click:") + config.CLICK_QUERY_MAX_LEN
+    # The key is a fixed-width digest, so it no longer grows with the beacon at
+    # all. The length cap still bounds what gets hashed, so a query past the cap
+    # keys identically to its bounded prefix -- the vote is not stranded.
+    assert len(key) == len(_qkey("x"))
+    assert key == _qkey("ola ipo " + "x" * config.CLICK_QUERY_MAX_LEN)
     assert store.ttls[key] == config.CLICK_QUERY_TTL_SECONDS
 
 
@@ -659,7 +700,7 @@ def test_a_failed_write_gives_the_click_vote_back(store, index, monkeypatch):
     healthy = FakeRedis()
     monkeypatch.setattr(analytics, "_client", lambda: healthy)
     assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200
-    assert healthy.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+    assert healthy.sets[_qkey("ola ipo")] == {"42": 1.0}
 
 
 def test_a_lost_claim_is_never_released_for_its_owner(store, index, monkeypatch):
@@ -671,10 +712,10 @@ def test_a_lost_claim_is_never_released_for_its_owner(store, index, monkeypatch)
 
     assert _beacon("ola ipo", 1, 42, ip="10.6.6.6").status_code == 200
     (claim,) = list(flaky.nx_keys)
-    assert flaky.sets["analytics:query_click:ola ipo"] == {"42": 1.0}
+    assert flaky.sets[_qkey("ola ipo")] == {"42": 1.0}
 
     flaky.fail_pipeline = True
     assert _beacon("ola ipo", 1, 42, ip="10.6.6.6").status_code == 200
 
     assert claim in flaky.nx_keys, "the winner's claim must survive a loser's failed write"
-    assert flaky.sets["analytics:query_click:ola ipo"] == {"42": 1.0}, "and still count once"
+    assert flaky.sets[_qkey("ola ipo")] == {"42": 1.0}, "and still count once"
