@@ -10,15 +10,12 @@ from pathlib import Path
 
 import pytest
 import redis
+from _support import run_sync as _run
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app import auth, health
 from app.config import config
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _async(result):

@@ -2,23 +2,19 @@ import asyncio
 import math
 from datetime import UTC
 from datetime import datetime as _dt
+from functools import partial
 
 import pytest
+from _support import OMIT, make_article
 from fastapi import HTTPException
 from qdrant_client.models import DatetimeRange, FieldCondition, Filter, MatchAny
 
 from app import main
 from app.main import SourceArticle, build_facet_filter, sort_results
 
-
-def _article(id_: int, score: float, published_date: str | None = None, title: str = "") -> SourceArticle:
-    return SourceArticle(
-        id=id_,
-        title=title,
-        url=f"https://example.com/{id_}",
-        published_date=published_date,
-        score=score,
-    )
+# The shape this file's copy of the helper had: no summary, and a title that
+# is empty unless the test sets one.
+_article = partial(make_article, title="", summary=OMIT)
 
 
 def _conditions(qfilter: Filter) -> dict[str, list[FieldCondition]]:
@@ -200,19 +196,6 @@ def test_retrieval_queries_no_dup_when_topic_equals_rewrite():
     assert qs == ["top deals"]
 
 
-class _FakeCache:
-    """Minimal in-memory stand-in for the HybridCache used by retrieve_and_rerank."""
-
-    def __init__(self):
-        self.store: dict = {}
-
-    async def get(self, key):
-        return self.store.get(key)
-
-    async def set(self, key, value):
-        self.store[key] = value
-
-
 def test_filter_token_deterministic_and_json_serializable():
     """The retrieve-cache key from a Qdrant filter must be a stable string
     (regression: model_dump_json(sort_keys=...) is unsupported in pydantic)."""
@@ -225,13 +208,13 @@ def test_filter_token_deterministic_and_json_serializable():
     assert "Fintech" in t1
 
 
-def test_retrieve_and_rerank_caches_without_body(monkeypatch):
+def test_retrieve_and_rerank_caches_without_body(monkeypatch, fake_cache):
     """The retrieve cache round-trips SourceArticles but never stores bodies;
     a chat request re-fetches them from Qdrant after a cache hit."""
     from app.main import SourceArticle
 
-    fake_cache = _FakeCache()
-    monkeypatch.setattr(main, "cache", fake_cache)
+    cache = fake_cache()
+    monkeypatch.setattr(main, "cache", cache)
 
     def make_article(id_: int, score: float) -> SourceArticle:
         return SourceArticle(id=id_, title="t", url="u", summary="s", body="", score=score)
@@ -257,7 +240,7 @@ def test_retrieve_and_rerank_caches_without_body(monkeypatch):
 
     out1 = asyncio.run(main.retrieve_and_rerank("q", 8, None, need_body=True))
     assert out1[0].body == "full body"
-    (_, cached), = list(fake_cache.store.items())
+    (_, cached), = list(cache.store.items())
     assert "body" not in cached[0]
     assert cached[0]["id"] == 1
 
@@ -268,7 +251,7 @@ def test_retrieve_and_rerank_caches_without_body(monkeypatch):
     monkeypatch.setattr(main, "_attach_bodies", refetch_bodies)
     out2 = asyncio.run(main.retrieve_and_rerank("q", 8, None, need_body=True))
     assert out2[0].body == "refetched"
-    assert len(fake_cache.store) == 1  # still a single cache entry
+    assert len(cache.store) == 1  # still a single cache entry
 
 
 def test_source_context_includes_whole_body():

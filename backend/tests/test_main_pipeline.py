@@ -4,25 +4,20 @@ embedding, intent rewrite, retrieval, body rescue/attach, and facet values."""
 import asyncio
 import logging
 import math
+from functools import partial
 
 import pytest
 from _common import make_point
+from _support import OMIT, make_article
+from _support import run_sync as _run
 from qdrant_client.models import Fusion, FusionQuery, SparseVector
 
 from app import main
 from app.main import SourceArticle
 
-_MISS = object()
-
-
-def _run(coro):
-    return asyncio.run(coro)
-
-
-def _article(id_: int, score: float, **kwargs) -> SourceArticle:
-    defaults = {"title": f"Title {id_}", "url": f"https://example.com/{id_}", "score": score}
-    defaults.update(kwargs)
-    return SourceArticle(id=id_, **defaults)
+# This file's copy left summary out of the constructor entirely; every other
+# field was the shared default.
+_article = partial(make_article, summary=OMIT)
 
 
 class _Arr:
@@ -93,24 +88,6 @@ class _FakeQdrant:
         if self.scroll_pages:
             return self.scroll_pages.pop(0)
         return [], None
-
-
-class _FakeCache:
-    def __init__(self, get_result=_MISS):
-        self.get_result = get_result
-        self.store = {}
-        self.sets = []
-        self.gets = []
-
-    async def get(self, key):
-        self.gets.append(key)
-        if self.get_result is not _MISS:
-            return self.get_result
-        return self.store.get(key)
-
-    async def set(self, key, value, ttl=None):
-        self.store[key] = value
-        self.sets.append((key, value, ttl))
 
 
 class _ProbeLock:
@@ -241,8 +218,8 @@ def test_retrieval_queries_dedup_when_flashback_equals_topic():
 # --- hybrid_search ---
 
 
-def test_hybrid_search_cache_miss(monkeypatch):
-    cache = _FakeCache()
+def test_hybrid_search_cache_miss(monkeypatch, fake_cache):
+    cache = fake_cache()
     monkeypatch.setattr(main, "cache", cache)
     dense = _FakeDense([0.1, 0.2, 0.3])
     sparse = _FakeSparse([1, 3], [0.9, 0.4])
@@ -300,9 +277,9 @@ def test_hybrid_search_cache_miss(monkeypatch):
     assert kwargs["prefetch"][0].limit == 32
 
 
-def test_hybrid_search_cache_hit_skips_encoding(monkeypatch):
+def test_hybrid_search_cache_hit_skips_encoding(monkeypatch, fake_cache):
     vec = {"dense": [0.1, 0.2], "si": [1], "sv": [0.7]}
-    monkeypatch.setattr(main, "cache", _FakeCache(get_result=vec))
+    monkeypatch.setattr(main, "cache", fake_cache(get_result=vec))
     dense = _FakeDense([9.9, 9.9])
     sparse = _FakeSparse([9], [9.9])
     monkeypatch.setitem(main.state, "model", dense)
@@ -322,8 +299,8 @@ def test_hybrid_search_cache_hit_skips_encoding(monkeypatch):
     assert isinstance(kwargs["prefetch"][1].query, SparseVector)
 
 
-def test_hybrid_search_acquires_inference_lock_once_on_miss(monkeypatch):
-    monkeypatch.setattr(main, "cache", _FakeCache())
+def test_hybrid_search_acquires_inference_lock_once_on_miss(monkeypatch, fake_cache):
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setitem(main.state, "model", _FakeDense([0.1]))
     monkeypatch.setitem(main.state, "sparse_model", _FakeSparse([0], [0.5]))
     monkeypatch.setitem(main.state, "qdrant", _FakeQdrant(points=[_Point(1, {"title": "T", "url": "u"})]))
@@ -337,8 +314,8 @@ def test_hybrid_search_acquires_inference_lock_once_on_miss(monkeypatch):
     assert lock.exits == 1
 
 
-def test_hybrid_search_skips_null_and_empty_payload_points(monkeypatch):
-    monkeypatch.setattr(main, "cache", _FakeCache())
+def test_hybrid_search_skips_null_and_empty_payload_points(monkeypatch, fake_cache):
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setitem(main.state, "model", _FakeDense([0.1]))
     monkeypatch.setitem(main.state, "sparse_model", _FakeSparse([0], [0.5]))
     monkeypatch.setitem(
@@ -359,7 +336,7 @@ def test_hybrid_search_skips_null_and_empty_payload_points(monkeypatch):
     assert [a.id for a in articles] == [1]
 
 
-def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch):
+def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch, fake_cache):
     """A payload written by the real writer reaches SourceArticle.content_type.
 
     This is the read half of the feature that was dead end to end: the write
@@ -369,7 +346,7 @@ def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch):
     `or None` mapping, so articles with no content type stay indistinguishable
     from articles that were never backfilled.
     """
-    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setitem(main.state, "model", _FakeDense([0.1, 0.2]))
     monkeypatch.setitem(main.state, "sparse_model", _FakeSparse([1], [0.5]))
     monkeypatch.setattr(main.config, "QDRANT_COLLECTION", "col")

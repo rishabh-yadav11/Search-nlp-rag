@@ -7,6 +7,7 @@ import asyncio
 import httpx
 import openai
 import pytest
+from _support import run_sync as _run
 
 from app.config import config
 from app.llm import LLMResult, LLMUnavailableError, _is_retryable, generate_answer, stream_answer
@@ -132,10 +133,6 @@ class _FakeChat:
 class _FakeClient:
     def __init__(self, completions):
         self.chat = _FakeChat(completions)
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 async def _collect(agen):

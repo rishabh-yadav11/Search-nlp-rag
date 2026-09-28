@@ -18,12 +18,12 @@ These tests pin three things the refactor must not change:
   raise at REQUEST time, so the two paths could supply DIFFERENT field sets.
 """
 
-import asyncio
 import pathlib
 import string
 from typing import ClassVar
 
 import pytest
+from _support import run_sync as _run
 
 from app import chat as chat_module
 from app import main as main_module
@@ -50,10 +50,6 @@ HISTORY = [
     chat_module.MessageOut(id=2, role="assistant", content="Alpha and Beta both raised in 2024.",
                            sources=[], created_at=1001.0),
 ]
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _golden(name):

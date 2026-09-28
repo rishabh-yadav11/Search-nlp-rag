@@ -2,6 +2,8 @@ import asyncio
 import json
 import time
 
+from _support import run_sync as _run
+
 from app import redis_cache
 from app.redis_cache import HybridCache
 
@@ -78,10 +80,6 @@ class _FlakyRedis(_RecordingRedis):
             raise self.error
         self.sets.append((key, value, ex))
         self.store[key] = value
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def test_set_get_round_trip():

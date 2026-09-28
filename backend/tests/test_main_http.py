@@ -2,11 +2,12 @@
 /analytics/summary endpoints of app.main (cache hit/miss wiring, qdrant/redis
 error mapping, and analytics beacons)."""
 
-import asyncio
 import json
 import os
 
 import pytest
+from _support import FakeCache, make_article
+from _support import run_sync as _run
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from qdrant_client.models import Filter
@@ -14,7 +15,7 @@ from qdrant_client.models import Filter
 from app import auth, main
 from app.analytics import AnalyticsUnavailableError
 from app.config import config
-from app.main import SourceArticle, SourceSummary
+from app.main import SourceSummary
 
 
 async def _noop_async(*args, **kwargs):
@@ -36,8 +37,6 @@ def _via_local_proxy(app):
 
 
 _client = TestClient(main.app, raise_server_exceptions=False)
-
-_MISS = object()
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +65,7 @@ def _public_rate_limiter(monkeypatch):
 
 def _cached_search_client(monkeypatch):
     """Wire /search to a pure cache hit so the limiter is the only variable."""
-    monkeypatch.setattr(main, "cache", _FakeCache(get_result=[_summary_dict(1, 0.9)]))
+    monkeypatch.setattr(main, "cache", FakeCache(get_result=[_summary_dict(1, 0.9)]))
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
     monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
@@ -167,7 +166,7 @@ def test_search_fails_closed_with_503_when_the_limiter_store_is_down(monkeypatch
 
 def test_facets_over_the_limit_is_rejected_with_429(monkeypatch):
     monkeypatch.setattr(config, "PUBLIC_FACETS_RATE_PER_MIN", 1)
-    monkeypatch.setattr(main, "cache", _FakeCache(get_result={"industry": [], "dealtype": []}))
+    monkeypatch.setattr(main, "cache", FakeCache(get_result={"industry": [], "dealtype": []}))
 
     assert _client.get("/facets").status_code == 200
     assert _client.get("/facets").status_code == 429
@@ -213,10 +212,6 @@ def test_analytics_click_over_the_limit_is_rejected_with_429(monkeypatch):
     assert _client.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 429
 
 
-def _run(coro):
-    return asyncio.run(coro)
-
-
 def _summary_dict(id_: int, score: float = 0.5) -> dict:
     return {
         "id": id_,
@@ -232,36 +227,9 @@ def _summary_dict(id_: int, score: float = 0.5) -> dict:
     }
 
 
-def _article(id_: int, score: float) -> SourceArticle:
-    return SourceArticle(
-        id=id_,
-        title=f"Title {id_}",
-        url=f"https://example.com/{id_}",
-        summary=f"summary {id_}",
-        score=score,
-    )
-
-
-class _FakeCache:
-    """In-memory stand-in for the HybridCache: async get/set, with a fixed
-    get() result or a get() error optional."""
-
-    def __init__(self, get_result=_MISS, get_error=None):
-        self.get_result = get_result
-        self.get_error = get_error
-        self.store: dict = {}
-        self.sets: list = []
-
-    async def get(self, key):
-        if self.get_error is not None:
-            raise self.get_error
-        if self.get_result is not _MISS:
-            return self.get_result
-        return self.store.get(key)
-
-    async def set(self, key, value, ttl=None):
-        self.store[key] = value
-        self.sets.append((key, value))
+# This file's copy derived every field from the id, which is what the shared
+# defaults already do.
+_article = make_article
 
 
 # --- /search ---
@@ -278,7 +246,7 @@ def test_search_cache_hit_returns_cached_summaries(monkeypatch):
     async def fake_record_search(*args, **kwargs):
         records.append((args, kwargs))
 
-    monkeypatch.setattr(main, "cache", _FakeCache(get_result=cached))
+    monkeypatch.setattr(main, "cache", FakeCache(get_result=cached))
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
     monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
@@ -299,11 +267,11 @@ def test_search_cache_hit_returns_cached_summaries(monkeypatch):
     assert records[0][1]["filtered"] is False
 
 
-def test_search_cache_miss_runs_full_pipeline(monkeypatch):
+def test_search_cache_miss_runs_full_pipeline(monkeypatch, fake_cache):
     records = []
     boost_calls = []
     div_calls = []
-    cache = _FakeCache()
+    cache = fake_cache()
     articles = [_article(1, 0.9), _article(2, 0.7)]
 
     async def fake_retrieve(q, top_k, qfilter, need_body=False):
@@ -340,14 +308,14 @@ def test_search_cache_miss_runs_full_pipeline(monkeypatch):
     assert all(isinstance(r, SourceSummary) for r in resp.results)
     assert all("body" not in r.model_dump() for r in resp.results)
     assert len(cache.sets) == 1
-    (stored_key, stored_value) = cache.sets[0]
+    (stored_key, stored_value, _ttl) = cache.sets[0]
     assert stored_key.startswith("search:")
     assert all("body" not in d for d in stored_value)
     assert records[0][1]["cached"] is False
     assert records[0][0][1] == 2
 
 
-def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch):
+def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch, fake_cache):
     boost_calls = []
     div_calls = []
 
@@ -365,7 +333,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch):
     async def fake_record_search(*args, **kwargs):
         pass
 
-    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
     monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
@@ -386,7 +354,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch):
     assert [r.id for r in resp.results] == [1]
 
 
-def test_search_passes_built_facet_filter_to_retrieve(monkeypatch):
+def test_search_passes_built_facet_filter_to_retrieve(monkeypatch, fake_cache):
     captured = {}
 
     async def fake_retrieve(q, top_k, qfilter, need_body=False):
@@ -399,7 +367,7 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch):
     async def fake_temporal_fallback(results, top_k, from_date, to_date, industry, dealtype, author, need_body):
         return results
 
-    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
     monkeypatch.setattr(main, "expand_query", lambda q: q)
     monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
@@ -419,11 +387,11 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch):
     assert [r.id for r in resp.results] == [1, 2]
 
 
-def test_search_cache_miss_does_not_cache_empty_results(monkeypatch):
+def test_search_cache_miss_does_not_cache_empty_results(monkeypatch, fake_cache):
     """Regression: an empty result set was cached and then replayed as
     authoritative 'no results' for the whole TTL, so a date-filtered query that
     transiently retrieved nothing kept returning nothing for minutes."""
-    cache = _FakeCache()
+    cache = fake_cache()
 
     async def fake_retrieve(q, top_k, qfilter, need_body=False):
         return []
@@ -449,10 +417,10 @@ def test_search_cache_miss_does_not_cache_empty_results(monkeypatch):
     assert cache.sets == [], "empty result sets must never be written to the cache"
 
 
-def test_search_empty_results_are_not_served_from_cache(monkeypatch):
+def test_search_empty_results_are_not_served_from_cache(monkeypatch, fake_cache):
     """The whole point of the guard: a second identical query must re-run
     retrieval instead of being answered from a poisoned empty cache entry."""
-    cache = _FakeCache()
+    cache = fake_cache()
     calls = []
 
     async def fake_retrieve(q, top_k, qfilter, need_body=False):
@@ -483,10 +451,10 @@ def test_search_empty_results_are_not_served_from_cache(monkeypatch):
     assert second.cached is False
 
 
-def test_search_non_empty_results_are_still_cached(monkeypatch):
+def test_search_non_empty_results_are_still_cached(monkeypatch, fake_cache):
     """Guard against over-correcting: the cache must stay enabled for real
     result sets, only empty ones are skipped."""
-    cache = _FakeCache()
+    cache = fake_cache()
     articles = [_article(1, 0.9)]
 
     async def fake_retrieve(q, top_k, qfilter, need_body=False):
@@ -532,8 +500,8 @@ def _patch_retrieval_pipeline(monkeypatch, articles):
     monkeypatch.setattr(main, "apply_entity_boost", lambda q, r: r)
 
 
-def test_retrieve_and_rerank_does_not_cache_empty_results(monkeypatch):
-    cache = _FakeCache()
+def test_retrieve_and_rerank_does_not_cache_empty_results(monkeypatch, fake_cache):
+    cache = fake_cache()
     monkeypatch.setattr(main, "cache", cache)
     _patch_retrieval_pipeline(monkeypatch, [])
 
@@ -544,8 +512,8 @@ def test_retrieve_and_rerank_does_not_cache_empty_results(monkeypatch):
     assert cache.store == {}
 
 
-def test_retrieve_and_rerank_non_empty_results_are_still_cached(monkeypatch):
-    cache = _FakeCache()
+def test_retrieve_and_rerank_non_empty_results_are_still_cached(monkeypatch, fake_cache):
+    cache = fake_cache()
     monkeypatch.setattr(main, "cache", cache)
     _patch_retrieval_pipeline(monkeypatch, [_article(1, 0.9)])
 
@@ -557,19 +525,40 @@ def test_retrieve_and_rerank_non_empty_results_are_still_cached(monkeypatch):
     assert "body" not in cache.sets[0][1][0]
 
 
-def test_search_retrieve_error_returns_500(monkeypatch):
+def test_search_retrieve_error_returns_500(monkeypatch, fake_cache):
     async def boom(*args, **kwargs):
         raise RuntimeError("qdrant down")
 
-    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setattr(main, "retrieve_and_rerank", boom)
 
     r = _client.get("/search", params={"q": "test"})
     assert r.status_code == 500
 
 
-def test_search_cache_error_returns_500(monkeypatch):
-    monkeypatch.setattr(main, "cache", _FakeCache(get_error=RuntimeError("redis down")))
+def test_search_cache_error_returns_500(monkeypatch, fake_cache):
+    """A cache read that raises must surface as a 500.
+
+    Retrieval is stubbed to succeed, so the only thing that can turn this
+    request into a 500 is the cache raising. With a working cache the very same
+    wiring answers 200, which is what makes the 500 attributable to the cache
+    instead of to whatever the unstubbed pipeline would have done.
+    """
+
+    async def fake_retrieve(*args, **kwargs):
+        return [_article(1, 0.9)]
+
+    monkeypatch.setattr(main, "cache", fake_cache(get_error=RuntimeError("redis down")))
+    monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
+    monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
+    monkeypatch.setattr(main, "expand_query", lambda q: q)
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
+    monkeypatch.setattr(main, "apply_click_boost", _passthrough_boost)
+    monkeypatch.setattr(main, "diversify", lambda results, **kwargs: results)
+    monkeypatch.setattr(main, "weak_results_note", lambda scores, label: None)
+    monkeypatch.setattr(main, "record_search", _noop_async)
+    monkeypatch.setattr(main.config, "ENABLE_CLICK_BOOST", False)
+    monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
 
     r = _client.get("/search", params={"q": "test"})
     assert r.status_code == 500
@@ -578,9 +567,9 @@ def test_search_cache_error_returns_500(monkeypatch):
 # --- /facets ---
 
 
-def test_facets_cache_hit(monkeypatch):
+def test_facets_cache_hit(monkeypatch, fake_cache):
     cached = {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A", "Funding"]}
-    monkeypatch.setattr(main, "cache", _FakeCache(get_result=cached))
+    monkeypatch.setattr(main, "cache", fake_cache(get_result=cached))
 
     async def fake_facet_values(key):
         raise AssertionError("_facet_values must not run on a cache hit")
@@ -592,8 +581,8 @@ def test_facets_cache_hit(monkeypatch):
     assert r.json() == cached
 
 
-def test_facets_cache_miss(monkeypatch):
-    cache = _FakeCache()
+def test_facets_cache_miss(monkeypatch, fake_cache):
+    cache = fake_cache()
     monkeypatch.setattr(main, "cache", cache)
 
     async def fake_facet_values(key):
@@ -605,15 +594,15 @@ def test_facets_cache_miss(monkeypatch):
     assert r.status_code == 200
     assert r.json() == {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A"]}
     assert cache.sets == [
-        (main.FACETS_CACHE_KEY, {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A"]})
+        (main.FACETS_CACHE_KEY, {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A"]}, None)
     ]
 
 
-def test_facets_qdrant_error_returns_500(monkeypatch):
+def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
     async def fake_facet_values(key):
         raise RuntimeError("qdrant down")
 
-    monkeypatch.setattr(main, "cache", _FakeCache())
+    monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setattr(main, "_facet_values", fake_facet_values)
 
     r = _client.get("/facets")
