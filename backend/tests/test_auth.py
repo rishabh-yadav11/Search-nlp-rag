@@ -579,10 +579,10 @@ def test_sub_floor_effective_credential_is_refused_by_every_set_path(tmp_path, m
         # The seeded account needs a password that CLEARS the raised floor, so
         # the 422 below can only be about the sub-floor one.
         seeded = "Goodpassword9-abcdefghijklmnop"
-        token = _token(client, "user@x.co", seeded)
+        cookie = _session(client, "user@x.co", seeded)
         cr = client.post(
             "/api/auth/change-password",
-            headers={"Authorization": f"Bearer {token}"},
+            cookies=cookie,
             json={"current_password": seeded, "new_password": pw},
         )
         assert cr.status_code == 422, "change_password admitted a sub-floor credential"
@@ -620,17 +620,19 @@ def test_change_password_accepts_the_long_passphrase_bootstrap_accepted(tmp_path
     assert len(long_pw.encode()) > auth._BCRYPT_MAX_BYTES
     client, s = _auth_app(tmp_path)
     try:
-        token = _token(client, "admin@x.co")
-        h = {"Authorization": f"Bearer {token}"}
+        cookie = _session(client, "admin@x.co")
         r = client.post(
             "/api/auth/change-password",
-            headers=h,
+            cookies=cookie,
             json={"current_password": "secret12", "new_password": long_pw},
         )
         assert r.status_code == 200, r.text
-        new_h = {"Authorization": f"Bearer {r.json()['token']}"}
+        # change_password revokes every token and re-issues the session, so the
+        # new credential arrives as a fresh Set-Cookie and never in the body.
+        new_cookie = auth_cookie(session_cookie_value(r))
+        assert "token" not in r.json()
         assert client.post(
-            "/api/auth/change-password", headers=new_h,
+            "/api/auth/change-password", cookies=new_cookie,
             json={"current_password": long_pw, "new_password": "secret99"},
         ).status_code == 200
         assert client.post("/api/auth/login", json={"email": "admin@x.co", "password": "secret99"}).status_code == 200
@@ -671,10 +673,10 @@ def test_truncated_password_is_warned_on_at_every_set_path(tmp_path, store, monk
         client, s = _auth_app(tmp_path)
         try:
             _signup(client, "warn@x.co", long_pw)
-            token = _token(client, "warn2@x.co")
+            cookie = _session(client, "warn2@x.co")
             r = client.post(
                 "/api/auth/change-password",
-                headers={"Authorization": f"Bearer {token}"},
+                cookies=cookie,
                 json={"current_password": "secret12", "new_password": long_pw},
             )
             assert r.status_code == 200

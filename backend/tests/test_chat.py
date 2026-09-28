@@ -4156,8 +4156,8 @@ def _delete_mid_turn_scenario(tmp_path, monkeypatch, delete_after_deltas):
     """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
         user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
 
         async def fake_prepare(question, history):

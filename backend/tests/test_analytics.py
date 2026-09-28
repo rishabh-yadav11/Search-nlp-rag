@@ -421,7 +421,7 @@ def test_summary_raises_when_redis_is_down(monkeypatch):
 @pytest.fixture
 def analytics_client(tmp_path):
     """An admin-authenticated TestClient over the real app, with both SQLite
-    stores on throwaway files. Yields (client, admin_headers, chat_store)."""
+    stores on throwaway files. Yields (client, admin_session_cookie, chat_store)."""
     from fastapi.testclient import TestClient
 
     from app import auth as auth_module
@@ -520,11 +520,11 @@ def test_summary_read_is_recorded_in_the_admin_audit_trail(analytics_client, mon
     """The cross-user read leaves a trail, as #273 established for
     /analytics/chat. Without one, an admin reading these aggregates is
     indistinguishable from nobody having looked."""
-    client, headers, chat_store = analytics_client
+    client, cookie, chat_store = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
 
     before = len(_run(chat_store.admin_audit_log(limit=1000)))
-    res = client.get("/analytics/summary", headers=headers)
+    res = client.get("/analytics/summary", cookies=cookie)
     assert res.status_code == 200
 
     log = _run(chat_store.admin_audit_log(limit=1000))
@@ -535,14 +535,14 @@ def test_summary_read_is_recorded_in_the_admin_audit_trail(analytics_client, mon
 def test_summary_serves_text_free_rows_over_http(analytics_client, monkeypatch):
     """End-to-end: what the admin dashboard actually receives contains no
     search text, only digests."""
-    client, headers, _ = analytics_client
+    client, cookie, _ = analytics_client
     secret = "who bought northwind capital"
     fake = _SummaryRedis()
     fake.store["analytics:search:total"] = 12
     fake.zsets["analytics:top_queries"] = {analytics.query_digest(secret, "k"): 12}
     monkeypatch.setattr(analytics, "_client", lambda: fake)
 
-    body = client.get("/analytics/summary", headers=headers).json()
+    body = client.get("/analytics/summary", cookies=cookie).json()
 
     assert secret not in json.dumps(body)
     assert body["top_queries"] == [[analytics.query_digest(secret, "k"), 12]]
@@ -552,7 +552,7 @@ def test_summary_still_serves_when_the_audit_write_fails(analytics_client, monke
     """The audit is best-effort: if it cannot be written the (text-free) read
     must still succeed, or a broken audit table would take the dashboard down
     with it."""
-    client, headers, chat_store = analytics_client
+    client, cookie, chat_store = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
 
     async def boom(*args, **kwargs):
@@ -560,7 +560,7 @@ def test_summary_still_serves_when_the_audit_write_fails(analytics_client, monke
 
     monkeypatch.setattr(chat_store, "record_admin_audit", boom)
 
-    res = client.get("/analytics/summary", headers=headers)
+    res = client.get("/analytics/summary", cookies=cookie)
 
     assert res.status_code == 200
     assert "searches_total" in res.json()
