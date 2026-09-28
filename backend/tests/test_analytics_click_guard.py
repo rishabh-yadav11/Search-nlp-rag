@@ -259,6 +259,20 @@ def test_click_without_an_id_is_still_counted(store, index):
     assert not [k for k in store.sets if k.startswith("analytics:query_click:")]
 
 
+def test_a_non_numeric_article_id_never_becomes_a_ranking_vote(store, index):
+    """``record_click`` is the module's public entry point, so its id handling
+    is pinned directly as well as through the route. A value that is not an
+    integer must not be written into the per-query sorted set -- a garbage
+    member there is a member the ranking layer can never interpret. The raw
+    click is still counted, exactly as for a beacon with no id at all."""
+    _run(analytics.record_click("ola ipo", 1, article_id="not-an-int", client_ip="10.9.9.9"))
+    _run(analytics.record_click("ola ipo", 1, article_id=None, client_ip="10.9.9.10"))
+
+    assert not [k for k in store.sets if k.startswith("analytics:query_click:")]
+    # Both beacons were still counted -- the guard drops the vote, not the click.
+    assert store.counters["analytics:click:total"] == 2
+
+
 # --- the client-supplied id must exist in the index ---
 
 
