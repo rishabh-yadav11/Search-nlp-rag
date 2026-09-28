@@ -631,7 +631,7 @@ not to a person.
 
 The dashboard UI is a Next.js page at `/analytics/dashboard` (proxied by nginx
 to the frontend; not part of this API). It renders KPI cards for search quality
-chat usage, top-query tables, clicks-by-position and
+and chat usage, top-query tables, clicks-by-position and
 conversations-by-cost/tokens tables by calling the two admin-gated JSON
 endpoints below with the bearer token, and refreshes every 30s.
 
