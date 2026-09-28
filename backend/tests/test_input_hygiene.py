@@ -17,7 +17,6 @@ from qdrant_client.models import MatchAny
 from app import analytics, auth, main
 from app.config import config
 from app.input_hygiene import (
-    MAX_FACET_VALUE_LEN,
     MAX_FACET_VALUES,
     MAX_KEY_LEN,
     build_cache_key,
@@ -305,7 +304,12 @@ def test_equivalent_spellings_share_one_search_cache_key(monkeypatch):
 
 
 def test_facet_value_count_over_the_cap_is_rejected():
-    too_many = ",".join(f"v{i}" for i in range(MAX_FACET_VALUES + 1))
+    # The input deliberately does NOT scale with MAX_FACET_VALUES. Building
+    # range(MAX_FACET_VALUES + 1) means that raising the cap mutates this test
+    # into allocating a list of that size -- with the cap at 10 ** 9 the suite
+    # hangs for minutes instead of failing. The mutation that disabled the cap
+    # is the one this file exists to catch, so it has to fail fast, not wedge.
+    too_many = ",".join(f"v{i}" for i in range(50))
     with pytest.raises(HTTPException) as excinfo:
         split_facet_values("industry", too_many)
     assert excinfo.value.status_code == 400
@@ -316,8 +320,10 @@ def test_facet_value_count_over_the_cap_is_rejected():
 
 
 def test_facet_value_length_over_the_cap_is_rejected():
+    # Fixed length, not MAX_FACET_VALUE_LEN + 1, for the same reason as the
+    # count test above: a mutated-up cap must not turn this into a gigabyte.
     with pytest.raises(HTTPException) as excinfo:
-        split_facet_values("author", "n" * (MAX_FACET_VALUE_LEN + 1))
+        split_facet_values("author", "n" * 200)
     assert excinfo.value.status_code == 400
     assert "author" in excinfo.value.detail
     assert "n" * 20 not in excinfo.value.detail
@@ -338,13 +344,12 @@ def test_facet_bomb_is_rejected_rather_than_truncated():
 def test_eleven_values_is_rejected_at_the_shipped_cap():
     """A LITERAL boundary test, on purpose.
 
-    Every other cap test builds its input from MAX_FACET_VALUES
-    (``range(MAX_FACET_VALUES + 1)``) and then asserts against the same
-    constant, so input and expectation scale together and the test passes
-    whatever the constant is. A mutation that raised the cap to 10 ** 9 was
-    sitting in the working tree of this branch, unnoticed, for exactly that
-    reason. These tests hold the boundary at fixed numbers so changing the
-    constant has to break something.
+    The cap tests that build their input from MAX_FACET_VALUES and then assert
+    against the same constant let input and expectation scale together, so the
+    test passes whatever the constant is. A mutation that raised the cap to
+    10 ** 9 was sitting in the working tree of this branch, unnoticed, for
+    exactly that reason. These tests hold the boundary at fixed numbers so
+    changing the constant has to break something.
     """
     with pytest.raises(HTTPException) as excinfo:
         split_facet_values("industry", ",".join(f"v{i}" for i in range(11)))
@@ -377,13 +382,18 @@ def test_facet_filter_never_builds_an_oversized_match_any():
 
 
 def test_facets_at_the_cap_are_still_accepted():
-    """The cap must not reject a legitimate in-bounds request."""
-    values = ["v" * MAX_FACET_VALUE_LEN] * MAX_FACET_VALUES
+    """The cap must not reject a legitimate in-bounds request.
+
+    Sized from literals, not from MAX_FACET_VALUES / MAX_FACET_VALUE_LEN: the
+    product of those two constants is what this builds, so a mutated-up cap
+    made it allocate gigabytes and the suite was OOM-killed before it could
+    report a failure."""
+    values = ["v" * 100] * 10
     accepted = split_facet_values("industry", ",".join(values))
-    assert len(accepted) == MAX_FACET_VALUES
-    assert all(len(v) == MAX_FACET_VALUE_LEN for v in accepted)
+    assert len(accepted) == 10
+    assert all(len(v) == 100 for v in accepted)
     filt = main.build_facet_filter(",".join(values), None, None, None, None, None)
-    assert len(filt.must[0].match.any) == MAX_FACET_VALUES
+    assert len(filt.must[0].match.any) == 10
 
 
 def test_oversized_facet_over_http_is_a_400_not_a_200(monkeypatch):
@@ -592,7 +602,9 @@ def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
     either, since the token is part of the same key. This one stays under the
     limit and must remain readable rather than being digested for nothing."""
     cache, _, _ = _wire(monkeypatch)
-    values = ",".join("v" * MAX_FACET_VALUE_LEN for _ in range(MAX_FACET_VALUES))
+    # Literals, not the cap constants -- same reason as the other facet tests:
+    # this multiplies MAX_FACET_VALUE_LEN by MAX_FACET_VALUES.
+    values = ",".join("v" * 100 for _ in range(10))
     response = _client.get("/search", params={"q": "test", "industry": values})
     assert response.status_code == 200
     # The request also builds the retrieve: prefetch key (#266); only the
