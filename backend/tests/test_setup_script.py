@@ -15,8 +15,10 @@ set is derived from config._env_tristate rather than restated here, so changing
 the parser's truthy set turns this file red until setup.sh is updated too.
 """
 
+import json
 import os
 import re
+import shutil
 import subprocess
 from itertools import product
 from pathlib import Path
@@ -26,6 +28,56 @@ import pytest
 from app.config import _FALSE_SPELLINGS, _TRUE_SPELLINGS, _env_tristate
 
 SETUP_SH = Path(__file__).resolve().parents[2] / "setup.sh"
+ECOSYSTEM_JS = Path(__file__).resolve().parents[2] / "ecosystem.config.js"
+
+NODE = shutil.which("node")
+needs_node = pytest.mark.skipif(NODE is None, reason="node resolves ecosystem.config.js")
+
+
+# The environment `run_services` hands `pm2 start ecosystem.config.js`, at the
+# defaults this module's harness runs it with. The harness below drives the real
+# function, so these are the same values `run_services` exports.
+_ECOSYSTEM_ENV = {
+    "VCCIRCLE_ROOT": str(ECOSYSTEM_JS.parent),
+    "API_PORT": "8001",
+    "NEXT_PORT": "3000",
+    "GUNICORN_WORKERS": "4",
+    "MIN_UPTIME_MS": "30000",
+    "API_MAX_MEMORY": "5G",
+    "FRONTEND_MAX_MEMORY": "1G",
+    "API_MAX_RESTARTS": "10",
+    "RESTART_BACKOFF_MS": "100",
+}
+
+
+def _ecosystem_apps() -> list[dict]:
+    """The pm2 apps `ecosystem.config.js` resolves to, as node computes them.
+
+    `run_services` starts pm2 from this file rather than from inline argv, so
+    what the running process gets is what the file resolves to once setup.sh's
+    exports are applied. Resolving it with node rather than reading the source
+    keeps these assertions about the EXECUTED definition: a `-H 127.0.0.1`
+    present in the text but lost in resolution would still leave the frontend
+    on the wildcard, and only executing the file catches that.
+    """
+    proc = subprocess.run(
+        [NODE, "-e", "console.log(JSON.stringify(require('./ecosystem.config.js').apps))"],
+        cwd=str(ECOSYSTEM_JS.parent),
+        env={**os.environ, **_ECOSYSTEM_ENV},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, f"ecosystem.config.js did not load: {proc.stderr}"
+    return json.loads(proc.stdout)
+
+
+def _ecosystem_app(service: str) -> dict:
+    for app in _ecosystem_apps():
+        if app["name"] == service:
+            return app
+    raise AssertionError(f"{service} is not defined in ecosystem.config.js")
 
 # The key the migration repairs, and the value it appends when absent.
 FLAG = "AUTH_TRUST_X_FORWARDED_FOR"
@@ -383,13 +435,19 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
         [
             "set -euo pipefail",
             f"cd {home}",
-            'API_PORT=8001; NEXT_PORT=3000; GUNICORN_WORKERS=4',
+            'API_PORT=8001; NEXT_PORT=3000; GUNICORN_WORKERS=4; MIN_UPTIME_MS=30000',
             'API_MAX_MEMORY=5G; API_MAX_RESTARTS=10; FRONTEND_MAX_MEMORY=1G; RESTART_BACKOFF_MS=100',
             f'LOGS={home}/logs; PID_DIR={home}/pid; ENV_FILE={home}/backend/.env',
             f'VENV_PY={home}/bin/python; SCRIPT_DIR={home}',
             "sleep() { :; }",  # wait_http's 1s backoff would cost 30s per run
             "stage() { :; }",
             "ensure_pm2() { :; }",
+            # run_services calls these, so they have to be here for the function
+            # under test to be the real one. MIN_UPTIME_MS above is the same
+            # reason: it is exported to `pm2 start`, and `set -u` turns a missing
+            # one into a subshell that never reaches pm2 at all.
+            _extract_function("env_value"),
+            _extract_function("harden_permissions"),
             _extract_function("report_readiness_reason"),
             _extract_function("wait_http"),
             _extract_function("run_services"),
@@ -415,7 +473,19 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
 
 
 def _started(pm2_log, service):
-    return any("start" in line and f"--name {service}" in line for line in pm2_log.splitlines())
+    """Did this run register `service` with pm2?
+
+    `run_services` starts pm2 ONCE, from `ecosystem.config.js`, so the evidence
+    is both halves: the invocation pm2 actually received (recorded by the stub)
+    and the app that file defines under this name. Either half alone would pass
+    for the wrong reason -- a start of some other file, or a start of this one
+    that happens not to carry the service.
+    """
+    started = any(
+        "start" in line and "ecosystem.config.js" in line
+        for line in pm2_log.splitlines()
+    )
+    return started and any(app["name"] == service for app in _ecosystem_apps())
 
 
 def test_a_failing_readiness_gate_does_not_leave_the_frontend_stopped(tmp_path):
@@ -450,21 +520,27 @@ def test_a_ready_deployment_still_succeeds(tmp_path):
     assert _started(pm2_log, "vccircle-frontend")
 
 
+@needs_node
 def test_the_frontend_is_registered_with_a_loopback_bind(tmp_path):
-    """`run_services` must hand pm2 a loopback bind, not just mention one (#318).
+    """`run_services` must give the frontend a loopback bind, not just mention one (#318).
 
-    The pm2 stub records the argv it was called with, so this asserts the
-    EXECUTED command rather than the text of setup.sh: a `-H 127.0.0.1` sitting
-    in the file but not reaching pm2 would leave the frontend on the wildcard,
-    and only this catches that. `next start` binds every interface when no
-    hostname is passed, so the flag is the whole control.
+    `run_services` starts pm2 from `ecosystem.config.js`, so the argv the
+    frontend actually runs is what that file RESOLVES to once setup.sh's
+    exports are applied -- and this resolves it with node rather than reading
+    the text. A `-H 127.0.0.1` present in the source but lost on the way to the
+    running process would still leave `next start` on the wildcard, and only
+    executing the definition catches that. `next start` binds every interface
+    when no hostname is passed, so the flag is the whole control.
     """
     proc, pm2_log = run_services(tmp_path, ready_deep_code=200)
 
     assert "RUN_SERVICES_RC=0" in proc.stdout, proc.stdout + proc.stderr
-    frontend = [ln for ln in pm2_log.splitlines() if "--name vccircle-frontend" in ln]
-    assert frontend, f"pm2 was never asked to start the frontend:\n{pm2_log}"
-    argv = frontend[0]
+    assert any(
+        "start" in line and "ecosystem.config.js" in line
+        for line in pm2_log.splitlines()
+    ), f"pm2 was never asked to start the frontend:\n{pm2_log}"
+
+    argv = _ecosystem_app("vccircle-frontend")["args"]
 
     assert "-H 127.0.0.1" in argv, (
         f"pm2 registers the frontend without a loopback bind, so `next start` "

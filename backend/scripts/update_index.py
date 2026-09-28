@@ -184,7 +184,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
 
     client = None
     try:
-        client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+        client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
         if deleted:
             client.delete(
                 collection_name=config.QDRANT_COLLECTION,
@@ -295,7 +295,7 @@ def reconcile(state: dict, records: dict[int, dict]) -> bool:
 
     client = None
     try:
-        client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+        client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
         point_ids = set()
         next_offset = None
         while True:

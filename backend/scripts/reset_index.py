@@ -95,7 +95,7 @@ def main() -> int:
     if api_is_live():
         log(f"WARNING: something is listening on port {API_PORT} — live queries will fail after this")
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=30)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
     try:
         try:
             existing = [c.name for c in client.get_collections().collections]

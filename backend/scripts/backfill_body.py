@@ -83,7 +83,7 @@ def main():
         return 1
 
     start = time.perf_counter()
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     log(f"loading sparse model {config.SPARSE_MODEL}...")
     sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
 

@@ -183,7 +183,7 @@ def main():
     print(f"Loading sparse embedding model {config.SPARSE_MODEL}...")
     sparse_model = SparseTextEmbedding(config.SPARSE_MODEL)
 
-    client = QdrantClient(url=config.QDRANT_URL, timeout=60)
+    client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     recreated = ensure_collection(client)
 
     # Index the payload fields on a resumed collection too. create_collection

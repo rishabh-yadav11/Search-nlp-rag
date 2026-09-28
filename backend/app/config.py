@@ -439,6 +439,12 @@ class Config:
 
     # Qdrant
     QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+    # The API key qdrant itself is started with (setup.sh sets
+    # QDRANT__SERVICE__API_KEY on the container). None when the store runs
+    # unauthenticated -- a dev box, or a localhost-only instance -- and the
+    # client is then built without the kwarg rather than with an empty string,
+    # because qdrant-client sends whatever it is given as the api-key header.
+    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
     QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "vccircle_articles")
 
     # Cache

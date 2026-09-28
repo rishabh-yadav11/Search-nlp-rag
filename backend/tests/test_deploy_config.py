@@ -1,31 +1,30 @@
 """`setup.sh services` and `ecosystem.config.js` must define the same pm2 processes.
 
-Both files can start the API, and they describe the same two pm2 apps. When
-`./setup.sh services` re-registers the backend, the process is rebuilt from the
-inline `pm2 start` line in `setup.sh` -- NOT from `ecosystem.config.js`. So any
-process option that exists only in `ecosystem.config.js` is silently dropped the
-first time an operator follows the documented remedy, and `pm2 save` then
-persists the stripped definition. `max_memory_restart` is the dangerous one: the
-backend loses its OOM auto-restart guard with no error anywhere.
+Both paths can start the API and they describe the same two pm2 apps, but the
+mechanism by which they could drift changed. `./setup.sh services` no longer
+re-registers the process from an inline `pm2 start` line: pm2's CLI has no
+`--min-uptime` flag in any released version, so it starts from
+`ecosystem.config.js` and EXPORTS the knobs to it. A hand-run
+`pm2 start ecosystem.config.js` instead gets whatever the ecosystem file falls
+back to.
 
-These tests compare the two definitions option by option:
+The two definitions are therefore still independent -- setup.sh's
+`${VAR:-default}` declarations versus the ecosystem file's own fallbacks -- and
+they can still drift, in two ways that matter:
 
-* every non-structural option `ecosystem.config.js` declares for an app must
-  also be passed on that app's `pm2 start` line in `setup.sh`;
-* and the VALUE must be equal, so a stale limit fails as loudly as a missing one.
+* a process option the ecosystem file declares that no exported knob drives, so
+  `./setup.sh services` cannot influence it and a hand-run start applies a
+  value nobody chose;
+* a knob whose default in `setup.sh` differs from the fallback in
+  `ecosystem.config.js`, so the two startup paths produce differently-shaped
+  processes on the same host.
 
-The option set is read from `ecosystem.config.js` itself rather than from a
-hardcoded list, so an option added there later is covered automatically. An
-earlier version of this file enumerated only the three options that existed when
-it was written, which meant adding a fourth option to the ecosystem file left the
-suite green -- the exact drift it exists to catch.
-
-For the value comparison, options that take no value (a bare flag such as
-`--watch`, which the backslash-continued `pm2 start` line leaves followed by
-the `'\n'` token shlex emits for the continuation) are checked for presence
-only, and a value that is a shell variable is resolved through setup.sh's own
-`${VAR:-default}` declaration so that `--max-memory-restart "$API_MAX_MEMORY"`
-compares equal to the literal `"5G"`.
+Both are compared here, option by option, and the option set is read from
+`ecosystem.config.js` itself rather than from a hardcoded list, so an option
+added there later is covered automatically. An earlier version of this file
+enumerated only the three options that existed when it was written, which meant
+adding a fourth option to the ecosystem file left the suite green -- the exact
+drift it exists to catch.
 """
 from __future__ import annotations
 
@@ -71,50 +70,89 @@ def _resolve(value: str, defaults: dict[str, str], where: str) -> str:
     return defaults[var]
 
 
-def _setup_sh_start_options(app_name: str) -> dict[str, str | None]:
-    """The pm2 options setup.sh passes for `app_name`.
+def _setup_sh_exports() -> dict[str, str]:
+    """The env vars `run_services` exports into `pm2 start ecosystem.config.js`.
 
-    Returns {flag: resolved value}, with value None for a flag that takes no
-    value. Only the tokens before the bare `--` that separates pm2 options from
-    the app argv are considered, so application arguments that also start with
-    dashes (`--workers`, `--bind`, `start -p`) cannot be mistaken for options.
+    `{VAR: value}` for every `VAR="$VAR"` on that one invocation, with the value
+    resolved through setup.sh's own `${VAR:-default}` declaration. Scoped to the
+    invocation so an unrelated `VAR="$VAR"` elsewhere in the script cannot be
+    mistaken for a knob the ecosystem file is meant to receive.
     """
     text = SETUP_SH.read_text()
-    defaults = _setup_sh_defaults()
-
     start = re.search(
-        r"pm2 start\b.*?--name\s+" + re.escape(app_name) + r"\b(?P<opts>.*?)--\s",
+        r'\(\s*cd\s+"\$SCRIPT_DIR"\s*&&(?P<exports>.*?)pm2 start\s+ecosystem\.config\.js',
         text,
         re.DOTALL,
     )
-    assert start is not None, f"no `pm2 start --name {app_name}` invocation in setup.sh"
+    assert start is not None, (
+        "setup.sh does not start pm2 from ecosystem.config.js; if it went back to "
+        "inline `pm2 start` lines, this guard is checking the wrong two paths"
+    )
 
-    tokens = shlex.split(start.group("opts"))
+    defaults = _setup_sh_defaults()
+    return {
+        name: _resolve(f"${ref}", defaults, f"setup.sh's export of {name}")
+        for name, ref in re.findall(r'(\w+)="\$(\w+)"', start.group("exports"))
+        if name == ref
+    }
+
+
+def _ecosystem_knobs() -> dict[str, str]:
+    """{const name: env var} for every knob ecosystem.config.js reads from the env."""
+    text = ECOSYSTEM_JS.read_text()
+    knobs: dict[str, str] = {}
+    for const, var in re.findall(r"const\s+(\w+)\s*=\s*process\.env\.(\w+)", text):
+        knobs[const] = var
+    for const, var in re.findall(
+        r"const\s+(\w+)\s*=\s*\w+\(\s*process\.env\.(\w+)\s*,", text
+    ):
+        knobs[const] = var
+    return knobs
+
+
+def _ecosystem_fallbacks() -> dict[str, str]:
+    """{env var: the literal ecosystem.config.js falls back to when it is unset}.
+
+    Only literals are recorded. A fallback that is a path expression
+    (`path.resolve(__dirname)`) has no value to compare against a setup.sh
+    default, and VCCIRCLE_ROOT is the one knob where that is correct: the
+    file's own location IS the answer, which is the whole reason the services
+    are started from the file.
+    """
+    text = ECOSYSTEM_JS.read_text()
+    fallbacks: dict[str, str] = {}
+    for var, rhs in re.findall(r"process\.env\.(\w+)\s*\|\|\s*([^\n;]+)", text):
+        fallbacks[var] = rhs.strip().strip("\"'")
+    for var, rhs in re.findall(r"\w+\(\s*process\.env\.(\w+)\s*,\s*([^,)]+)", text):
+        fallbacks[var] = rhs.strip().strip("\"'")
+    return fallbacks
+
+
+def _setup_sh_start_options(app_name: str) -> dict[str, str | None]:
+    """The value `./setup.sh services` actually starts `app_name` with.
+
+    setup.sh starts from `ecosystem.config.js`, so an option's value on that
+    path is the one its EXPORTED knob carries, resolved through setup.sh's own
+    `${VAR:-default}` declaration so a `5G` here compares equal to the literal
+    `"5G"` the ecosystem file falls back to. An option no exported knob drives
+    is absent, which is the drift `_missing_options` reports.
+
+    Read from the RAW declaration, not from `_ecosystem_options`: that one
+    resolves each `const` to its fallback, and the NAME of the const is exactly
+    what has to be looked up in the export list.
+    """
+    knobs = _ecosystem_knobs()
+    exports = _setup_sh_exports()
     options: dict[str, str | None] = {}
-    i = 0
-    while i < len(tokens):
-        if not tokens[i].startswith("--"):
-            i += 1
-            continue
-        flag = tokens[i]
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-        if nxt.startswith("--") or not nxt.strip():
-            # A bare flag with no value, e.g. `--watch`. The next token is
-            # either the following `--flag` or the `'\n'` that shlex leaves
-            # behind for the backslash line continuation the `pm2 start` line
-            # uses; a whitespace-only token is not a value.
-            options[flag] = None
-            i += 1
-        else:
-            options[flag] = _resolve(
-                nxt, defaults, f"setup.sh's `pm2 start --name {app_name}`"
-            )
-            i += 2
+    for flag, declared in _ecosystem_declared(app_name).items():
+        var = knobs.get(declared)
+        if var is not None and var in exports:
+            options[flag] = exports[var]
     return options
 
 
-def _ecosystem_options(app_name: str) -> dict[str, str]:
-    """Every non-structural option `ecosystem.config.js` declares for `app_name`.
+def _ecosystem_declared(app_name: str) -> dict[str, str]:
+    """Every non-structural option `ecosystem.config.js` declares, verbatim.
 
     App-level keys sit at six spaces of indentation; nested blocks (`env: {...}`)
     are indented further and are skipped. Values are unquoted and stripped so
@@ -138,9 +176,27 @@ def _ecosystem_options(app_name: str) -> dict[str, str]:
         key, value = m.group(1), m.group(2)
         if key in STRUCTURAL_KEYS or value.startswith("{"):
             continue
-        options["--" + key.replace("_", "-")] = value.strip("\"'")
+        options["--" + key.replace("_", "-")] = value.strip("\"'`")
     return options
 
+
+def _ecosystem_options(app_name: str) -> dict[str, str]:
+    """`_ecosystem_declared`, with each knob resolved to the value it falls back to.
+
+    An option declared as a `const` resolves to that const's FALLBACK, i.e. the
+    value a hand-run `pm2 start ecosystem.config.js` gets when the knob is unset.
+    That is the value this guard compares against setup.sh's own default, so a
+    `const` is never compared as the name of a variable. A const with no literal
+    fallback (VCCIRCLE_ROOT, whose fallback is the file's own location) is left
+    as the name, so it cannot be silently compared equal to an unrelated value.
+    """
+    knobs = _ecosystem_knobs()
+    fallbacks = _ecosystem_fallbacks()
+    resolved: dict[str, str] = {}
+    for flag, declared in _ecosystem_declared(app_name).items():
+        fallback = fallbacks.get(knobs.get(declared, ""))
+        resolved[flag] = fallback if fallback else declared
+    return resolved
 
 def _missing_options(
     declared: dict[str, str], passed: dict[str, str | None]
@@ -165,12 +221,18 @@ def _mismatched_values(
 
 
 @pytest.mark.parametrize("app_name", APP_NAMES)
-def test_setup_sh_passes_every_ecosystem_process_option(app_name: str) -> None:
-    """No process option in ecosystem.config.js may be absent from setup.sh.
+def test_every_ecosystem_process_option_is_driven_by_a_knob_setup_sh_exports(
+    app_name: str,
+) -> None:
+    """Every process option must be reachable from `./setup.sh services`.
 
-    This is the guard against the silent regression: an option present only in
-    ecosystem.config.js is dropped from the running process the next time
-    `./setup.sh services` re-registers it, with no error to notice.
+    An option the ecosystem file declares that no exported knob drives is one
+    `./setup.sh services` cannot influence, while a hand-run
+    `pm2 start ecosystem.config.js` applies with whatever the file's fallback
+    says. That is the same silent divergence this guard has always existed for,
+    in the mechanism the startup path actually uses: a knob an operator sets and
+    setup.sh exports is accepted and then ignored, which is worse than not
+    offering it at all.
     """
     declared = _ecosystem_options(app_name)
     assert declared, f"no process options parsed for {app_name} in ecosystem.config.js"
@@ -178,9 +240,10 @@ def test_setup_sh_passes_every_ecosystem_process_option(app_name: str) -> None:
     passed = _setup_sh_start_options(app_name)
     missing = _missing_options(declared, passed)
     assert not missing, (
-        f"ecosystem.config.js declares {missing} for {app_name} but setup.sh's "
-        f"`pm2 start --name {app_name}` does not pass them, so `./setup.sh services` "
-        "would drop them from the running process"
+        f"ecosystem.config.js declares {missing} for {app_name} but `./setup.sh "
+        f"services` exports no knob that drives them, so a hand-run "
+        f"`pm2 start ecosystem.config.js` and `./setup.sh services` would start "
+        f"{app_name} with different options"
     )
 
 
@@ -189,9 +252,10 @@ def test_setup_sh_process_options_match_ecosystem_values(app_name: str) -> None:
     """The option values must be equal, not merely both present.
 
     Comparing values is what makes this a real guard rather than a key-name
-    grep: a renamed flag or a reordered argument line does not fail, but a
-    drifted limit does. Valueless flags are compared by presence, since a bare
-    `--watch` carries no value to disagree about.
+    grep: a renamed knob does not fail, but a drifted limit does. setup.sh's
+    `${VAR:-default}` and the ecosystem file's own fallback are two independent
+    declarations of the same default, and a hand-run ecosystem start is exactly
+    where the mismatch would show up.
     """
     declared = _ecosystem_options(app_name)
     passed = _setup_sh_start_options(app_name)
@@ -204,26 +268,28 @@ def test_setup_sh_process_options_match_ecosystem_values(app_name: str) -> None:
 
 
 def _write_deploy_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, setup_line: str, declared: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, defaults: str, exports: str, declared: str
 ) -> None:
     """Point the drift guard at a synthetic `setup.sh` + `ecosystem.config.js`.
 
-    `setup_line` is the continuation-joined body of the app's `pm2 start` line
-    (everything after `--name demo-app`), and `declared` is the app's option
-    lines as they appear in `ecosystem.config.js`.
+    `defaults` is the body of setup.sh's `${VAR:-default}` declarations,
+    `exports` the knobs it hands `pm2 start ecosystem.config.js`, and `declared`
+    the app's option lines as they appear in `ecosystem.config.js`.
     """
     setup = tmp_path / "setup.sh"
     setup.write_text(
-        '#!/usr/bin/env bash\n'
-        'API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"\n'
+        "#!/usr/bin/env bash\n"
+        f"{defaults}"
         "\n"
         "run_services() {\n"
-        f"    pm2 start ./demo-app \\\n        --name demo-app \\\n{setup_line}"
-        "        -- app.main:app)\n"
+        '    (cd "$SCRIPT_DIR" && \\\n'
+        f"{exports}"
+        "        pm2 start ecosystem.config.js)\n"
         "}\n"
     )
     ecosystem = tmp_path / "ecosystem.config.js"
     ecosystem.write_text(
+        'const API_MAX_MEMORY = process.env.API_MAX_MEMORY || "5G";\n'
         "module.exports = {\n"
         "  apps: [\n"
         "    {\n"
@@ -240,127 +306,143 @@ def _write_deploy_files(
     monkeypatch.setattr(sys.modules[__name__], "ECOSYSTEM_JS", ecosystem)
 
 
-_WATCH_ECOSYSTEM = "      watch: true,\n"
-_WATCH_SETUP = "        --watch \\\n"
+_DEFAULTS = 'API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"\n'
+_EXPORTS = '        API_MAX_MEMORY="$API_MAX_MEMORY" \\\n'
+_DECLARED = "      max_memory_restart: API_MAX_MEMORY,\n"
 
 
-def test_a_bare_flag_on_both_sides_is_compared_by_presence_only(
+def test_agreeing_options_are_not_reported_as_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A valueless flag declared and passed alike is agreement, not drift.
+    """The baseline: a knob exported with the same default on both sides agrees.
 
-    The `pm2 start` lines are backslash-continued, so `shlex.split` emits a
-    stray `'\n'` token after every flag. Reading that token as the flag's
-    value made a consistent `--watch` pairing fail as
-    `{'--watch': ('true', '\\n')}`, blocking a legitimate future change.
+    Without this, a comparison that reported drift for everything would pass
+    every drift test below for entirely the wrong reason.
     """
     _write_deploy_files(
-        tmp_path,
-        monkeypatch,
-        setup_line=_WATCH_SETUP,
-        declared=_WATCH_ECOSYSTEM,
+        tmp_path, monkeypatch, defaults=_DEFAULTS, exports=_EXPORTS, declared=_DECLARED
     )
 
     declared = _ecosystem_options("demo-app")
     passed = _setup_sh_start_options("demo-app")
 
-    assert passed["--watch"] is None, (
-        f"a bare `--watch` must parse as valueless, not with value {passed['--watch']!r}"
+    assert passed == {"--max-memory-restart": "5G"}, (
+        f"the exported knob was not read: {passed!r}"
     )
     assert _missing_options(declared, passed) == []
     assert _mismatched_values(declared, passed) == {}
 
 
-def test_a_bare_flag_declared_but_not_passed_is_still_drift(
+def test_a_knob_declared_but_not_exported_is_still_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Presence-only comparison must not mean a bare flag is never checked.
+    """An option no exported knob drives is reported, not skipped.
 
-    If `--watch` is declared in `ecosystem.config.js` but absent from the
-    `pm2 start` line, `./setup.sh services` drops it from the running process,
-    so the missing option must still be reported.
+    setup.sh would start the app with the ecosystem file's fallback while
+    believing it had applied its own value, and an operator's override would be
+    accepted and discarded.
     """
     _write_deploy_files(
-        tmp_path, monkeypatch, setup_line="", declared=_WATCH_ECOSYSTEM
+        tmp_path, monkeypatch, defaults=_DEFAULTS, exports="", declared=_DECLARED
     )
 
     assert _missing_options(
         _ecosystem_options("demo-app"), _setup_sh_start_options("demo-app")
-    ) == ["--watch"]
+    ) == ["--max-memory-restart"]
 
 
-def test_a_bare_flag_passed_but_not_declared_is_not_drift(
+def test_a_default_that_drifted_is_reported_with_both_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The guard is one-directional: extra setup.sh options are not reported.
+    """A stale default must fail as loudly as a missing option.
 
-    An option pm2 accepts on the CLI but the ecosystem file omits is not a
-    silent-drop regression -- the process still gets it -- so it is out of
-    scope here, and pinning that keeps the direction of the guard explicit.
+    The option is present on both sides and only the numbers disagree, which is
+    exactly the drift a presence-only check would pass.
     """
     _write_deploy_files(
-        tmp_path, monkeypatch, setup_line=_WATCH_SETUP, declared=""
+        tmp_path,
+        monkeypatch,
+        defaults='API_MAX_MEMORY="${API_MAX_MEMORY:-8G}"\n',
+        exports=_EXPORTS,
+        declared=_DECLARED,
     )
 
     declared = _ecosystem_options("demo-app")
     passed = _setup_sh_start_options("demo-app")
 
-    assert passed["--watch"] is None
     assert _missing_options(declared, passed) == []
-    assert _mismatched_values(declared, passed) == {}
+    assert _mismatched_values(declared, passed) == {"--max-memory-restart": ("5G", "8G")}
 
 
 def test_both_startup_paths_bind_the_api_to_loopback() -> None:
-    """The API bind must be 127.0.0.1 in both files, and they must agree.
+    """The API must be bound to loopback, and nginx must be the only way in.
 
-    `setup.sh services` and `pm2 start ecosystem.config.js` are two ways to start
-    the same API; a wildcard bind surviving in either one re-exposes :8001 on
-    every interface of the host.
+    `./setup.sh services` and a hand-run `pm2 start ecosystem.config.js` are
+    the two ways to start the API, and they now read the SAME line in
+    `ecosystem.config.js`, so a wildcard bind cannot survive in one of them --
+    but it can survive in the file itself, which is what this asserts. The port
+    is resolved through the knob's fallback so a `${API_PORT}` template is
+    compared to setup.sh's own `API_PORT` default rather than string-matched.
     """
-    ecosystem_bind = re.search(r"--bind\s+([0-9.]+):(\d+)", ECOSYSTEM_JS.read_text())
-    assert ecosystem_bind is not None, "ecosystem.config.js has no --bind"
-    assert ecosystem_bind.group(1) == "127.0.0.1", (
-        f"ecosystem.config.js binds the API to {ecosystem_bind.group(1)}; it must be "
-        "127.0.0.1 so the API is not reachable off-host"
-    )
-
-    # The host may be a literal or a shell variable; the port is always one.
-    setup_bind = re.search(
-        r'--bind\s+"?([0-9.]+|\$\w+):\$\{?(\w+)\}?"?', SETUP_SH.read_text()
-    )
-    assert setup_bind is not None, "setup.sh has no --bind for the API"
-
     defaults = _setup_sh_defaults()
-    address = setup_bind.group(1)
-    if address.startswith("$"):
-        var = address[1:]
-        assert var in defaults, f"setup.sh --bind host ${var} has no default"
-        address = defaults[var]
-    assert address == "127.0.0.1", f"setup.sh binds the API to {address}, not 127.0.0.1"
-
-    assert ecosystem_bind.group(2) == defaults[setup_bind.group(2)], (
-        "the two startup paths must agree on the API port"
+    ecosystem_bind = re.search(
+        r"--bind\s+([0-9.]+|\$\{\w+\}):(\$\{\w+\}|\d+)", ECOSYSTEM_JS.read_text()
     )
+    assert ecosystem_bind is not None, "ecosystem.config.js has no --bind"
+
+    host = _resolve(ecosystem_bind.group(1), defaults, "ecosystem.config.js --bind host")
+    assert host == "127.0.0.1", (
+        f"ecosystem.config.js binds the API to {host}; it must be 127.0.0.1 so the "
+        "API is not reachable off-host"
+    )
+
+    port = _resolve(ecosystem_bind.group(2), defaults, "ecosystem.config.js --bind port")
+    assert port == defaults["API_PORT"], (
+        f"ecosystem.config.js binds the API to port {port} but setup.sh's API_PORT "
+        f"defaults to {defaults['API_PORT']}, so nginx would proxy to a port nothing "
+        "is listening on"
+    )
+
+    # The bind is only safe because nginx proxies over loopback to that same
+    # port; asserting it here is what stops the loopback bind from becoming the
+    # reason the site is unreachable.
+    proxies = re.findall(
+        r"proxy_pass\s+http://([0-9.]+|\$\w+):\$\{?API_PORT\}?;", SETUP_SH.read_text()
+    )
+    assert proxies, "the nginx template has no proxy_pass to the API port"
+    for proxy_host in proxies:
+        address = defaults[proxy_host[1:]] if proxy_host.startswith("$") else proxy_host
+        assert address == "127.0.0.1", (
+            f"nginx proxies the API to {address}, so binding it to 127.0.0.1 would "
+            "take the site down"
+        )
 
 
 FRONTEND_PKG_JSON = REPO_ROOT / "frontend" / "package.json"
 
 
-def _setup_sh_frontend_argv() -> list[str]:
-    """The argv setup.sh hands `next` for the frontend, after the `--` separator.
+def _ecosystem_frontend_argv() -> list[str]:
+    """The argv `next start` is given, from the pm2 app definition.
+
+    `./setup.sh services` and a hand-run `pm2 start ecosystem.config.js` both
+    start the frontend from this one `args` string, so there is a single
+    definition to assert on and a second path (the `npm start` script) to
+    compare it against.
 
     Every token is returned, not just the subcommand: the host is carried by a
-    `-H` flag later in the argv, so dropping the tail would make the caller
-    read an absent flag as Next's wildcard default.
+    `-H` flag later in the argv, so dropping the tail would make the caller read
+    an absent flag as Next's wildcard default.
     """
-    start = re.search(
-        r"pm2 start\b.*?--name\s+vccircle-frontend\b(?P<opts>.*?)--\s(?P<argv>[^)]*)\)",
-        SETUP_SH.read_text(),
+    # `args` is a template literal in the ecosystem file (it interpolates
+    # ${NEXT_PORT}), so the quoting is matched rather than assumed: a `"`-only
+    # pattern silently finds nothing there, which reads as "declares no args".
+    ecosystem = re.search(
+        r'"vccircle-frontend".*?args:\s*(?P<q>["\'`])(?P<argv>[^"\'`]+)(?P=q)',
+        ECOSYSTEM_JS.read_text(),
         re.DOTALL,
     )
-    assert start is not None, "no `pm2 start --name vccircle-frontend` invocation in setup.sh"
-    return shlex.split(start.group("argv"))
-
+    assert ecosystem is not None, "vccircle-frontend declares no args in ecosystem.config.js"
+    return shlex.split(ecosystem.group("argv"))
 
 def _next_start_flag(tokens: list[str], flag: str, default: str) -> str:
     """The value of `-H`/`--hostname` or `-p`/`--port`, or `default` if absent.
@@ -393,38 +475,29 @@ def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
     request-size limits, rate limiting and access logging. Next.js binds
     0.0.0.0 by default, so this is only true when the flag is actually passed.
 
-    There are three such paths and each one is effective on its own: the pm2 app
-    definition an operator starts by hand, the inline `pm2 start` line
-    `./setup.sh services` re-registers the process from (it does NOT read
-    ecosystem.config.js), and the `npm start` script a manual deploy runs.
+    There are two such paths and each one is effective on its own: the pm2 app
+    definition in `ecosystem.config.js` (which is what `./setup.sh services`
+    starts from as well as what an operator starts by hand), and the `npm start`
+    script a manual deploy runs.
     """
-    ecosystem = re.search(
-        r'"vccircle-frontend".*?args:\s*"([^"]+)"', ECOSYSTEM_JS.read_text(), re.DOTALL
-    )
-    assert ecosystem is not None, "vccircle-frontend declares no args in ecosystem.config.js"
-    ecosystem_host = _next_start_host(shlex.split(ecosystem.group(1)))
-    assert ecosystem_host == "127.0.0.1", (
-        f"ecosystem.config.js binds the frontend to {ecosystem_host}; it must be "
-        "127.0.0.1 so nginx on :80 is the only way in"
-    )
-
-    setup_tokens = _setup_sh_frontend_argv()
-    setup_host = _next_start_host(setup_tokens)
-    assert setup_host == "127.0.0.1", (
-        f"setup.sh binds the frontend to {setup_host}; it must be 127.0.0.1, or "
-        "`./setup.sh services` re-exposes :3000 on every interface"
+    tokens = _ecosystem_frontend_argv()
+    host = _next_start_host(tokens)
+    assert host == "127.0.0.1", (
+        f"ecosystem.config.js binds the frontend to {host}; it must be 127.0.0.1 so "
+        "nginx on :80 is the only way in, and `./setup.sh services` would otherwise "
+        "re-expose :3000 on every interface"
     )
 
     # A loopback bind on the wrong port is as broken as a wildcard bind on the
-    # right one: nginx proxies to $NEXT_PORT, so a frontend pm2 started on any
-    # other port is unreachable through the site. `args` is a structural key,
-    # so the drift guard above never sees it and this is the only check on it.
-    ecosystem_port = _next_start_flag(shlex.split(ecosystem.group(1)), "-p", "3000")
-    setup_port = _next_start_flag(setup_tokens, "-p", "3000")
-    assert ecosystem_port == setup_port, (
-        f"the two startup paths disagree on the frontend port "
-        f"(ecosystem.config.js :{ecosystem_port}, setup.sh :{setup_port}); nginx "
-        "proxies to $NEXT_PORT, so a frontend on the other port is unreachable"
+    # right one: nginx proxies to $NEXT_PORT, so a frontend on any other port is
+    # unreachable through the site. `args` is a structural key, so the option
+    # drift guard never sees it and this is the only check on the port.
+    defaults = _setup_sh_defaults()
+    port = _next_start_flag(tokens, "-p", "3000")
+    assert port == defaults["NEXT_PORT"], (
+        f"ecosystem.config.js starts the frontend on :{port} but setup.sh's "
+        f"NEXT_PORT defaults to {defaults['NEXT_PORT']}; nginx proxies to "
+        "$NEXT_PORT, so the frontend would be unreachable through the site"
     )
 
     script = FRONTEND_PKG_JSON.read_text(encoding="utf-8")
