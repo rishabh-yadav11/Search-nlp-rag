@@ -82,8 +82,8 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 # bootstrap_admin-seeded admin on main. What changed is that a user may now
 # CHOOSE a password that has such a tail; _warn_truncated_password records it at
 # every set path. Removing the root cause means hashing a pre-image (SHA-256
-# before bcrypt) instead of truncating, which invalidates every stored hash and
-# so needs a migration of its own -- tracked separately, not smuggled in here.
+# before bcrypt) instead of truncating, which changes the meaning of every
+# stored hash and so needs a credential-rehash migration of its own -- #387.
 _BCRYPT_MAX_BYTES = 72
 
 
