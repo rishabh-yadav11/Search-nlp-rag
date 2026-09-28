@@ -20,8 +20,14 @@ from app.redis_cache import HybridCache
 
 USER = "user-1"
 OTHER_USER = "user-2"
+
+
+def _for_you_key(user_id: str, limit: int) -> str:
+    return main._for_you_cache_key(user_id, limit)
+
+
 FOR_YOU_KEYS = [
-    f"recommend:for-you:{USER}:{n}" for n in range(main.FOR_YOU_MIN_LIMIT, main.FOR_YOU_MAX_LIMIT + 1)
+    _for_you_key(USER, n) for n in range(main.FOR_YOU_MIN_LIMIT, main.FOR_YOU_MAX_LIMIT + 1)
 ]
 # Unrelated cache traffic standing in for the rest of the database. Nothing in
 # the invalidation path may depend on how large this is.
@@ -208,7 +214,7 @@ def test_the_cache_exposes_no_scan_based_delete(client, env):
 
 
 def test_interaction_leaves_another_users_for_you_cache_alone(client, env):
-    other_key = f"recommend:for-you:{OTHER_USER}:5"
+    other_key = _for_you_key(OTHER_USER, 5)
     env.redis.store[other_key] = json.dumps([{"id": 3}])
 
     assert _post_interaction(client).status_code == 200
@@ -252,7 +258,7 @@ def test_every_writable_for_you_limit_is_invalidated(client, env):
     endpoint accepts, and then requires that every key it actually wrote is
     gone afterwards -- matched by string prefix, not by list membership.
     """
-    prefix = f"recommend:for-you:{USER}:"
+    prefix = _for_you_key(USER, 0).rsplit(":", 1)[0] + ":"
     env.redis.store = {k: v for k, v in env.redis.store.items() if not k.startswith(prefix)}
 
     # Discover the band from the request side, and probe well past the current
@@ -315,8 +321,8 @@ def test_interaction_purges_the_in_process_fallback_when_redis_is_down(client, e
             return None
 
     env.cache._redis = _DeadRedis()
-    own = f"recommend:for-you:{USER}:7"
-    unrelated = f"recommend:for-you:{OTHER_USER}:7"
+    own = _for_you_key(USER, 7)
+    unrelated = _for_you_key(OTHER_USER, 7)
 
     async def scenario():
         # With Redis down both of these land in the in-process tier.

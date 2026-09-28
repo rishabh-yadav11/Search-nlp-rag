@@ -1498,6 +1498,14 @@ class SimilarArticlesResponse(BaseModel):
     cached: bool = False
 
 
+# Bumped when the cached recommendation shape changed. Entries written by the
+# previous shape still carry the full article `body` (up to BODY_CHAR_LIMIT
+# chars per article), and every recommend endpoint returns its cached value
+# verbatim, so a versioned key is what stops those pre-deploy entries from
+# being served for their remaining TTL.
+RECOMMEND_CACHE_VERSION = "v2"
+
+
 class RecommendationsResponse(BaseModel):
     """Response for personalized recommendations."""
     user_id: str
@@ -1526,10 +1534,22 @@ FOR_YOU_MIN_LIMIT = 1
 FOR_YOU_MAX_LIMIT = 20
 
 
+def _for_you_cache_key(user_id: str, limit: int) -> str:
+    """The one place a /recommend/for-you cache key is spelled.
+
+    The writer in ``get_for_you`` and the invalidator in
+    ``record_user_interaction`` must agree on this string exactly. They used to
+    be f-strings written out twice, and a change to one silently stopped the
+    other from matching, leaving a user's feed served from a stale entry until
+    its TTL ran out. Both call this instead.
+    """
+    return f"recommend:for-you:{user_id}:{RECOMMEND_CACHE_VERSION}:{limit}"
+
+
 def _for_you_cache_keys(user_id: str) -> list[str]:
     """Every cache key /recommend/for-you can have written for ``user_id``."""
     return [
-        f"recommend:for-you:{user_id}:{limit}"
+        _for_you_cache_key(user_id, limit)
         for limit in range(FOR_YOU_MIN_LIMIT, FOR_YOU_MAX_LIMIT + 1)
     ]
 
@@ -1602,7 +1622,7 @@ async def get_similar(
 
     Uses dense vector similarity from Qdrant with optional category filtering.
     """
-    cached_key = f"recommend:similar:{article_id}:{limit}:{same_category}"
+    cached_key = f"recommend:similar:{RECOMMEND_CACHE_VERSION}:{article_id}:{limit}:{same_category}"
     cached = await cache.get(cached_key)
     if cached:
         return SimilarArticlesResponse(
@@ -1648,7 +1668,7 @@ async def get_for_you(
     """
     user_id = request.state.user_id
 
-    cached_key = f"recommend:for-you:{user_id}:{limit}"
+    cached_key = _for_you_cache_key(user_id, limit)
     cached = await cache.get(cached_key)
     if cached:
         return RecommendationsResponse(
@@ -1690,7 +1710,7 @@ async def get_trending(
     Queries Redis for recent interaction counts and returns the most
     engaged-with articles from the configured time window.
     """
-    cached_key = f"recommend:trending:{limit}"
+    cached_key = f"recommend:trending:{RECOMMEND_CACHE_VERSION}:{limit}"
     cached = await cache.get(cached_key)
     if cached:
         return TrendingResponse(

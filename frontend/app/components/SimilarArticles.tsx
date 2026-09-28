@@ -22,6 +22,21 @@ interface SimilarArticlesProps {
   compact?: boolean
 }
 
+// A search page renders one <SimilarArticles> per result and a chat source
+// list renders one per source, so the same article id is fetched repeatedly
+// within a single view -- and again on every subsequent search. The backend
+// already caches these by `recommend:similar:{version}:{id}:{limit}`, but the
+// browser still paid a full request each time. This module-level memo keys on
+// the same (articleId, limit) pair so a repeated id is served from memory
+// instead of the network. Successful non-empty responses only: an error or an
+// empty result is not memoized, so a later mount can retry.
+const similarCache = new Map<string, Article[]>()
+
+function cacheKey(articleId: number | string, limit: number): string {
+  return `${articleId}:${limit}`
+}
+
+
 export default function SimilarArticles({
   articleId,
   limit = 5,
@@ -34,6 +49,15 @@ export default function SimilarArticles({
 
   useEffect(() => {
     if (!articleId) return
+
+    const key = cacheKey(articleId, limit)
+    const memoized = similarCache.get(key)
+    if (memoized) {
+      setArticles(memoized)
+      setLoading(false)
+      setError(null)
+      return
+    }
 
     const controller = new AbortController()
     setLoading(true)
@@ -49,7 +73,9 @@ export default function SimilarArticles({
       })
       .then((data) => {
         if (!controller.signal.aborted) {
-          setArticles(data.similar_articles || [])
+          const next: Article[] = data.similar_articles || []
+          if (next.length) similarCache.set(key, next)
+          setArticles(next)
           setLoading(false)
         }
       })
