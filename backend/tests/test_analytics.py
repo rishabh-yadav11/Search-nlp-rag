@@ -74,15 +74,19 @@ class _FakeRedis:
 
 @pytest.fixture(autouse=True)
 def _reset_digest_key():
-    """Clear the process-wide digest key around every test.
+    """Clear the process-wide digest key and warning latch around every test.
 
     ``_QUERY_DIGEST_KEY`` is deliberately cached for the life of the process
     (it is the secret shared by all workers), so without this a key seeded
     through one test's fake Redis would still be in force for the next test.
+    ``_digest_warned`` is reset alongside it so a test cannot inherit another's
+    already-emitted warning and assert nothing was logged.
     """
     analytics._QUERY_DIGEST_KEY = None
+    analytics._digest_warned = False
     yield
     analytics._QUERY_DIGEST_KEY = None
+    analytics._digest_warned = False
 
 
 class _SignalsRedis:
@@ -576,14 +580,27 @@ def test_click_signals_success_builds_dict(monkeypatch):
 
 
 def test_click_signals_redis_down_returns_none(monkeypatch):
+    """A dead store must return no signal AND warn exactly once.
+
+    The digest-key read now happens before the zrevrange, so the outage is
+    reported through the digest latch rather than the store-outage one; the
+    behaviour under test is unchanged, only the latch that records it.
+    """
+
     class _BrokenRedis:
+        async def get(self, key):
+            raise ConnectionError("redis unreachable")
+
+        async def set(self, key, value, nx=False):
+            raise ConnectionError("redis unreachable")
+
         async def zrevrange(self, key, start, stop, withscores=False):
             raise ConnectionError("redis unreachable")
 
-    monkeypatch.setattr(analytics, "_warned", False)
+    monkeypatch.setattr(analytics, "_digest_warned", False)
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
     assert _run(analytics.click_signals("q")) is None  # degraded -> None
-    assert analytics._warned is True
+    assert analytics._digest_warned is True
 
 
 # --- _i / _f malformed-value branches ---
@@ -660,6 +677,32 @@ def test_summary_drops_legacy_verbatim_members(monkeypatch):
 
     assert legacy not in repr(s)
     assert [q for q, _ in s["top_queries"]] == [analytics.query_digest("ok", "k")]
+
+
+def test_summary_still_reports_a_full_list_when_legacy_rows_dominate(monkeypatch):
+    """Dropping legacy rows must not silently shrink the report.
+
+    An upgraded deployment's store is full of pre-change verbatim members
+    ranked above the new digests. Reading exactly TOP_QUERIES_N and filtering
+    afterwards would let those rows swallow the whole window and report a short
+    or empty list even though real digest rows sit just below the cut -- so the
+    read over-fetches. A short list while a full one of digests is available is
+    the failure this pins.
+    """
+    fake = _SummaryRedis()
+    rows = {f"legacy verbatim query {i}": 1000 - i for i in range(40)}
+    digests = [f"q1:{i:032x}" for i in range(1, analytics.TOP_QUERIES_N + 6)]
+    rows.update({d: 100 - i for i, d in enumerate(digests)})
+    fake.zsets["analytics:top_queries"] = rows
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    s = _run(analytics.summary())
+
+    assert "legacy verbatim" not in repr(s)
+    assert len(s["top_queries"]) == analytics.TOP_QUERIES_N
+    # Every row is a digest, and they are the highest-scoring ones available.
+    assert all(analytics._is_digest(q) for q, _ in s["top_queries"])
+    assert [q for q, _ in s["top_queries"]] == digests[: analytics.TOP_QUERIES_N]
 
 
 def test_click_beacon_never_stores_the_query_text(monkeypatch):

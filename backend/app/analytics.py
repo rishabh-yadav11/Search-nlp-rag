@@ -56,6 +56,15 @@ QUERY_DIGEST_PREFIX = "q1:"
 QUERY_DIGEST_HEX_LEN = 32
 _DIGEST_RE = re.compile(r"^q1:[0-9a-f]{32}$")
 
+# How much extra to read from each top-query set before dropping non-digest
+# members (see ``_digest_rows``). Legacy verbatim rows are dropped on read, so
+# a window read of exactly N could be entirely legacy and report an empty list
+# on a deployment whose top queries have not changed at all. Bounded rather
+# than "read everything" because these sets can hold many distinct queries and
+# the response stays a top-N report; this is a safety margin for the upgrade
+# window, not an unbounded scan.
+LEGACY_ROW_OVERFETCH = 5
+
 # Where the auto-generated digest key is persisted. It lives in the analytics
 # Redis (not a file) so it inherits the same backup/flush lifecycle as the data
 # it keys, and it is never returned over HTTP or written to a log.
@@ -75,6 +84,12 @@ _QUERY_DIGEST_KEY: str | None = None
 
 _redis = None
 _warned = False
+# Separate from ``_warned`` on purpose. A digest-key failure is NOT a Redis
+# outage -- recording continues without the query-keyed fields -- so it must
+# not consume the once-only outage warning, or a transient key hiccup would
+# silence the far more important "recording paused" alert for a real outage
+# later on. Its own message, its own flag.
+_digest_warned = False
 
 
 async def _digest_key(c) -> str | None:
@@ -109,7 +124,14 @@ async def _digest_key(c) -> str | None:
         _QUERY_DIGEST_KEY = stored
         return _QUERY_DIGEST_KEY
     except Exception as exc:
-        _degraded(exc)
+        global _digest_warned
+        if not _digest_warned:
+            logger.warning(
+                "analytics digest key unavailable (%s); query-keyed counts not "
+                "recorded (total/latency/cache counters still are)",
+                exc,
+            )
+            _digest_warned = True
         return None
 
 
@@ -164,11 +186,14 @@ def _degraded(exc: Exception) -> None:
 
 
 async def close() -> None:
-    global _redis, _QUERY_DIGEST_KEY
+    global _redis, _QUERY_DIGEST_KEY, _digest_warned
     # The cached key goes too: it was read through the client being closed, so
     # keeping it would let a reconnected client keep signing digests with a key
-    # the new store was never checked against.
+    # the new store was never checked against. The digest warning is reset for
+    # the same reason the key is -- a warning already emitted against a store
+    # that is gone would otherwise be suppressed against the one replacing it.
     _QUERY_DIGEST_KEY = None
+    _digest_warned = False
     if _redis is not None:
         await _redis.aclose()
         _redis = None
@@ -472,8 +497,8 @@ def _pct(part: int, total: int) -> float:
     return round(100.0 * part / total, 2) if total else 0.0
 
 
-def _digest_rows(rows) -> list:
-    """Top-N rows, keeping only members that are digests.
+def _digest_rows(rows, limit: int) -> list:
+    """Top-`limit` digest rows from an over-fetched window, newest score first.
 
     The write path stores digests, so in steady state every member passes and
     this is a pure format check. It exists for the members recorded BEFORE this
@@ -487,8 +512,14 @@ def _digest_rows(rows) -> list:
     Dropping is honest about the count too: a legacy row's score is real, but
     it is only reportable as "some query", which carries no information a
     dashboard can use.
+
+    The caller over-fetches (``LEGACY_ROW_OVERFETCH``) precisely because this
+    drops rows: reading only N members and filtering afterwards would let a
+    cluster of legacy rows eat the whole window and report an artificially
+    short list on a deployment whose top queries have not changed at all.
     """
-    return [[m, _i(s)] for m, s in rows if _is_digest(m)]
+    kept = [[m, _i(s)] for m, s in rows if _is_digest(m)]
+    return kept[:limit]
 
 
 async def summary() -> dict:
@@ -529,9 +560,21 @@ async def summary() -> dict:
         ) = vals
         cached = await c.get("analytics:search:cached")
 
-        top_queries = await c.zrevrange("analytics:top_queries", 0, TOP_QUERIES_N - 1, withscores=True)
+        # Read a wider window than we report, because ``_digest_rows`` drops
+        # pre-upgrade verbatim members: reading exactly N would let a run of
+        # legacy rows swallow the whole window and under-report. zrevrange's
+        # end index is INCLUSIVE, hence the -1.
+        top_queries = await c.zrevrange(
+            "analytics:top_queries",
+            0,
+            (TOP_QUERIES_N * LEGACY_ROW_OVERFETCH) - 1,
+            withscores=True,
+        )
         click_top_queries = await c.zrevrange(
-            "analytics:click_top_queries", 0, TOP_CLICKED_QUERIES_N - 1, withscores=True
+            "analytics:click_top_queries",
+            0,
+            (TOP_CLICKED_QUERIES_N * LEGACY_ROW_OVERFETCH) - 1,
+            withscores=True,
         )
 
         # Read exactly the buckets ``record_click`` can write. Derived from the
@@ -550,9 +593,9 @@ async def summary() -> dict:
             "cache_hit_rate": _pct(_i(cached), total),
             "avg_latency_ms": round(_f(lat_sum) / _i(lat_count), 1) if _i(lat_count) else 0.0,
             "clicks_total": _i(click_total),
-            "top_queries": _digest_rows(top_queries),
+            "top_queries": _digest_rows(top_queries, TOP_QUERIES_N),
             "click_positions": {str(i): _i(v) for i, v in zip(positions, pos_vals)},
-            "click_top_queries": _digest_rows(click_top_queries),
+            "click_top_queries": _digest_rows(click_top_queries, TOP_CLICKED_QUERIES_N),
         }
     except Exception as exc:
         _degraded(exc)
