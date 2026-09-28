@@ -470,6 +470,21 @@ class Config:
     # balloons the prompt size. 400000 matches today's 8 sources x 50K bodies.
     CHAT_MAX_SOURCES = int(os.getenv("CHAT_MAX_SOURCES", "20"))
     CHAT_TOTAL_BODY_CHARS = int(os.getenv("CHAT_TOTAL_BODY_CHARS", "400000"))
+    # A comparison/intersection chat turn runs one full retrieval leg PER
+    # entity, so the entity count is the turn's fan-out. A question can name
+    # an unbounded number of proper nouns (MAX_CONTENT_LEN is 8000 chars,
+    # which an attacker fills with 150+ of them), so "compare A and B and ..."
+    # could otherwise fan out that many pipelines -- each of which can run the
+    # pipeline twice -- inside one turn. Above this cap the multi-entity
+    # expansion is skipped and the question is answered as a single query,
+    # which is what a 150-way comparison deserves anyway.
+    CHAT_MAX_MULTI_ENTITIES = int(os.getenv("CHAT_MAX_MULTI_ENTITIES", "6"))
+    # How many of those legs may be in flight at once. Every leg takes the
+    # shared module-global inference_lock for its CPU rerank, so gathering
+    # them all would only queue them on that lock; a small depth is what
+    # actually overlaps the Qdrant I/O between legs without piling waiters
+    # onto the encoder pool.
+    CHAT_MULTI_ENTITY_CONCURRENCY = int(os.getenv("CHAT_MULTI_ENTITY_CONCURRENCY", "4"))
 
     # Total characters of prior conversation replayed into the chat prompt.
     # CHAT_MAX_HISTORY_TURNS bounds the turn COUNT but not their SIZE, and every
