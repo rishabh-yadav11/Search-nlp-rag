@@ -74,19 +74,22 @@ class _FakeRedis:
 
 @pytest.fixture(autouse=True)
 def _reset_digest_key():
-    """Clear the process-wide digest key and warning latch around every test.
+    """Clear the process-wide digest key, warning latch and scrub flag.
 
     ``_QUERY_DIGEST_KEY`` is deliberately cached for the life of the process
     (it is the secret shared by all workers), so without this a key seeded
     through one test's fake Redis would still be in force for the next test.
-    ``_digest_warned`` is reset alongside it so a test cannot inherit another's
-    already-emitted warning and assert nothing was logged.
+    ``_digest_warned`` and ``_legacy_scrubbed`` are reset alongside it so a test
+    cannot inherit another's already-emitted warning, or skip the one-time
+    legacy scrub because an earlier test already ran it.
     """
     analytics._QUERY_DIGEST_KEY = None
     analytics._digest_warned = False
+    analytics._legacy_scrubbed = False
     yield
     analytics._QUERY_DIGEST_KEY = None
     analytics._digest_warned = False
+    analytics._legacy_scrubbed = False
 
 
 class _SignalsRedis:
@@ -217,6 +220,17 @@ class _SummaryRedis:
         if withscores:
             return list(window)
         return [m for m, _ in window]
+
+    async def zrange(self, key, start, stop):
+        return list(self.zsets.get(key, {}))
+
+    async def zrem(self, key, *members):
+        self.zsets.setdefault(key, {})
+        removed = 0
+        for m in members:
+            if self.zsets[key].pop(m, None) is not None:
+                removed += 1
+        return removed
 
 
 def test_summary_click_positions_follow_click_position_max(monkeypatch):
@@ -703,6 +717,79 @@ def test_summary_still_reports_a_full_list_when_legacy_rows_dominate(monkeypatch
     # Every row is a digest, and they are the highest-scoring ones available.
     assert all(analytics._is_digest(q) for q, _ in s["top_queries"])
     assert [q for q, _ in s["top_queries"]] == digests[: analytics.TOP_QUERIES_N]
+
+
+def test_summary_deletes_legacy_verbatim_members_from_the_store(monkeypatch):
+    """Hiding the legacy corpus at the read boundary is not enough.
+
+    The write path re-issues EXPIRE on the whole top_queries key on every event,
+    so a pre-upgrade verbatim member's TTL is re-armed continuously and never
+    lapses on a deployment still taking searches: the harvested corpus would sit
+    in Redis, and in its backups, indefinitely. This asserts the members are
+    actually DELETED, which a read filter alone would not achieve.
+    """
+    fake = _SummaryRedis()
+    secret = "project falcon acquisition terms"
+    fake.zsets["analytics:top_queries"] = {
+        secret: 30,
+        "another pre-upgrade query": 20,
+        analytics.query_digest("live", "k"): 5,
+    }
+    fake.zsets["analytics:click_top_queries"] = {secret: 9}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics, "_legacy_scrubbed", False)
+
+    _run(analytics.summary())
+
+    # Gone from the store, not just from the response.
+    assert secret not in repr(fake.zsets)
+    assert "another pre-upgrade query" not in repr(fake.zsets)
+    assert list(fake.zsets["analytics:top_queries"]) == [analytics.query_digest("live", "k")]
+    assert fake.zsets["analytics:click_top_queries"] == {}
+
+
+def test_legacy_scrub_runs_once_not_on_every_read(monkeypatch):
+    """The scrub is a one-time cost per process; re-scanning the whole set on
+    every 30s dashboard poll would tax a hot path for no benefit after the first
+    pass."""
+    fake = _SummaryRedis()
+    fake.zsets["analytics:top_queries"] = {analytics.query_digest("live", "k"): 5}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics, "_legacy_scrubbed", False)
+
+    scans = []
+    original = fake.zrange
+
+    async def counting_zrange(*args, **kwargs):
+        scans.append(args[0])
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(fake, "zrange", counting_zrange)
+
+    _run(analytics.summary())
+    first = len(scans)
+    _run(analytics.summary())
+
+    assert first > 0
+    assert len(scans) == first  # no second pass
+
+
+def test_summary_still_reads_when_the_scrub_fails(monkeypatch):
+    """A store that cannot be scanned must not turn the dashboard into a 503:
+    the read-side filter still withholds the text, which is what matters."""
+
+    class _NoZrangeRedis(_SummaryRedis):
+        async def zrange(self, key, start, stop):
+            raise ConnectionError("redis unreachable")
+
+    fake = _NoZrangeRedis()
+    fake.zsets["analytics:top_queries"] = {analytics.query_digest("live", "k"): 5}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics, "_legacy_scrubbed", False)
+
+    s = _run(analytics.summary())
+
+    assert s["top_queries"] == [[analytics.query_digest("live", "k"), 5]]
 
 
 def test_click_beacon_never_stores_the_query_text(monkeypatch):

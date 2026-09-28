@@ -90,6 +90,10 @@ _warned = False
 # silence the far more important "recording paused" alert for a real outage
 # later on. Its own message, its own flag.
 _digest_warned = False
+# Set once the pre-upgrade verbatim members have been deleted from both
+# top-query sets, so the scrub runs once per process rather than per request.
+# Reset by close() alongside the digest key.
+_legacy_scrubbed = False
 
 
 async def _digest_key(c) -> str | None:
@@ -157,6 +161,55 @@ def query_digest(query: str, key: str) -> str:
     return QUERY_DIGEST_PREFIX + mac.hexdigest()[:QUERY_DIGEST_HEX_LEN]
 
 
+async def _scrub_legacy_members(c, key: str) -> int:
+    """Delete pre-upgrade verbatim members from a top-query set. Returns the count.
+
+    Hiding them at the read boundary is not enough. The write path re-issues
+    EXPIRE on the whole key on every event, so a legacy member's TTL is
+    re-armed continuously: on any deployment still taking searches the verbatim
+    corpus this fix exists to remove would sit in the analytics Redis -- and in
+    its backups -- indefinitely. A read filter stops the HTTP leak but leaves
+    the store holding precisely what #348's point 4 asks about.
+
+    So the members are actually removed. Guarded to once per process per key
+    (``_legacy_scrubbed``) because after the first pass there is nothing left to
+    delete, and a fresh install never has anything to begin with.
+    """
+    try:
+        rows = await c.zrange(key, 0, -1)
+    except Exception as exc:
+        # Best-effort: never let the scrub break a read. If it fails, the
+        # read-side filter still withholds the text from the response.
+        _degraded(exc)
+        return 0
+    stale = [m for m in rows if not _is_digest(m)]
+    if not stale:
+        return 0
+    try:
+        await c.zrem(key, *stale)
+    except Exception as exc:
+        _degraded(exc)
+        return 0
+    logger.info(
+        "removed %d pre-upgrade verbatim query members from %s (issue #348)",
+        len(stale),
+        key,
+    )
+    return len(stale)
+
+
+async def _scrub_legacy_once(c) -> None:
+    """One-time scrub of both top-query sets, on the first summary() read."""
+    global _legacy_scrubbed
+    if _legacy_scrubbed:
+        return
+    await _scrub_legacy_members(c, "analytics:top_queries")
+    await _scrub_legacy_members(c, "analytics:click_top_queries")
+    # Set even if a delete failed: the read-side filter withholds the text on
+    # every read regardless, so re-scanning per request buys nothing.
+    _legacy_scrubbed = True
+
+
 def _is_digest(member) -> bool:
     """True when a stored member is one of our digests rather than raw text."""
     return isinstance(member, str) and _DIGEST_RE.match(member) is not None
@@ -186,14 +239,17 @@ def _degraded(exc: Exception) -> None:
 
 
 async def close() -> None:
-    global _redis, _QUERY_DIGEST_KEY, _digest_warned
+    global _redis, _QUERY_DIGEST_KEY, _digest_warned, _legacy_scrubbed
     # The cached key goes too: it was read through the client being closed, so
     # keeping it would let a reconnected client keep signing digests with a key
     # the new store was never checked against. The digest warning is reset for
     # the same reason the key is -- a warning already emitted against a store
     # that is gone would otherwise be suppressed against the one replacing it.
+    # The scrub flag too, for the same reason: a reconnected store may be the
+    # one that actually needs the legacy members deleted.
     _QUERY_DIGEST_KEY = None
     _digest_warned = False
+    _legacy_scrubbed = False
     if _redis is not None:
         await _redis.aclose()
         _redis = None
@@ -502,12 +558,16 @@ def _digest_rows(rows, limit: int) -> list:
 
     The write path stores digests, so in steady state every member passes and
     this is a pure format check. It exists for the members recorded BEFORE this
-    change, which are verbatim queries: a deployment that upgrades keeps those
-    rows until their TTL lapses, and this is the read-side half of the fix --
-    without it the leak would survive the deploy for up to
-    ``CLICK_QUERY_TTL_SECONDS`` and the fix would only be true for a fresh
-    install. Such a member is dropped rather than returned, because the only
-    alternative is handing back the very text being removed.
+    change, which are verbatim queries, and is the read-side half of the fix:
+    without it the leak would survive the deploy entirely and this would only
+    be true for a fresh install. Such a member is dropped rather than returned,
+    because the only alternative is handing back the very text being removed.
+
+    Note this WITHHOLDS, it does not REMOVE. The write path re-arms the whole
+    key's TTL on every event, so a legacy member never lapses on a live
+    deployment; ``_scrub_legacy_once`` is what actually deletes them. This
+    filter is what makes the response correct in the meantime, and what still
+    holds if the scrub could not run.
 
     Dropping is honest about the count too: a legacy row's score is real, but
     it is only reportable as "some query", which carries no information a
@@ -560,6 +620,12 @@ async def summary() -> dict:
         ) = vals
         cached = await c.get("analytics:search:cached")
 
+        # Delete any pre-upgrade verbatim members before reading the window, so
+        # the corpus is gone from the store and not merely withheld from this
+        # response -- a read filter alone would leave it in Redis and its
+        # backups, since the write path re-arms the whole key's TTL on every
+        # event. Best-effort; the filter below still applies either way.
+        await _scrub_legacy_once(c)
         # Read a wider window than we report, because ``_digest_rows`` drops
         # pre-upgrade verbatim members: reading exactly N would let a run of
         # legacy rows swallow the whole window and under-report. zrevrange's

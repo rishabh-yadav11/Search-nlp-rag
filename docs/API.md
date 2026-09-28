@@ -563,9 +563,12 @@ first use and persists it in the analytics Redis, so all workers and restarts
 share it with no operator action. Changing it invalidates existing digests,
 which empties the two top-query lists but leaks nothing.
 
-Rows recorded **before** this change hold verbatim queries and are dropped
-from these lists rather than returned, so an upgraded deployment stops
-reporting them immediately instead of at the end of their TTL.
+Rows recorded **before** this change hold verbatim queries. They are never
+returned — the read path drops any member that is not a digest — and they are
+also **deleted from the store** on the first read of this endpoint after the
+upgrade, because the write path re-arms the whole key's TTL on every event and
+a pre-upgrade member would otherwise never expire. An upgraded deployment
+therefore both stops reporting them immediately and stops retaining them.
 
 Each read of this endpoint is recorded in the admin audit trail as
 `analytics.summary.read`, as `/analytics/chat` is.
