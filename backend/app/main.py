@@ -324,6 +324,7 @@ async def lifespan(app: FastAPI):
     await auth_store.connect()
     auth_module.store = auth_store
     await auth_module.bootstrap_admin()
+    await auth_module.report_legacy_password_hashes()
     state["auth_token_purge"] = asyncio.create_task(auth_module.token_purge_loop())
 
     init_fixer(

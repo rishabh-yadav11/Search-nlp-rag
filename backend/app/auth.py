@@ -83,25 +83,33 @@ ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
 SERVICE_USER_ID = "service-token"
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-# bcrypt silently truncates its input at 72 bytes, so this is the width of the
-# credential that actually authenticates. Password validation judges the
-# minimum against it rather than the raw string, which is what makes the floor
-# mean anything (#334).
+
+# How a password reaches bcrypt.
 #
-# This is NOT a cap on what a caller may submit. The policy deliberately has no
-# maximum, because refusing over-long values is what stopped bootstrap_admin --
-# the only path that can create an admin -- from seeding one (#290, #334).
+# bcrypt hashes AT MOST the first 72 bytes of its input and silently discards
+# the rest. Handed the password itself, that makes every long password a prefix
+# of itself: a 103-byte passphrase authenticates from its first 72 bytes, any
+# two values sharing a 72-byte prefix are the same credential, and bytes past
+# the cut add no entropy at all. No application-level maximum can fix that,
+# because the cut happens inside bcrypt rather than in validation -- which is
+# why the policy deliberately has no maximum (#290, #334).
 #
-# The accepted consequence is a prefix collision: once two passwords share a
-# 72-byte prefix, the bytes after it are not part of either credential, so the
-# shorter prefix authenticates the longer password. That is inherent to bcrypt's
-# truncation, not introduced here, and it was already true of every
-# bootstrap_admin-seeded admin on main. What changed is that a user may now
-# CHOOSE a password that has such a tail; _warn_truncated_password records it at
-# every set path. Removing the root cause means hashing a pre-image (SHA-256
-# before bcrypt) instead of truncating, which changes the meaning of every
-# stored hash and so needs a credential-rehash migration of its own -- #387.
-_BCRYPT_MAX_BYTES = 72
+# So bcrypt is handed a fixed-width SHA-256 pre-image instead. The digest is
+# always 32 bytes, so nothing is ever truncated, the prefix collision is gone,
+# and a 200-byte passphrase is worth 200 bytes. This is the standard remedy for
+# bcrypt's limit.
+#
+# It changes what a stored hash MEANS, so the two schemes must be tellable
+# apart. A current hash is this marker followed by a plain bcrypt string;
+# anything without the marker is a pre-migration ``bcrypt(raw[:72])``, which
+# ``verify_password`` still accepts until its owner next logs in and it is
+# rewritten in place (see ``login`` and ``_upgrade_password_hash``).
+_PASSWORD_SCHEME = "$bcrypt-sha256$"
+
+# The width of the credential a pre-migration hash represents. Kept ONLY so
+# those hashes can still be verified: no password is handed to bcrypt raw any
+# more, so nothing truncates and this bounds nothing.
+_LEGACY_BCRYPT_MAX_BYTES = 72
 
 
 class SignupIn(BaseModel):
@@ -248,68 +256,37 @@ def _password_rejection(password: str) -> str | None:
     reach this function. The three of them used to state the same two rules
     against different values, so they admitted different passwords (#334).
 
-    The two rules are deliberately judged against different values, because
-    they answer different questions:
+    Both rules are judged on the WHOLE value, because the whole value is what
+    authenticates: ``hash_password`` hands bcrypt a fixed-width SHA-256
+    pre-image, so no byte of the password is ever dropped. That is the second
+    half of the argument #334 made. It had to judge the length floor on
+    ``_effective_password()`` -- the 72-byte prefix bcrypt could actually see --
+    because a floor judged on the raw string was then the weaker bound: a
+    30-character password of 3-byte characters cleared a 30-character floor
+    while only 24 characters of it became the credential. That weaker bound was
+    safe only because the raw 72-byte maximum refused every value long enough to
+    have a shortened effective form, so the two bounds masked each other.
+    Pre-hashing removes the shortening that made the raw bound weaker, and with
+    it the reason the two bounds had to differ at all.
 
-    - **Length** is a property of the credential that actually authenticates.
-      ``hash_password`` and ``verify_password`` both go through
-      ``_password_bytes()``, which keeps only the first ``_BCRYPT_MAX_BYTES``
-      bytes, so nothing past that window can make a short password long.
-      Judging the minimum on the raw string is therefore the WEAKER bound: it
-      admits a password whose *effective* form is under
-      ``AUTH_PASSWORD_MIN_LEN``, so a configured floor can be stepped under.
-      On main that was latent rather than exploitable, because the raw 72-byte
-      maximum refused every value long enough to have a shortened effective
-      form (if a value fits in 72 bytes, ``_effective_password`` returns it
-      unchanged). The two bounds therefore MASKED each other, and removing the
-      maximum -- which the lockout required -- is what made the weak minimum
-      reachable. That is why both move together here: the minimum is judged on
-      ``_effective_password()``, so no credential is admitted below the floor by
-      any path, whichever bounds are in force.
+    **Letter+digit** is a composition rule, not an entropy rule, and has always
+    been judged on the configured secret. It stays that way: judging it on a
+    truncated prefix used to refuse credentials ``login`` already accepted (a
+    passphrase whose only digit sat past byte 72), and with nothing truncated
+    there is no second value to judge it on.
 
-    - **Letter+digit** is a property of the secret that was configured, not of
-      the truncated prefix. It is a composition rule, not an entropy rule, so
-      there is nothing to gain by applying it to bytes that will never
-      authenticate -- and applying it there refuses credentials ``login``
-      already accepted: a passphrase whose only digit was appended past byte 72
-      is long and usable, yet its 72-byte prefix has no digit.
-
-    There is deliberately NO maximum. The 72-byte cut is a property of bcrypt,
-    not a policy the application may enforce, and refusing over-long values is
+    There is deliberately NO maximum. The 72-byte cut was a property of bcrypt,
+    not a policy the application could enforce, and refusing over-long values is
     what stopped ``bootstrap_admin`` -- the only path that can ever create an
     admin -- from seeding one, while leaving the very same working passphrase
-    unsettable through ``change_password`` (#290, #334). All three set paths now
-    agree: a value longer than bcrypt's window is accepted, and
-    ``_warn_truncated_password`` records that its tail is not part of the
-    credential.
+    unsettable through ``change_password`` (#290, #334). All three set paths
+    accept a value of any length, and every byte of it now counts.
     """
-    if len(_effective_password(password)) < config.AUTH_PASSWORD_MIN_LEN:
+    if len(password) < config.AUTH_PASSWORD_MIN_LEN:
         return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
     if not _has_letter_and_digit(password):
         return "password must contain a letter and a digit"
     return None
-
-
-def _warn_truncated_password(password: str, path: str) -> None:
-    """Log that ``password`` is longer than what bcrypt will actually hash.
-
-    Every set path calls this once the value is accepted, so the fact that the
-    tail is not part of the credential is on the record instead of silent, and
-    the operator sees the same warning whichever path stored it. Only byte
-    counts are logged -- never the password, and never the account it belongs
-    to -- so the line cannot become a credential oracle.
-    """
-    effective = _effective_password(password)
-    if effective == password:
-        return
-    logger.warning(
-        "%s stored a password of %d bytes, but bcrypt only hashes the first %d. The trailing "
-        "bytes are dropped and will never authenticate. Shorten it, or accept that the tail is "
-        "not part of the credential.",
-        path,
-        len(password.encode("utf-8")),
-        _BCRYPT_MAX_BYTES,
-    )
 
 
 def validate_password(password: str) -> str:
@@ -349,49 +326,72 @@ def validate_name(name: str) -> str:
     return name
 
 
-def _password_bytes(password: str) -> bytes:
-    """Normalize a password to exactly the bytes bcrypt will hash, so the
-    set and verify paths agree (bcrypt truncates at 72 bytes)."""
-    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES]
+def _prehash(password: str) -> bytes:
+    """The fixed-width pre-image bcrypt is actually handed.
 
-
-def _effective_password(password: str) -> str:
-    """Return the password as it will actually be used: the first
-    ``_BCRYPT_MAX_BYTES`` bytes, decoded back to ``str``.
-
-    ``hash_password`` / ``verify_password`` both go through ``_password_bytes``,
-    so anything past byte 72 is silently dropped and never takes part in
-    authentication. Validating a bootstrap credential must therefore judge the
-    part that is really in effect, not the raw string: a long passphrase is
-    perfectly serviceable, and rejecting it would make a fresh deploy
-    unadministrable (bootstrap_admin is the only path that can ever create an
-    admin, since signup hardcodes SIGNUP_ROLE and role changes need an
-    existing admin token).
-
-    ``decode("utf-8", "ignore")`` matters: a multi-byte character can straddle
-    the 72-byte cut, and a strict decode would raise UnicodeDecodeError during
-    startup -- the fail-dead this check exists to avoid. The result is therefore
-    *at most* ``_BCRYPT_MAX_BYTES`` bytes and a byte-prefix of what
-    ``_password_bytes`` hashes: when the cut splits a character, the partial
-    character is dropped whole, so the decoded string is shorter by the number of
-    that character's bytes that fell inside the truncated buffer (1-3, depending
-    on its width and where the cut landed) rather than by a fixed amount. That
-    only ever drops a non-ASCII tail, so it cannot turn a policy-failing value
-    into a passing one. The min-length rule is decided entirely by the retained
-    prefix; the letter+digit rule is decided on the whole configured value (see
-    ``_password_rejection``).
+    SHA-256 rather than a second bcrypt: a second bcrypt would only move the
+    truncation window somewhere else, and a plain digest removes it outright.
+    32 bytes whatever the password's length, so the 72-byte cut can never bite.
     """
-    return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
+    return hashlib.sha256(password.encode("utf-8")).digest()
 
 
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt()).decode("utf-8")
+    """Hash a password in the current scheme: the scheme marker followed by a
+    plain bcrypt string over ``_prehash(password)``."""
+    digest = bcrypt.hashpw(_prehash(password), bcrypt.gensalt()).decode("utf-8")
+    return _PASSWORD_SCHEME + digest
+
+
+def needs_rehash(hashed: str) -> bool:
+    """Whether ``hashed`` is a pre-migration hash a verified password should be
+    rewritten into the current scheme.
+
+    A pure test of the stored marker: no bcrypt, no secret, no user input. It
+    reads the same string ``verify_password`` dispatches on, so the two can
+    never disagree about which scheme a row is in. Callers only ask after a
+    successful verify, and a row whose hash is unreadable or empty (a
+    non-account's placeholder, a corrupt value) can never reach that point,
+    because a hash that verifies is a hash bcrypt produced.
+    """
+    return not hashed.startswith(_PASSWORD_SCHEME)
 
 
 def verify_password(password: str, hashed: str) -> bool:
+    """Check a password against a stored hash of EITHER scheme.
+
+    The scheme is read from the STORED hash and only from the stored hash; the
+    two schemes are never both tried and the caller cannot choose between them.
+    That is what makes the migration safe in both directions:
+
+    - A current-scheme row is only ever checked against the pre-image, so
+      nobody can authenticate it with a raw 72-byte prefix. The collision
+      cannot survive the upgrade for exactly the accounts that were upgraded.
+    - A pre-migration row is only ever checked against ``raw[:72]`` -- the
+      credential it was created to represent -- so an account that predates the
+      change keeps logging in unchanged.
+
+    Trying both, or picking the scheme by what the caller submitted, would leave
+    the shorter of the two as a working alternative for whichever row an
+    attacker targeted: a current row would still fall back to the prefix, which
+    is the whole bug, and a legacy row would accept a value the owner never set.
+
+    Dispatching on the row also keeps the cost at exactly one bcrypt either way,
+    so a pre-migration account is not distinguishable by timing from a current
+    one, and the unknown-address path keeps paying the same
+    ``_DUMMY_PASSWORD_HASH`` cost it always did.
+    """
+    if hashed.startswith(_PASSWORD_SCHEME):
+        stored, preimage = hashed[len(_PASSWORD_SCHEME):], _prehash(password)
+    else:
+        stored = hashed
+        preimage = password.encode("utf-8")[:_LEGACY_BCRYPT_MAX_BYTES]
     try:
-        return bcrypt.checkpw(_password_bytes(password), hashed.encode("utf-8"))
+        return bcrypt.checkpw(preimage, stored.encode("utf-8"))
     except ValueError:
+        # Not a bcrypt string at all: a corrupt row, an empty placeholder, a
+        # truncated write. Same answer as a wrong password, and never an
+        # exception out of an auth path.
         return False
 
 
@@ -629,6 +629,51 @@ class AuthStore:
         """
         await self._db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
         await self._db.commit()
+
+    async def upgrade_password_hash(self, user_id: str, observed_hash: str, new_hash: str) -> int:
+        """Replace a pre-migration hash with a current one, but only while the
+        row still holds the hash that was just verified. Returns rows changed.
+
+        The compare-and-swap on ``observed_hash`` is what makes the
+        opportunistic upgrade safe to run from a login. A concurrent
+        ``change_password``, or a second worker upgrading the same account,
+        that committed after this request read the row must not be clobbered
+        with a hash derived from a credential its owner has already replaced.
+        Losing that race is the correct outcome -- the winning writer's hash is
+        the newer one -- so the rowcount is returned for the caller to log, not
+        retried: a retry would reopen the same race.
+
+        One statement, so it is atomic on its own and needs no transaction
+        around it: the row is on the old hash or the new one, never anything in
+        between, and a worker killed mid-write leaves the pre-migration hash in
+        place -- which still authenticates, so a crash here cannot lock anyone
+        out.
+        """
+        cur = await self._db.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (new_hash, user_id, observed_hash),
+        )
+        await self._db.commit()
+        return cur.rowcount
+
+    async def count_legacy_passwords(self) -> int:
+        """How many accounts still hold a pre-migration hash.
+
+        An upper bound on the at-risk set, not an exact one: a row records
+        nothing about how long the original password was, so a pre-migration
+        account whose password fitted inside bcrypt's window -- and which
+        therefore carries no prefix-collision exposure at all -- is counted
+        here too. Nothing in the row can tell those apart.
+
+        ``substr`` with a bound parameter rather than ``NOT LIKE``: ``%`` and
+        ``_`` are LIKE wildcards, so a scheme marker containing one would
+        silently match the wrong rows.
+        """
+        row = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM users WHERE substr(password_hash, 1, ?) <> ?",
+            (len(_PASSWORD_SCHEME), _PASSWORD_SCHEME),
+        )
+        return int(row["n"]) if row else 0
 
     async def count_admins(self) -> int:
         row = await self._fetchone("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
@@ -1654,7 +1699,6 @@ async def signup(body: SignupIn, request: Request):
     await _check_rate_limit(request, "signup", config.AUTH_SIGNUP_RATE_PER_MIN)
     email = validate_email(body.email)
     password = validate_password(body.password)
-    _warn_truncated_password(password, "signup")
     name = validate_name(body.name)
     s = _require_auth_store()
     # No pre-flight "does this address exist" lookup: create_user hashes the
@@ -1727,6 +1771,14 @@ async def login(
     timing oracle, because a cheap 429 for a known address and an expensive
     verify for an unknown one is a perfect enumeration signal. The counter is
     deliberately second-line.
+
+    A successful login also REWRITES the stored hash if it predates the
+    pre-image scheme (#387). That is a write on the read-looking path, and it
+    is deliberate: the plaintext exists in this request and nowhere else, so
+    this is the only moment a pre-migration credential can be re-expressed
+    without the account owner doing anything but logging in as they already do.
+    It never revokes anything -- the credential is unchanged, only how it is
+    stored -- and it can never fail the login (see ``_upgrade_password_hash``).
     """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
@@ -1743,6 +1795,13 @@ async def login(
     if password_ok and user is not None and user.is_active:
         # A real user with a real password is never counted, never gated, and
         # never rate-limited. Only failures consume the account's budget.
+        if needs_rehash(user.password_hash):
+            # Opportunistic migration. The plaintext exists only in this
+            # request, and this is the one moment the pre-migration hash can be
+            # re-expressed in the current scheme -- so the migration completes
+            # without a bulk reset, an operator action, or the account owner
+            # doing anything but logging in as they already do.
+            await _upgrade_password_hash(s, user, body.password)
         token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
         # The session is delivered ONLY as the HttpOnly cookie. It is never put
         # in the response body, so there is nothing for script on the page --
@@ -1757,6 +1816,38 @@ async def login(
         request, "login", config.AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN, email
     )
     raise HTTPException(status_code=401, detail="invalid email or password")
+
+
+async def _upgrade_password_hash(s: AuthStore, user: StoredUser, password: str) -> None:
+    """Re-store ``user``'s just-verified password in the current scheme.
+
+    Only ever called after ``verify_password`` accepted ``password`` against
+    ``user.password_hash``, so the credential cannot change meaning here: the
+    owner keeps logging in with the same value and every token already issued
+    stays valid. Nothing is revoked, because this rewrites how one secret is
+    stored, not which secret it is -- the opposite of ``change_password``, which
+    is why that path is deliberately not reused.
+
+    Never raises. A failure here is logged and dropped: the row is untouched
+    and its pre-migration hash still authenticates, so the user is logged in,
+    the upgrade is retried on their next login, and a housekeeping write can
+    never turn into an authentication outage. The user id is logged rather than
+    the address so this line cannot be read back as a record of who has
+    successfully authenticated.
+    """
+    try:
+        new_hash = await asyncio.to_thread(hash_password, password)
+        changed = await s.upgrade_password_hash(user.id, user.password_hash, new_hash)
+    except Exception:
+        logger.warning(
+            "could not upgrade the stored password hash for user %s; the existing hash still "
+            "authenticates and the upgrade is retried on the next login",
+            user.id,
+            exc_info=True,
+        )
+        return
+    if changed:
+        logger.info("upgraded the stored password hash for user %s to the current scheme", user.id)
 
 
 @router.get("/me", response_model=UserOut)
@@ -1800,9 +1891,9 @@ async def change_password(
     fresh token, so this session stays signed in and no other one does.
 
     The new password is judged by the same policy ``signup`` and
-    ``bootstrap_admin`` use (see ``_password_rejection``), so an admin seeded
-    with a passphrase longer than bcrypt's 72-byte window can re-apply that very
-    passphrase here instead of being 422'd out of its own credential.
+    ``bootstrap_admin`` use (see ``_password_rejection``), and stored the same
+    way, so an admin seeded with a passphrase of any length can re-apply that
+    very passphrase here instead of being 422'd out of its own credential.
 
     "Invalidates" holds even if the worker is killed mid-request: the hash
     write, the revocation and the replacement token commit together or not at
@@ -1816,7 +1907,6 @@ async def change_password(
     ):
         raise HTTPException(status_code=400, detail="current password is incorrect")
     new_password = validate_password(body.new_password)
-    _warn_truncated_password(new_password, "change-password")
     # Hash first, then take the write lock: bcrypt is the slow part and has no
     # business being spent holding it.
     new_hash = await asyncio.to_thread(hash_password, new_password)
@@ -1977,6 +2067,52 @@ async def revoke_service_tokens(
 
 
 
+async def report_legacy_password_hashes() -> int | None:
+    """Log how many accounts still hold a pre-migration password hash, and
+    return that count (None when it could not be determined).
+
+    The migration is completed by each account owner logging in, and nothing
+    here can finish it for them: a hash that means "the first 72 bytes" can
+    only become a pre-image hash by someone supplying the plaintext. What the
+    operator can do is SEE whether it is draining, which is the difference
+    between "three dormant accounts still authenticate on a 72-byte prefix" and
+    "the migration completed on day one".
+
+    There is deliberately no force option alongside this. Revoking a
+    pre-migration hash is the only way to finish one without the plaintext, and
+    this codebase has no password-reset path to revoke one with: a force switch
+    would not migrate anything, it would permanently lock out every account
+    that has not logged in since the upgrade, including on a fresh deploy an
+    operator has flipped the switch on to be thorough. Reporting the remainder
+    costs nothing and locks nobody out; a forced cutoff would have to wait for
+    a reset flow to exist (#387).
+
+    Never raises and never blocks startup. A count that fails is not worth
+    failing a boot over, and the next restart tries again.
+    """
+    s = store
+    if s is None:
+        return None
+    try:
+        remaining = await s.count_legacy_passwords()
+    except Exception:
+        logger.warning("could not count pre-migration password hashes", exc_info=True)
+        return None
+    if remaining:
+        logger.info(
+            "auth: %d account(s) still hold a pre-migration password hash. Each authenticates on "
+            "the first %d bytes of its password and is rewritten to the full password on its next "
+            "successful login. An account that never logs in again keeps the old hash, which is "
+            "the exposure it always had: there is no way to rehash a password without its "
+            "plaintext, and no password-reset path to revoke one with.",
+            remaining,
+            _LEGACY_BCRYPT_MAX_BYTES,
+        )
+    else:
+        logger.info("auth: no pre-migration password hashes remain")
+    return remaining
+
+
 async def bootstrap_admin() -> None:
     """Seed the bootstrap admin from config (once, at startup). Never overwrites
     an existing account's password. Safe under concurrent worker startups: the
@@ -2014,12 +2150,10 @@ async def bootstrap_admin() -> None:
     # both faults at once, and reporting only the address would hide a live
     # 1-character admin password.
     #
-    # Length is judged on what will actually authenticate. bcrypt only ever sees
-    # the first _BCRYPT_MAX_BYTES bytes (hash_password and verify_password both
-    # truncate), so those bytes ARE the credential. The original password is
-    # still what gets stored, so the row and its hash are byte-identical to
-    # before. See _password_rejection for why letter+digit is judged on the
-    # whole value instead, and why there is no maximum.
+    # Length is judged on the whole configured value, and so is everything else
+    # about it: hash_password hands bcrypt a fixed-width pre-image, so every
+    # byte of this passphrase becomes part of the credential and none of it is
+    # dropped. See _password_rejection for why there is still no maximum.
     password_error = _password_rejection(password)
 
     email_error = _validator_rejection(validate_email, email)
@@ -2039,12 +2173,6 @@ async def bootstrap_admin() -> None:
             password_rejected=password_error,
         )
         return
-    # Warned only once the value is ACCEPTED. Emitted before the rejections
-    # above, this reported "stored a password of N bytes" for a credential that
-    # was refused and never stored anywhere. It still fires when the admin
-    # already exists, and that is correct: that account really was provisioned
-    # from this value, and its tail really is not part of the credential.
-    _warn_truncated_password(password, "AUTH_ADMIN_PASSWORD")
     s = _require_auth_store()
     for attempt in range(5):
         if await s.get_user_by_email(email) is not None:

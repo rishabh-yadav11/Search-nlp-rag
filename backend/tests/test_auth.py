@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import logging
 import re
@@ -42,7 +43,8 @@ def store(tmp_path) -> AuthStore:
 def test_password_hashes_never_plaintext(store):
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     assert user.password_hash != "secret12"
-    assert re.match(r"^\$2[ab]\$", user.password_hash)  # bcrypt format
+    # the current scheme: the marker plus a plain bcrypt string (#387)
+    assert re.match(r"^\$bcrypt-sha256\$\$2[aby]\$", user.password_hash)
     assert auth.verify_password("secret12", user.password_hash)
     assert not auth.verify_password("wrong12", user.password_hash)
     # hash-only on disk: raw password must not appear in the db or its WAL
@@ -66,11 +68,11 @@ def test_validate_email_rejects_and_normalizes():
 def test_validate_password_rules():
     auth.validate_password("password1")  # ok
     # No "too long" case here: the policy deliberately has no maximum, since
-    # bcrypt truncates at 72 bytes and refusing longer values is what left an
-    # admin unable to re-apply its own bootstrap passphrase (#334). bcrypt
-    # always hashes exactly 72 bytes, so an unbounded input costs no extra
-    # hashing work. Over-length values are covered in
-    # test_signup_accepts_long_password_without_revealing_it and
+    # refusing longer values is what left an admin unable to re-apply its own
+    # bootstrap passphrase (#334). bcrypt now hashes a fixed-width SHA-256
+    # pre-image rather than the password (#387), so an unbounded input costs no
+    # extra hashing work and none of it is discarded. Over-length values are
+    # covered in test_signup_accepts_long_password_without_revealing_it and
     # test_change_password_accepts_the_long_passphrase_bootstrap_accepted.
     for bad in ("", "short1", "nodigits", "12345678"):
         with pytest.raises(HTTPException) as e:
@@ -287,14 +289,14 @@ def test_bootstrap_admin_keeps_existing_weak_admin_but_warns(store, monkeypatch,
 
 
 def test_bootstrap_admin_accepts_long_passphrase_and_creates_loggable_admin(store, monkeypatch):
-    """REGRESSION: bcrypt only ever sees the first 72 bytes, so a longer
-    passphrase is fully serviceable. Rejecting it would be worse than the bug it
-    guards: bootstrap_admin is the ONLY path that can ever create an admin
-    (signup hardcodes SIGNUP_ROLE, and PATCH /users needs an admin token that
-    cannot exist yet), so refusing it leaves a fresh deploy permanently
+    """REGRESSION: a passphrase longer than bcrypt's old 72-byte window is fully
+    serviceable. Rejecting it would be worse than the bug it guards:
+    bootstrap_admin is the ONLY path that can ever create an admin (signup
+    hardcodes SIGNUP_ROLE, and PATCH /users needs an admin token that cannot
+    exist yet), so refusing it leaves a fresh deploy permanently
     unadministrable while /health still reports green."""
     long_pw = "Passphrase1234" + "a" * 89  # 103 chars
-    assert len(long_pw.encode()) > auth._BCRYPT_MAX_BYTES
+    assert len(long_pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", long_pw)
     monkeypatch.setattr(auth, "store", store)
@@ -310,12 +312,13 @@ def test_bootstrap_admin_accepts_long_passphrase_and_creates_loggable_admin(stor
 
 
 def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeypatch):
-    """A multi-byte character can straddle the 72-byte cut. A strict decode of
-    the truncated bytes would raise UnicodeDecodeError inside bootstrap and
-    restart-loop the worker -- the fail-dead outcome this check exists to
-    avoid -- so the partial character must be dropped, not decoded."""
+    """A multi-byte passphrase used to straddle bcrypt's 72-byte cut, and
+    decoding the truncated bytes strictly raised UnicodeDecodeError inside
+    bootstrap -- a restart-looping worker, the fail-dead outcome the old check
+    existed to avoid. Nothing is decoded from a cut buffer any more: the whole
+    value is encoded and digested, so the straddle has nowhere to happen."""
     pw = "Passphrase1234" + "a" * 57 + "é" * 20
-    assert len(pw.encode()) > auth._BCRYPT_MAX_BYTES
+    assert len(pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", pw)
     monkeypatch.setattr(auth, "store", store)
@@ -325,61 +328,26 @@ def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeyp
     admin = asyncio.run(store.get_user_by_email("admin@x.co"))
     assert admin is not None and admin.role == "admin"
     assert auth.verify_password(pw, admin.password_hash)
-    # The effective credential is what actually authenticates: a byte-prefix of
-    # what gets hashed. A split multi-byte char drops the whole character, so
-    # the decoded string is shorter, never longer.
-    hashed = auth._password_bytes(pw)
-    effective = auth._password_bytes(auth._effective_password(pw))
-    assert len(effective) <= auth._BCRYPT_MAX_BYTES
-    assert hashed.startswith(effective)
-
-
-@pytest.mark.parametrize(
-    "pw, expected_shortfall",
-    [
-        # The boundary case (byte 72 is a whole ASCII char, so nothing is
-        # dropped) pins that a straddle-free value keeps all 72 bytes. The
-        # straddle cases below are what detect a change in the cut itself: at a
-        # 71-byte cut they each lose one more byte, so their expected shortfalls
-        # (1/2/3) no longer hold. The boundary case is deliberately kept because
-        # a 0-shortfall case is the only one that proves the limit is inclusive
-        # of the final byte.
-        ("a" * 71 + "1", 0),
-        ("Passphrase1234" + "a" * 57 + "é" * 20, 1),  # 2-byte char, cut 1 byte in
-        ("a" * 70 + "€" * 5, 2),  # 3-byte char, cut 2 bytes in
-        ("a" * 69 + "\U0001F600" * 5, 3),  # 4-byte char, cut 3 bytes in
-    ],
-)
-def test_effective_password_is_a_byte_prefix_of_what_gets_hashed(pw, expected_shortfall):
-    """Whatever the character width at the cut, the decoded value is a prefix of
-    the hashed bytes and never longer, and the shortfall is the EXACT number of
-    that character's bytes left inside the truncated buffer.
-
-    Asserting the exact count (not a 1-3 range) is deliberate: an off-by-one in
-    the cut would change which credentials pass the bootstrap guard, and a range
-    would let that regression pass unnoticed.
-    """
-    hashed = auth._password_bytes(pw)
-    effective = auth._password_bytes(auth._effective_password(pw))
-    assert len(hashed) == auth._BCRYPT_MAX_BYTES
-    assert hashed.startswith(effective)
-    assert len(hashed) - len(effective) == expected_shortfall
+    # the whole value is the pre-image, not a byte-prefix of it
+    assert auth._prehash(pw) == hashlib.sha256(pw.encode("utf-8")).digest()
 
 
 @pytest.mark.parametrize(
     "password",
     [
-        "a" * 80 + "1",  # the only digit sits past byte 72
-        "Passphrase" + "a" * 62 + "123",  # digits start past byte 72
+        "a" * 80 + "1",  # the only digit sits past where bcrypt used to cut
+        "Passphrase" + "a" * 62 + "123",  # digits start past that point
     ],
 )
 def test_bootstrap_admin_accepts_digit_past_the_bcrypt_cut(store, monkeypatch, password):
     """REGRESSION: the letter+digit rule is about the secret the operator
-    configured, not the truncated prefix. Judging it on the prefix refuses a
-    long, usable passphrase whose only digit was appended past byte 72 -- which
-    main accepted and login would authenticate -- and since bootstrap_admin is
-    the only path that can create an admin, that refusal leaves a fresh deploy
-    unadministrable."""
+    configured, not any prefix of it. A passphrase whose only digit sits past
+    byte 72 used to have that digit discarded before the rule was applied, so
+    judging composition on what survived would refuse a long, usable value --
+    and since bootstrap_admin is the only path that can create an admin, that
+    refusal leaves a fresh deploy unadministrable. The rule is judged on the
+    whole configured value, and every byte of it is now part of the
+    credential."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
     monkeypatch.setattr(auth, "store", store)
@@ -387,11 +355,9 @@ def test_bootstrap_admin_accepts_digit_past_the_bcrypt_cut(store, monkeypatch, p
     asyncio.run(bootstrap_admin())
 
     admin = asyncio.run(store.get_user_by_email("admin@x.co"))
-    assert admin is not None, "a digit past byte 72 must not block the admin"
+    assert admin is not None, "a digit late in the passphrase must not block the admin"
     assert admin.role == "admin"
     assert auth.verify_password(password, admin.password_hash)
-    # the 72-byte prefix really does lack a digit -- that is the point
-    assert not re.search(r"\d", auth._effective_password(password))
 
 
 def test_bootstrap_admin_refuses_genuinely_composition_free_password(store, monkeypatch, caplog):
@@ -437,11 +403,14 @@ def test_bootstrap_does_not_demand_rotation_for_an_email_rejection(store, monkey
     assert len(asyncio.run(store.list_users())) == 1
 
 
-def test_bootstrap_admin_still_blocks_weak_password_despite_truncation(store, monkeypatch):
-    """Normalizing to the effective value must not reopen the #290 hole: a
-    1-character password has a 1-character effective form, so it stays refused."""
+def test_bootstrap_admin_still_blocks_a_sub_floor_password_however_long_it_is(store, monkeypatch):
+    """Length is judged on the whole password, so a long one can no longer be
+    admitted by a short prefix: a 201-character value under a raised floor is
+    refused, and refusing it does not take startup down with it (#290)."""
+    password = "a" * 200 + "1"
+    monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", len(password) + 1)
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
-    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
     monkeypatch.setattr(auth, "store", store)
 
     asyncio.run(bootstrap_admin())
@@ -458,8 +427,9 @@ def test_bootstrap_admin_still_blocks_weak_password_despite_truncation(store, mo
 )
 def test_bootstrap_rejection_hint_matches_the_reason(store, monkeypatch, caplog, password):
     """The remediation must never contradict the reason it accompanies: telling
-    an operator to lengthen a password that was rejected for being too long
-    sends them the wrong way (#290)."""
+    an operator to lengthen a password that was rejected for having no digit
+    sends them the wrong way (#290). The reason is read back off the policy
+    itself, so this fails if the two drift rather than restating them."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
     monkeypatch.setattr(auth, "store", store)
@@ -470,7 +440,7 @@ def test_bootstrap_rejection_hint_matches_the_reason(store, monkeypatch, caplog,
     assert asyncio.run(store.list_users()) == []
     joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
     with pytest.raises(HTTPException) as exc:
-        auth.validate_password(auth._effective_password(password))
+        auth.validate_password(password)
     assert exc.value.detail in joined
     # the advice must not push the operator toward the other failure mode
     if "at least" in exc.value.detail:
@@ -496,7 +466,7 @@ def test_all_three_set_paths_agree_on_one_policy():
     for name in ("signup", "change_password"):
         src = inspect.getsource(getattr(auth, name))
         assert "validate_password(" in src, f"{name} must go through validate_password"
-        for stray in ("AUTH_PASSWORD_MIN_LEN", "_effective_password", "too long", "at least"):
+        for stray in ("AUTH_PASSWORD_MIN_LEN", "too long", "at least"):
             assert stray not in src, f"{name} restates a bound ({stray}); it must delegate only"
 
     boot = inspect.getsource(auth.bootstrap_admin)
@@ -507,64 +477,60 @@ def test_all_three_set_paths_agree_on_one_policy():
     assert "too long" not in vp, "the raw 72-byte cap must not come back"
 
 
-def test_a_truncated_passwords_prefix_still_authenticates_it():
-    """The documented consequence of having no maximum, pinned so it is a known
-    property rather than a surprise (#334).
+def test_a_truncated_passwords_prefix_no_longer_authenticates_it():
+    """The consequence #334 documented and pinned is gone (#387).
 
-    bcrypt truncates, so two passwords sharing a 72-byte prefix are the same
-    credential. This is why a user must be TOLD that a tail is being dropped
-    (``_warn_truncated_password``), and why the real fix is hashing a pre-image
-    instead of truncating. Pinning it here means a future change that alters the
-    truncation semantics has to confront this rather than change it silently.
+    With no maximum on the policy, a user could choose a password whose tail was
+    silently dropped, and two passwords sharing a 72-byte prefix were the same
+    credential -- so the prefix alone opened the longer account. That is the
+    collision bcrypt's truncation permits, and it is exactly why the value has
+    to be pre-hashed rather than truncated. Pinned here so a change that puts
+    the truncation back has to confront it.
     """
     long_pw = "Passphrase1234" + "a" * 89
-    prefix = long_pw[: auth._BCRYPT_MAX_BYTES]
+    prefix = long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES]
+    assert len(long_pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     stored = auth.hash_password(long_pw)
-    # the prefix is itself an acceptable password...
+    # the prefix is still itself an acceptable password...
     assert auth._password_rejection(prefix) is None
-    # ...and it authenticates the longer one. Inherent to bcrypt truncation.
-    assert auth.verify_password(prefix, stored)
-    # a difference INSIDE the window is still a different credential
+    # ...it just no longer authenticates the longer one
+    assert not auth.verify_password(prefix, stored)
     assert not auth.verify_password("Z" + prefix[1:], stored)
 
 
-def test_minimum_is_judged_on_the_effective_credential_not_the_raw_string(monkeypatch):
-    """The security half of #334, and the part that was actually a hole.
+def test_minimum_is_judged_on_the_whole_password(monkeypatch):
+    """The floor applies to the credential, whatever the credential is made of.
 
-    bcrypt hashes only the first 72 bytes, so a password made of 3-byte
-    characters is 30 CHARACTERS long but only 24 characters of it survive to
-    become the credential. Judged on the raw string it clears a 30-character
-    floor; the thing that actually authenticates is a 24-character one. That is
-    a weaker path admitting a password below the configured minimum, on the
-    public signup endpoint, with no bootstrap rationale to excuse it.
-
-    Judging length on ``_effective_password`` closes it: the floor now applies to
-    the credential, so no path can be talked under it.
+    #334 had to judge length on a 72-byte prefix because bcrypt hashed one, and
+    that made a floor on the raw string the weaker bound: a 30-character
+    password of 3-byte characters cleared a 30-character floor while only 24
+    characters of it became the credential. Pre-hashing removed the shortening
+    that made the raw bound weaker, so the floor is judged on the whole value
+    and a password is neither silently cut nor admitted by a short prefix.
     """
-    pw = "a" + "１" * 29  # 30 chars, 88 bytes, 24 effective chars
-    assert len(pw) == 30
-    assert len(auth._effective_password(pw)) == 24
+    pw = "a" + "１" * 29  # 30 chars, 88 bytes
+    assert len(pw) == 30 and len(pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", 30)
+    # 30 characters is 30 characters of credential now, so the floor is met ...
+    assert auth._password_rejection(pw) is None
+    # ... and one character short of it is still refused, on the whole value
+    short = pw[:-1]
+    assert auth._password_rejection(short) == "password must be at least 30 characters"
     with pytest.raises(HTTPException) as exc:
-        auth.validate_password(pw)
+        auth.validate_password(short)
     assert "at least 30" in str(exc.value.detail)
-    # bootstrap, which judged on the effective value all along, agrees exactly
-    assert auth._password_rejection(pw) == str(exc.value.detail)
 
 
-def test_sub_floor_effective_credential_is_refused_by_every_set_path(tmp_path, monkeypatch, store):
+def test_a_sub_floor_password_is_refused_by_every_set_path(tmp_path, monkeypatch, store):
     """The minimum rule must hold at the ENDPOINTS, not just in the helper: a
     caller must not reach the user table with a sub-floor credential by any of
     the three routes.
 
     Every leg asserts the rejection REASON, not merely a 422. A bare status
-    check would pass on any refusal -- including the old 72-byte cap and any
-    Pydantic error -- so it could not tell "refused because the credential is
-    under the floor" from "refused for an unrelated reason", and this test
-    passes against pre-fix code unless the reason is pinned. The value is 88
-    bytes, so pre-fix it was refused as too long rather than too short.
+    check would pass on any refusal, so it could not tell "refused because the
+    credential is under the floor" from "refused for an unrelated reason".
     """
-    pw = "a" + "１" * 29  # 30 chars / 88 bytes / 24 effective chars
+    pw = "a" + "１" * 28  # 29 characters
     monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", 30)
     reason = "password must be at least 30 characters"
     assert auth._password_rejection(pw) == reason
@@ -617,7 +583,7 @@ def test_change_password_accepts_the_long_passphrase_bootstrap_accepted(tmp_path
     and it really authenticates afterwards.
     """
     long_pw = "Passphrase1234" + "a" * 89  # 103 bytes
-    assert len(long_pw.encode()) > auth._BCRYPT_MAX_BYTES
+    assert len(long_pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     client, s = _auth_app(tmp_path)
     try:
         cookie = _session(client, "admin@x.co")
@@ -644,10 +610,9 @@ def test_change_password_accepts_the_long_passphrase_bootstrap_accepted(tmp_path
 def test_signup_accepts_long_password_without_revealing_it(tmp_path):
     """#334: ``signup`` refused any password over 72 bytes outright, so the
     ordinary user path carried the same ceiling. It is now aligned with
-    bootstrap and change_password -- and the warning about the dropped tail must
-    not leak into the response, which is the one fixed message that makes the
-    endpoint non-enumerable (#276).
-    """
+    bootstrap and change_password -- and nothing about the password may leak
+    into the response, which is the one fixed message that makes the endpoint
+    non-enumerable (#276)."""
     long_pw = "Passphrase1234" + "a" * 89
     client, s = _auth_app(tmp_path)
     try:
@@ -660,53 +625,64 @@ def test_signup_accepts_long_password_without_revealing_it(tmp_path):
         asyncio.run(s.close())
 
 
-def test_truncated_password_is_warned_on_at_every_set_path(tmp_path, store, monkeypatch, caplog):
-    """A value past bcrypt's window is accepted, so the fact that its tail is
-    not part of the credential must be recorded rather than silent -- on the
-    paths a user can reach, not just the operator's startup one (#334).
+def test_no_set_path_still_drops_a_passwords_tail(tmp_path, store, monkeypatch, caplog):
+    """#334 warned on every set path that the bytes past byte 72 were being
+    discarded. Nothing is discarded now, so what each path stores is the whole
+    password: the tail is part of the credential rather than a warning about
+    what was lost.
 
-    The warning states byte counts and the path, never the password itself and
-    never the account, so it cannot become a credential oracle.
+    The three paths are also driven under ``caplog`` to pin the property #334's
+    warning test carried as a side assertion: none of them ever writes the
+    password to the log. That matters more here than it did, because the
+    migration adds logging to the login path, and a line that named the secret
+    would put a credential in the log exactly when the login is rewriting it.
     """
     long_pw = "Passphrase1234" + "a" * 89
-    with caplog.at_level(logging.WARNING, logger="auth"):
-        client, s = _auth_app(tmp_path)
-        try:
-            _signup(client, "warn@x.co", long_pw)
-            cookie = _session(client, "warn2@x.co")
-            r = client.post(
-                "/api/auth/change-password",
-                cookies=cookie,
-                json={"current_password": "secret12", "new_password": long_pw},
-            )
-            assert r.status_code == 200
-        finally:
-            auth.store = None
-            asyncio.run(s.close())
-        monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
-        monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", long_pw)
-        monkeypatch.setattr(auth, "store", store)
-        asyncio.run(bootstrap_admin())
-
-    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING and "72" in r.getMessage()]
-    joined = "\n".join(warned)
-    assert warned, "a truncated password must be warned about on every set path"
-    for path in ("signup", "change-password", "AUTH_ADMIN_PASSWORD"):
-        assert path in joined, f"no truncation warning for {path}"
-    assert long_pw not in joined, "the password must never be logged"
-
-
-def test_no_truncation_warning_for_a_password_within_the_window(tmp_path, caplog):
-    """The warning must be reserved for the case it describes, not fired on
-    every account that sets a password."""
+    caplog.set_level(logging.DEBUG, logger="auth")
     client, s = _auth_app(tmp_path)
     try:
-        with caplog.at_level(logging.WARNING, logger="auth"):
-            _signup(client, "quiet@x.co", "secret12")
+        _signup(client, "tail@x.co", long_pw)
+        signed_up = asyncio.run(s.get_user_by_email("tail@x.co")).password_hash
+        assert auth.verify_password(long_pw, signed_up)
+        assert not auth.verify_password(long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES], signed_up)
+
+        # The one line the auth logger writes on a set path is the
+        # already-registered notice, so the second signup is what puts a log
+        # record on the path at all -- two fresh addresses would log nothing
+        # here and the assertion at the end would pass on an empty capture.
+        assert _signup(client, "tail@x.co", long_pw) == {
+            "message": auth.SIGNUP_ACCEPTED_MESSAGE
+        }
+
+        cookie = _session(client, "tail2@x.co")
+        r = client.post(
+            "/api/auth/change-password",
+            cookies=cookie,
+            json={"current_password": "secret12", "new_password": long_pw},
+        )
+        assert r.status_code == 200
+        changed = asyncio.run(s.get_user_by_email("tail2@x.co")).password_hash
+        assert auth.verify_password(long_pw, changed)
+        assert not auth.verify_password(long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES], changed)
     finally:
         auth.store = None
         asyncio.run(s.close())
-    assert not [r for r in caplog.records if "only hashes the first" in r.getMessage()]
+
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", long_pw)
+    monkeypatch.setattr(auth, "store", store)
+    asyncio.run(bootstrap_admin())
+    seeded = asyncio.run(store.get_user_by_email("admin@x.co"))
+    assert auth.verify_password(long_pw, seeded.password_hash)
+    assert not auth.verify_password(long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES], seeded.password_hash)
+
+    # Guard first: without a captured auth record the assertion below would pass
+    # on an empty capture and prove nothing. Then the property #334 carried as a
+    # side assertion, now that the truncation warning it rode along with is gone.
+    assert any(r.name == "auth" for r in caplog.records), (
+        "nothing was captured from the auth logger, so the check below is vacuous"
+    )
+    assert long_pw not in caplog.text, "a set path must never write the password to the log"
 
 
 def test_bootstrap_no_rotate_alarm_for_unrelated_healthy_admin(store, monkeypatch, caplog):
@@ -1203,11 +1179,13 @@ def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
         assert verified == [auth._DUMMY_PASSWORD_HASH]
         assert not real_verify("secret12", auth._DUMMY_PASSWORD_HASH)  # the dummy is not a back door
 
-        # the dummy hash costs what a real one costs
+        # the dummy hash costs what a real one costs, and is in the same scheme
+        # so it takes the same verify path (#387)
         def cost_of(hashed: str) -> str:
-            return hashed.split("$")[2]  # "$2b$<rounds>$..."
+            body = hashed.removeprefix(auth._PASSWORD_SCHEME)
+            return body.split("$")[2]  # "$2b$<rounds>$..."
 
-        assert re.match(r"^\$2[ab]\$", auth._DUMMY_PASSWORD_HASH)
+        assert auth._DUMMY_PASSWORD_HASH.startswith(auth._PASSWORD_SCHEME)
         assert cost_of(auth._DUMMY_PASSWORD_HASH) == cost_of(auth.hash_password("secret12"))
 
         verified.clear()
