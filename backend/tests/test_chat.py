@@ -3460,14 +3460,14 @@ def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path,
         assert r.json()["detail"] == expected
         # No fabricated answer is stored, and the failed turn leaves no dangling
         # user message behind.
-        assert client.get(f"/api/chat/sessions/{json_sid}", cookies=h[,)].json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{json_sid}", cookies=h).json()["messages"] == []
 
-        sse_sid = client.post("/api/chat/sessions", cookies=h[,)].json()["id"]
+        sse_sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
         body = _stream_body(client, h, sse_sid, "Who invested in fintech?")
         assert "event: error" in body
         assert "event: done" not in body
         assert json.loads(re.search(r"event: error\ndata: (.*)", body).group(1)) == expected
-        assert client.get(f"/api/chat/sessions/{sse_sid}", cookies=h[,)].json()["messages"] == []
+        assert client.get(f"/api/chat/sessions/{sse_sid}", cookies=h).json()["messages"] == []
 
         # The outage cost money on both paths: 3 billed attempts x $0.02.
         assert llm.calls == 6
@@ -5239,10 +5239,10 @@ def test_api_session_detail_flags_truncation_to_the_client(tmp_path, monkeypatch
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
-        sid = client.post("/api/chat/sessions", cookies=h[,)].json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
         _seed_messages(chat_store, sid, 40, user_id=_run(auth_store.get_user_by_email(EMAIL_A)).id)
 
-        body = client.get(f"/api/chat/sessions/{sid}", cookies=h[,)].json()
+        body = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
 
         assert len(body["messages"]) == 5
         assert body["truncated"] is True
@@ -5257,10 +5257,10 @@ def test_api_session_detail_under_the_cap_is_not_flagged_truncated(tmp_path, mon
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
-        sid = client.post("/api/chat/sessions", cookies=h[,)].json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
         _seed_messages(chat_store, sid, 12, user_id=_run(auth_store.get_user_by_email(EMAIL_A)).id)
 
-        body = client.get(f"/api/chat/sessions/{sid}", cookies=h[,)].json()
+        body = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
 
         assert body["truncated"] is False
         assert body["total_messages"] == 12

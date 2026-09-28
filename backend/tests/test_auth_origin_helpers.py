@@ -15,7 +15,6 @@ import pytest
 
 from app.auth import _host_only, _origin_host
 
-
 # --- _host_only: lowercasing, and dropping the port without eating IPv6 ---
 
 

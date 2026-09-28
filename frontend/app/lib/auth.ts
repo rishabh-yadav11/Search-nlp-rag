@@ -340,21 +340,31 @@ export function clearMeCache(): void {
  * `Authorization` header to set. `authRequestInit` attaches the cookie only
  * when API_BASE is a trusted backend. `redirectToLogin` already clears the
  * cached identity and any legacy localStorage token, so neither is repeated
- * here. The logout request is fire-and-forget on purpose: the local session is
- * dropped whether or not the backend call succeeds, so a network failure
- * cannot leave the user stuck on an authenticated page.
+ * here. The logout request is fire-and-forget on purpose: the page moves on
+ * whether or not the backend call succeeds, so a network failure cannot leave
+ * the user stuck on an authenticated page.
+ *
+ * `keepalive: true` is load-bearing, not decoration. `redirectToLogin` calls
+ * `window.location.replace`, which tears the page down; an ordinary fetch is
+ * cancelled with it and the revocation never reaches the server. That used to
+ * be survivable: the credential lived in localStorage and `clearToken()` had
+ * already destroyed it synchronously, so a lost POST cost nothing. An httpOnly
+ * cookie cannot be cleared by script at all, so a lost POST means the session
+ * stays live in the browser AND in the store — the user lands on /login still
+ * authenticated, and a shared machine stays signed in. `keepalive` lets the
+ * request outlive the navigation.
  *
  * Bounded like every other request here (#287): a backend that accepts the
- * connection and never answers would otherwise hold the socket open forever,
- * since the caller has already navigated away and nothing is left to release
- * it. The bound only ever releases that socket — it never delays the
- * redirect, and a failure is swallowed either way.
+ * connection and never answers would otherwise hold the socket open forever.
+ * The bound only ever releases that socket, and only at 10 s — long after the
+ * redirect that `keepalive` has to outlive — so it never costs the revocation
+ * its window. A failure is swallowed either way.
  */
 export function logout(): void {
   const deadline = createDeadline(LOGOUT_DEADLINE_MS)
   fetch(
     `${API_BASE}/api/auth/logout`,
-    authRequestInit({ method: 'POST', signal: deadline.signal })
+    authRequestInit({ method: 'POST', keepalive: true, signal: deadline.signal })
   )
     .catch(() => {})
     .finally(() => deadline.clear())

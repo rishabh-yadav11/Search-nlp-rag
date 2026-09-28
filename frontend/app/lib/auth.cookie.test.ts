@@ -19,6 +19,7 @@ type AuthModule = Pick<
   | 'clearLegacyToken'
   | 'clearMeCache'
   | 'getMe'
+  | 'logout'
 >
 
 const LEGACY_KEY = 'vccircle_auth_token'
@@ -306,5 +307,65 @@ describe('authRequestInit', () => {
     await getMe()
 
     expect(fetchInits[0].credentials).toBe('include')
+  })
+})
+
+describe('logout', () => {
+  it('sends the revocation with keepalive so it survives the redirect', async () => {
+    // The reason this is a test and not a comment: `redirectToLogin` navigates
+    // away on the next line, which tears down an ordinary in-flight fetch. An
+    // httpOnly cookie cannot be cleared by script, so a cancelled POST leaves
+    // the session live on the server and in the browser -- the user returns to
+    // /login still authenticated, and a shared machine stays signed in.
+    const { logout } = await freshAuth()
+    const replaced = vi.fn()
+    const original = window.location
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...original, replace: replaced, origin: 'http://localhost:3000' },
+    })
+
+    try {
+      route = () => jsonResponse({ ok: true })
+      logout()
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: original })
+    }
+
+    expect(replaced).toHaveBeenCalled()
+    const logoutCall = fetchInits.find((_, i) => fetchUrls[i].endsWith('/api/auth/logout'))
+    expect(logoutCall).toBeDefined()
+    expect(logoutCall?.keepalive).toBe(true)
+    // Credentialed, so the cookie rides and the server can revoke the session.
+    expect(logoutCall?.credentials).toBe('include')
+    // And still nothing script-readable is attached to it.
+    expect(new Headers(logoutCall?.headers).has('Authorization')).toBe(false)
+  })
+
+  it('still navigates away when the revocation request fails', async () => {
+    // The page must not strand the user on an authenticated page because the
+    // network is down; the session simply dies with the tab.
+    const { logout } = await freshAuth()
+    const replaced = vi.fn()
+    const original = window.location
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...original, replace: replaced, origin: 'http://localhost:3000' },
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('network down')
+      })
+    )
+
+    try {
+      logout()
+      await Promise.resolve()
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: original })
+    }
+
+    expect(replaced).toHaveBeenCalled()
   })
 })

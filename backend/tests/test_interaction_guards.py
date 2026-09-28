@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from conftest import auth_cookie
 from fastapi.testclient import TestClient
 from qdrant_client.models import ScoredPoint
 
@@ -328,7 +329,7 @@ def qdrant(monkeypatch):
 
 @pytest.fixture
 def account(tmp_path, monkeypatch):
-    """Real accounts holding real bearer tokens from the real auth store."""
+    """Real accounts holding real session cookies from the real auth store."""
     store = AuthStore(str(tmp_path / "auth.db"))
     asyncio.run(store.connect())
     monkeypatch.setattr(auth_module, "store", store)
@@ -336,7 +337,7 @@ def account(tmp_path, monkeypatch):
     def make(email: str):
         user = asyncio.run(store.create_user(email, "secret12", email.split("@")[0], "user"))
         token = asyncio.run(store.issue_token(user.id, 7))
-        return user, {"Authorization": f"Bearer {token}"}
+        return user, auth_cookie(token)
 
     try:
         yield make
@@ -344,11 +345,11 @@ def account(tmp_path, monkeypatch):
         asyncio.run(store.close())
 
 
-def _interact(headers, article_id, kind="click"):
+def _interact(cookie, article_id, kind="click"):
     return _client.post(
         "/recommend/interaction",
         json={"article_id": article_id, "interaction_type": kind},
-        headers=headers,
+        cookies=cookie,
     )
 
 
