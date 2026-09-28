@@ -132,6 +132,41 @@ class HybridCache:
             self._degraded(exc)
             return self._get_mem(key)
 
+    async def get_many(self, keys: list[str]) -> list[object | None]:
+        """Read several keys in a single Redis round trip (MGET).
+
+        Callers that already know they will need more than one key (e.g. /search
+        reads both its own summary entry and the underlying retrieval entry)
+        must not pay one round trip per key. Results are positional, matching
+        ``keys``; a key with no Redis entry falls back to the in-process cache
+        exactly as :meth:`get` does, so the two paths stay equivalent.
+        """
+        if not keys:
+            return []
+        client, is_new = self._acquire()
+        try:
+            raws = await client.mget(keys)
+        except _REDIS_ERRORS as exc:
+            if is_new:
+                await self._discard(client)
+            self._degraded(exc)
+            raws = [None] * len(keys)
+        else:
+            await self._publish(client)
+        values: list[object | None] = []
+        for key, raw in zip(keys, raws, strict=True):
+            if raw is None:
+                values.append(self._get_mem(key))
+                continue
+            try:
+                values.append(json.loads(raw))
+            except json.JSONDecodeError as exc:
+                # Same distinct handling as get(): a corrupt payload degrades to
+                # the memory cache rather than poisoning the whole batch.
+                self._degraded(exc)
+                values.append(self._get_mem(key))
+        return values
+
     def _get_mem(self, key: str) -> object | None:
         entry = self._mem.get(key)
         if entry is None:

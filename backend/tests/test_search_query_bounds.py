@@ -65,6 +65,12 @@ class _FakeCache:
             return self.get_result
         return self.store.get(key)
 
+    async def get_many(self, keys):
+        """Mirrors ``HybridCache.get_many``: positional results, one per key,
+        each read through ``get()`` so the recorded key list still shows every
+        key the request actually looked at."""
+        return [await self.get(key) for key in keys]
+
     async def set(self, key, value, ttl=None):
         self.store[key] = value
         self.sets.append(key)

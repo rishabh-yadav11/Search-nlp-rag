@@ -148,6 +148,10 @@ class _VectorOnlyCache:
             return {"dense": [0.1] * 8, "si": [1], "sv": [0.5]}
         return self.store.get(key)
 
+    async def get_many(self, keys):
+        """Mirrors HybridCache.get_many: positional results, one per key."""
+        return [await self.get(key) for key in keys]
+
     async def set(self, key, value, ttl=None):
         self.store[key] = value
 
