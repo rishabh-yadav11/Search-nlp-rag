@@ -37,6 +37,7 @@ import os
 import re
 import signal
 import statistics
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -50,6 +51,13 @@ if TYPE_CHECKING:
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"))
+
+
+# Mirrors the bootstrap in ``_common.py`` so ``app`` (one directory up) imports
+# when this script is run directly from any working directory.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.lexical import jaccard
 
 CHAT_BASE = os.getenv("EVAL_CHAT_BASE", "http://localhost:8001/api/chat")
 SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
@@ -101,6 +109,8 @@ _LEADING_FILLERS = (
     "a",
     "an",
 )
+
+
 _STOPWORDS = frozenset(
     (
         "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "am", "of", "in", "on", "at", "by",
@@ -182,10 +192,6 @@ def _content_tokens(normalized: str) -> frozenset[str]:
     return frozenset(t for t in normalized.split() if t not in _STOPWORDS)
 
 
-def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
-    return len(a & b) / len(a | b)
-
-
 class _UnionFind:
     def __init__(self, n: int):
         self.parent = list(range(n))
@@ -215,7 +221,7 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
         run = range(run_start, min(run_start + VARIATION_RUN, len(prompts)))
         for i in run:
             for j in run:
-                if j > i and tokens[i] and tokens[j] and _jaccard(tokens[i], tokens[j]) >= SIMILARITY_THRESHOLD:
+                if j > i and tokens[i] and tokens[j] and jaccard(tokens[i], tokens[j]) >= SIMILARITY_THRESHOLD:
                     uf.union(i, j)
     clusters: dict[int, list[int]] = {}
     for i in range(len(prompts)):
@@ -579,10 +585,13 @@ def _p95(values: list[float]) -> float | None:
 
 def _pairwise_source_jaccard(results: list[dict]) -> float | None:
     sets = [frozenset(_citation_ids(r.get("sources") or [])) for r in results]
+    # Pairs where *neither* side cited a source are dropped rather than scored
+    # 0.0: "the model cited nothing" is missing data, not evidence of two
+    # disagreeing answers, and averaging it in would understate consistency.
     pairs = [(a, b) for i, a in enumerate(sets) for b in sets[i + 1 :] if a or b]
     if not pairs:
         return None
-    return statistics.mean(len(a & b) / len(a | b) for a, b in pairs)
+    return statistics.mean(jaccard(a, b) for a, b in pairs)
 
 
 def build_report(meta: dict, results: list[dict]) -> str:

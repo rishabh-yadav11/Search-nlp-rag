@@ -13,6 +13,8 @@ import math
 import re
 from typing import Protocol
 
+from app.lexical import jaccard
+
 logger = logging.getLogger("diversity")
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -25,12 +27,6 @@ class _Result(Protocol):
 
 def _tokens(title: str) -> frozenset[str]:
     return frozenset(_WORD_RE.findall((title or "").lower()))
-
-
-def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
 
 
 def diversify(
@@ -57,7 +53,7 @@ def diversify(
     def max_sim(i: int, chosen_idx: list[int]) -> float:
         best = 0.0
         for j in chosen_idx:
-            s = _jaccard(tok[i], tok[j])
+            s = jaccard(tok[i], tok[j])
             if s >= sim_thresh and s > best:
                 best = s
         return best

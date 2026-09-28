@@ -87,12 +87,13 @@ sentence_transformers imports (no model download or real inference).
 
 - [x] **`diversify` short-circuit** (line 34): `len(results) <= n`, including
       truncation under `n`.
-- [x] **`diversify` MMR loop** (lines 38-59): greedy selection; `_jaccard`
+- [x] **`diversify` MMR loop** (lines 38-59): greedy selection; `jaccard`
       similarity with the `sim_thresh` floor (above vs below floor);
       `lam` weighting (`lam=1.0` pure relevance vs `lam=0.0` pure diversity);
       `max_sim` over multiple chosen indices; `>` keeps first on ties.
 - [x] **`_tokens` empty/None title** (line 17).
-- [x] **`_jaccard` empty-set branch** (lines 21-22).
+- [x] **`jaccard` empty-set branch** (now in `app/lexical.py`; covered by
+      `tests/test_lexical.py`).
 
 ---
 
