@@ -1,12 +1,48 @@
 """Analytics recording/summary uses Redis aggregates and is best-effort."""
 
 import json
+import logging
 
 import pytest
 from _support import run_sync as _run
 
 from app import analytics
+from app.degraded import REANNOUNCE_SECONDS, DegradedLatch
 
+
+class _FakeClock:
+    """Callable stand-in for ``time.monotonic`` that moves only when told.
+
+    The analytics latch rate-limits its lines against the clock, so a test
+    that drives two outages has to decide whether they are seconds or minutes
+    apart. Injecting the clock makes that explicit and keeps tests from
+    sleeping.
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+ 
+ 
+def _outage_lines(caplog, logger_name="analytics"):
+    """The latch's own lines, excluding the independent digest-key warning.
+
+    A dead store fails the digest-key read as well as the write, and #348 gave
+    that its own message and its own flag on purpose. Counting every WARNING
+    would make these assertions depend on a different feature's warning, so
+    the outage under test is selected by its own text.
+    """
+    return [
+        r
+        for r in caplog.records
+        if r.name == logger_name and "analytics Redis" in r.getMessage()
+    ]
 
 class _FakeRedis:
     """In-memory Redis stand-in recording every pipeline command."""
@@ -319,7 +355,7 @@ def test_summary_top_lists_window_sizes_are_exact(monkeypatch):
     assert [q for q, _ in s["click_top_queries"]] == [f"q1:{i:032x}" for i in range(1, 11)]
 
 
-def test_recording_never_raises_when_redis_down(monkeypatch):
+def test_recording_never_raises_when_redis_down(monkeypatch, caplog, clock):
     class _BrokenRedis:
         def pipeline(self):
             return self
@@ -337,13 +373,21 @@ def test_recording_never_raises_when_redis_down(monkeypatch):
             raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
-    # Reset the process-global warning flag so this test independently verifies
-    # that a Redis failure triggers the warn-once path (order-independent).
-    monkeypatch.setattr(analytics, "_warned", False)
+    # Rebind a fresh latch, on the injected clock, so this test owns both the
+    # transition state and the re-announce window regardless of what earlier
+    # tests left behind in the process-global.
+    monkeypatch.setattr(
+        analytics,
+        "_latch",
+        DegradedLatch(analytics.logger, "analytics Redis", now=clock),
+    )
 
+    # Both lines of the policy are WARNING, so caplog's default level captures
+    # them; no override is needed here.
     _run(analytics.record_search("anything", 1, weak=False, cached=False, latency_ms=10, filtered=False))
     _run(analytics.record_click("anything", 1))
-    assert analytics._warned is True
+    # Two failures, one outage: the latch holds the second one silent.
+    assert [r.levelname for r in _outage_lines(caplog)] == ["WARNING"]
 
 
 def test_summary_raises_when_redis_is_down(monkeypatch):
@@ -548,14 +592,38 @@ def test_client_lazy_init_replaces_redis_db(monkeypatch):
     assert created[0][1]["decode_responses"] is True
 
 
-def test_degraded_warns_once(monkeypatch):
-    monkeypatch.setattr(analytics, "_warned", False)
-    warnings = []
-    monkeypatch.setattr(analytics.logger, "warning", lambda *a, **k: warnings.append(a))
-    analytics._degraded(ConnectionError("down"))
-    analytics._degraded(ConnectionError("down"))
-    assert len(warnings) == 1
-    assert analytics._warned is True
+def test_degraded_warns_once(monkeypatch, caplog, clock):
+    """A sustained outage costs one line no matter how many failures arrive.
+
+    The clock never moves, so no re-announce window can open inside this run.
+    """
+    class _BrokenRedis:
+        def pipeline(self):
+            return self
+
+        def incr(self, key, amount=1):
+            return self
+
+        def zincrby(self, key, amount, member):
+            return self
+
+        def expire(self, key, seconds):
+            return self
+
+        async def execute(self):
+            raise ConnectionError("redis unreachable")
+
+    monkeypatch.setattr(
+        analytics,
+        "_latch",
+        DegradedLatch(analytics.logger, "analytics Redis", now=clock),
+    )
+    monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
+
+    for _ in range(5):
+        _run(analytics.record_search("q", 1, weak=False, cached=False, latency_ms=1, filtered=False))
+
+    assert [r.levelname for r in _outage_lines(caplog)] == ["WARNING"]
 
 
 def test_close_resets_redis(monkeypatch):
@@ -629,12 +697,13 @@ def test_click_signals_success_builds_dict(monkeypatch):
     assert _run(analytics.click_signals("q")) == {"total": 4, "by_id": {42: 3, 7: 1}}
 
 
-def test_click_signals_redis_down_returns_none(monkeypatch):
-    """A dead store must return no signal AND warn exactly once.
+def test_click_signals_redis_down_returns_none(monkeypatch, caplog, clock):
+    """A dead store must return no signal, and warn about the digest key.
 
-    The digest-key read now happens before the zrevrange, so the outage is
-    reported through the digest latch rather than the store-outage one; the
-    behaviour under test is unchanged, only the latch that records it.
+    The digest-key read happens first, so a dead store is reported there and
+    the query-keyed lookup is abandoned rather than attempted against raw text.
+    That is the digest latch, not the store-outage latch, and this asserts the
+    behaviour main owns -- so the outage latch is asserted to stay silent.
     """
 
     class _BrokenRedis:
@@ -648,9 +717,19 @@ def test_click_signals_redis_down_returns_none(monkeypatch):
             raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(analytics, "_digest_warned", False)
+    monkeypatch.setattr(
+        analytics,
+        "_latch",
+        DegradedLatch(analytics.logger, "analytics Redis", now=clock),
+    )
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
-    assert _run(analytics.click_signals("q")) is None  # degraded -> None
+    with caplog.at_level(logging.WARNING, logger="analytics"):
+        assert _run(analytics.click_signals("q")) is None  # degraded -> None
     assert analytics._digest_warned is True
+    # The outage latch never sees a failure here, so it must not claim one: a
+    # digest hiccup is not a store outage (#348) and must not consume it.
+    assert _outage_lines(caplog) == []
+    assert "analytics digest key unavailable" in caplog.records[0].getMessage()
 
 
 # --- _i / _f malformed-value branches ---
@@ -993,3 +1072,102 @@ def test_digest_width_is_bounded_regardless_of_query_length(monkeypatch):
     monkeypatch.setattr(analytics.config, "CLICK_QUERY_MAX_LEN", 256)
     digest = analytics.query_digest("x" * 10_000, "k")
     assert len(digest) == len(analytics.QUERY_DIGEST_PREFIX) + analytics.QUERY_DIGEST_HEX_LEN
+# --- degraded latch transitions ---
+
+
+class _SwitchableRedis:
+    """Pipeline fake whose ``execute`` can be flipped between up and down."""
+
+    def __init__(self):
+        self.broken = False
+
+    def pipeline(self):
+        return self
+
+    def incr(self, key, amount=1):
+        return self
+
+    def zincrby(self, key, amount, member):
+        return self
+
+    def expire(self, key, seconds):
+        return self
+
+    async def execute(self):
+        if self.broken:
+            raise ConnectionError("redis unreachable")
+        return []
+
+
+def _record_search():
+    return analytics.record_search("q", 1, weak=False, cached=False, latency_ms=1, filtered=False)
+
+
+@pytest.fixture
+def latch(monkeypatch, clock):
+    """A fresh analytics latch on the injected clock.
+
+    Rebinding it means each test owns both the transition state and the
+    re-announce window instead of inheriting either from a previous test.
+    """
+    fresh = DegradedLatch(analytics.logger, "analytics Redis", now=clock)
+    monkeypatch.setattr(analytics, "_latch", fresh)
+    return fresh
+
+
+@pytest.fixture
+def clock():
+    return _FakeClock()
+
+
+def test_degraded_latch_logs_warn_warn_warn_across_flap(
+    monkeypatch, caplog, latch, clock
+):
+    """failure -> success -> failure is exactly 3 events: W, W, W.
+
+    Both lines are WARNING, so the levels alone cannot identify which is
+    which; the rendered messages carry the ordering proof. The clock jumps
+    past the re-announce window between the two outages, so these are two
+    separate incidents; inside the window the second outage is deliberately
+    swallowed as a flap (see app/degraded.py).
+    """
+    fake = _SwitchableRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    fake.broken = True
+    _run(_record_search())
+    fake.broken = False
+    _run(_record_search())
+    # Two incidents minutes apart, not one flap: the window has to pass.
+    clock.advance(REANNOUNCE_SECONDS + 1)
+    fake.broken = True
+    _run(_record_search())
+
+    outage = _outage_lines(caplog)
+    assert [r.levelname for r in outage] == ["WARNING"] * 3
+    assert "analytics Redis unavailable" in outage[0].getMessage()
+    assert outage[1].getMessage() == "analytics Redis recovered"
+    assert "analytics Redis unavailable" in outage[2].getMessage()
+
+
+def test_degraded_latch_logs_once_for_many_consecutive_failures(monkeypatch, caplog, latch):
+    """The anti-spam guard: N failures in one run produce exactly 1 event.
+
+    The injected clock never moves, so no re-announce window can open.
+    """
+    fake = _SwitchableRedis()
+    fake.broken = True
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    for _ in range(5):
+        _run(_record_search())
+
+    assert [r.levelname for r in _outage_lines(caplog)] == ["WARNING"]
+
+
+def test_degraded_latch_logs_nothing_when_no_failure_preceded(monkeypatch, caplog, latch):
+    """A success on a hot path cannot manufacture a recovery line."""
+    monkeypatch.setattr(analytics, "_client", lambda: _SwitchableRedis())
+    _run(_record_search())
+
+    assert _outage_lines(caplog) == []
