@@ -6,17 +6,70 @@ from moving the ranking other users see: the per-client dedupe of the ranking
 vote, the index check on the client-supplied article id, and the canonical form
 of the stored query. They exercise the real route, the real recording and the
 real boosting code, standing in only for Redis and Qdrant.
+
+Hermeticity: ``app/config.py`` calls ``load_dotenv()`` at import, so the live
+``config`` object carries whatever a developer's ``backend/.env`` says -- and an
+env file that pins ``CLICK_BOOST_MIN_*`` silently replaces the shipped
+thresholds. These tests pin a security property, so they must not read whatever
+this machine happens to have: the autouse fixture below loads the SHIPPED policy
+and installs it on the live config. Vote counts are then derived FROM that
+policy, so each test states its claim for any valid thresholds rather than
+relying on one particular ratio between them holding.
 """
 import asyncio
+import importlib.util
+import math
+import os
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import analytics, auth, click_boost, main
+from app import config as _config_module
 from app.config import config
 from app.main import SourceArticle
 
 _client = TestClient(main.app, raise_server_exceptions=False)
+
+# The click-boost policy these tests run under. The values themselves are
+# pinned explicitly in test_shipped_click_boost_thresholds_are_the_shipped_ones,
+# so retuning the boost is a deliberate, visible act rather than something an
+# operator's .env can quietly redefine.
+_CLICK_POLICY_KNOBS = (
+    "ENABLE_CLICK_BOOST",
+    "CLICK_BOOST_MIN_CLICKS",
+    "CLICK_BOOST_MIN_ARTICLE_CLICKS",
+    "CLICK_BOOST_MIN_SHARE",
+    "CLICK_BOOST_MULT",
+    "CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS",
+    "CLICK_QUERY_MAX_LEN",
+    "CLICK_QUERY_TTL_SECONDS",
+)
+
+
+def _shipped_config(monkeypatch, **env):
+    """Parse ``app/config.py`` in a private module under a controlled environment.
+
+    Two things have to be neutralised for the result to be the SHIPPED policy
+    rather than an echo of this machine: ``load_dotenv()`` runs inside
+    config.py and would repopulate ``os.environ`` from a developer's
+    ``backend/.env`` (and it resolves the file from the CALLING file's
+    location, not the CWD, so chdir alone would not keep it out), and the
+    ambient environment is replaced outright so an unrelated shell export
+    cannot leak in. monkeypatch undoes both. The load is private, so no other
+    module's ``config`` object is touched and the rest of the suite still sees
+    the process-wide config it had before.
+    """
+    import dotenv
+
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(os, "environ", dict(env))
+    src = Path(_config_module.__file__).resolve()
+    spec = importlib.util.spec_from_file_location("click_guard_shipped_config", src)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.config
 
 
 class FakeRedis:
@@ -128,6 +181,63 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+
+@pytest.fixture(autouse=True)
+def shipped_click_policy(monkeypatch):
+    """Install the SHIPPED click-boost policy on the live config for every test.
+
+    Without this, these assertions read whatever the developer running them has
+    in ``backend/.env`` -- and #242 proved the cost of that: a .env pinning
+    ``CLICK_BOOST_MIN_*`` redefines the bar these tests claim to pin, so
+    ``_CLICK_POLICY_KNOBS`` are read from a clean parse of config.py and set
+    explicitly. The knobs are read at call time by the code under test, so
+    setting them here is enough to steer the real route, recording and
+    boosting. monkeypatch restores the ambient values afterwards, leaving the
+    rest of the suite exactly as it found them.
+    """
+    shipped = _shipped_config(monkeypatch)
+    for knob in _CLICK_POLICY_KNOBS:
+        monkeypatch.setattr(config, knob, getattr(shipped, knob))
+    return shipped
+
+
+def _votes_short_of_boost(target_votes):
+    """Votes for a filler article that leave ``target_votes`` a minority share.
+
+    ``apply_click_boost`` boosts an article holding ``c`` clicks only when
+    ``c >= CLICK_BOOST_MIN_ARTICLE_CLICKS`` AND ``c >= max(1, round(total *
+    CLICK_BOOST_MIN_SHARE))``. The share gate is the one an attacker's own
+    clicks cannot satisfy on their own: the more total traffic the query has,
+    the more filler is needed. Solving ``round(total * share) > target_votes``
+    for ``total`` gives the padding below, so the target's share sits strictly
+    under the threshold BY CONSTRUCTION -- it does not depend on
+    ``min_article / min_clicks < min_share`` happening to hold for whatever
+    thresholds are in force, which is what broke under a retuned or
+    .env-overridden policy.
+
+    Returns ``(total_clicks, filler_votes)``; the caller is responsible for
+    firing the filler from distinct clients so each one really is a vote.
+    """
+    share = config.CLICK_BOOST_MIN_SHARE
+    if not 0 < share < 1:
+        # A share at or above 1 can never be crossed by any article, and a
+        # share of 0 makes every article a majority of the query. Neither is a
+        # threshold this test can demonstrate a minority share against, so the
+        # tests that use this helper say so rather than assert something the
+        # policy has made vacuous.
+        raise AssertionError(
+            f"CLICK_BOOST_MIN_SHARE={share!r} admits no minority share; the "
+            "click-guard thresholds are not a usable policy for this test"
+        )
+    # The smallest total whose share gate lands strictly above target_votes.
+    # +1 keeps the result clear of banker's rounding on an exact .5.
+    total = max(
+        config.CLICK_BOOST_MIN_CLICKS,
+        target_votes + 1,
+        math.ceil((target_votes + 1) / share),
+    )
+    return total, total - target_votes
+
 @pytest.fixture
 def store(monkeypatch):
     """Install a fresh analytics Redis and a working rate-limiter store."""
@@ -148,8 +258,12 @@ def store(monkeypatch):
 
 @pytest.fixture
 def index(monkeypatch):
-    """Install a Qdrant stub holding ids 7, 42 and 99, as the search path does."""
-    stub = QdrantStub(ids=(7, 42, 99))
+    """Install a Qdrant stub holding ids 7, 42, 99 and 123, as the search path
+    does. 123 is a clickable result that ``_results()`` never returns, so tests
+    can give the query real traffic that contributes to the click total without
+    appearing in the ranking -- the traffic a boost must not be fooled by.
+    """
+    stub = QdrantStub(ids=(7, 42, 99, 123))
     monkeypatch.setitem(main.state, "qdrant", stub)
     return stub
 
@@ -190,37 +304,86 @@ def _boosted(store, query="ola ipo"):
 
 def test_forged_beacon_burst_does_not_move_ranking(store, index):
     """The issue's repro, post-fix: 5 forged beacons from one client for a real
-    article id leave both the scores and the order exactly as they were."""
+    article id leave both the scores and the order exactly as they were.
+
+    The dedupe is the load-bearing part and holds for any policy: five beacons,
+    one vote. The ranking assertion is made independent of the thresholds by
+    giving the query real traffic from uninvolved clients, so the lone forged
+    vote is both under the per-article bar and a minority share. It is not left
+    to the accident that one vote happens to be too few at today's thresholds.
+    """
     for _ in range(5):
         assert _beacon("ola ipo", 1, 42).status_code == 200
+    total, filler = _votes_short_of_boost(1)
+    for i in range(filler):
+        _beacon("ola ipo", 2, 99, ip=f"10.4.4.{i}")
 
-    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0}, "5 beacons, one vote"
+    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0, "99": float(filler)}, (
+        "5 beacons, one vote"
+    )
+    assert sum(store.sets["analytics:query_click:ola ipo"].values()) == total
     assert _boosted(store) == _results()
-    assert index.asked == [[42]] * 5, "the id is looked up in the index on every beacon"
+    assert index.asked[:5] == [[42]] * 5, "the id is looked up in the index on every beacon"
 
 
 def test_forged_beacons_from_distinct_clients_still_cannot_boost_one_article(store, index):
     """A handful of clients voting for the same article is not enough, even once
     the query is busy enough for the signal to be live at all: their votes hold
-    too small a share of the query's total to be believed."""
-    padding = max(0, config.CLICK_BOOST_MIN_CLICKS - config.CLICK_BOOST_MIN_ARTICLE_CLICKS)
-    for i in range(config.CLICK_BOOST_MIN_ARTICLE_CLICKS):
+    too small a share of the query's total to be believed.
+
+    The attacker spends exactly the per-article allowance they are entitled to
+    (``CLICK_BOOST_MIN_ARTICLE_CLICKS`` distinct clients, one vote each -- the
+    most a single forged campaign can buy under the dedupe), and every other
+    click on the query comes from a different, uninvolved client. The filler
+    count is DERIVED so the target's share sits below ``CLICK_BOOST_MIN_SHARE``
+    by construction: the claim is about a minority never being believed, and
+    holds for any valid thresholds. It is not the case that
+    ``min_article / min_clicks < min_share`` happens to be true, which is what
+    the old count arithmetic silently assumed -- under a .env or a retuned
+    policy that ratio inverts, and a handful of clients really would boost the
+    article, so the test would fail for a reason that has nothing to do with the
+    dedupe it is here to pin.
+    """
+    forged = max(1, config.CLICK_BOOST_MIN_ARTICLE_CLICKS)
+    total, filler = _votes_short_of_boost(forged)
+
+    for i in range(forged):
         assert _beacon("ola ipo", 1, 42, ip=f"10.0.0.{i}").status_code == 200
-    for i in range(padding):
+    for i in range(filler):
         _beacon("ola ipo", 2, 99, ip=f"10.9.9.{i}")
 
+    # The signal really is live -- the target is not spared by a quiet query.
+    assert total == forged + filler >= config.CLICK_BOOST_MIN_CLICKS
+    tally = store.sets["analytics:query_click:ola ipo"]
+    assert tally["42"] == forged, "every forged beacon is a distinct client's vote"
+    assert round(sum(tally.values()) * config.CLICK_BOOST_MIN_SHARE) > forged, (
+        "the forged votes are a minority of the query's clicks"
+    )
     assert _boosted(store) == _results()
 
 
 def test_one_client_cannot_manufacture_click_share(store, index):
-    """One client cannot vote its way to a majority share: flooding the same
-    query with beacons for two articles stays far below the 120/min limit and
-    still leaves it with a single vote on each."""
-    for _ in range(config.CLICK_BOOST_MIN_CLICKS):
+    """One client cannot vote its way to a majority share: however hard it
+    floods the query, and however busy the query is from other clients, it is
+    left with a single vote on each article it names.
+
+    The flood is bounded by the shipped per-IP rate limit rather than by
+    ``CLICK_BOOST_MIN_CLICKS``, so the test does not change shape if the
+    thresholds are retuned, and the query is filled with other clients' clicks
+    so the single client's vote is a minority rather than being spared by a
+    quiet query.
+    """
+    flood = max(config.CLICK_BOOST_MIN_CLICKS, config.PUBLIC_CLICK_RATE_PER_MIN // 2)
+    for _ in range(flood):
         _beacon("ola ipo", 1, 42, ip="10.1.1.1")
         _beacon("ola ipo", 1, 99, ip="10.1.1.1")
+    total, filler = _votes_short_of_boost(2)  # one vote on 42 and one on 99
+    for i in range(filler):
+        _beacon("ola ipo", 3, 123, ip=f"10.1.2.{i}")
 
-    assert store.sets["analytics:query_click:ola ipo"] == {"42": 1.0, "99": 1.0}
+    tally = store.sets["analytics:query_click:ola ipo"]
+    assert tally["42"] == 1.0 and tally["99"] == 1.0, "one client, one vote per article"
+    assert sum(tally.values()) == total >= config.CLICK_BOOST_MIN_CLICKS
     assert _boosted(store) == _results()
 
 
@@ -229,14 +392,57 @@ def test_one_client_cannot_manufacture_click_share(store, index):
 
 def test_distinct_clients_still_boost_a_genuinely_clicked_article(store, index):
     """The feature is not switched off: once enough distinct users click one
-    result, that result is boosted and re-sorted."""
-    voters = max(config.CLICK_BOOST_MIN_CLICKS, config.CLICK_BOOST_MIN_ARTICLE_CLICKS)
+    result, that result is boosted and re-sorted.
+
+    The vote count is derived from the policy (every distinct client that the
+    boost needs at least), and the click is unanimous, so this holds for any
+    thresholds rather than for the particular counts shipped today.
+    """
+    voters = max(
+        config.CLICK_BOOST_MIN_CLICKS,
+        config.CLICK_BOOST_MIN_ARTICLE_CLICKS,
+        1,
+    )
     for i in range(voters):
         assert _beacon("ola ipo", 1, 42, ip=f"10.0.0.{i}").status_code == 200
 
     out = _boosted(store)
     assert out[0].id == 42, "the clicked result should now rank first"
     assert out[0].score == pytest.approx(0.85 * config.CLICK_BOOST_MULT)
+
+
+def test_shipped_click_boost_thresholds_are_the_shipped_ones(shipped_click_policy):
+    """The shipped click-boost thresholds are pinned, deliberately.
+
+    #242 fixes the forged-burst attack with the per-client vote dedupe, which
+    defeats the attack at ANY threshold. It deliberately does NOT raise these
+    values: raising them also makes the boost harder to trigger for genuine
+    signal, which is a ranking-tuning decision that needs measurement, not a
+    side effect of a security fix. This test is where that decision gets made
+    visible if it is ever made.
+
+    The values are read from a clean parse of config.py with ``load_dotenv``
+    neutralised (see ``_shipped_config``), so what is asserted is what the code
+    ships -- not what a developer's ``backend/.env`` happens to override it
+    with. That override is exactly how #242's fix could be silently disabled:
+    an env file pinning ``CLICK_BOOST_MIN_*`` wins over the code default, and
+    every threshold-sensitive test here would then be asserting the operator's
+    policy while appearing to assert the repository's.
+    """
+    shipped = shipped_click_policy
+    assert (
+        shipped.CLICK_BOOST_MIN_CLICKS,
+        shipped.CLICK_BOOST_MIN_ARTICLE_CLICKS,
+        shipped.CLICK_BOOST_MIN_SHARE,
+    ) == (5, 3, 0.3), (
+        "the click-boost thresholds changed. That is a ranking-tuning decision, "
+        "not a consequence of the #242 dedupe fix: it makes the boost harder to "
+        "trigger for genuine signal too, so it needs its own justification."
+    )
+    assert shipped.CLICK_BOOST_MULT == 1.3
+    assert shipped.CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS == 3600, (
+        "the dedupe window is the control #242 actually relies on"
+    )
 
 
 def test_a_clients_repeat_click_adds_no_second_vote_but_others_still_count(store, index):
