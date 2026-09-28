@@ -17,8 +17,22 @@ from enum import StrEnum
 import redis.asyncio as aioredis
 
 from app.config import config
+from app.degraded import DegradedLatch
 
 logger = logging.getLogger(__name__)
+
+_latches = {
+    op: DegradedLatch(logger, f"user profile Redis ({op})")
+    for op in (
+        "record_interaction",
+        "get_user_interactions",
+        "get_user_profile_vector",
+        "build_user_profile",
+        "get_user_profile_categories",
+        "invalidate_user_profile",
+        "get_trending_articles",
+    )
+}
 
 
 # Interaction types are a CLOSED set. ``article:interactions:{id}`` is a Redis
@@ -266,8 +280,18 @@ async def record_interaction(
         # article's pre-expiry score and must be re-seeded rather than incremented.
         reseed_needed = results[0] == 1
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to record user interaction: %s", exc)
+        # Warn on the transition into the outage, log one "recovered" line when
+        # it ends, then re-arm so the next outage is announced again. Volume
+        # is rate-limited by elapsed time, not by request count; before this
+        # every failed call logged, so a Redis outage produced one line per
+        # request here. See app/degraded.py.
+        _latches["record_interaction"].warn_degraded(
+            "Failed to record user interaction: %s", exc
+        )
         return InteractionResult.UNAVAILABLE
+    # The interaction is durably recorded, so Redis answered: a real recovery
+    # observation, which is what re-arms the latch for the next outage.
+    _latches["record_interaction"].log_recovered()
 
     if reseed_needed:
         # Deliberately outside the guard above. The interaction is already
@@ -314,9 +338,12 @@ async def get_user_interactions(user_id: str, limit: int = _PROFILE_MAX_INTERACT
             limit - 1,
             withscores=True,
         )
+        _latches["get_user_interactions"].log_recovered()
         return [(int(article_id), float(ts)) for article_id, ts in items]
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to get user interactions: %s", exc)
+        _latches["get_user_interactions"].warn_degraded(
+            "Failed to get user interactions: %s", exc
+        )
         return []
 
 
@@ -330,6 +357,7 @@ async def get_user_profile_vector(user_id: str) -> list[float] | None:
         client = _redis_client()
         raw_vector = await client.get(f"user:profile_vector:{user_id}")
         if raw_vector is None:
+            _latches["get_user_profile_vector"].log_recovered()
             return await build_user_profile(user_id)
         if isinstance(raw_vector, bytes):
             raw_vector = raw_vector.decode("utf-8")
@@ -339,9 +367,12 @@ async def get_user_profile_vector(user_id: str) -> list[float] | None:
         vector = [float(value) for value in values]
         if not vector or not all(math.isfinite(value) for value in vector):
             raise ValueError("profile vector contains invalid values")
+        _latches["get_user_profile_vector"].log_recovered()
         return vector
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to get user profile vector; using cold start: %s", exc)
+        _latches["get_user_profile_vector"].warn_degraded(
+            "Failed to get user profile vector; using cold start: %s", exc
+        )
         return None
 
 
@@ -355,6 +386,7 @@ async def build_user_profile(user_id: str) -> list[float] | None:
     try:
         interactions = await get_user_interactions(user_id)
         if not interactions:
+            _latches["build_user_profile"].log_recovered()
             return None
 
         from app.main import state  # lazy import avoids a startup cycle
@@ -397,6 +429,7 @@ async def build_user_profile(user_id: str) -> list[float] | None:
                         affinities[category] = affinities.get(category, 0.0) + weight
 
         if not weighted_values:
+            _latches["build_user_profile"].log_recovered()
             return None
         dimension = len(weighted_values[0][0])
         if any(len(vector) != dimension for vector, _ in weighted_values):
@@ -414,9 +447,12 @@ async def build_user_profile(user_id: str) -> list[float] | None:
             pipe.zadd(category_key, affinities)
             pipe.expire(category_key, _CATEGORIES_TTL_HOURS * 3600)
         await pipe.execute()
+        _latches["build_user_profile"].log_recovered()
         return profile
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to build user profile; using cold start: %s", exc)
+        _latches["build_user_profile"].warn_degraded(
+            "Failed to build user profile; using cold start: %s", exc
+        )
         return None
 
 async def get_user_profile_categories(user_id: str) -> list[tuple[str, float]]:
@@ -432,9 +468,12 @@ async def get_user_profile_categories(user_id: str) -> list[tuple[str, float]]:
             -1,
             withscores=True,
         )
+        _latches["get_user_profile_categories"].log_recovered()
         return [(str(cat), float(score)) for cat, score in items]
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to get user categories: %s", exc)
+        _latches["get_user_profile_categories"].warn_degraded(
+            "Failed to get user categories: %s", exc
+        )
         return []
 
 
@@ -447,7 +486,11 @@ async def invalidate_user_profile(user_id: str) -> None:
             f"user:categories:{user_id}",
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to invalidate user profile: %s", exc)
+        _latches["invalidate_user_profile"].warn_degraded(
+            "Failed to invalidate user profile: %s", exc
+        )
+    else:
+        _latches["invalidate_user_profile"].log_recovered()
 
 
 def _article_total(counts: dict) -> int:
@@ -529,6 +572,7 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
         # Check if we have a cached trending set for this window
         cached = await client.get(window_key)
         if cached:
+            _latches["get_trending_articles"].log_recovered()
             return json.loads(cached)
 
         await _ensure_trending_index(client)
@@ -567,7 +611,10 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
         if result:
             await client.set(window_key, json.dumps(result), ex=_TRENDING_CACHE_TTL_SECONDS)
 
+        _latches["get_trending_articles"].log_recovered()
         return result
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to get trending articles: %s", exc)
+        _latches["get_trending_articles"].warn_degraded(
+            "Failed to get trending articles: %s", exc
+        )
         return []

@@ -6,8 +6,9 @@ across gunicorn workers. No user identifiers, no client-side scripts and no
 cookie banner are involved: every event is derived server-side from the request
 itself plus an anonymous ``/analytics/click`` beacon from the frontend.
 
-Recording is best-effort: a Redis outage never raises into the request path,
-it only logs a warning once and stops recording until Redis returns.
+Recording is best-effort: a Redis outage never raises into the request path.
+It warns once per outage, logs a single "recovered" line when Redis returns,
+then re-arms so the next outage is announced too.
 """
 import hashlib
 import hmac
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 import redis.asyncio as aioredis
 
 from app.config import config
+from app.degraded import DegradedLatch
 
 logger = logging.getLogger("analytics")
 
@@ -31,6 +33,7 @@ class AnalyticsUnavailableError(RuntimeError):
     indistinguishable from a report whose counters are legitimately all zero.
     """
 
+_latch = DegradedLatch(logger, "analytics Redis")
 
 # Click positions are bucketed 1..CLICK_POSITION_MAX in the summary view, so an
 # unauthenticated beacon can only poison within this range (never create
@@ -83,12 +86,11 @@ QUERY_DIGEST_KEY_REDIS_KEY = "analytics:query_digest_key"
 _QUERY_DIGEST_KEY: str | None = None
 
 _redis = None
-_warned = False
-# Separate from ``_warned`` on purpose. A digest-key failure is NOT a Redis
-# outage -- recording continues without the query-keyed fields -- so it must
-# not consume the once-only outage warning, or a transient key hiccup would
-# silence the far more important "recording paused" alert for a real outage
-# later on. Its own message, its own flag.
+# The digest-key warning is separate from the ``_latch`` outage latch on
+# purpose. A digest-key failure is NOT a Redis outage -- recording continues
+# without the query-keyed fields -- so it must not consume the outage latch,
+# or a transient key hiccup would silence the far more important "recording
+# paused" alert for a real outage later on. Its own message, its own flag.
 _digest_warned = False
 # Set once the pre-upgrade verbatim members have been deleted from both
 # top-query sets, so the scrub runs once per process rather than per request.
@@ -188,7 +190,7 @@ async def _scrub_legacy_members(c, key: str) -> int:
     except Exception as exc:
         # Best-effort: never let the scrub break a read. If it fails, the
         # read-side filter still withholds the text from the response.
-        _degraded(exc)
+        _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
         return 0
     stale = [m for m in rows if not _is_digest(m)]
     if not stale:
@@ -196,7 +198,7 @@ async def _scrub_legacy_members(c, key: str) -> int:
     try:
         await c.zrem(key, *stale)
     except Exception as exc:
-        _degraded(exc)
+        _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
         return 0
     logger.info(
         "removed %d pre-upgrade verbatim query members from %s (issue #348)",
@@ -237,13 +239,6 @@ def _client() -> aioredis.Redis:
             socket_timeout=2,
         )
     return _redis
-
-
-def _degraded(exc: Exception) -> None:
-    global _warned
-    if not _warned:
-        logger.warning("analytics Redis unavailable (%s); recording paused", exc)
-        _warned = True
 
 
 async def close() -> None:
@@ -384,7 +379,13 @@ async def record_search(
             p.incr("analytics:search:weak")
         await p.execute()
     except Exception as exc:
-        _degraded(exc)
+        _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
+    else:
+        # Warn on the transition into the outage, log one "recovered" line when
+        # it ends, then re-arm so a later outage is announced rather than
+        # swallowed. Volume is rate-limited by elapsed time, not by request
+        # count; see app/degraded.py.
+        _latch.log_recovered()
 
 
 async def record_click(
@@ -482,7 +483,9 @@ async def record_click(
         # A claim that unlocked a tally which never landed would otherwise
         # silence this client for the whole window; give it back.
         await _release_click_signal(claim_key)
-        _degraded(exc)
+        _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
+    else:
+        _latch.log_recovered()
 
 
 async def click_signals(query: str) -> dict | None:
@@ -528,12 +531,15 @@ async def click_signals(query: str) -> dict | None:
                 break
             offset += _ZSUM_BATCH
         if not by_id:
+            _latch.log_recovered()
             return None
         if total < config.CLICK_BOOST_MIN_CLICKS:
+            _latch.log_recovered()
             return None
+        _latch.log_recovered()
         return {"total": total, "by_id": by_id}
     except Exception as exc:
-        _degraded(exc)
+        _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
         return None
 
 
@@ -659,6 +665,7 @@ async def summary() -> dict:
         pos_vals = await c.mget([f"analytics:click:pos:{i}" for i in positions])
 
         total = _i(search_total)
+        _latch.log_recovered()
         return {
             "searches_total": total,
             "searches_today": _i(search_today),
@@ -673,6 +680,6 @@ async def summary() -> dict:
             "click_top_queries": _digest_rows(click_top_queries, TOP_CLICKED_QUERIES_N),
         }
     except Exception as exc:
-        _degraded(exc)
+        _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
         logger.exception("analytics summary failed; analytics store unavailable")
         raise AnalyticsUnavailableError("analytics unavailable") from exc

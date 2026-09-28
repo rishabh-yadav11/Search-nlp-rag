@@ -262,8 +262,17 @@ async def _load_facet_maps() -> None:
         try:
             values = await _facet_values(key)
             facets = {value.strip().lower(): value for value in values}
-        except Exception:  # noqa: BLE001 - degraded mode, never crash startup
-            logger.warning("facet map load failed for %s", key)
+        except Exception as exc:
+            # A missing facet map and an unreachable Qdrant both leave the
+            # vocabulary empty, so the exception is the only thing that tells
+            # them apart downstream.
+            logger.warning(
+                "facet map load failed for %s (%s: %s); continuing without it",
+                key,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             continue
         if name == "_DEALTYPE_FACETS":
             _DEALTYPE_FACETS = facets

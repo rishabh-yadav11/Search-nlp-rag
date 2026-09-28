@@ -9,6 +9,7 @@ import redis
 import redis.asyncio as aioredis
 
 from app.config import config
+from app.degraded import DegradedLatch
 
 logger = logging.getLogger("cache")
 
@@ -36,8 +37,11 @@ class HybridCache:
         self._mem: OrderedDict[str, tuple[object, float, int]] = OrderedDict()
         self._mem_bytes = 0
         self._redis: aioredis.Redis | None = None
-        self._decode_warned = False
-        self._conn_warned = False
+        # Two independent latches: a corrupt payload is a different incident
+        # from an unreachable server, and healing one must not silence (or
+        # falsely "recover") the other.
+        self._decode_latch = DegradedLatch(logger, "cache payload decode")
+        self._conn_latch = DegradedLatch(logger, "cache Redis")
 
     def _drop_mem(self, key: str) -> None:
         """Remove one in-process entry, keeping the byte total in sync."""
@@ -104,13 +108,11 @@ class HybridCache:
 
     def _degraded(self, exc: Exception) -> None:
         if isinstance(exc, json.JSONDecodeError):
-            if not self._decode_warned:
-                logger.warning("Redis payload decode failed (%s); using in-process cache", exc)
-                self._decode_warned = True
+            self._decode_latch.warn_degraded(
+                "Redis payload decode failed (%s); using in-process cache", exc
+            )
         else:
-            if not self._conn_warned:
-                logger.warning("Redis unavailable (%s); using in-process cache", exc)
-                self._conn_warned = True
+            self._conn_latch.warn_degraded("Redis unavailable (%s); using in-process cache", exc)
 
     async def get(self, key: str) -> object | None:
         client, is_new = self._acquire()
@@ -122,15 +124,23 @@ class HybridCache:
             self._degraded(exc)
             return self._get_mem(key)
         await self._publish(client)
+        # Both latches re-arm here. A miss is a clean response, so a corrupt
+        # payload incident is over even though nothing was decoded -- without
+        # this the decode latch would stay closed across a miss and swallow
+        # the next corrupt payload, which is the one-way latch this module
+        # exists to eliminate.
+        self._conn_latch.log_recovered()
+        self._decode_latch.log_recovered()
         if raw is None:
             return self._get_mem(key)
         try:
-            return json.loads(raw)
+            value = json.loads(raw)
         except json.JSONDecodeError as exc:
             # Corrupt payload in Redis: log it distinctly (don't silently swallow
             # into the in-process fallback) and degrade to the memory cache.
             self._degraded(exc)
             return self._get_mem(key)
+        return value
 
     async def get_many(self, keys: list[str]) -> list[object | None]:
         """Read several keys in a single Redis round trip (MGET).
@@ -193,6 +203,7 @@ class HybridCache:
             self._degraded(exc)
         else:
             await self._publish(client)
+            self._conn_latch.log_recovered()
             return
         effective_ttl = self._ttl if ttl is None else ttl
         cost = len(payload.encode())
@@ -253,6 +264,7 @@ class HybridCache:
             self._degraded(exc)
         else:
             await self._publish(client)
+            self._conn_latch.log_recovered()
 
     async def close(self) -> None:
         if self._redis is not None:

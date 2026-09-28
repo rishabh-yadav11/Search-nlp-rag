@@ -5,7 +5,44 @@ import time
 from _support import run_sync as _run
 
 from app import redis_cache
+from app.degraded import REANNOUNCE_SECONDS, DegradedLatch
 from app.redis_cache import HybridCache
+
+
+class _LatchClock:
+    """Callable stand-in for ``time.monotonic`` that moves only when told.
+
+    The cache's two latches rate-limit their lines against the clock, so a
+    test that has to separate two incidents by more than the re-announce
+    window would otherwise have to sleep. Injecting the clock makes that
+    explicit and keeps the tests hermetic.
+    """
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _cache_on(clock, **kwargs):
+    """A real HybridCache whose two latches read the injected clock.
+
+    ``HybridCache`` builds its latches with the real ``time.monotonic`` and
+    takes no clock argument, so the only way to keep a latch-policy test
+    hermetic is to rebind them on the real object. Nothing else is faked: the
+    logger is the module's own, so caplog sees exactly the records the
+    shipping code would emit.
+    """
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10, **kwargs)
+    cache._conn_latch = DegradedLatch(redis_cache.logger, "cache Redis", now=clock)
+    cache._decode_latch = DegradedLatch(
+        redis_cache.logger, "cache payload decode", now=clock
+    )
+    return cache
 
 
 class _FakeRedis:
@@ -160,13 +197,10 @@ def test_degraded_fallback_honors_per_write_ttl_override():
     _run(scenario())
 
 
-def test_degraded_mode_falls_back_and_warns_once(monkeypatch):
-    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+def test_degraded_mode_falls_back_and_warns_once(caplog):
+    clock = _LatchClock()
+    cache = _cache_on(clock)
     cache._redis = _FakeRedis()
-    assert cache._conn_warned is False
-
-    warnings = []
-    monkeypatch.setattr("app.redis_cache.logger.warning", lambda *a, **k: warnings.append(a))
 
     async def scenario():
         await cache.set("k", "v")
@@ -177,22 +211,154 @@ def test_degraded_mode_falls_back_and_warns_once(monkeypatch):
 
     _run(scenario())
 
-    assert cache._conn_warned is True
-    assert len(warnings) == 1, "degraded warning should be logged exactly once"
+    # Five failing commands, one outage, one line. Both lines of the latch
+    # policy are WARNING, so no level override is needed to capture them.
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert "Redis unavailable" in caplog.records[0].getMessage()
 
 
-def test_degraded_warn_flag_stays_set(monkeypatch):
-    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
-    cache._redis = _FakeRedis()
+def test_degraded_latch_rearms_after_success(caplog):
+    """A second outage in the same process must be announced again.
 
-    async def scenario():
-        await cache.set("a", 1)
-        await cache.set("b", 2)
+    A plain "warn once" flag never cleared, so it silenced every later outage
+    for the lifetime of the worker; the latch re-arms on the first success.
+    Both lines are WARNING, so the messages carry the ordering proof. The two
+    incidents are separated by a clock jump past the re-announce window: a
+    second outage that arrives inside the window is deliberately swallowed as
+    a flap, which is what keeps a flapping cache off the log.
+    """
+    clock = _LatchClock()
+    cache = _cache_on(clock)
+    flaky = _FlakyRedis()
+    cache._redis = flaky
 
-    _run(scenario())
-    assert cache._conn_warned is True
-    _run(scenario())
-    assert cache._conn_warned is True
+    flaky.fail = True
+    _run(cache.set("a", 1))
+    flaky.fail = False
+    _run(cache.set("b", 2))
+    flaky.fail = True
+    # Two incidents minutes apart, not one flap: the window has to pass.
+    clock.advance(REANNOUNCE_SECONDS + 1)
+    _run(cache.set("c", 3))
+
+    assert [r.levelname for r in caplog.records] == ["WARNING"] * 3
+    assert "Redis unavailable" in caplog.records[0].getMessage()
+    assert caplog.records[1].getMessage() == "cache Redis recovered"
+    assert "Redis unavailable" in caplog.records[2].getMessage()
+
+
+class _CorruptRedis(_RecordingRedis):
+    """Redis stand-in that can answer reads with an undecodable payload."""
+
+    async def get(self, key):
+        return self.store.get(key, "{not json")
+
+
+class _FlakyCorruptRedis(_RecordingRedis):
+    """Redis stand-in that can fail outright or return an undecodable payload."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail = False
+
+    async def get(self, key):
+        if self.fail:
+            raise ConnectionError("redis unreachable")
+        return self.store.get(key, "{not json")
+
+
+def test_decode_latch_is_independent_of_connection_latch(caplog):
+    """A decode failure, a good decode, then a decode failure again == W, W, W.
+
+    The two latches must stay separate: if they shared state, a corrupt payload
+    would silence (or falsely recover) the connection incident. Both lines are
+    WARNING, so the messages carry the ordering proof. The clock jumps past
+    the re-announce window before the second corrupt payload, so the second
+    decode failure is a separate incident rather than a suppressed flap.
+    """
+    clock = _LatchClock()
+    cache = _cache_on(clock)
+    corrupt = _CorruptRedis()
+    cache._redis = corrupt
+
+    assert _run(cache.get("k")) is None
+    corrupt.store["k"] = '{"a": 1}'
+    assert _run(cache.get("k")) == {"a": 1}
+    corrupt.store["k"] = "{not json"
+    clock.advance(REANNOUNCE_SECONDS + 1)  # past the window: a new incident
+    _run(cache.get("k"))
+
+    assert [r.levelname for r in caplog.records] == ["WARNING"] * 3
+    assert "Redis payload decode failed" in caplog.records[0].getMessage()
+    assert caplog.records[1].getMessage() == "cache payload decode recovered"
+    assert "Redis payload decode failed" in caplog.records[2].getMessage()
+
+
+def test_decode_latch_rearms_after_a_miss_between_two_corrupt_payloads(caplog):
+    """A cache miss is a clean response, so it ends a corrupt-payload incident.
+
+    A miss decodes nothing, but the round trip succeeded. If the decode latch
+    only re-armed on a *successful* decode, a corrupt payload, then a miss,
+    then a second corrupt payload would log the second failure NEVER -- the
+    one-way latch this module exists to eliminate. The clock jumps past the
+    re-announce window between the two, because inside the window the second
+    corrupt payload is suppressed by design rather than by the re-arm.
+    """
+    clock = _LatchClock()
+    cache = _cache_on(clock)
+    # ``_RecordingRedis`` answers an unstored key with None, so "absent" is a
+    # genuine miss rather than another undecodable payload.
+    cache._redis = _RecordingRedis({"k": "{not json"})
+
+    # 1. Corrupt payload -> one decode warning, latch closes.
+    assert _run(cache.get("k")) is None
+    # 2. A different key with nothing stored: Redis returns None, a clean miss.
+    assert _run(cache.get("absent")) is None
+    # 3. Corrupt payload again -> this MUST be announced.
+    clock.advance(REANNOUNCE_SECONDS + 1)  # past the window: a new incident
+    _run(cache.get("k"))
+
+    assert [r.levelname for r in caplog.records] == ["WARNING"] * 3
+    assert "Redis payload decode failed" in caplog.records[0].getMessage()
+    assert caplog.records[1].getMessage() == "cache payload decode recovered"
+    assert "Redis payload decode failed" in caplog.records[2].getMessage()
+
+
+def test_decode_failure_does_not_silence_the_connection_latch(caplog):
+    """A corrupt payload must not consume or re-arm the connection latch.
+
+    If the two shared state, the decode failure here would either swallow the
+    next connection outage or fake a recovery for it. The clock jumps past the
+    re-announce window before the second connection outage, so that outage is
+    a separate incident and not a flap the window is entitled to drop.
+    """
+    clock = _LatchClock()
+    cache = _cache_on(clock)
+    flaky = _FlakyCorruptRedis()
+    cache._redis = flaky
+    flaky.fail = True
+    _run(cache.get("k"))  # connection down -> conn warning
+    flaky.fail = False
+    _run(cache.get("k"))  # round trip OK, payload corrupt -> conn recovery + decode warning
+    flaky.fail = True
+    clock.advance(REANNOUNCE_SECONDS + 1)  # past the window: a new incident
+    _run(cache.get("k"))  # connection down again -> conn warning again
+
+    assert [r.levelname for r in caplog.records] == ["WARNING"] * 4
+    assert "Redis unavailable" in caplog.records[0].getMessage()
+    assert caplog.records[1].getMessage() == "cache Redis recovered"
+    assert "Redis payload decode failed" in caplog.records[2].getMessage()
+    assert "Redis unavailable" in caplog.records[3].getMessage()
+
+
+def test_cache_latch_logs_nothing_when_no_failure_preceded(caplog):
+    clock = _LatchClock()
+    cache = _cache_on(clock)
+    cache._redis = _RecordingRedis({"k": '{"a": 1}'})
+
+    assert _run(cache.get("k")) == {"a": 1}
+
+    assert caplog.records == []
 
 
 def test_get_redis_hit_decodes_json():
@@ -251,7 +417,7 @@ def test_get_many_degrades_to_memory_when_redis_is_down(monkeypatch):
 
     _run(scenario())
 
-    assert cache._conn_warned is True
+    assert cache._conn_latch._announced is True
     assert len(warnings) == 1, "the batched read must warn once, like get()"
 
 

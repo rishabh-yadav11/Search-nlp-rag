@@ -5,6 +5,7 @@ vocabulary that mirrors the real index (e.g. funding -> 'Venture Capital',
 not a mythical 'Funding' facet)."""
 
 import asyncio
+import logging
 
 from app import main
 
@@ -128,6 +129,32 @@ def test_facet_load_publishes_complete_replacements_and_retains_on_failure(monke
     assert main._DEALTYPE_FACETS == {"new venture": "New Venture", "new m&a": "New M&A"}
     assert main._INDUSTRY_FACETS == {"new finance": "New Finance", "new healthcare": "New Healthcare"}
     assert main._CONTENT_TYPE_FACETS == {"new article": "New Article", "new interview": "New Interview"}
+
+
+def test_facet_load_failure_names_the_exception(monkeypatch, caplog) -> None:
+    """A failed facet load must say WHY, not just that it failed.
+
+    "Qdrant is down" and "the corpus has no facet tags" both leave the
+    vocabulary empty, so without the exception the operator cannot tell a real
+    outage from an empty index.
+    """
+    before = dict(main._DEALTYPE_FACETS)
+
+    async def failed_values(_: str) -> list[str]:
+        raise ConnectionError("qdrant unreachable")
+
+    monkeypatch.setattr(main, "_facet_values", failed_values)
+    with caplog.at_level(logging.WARNING, logger=main.logger.name):
+        asyncio.run(main._load_facet_maps())
+
+    failures = [r for r in caplog.records if "facet map load failed" in r.getMessage()]
+    assert len(failures) == 3  # one per facet map, and startup continues
+    for record in failures:
+        message = record.getMessage()
+        assert "ConnectionError" in message
+        assert "qdrant unreachable" in message
+        assert record.exc_info is not None
+    assert main._DEALTYPE_FACETS == before
 
 
 def test_extract_content_type_none_when_no_match() -> None:
