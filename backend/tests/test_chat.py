@@ -1761,6 +1761,55 @@ def test_run_turn_no_usage_still_settles_positive_reserve_estimate(monkeypatch):
     assert cost == pytest.approx(budget.writes[0][1] / 1_000_000)
 
 
+def test_run_turn_no_usage_with_failed_nudge_settles_reserve_plus_nudge(monkeypatch):
+    """Pins the ORDERING of the accumulator against the #255 fallback (#347).
+
+    The two rules interact, and only one order is correct:
+      cost_usd = to_usd(result.cost())
+      if cost_usd <= 0: cost_usd = LLM_CALL_RESERVE_USD   # #255 fallback
+      cost_usd += spend.usd                              # #347 accumulator
+
+    Adding `spend.usd` FIRST would make this turn's total 3 x $0.02 = $0.06,
+    which is already positive, so the `<= 0` fallback would never fire and the
+    answer call's own reserve estimate would be silently never charged -- the
+    #255 invariant broken with no error anywhere. The other two tests cannot
+    catch that: this one's predecessor has no failed nudge, and the end-to-end
+    one reports real usage. So the reserve estimate and the nudge attempts must
+    BOTH appear, as one identical number on both the accounting and stored
+    paths."""
+    budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+    generate_calls = []
+
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+    async def fake_generate(client, prompt, model, system_prompt=None):
+        generate_calls.append(prompt)
+        if len(generate_calls) == 1:
+            # Chart ask, answered without a block AND with no usage reported.
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=0, completion_tokens=0)
+        # The nudge burned three billed attempts before giving up.
+        raise chat_module.LLMUnavailableError(attempts=3)
+
+    monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    _answer, _sources, _note, _pt, _ct, cost = _run(
+        chat_module._run_turn("show me a chart of top 5 deals", [])
+    )
+
+    assert len(generate_calls) == 2
+    # The answer call's $0.02 reserve estimate PLUS the nudge's 3 x $0.02.
+    # A settle of 60_000 (nudge only) is the ordering bug this guards.
+    assert budget.writes == [("settle", 80_000)]
+    assert budget.counter == 80_000
+    # One identical number on the accounting path and the stored path.
+    assert cost == pytest.approx(0.08)
+    assert cost == pytest.approx(budget.writes[0][1] / 1_000_000)
+
+
 def test_json_loads_malformed_returns_empty(caplog):
     """Decode failures on a str/bytes payload still degrade to [] but must be
     logged, so corrupt stored rows are diagnosable instead of silently empty."""

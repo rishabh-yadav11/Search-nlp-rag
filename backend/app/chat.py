@@ -2725,9 +2725,12 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             answer = "".join(chunks)
             prompt_tokens = usage.prompt_tokens if usage else 0
             completion_tokens = usage.completion_tokens if usage else 0
-            # No pending-spend accumulator is needed: each billed call holds
-            # its own budget up front, and the end-of-turn settle below records
-            # the summed token cost.
+            # Each billed call holds its own budget up front, and the
+            # end-of-turn settle below records the summed token cost. A nudge
+            # that exhausts its retries is the exception the token sum cannot
+            # see: the provider billed every attempt but none of them reported
+            # usage, so those attempts are accumulated in `spend` and added to
+            # the same single settle (#347).
             if parse_dataviz(answer) is None and _CHART_INTENT_RE.search(question):
                 # The user explicitly asked for a chart/graph/plot/table but the
                 # answer streamed without one; ask once more so visual requests
