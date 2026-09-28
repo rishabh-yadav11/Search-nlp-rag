@@ -130,99 +130,104 @@ list is hand-written, but `tests/test_coverage_doc.py` fails if it drifts from
 the generated table.
 
 <!-- gaps:begin -->
-- `app/recommender.py` — 57.4% (112/263 statements uncovered). The
-  recommendation engine is the largest hole in the backend. `get_similar_articles`
-  lines 86-156 is untested end to end: the point-id `query_points` call against
-  the `dense` vector, the `must_not` list built from `exclude_ids`, the
-  same-category filter, and the catch-all that logs and returns `[]`.
-  `get_personalized_recommendations` lines 184, 196-197, 254, 311, 326, 341 and
-  379-381 leave its cold-start fallback, its per-candidate `continue` guards and
-  its failure path unexercised. `get_trending_feed` lines 397-447 — the disabled
-  short-circuit, the `get_trending_articles` call, the fallback to latest
-  stories, the Qdrant retrieve and the re-sort by click velocity — has no test.
-  `_entity_acquisition_role` lines 578-600 and `rerank_acquisition_relation`
-  lines 612-648, which produce the acquisition-direction score the rerank boost
-  depends on, are untested as well, as is the `tzinfo` normalisation in
-  `_calculate_recency_score` line 516. A wrong `FieldCondition` or a wrong
-  scoring weight in any of these returns an empty or mis-ranked feed for every
-  user while the suite stays green.
-- `app/user_profile.py` — 63.1% (59/160 statements uncovered). Most of the
-  Redis-backed profile path. `_redis_client` lines 41-42, 49 — the lazy
-  `from_url` on `_PROFILE_REDIS_DB` — has no test at all, so the DB index is
-  unverified. `get_trending_articles` lines 259-294 leaves the `SCAN` loop over
-  `article:interactions:*`, the per-key `hgetall` sum, the top-`limit` sort and
-  the window-cache write unexercised (only its `except` runs today).
-  `get_user_profile_vector` lines 132, 135, 138, 140-142 leave the bytes decode,
-  the non-array `TypeError`, the non-finite `ValueError` and the cold-start
-  catch-all unexercised; `build_user_profile` lines 155, 173, 176, 179, 191,
-  197, 200, 215-217 leave its skip guards, its no-interactions early return, the
-  inconsistent-dimension `ValueError` and its failure path untested;
-  `get_user_interactions` lines 108, 114 leave the successful `zrevrange` read
-  and its `(int, float)` coercion untested — only the failure path is covered;
-  `get_user_profile_categories` lines 224-226, 232-235;
-  `invalidate_user_profile` lines 246-247; `record_interaction` lines 96-97, the
-  catch-all that swallows a failed write.
+- `app/recommender.py` — 57.8% (111/263 statements uncovered). The
+  recommendation engine is the largest hole in the backend, and the reason this
+  document used to be misleading. `get_similar_articles` lines 86-156 is
+  untested end to end: the point-id `query_points` call against the `dense`
+  vector, the `must_not` list built from `exclude_ids`, the same-category
+  filter, and the catch-all that logs and returns `[]`. `get_trending_feed`
+  lines 397-447 — the disabled short-circuit, the `get_trending_articles` call,
+  the fallback to latest stories, the Qdrant retrieve and the re-sort by click
+  velocity — has no test. `rerank_acquisition_relation` lines 612-648 and
+  `_entity_acquisition_role` lines 578-600, which produce the
+  acquisition-direction score the rerank boost depends on, are untested as
+  well, as is the `tzinfo` normalisation in `_calculate_recency_score` line 516
+  and, in `get_personalized_recommendations`, the cold-start fallback (lines
+  196-197), the per-candidate `continue` guards (lines 311, 326, 341) and the
+  failure path (lines 379-381). A wrong `FieldCondition` or a wrong scoring
+  weight in any of these returns an empty or mis-ranked feed for every user
+  while the suite stays green.
+- `app/user_profile.py` — 86.3% (30/219 statements uncovered). The profile
+  aggregation, not the Redis plumbing, is what is left: `build_user_profile`
+  lines 302, 320, 323, 326, 338, 344, 347, 362-364 (its skip guards, the
+  inconsistent-dimension `ValueError` and its catch-all),
+  `get_user_profile_vector` lines 279, 282, 285, 287-289 (the bytes decode, the
+  non-array `TypeError`, the non-finite `ValueError` and the cold-start
+  catch-all), `_redis_client` lines 158-159, 166, `record_interaction` lines
+  242-244, `get_user_profile_categories` lines 380-382, `invalidate_user_profile`
+  lines 393-394, `get_trending_articles` lines 421, 425 (the two defensive
+  branches of its `SCAN` loop) and `_has_interaction_slot` line 129, the
+  disabled-cap early return.
 - `app/query_intent.py` — 87.1% (48/371 statements uncovered). The largest
-  single gap is `extract_recency_range` lines 490-508, the relative-range
-  parsing that turns text like "last 3 quarters" into dates. The
+  single gap is `extract_recency_range` lines 490-496, 500-508, the
+  relative-range parsing that turns text like "last 3 quarters" into dates. The
   multi-entity path is uncovered end to end: `acquisition_relation` lines
   831-835, `_strip_entities` lines 868-873, `_multi_entity_scaffold` lines
   881-887 and `detect_multi_entity` lines 914-920. Also `_week_start_iso` lines
   477-478, `_days_ago_iso` line 465, `_month_start_iso` line 471, `_full_year`
   line 310, `strip_recency_window` line 514 and `_top_n_to_int` line 595.
-- `app/main.py` — 90.0% (58/579 statements uncovered). `retrieve_by_date_window`
-  lines 1125-1170 is the whole date-windowed fetch, including its date-filler
-  materialisation, and is untested. The recommendation endpoints' bodies are
-  uncovered: `get_similar` lines 1492-1510 (cache key, hit and miss) and
-  `get_trending` lines 1583-1596, plus `get_for_you` lines 1533-1534, the
-  latest-stories fallback. `retrieve_with_auto_facet_fallback` lines 1046-1059
-  leaves the facet-relaxation retry untested, as are `_facet_values` lines
-  1321-1323, 1332 (the `FACETS_LIMIT` truncation warning), `_effective_intent`
-  lines 506-509, `_retrieval_queries` lines 575-577, `_temporal_date_fallback`
-  lines 1098, 1105-1106, `_merge_results` lines 542, 544, `_resolve_facet` line
-  190, `extract_content_type` line 222 and the `rerank_acquisition_relation`
-  call in `retrieve_and_rerank` line 969.
-- `app/analytics.py` — 94.3% (8/141 statements uncovered). The two `int()`
-  casts in `record_click` and their fallbacks (lines 143-144 and 152-153, the
-  second dropping the article id), the `_ZSUM_BATCH` paging in `click_signals`
-  lines 201, 206, and `_safe_int` lines 220-221, so neither a malformed beacon
-  position nor a poisoned article id in the stored signal is exercised.
+- `app/main.py` — 90.3% (59/609 statements uncovered). `retrieve_by_date_window`
+  lines 1169-1171, 1177, 1186-1188, 1208-1210, 1214 is the whole date-windowed
+  fetch, including its date-filler materialisation. The recommendation
+  endpoints' bodies are uncovered: `get_similar` lines 1614-1617, 1624,
+  1629-1630, 1632 and `get_trending` lines 1705-1708, 1714-1716, 1718, plus
+  `get_for_you` lines 1655-1656, the latest-stories fallback.
+  `retrieve_with_auto_facet_fallback` lines 1090-1095, 1098-1100, 1103 leaves
+  the facet-relaxation retry untested, as are `_facet_values` lines 1365-1367,
+  1376, `_effective_intent` lines 550-553, `_retrieval_queries` lines 619-621,
+  `_temporal_date_fallback` lines 1142, 1149-1150, `_merge_results` lines 586,
+  588, `_resolve_facet` line 212, `extract_content_type` line 244, the
+  `rerank_acquisition_relation` call in `retrieve_and_rerank` line 1013, and the
+  422 for an unknown interaction type in `record_user_interaction` line 1582.
+- `app/observability.py` — 93.8% (4/65 statements uncovered). The request-id
+  plumbing: the `Mapping` branch of `_user_id` line 98, the non-HTTP passthrough
+  in `RequestIdMiddleware.__call__` lines 119-120 (the lifespan and websocket
+  traffic that must not be given a request id), and the
+  no-handler-installed return in `attach_request_id_filter` line 253.
 - `app/llm.py` — 94.3% (6/105 statements uncovered). `_retry_after_seconds`
   lines 88-90 and 92, the `Retry-After` header parsing including its
   unparseable-value path, and in `generate_answer` lines 127 and 134 the
   `LLMUnavailableError` for a provider that returns an empty `choices` list
-  plus the re-raise. A provider answering 200 with no choices is currently
-  untested.
-- `app/redis_cache.py` — 94.3% (7/122 statements uncovered). The
-  `json.JSONDecodeError` path of `get` lines 129-133, which is the corrupt-cache
-  degradation to the in-process cache, the warn-once in `_degraded` lines
-  107-109, and the client-discard in `delete_keys` line 217.
+  plus the re-raise. A provider answering 200 with no choices is untested.
+- `app/analytics.py` — 94.4% (8/142 statements uncovered). The two `int()` casts
+  in `record_click` and their fallbacks (lines 153-154 and 162-163, the second
+  dropping the article id), the `_ZSUM_BATCH` paging in `click_signals` lines
+  211, 216, and `_safe_int` lines 230-231, so neither a malformed beacon
+  position nor a poisoned article id in the stored signal is exercised.
 - `app/health.py` — 95.0% (8/160 statements uncovered). `_redis_status` lines
   179-180 and 183, the `from_url` construction failure that reports `down` and
   the `client is None` guard that reports `degraded` — the ping-failure and
   timeout legs that also report `degraded` are covered. The two rejection
   returns in `_is_host_local_probe` lines 390 and 393, and the `except Exception`
-  of `ready_deep` lines 429-433, which must return a 500 rather than launder a
-  probe defect into a verdict.
+  of `ready_deep` lines 429, 432-433, which must return a 500 rather than
+  launder a probe defect into a verdict.
+- `app/redis_cache.py` — 95.1% (6/122 statements uncovered). The
+  `json.JSONDecodeError` path of `get` lines 129, 132-133, which is the
+  corrupt-cache degradation to the in-process cache, and the warn-once in
+  `_degraded` lines 107-109.
+- `app/request_context.py` — 95.5% (2/44 statements uncovered). The rejection
+  in `is_valid_request_id` line 46 (a non-string, an over-long value, or the
+  `NO_REQUEST_ID` placeholder itself) and the `return ""` in
+  `scope_request_id` line 104, where no id is stored and none is assigned.
 - `app/index_text.py` — 97.5% (2/81 statements uncovered): `split_names` line
   42 and `_join_vals` line 148.
 - `app/rerank_boost.py` — 97.6% (2/83 statements uncovered):
   `_strip_entity_phrase` line 199 and `apply_entity_boost` line 285.
-- `app/chat.py` — 97.8% (21/970 statements uncovered). The generic failure
-  path of `send_message` lines 2319-2324, where the dangling user message is
+- `app/chat.py` — 97.8% (21/971 statements uncovered). The generic failure path
+  of `send_message` lines 2334, 2338-2339, where the dangling user message is
   rolled back before the re-raise, and six returns in `send_message_stream`
-  lines 2426, 2434, 2555, 2559, 2571, 2723 (including the `release(holds)` at
-  2434). Also the unconnected-store `raise` in `ChatStore._require_db` line 218,
-  `ChatStore.delete_message` line 404, the sized-less-iterable `except TypeError`
-  in `_container_stub` lines 597-598, `_shrink_for_log` lines 619 and 629, the
-  `except OverflowError` in `_as_float` lines 1025-1026, `_append_nudge` lines
-  1194 and 1203, and `_truncate_untrusted` lines 1532 and 1534.
-- `app/auth.py` — 99.0% (6/597 statements uncovered): the two purge-count logs
-  in `token_purge_loop` lines 820 and 826, `_local_rate_hit` line 1046 and
-  `_prune_local_rate_counters` lines 1061 and 1064, and the policy-violation
-  hint in `_password_hint` line 1729.
-- `app/config.py` — 99.6% (1/231 statements uncovered): the `ValueError` in
-  `_parse_allowed_hosts` line 233 for an entry that is not a usable hostname.
+  lines 2441, 2449, 2570, 2574, 2586, 2738. Also the unconnected-store `raise`
+  in `ChatStore._require_db` line 228, `ChatStore.delete_message` line 414, the
+  sized-less-iterable `except TypeError` in `_container_stub` lines 612-613,
+  `_shrink_for_log` lines 634 and 644, the `except OverflowError` in `_as_float`
+  lines 1040-1041, `_append_nudge` lines 1209 and 1218, and `_truncate_untrusted`
+  lines 1547 and 1549.
+- `app/auth.py` — 99.0% (6/603 statements uncovered): the two purge-count logs
+  in `token_purge_loop` lines 842 and 848, `_local_rate_hit` line 1077 and
+  `_prune_local_rate_counters` lines 1092 and 1095, and the policy-violation
+  hint in `_password_hint` line 1800.
+- `app/config.py` — 99.6% (1/256 statements uncovered): the `ValueError` in
+  `_parse_allowed_hosts` line 267 for an entry that is not a usable hostname.
 <!-- gaps:end -->
 
 ## Per-module checklists
@@ -405,8 +410,8 @@ coroutine.
 
 ### app/redis_cache.py (covered by tests/test_cache.py)
 
-_Not fully covered: the corrupt-payload degradation in `get` and the client
-discard in `delete_keys`. See the open-gaps entry._
+_Not fully covered: the corrupt-payload degradation in `get` and the warn-once
+in `_degraded`. See the open-gaps entry._
 
 Redis faked in-process (`_RecordingRedis` happy path, `_FakeRedis` for the
 degraded path).
@@ -415,8 +420,9 @@ degraded path).
       `json.loads`-ed back into a dict; a Redis miss (`get` → None) falls
       through to the in-memory cache.
 - [x] **`get`/`set` degraded fallback to in-memory**:
-      Redis raising → warn-once → reads/writes the in-process `TTLCache`.
-      **ERROR PATH — Redis down → silent in-process fallback.**
+      Redis raising → reads/writes the in-process `TTLCache`. The warn-once
+      that records the degradation is *not* exercised — see the open-gaps
+      entry. **ERROR PATH — Redis down → silent in-process fallback.**
 - [x] **`_client` lazy init + reuse**: `from_url` called once,
       kwargs (`decode_responses`, timeouts) asserted, cached for later calls.
 - [x] **`set` success writes JSON + TTL**: default ttl vs per-call
@@ -851,29 +857,30 @@ timestamp normalisation in `_calculate_recency_score`, and the per-candidate
 
 ---
 
-### app/user_profile.py (covered by tests/test_recommender.py)
+### app/user_profile.py (covered by tests/test_recommender.py and tests/test_record_interaction_pipeline.py)
 
-The Redis-backed profile that personalisation depends on. Its Redis plumbing is
-exercised through the recommender's interaction tests; the aggregation half is
-not.
+The Redis-backed profile that personalisation depends on. The Redis plumbing and
+the read-back of interactions are now exercised; what is left is the aggregation
+and its guards.
 
 - [x] **recording an interaction**: the sorted-set write with its TTL, and the
       invalidation of the derived vector and category keys in the same
       transaction.
-- [x] **the Redis failure path of `get_user_interactions`**: a failing
-      `zrevrange` returns an empty list rather than raising.
+- [x] **reading interactions back**, including the Redis failure path, where a
+      failing `zrevrange` returns an empty list rather than raising.
 - [x] **the warm reads**: the cached profile vector (including the miss that
       rebuilds it) and the category list.
 - [x] **the body of `build_user_profile`** for a user who has interactions.
 - [x] **interaction-driven invalidation** (also asserted from
       `tests/test_recommend_interaction_invalidation.py`): a new signal
       invalidates the cached profile so the next read rebuilds it.
+- [x] **the trending scan** in `get_trending_articles`, bar its two defensive
+      branches.
 
-Not covered: reading interactions back, the no-interactions early return and
-the dimension-mismatch raise in `build_user_profile`, the validation of a bad
-cached profile vector, most of `get_user_profile_categories`, the whole
-trending scan, and the failure paths of the writers. See the open-gaps entry.
-
+Not covered: the skip guards, the dimension-mismatch raise and the catch-all in
+`build_user_profile`, the validation of a bad cached profile vector, the
+failure paths of the writers, and the two defensive branches named above. See
+the open-gaps entry.
 ---
 
 ## Error-path status
@@ -899,8 +906,8 @@ The untested error paths, grouped by the failure that would have been caught:
   `_redis_status` in `app/health.py`; the corrupt-payload degradation in
   `HybridCache.get`; the `int()` casts and their fallbacks in `record_click` in
   `app/analytics.py`; the `Retry-After` parsing and the empty-`choices`
-  `LLMUnavailableError` in `app/llm.py`; the whole `get_trending_articles`
-  Redis scan and the profile-vector validation `TypeError`/`ValueError` in
+  `LLMUnavailableError` in `app/llm.py`; the profile-vector validation
+  `TypeError`/`ValueError` and the writers' catch-alls in
   `app/user_profile.py`.
 * **A malformed or legacy row.** The unconnected-store `raise` and
   `delete_message` in the store in `app/chat.py`, the sized-less-iterable
@@ -923,13 +930,14 @@ Roughly in the order the risk falls, all of it already listed in the open gaps
 above:
 
 1. `app/recommender.py` — candidate generation, hybrid scoring and the
-   acquisition-relation rerank: the largest untested surface in the backend,
-   and a defect there is invisible both to the user and to the suite.
-2. `app/user_profile.py` — the trending scan and the cold-start profile build,
-   which is where a new user's first recommendations come from.
-3. `app/main.py` and `app/query_intent.py` — the date-windowed retrieval, the
-   facet-relaxation retry and the relative-range parsing, all on the search
-   path itself.
+   acquisition-relation rerank. It is less than half covered, three of its four
+   entry points have no test at all, and a defect there is invisible both to the
+   user and to the suite.
+2. `app/main.py` and `app/query_intent.py` — the date-windowed retrieval, the
+   facet-relaxation retry, the recommendation endpoint bodies and the
+   relative-range parsing, all on the search path itself.
+3. `app/user_profile.py` — the guards and the validation inside the profile
+   build, which is where a new user's first recommendations come from.
 4. The remainder, which is small and mostly a single branch each.
 
 Adding a test for one of these is a normal change: re-run
