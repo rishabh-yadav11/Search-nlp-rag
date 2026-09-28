@@ -41,8 +41,9 @@ Internal machine clients may authenticate with `X-Service-Token` (config
 | `POST /api/auth/users/{id}/tokens/revoke` | `admin` | Revoke all of a user's tokens |
 
 Signup validation: `email` (format, ≤254, lowercased),
-`password` (8–72 **bytes** UTF-8, must contain a letter and a digit; the upper
-bound is bcrypt's, and over-long → `422`), `name` (optional,
+`password` (at least 8 **characters**, at most 72 UTF-8 **bytes**; must contain a
+letter and a digit — the ceiling is bcrypt's, and exceeding it → `422`),
+`name` (optional,
 ≤60, no control characters). Signup always returns `200`
 `{"message": "If this email is not already registered, your account is ready. Sign in with your email and password to continue; if you already have an account, sign in with your existing password."}`
 and never a token, so a fresh address and an already-registered one (including
@@ -80,7 +81,7 @@ role carries all three.
 
 | Access | Endpoints |
 |---|---|
-| **Public** (no token) | `GET /search`, `GET /facets`, `POST /analytics/click`, `POST /api/auth/signup`, `POST /api/auth/login`, health (`/health`, `/live`, `/ready`, `/readyz`) |
+| **Public** (no token) | `GET /search`, `GET /facets`, `POST /analytics/click`, `POST /api/auth/signup`, `POST /api/auth/login`, health (`/health`, `/live`, `/ready`, `/readyz`, `/ready/deep` — the last is loopback-only and `403`s any proxied or non-local caller) |
 | **Any authenticated user** (`user` role, default) | `POST/GET/PATCH/DELETE /api/chat/...`, `POST /api/auth/logout`, `POST /api/auth/change-password`, `GET /recommend/similar/{article_id}`, `GET /recommend/for-you`, `GET /recommend/trending` |
 | **Admin only** | `GET /analytics/summary`, `GET /analytics/chat`, all `GET/PATCH/DELETE /api/auth/users...` |
 
@@ -185,7 +186,7 @@ rotating addresses. The two counters are keyed separately and cannot collide.
 → `422`. An `article_id` absent from the index → `404`, and **no key is
 written for it**. Other decline statuses: `429` when the account has already
 interacted with `USER_MAX_DISTINCT_INTERACTIONS` (500) distinct articles, and
-`503` when the article index is unreachable.
+`503` when the article index **or the interaction store (Redis)** is unreachable.
 
 ### 4. Consuming the chat SSE stream
 
@@ -630,7 +631,7 @@ not to a person.
 
 The dashboard UI is a Next.js page at `/analytics/dashboard` (proxied by nginx
 to the frontend; not part of this API). It renders KPI cards for search quality
-+ chat usage, top-query tables, clicks-by-position and
+chat usage, top-query tables, clicks-by-position and
 conversations-by-cost/tokens tables by calling the two admin-gated JSON
 endpoints below with the bearer token, and refreshes every 30s.
 
