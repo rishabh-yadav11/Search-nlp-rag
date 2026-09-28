@@ -981,6 +981,8 @@ def _cache_key_component(value: str) -> str:
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
     return f"h:{digest}"
+
+
 # (digest key, config attribute) for every input that can change what a cached
 # retrieval or /search result contains. Kept as data rather than inline in the
 # digest so the coverage list is inspectable — a test asserts it stays in step
@@ -1002,6 +1004,12 @@ _RETRIEVAL_CONFIG_INPUTS: tuple[tuple[str, str], ...] = (
     ("rerank_candidates", "RERANK_CANDIDATES"),
     ("recency_strength", "RECENCY_STRENGTH"),
     ("recency_decay_days", "RECENCY_DECAY_DAYS"),
+    # The recency-intent branch of the blend. sort_results swaps in this pair
+    # for a query like "latest deals" (is_recency_intent), and that ordered list
+    # is what both the retrieve: and search: entries hold, so retuning either
+    # value has to invalidate them.
+    ("recency_boost_strength", "RECENCY_BOOST_STRENGTH"),
+    ("recency_boost_decay_days", "RECENCY_BOOST_DECAY_DAYS"),
     ("enable_query_expansion", "ENABLE_QUERY_EXPANSION"),
     ("enable_entity_boost", "ENABLE_ENTITY_BOOST"),
     ("enable_click_boost", "ENABLE_CLICK_BOOST"),
@@ -1019,6 +1027,7 @@ _RETRIEVAL_CONFIG_INPUTS: tuple[tuple[str, str], ...] = (
     ("diversity_sim_threshold", "DIVERSITY_SIM_THRESHOLD"),
     ("ask_min_score", "ASK_MIN_SCORE"),
 )
+
 
 def retrieval_config_fingerprint() -> str:
     """Short, stable digest of every config value that can change what a cached
