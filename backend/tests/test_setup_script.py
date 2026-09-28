@@ -450,6 +450,31 @@ def test_a_ready_deployment_still_succeeds(tmp_path):
     assert _started(pm2_log, "vccircle-frontend")
 
 
+def test_the_frontend_is_registered_with_a_loopback_bind(tmp_path):
+    """`run_services` must hand pm2 a loopback bind, not just mention one (#318).
+
+    The pm2 stub records the argv it was called with, so this asserts the
+    EXECUTED command rather than the text of setup.sh: a `-H 127.0.0.1` sitting
+    in the file but not reaching pm2 would leave the frontend on the wildcard,
+    and only this catches that. `next start` binds every interface when no
+    hostname is passed, so the flag is the whole control.
+    """
+    proc, pm2_log = run_services(tmp_path, ready_deep_code=200)
+
+    assert "RUN_SERVICES_RC=0" in proc.stdout, proc.stdout + proc.stderr
+    frontend = [ln for ln in pm2_log.splitlines() if "--name vccircle-frontend" in ln]
+    assert frontend, f"pm2 was never asked to start the frontend:\n{pm2_log}"
+    argv = frontend[0]
+
+    assert "-H 127.0.0.1" in argv, (
+        f"pm2 registers the frontend without a loopback bind, so `next start` "
+        f"would listen on the wildcard: {argv!r}"
+    )
+    # The port must be the one the nginx template proxies to, or the site goes
+    # down; run_services is invoked here with the shipped NEXT_PORT default.
+    assert "-p 3000" in argv, f"the frontend is registered on an unexpected port: {argv!r}"
+
+
 def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
     """setup.sh must not judge the key at all, so it cannot refuse a deploy the
     app considers ready.

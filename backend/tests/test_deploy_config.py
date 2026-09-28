@@ -341,3 +341,118 @@ def test_both_startup_paths_bind_the_api_to_loopback() -> None:
     assert ecosystem_bind.group(2) == defaults[setup_bind.group(2)], (
         "the two startup paths must agree on the API port"
     )
+
+
+FRONTEND_PKG_JSON = REPO_ROOT / "frontend" / "package.json"
+
+
+def _setup_sh_frontend_argv() -> list[str]:
+    """The argv setup.sh hands `next` for the frontend, after the `--` separator.
+
+    Every token is returned, not just the subcommand: the host is carried by a
+    `-H` flag later in the argv, so dropping the tail would make the caller
+    read an absent flag as Next's wildcard default.
+    """
+    start = re.search(
+        r"pm2 start\b.*?--name\s+vccircle-frontend\b(?P<opts>.*?)--\s(?P<argv>[^)]*)\)",
+        SETUP_SH.read_text(),
+        re.DOTALL,
+    )
+    assert start is not None, "no `pm2 start --name vccircle-frontend` invocation in setup.sh"
+    return shlex.split(start.group("argv"))
+
+
+def _next_start_flag(tokens: list[str], flag: str, default: str) -> str:
+    """The value of `-H`/`--hostname` or `-p`/`--port`, or `default` if absent.
+
+    A `$VAR` value is resolved through setup.sh's own `${VAR:-default}`
+    declaration, so a correct config that factors the address out into a
+    variable is recognised rather than reported as a regression.
+    """
+    for name in (flag, {"-H": "--hostname", "-p": "--port"}[flag]):
+        if name in tokens:
+            return _resolve(tokens[tokens.index(name) + 1], _setup_sh_defaults(), flag)
+    return default
+
+
+def _next_start_host(tokens: list[str]) -> str:
+    """The address `next start` binds.
+
+    `next start` binds all interfaces when no hostname is given, so an absent
+    flag is the wildcard bind this issue is about, not an unspecified value.
+    """
+    return _next_start_flag(tokens, "-H", "0.0.0.0")
+
+
+def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
+    """`next start` must be told 127.0.0.1 in every path that starts the frontend.
+
+    The frontend is a production service behind nginx, so listening on the
+    wildcard publishes the app shell, `/login`, `/signup` and `middleware.ts`
+    on every interface of the host, bypassing TLS termination, the header and
+    request-size limits, rate limiting and access logging. Next.js binds
+    0.0.0.0 by default, so this is only true when the flag is actually passed.
+
+    There are three such paths and each one is effective on its own: the pm2 app
+    definition an operator starts by hand, the inline `pm2 start` line
+    `./setup.sh services` re-registers the process from (it does NOT read
+    ecosystem.config.js), and the `npm start` script a manual deploy runs.
+    """
+    ecosystem = re.search(
+        r'"vccircle-frontend".*?args:\s*"([^"]+)"', ECOSYSTEM_JS.read_text(), re.DOTALL
+    )
+    assert ecosystem is not None, "vccircle-frontend declares no args in ecosystem.config.js"
+    ecosystem_host = _next_start_host(shlex.split(ecosystem.group(1)))
+    assert ecosystem_host == "127.0.0.1", (
+        f"ecosystem.config.js binds the frontend to {ecosystem_host}; it must be "
+        "127.0.0.1 so nginx on :80 is the only way in"
+    )
+
+    setup_tokens = _setup_sh_frontend_argv()
+    setup_host = _next_start_host(setup_tokens)
+    assert setup_host == "127.0.0.1", (
+        f"setup.sh binds the frontend to {setup_host}; it must be 127.0.0.1, or "
+        "`./setup.sh services` re-exposes :3000 on every interface"
+    )
+
+    # A loopback bind on the wrong port is as broken as a wildcard bind on the
+    # right one: nginx proxies to $NEXT_PORT, so a frontend pm2 started on any
+    # other port is unreachable through the site. `args` is a structural key,
+    # so the drift guard above never sees it and this is the only check on it.
+    ecosystem_port = _next_start_flag(shlex.split(ecosystem.group(1)), "-p", "3000")
+    setup_port = _next_start_flag(setup_tokens, "-p", "3000")
+    assert ecosystem_port == setup_port, (
+        f"the two startup paths disagree on the frontend port "
+        f"(ecosystem.config.js :{ecosystem_port}, setup.sh :{setup_port}); nginx "
+        "proxies to $NEXT_PORT, so a frontend on the other port is unreachable"
+    )
+
+    script = FRONTEND_PKG_JSON.read_text(encoding="utf-8")
+    pkg_start = re.search(r'"start":\s*"([^"]+)"', script)
+    assert pkg_start is not None, "frontend/package.json has no start script"
+    pkg_tokens = shlex.split(pkg_start.group(1))[1:]
+    assert pkg_tokens[0] == "start", f"unexpected start script: {pkg_start.group(1)!r}"
+    pkg_host = _next_start_host(pkg_tokens)
+    assert pkg_host == "127.0.0.1", (
+        f"npm start binds the frontend to {pkg_host}; it must be 127.0.0.1"
+    )
+
+
+def test_nginx_proxies_the_frontend_over_loopback() -> None:
+    """The loopback bind is only safe because nginx already proxies to it.
+
+    Binding Next.js to 127.0.0.1 while nginx proxies anywhere else takes the
+    site down, so the precondition the bind change depends on is asserted here
+    rather than left to whoever next edits the nginx template.
+    """
+    template = SETUP_SH.read_text()
+    proxy_hosts = re.findall(r"proxy_pass\s+http://([0-9.]+|\$\w+):\$\{?(NEXT_PORT)\}?;", template)
+    assert proxy_hosts, "the nginx template has no proxy_pass to the frontend port"
+
+    defaults = _setup_sh_defaults()
+    for host, _ in proxy_hosts:
+        address = defaults[host[1:]] if host.startswith("$") else host
+        assert address == "127.0.0.1", (
+            f"nginx proxies the frontend to {address}, so binding Next.js to "
+            "127.0.0.1 would take the site down"
+        )
