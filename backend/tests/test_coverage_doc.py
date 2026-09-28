@@ -31,6 +31,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 BACKEND = Path(__file__).resolve().parents[1]
 DOCUMENT = BACKEND / "TEST_COVERAGE_GAPS.md"
 APP = BACKEND / "app"
@@ -570,3 +572,66 @@ def test_no_module_percentage_claim_outside_the_generated_blocks():
         "into the generated table or the gaps block, or drop the number:\n"
         + "\n".join(f"  line {number}: {line}" for number, line in offenders)
     )
+
+
+def _counts(passed: int, failed: int = 0, errors: int = 0) -> dict:
+    return {name: 0 for name in gate.SUITE_COUNTS} | {
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+    }
+
+
+def test_a_stale_document_can_actually_be_regenerated():
+    """`--write` must not be blocked by the very staleness it exists to repair.
+
+    The block is generated and `tests/test_coverage_doc.py` polices it, so a
+    stale document fails those tests -- and they are part of the run that
+    produces the measurement. Treating that as a broken measurement deadlocks
+    the gate: `--write` exits 2, the document is never touched, and the only
+    way out is moving the test file aside by hand.
+    """
+    output = (
+        "FAILED tests/test_coverage_doc.py::test_overall_line_agrees_with_the_table\n"
+        "FAILED tests/test_coverage_doc.py::test_gap_figures_match_the_table_row\n"
+        "2 failed, 1899 passed in 120.00s"
+    )
+    tolerated = gate.staleness_failures(output, _counts(1899, failed=2))
+    assert tolerated == (
+        "tests/test_coverage_doc.py::test_overall_line_agrees_with_the_table",
+        "tests/test_coverage_doc.py::test_gap_figures_match_the_table_row",
+    )
+
+
+@pytest.mark.parametrize(
+    ("summary", "counts", "why"),
+    [
+        (
+            "FAILED tests/test_auth.py::test_login\n1 failed, 1900 passed in 120.00s",
+            _counts(1900, failed=1),
+            "a failure anywhere else is a real failure, not staleness",
+        ),
+        (
+            "ERROR tests/test_coverage_doc.py\n1 error, 1900 passed in 120.00s",
+            _counts(1900, errors=1),
+            "a collection error is not a stale number",
+        ),
+        (
+            "FAILED tests/test_coverage_doc.py::test_a\n1 failed, 1900 passed in 120.00s",
+            _counts(1900, failed=2),
+            "the summary must account for every count pytest reported",
+        ),
+        (
+            "Interrupted: 1 error during collection\n1 error",
+            _counts(0, errors=1),
+            "output with no usable short summary cannot be vouched for",
+        ),
+    ],
+)
+def test_a_broken_measurement_is_never_tolerated(summary, counts, why):
+    """Fail closed: `--write` must leave the document alone for anything else.
+
+    A gate that writes the block from a run it could not vouch for is worse
+    than no gate, so every other reason a run can be red has to be refused.
+    """
+    assert gate.staleness_failures(summary, counts) is None, why

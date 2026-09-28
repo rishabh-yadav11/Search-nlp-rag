@@ -20,17 +20,13 @@ Exit codes:
   1  the document is stale; a unified diff and the module-level delta print
   2  the measurement itself failed, or the document has no usable block
 
-Two consequences of the gate measuring the same suite the document describes:
-
-* A pytest failure is exit 2 and the document is left alone -- including a
-  failure of ``tests/test_coverage_doc.py``, which is part of that suite. So a
-  stale *number* is normally caught by the fast test first and surfaces here as
-  exit 2 with the failing assertion in the output tail, while a genuine
-  coverage change (a test added, coverage moved) is what reaches exit 1.
-* The very first ``--write`` on a document whose block does not exist yet has to
-  happen with ``tests/test_coverage_doc.py`` moved aside, because that test
-  fails on the empty block and would turn the measurement into exit 2. It is a
-  one-time step; every later regeneration is an ordinary ``--write``.
+One consequence of the gate measuring the same suite the document describes:
+`tests/test_coverage_doc.py` is part of that suite and polices the very block
+`--write` regenerates, so a stale block makes those tests fail. `--write`
+tolerates exactly that -- every failure in that one module, and nothing else
+(see `staleness_failures`) -- so a stale document can be repaired in one
+command, with the whole suite still running and the `Suite:` line still read
+from it. Any other red run is a real failure and leaves the document alone.
 
 No ``app`` import, no network, no hardcoded percentage: everything in the
 document comes from the run this script just performed.
@@ -46,7 +42,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -99,6 +95,13 @@ GAP_ENTRY_RE = re.compile(
 LINE_CITATION_RE = re.compile(r"\blines?\s+((?:\d+(?:-\d+)?)(?:,\s*\d+(?:-\d+)?)*)")
 
 OUTPUT_TAIL_LINES = 40
+
+# The one test module allowed to be red during a `--write` run: it polices the
+# block that run is about to replace, so its failures are the staleness being
+# repaired rather than a broken measurement. See `staleness_failures`.
+DOC_POLICY = "tests/test_coverage_doc.py"
+
+FAILED_NODE_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<node>\S+)")
 
 
 class GateError(RuntimeError):
@@ -397,6 +400,45 @@ def module_delta(document_rows: Sequence[ModuleRow], measured: Sequence[str]) ->
     return lines
 
 
+def failing_tests(output: str) -> list[str]:
+    """Node ids from pytest's short test summary; `[]` when there is no summary."""
+    failed: list[str] = []
+    for line in output.splitlines():
+        match = FAILED_NODE_RE.match(line)
+        if match:
+            failed.append(match.group("node"))
+    return failed
+
+
+def staleness_failures(output: str, counts: Mapping[str, int]) -> tuple[str, ...] | None:
+    """The failures that are only the document's own consistency tests, else `None`.
+
+    `tests/test_coverage_doc.py` polices the very block `--write` regenerates, so
+    a stale block makes those tests fail -- the precise condition `--write`
+    exists to repair. Treating that as a broken measurement deadlocks the gate:
+    the document can never be regenerated, and the only way out is moving the
+    test file aside by hand.
+
+    The suite is still run whole. Nothing is deselected, because the `Suite:`
+    line is parsed out of this very run's summary: dropping those tests would
+    write a passed-count that no full run could ever reproduce, and check mode
+    would then fail forever.
+
+    Returns `None` -- fail closed, leave the document alone -- for any other
+    reason a run can be red: a failing test elsewhere, a collection error, a
+    short summary that does not account for every count pytest reported, or
+    output with no summary at all.
+    """
+    failed = failing_tests(output)
+    if not failed:
+        return None
+    if counts["errors"] or counts["failed"] != len(failed):
+        return None
+    if not all(node.startswith(DOC_POLICY) for node in failed):
+        return None
+    return tuple(failed)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -417,17 +459,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         tmp_dir = Path(raw_tmp)
         try:
             completed, report_path = run_suite(tmp_dir)
-            if completed.returncode != 0:
-                output = (completed.stdout + completed.stderr).splitlines()
+            output = completed.stdout + completed.stderr
+            counts = parse_suite_counts(output)
+            tolerated = staleness_failures(output, counts) if args.write else None
+            if completed.returncode != 0 and tolerated is None:
                 print(
                     "error: the measurement run failed "
                     f"(pytest exit {completed.returncode}); the document was left untouched.",
                     file=sys.stderr,
                 )
-                print("\n".join(output[-OUTPUT_TAIL_LINES:]), file=sys.stderr)
+                print("\n".join(output.splitlines()[-OUTPUT_TAIL_LINES:]), file=sys.stderr)
                 return 2
+            if tolerated:
+                # Those tests fail *because* of the block this run is about to
+                # replace, and pass once it is replaced -- so counting them as
+                # failed would write a `Suite:` line no clean run can ever
+                # reproduce, leaving the gate permanently red. The rewrite does
+                # not have to be right about that: the next check-mode run
+                # re-measures for real and turns any mistake here into exit 1.
+                counts = {**counts, "passed": counts["passed"] + len(tolerated), "failed": 0}
+                print(
+                    f"note: {len(tolerated)} failure(s) in {DOC_POLICY} are the document "
+                    "being stale, which is what --write exists to repair. The block is "
+                    f"written counting them as passed ({counts['passed']} projected); "
+                    "the next check-mode run verifies that against a clean run.",
+                    file=sys.stderr,
+                )
             report = json.loads(report_path.read_text(encoding="utf-8"))
-            block = build_block(report, parse_suite_counts(completed.stdout + completed.stderr))
+            block = build_block(report, counts)
         except (OSError, ValueError, GateError) as error:
             print(f"error: {error}", file=sys.stderr)
             return 2
