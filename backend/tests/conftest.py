@@ -42,3 +42,41 @@ def _reset_auth_rate_limits():
     auth.reset_local_rate_limits()
     yield
     auth.reset_local_rate_limits()
+
+
+@pytest.fixture
+def parse_config(monkeypatch):
+    """Return a loader for a private copy of ``app/config.py`` parsed under a
+    controlled environment.
+
+    ``app.config`` reads its knobs with ``os.getenv`` at import time, so the
+    only way to ask "what does the app parse when the environment says X?" is
+    to execute config.py again. Two things have to be neutralised for that to
+    be a controlled measurement rather than an echo of the machine:
+
+    * ``load_dotenv()`` runs inside config.py and would re-populate
+      ``os.environ`` from a developer's ``backend/.env`` while the copy loads;
+    * the ambient environment is replaced outright by the caller's mapping, so
+      a shell export of an unrelated knob cannot leak into the result.
+
+    The load is private: no other module's ``config`` object is touched, so
+    the rest of the suite still sees the process-wide config it had before.
+    """
+
+    def _parse(**env):
+        import importlib.util
+        from pathlib import Path
+
+        import dotenv
+
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+        monkeypatch.setattr(os, "environ", dict(env))
+        spec = importlib.util.spec_from_file_location(
+            "config_probe", Path(BACKEND_DIR) / "app" / "config.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.config
+
+    return _parse
+
