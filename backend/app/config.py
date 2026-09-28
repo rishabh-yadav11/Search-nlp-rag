@@ -527,11 +527,30 @@ class Config:
     # ASK_MIN_SCORE, so retuning the gate silently moved the filler floor too.
     # The default reproduces the value the alias resolved to out of the box
     # (ASK_MIN_SCORE's own 0.2 default), so the shipped ranking is unchanged.
-    # The two are now independent, which means this floor must be kept at or
+    # The two are now independent, which means this floor has to be kept at or
     # above ASK_MIN_SCORE for fillers to survive the chat gate that filters
-    # sources by score; raise the gate without raising this and the temporal
+    # sources by score. Raise the gate without raising this and the temporal
     # fallback stops reaching the model.
+    #
+    # A warning, not a ValueError, and deliberately so: the two are separate
+    # operator knobs, and refusing to boot over a mis-ordered pair of scoring
+    # thresholds would be a worse failure than serving degraded answers that
+    # are at least named in the logs. (_parse_allowed_hosts does raise for
+    # ALLOWED_HOSTS=*, where the misconfiguration disables a security check
+    # outright and there is no safe degraded mode to serve.) Deriving one knob
+    # from the other is not an option either: that is the import-time alias #300
+    # removed, and it would put a knob the operator chose back under another's
+    # control.
     DATE_FILLER_SCORE = float(os.getenv("DATE_FILLER_SCORE", "0.2"))
+    if DATE_FILLER_SCORE < ASK_MIN_SCORE:
+        logger.warning(
+            "DATE_FILLER_SCORE=%g is below ASK_MIN_SCORE=%g: date-only fallback "
+            "fillers are filtered out by the chat relevance gate before reaching "
+            "the model, so the temporal fallback contributes nothing. Raise "
+            "DATE_FILLER_SCORE to at least ASK_MIN_SCORE.",
+            DATE_FILLER_SCORE,
+            ASK_MIN_SCORE,
+        )
 
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))

@@ -472,6 +472,48 @@ def test_date_filler_floor_is_tunable_from_the_environment(parse_config):
     assert parse_config(DATE_FILLER_SCORE="0.45").DATE_FILLER_SCORE == 0.45
 
 
+def _filler_gate_warnings(caplog):
+    return [r for r in caplog.records if "DATE_FILLER_SCORE" in r.getMessage()]
+
+
+def test_a_filler_floor_below_the_chat_gate_is_logged_at_startup(parse_config, caplog):
+    """The two knobs are independent, which makes the mis-ordered pairing
+    reachable from a deployment's .env — and it fails silently: every date-only
+    filler is dropped by the chat gate, the temporal fallback contributes
+    nothing, and the turn answers "no relevant articles" with no other trace.
+    config.py warns about it, the way it warns about clamped knobs, instead of
+    raising: the service still serves, but the misconfiguration is named."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        parse_config(ASK_MIN_SCORE="0.6")
+    warnings = _filler_gate_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "0.2" in message and "0.6" in message  # both knob values, as configured
+    assert "temporal fallback" in message  # and the consequence
+
+
+def test_the_filler_floor_warning_stays_quiet_for_sound_configurations(parse_config, caplog):
+    """A warning that fires for the shipped defaults is noise nobody reads, and
+    one that fires for a correctly raised pair trains the reader to ignore it.
+    Only the mis-ordered combination may speak."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        parse_config()
+    assert _filler_gate_warnings(caplog) == []
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # Gate raised and the floor raised with it: a valid deployment.
+        parse_config(ASK_MIN_SCORE="0.6", DATE_FILLER_SCORE="0.7")
+    assert _filler_gate_warnings(caplog) == []
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        parse_config(ASK_MIN_SCORE="0.6", DATE_FILLER_SCORE="0.6")
+    assert _filler_gate_warnings(caplog) == []  # equal is fine: the gate is `>=`
+
+
 # --- body_rescue ---
 
 
