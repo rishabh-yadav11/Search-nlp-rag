@@ -19,6 +19,7 @@ qdrant_backup.py.
 import os
 import sys
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 # Mirrors the bootstrap every script in this directory already performs, so this
 # module is importable on its own (``app`` lives one directory up).
@@ -32,6 +33,28 @@ from app.config import config
 def log(msg: str):
     """Print one UTC-timestamped progress line (the ops scripts' shared format)."""
     print(f"[{datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
+
+
+def redact_url(url: str) -> str:
+    """Return the URL with userinfo and query-param secrets stripped.
+
+    Ops output gets pasted into tickets and chat, and a service URL can carry a
+    password in its userinfo or a token in its query string, so no script may
+    print one raw. It lives here rather than in the one script that first needed
+    it for the same reason ``log`` does: two copies of a redactor is a redactor
+    that gets fixed in only one of them.
+
+    On any parse failure, returns a safe placeholder rather than the original
+    URL, so a malformed (and potentially secret-bearing) value cannot leak.
+    """
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return parsed._replace(netloc=netloc, query="").geturl()
+    except ValueError:
+        return "<redacted>"
 
 
 def make_point(rec: dict, dvec, svec) -> PointStruct:

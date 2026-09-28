@@ -38,11 +38,10 @@ import tarfile
 import urllib.request
 from datetime import UTC, datetime
 from typing import NamedTuple
-from urllib.parse import urlparse
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _common import log
+from _common import log, redact_url
 
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUPS_DIR = os.path.join(BACKEND_DIR, "backups")
@@ -121,21 +120,6 @@ def _snapshot_download_url(collection_name: str, snapshot_name: str) -> str:
     return f"{base}/collections/{collection_name}/snapshots/{snapshot_name}"
 
 
-def _redact_url(url: str) -> str:
-    """Return the URL with userinfo and query-param secrets stripped.
-
-    On any parse failure, returns a safe placeholder rather than the original
-    URL so a malformed (and potentially secret-bearing) value cannot leak.
-    """
-    try:
-        parsed = urlparse(url)
-        netloc = parsed.hostname or ""
-        if parsed.port:
-            netloc = f"{netloc}:{parsed.port}"
-        return parsed._replace(netloc=netloc, query="").geturl()
-    except ValueError:
-        return "<redacted>"
-
 
 def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
     """Stream ``url`` to ``dest`` using only the stdlib.
@@ -178,7 +162,7 @@ def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
                 expected = None
         else:
             log(
-                f"WARNING: {_redact_url(url)} sent no Content-Length; this download "
+                f"WARNING: {redact_url(url)} sent no Content-Length; this download "
                 f"cannot be checked for truncation, only for being a readable archive",
             )
         while True:
@@ -242,10 +226,10 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str) ->
     dest = os.path.join(dest_dir, name)
     try:
         url = _snapshot_download_url(collection_name, name)
-        log(f"downloading snapshot '{name}' from {_redact_url(url)}")
+        log(f"downloading snapshot '{name}' from {redact_url(url)}")
         _download_to(url, dest)
     except Exception as e:
-        err = str(e).replace(url, _redact_url(url)) if url else str(e)
+        err = str(e).replace(url, redact_url(url)) if url else str(e)
         # A half-written file is not a backup either: remove it so the backup
         # directory can never be mistaken for holding a snapshot.
         if os.path.exists(dest):

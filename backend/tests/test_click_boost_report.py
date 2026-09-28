@@ -158,22 +158,45 @@ def test_the_share_gate_is_the_documented_rounding(total, min_share, expected):
     assert click_boost.share_gate(total, min_share) == expected
 
 
-def test_the_report_compares_the_shipped_policy_with_242s_proposal(parse_config):
-    """The report is only worth running if its two columns are the two the
-    issue asks about: the thresholds the repository ships, and the 20/8/0.5
-    #242 proposed before they were split back out. Both are pinned here, the
-    shipped one against a clean parse of config.py so no ``backend/.env`` on
-    this machine can answer for the repository."""
-    shipped = parse_config()
-    assert report.effective_policy().key == (
-        shipped.CLICK_BOOST_MIN_CLICKS,
-        shipped.CLICK_BOOST_MIN_ARTICLE_CLICKS,
-        shipped.CLICK_BOOST_MIN_SHARE,
-    )
-    assert report.proposed_policy().key == (20, 8, 0.5), (
-        "#242's proposal is the alternative this measurement exists to test; a "
-        "different number here would be measuring a policy nobody proposed"
-    )
+def test_the_report_compares_the_shipped_policy_with_242s_proposal():
+    """The report is only worth running if its second column is the alternative
+    the issue actually asks about: the 20/8/0.5 #242 proposed before the raise
+    was split back out. A different number here would be measuring a policy
+    nobody proposed."""
+    assert report.proposed_policy().key == (20, 8, 0.5)
+
+
+@pytest.mark.parametrize("key", [(5, 3, 0.3), (999, 999, 0.99), (20, 8, 0.5)])
+def test_the_policy_the_report_measures_is_the_one_in_force(key, monkeypatch):
+    """``effective_policy`` mirrors the live config, whatever an env file says
+    to it.
+
+    Stated as a mirror rather than as a value on purpose. Asserting the shipped
+    numbers here would make this test read the environment for its expectation
+    -- the defect #242 found, where a developer's ``backend/.env`` redefines the
+    policy a test believes it is pinning. Under a ``.env`` of 999/999/0.99 the
+    report must describe 999/999/0.99, because that is the policy in force and
+    the one a retune has to be measured against.
+    """
+    clicks, article, share = key
+    monkeypatch.setattr(config, "CLICK_BOOST_MIN_CLICKS", clicks)
+    monkeypatch.setattr(config, "CLICK_BOOST_MIN_ARTICLE_CLICKS", article)
+    monkeypatch.setattr(config, "CLICK_BOOST_MIN_SHARE", share)
+
+    assert report.effective_policy().key == key
+
+
+@pytest.fixture
+def shipped_policy_in_force(monkeypatch):
+    """Put the shipped thresholds on the live config for a test about how the
+    report presents them, so the expectation is stated here rather than read
+    from whatever ``backend/.env`` this machine happens to have."""
+    for knob, value in (
+        ("CLICK_BOOST_MIN_CLICKS", 5),
+        ("CLICK_BOOST_MIN_ARTICLE_CLICKS", 3),
+        ("CLICK_BOOST_MIN_SHARE", 0.3),
+    ):
+        monkeypatch.setattr(config, knob, value)
 
 
 # --- the report reads what the click path writes ---
@@ -351,6 +374,91 @@ def test_a_busy_deployment_still_boosting_nothing_names_the_gap_in_votes():
     assert "inert here because of the click volume" in text
 
 
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"3": 2},                                  # under MIN_CLICKS: never live at all
+        {"1": 1, "2": 1, "3": 1, "4": 1, "5": 1},  # 5 clicks, no majority
+        {"1": 2, "2": 1, "3": 1},                  # live, top article a minority
+        {"1": 3, "2": 2},                          # live, top article exactly at the floor
+        {"1": 4, "2": 2, "3": 1},
+        {"1": 1, **{str(i): 1 for i in range(2, 62)}},  # busy query, no majority at all
+        {"1": 12, "2": 6},                         # clears: the answer must be 0
+    ],
+)
+@pytest.mark.parametrize("policy", [SHIPPED, PROPOSED])
+def test_the_quoted_shortfall_is_exactly_what_clears_the_gate(counts, policy):
+    """The number the report quotes has to BE the number that works.
+
+    For every tally, growing the top article by the reported shortfall must
+    clear the policy, and growing it by one fewer must not. Stated as a
+    property over the real gate rather than as a hardcoded figure, because the
+    failure it guards against is a shortfall that satisfies the share and the
+    article floor while the query is still under the liveness bar -- votes that
+    would change nothing, quoted to an operator as though they would.
+    """
+    row = report.QueryRow("k", counts)
+    need = policy.shortfall(row)
+
+    if need == report._SHORTFALL_UNREACHABLE:
+        # Nothing clears it, so nothing may be quoted as clearing it.
+        assert not any(
+            policy.clears(report.QueryRow("k", {**counts, row.top_id: row.top_clicks + n}))
+            for n in (1, 2, 5, 20, 100)
+        )
+        return
+
+    def grown(n):
+        return report.QueryRow("k", {**counts, row.top_id: row.top_clicks + n})
+
+    if need == 0:
+        # Already clearing: there is no gap to be minimal about, and asking for
+        # "one fewer must not clear" would be asking about a tally nobody has.
+        assert policy.clears(row)
+        return
+
+    assert policy.clears(grown(need)), f"{need} extra votes should clear, and do not"
+    assert not policy.clears(grown(need - 1)), f"{need - 1} extra votes should not clear, but do"
+
+
+def test_a_query_under_the_liveness_bar_is_not_told_one_vote_would_do_it():
+    """The specific miscount the shortfall must never make: 2 of 2 clicks
+    satisfies the article floor and the share gate, but the query is under
+    MIN_CLICKS and would stay unboosted. Quoting 1 here would send an operator
+    to count a vote that changes nothing."""
+    row = report.QueryRow("k", {"3": 2})
+
+    assert not SHIPPED.clears(row)
+    assert SHIPPED.shortfall(row) == 3, "the query needs to reach MIN_CLICKS first"
+    assert not SHIPPED.clears(report.QueryRow("k", {"3": 3})), "3 total is still under the bar"
+    assert SHIPPED.clears(report.QueryRow("k", {"3": 5}))
+
+
+def test_the_report_never_prints_a_credential(monkeypatch, capsys):
+    """Report output gets pasted into tickets. A Redis URL can carry a password
+    in its userinfo and a token in its query string, so neither the header nor
+    the failure message may print one raw -- and both still have to name the
+    host, or the operator cannot tell which Redis was measured."""
+    secret_url = "redis://admin:hunter2@cache.internal:6380/1?token=s3cr3t"
+    monkeypatch.setattr(config, "REDIS_URL", secret_url)
+    row = report.QueryRow("k", {"42": 4, "99": 2, "7": 1})
+
+    header = report.render(report.analyse(report.Scan(keys=1, rows=(row,)), (SHIPPED, PROPOSED)))
+    assert "cache.internal:6380" in header
+    for secret in ("hunter2", "s3cr3t", "admin", secret_url):
+        assert secret not in header, f"the report header leaked {secret!r}"
+
+    async def boom():
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(report, "_run", boom)
+    assert report.main([]) == 2
+    err = capsys.readouterr().err
+    assert "cache.internal:6380" in err
+    for secret in ("hunter2", "s3cr3t", "admin", secret_url):
+        assert secret not in err, f"the failure message leaked {secret!r}"
+
+
 def test_the_two_policies_are_scored_independently_on_one_distribution():
     """The point of the report: the shipped policy and #242's proposal are
     scored on the SAME tallies, so the difference between them is a
@@ -415,7 +523,9 @@ def test_the_defaults_this_report_calls_shipped_are_the_defaults_the_code_ships(
     ) == report.PINNED_SHIPPED
 
 
-def test_the_report_names_the_policy_in_force_and_flags_an_override(monkeypatch):
+def test_the_report_names_the_policy_in_force_and_flags_an_override(
+    monkeypatch, shipped_policy_in_force
+):
     """The report must describe what is RUNNING, and say so loudly when that is
     not the code default. A retune in config.py does not reach a deployment
     whose .env pins these knobs, and an operator reading a report that silently

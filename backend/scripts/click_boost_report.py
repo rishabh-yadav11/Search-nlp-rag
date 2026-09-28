@@ -53,6 +53,9 @@ from pathlib import Path
 # Mirrors the bootstrap every script in this directory performs, so ``app`` is
 # importable no matter which working directory the operator is in.
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parent))
+
+from _common import redact_url
 
 from app import analytics
 from app.click_boost import boosting_ids, share_gate
@@ -106,16 +109,25 @@ class Policy:
 
         ``0`` when it already clears. A query's total only grows as more votes
         land, so the share gate's requirement grows with it; this is the
-        smallest number of further votes on the top article that satisfies the
-        gate at the total those votes produce, or ``_SHORTFALL_UNREACHABLE``
-        when no number can (a share of 1.0 is held by no article, ever).
+        smallest number of further votes on the top article that satisfies
+        EVERY half of the gate at the total those votes produce -- the article
+        floor, the share, and the liveness bar. The liveness half is the one
+        that is easy to forget: a query under ``min_clicks`` is not boosted at
+        any share, so votes that satisfy the other two while the query stays
+        under the bar buy nothing, and quoting that smaller number would send
+        an operator to count votes that change nothing.
+
+        ``_SHORTFALL_UNREACHABLE`` when no number can (a share of 1.0 is held
+        by no article, ever).
         """
         if self.clears(row):
             return 0
         for extra in range(1, _SHORTFALL_LIMIT):
             clicks = row.top_clicks + extra
-            if clicks >= self.min_article and clicks >= share_gate(
-                row.total + extra, self.min_share
+            if (
+                row.total + extra >= self.min_clicks
+                and clicks >= self.min_article
+                and clicks >= share_gate(row.total + extra, self.min_share)
             ):
                 return extra
         return _SHORTFALL_UNREACHABLE
@@ -282,7 +294,7 @@ def render(report: Report, top: int = 5) -> str:
         "click-boost measurement (#391)",
         "=" * 60,
         (
-            f"data:   {config.REDIS_URL} db={config.ANALYTICS_REDIS_DB}"
+            f"data:   {redact_url(config.REDIS_URL)} db={config.ANALYTICS_REDIS_DB}"
             f"  (key prefix {analytics.CLICK_SIGNAL_KEY_PREFIX})"
         ),
         "window: every tally still in Redis. A query's tally is the deduped votes it has",
@@ -477,7 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # any failure means the answer is unknown, not "no clicks"
         print(
             f"could not measure the click-boost gate: {type(exc).__name__}: {exc}\n"
-            f"  expected a reachable analytics Redis at {config.REDIS_URL} "
+            f"  expected a reachable analytics Redis at {redact_url(config.REDIS_URL)} "
             f"db={config.ANALYTICS_REDIS_DB}. No conclusion is drawn from this run.",
             file=sys.stderr,
         )
