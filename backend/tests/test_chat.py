@@ -416,15 +416,15 @@ def test_one_turn_makes_fewer_round_trips_and_authorises_once(tmp_path, monkeypa
     the single connection while 4 gunicorn workers contend for the WAL."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
         monkeypatch.setattr(chat_module, "_run_turn", _ok_turn)
 
         counter = _RoundTripCounter(chat_store._db)
         chat_store._db = counter
 
         r = client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h,
+            f"/api/chat/sessions/{sid}/messages", cookies=h,
             json={"content": "Who invested in fintech?"},
         )
         assert r.status_code == 200
@@ -450,8 +450,8 @@ def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monke
     rollback is authorised by that same proof."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def boom(question, history):
             raise RuntimeError("the provider is on fire")
@@ -463,7 +463,7 @@ def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monke
 
         with pytest.raises(RuntimeError):
             client.post(
-                f"/api/chat/sessions/{sid}/messages", headers=h,
+                f"/api/chat/sessions/{sid}/messages", cookies=h,
                 json={"content": "Who invested in fintech?"},
             )
 
@@ -474,7 +474,7 @@ def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monke
 
         # And the rollback still happened: no dangling user message survives a
         # failed turn. The authorisation was removed, not the cleanup.
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["messages"] == []
     finally:
         _run(auth_store.close())
@@ -625,9 +625,9 @@ def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypat
     and the SSE turn -- and must still reject."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h_a = _auth_headers(auth_store, email=EMAIL_A)
-        h_b = _auth_headers(auth_store, email=EMAIL_B)
-        sid = client.post("/api/chat/sessions", headers=h_a).json()["id"]
+        h_a = _auth_cookies(auth_store, email=EMAIL_A)
+        h_b = _auth_cookies(auth_store, email=EMAIL_B)
+        sid = client.post("/api/chat/sessions", cookies=h_a).json()["id"]
 
         async def must_not_run(question, history):
             raise AssertionError("the LLM was reached for a session the user does not own")
@@ -635,23 +635,23 @@ def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypat
         monkeypatch.setattr(chat_module, "_run_turn", must_not_run)
 
         assert client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h_b,
+            f"/api/chat/sessions/{sid}/messages", cookies=h_b,
             json={"content": "what did they invest in?"},
         ).status_code == 404
         assert client.post(
-            f"/api/chat/sessions/{sid}/messages/stream", headers=h_b,
+            f"/api/chat/sessions/{sid}/messages/stream", cookies=h_b,
             json={"content": "what did they invest in?"},
         ).status_code == 404
 
         # The rejected turns wrote nothing into the victim's conversation.
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h_a).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h_a).json()
         assert detail["messages"] == []
         assert detail["title"] == "New chat"
 
         # And the owner is unaffected.
         monkeypatch.setattr(chat_module, "_run_turn", _ok_turn)
         assert client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h_a,
+            f"/api/chat/sessions/{sid}/messages", cookies=h_a,
             json={"content": "Who invested in fintech?"},
         ).status_code == 200
     finally:
@@ -666,8 +666,8 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
     second turn must not clobber that title."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        h = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         seen = []
 
@@ -678,12 +678,12 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
         monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
 
         assert client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h,
+            f"/api/chat/sessions/{sid}/messages", cookies=h,
             json={"content": "Who invested in fintech?"},
         ).status_code == 200
 
         assert client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h,
+            f"/api/chat/sessions/{sid}/messages", cookies=h,
             json={"content": "And in mobility?"},
         ).status_code == 200
 
@@ -700,7 +700,7 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
             ),
         ]
 
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["title"] == "Who invested in fintech?"  # named once, then left alone
         assert [m["role"] for m in detail["messages"]] == [
             "user", "assistant", "user", "assistant",
@@ -726,9 +726,9 @@ def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, mon
     pins it so the cheap path cannot quietly give it back."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
+        h = _auth_cookies(auth_store)
         user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def rename_mid_turn(question, history):
             # The user renames the conversation while the answer is in flight.
@@ -738,12 +738,12 @@ def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, mon
         monkeypatch.setattr(chat_module, "_run_turn", rename_mid_turn)
 
         r = client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h,
+            f"/api/chat/sessions/{sid}/messages", cookies=h,
             json={"content": "Who invested in fintech?"},
         )
         assert r.status_code == 200
 
-        detail = client.get(f"/api/chat/sessions/{sid}", headers=h).json()
+        detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["title"] == "My carefully chosen name"
         # The turn itself still completed and persisted normally.
         assert [m["content"] for m in detail["messages"]] == [
@@ -763,9 +763,9 @@ def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkey
     INSERT's own WHERE clause so this costs no extra round trip."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
-        h = _auth_headers(auth_store)
+        h = _auth_cookies(auth_store)
         user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
-        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def delete_mid_turn(question, history):
             await chat_store.delete_session(sid, user_id)
@@ -774,7 +774,7 @@ def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkey
         monkeypatch.setattr(chat_module, "_run_turn", delete_mid_turn)
 
         r = client.post(
-            f"/api/chat/sessions/{sid}/messages", headers=h,
+            f"/api/chat/sessions/{sid}/messages", cookies=h,
             json={"content": "Who invested in fintech?"},
         )
         assert r.status_code == 404
@@ -5686,8 +5686,11 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=
     app.include_router(chat_module.router)
     chat_module.store = chat_store
     auth_module.store = auth_store
-    headers = _auth_headers(auth_store)
-    # The session must belong to the user the token authenticates, or the turn
+    session = _auth_cookies(auth_store)
+    # A raw ASGI scope has no client cookie jar behind it, so the header a
+    # browser would attach is written out explicitly.
+    cookie_header = "; ".join(f"{name}={value}" for name, value in session.items())
+    # The session must belong to the user the cookie authenticates, or the turn
     # 404s on a conversation it does not own and nothing streams at all.
     user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
     sid = _run(chat_store.create_session(user_id)).id
@@ -5749,7 +5752,7 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=
         "headers": [
             (b"host", b"testserver"),
             (b"content-type", b"application/json"),
-            (b"authorization", headers["Authorization"].encode()),
+            (b"cookie", cookie_header.encode()),
         ],
         "client": ("testclient", 50000),
         "server": ("testserver", 80),

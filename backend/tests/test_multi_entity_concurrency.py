@@ -29,6 +29,7 @@ import json
 import time
 
 import pytest
+from conftest import auth_cookie
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -640,19 +641,24 @@ def _stream_client(tmp_path):
     return TestClient(app), chat_store, auth_store
 
 
-def _bearer(auth_store) -> dict[str, str]:
+def _auth_cookie(auth_store) -> dict[str, str]:
+    """Create the account and return the session cookie the browser would send.
+
+    The credential is an HttpOnly cookie (#247), so there is no ``Authorization``
+    header left to build: the tests authenticate exactly the way the app does.
+    """
     user = _run(auth_store.get_user_by_email(_EMAIL))
     if user is None:
         user = _run(auth_store.create_user(_EMAIL, "secret1", "user-a", "user"))
-    return {"Authorization": f"Bearer {_run(auth_store.issue_token(user.id, 7))}"}
+    return auth_cookie(_run(auth_store.issue_token(user.id, 7)))
 
 
-def _post_turn(client, headers, question: str) -> str:
+def _post_turn(client, cookie, question: str) -> str:
     """Drive one SSE turn through the real route and hand back the raw body."""
-    sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
+    sid = client.post("/api/chat/sessions", cookies=cookie).json()["id"]
     with client.stream(
         "POST", f"/api/chat/sessions/{sid}/messages/stream",
-        headers=headers, json={"content": question},
+        cookies=cookie, json={"content": question},
     ) as r:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/event-stream")
@@ -703,7 +709,7 @@ def test_stream_event_order_is_unchanged(stub_pipeline, monkeypatch, tmp_path):
 
     client, chat_store, auth_store = _stream_client(tmp_path)
     try:
-        body = _post_turn(client, _bearer(auth_store), _QUESTION)
+        body = _post_turn(client, _auth_cookie(auth_store), _QUESTION)
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
@@ -737,7 +743,7 @@ def test_entity_count_does_not_multiply_billed_calls(stub_pipeline, monkeypatch,
 
     client, chat_store, auth_store = _stream_client(tmp_path)
     try:
-        body = _post_turn(client, _bearer(auth_store), _QUESTION)
+        body = _post_turn(client, _auth_cookie(auth_store), _QUESTION)
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
