@@ -384,6 +384,136 @@ def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch, fake_cache)
     # The field must actually be requested from Qdrant, not merely mapped.
     assert "content_type" in qdrant.query_points_calls[0]["with_payload"]
 
+
+# --- retrieve_by_date_window (date-only fallback fillers) ---
+
+
+def _date_window_qdrant(monkeypatch):
+    """A scroll page of two window articles, newest first, as Qdrant returns
+    them under the published_date order_by."""
+    page = (
+        [
+            _Point(11, {"title": "Newer", "published_date": "2025-06-02T00:00:00"}),
+            _Point(12, {"title": "Older", "published_date": "2025-05-02T00:00:00"}),
+        ],
+        None,
+    )
+    # Two copies: the knob tests call the real retrieval twice, and the fake
+    # hands out one page per call.
+    qdrant = _FakeQdrant(scroll_pages=[page, page])
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+    return qdrant
+
+
+def _date_window_articles():
+    return _run(main.retrieve_by_date_window(top_k=5, from_date="2025-05-01", to_date="2025-06-30"))
+
+
+def test_date_fillers_take_their_own_knob(monkeypatch):
+    """The relevance floor handed to date-only fillers is its own knob, read
+    where the articles are built: retuning it must move the fillers, and
+    nothing else. Pinned to the shipped 0.2 first so a developer .env cannot
+    decide the starting expectation (the default itself is asserted against a
+    clean parse below)."""
+    _date_window_qdrant(monkeypatch)
+    monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.2)
+    assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
+
+    monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.05)
+    assert [a.score for a in _date_window_articles()] == [0.05, 0.05]
+
+
+def test_date_fillers_do_not_follow_the_inclusion_gate_at_the_call_site(monkeypatch):
+    """Regression (issue #300), call-site half: the floor must not be
+    re-derived from config.ASK_MIN_SCORE where the articles are built, which
+    would drag every date-only filler up the moment an operator retuned the
+    gate. The import-time capture the issue found is what
+    test_date_fillers_take_their_own_knob pins (a module-level constant bound
+    before the test runs cannot follow a monkeypatched knob at all)."""
+    _date_window_qdrant(monkeypatch)
+    monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.2)
+    monkeypatch.setattr(main.config, "ASK_MIN_SCORE", 0.9)
+    assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
+
+
+def test_date_filler_knob_ships_the_value_the_alias_resolved_to(parse_config):
+    """Default configuration must be byte-identical to the pre-#300 behaviour:
+    _DATE_FILLER_SCORE = config.ASK_MIN_SCORE resolved to ASK_MIN_SCORE's own
+    0.2 default out of the box, and the two shipped defaults stay equal.
+
+    The ordering assertion is about the shipped PAIR, not about a coupling
+    between the knobs: chat filters sources with `score >= ASK_MIN_SCORE`, so a
+    filler floor below the gate would be dropped before the model ever saw it
+    and the temporal fallback would silently stop working. The two are
+    independent now, which means raising one in a deployment's .env without
+    raising the other is a real (documented) way to break that -- but the
+    defaults this branch ships must not start out broken.
+    """
+    shipped = parse_config()
+    assert shipped.ASK_MIN_SCORE == 0.2
+    assert shipped.DATE_FILLER_SCORE == 0.2
+    assert shipped.DATE_FILLER_SCORE >= shipped.ASK_MIN_SCORE
+
+
+def test_retuning_the_inclusion_gate_does_not_move_the_date_filler_floor(parse_config):
+    """The deployment-level half of the #300 regression. A shipped .env that
+    raises ASK_MIN_SCORE to 0.9 must not drag the date-only fillers up with
+    it: with the old import-time alias the filler floor followed the gate into
+    every window query. Parsed from `ASK_MIN_SCORE=0.9` and nothing else, so
+    the result cannot be an echo of this machine's own .env."""
+    parsed = parse_config(ASK_MIN_SCORE="0.9")
+    assert parsed.ASK_MIN_SCORE == 0.9
+    assert parsed.DATE_FILLER_SCORE == 0.2
+
+
+def test_date_filler_floor_is_tunable_from_the_environment(parse_config):
+    """...and it is a real knob, not a constant with a new name: the shipped
+    template's value is what the app parses when an operator sets it."""
+    assert parse_config(DATE_FILLER_SCORE="0.45").DATE_FILLER_SCORE == 0.45
+
+
+def _filler_gate_warnings(caplog):
+    return [r for r in caplog.records if "DATE_FILLER_SCORE" in r.getMessage()]
+
+
+def test_a_filler_floor_below_the_chat_gate_is_logged_at_startup(parse_config, caplog):
+    """The two knobs are independent, which makes the mis-ordered pairing
+    reachable from a deployment's .env — and it fails silently: every date-only
+    filler is dropped by the chat gate, the temporal fallback contributes
+    nothing, and the turn answers "no relevant articles" with no other trace.
+    config.py warns about it, the way it warns about clamped knobs, instead of
+    raising: the service still serves, but the misconfiguration is named."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        parse_config(ASK_MIN_SCORE="0.6")
+    warnings = _filler_gate_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "0.2" in message and "0.6" in message  # both knob values, as configured
+    assert "temporal fallback" in message  # and the consequence
+
+
+def test_the_filler_floor_warning_stays_quiet_for_sound_configurations(parse_config, caplog):
+    """A warning that fires for the shipped defaults is noise nobody reads, and
+    one that fires for a correctly raised pair trains the reader to ignore it.
+    Only the mis-ordered combination may speak."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        parse_config()
+    assert _filler_gate_warnings(caplog) == []
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # Gate raised and the floor raised with it: a valid deployment.
+        parse_config(ASK_MIN_SCORE="0.6", DATE_FILLER_SCORE="0.7")
+    assert _filler_gate_warnings(caplog) == []
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        parse_config(ASK_MIN_SCORE="0.6", DATE_FILLER_SCORE="0.6")
+    assert _filler_gate_warnings(caplog) == []  # equal is fine: the gate is `>=`
+
+
 # --- body_rescue ---
 
 

@@ -2,12 +2,76 @@
 import pytest
 
 from app.answer_fallback import (
-    TOP_WEAK_THRESHOLD,
     date_label,
     fallback_answer,
     results_are_weak,
     weak_results_note,
 )
+from app.config import config
+
+
+@pytest.fixture(autouse=True)
+def _shipped_weak_gate(monkeypatch):
+    """Pin the two answerability knobs for this module.
+
+    They are deployment settings now (#300), so on a machine whose .env
+    retunes them every assertion below would be deciding something other than
+    what it looks like it is deciding. Pinned here rather than read from
+    `config` so the constants in the assertions mean what they say.
+    """
+    monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.3)
+    monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", 3)
+
+
+def test_weak_result_knobs_ship_the_values_the_pre_knob_constants_had(parse_config):
+    """Issue #300 moved the answerability gate out of answer_fallback.py's
+    module scope into config. Parsed from a clean environment, the knobs must
+    still be exactly the literals that lived there (0.3 and 3), or every
+    answerability decision moves the moment the change lands."""
+    shipped = parse_config()
+    assert shipped.WEAK_RESULT_SCORE == 0.3
+    assert shipped.WEAK_RESULT_MIN_STRONG == 3
+
+
+def test_weak_gate_defaults_decide_the_way_the_old_constants_did():
+    """The shipped decision, with the gate pinned above: 0.3 exclusive-above,
+    three strong hits needed."""
+    assert results_are_weak([0.31, 0.31, 0.31]) is False
+    assert results_are_weak([0.31, 0.31, 0.29]) is True
+
+
+def test_weak_result_score_knob_moves_the_answerability_decision(monkeypatch):
+    """Raising the score a hit must clear must start refusing hits it used to
+    accept -- otherwise the knob is a promise no code keeps."""
+    assert results_are_weak([0.4, 0.4, 0.4]) is False
+    monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.5)
+    assert results_are_weak([0.4, 0.4, 0.4]) is True
+    monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.1)
+    assert results_are_weak([0.15, 0.15, 0.15]) is False
+
+
+def test_weak_result_min_strong_knob_moves_the_answerability_decision(monkeypatch):
+    """The default ``limit`` must come from the knob, not a literal baked into
+    the signature: a deployment that wants two strong hits must get them."""
+    scores = [0.9, 0.9, 0.05]
+    assert results_are_weak(scores) is True
+    monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", 2)
+    assert results_are_weak(scores) is False
+    # An explicit limit still wins over the knob. No production caller passes
+    # one (chat and the /search note both take the default), so this only
+    # pins that the parameter still overrides.
+    assert results_are_weak(scores, limit=3) is True
+
+
+def test_weak_result_min_strong_cannot_open_the_gate(monkeypatch):
+    """The count is floored at 1: a knob of 0 or less must not turn
+    "is this list weak?" into a permanent no. An unclamped env value reaching
+    `min(0, len(scores))` would silence every weak-result note and every chat
+    refusal."""
+    for nonsense in (0, -1):
+        monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", nonsense)
+        assert results_are_weak([0.01, 0.01]) is True
+        assert results_are_weak([0.01, 0.9]) is False
 
 
 def test_results_are_weak_all_low_scores():
@@ -43,9 +107,10 @@ def test_results_are_weak_custom_limit():
 
 
 def test_results_are_weak_edge_near_threshold():
-    assert results_are_weak([TOP_WEAK_THRESHOLD] * 3) is True
-    assert results_are_weak([TOP_WEAK_THRESHOLD + 0.001] * 3) is False
+    assert results_are_weak([0.3] * 3) is True
+    assert results_are_weak([0.301] * 3) is False
     assert results_are_weak([0.31, 0.31, 0.29]) is True
+
 
 
 def test_fallback_answer_contains_query_and_is_nonempty():

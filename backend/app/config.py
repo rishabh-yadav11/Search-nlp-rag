@@ -501,6 +501,57 @@ class Config:
     # category queries (e.g. 'funding news in jun 2025') surface their matches
     # instead of being rejected as "weakly related".
     ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
+    # Answerability gates (app/answer_fallback.py). WEAK_RESULT_SCORE is the
+    # score a reranked hit must exceed to count as "strong", and
+    # WEAK_RESULT_MIN_STRONG is how many strong hits a result list must hold
+    # before it is reported as weakly answered. These are deliberately separate
+    # from ASK_MIN_SCORE above because they answer different questions: that
+    # gate is chat's inclusion filter (it drops a source before anything else
+    # looks at it), while this pair judges the whole list the caller hands over
+    # and decides whether the answer is reported as weakly supported. /search
+    # applies no inclusion gate at all, so the pair is the only relevance bar
+    # its weak note sees.
+    #
+    # The count is capped at the length of the list and floored at 1
+    # (app/answer_fallback.py:results_are_weak), so a deployment that raises
+    # this above the number of results a caller passes sees no change -- the
+    # /search weak note passes the whole result list and is the caller this
+    # knob actually moves; chat's fallback passes at most one source, where
+    # the count is always 1. A value of 0 or less behaves as 1.
+    WEAK_RESULT_SCORE = float(os.getenv("WEAK_RESULT_SCORE", "0.3"))
+    WEAK_RESULT_MIN_STRONG = int(os.getenv("WEAK_RESULT_MIN_STRONG", "3"))
+    # Score handed to every date-only fallback filler
+    # (app/main.py:retrieve_by_date_window) when a temporal query's lexical
+    # signal is too weak to fill the window. Its own knob rather than a shared
+    # one with the inclusion gate above: it used to be an import-time alias of
+    # ASK_MIN_SCORE, so retuning the gate silently moved the filler floor too.
+    # The default reproduces the value the alias resolved to out of the box
+    # (ASK_MIN_SCORE's own 0.2 default), so the shipped ranking is unchanged.
+    # The two are now independent, which means this floor has to be kept at or
+    # above ASK_MIN_SCORE for fillers to survive the chat gate that filters
+    # sources by score. Raise the gate without raising this and the temporal
+    # fallback stops reaching the model.
+    #
+    # A warning, not a ValueError, and deliberately so: the two are separate
+    # operator knobs, and refusing to boot over a mis-ordered pair of scoring
+    # thresholds would be a worse failure than serving degraded answers that
+    # are at least named in the logs. (_parse_allowed_hosts does raise for
+    # ALLOWED_HOSTS=*, where the misconfiguration disables a security check
+    # outright and there is no safe degraded mode to serve.) Deriving one knob
+    # from the other is not an option either: that is the import-time alias #300
+    # removed, and it would put a knob the operator chose back under another's
+    # control.
+    DATE_FILLER_SCORE = float(os.getenv("DATE_FILLER_SCORE", "0.2"))
+    if DATE_FILLER_SCORE < ASK_MIN_SCORE:
+        logger.warning(
+            "DATE_FILLER_SCORE=%g is below ASK_MIN_SCORE=%g: date-only fallback "
+            "fillers are filtered out by the chat relevance gate before reaching "
+            "the model, so the temporal fallback contributes nothing. Raise "
+            "DATE_FILLER_SCORE to at least ASK_MIN_SCORE.",
+            DATE_FILLER_SCORE,
+            ASK_MIN_SCORE,
+        )
+
     CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "1000"))
     # Byte budget for the in-process fallback cache (the HybridCache degrades to
@@ -528,6 +579,15 @@ class Config:
     # so fresher news ranks higher; missing dates get no boost.
     RECENCY_STRENGTH = float(os.getenv("RECENCY_STRENGTH", "0.25"))
     RECENCY_DECAY_DAYS = float(os.getenv("RECENCY_DECAY_DAYS", "90"))
+    # Stronger recency weighting applied when the query itself expresses a
+    # recency intent ('latest', 'recent', 'fresh'), so old evergreen articles
+    # drop below newer ones instead of surfacing on relevance alone. Hard-window
+    # phrases ('this week') are filtered separately and get no boost. This is
+    # the branch that decides whether a "latest" query surfaces new news, so it
+    # is a tuning knob beside the baseline pair above rather than a literal in
+    # app/main.py. The defaults are the values that were hardcoded there.
+    RECENCY_BOOST_STRENGTH = float(os.getenv("RECENCY_BOOST_STRENGTH", "0.85"))
+    RECENCY_BOOST_DECAY_DAYS = float(os.getenv("RECENCY_BOOST_DECAY_DAYS", "30.0"))
 
     # Retrieval-quality tuning (see app/query_expand.py, app/rerank_boost.py,
     # app/answer_fallback.py, app/query_fix.py). Toggles can be disabled per-deployment.
