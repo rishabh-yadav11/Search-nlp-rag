@@ -294,9 +294,9 @@ def test_document_declares_both_machine_verified_blocks():
 
 
 def test_generated_block_is_machine_written():
-    """The block opens with the gate's own notice, command and suite line."""
+    """The block opens with the gate's own notice, command, interpreter and suite line."""
     section = _coverage_section()
-    assert len(section.lines) >= 3, (
+    assert len(section.lines) >= 4, (
         f"{DOCUMENT.name} line {section.first_line}: the generated block is empty or truncated "
         f"({len(section.lines)} lines); regenerate it with "
         "`python scripts/measure_coverage.py --write`"
@@ -306,24 +306,52 @@ def test_generated_block_is_machine_written():
             f"{DOCUMENT.name} line {section.number(index)}: expected {expected!r}, "
             f"found {section.lines[index]!r}"
         )
-    suite = section.lines[2]
+    assert gate.MEASURED_WITH_RE.match(section.lines[2]), (
+        f"{DOCUMENT.name} line {section.number(2)}: expected a {gate.MEASURED_WITH_PREFIX!r} "
+        f"line naming the measuring interpreter, found {section.lines[2]!r}"
+    )
+    suite = section.lines[3]
     assert SUITE_RE.match(suite), (
-        f"{DOCUMENT.name} line {section.number(2)}: expected "
+        f"{DOCUMENT.name} line {section.number(3)}: expected "
         "'Suite: <n> passed, <n> skipped, <n> failed, <n> errors, <n> xfailed, <n> xpassed', "
         f"found {suite!r}"
     )
 
 
 def test_generated_block_carries_no_environment_specific_values():
-    """No date, commit SHA or tool version: the block must be identical everywhere."""
+    """No date or commit SHA, and no version outside the one `Measured with:` line.
+
+    The block must be identical on every checkout so a diff means the document
+    rotted. That is true of everything here except the interpreter, and the
+    interpreter was the one thing that had to be recorded: statement counts are
+    parser-dependent (the same source yields 5137 statements under 3.11 and
+    5075 under 3.14), so a block written on 3.14 and compared on CI's 3.11 was a
+    62-statement diff whose cause appeared nowhere. Recording it converts an
+    unreadable diff into a named mismatch, and the gate now fails with that
+    name instead of the arithmetic.
+    """
     section = _coverage_section()
+    measured = [
+        (index, line)
+        for index, line in enumerate(section.lines)
+        if gate.MEASURED_WITH_RE.match(line)
+    ]
+    assert len(measured) == 1, (
+        f"{DOCUMENT.name}: expected exactly one {gate.MEASURED_WITH_PREFIX!r} line in the "
+        f"generated block, found {len(measured)}; regenerate it with "
+        "`python scripts/measure_coverage.py --write`"
+    )
+    exempt = {measured[0][0]}
     for index, line in enumerate(section.lines):
+        if index in exempt:
+            continue
         for pattern in ENVIRONMENT_VALUE_RES:
             found = pattern.search(line)
             assert found is None, (
                 f"{DOCUMENT.name} line {section.number(index)}: {found.group(0)!r} makes the "
                 f"generated block environment-specific (matched {pattern.pattern!r}); the block "
-                "has to be byte-identical on every checkout, so it carries no clock, SHA or version"
+                "has to be byte-identical on every checkout, so it carries no clock, SHA or "
+                "version outside its single `Measured with:` line"
             )
 
 

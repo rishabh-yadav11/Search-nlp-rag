@@ -38,6 +38,7 @@ import argparse
 import difflib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -63,6 +64,37 @@ GENERATED_NOTICE = (
 # The human-readable twin of MEASUREMENT_ARGS below: both describe the same run,
 # so neither is written down twice.
 COMMAND_LINE = "Command: `python -m pytest --cov=app --cov-report=term-missing`"
+
+# The interpreter that produced the block. Statement counts are a property of
+# the source AND the parser: CPython 3.11 finds 5137 statements in app/ where
+# 3.14 finds 5075, from byte-identical source, and the difference is identical
+# under coverage 7.15.4 and 7.16.2. A block written on one and compared on the
+# other is a 62-statement diff with no visible cause, which is how a green
+# local run and a red CI run coexisted unnoticed. Recording it lets the gate
+# name the mismatch instead of printing arithmetic.
+MEASURED_WITH_PREFIX = "Measured with: "
+
+
+def coverage_version() -> str:
+    try:
+        import coverage
+    except ModuleNotFoundError:
+        return "not installed"
+    return getattr(coverage, "__version__", "unknown")
+
+
+def measured_with_line() -> str:
+    """The `Measured with:` line naming the interpreter and coverage.py."""
+    return f"{MEASURED_WITH_PREFIX}Python {platform.python_version()}, coverage {coverage_version()}"
+
+
+MEASURED_WITH_RE = re.compile(rf"^{re.escape(MEASURED_WITH_PREFIX)}(?P<detail>.+)$")
+
+# The interpreter the committed block is expected to have been measured under.
+# It is the one CI uses (actions/setup-python, python-version "3.11"), the one
+# backend/ruff.toml targets (py311) and the one the README documents, so the
+# block is written under it rather than under whatever the author's box has.
+TARGET_PYTHON = "python3.11"
 
 # Run by the gate itself (with the JSON report swapped in, so nothing has to be
 # parsed out of a terminal report) and echoed in the document as `Command:`.
@@ -284,8 +316,10 @@ def build_block(report: dict, counts: dict[str, int], root: Path = BACKEND_DIR) 
     """The full body of the generated block, markers excluded.
 
     This is the only place the document's numbers are produced. It takes no
-    clock, no git state and no interpreter version: those differ per machine
-    and would make the block unreproducible everywhere but the author's box.
+    clock and no git state. It does record the measuring interpreter, because
+    statement counts are interpreter-dependent: the same source yields 5137
+    statements under 3.11 and 5075 under 3.14. Omitting it did not make the
+    block reproducible, it only made the disagreement invisible.
     """
     rows = build_rows(report, root)
     statements = sum(row.statements for row in rows)
@@ -295,6 +329,7 @@ def build_block(report: dict, counts: dict[str, int], root: Path = BACKEND_DIR) 
     lines = [
         GENERATED_NOTICE,
         COMMAND_LINE,
+        measured_with_line(),
         f"Suite: {format_suite(counts)}",
         "",
         f"Overall: {format_pct(overall)} ({missed} of {statements} statements uncovered)",
@@ -504,6 +539,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = next(line for line in block.splitlines() if line.startswith("Overall:"))
         print(f"{DOCUMENT.name} matches the fresh measurement. {summary}")
         return 0
+
+    # Name the cause before the arithmetic. When the block was measured on a
+    # different interpreter the diff is a wall of per-module statement counts
+    # with nothing in common, and the only useful fact -- that no amount of
+    # editing the document will fix it -- is not visible anywhere in it.
+    committed = next(
+        (m.group("detail") for line in current.splitlines() if (m := MEASURED_WITH_RE.match(line))),
+        None,
+    )
+    running = measured_with_line()[len(MEASURED_WITH_PREFIX) :]
+    if committed is not None and committed != running:
+        print(
+            f"error: the committed block was measured with {committed}, but this run is "
+            f"measuring with {running}.",
+            file=sys.stderr,
+        )
+        print(
+            "Statement counts are interpreter-dependent (the same source yields 5137 "
+            "statements under Python 3.11 and 5075 under 3.14), so this diff is not "
+            "staleness, and re-running --write here would only trade one wrong "
+            "interpreter for another.",
+            file=sys.stderr,
+        )
+        print(
+            f"Regenerate the block under the interpreter CI uses ({TARGET_PYTHON}): "
+            f"{TARGET_PYTHON} -m pip install -r requirements.txt -r requirements-dev.txt",
+            file=sys.stderr,
+        )
+        return 1
 
     print(f"{DOCUMENT.name} does not match the fresh measurement.")
     print("Re-run `python scripts/measure_coverage.py --write` to regenerate the block.")

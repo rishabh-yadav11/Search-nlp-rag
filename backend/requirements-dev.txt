@@ -1,5 +1,13 @@
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
+# coverage.py is pinned exactly, not left as a floating transitive of
+# pytest-cov. It produces the statement counts committed into
+# TEST_COVERAGE_GAPS.md, and that block is compared byte-for-byte by
+# scripts/measure_coverage.py, so the version that writes it has to be the
+# version that reads it. Unpinned, CI resolved 7.16.2 while a local venv held
+# 7.15.4, so two machines could disagree about the same source. pytest-cov
+# stays a floor so the pair can move together; coverage itself cannot.
+coverage==7.16.2
 pytest-cov>=5.0.0
 ruff>=0.9.0
 pip-audit>=2.7.3
