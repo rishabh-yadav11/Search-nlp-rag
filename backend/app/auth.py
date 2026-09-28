@@ -66,9 +66,24 @@ ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
 SERVICE_USER_ID = "service-token"
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
-# bcrypt silently truncates its input at 72 bytes; cap there so validation
-# matches what bcrypt actually hashes (otherwise two distinct long passwords
-# can collide on their shared 72-byte prefix).
+# bcrypt silently truncates its input at 72 bytes, so this is the width of the
+# credential that actually authenticates. Password validation judges the
+# minimum against it rather than the raw string, which is what makes the floor
+# mean anything (#334).
+#
+# This is NOT a cap on what a caller may submit. The policy deliberately has no
+# maximum, because refusing over-long values is what stopped bootstrap_admin --
+# the only path that can create an admin -- from seeding one (#290, #334).
+#
+# The accepted consequence is a prefix collision: once two passwords share a
+# 72-byte prefix, the bytes after it are not part of either credential, so the
+# shorter prefix authenticates the longer password. That is inherent to bcrypt's
+# truncation, not introduced here, and it was already true of every
+# bootstrap_admin-seeded admin on main. What changed is that a user may now
+# CHOOSE a password that has such a tail; _warn_truncated_password records it at
+# every set path. Removing the root cause means hashing a pre-image (SHA-256
+# before bcrypt) instead of truncating, which changes the meaning of every
+# stored hash and so needs a credential-rehash migration of its own -- #387.
 _BCRYPT_MAX_BYTES = 72
 
 
@@ -200,57 +215,88 @@ def _has_letter_and_digit(password: str) -> bool:
     return bool(re.search(r"[A-Za-z]", password)) and bool(re.search(r"\d", password))
 
 
-def _bootstrap_password_rejection(password: str, effective: str) -> str | None:
-    """Why the configured admin password is refused, or None if it is accepted.
+def _password_rejection(password: str) -> str | None:
+    """Why this password is refused, or None when it is accepted.
 
-    The two classes of rule are deliberately judged against different values,
-    because they answer different questions:
+    THE SINGLE SOURCE OF TRUTH for the password policy. Every path that can set
+    a password -- ``signup``, ``change_password`` and ``bootstrap_admin`` -- must
+    reach this function. The three of them used to state the same two rules
+    against different values, so they admitted different passwords (#334).
+
+    The two rules are deliberately judged against different values, because
+    they answer different questions:
 
     - **Length** is a property of the credential that actually authenticates.
-      bcrypt only ever sees the first ``_BCRYPT_MAX_BYTES`` bytes, so nothing
-      beyond them can make a short password long. Judging length on the raw
-      string would reject a long passphrase whose effective form is perfectly
-      serviceable -- and ``bootstrap_admin`` is the only path that can ever
-      create an admin (signup hardcodes ``SIGNUP_ROLE``; a role change needs an
-      admin token that cannot exist yet), so that rejection would leave a fresh
-      deploy permanently unadministrable.
+      ``hash_password`` and ``verify_password`` both go through
+      ``_password_bytes()``, which keeps only the first ``_BCRYPT_MAX_BYTES``
+      bytes, so nothing past that window can make a short password long.
+      Judging the minimum on the raw string is therefore the WEAKER bound: it
+      admits a password whose *effective* form is under
+      ``AUTH_PASSWORD_MIN_LEN``, so a configured floor can be stepped under.
+      On main that was latent rather than exploitable, because the raw 72-byte
+      maximum refused every value long enough to have a shortened effective
+      form (if a value fits in 72 bytes, ``_effective_password`` returns it
+      unchanged). The two bounds therefore MASKED each other, and removing the
+      maximum -- which the lockout required -- is what made the weak minimum
+      reachable. That is why both move together here: the minimum is judged on
+      ``_effective_password()``, so no credential is admitted below the floor by
+      any path, whichever bounds are in force.
 
-    - **Letter+digit** is a property of the secret the operator configured, not
-      of the truncated prefix. It is a composition rule, not an entropy rule, so
+    - **Letter+digit** is a property of the secret that was configured, not of
+      the truncated prefix. It is a composition rule, not an entropy rule, so
       there is nothing to gain by applying it to bytes that will never
-      authenticate -- and applying it there refuses credentials that both
-      ``main`` and ``login`` accepted: a passphrase whose only digit was
-      appended past byte 72 is long and usable, yet its 72-byte prefix has no
-      digit.
+      authenticate -- and applying it there refuses credentials ``login``
+      already accepted: a passphrase whose only digit was appended past byte 72
+      is long and usable, yet its 72-byte prefix has no digit.
 
-    The composition class is shared verbatim with ``validate_password`` through
-    ``_has_letter_and_digit``, so the two cannot disagree about what counts. The
-    length class is re-stated here because it is the one rule that must be
-    applied to a different value than ``validate_password`` applies it to, and
-    its message is kept identical so an operator sees the same wording whichever
-    path rejected them.
+    There is deliberately NO maximum. The 72-byte cut is a property of bcrypt,
+    not a policy the application may enforce, and refusing over-long values is
+    what stopped ``bootstrap_admin`` -- the only path that can ever create an
+    admin -- from seeding one, while leaving the very same working passphrase
+    unsettable through ``change_password`` (#290, #334). All three set paths now
+    agree: a value longer than bcrypt's window is accepted, and
+    ``_warn_truncated_password`` records that its tail is not part of the
+    credential.
     """
-    if len(effective) < config.AUTH_PASSWORD_MIN_LEN:
+    if len(_effective_password(password)) < config.AUTH_PASSWORD_MIN_LEN:
         return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
     if not _has_letter_and_digit(password):
         return "password must contain a letter and a digit"
     return None
 
 
+def _warn_truncated_password(password: str, path: str) -> None:
+    """Log that ``password`` is longer than what bcrypt will actually hash.
+
+    Every set path calls this once the value is accepted, so the fact that the
+    tail is not part of the credential is on the record instead of silent, and
+    the operator sees the same warning whichever path stored it. Only byte
+    counts are logged -- never the password, and never the account it belongs
+    to -- so the line cannot become a credential oracle.
+    """
+    effective = _effective_password(password)
+    if effective == password:
+        return
+    logger.warning(
+        "%s stored a password of %d bytes, but bcrypt only hashes the first %d. The trailing "
+        "bytes are dropped and will never authenticate. Shorten it, or accept that the tail is "
+        "not part of the credential.",
+        path,
+        len(password.encode("utf-8")),
+        _BCRYPT_MAX_BYTES,
+    )
+
+
 def validate_password(password: str) -> str:
-    """Validate a password (length + letter/digit), raising 422 on violation."""
-    if not password or len(password) < config.AUTH_PASSWORD_MIN_LEN:
-        raise HTTPException(
-            status_code=422,
-            detail=f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters",
-        )
-    if len(password.encode("utf-8")) > _BCRYPT_MAX_BYTES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"password too long (max {_BCRYPT_MAX_BYTES} bytes)",
-        )
-    if not _has_letter_and_digit(password):
-        raise HTTPException(status_code=422, detail="password must contain a letter and a digit")
+    """Validate a password (length + letter/digit), raising 422 on violation.
+
+    The raising form the signup and change-password endpoints call. It returns
+    the password unchanged rather than a normalised variant, so a caller can
+    never store something other than the exact value that was validated.
+    """
+    reason = _password_rejection(password)
+    if reason:
+        raise HTTPException(status_code=422, detail=reason)
     return password
 
 
@@ -308,7 +354,7 @@ def _effective_password(password: str) -> str:
     only ever drops a non-ASCII tail, so it cannot turn a policy-failing value
     into a passing one. The min-length rule is decided entirely by the retained
     prefix; the letter+digit rule is decided on the whole configured value (see
-    ``_bootstrap_password_rejection``).
+    ``_password_rejection``).
     """
     return password.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", "ignore")
 
@@ -1410,6 +1456,7 @@ async def signup(body: SignupIn, request: Request):
     await _check_rate_limit(request, "signup", config.AUTH_SIGNUP_RATE_PER_MIN)
     email = validate_email(body.email)
     password = validate_password(body.password)
+    _warn_truncated_password(password, "signup")
     name = validate_name(body.name)
     s = _require_auth_store()
     # No pre-flight "does this address exist" lookup: create_user hashes the
@@ -1522,6 +1569,11 @@ async def change_password(body: ChangePasswordIn, request: Request, _: None = De
     """Change the current user's password after verifying the old one. Invalidates
     every other token the user holds (the current session stays signed in).
 
+    The new password is judged by the same policy ``signup`` and
+    ``bootstrap_admin`` use (see ``_password_rejection``), so an admin seeded
+    with a passphrase longer than bcrypt's 72-byte window can re-apply that very
+    passphrase here instead of being 422'd out of its own credential.
+
     "Invalidates" holds even if the worker is killed mid-request: the hash
     write, the revocation and the replacement token commit together or not at
     all -- see ``AuthStore.change_password``."""
@@ -1533,9 +1585,15 @@ async def change_password(body: ChangePasswordIn, request: Request, _: None = De
     ):
         raise HTTPException(status_code=400, detail="current password is incorrect")
     new_password = validate_password(body.new_password)
+    _warn_truncated_password(new_password, "change-password")
     # Hash first, then take the write lock: bcrypt is the slow part and has no
     # business being spent holding it.
     new_hash = await asyncio.to_thread(hash_password, new_password)
+    # ONE transaction for the hash write, the revocation and the replacement
+    # token. Do not split this back into set_password / revoke_all_tokens /
+    # issue_token: that is the three-transaction shape #285 closed, and it
+    # leaves a durable new password valid alongside still-authenticating
+    # pre-existing tokens whenever the worker dies between them.
     token = await s.change_password(user.id, new_hash, config.AUTH_TOKEN_TTL_DAYS)
     return AuthOut(token=token, user=UserOut.from_user(stored))
 
@@ -1725,18 +1783,9 @@ async def bootstrap_admin() -> None:
     # the first _BCRYPT_MAX_BYTES bytes (hash_password and verify_password both
     # truncate), so those bytes ARE the credential. The original password is
     # still what gets stored, so the row and its hash are byte-identical to
-    # before. See _bootstrap_password_rejection for why letter+digit is judged
-    # on the whole value instead.
-    effective = _effective_password(password)
-    if effective != password:
-        logger.warning(
-            "AUTH_ADMIN_PASSWORD exceeds bcrypt's %d-byte limit; the trailing bytes are dropped "
-            "and only the first %d bytes will ever authenticate. Shorten it, or accept that the "
-            "tail is not part of the credential.",
-            _BCRYPT_MAX_BYTES,
-            _BCRYPT_MAX_BYTES,
-        )
-    password_error = _bootstrap_password_rejection(password, effective)
+    # before. See _password_rejection for why letter+digit is judged on the
+    # whole value instead, and why there is no maximum.
+    password_error = _password_rejection(password)
 
     email_error = _validator_rejection(validate_email, email)
     if email_error:
@@ -1755,6 +1804,12 @@ async def bootstrap_admin() -> None:
             password_rejected=password_error,
         )
         return
+    # Warned only once the value is ACCEPTED. Emitted before the rejections
+    # above, this reported "stored a password of N bytes" for a credential that
+    # was refused and never stored anywhere. It still fires when the admin
+    # already exists, and that is correct: that account really was provisioned
+    # from this value, and its tail really is not part of the credential.
+    _warn_truncated_password(password, "AUTH_ADMIN_PASSWORD")
     s = _require_auth_store()
     for attempt in range(5):
         if await s.get_user_by_email(email) is not None:
@@ -1864,10 +1919,10 @@ def _password_hint(reason: str) -> str:
     """The remediation hint for a ``validate_password`` reason.
 
     Keyed on the reason so the advice can never contradict it -- one fixed hint
-    would tell an operator to lengthen a password that was rejected for being
-    too long. Only the reasons still reachable for an already-truncated value
-    appear here: the too-long branch cannot fire, because ``bootstrap_admin``
-    validates the output of ``_effective_password``.
+    would tell an operator to lengthen a password that was rejected for having
+    no digit. It enumerates every reason ``_password_rejection`` can return; the
+    too-long case is gone entirely now that the policy has no maximum, so a
+    "lengthen it" branch here would have nothing left to describe.
     """
     if "at least" in reason:
         return (
