@@ -377,6 +377,29 @@ def test_analytics_dashboard_is_frontend_owned():
     assert "/analytics/chat" in paths
 
 
+def test_route_paths_walks_routes_nested_in_included_routers():
+    """The walk must reach routes mounted via include_router, not just the
+    top level.
+
+    Every path asserted by ``test_analytics_dashboard_is_frontend_owned`` is a
+    top-level route, so those three assertions stay green even if the descent
+    is deleted -- which would silently blind the negative assertion to a
+    dashboard route mounted on an included router. This pins the descent
+    itself using paths that are reachable ONLY through it: since fastapi 0.141
+    (issue #331) the health, auth and chat routers are stored as
+    ``_IncludedRouter`` wrappers, so none of these appear in a flat
+    ``app.routes`` walk.
+    """
+    paths = _route_paths(main.app.routes)
+    flat = {r.path for r in main.app.routes if getattr(r, "path", None) is not None}
+
+    for nested_only in ("/health", "/ready", "/api/auth/login", "/api/chat/sessions"):
+        assert nested_only not in flat, "guard is stale: this route is top-level now"
+        assert nested_only in paths
+
+    assert paths - flat, "the walk added nothing beyond the top level"
+
+
 def test_best_body_window_finds_query_token_dense_region():
     from app.main import _best_body_window, _query_content_tokens
 
