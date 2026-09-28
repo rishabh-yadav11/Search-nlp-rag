@@ -79,6 +79,16 @@ jobs:
             echo "::error::pytest skipped tests in CI. The suite must be fully covered; see the SKIPPED lines above."
             exit 1
           fi
+      # The coverage figures in TEST_COVERAGE_GAPS.md are generated, and nothing
+      # else keeps them honest: they rot silently the first time a test is added
+      # and the document is not re-measured, which is exactly what issue #295
+      # was. This step re-measures the suite and fails the build when the
+      # committed block no longer matches. It runs the whole suite a SECOND
+      # time under pytest-cov -- about two minutes on top of the step above,
+      # well inside the job's 30-minute timeout, and it stays in this job
+      # rather than a new one so it reuses this job's installed dependencies.
+      - name: Coverage document is not stale
+        run: python scripts/measure_coverage.py
 
   frontend:
     name: frontend (lint + typecheck + build + vitest)
