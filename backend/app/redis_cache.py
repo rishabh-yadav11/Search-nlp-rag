@@ -3,7 +3,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 
 import redis
 import redis.asyncio as aioredis
@@ -181,49 +181,6 @@ class HybridCache:
         # slide its TTL, so this keeps the fallback faithful to it.
         self._mem.move_to_end(key)
         return value
-
-    async def get_many(self, keys: Sequence[str]) -> list[object | None]:
-        """Read many keys, preferring a single Redis round trip (MGET).
-
-        ``get`` degrades to the in-process cache key by key, and so does this:
-        a Redis miss falls back for that key alone, a corrupt payload for that
-        key alone, and a Redis outage for all of them. Reading N keys with N
-        calls to ``get`` is N round trips, which is the whole reason this
-        exists -- one view that needs 8 cached lists should cost one trip.
-
-        Returns one value per key, positionally, so a caller can zip the
-        result back onto the keys it passed.
-        """
-        if not keys:
-            return []
-        client, is_new = self._acquire()
-        try:
-            raws = await client.mget(*keys)
-        except _REDIS_ERRORS as exc:
-            if is_new:
-                await self._discard(client)
-            self._degraded(exc)
-            return [self._get_mem(key) for key in keys]
-        await self._publish(client)
-        # MGET answers with one element per key. A short or missing answer is
-        # not something to zip silently: the caller would get its list
-        # misaligned with its keys and read the wrong cache entry for the
-        # wrong article, so fall back instead.
-        if raws is None or len(raws) != len(keys):
-            return [self._get_mem(key) for key in keys]
-        values: list[object | None] = []
-        for key, raw in zip(keys, raws):
-            if raw is None:
-                values.append(self._get_mem(key))
-                continue
-            try:
-                values.append(json.loads(raw))
-            except json.JSONDecodeError as exc:
-                # Same reasoning as `get`: a corrupt payload is logged
-                # distinctly and degrades to the in-process cache.
-                self._degraded(exc)
-                values.append(self._get_mem(key))
-        return values
 
     async def set(self, key: str, value, ttl: int | None = None) -> None:
         payload = json.dumps(value)
