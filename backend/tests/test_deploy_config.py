@@ -362,14 +362,26 @@ def _setup_sh_frontend_argv() -> list[str]:
     return shlex.split(start.group("argv"))
 
 
+def _next_start_flag(tokens: list[str], flag: str, default: str) -> str:
+    """The value of `-H`/`--hostname` or `-p`/`--port`, or `default` if absent.
+
+    A `$VAR` value is resolved through setup.sh's own `${VAR:-default}`
+    declaration, so a correct config that factors the address out into a
+    variable is recognised rather than reported as a regression.
+    """
+    for name in (flag, {"-H": "--hostname", "-p": "--port"}[flag]):
+        if name in tokens:
+            return _resolve(tokens[tokens.index(name) + 1], _setup_sh_defaults(), flag)
+    return default
+
+
 def _next_start_host(tokens: list[str]) -> str:
-    """The address `next start` binds, from a `-H`/`--hostname` flag or Next's default."""
-    for flag in ("-H", "--hostname"):
-        if flag in tokens:
-            return tokens[tokens.index(flag) + 1]
-    # `next start` binds 0.0.0.0 when no hostname is given, so an absent flag
-    # is the wildcard bind this issue is about, not an unspecified value.
-    return "0.0.0.0"
+    """The address `next start` binds.
+
+    `next start` binds all interfaces when no hostname is given, so an absent
+    flag is the wildcard bind this issue is about, not an unspecified value.
+    """
+    return _next_start_flag(tokens, "-H", "0.0.0.0")
 
 
 def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
@@ -396,10 +408,23 @@ def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
         "127.0.0.1 so nginx on :80 is the only way in"
     )
 
-    setup_host = _next_start_host(_setup_sh_frontend_argv())
+    setup_tokens = _setup_sh_frontend_argv()
+    setup_host = _next_start_host(setup_tokens)
     assert setup_host == "127.0.0.1", (
         f"setup.sh binds the frontend to {setup_host}; it must be 127.0.0.1, or "
         "`./setup.sh services` re-exposes :3000 on every interface"
+    )
+
+    # A loopback bind on the wrong port is as broken as a wildcard bind on the
+    # right one: nginx proxies to $NEXT_PORT, so a frontend pm2 started on any
+    # other port is unreachable through the site. `args` is a structural key,
+    # so the drift guard above never sees it and this is the only check on it.
+    ecosystem_port = _next_start_flag(shlex.split(ecosystem.group(1)), "-p", "3000")
+    setup_port = _next_start_flag(setup_tokens, "-p", "3000")
+    assert ecosystem_port == setup_port, (
+        f"the two startup paths disagree on the frontend port "
+        f"(ecosystem.config.js :{ecosystem_port}, setup.sh :{setup_port}); nginx "
+        "proxies to $NEXT_PORT, so a frontend on the other port is unreachable"
     )
 
     script = FRONTEND_PKG_JSON.read_text(encoding="utf-8")
