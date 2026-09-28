@@ -2752,14 +2752,18 @@ def test_api_require_store_uninitialized_503(tmp_path):
         _run(chat_store.close())
 
 
-def test_api_send_message_too_long_400(tmp_path):
+def test_api_send_message_too_long_422(tmp_path):
+    """An oversized message is refused at the model boundary, so the answer is
+    the standard 422 rather than a route's ad-hoc 400 (#350). The bound and the
+    accept-at-the-limit / store-nothing behaviour are covered in
+    test_chat_content_bound.py."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_headers(auth_store)
         sid = client.post("/api/chat/sessions", headers=h).json()["id"]
         long_msg = "x" * (chat_module.MAX_CONTENT_LEN + 1)
         r = client.post(f"/api/chat/sessions/{sid}/messages", headers=h, json={"content": long_msg})
-        assert r.status_code == 400
+        assert r.status_code == 422
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
