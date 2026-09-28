@@ -152,6 +152,19 @@ _CATEGORIES_TTL_HOURS = 6
 # Number of interaction records to consider for profile building (most recent N)
 _PROFILE_MAX_INTERACTIONS = 50
 
+# Trending index: a sorted set of article_id -> total interaction count, kept in
+# step by record_interaction so the trending read path ranks candidates without
+# walking the keyspace. Scores are always read back from the per-article
+# counters, so the index only decides which candidates get hydrated — a score
+# that drifts can cost a candidate slot, never a wrong number. The index and
+# its ready marker share the counter TTL and are refreshed together, so they
+# can only fall out of step if Redis evicts one of them.
+_TRENDING_INDEX_KEY = "trending:article_scores"
+_TRENDING_INDEX_READY_KEY = "trending:article_scores:ready"
+_TRENDING_CACHE_TTL_SECONDS = 3600
+_TRENDING_RANK_BATCH = 50      # candidates hydrated per pipelined HGETALL round trip
+_TRENDING_SCAN_COUNT = 500     # only used by the one-time index bootstrap
+
 
 def _redis_client() -> aioredis.Redis:
     global _redis_client_instance
@@ -209,7 +222,17 @@ async def record_interaction(
             logger.warning("User %s hit the distinct-interaction cap", user_id)
             return InteractionResult.CAP_REACHED
         now = datetime.now(UTC).timestamp()
+        article_key = f"article:interactions:{article_id}"
         pipe = client.pipeline()
+
+        # Update article-level interaction counts (for future popularity scoring).
+        # Queued first: pipeline results come back in command order, so results[0]
+        # is this HINCRBY's post-increment value. A value of 1 means the article's
+        # counters are brand new, so the trending index still holds this
+        # article's pre-expiry score and must be re-seeded, not incremented.
+        pipe.hincrby(article_key, kind, 1)
+        pipe.hset(article_key, "last_timestamp", str(now))
+        pipe.expire(article_key, config.USER_INTERACTION_TTL_DAYS * 86400)
 
         # Add to user's interaction history (sorted set, score = timestamp)
         pipe.zadd(f"user:interactions:{user_id}", {str(article_id): now})
@@ -224,11 +247,11 @@ async def record_interaction(
         })
         pipe.expire(detail_key, config.USER_INTERACTION_TTL_DAYS * 86400)
 
-        # Update article-level interaction counts (for future popularity scoring)
-        article_key = f"article:interactions:{article_id}"
-        pipe.hincrby(article_key, kind, 1)
-        pipe.hset(article_key, "last_timestamp", str(now))
-        pipe.expire(article_key, config.USER_INTERACTION_TTL_DAYS * 86400)
+        # Advance the trending index in the same transaction, so trending never
+        # has to scan the keyspace to discover this article.
+        pipe.zincrby(_TRENDING_INDEX_KEY, 1, str(article_id))
+        pipe.expire(_TRENDING_INDEX_KEY, config.USER_INTERACTION_TTL_DAYS * 86400)
+        pipe.expire(_TRENDING_INDEX_READY_KEY, config.USER_INTERACTION_TTL_DAYS * 86400)
 
         # Derived data is only valid for the interaction snapshot it was built
         # from. Invalidate it in the same Redis transaction as the new signal.
@@ -237,11 +260,44 @@ async def record_interaction(
             f"user:categories:{user_id}",
         )
 
-        await pipe.execute()
-        return InteractionResult.RECORDED
+        results = await pipe.execute()
+        # results[0] is the article counter HINCRBY queued above; a post-value
+        # of 1 means the counters were just (re)created, so the index holds this
+        # article's pre-expiry score and must be re-seeded rather than incremented.
+        reseed_needed = results[0] == 1
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to record user interaction: %s", exc)
         return InteractionResult.UNAVAILABLE
+
+    if reseed_needed:
+        # Deliberately outside the guard above. The interaction is already
+        # durably recorded at this point, so a failed index repair must not turn
+        # a true RECORDED into a false UNAVAILABLE (#271's reporting contract);
+        # the stale index entry is corrected by the next interaction regardless.
+        try:
+            await _reseed_trending_index(client, article_id, article_key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to re-seed trending index: %s", exc)
+    return InteractionResult.RECORDED
+
+
+async def _reseed_trending_index(client: aioredis.Redis, article_id: int, article_key: str) -> None:
+    """Re-seed the trending index when an article's counters start from scratch.
+
+    The counters expired (or never existed) while the index kept the article's
+    pre-expiry score, so overwrite it with the counters' real total instead of
+    incrementing the stale one. If a concurrent write lands in the gap between
+    the read and the write, the index is left one behind rather than one ahead:
+    scores are read back from the counters on every trending read, and the next
+    interaction increments the index to the correct value.
+    """
+    total = _article_total(await client.hgetall(article_key))
+    if total <= 0:
+        return
+    pipe = client.pipeline()
+    pipe.zadd(_TRENDING_INDEX_KEY, {str(article_id): float(total)})
+    pipe.expire(_TRENDING_INDEX_KEY, config.USER_INTERACTION_TTL_DAYS * 86400)
+    await pipe.execute()
 
 
 async def get_user_interactions(user_id: str, limit: int = _PROFILE_MAX_INTERACTIONS) -> list[tuple[int, float]]:
@@ -394,10 +450,74 @@ async def invalidate_user_profile(user_id: str) -> None:
         logger.warning("Failed to invalidate user profile: %s", exc)
 
 
+def _article_total(counts: dict) -> int:
+    """Total interactions for an article from its per-article counter hash.
+
+    The same computation trending has always used: sum the per-type counters,
+    ignoring bookkeeping fields such as ``last_timestamp``.
+
+    Summed by NAME against the known interaction kinds, not name-blind over
+    every digit-valued field. A name-blind sum credits junk fields, so any kind
+    minted before the write-side enum landed would keep inflating a chosen
+    article's trending score for the full USER_INTERACTION_TTL_DAYS (90 by
+    default). The allow-list contains that legacy residue, as well as anything
+    a future writer might add.
+    """
+    return sum(
+        int(counts[kind_name])
+        for kind_name in _INTERACTION_TYPE_VALUES
+        if kind_name in counts and counts[kind_name].isdigit()
+    )
+
+
+async def _ensure_trending_index(client: aioredis.Redis) -> None:
+    """Seed the trending index from the per-article counters if it is missing.
+
+    Deploys that predate the index leave `article:interactions:*` hashes with no
+    sorted set behind them, so a single scan rebuilds it once and every later
+    read is served from the index. The ready marker is written only here, never
+    by the write path, so an install that takes interactions before its first
+    trending read still gets seeded. It is written even when no counters are
+    found, and carries the index's TTL so the two cannot outlive each other.
+    """
+    if await client.exists(_TRENDING_INDEX_READY_KEY):
+        return
+
+    cursor = 0
+    while True:
+        cursor, keys = await client.scan(
+            cursor, match="article:interactions:*", count=_TRENDING_SCAN_COUNT
+        )
+        keys = [k for k in keys if k.startswith("article:interactions:")]
+        if keys:
+            pipe = client.pipeline()
+            for key in keys:
+                pipe.hgetall(key)
+            counts_list = await pipe.execute()
+            seeds: dict[str, float] = {}
+            for key, counts in zip(keys, counts_list, strict=True):
+                total = _article_total(counts or {})
+                if total > 0:
+                    seeds[key.rsplit(":", 1)[-1]] = float(total)
+            if seeds:
+                pipe = client.pipeline()
+                pipe.zadd(_TRENDING_INDEX_KEY, seeds)
+                pipe.expire(_TRENDING_INDEX_KEY, config.USER_INTERACTION_TTL_DAYS * 86400)
+                await pipe.execute()
+        if cursor == 0:
+            break
+
+    await client.set(
+        _TRENDING_INDEX_READY_KEY, "1", ex=config.USER_INTERACTION_TTL_DAYS * 86400
+    )
+
+
 async def get_trending_articles(limit: int = 10) -> list[dict]:
     """Get trending articles based on click velocity over recent window.
 
-    Queries Redis for article interaction counts in the trending window.
+    Ranks candidates from the incrementally maintained trending index and
+    hydrates their scores with one pipelined HGETALL per rank batch, so the
+    result is the same as a full scan without walking the keyspace.
     Returns list of {article_id, score} dicts sorted by popularity.
     """
     try:
@@ -411,44 +531,41 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
         if cached:
             return json.loads(cached)
 
-        # Query individual article scores
+        await _ensure_trending_index(client)
+
+        # Walk the index in bounded rank batches. Batches are needed because an
+        # indexed article whose counters have since expired must be skipped, and
+        # the index is ranked by a score that may have moved on since.
         article_scores: dict[str, float] = {}
-        batch_size = 100
-        cursor = 0
-        while True:
-            cursor, keys = await client.scan(cursor, match="article:interactions:*", count=batch_size)
-            if not keys:
+        rank = 0
+        while len(article_scores) < limit:
+            ranked = await client.zrevrange(
+                _TRENDING_INDEX_KEY, rank, rank + _TRENDING_RANK_BATCH - 1
+            )
+            if not ranked:
                 break
-            for key in keys:
-                article_id = key.split(":")[-1]
-                if not key.startswith("article:interactions:"):
-                    continue
-                counts = await client.hgetall(key)
-                # Sum ONLY the known interaction kinds, by name. Summing every
-                # digit-valued field is name-blind, so it also credits junk
-                # fields: any kind minted before the write-side enum landed
-                # still scores for the full USER_INTERACTION_TTL_DAYS (90 by
-                # default), letting an attacker inflate a chosen article's
-                # trending score. Allow-listing on READ contains that legacy
-                # residue, as well as anything a future writer might add.
-                # ``last_timestamp`` is excluded by name -- it is not a counter.
-                total = sum(
-                    int(counts[kind_name])
-                    for kind_name in _INTERACTION_TYPE_VALUES
-                    if kind_name in counts and counts[kind_name].isdigit()
-                )
+            # One pipelined HGETALL per rank batch instead of a round trip per
+            # key, which is the whole point of the index.
+            pipe = client.pipeline()
+            for article_id in ranked:
+                pipe.hgetall(f"article:interactions:{article_id}")
+            counts_list = await pipe.execute()
+            for article_id, counts in zip(ranked, counts_list, strict=True):
+                total = _article_total(counts or {})
                 if total > 0:
                     article_scores[article_id] = float(total)
-            if cursor == 0:
-                break
+            rank += len(ranked)
 
-        # Sort by score and return top articles
-        sorted_articles = sorted(article_scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+        # Sort by score and return top articles (article_id breaks ties, so the
+        # order no longer depends on where the keyspace scan happened to start)
+        sorted_articles = sorted(
+            article_scores.items(), key=lambda x: (-x[1], int(x[0]))
+        )[:limit]
         result = [{"article_id": int(aid), "score": score} for aid, score in sorted_articles]
 
         # Cache for the window duration
         if result:
-            await client.set(window_key, json.dumps(result), ex=3600)
+            await client.set(window_key, json.dumps(result), ex=_TRENDING_CACHE_TTL_SECONDS)
 
         return result
     except Exception as exc:  # noqa: BLE001

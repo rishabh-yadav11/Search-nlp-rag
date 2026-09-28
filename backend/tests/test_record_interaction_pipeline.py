@@ -89,6 +89,10 @@ class _FakePipeline:
     def hincrby(self, key: str, field: str, amount: int) -> None:
         self._queue("hincrby", key, field, amount)
 
+    def zincrby(self, key: str, amount: int, member: str) -> None:
+        # Advances the trending index (#261) inside the write transaction.
+        self._queue("zincrby", key, amount, str(member))
+
     def hset(self, key: str, field: Any = None, value: Any = None, *, mapping: Any = None) -> None:
         if mapping is not None:
             pairs = list(mapping.items())
@@ -185,6 +189,11 @@ class _FakeRedis:
             key, mapping = args
             zs.setdefault(key, {}).update({str(m): float(s) for m, s in mapping.items()})
             return 1
+        if method == "zincrby":
+            key, amount, member = args
+            zset = zs.setdefault(key, {})
+            zset[str(member)] = zset.get(str(member), 0.0) + float(amount)
+            return zset[str(member)]
         if method == "zcard":
             (key,) = args
             return len(zs.get(key, {}))
@@ -195,7 +204,12 @@ class _FakeRedis:
             key, field, amount = args
             current = int(hs.setdefault(key, {}).get(field, "0"))
             hs[key][field] = str(current + int(amount))
-            return 1
+            # Redis returns the POST-increment value, and #261 now depends on
+            # it: record_interaction reads the first result to learn whether
+            # these counters were just created, which decides whether the
+            # trending index must be re-seeded. A constant here would make
+            # every write look like a fresh counter.
+            return current + int(amount)
         if method == "hset":
             key, field, value = args
             hs.setdefault(key, {})[str(field)] = str(value)
@@ -220,6 +234,15 @@ class _FakeRedis:
 
     async def get(self, key: str) -> str | None:
         return self.strings.get(key)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        # Read by the trending-index re-seed (#261) after a pipeline reports
+        # that the article's counters were just created.
+        return dict(self.hashes.get(key, {}))
+
+    async def exists(self, key: str) -> int:
+        # Read by the trending-index bootstrap (#261).
+        return int(key in self.strings or key in self.hashes or key in self.zsets)
 
     async def set(self, key: str, value: str, ex: int | None = None) -> bool:
         """`SET ... EX`, as awaited by the article-exists negative cache.
@@ -333,7 +356,9 @@ async def test_recording_an_interaction_is_visible_to_the_interactions_reader(re
     """
     await record_interaction(USER, 42)
 
-    assert list(redis.zsets) == [f"user:interactions:{USER}"]
+    # The writer also maintains the trending index (#261), so this asserts the
+    # reader's key is there and correct rather than that it is the only zset.
+    assert f"user:interactions:{USER}" in redis.zsets
     assert list(redis.zsets[f"user:interactions:{USER}"]) == ["42"], (
         "the sorted set member is the article id as a string"
     )
@@ -376,13 +401,16 @@ async def test_article_counters_are_keyed_by_article_and_accumulate_per_type(red
 
 @pytest.mark.asyncio
 async def test_every_written_key_receives_its_ttl(redis, monkeypatch):
-    """All three written keys get a TTL, asserted exactly.
+    """Every written key gets a TTL, asserted exactly.
 
     The interaction set is pinned to the module's one-year raw-signal horizon
     (it exists so profile building has long-term history to read); the detail
-    and counter hashes use the configured TTL, pinned here so the assertion is
-    independent of the ambient environment. The 365 is written out rather
-    than imported, so shortening the retention horizon has to update this test.
+    hash, the counter hash and the trending index (#261) share the configured
+    TTL, pinned here so the assertion is independent of the ambient
+    environment. The index and its ready marker deliberately carry the COUNTER
+    TTL, so neither can outlive the counters it ranks or the seed state that
+    backfills it. The 365 is written out rather than imported, so shortening
+    the retention horizon has to update this test.
     """
     monkeypatch.setattr(user_profile.config, "USER_INTERACTION_TTL_DAYS", CONTROLLED_TTL_DAYS)
 
@@ -392,6 +420,8 @@ async def test_every_written_key_receives_its_ttl(redis, monkeypatch):
         f"user:interactions:{USER}": INTERACTION_SET_TTL_DAYS * 86400,
         f"user:interaction_detail:{USER}:{ARTICLE}": CONTROLLED_TTL_DAYS * 86400,
         f"article:interactions:{ARTICLE}": CONTROLLED_TTL_DAYS * 86400,
+        user_profile._TRENDING_INDEX_KEY: CONTROLLED_TTL_DAYS * 86400,
+        user_profile._TRENDING_INDEX_READY_KEY: CONTROLLED_TTL_DAYS * 86400,
     }
 
 
@@ -444,11 +474,12 @@ async def test_the_derived_key_deletes_ride_in_the_same_transaction_as_the_write
     second pipeline after `execute()` would leave identical bytes -- so it is
     read off the command log.
 
-    The call buffers a second, read-only pipeline before the write: the
-    distinct-article cap check asks ZCARD/ZSCORE. So the counts are asserted
-    per pipeline rather than per call -- one pipeline carries the write, and
-    every other one carries reads only. Splitting the write in two, or moving
-    the delete into its own pipeline, still fails both halves.
+    Two other pipelines may appear. One is read-only and precedes the write: the
+    distinct-article cap check asks ZCARD/ZSCORE. The other is the trending
+    index re-seed (#261), which can only learn that the article's counters are
+    brand new FROM the write's own result, so it is necessarily a post-commit
+    repair. It may write, but only to the index. Splitting the write in two, or
+    moving the delete into its own pipeline, still fails both halves.
     """
     await record_interaction(USER, ARTICLE)
 
@@ -456,26 +487,40 @@ async def test_the_derived_key_deletes_ride_in_the_same_transaction_as_the_write
     for pipeline_id, method, _args in redis.commands:
         ids_by_method.setdefault(method, set()).add(pipeline_id)
 
-    write_ids = ids_by_method["zadd"]
+    # The article counter is buffered by exactly one pipeline, and that is the
+    # write. The trending index advances in it too, so the index can never lag
+    # a committed counter: both land in the same MULTI/EXEC or neither does.
+    write_ids = ids_by_method["hincrby"]
     assert len(write_ids) == 1, (
-        f"the whole write must be buffered by one pipeline; saw {write_ids} for zadd "
+        f"the whole write must be buffered by one pipeline; saw {write_ids} for hincrby "
         f"across methods {ids_by_method}"
     )
     write_id = write_ids.pop()
+    assert ids_by_method["zincrby"] == {write_id}, (
+        "the trending index must advance in the same transaction as the counters, "
+        f"not in a pipeline of its own; seen pipeline ids per command: {ids_by_method}"
+    )
 
-    # Every other pipeline is read-only: a second one carrying a write would
-    # mean part of the write escaped the transaction pinned above.
-    read_only_ids = {pid for pid, _method, _args in redis.commands} - {write_id}
-    for pipeline_id in read_only_ids:
-        methods = {m for pid, m, _a in redis.commands if pid == pipeline_id}
-        assert methods <= {"zcard", "zscore"}, (
+    # Every other pipeline either only reads, or is the post-commit index
+    # re-seed, which is allowed to write but only to the index.
+    other_ids = {pid for pid, _method, _args in redis.commands} - {write_id}
+    for pipeline_id in other_ids:
+        buffered = [(m, a) for pid, m, a in redis.commands if pid == pipeline_id]
+        methods = {m for m, _a in buffered}
+        assert methods <= {"zcard", "zscore", "zadd", "expire"}, (
             f"pipeline {pipeline_id} carries writes {sorted(methods - {'zcard', 'zscore'})}"
         )
-    assert redis.pipeline_calls == len(read_only_ids) + 1
+        for _m, args in buffered:
+            if _m in {"zadd", "expire"}:
+                assert args[0] == user_profile._TRENDING_INDEX_KEY, (
+                    "only the trending index may be repaired after the write commits; "
+                    f"pipeline {pipeline_id} touched {args[0]!r}"
+                )
+    assert redis.pipeline_calls == len(other_ids) + 1
     assert redis.executes == redis.pipeline_calls, "each pipeline must be executed exactly once"
 
     assert ids_by_method.get("delete") == {write_id}, (
-        "the derived-key delete must be buffered by the same pipeline as the zadd; "
+        "the derived-key delete must be buffered by the same pipeline as the counters; "
         f"seen pipeline ids per command: {ids_by_method}"
     )
 

@@ -208,6 +208,11 @@ class TestUserProfileIntegration:
                     def hincrby(self, key, field, amount):
                         written[f"{key}:{field}"] = str(amount)
 
+                    def zincrby(self, *a, **k):
+                        # Advances the trending index (#261) in the same
+                        # transaction; this double only asserts the counter.
+                        pass
+
                     def delete(self, *a, **k):
                         pass
 
