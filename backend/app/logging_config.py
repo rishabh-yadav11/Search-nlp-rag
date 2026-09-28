@@ -57,6 +57,7 @@ APP_LOGGERS = (
     "auth",
     "cache",
     "chat",
+    "close_guard",
     "cost_budget",
     "diversity",
     "encoders",
