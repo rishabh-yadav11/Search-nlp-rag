@@ -222,24 +222,24 @@ the generated table.
   `_days_ago_iso` line 465, `_month_start_iso` line 471 and `_week_start_iso`
   lines 477-478, the `full -= 100` branch of `_full_year` line 310,
   `strip_recency_window` line 514 and `_top_n_to_int` line 595.
-- `app/main.py` — 95.6% (31/699 statements uncovered). The
+- `app/main.py` — 95.6% (31/705 statements uncovered). The
   facet-relaxation retry in `retrieve_with_auto_facet_fallback` lines
-  1342-1347, 1350-1352, 1355 is uncovered, so the branch that widens a query
+  1408-1413, 1416-1418, 1421 is uncovered, so the branch that widens a query
   when an inferred facet returns nothing — the thing that keeps a search from
   coming back empty — has no test, and neither leg of it (the identical-filter
-  short-circuit at lines 1346-1347 and the relaxed re-retrieve at line 1351) is
-  exercised. The two `min(candidates, key=…)` tie-breaks that pick a single
-  facet value are uncovered in both `_resolve_facet` line 213 and
-  `extract_content_type` line 245; the recency-stripping tail of
-  `_effective_intent` lines 624-627; `_merge_results` lines 660, 662; the
-  flashback topic leg of `_retrieval_queries` lines 693-695; the
-  `rerank_acquisition_relation` call inside `retrieve_and_rerank` line 1249,
+  short-circuit at lines 1412-1413 and the relaxed re-retrieve at lines
+  1416-1418) is exercised. The two `min(candidates, key=…)` tie-breaks that pick a single
+  facet value are uncovered in both `_resolve_facet` line 214 and
+  `extract_content_type` line 246; the recency-stripping tail of
+  `_effective_intent` lines 645-648; `_merge_results` lines 681, 683; the
+  flashback topic leg of `_retrieval_queries` lines 714-716; the
+  `rerank_acquisition_relation` call inside `retrieve_and_rerank` line 1315,
   which means the acquisition-direction rescoring is wired in but never
-  observed; the date-windowed fetch and its merge/sort at lines 1387,
-  1394-1395; three early `return []` guards at lines 1416, 1432, 1794; the
-  body-attach call in the batched similar-articles path line 1461; the 422 for
-  an unknown `interaction_type` line 2065; and the `TrendingResponse`
-  construction line 2272.
+  observed; the date-windowed fetch and its merge/sort at lines 1453,
+  1460-1461; three early `return []` guards at lines 1482, 1498, 1527; the
+  body-attach call in the batched similar-articles path line 1880; the 422 for
+  an unknown `interaction_type` line 2151; and the `TrendingResponse`
+  construction line 2358.
 - `app/observability.py` — 93.8% (4/65 statements uncovered). The request-id
   plumbing: the `Mapping` branch of `_user_id` line 98, the non-HTTP passthrough
   in `RequestIdMiddleware.__call__` lines 119-120 (the lifespan and websocket
@@ -250,15 +250,15 @@ the generated table.
   unparseable-value path, and in `generate_answer` lines 127 and 134 the
   `LLMUnavailableError` for a provider that returns an empty `choices` list
   plus the re-raise. A provider answering 200 with no choices is untested.
-- `app/analytics.py` — 93.9% (15/246 statements uncovered). The click
+- `app/analytics.py` — 93.9% (15/247 statements uncovered). The click
   aggregation, not the beacon write, is what is left: `click_signals` lines
-  450-451 (a non-numeric stored position falling back to
-  `CLICK_POSITION_MIN`), 527 (a member that fails to decode) and 532 (the
+  463-464 (a non-numeric stored position falling back to
+  `CLICK_POSITION_MIN`), 540 (a member that fails to decode) and 545 (the
   `_ZSUM_BATCH` paging), so a second page of click signals is never read and a
   poisoned counter is never exercised. The `click_signals` and `global_stats`
-  degraded returns are uncovered at lines 541-543 and 549-550, as is
-  `_safe_int`'s failure at lines 200-202 and the warn-only release-claim path
-  at lines 338-339, plus the no-raw `return None` line 129.
+  degraded returns are uncovered at lines 554-556 and 562-563, as is
+  `_safe_int`'s failure at lines 201-203 and the warn-only release-claim path
+  at lines 351-352, plus the no-raw `return None` line 130.
 - `app/health.py` — 94.8% (8/155 statements uncovered). `_redis_status` lines
   179-180 and 183, the `from_url` construction failure that reports `down` and
   the `client is None` guard that reports `degraded` — the ping-failure and
@@ -298,7 +298,7 @@ the generated table.
   970, the in-process rate-counter eviction `del` line 1214 and its early
   return line 1217, and the policy-violation hint in `_password_hint`
   line 1936.
-- `app/config.py` — 99.7% (1/286 statements uncovered): the `ValueError` in
+- `app/config.py` — 99.7% (1/287 statements uncovered): the `ValueError` in
   `_parse_allowed_hosts` line 267 for an entry that is not a usable hostname.
 <!-- gaps:end -->
 
