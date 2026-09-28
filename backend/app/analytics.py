@@ -153,10 +153,18 @@ def query_digest(query: str, key: str) -> str:
     Truncated to 128 bits. Same-input stability is what makes the counts
     aggregate and what lets ``click_signals`` find the signal for the query in
     hand; the truncation keeps the stored member bounded without a length cap.
+
+    The input is canonicalised with ``_normalise_query`` first -- the SAME
+    canonical form the click-signal claim uses (#242). That is what keeps one
+    logical query a single key across spellings: hashing the raw text would
+    give ``"ola ipo"``, ``"OLA IPO"`` and ``"Ola   IPO"`` three different
+    digests, which strands the signal under keys the ranking path never looks
+    up and splits one query's counts three ways. Canonicalising here rather
+    than at each call site keeps the property in one place, and it also bounds
+    the hashed string (an unauthenticated beacon can send an arbitrarily long
+    query).
     """
-    # Bound the input before hashing (an unauthenticated beacon can send an
-    # arbitrarily long query) so the digest is a function of a bounded string.
-    normalized = (query or "").strip()[: config.CLICK_QUERY_MAX_LEN]
+    normalized = _normalise_query(query)
     mac = hmac.new(key.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256)
     return QUERY_DIGEST_PREFIX + mac.hexdigest()[:QUERY_DIGEST_HEX_LEN]
 
@@ -428,6 +436,7 @@ async def record_click(
         # whole click.
         # The aggregate members are NOT written from any of these forms: they
         # carry a keyed digest, so neither the casing nor the text reaches Redis.
+
         # As in record_search: counters are unconditional, the query-keyed
         # fields are skipped if the digest key cannot be resolved.
         digest_key = await _digest_key(c)

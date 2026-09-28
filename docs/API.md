@@ -550,10 +550,13 @@ query is user-authored content and these sets aggregate by query text, so
 returning it verbatim made this a cross-user read of every user's search
 history for any account holding `analytics:read`.
 
-The digest is stable, so identical queries still aggregate into one row and the
-dashboard can still rank and compare them — but it is a keyed HMAC, so it
-cannot be turned back into the query by anyone who sees the digest without the
-key. This is the same treatment `/analytics/chat` gives session titles.
+The digest is a function of the query's *canonical* form — casefolded, internal
+whitespace collapsed, then length-bounded — which is the same canonical form the
+click-signal dedupe claim uses. So a query still aggregates into one row however
+it is spelled, and the dashboard can still rank and compare them — but it is a
+keyed HMAC, so it cannot be turned back into the query by anyone who sees the
+digest without the key. This is the same treatment `/analytics/chat` gives
+session titles.
 
 The query text is **never written** — not as a sorted-set member, and not
 inside the `analytics:query_click:{...}` key — so no reader of these
