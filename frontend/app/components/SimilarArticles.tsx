@@ -2,38 +2,15 @@
 
 import { useEffect, useState } from 'react'
 import SafeArticleLink from './SafeArticleLink'
-import { API_BASE, authHeaders } from '../lib/auth'
 import { formatArticleDate } from '../lib/format'
+import { fetchSimilarArticles, peekSimilarArticles } from '../lib/similar'
+import type { SimilarArticle } from '../lib/similar'
 import styles from './SimilarArticles.module.css'
-
-interface Article {
-  id: number | string
-  title: string
-  url: string
-  published_date?: string
-  category?: string
-  summary?: string
-  score?: number
-}
 
 interface SimilarArticlesProps {
   articleId: number | string
   limit?: number
   compact?: boolean
-}
-
-// A search page renders one <SimilarArticles> per result and a chat source
-// list renders one per source, so the same article id is fetched repeatedly
-// within a single view -- and again on every subsequent search. The backend
-// already caches these by `recommend:similar:{version}:{id}:{limit}`, but the
-// browser still paid a full request each time. This module-level memo keys on
-// the same (articleId, limit) pair so a repeated id is served from memory
-// instead of the network. Successful non-empty responses only: an error or an
-// empty result is not memoized, so a later mount can retry.
-const similarCache = new Map<string, Article[]>()
-
-function cacheKey(articleId: number | string, limit: number): string {
-  return `${articleId}:${limit}`
 }
 
 
@@ -42,7 +19,9 @@ export default function SimilarArticles({
   limit = 5,
   compact = false,
 }: SimilarArticlesProps) {
-  const [articles, setArticles] = useState<Article[]>([])
+  const [articles, setArticles] = useState<SimilarArticle[]>(
+    () => peekSimilarArticles(articleId, limit) ?? []
+  )
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
@@ -50,43 +29,31 @@ export default function SimilarArticles({
   useEffect(() => {
     if (!articleId) return
 
-    const key = cacheKey(articleId, limit)
-    const memoized = similarCache.get(key)
-    if (memoized) {
-      setArticles(memoized)
-      setLoading(false)
-      setError(null)
-      return
-    }
-
-    const controller = new AbortController()
+    // No AbortController here on purpose. The request is shared with every
+    // other card in this view, so aborting it because THIS card unmounted
+    // would take the rest of the view's data down with it. Unmounting only
+    // means the answer is no longer worth applying.
+    let active = true
     setLoading(true)
     setError(null)
 
-    fetch(`${API_BASE}/recommend/similar/${articleId}?limit=${limit}`, {
-      signal: controller.signal,
-      headers: authHeaders(),
-    })
-      .then((res) => {
-        if (!res.ok) throw new Error('Failed to load')
-        return res.json()
-      })
-      .then((data) => {
-        if (!controller.signal.aborted) {
-          const next: Article[] = data.similar_articles || []
-          if (next.length) similarCache.set(key, next)
-          setArticles(next)
+    fetchSimilarArticles(articleId, limit)
+      .then((list) => {
+        if (active) {
+          setArticles(list)
           setLoading(false)
         }
       })
       .catch((err) => {
-        if (!controller.signal.aborted) {
+        if (active) {
           setError(err.message)
           setLoading(false)
         }
       })
 
-    return () => controller.abort()
+    return () => {
+      active = false
+    }
   }, [articleId, limit])
 
   if (loading && articles.length === 0) {
