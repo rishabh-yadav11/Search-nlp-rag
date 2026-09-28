@@ -13,6 +13,7 @@ import redis
 from _support import run_sync as _run
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from rate_limit_fake import RateLimitRedisFake
 
 from app import auth, health
 from app.config import config
@@ -107,21 +108,13 @@ def _public_rate_limiter(monkeypatch):
 
     /ready is rate-limited per client IP, so the endpoint tests need a working
     store or every poll would fall through to the fail-open path and the
-    limiter itself would go untested. Rebuilt per test, so no counter leaks
-    between cases.
+    limiter itself would go untested. The shared fake models SET NX EX / INCR
+    for real, so these cases see the production window bookkeeping rather than
+    a permissive stub. Rebuilt per test, so no counter leaks between cases.
     """
-    counters: dict[str, int] = {}
-
-    class _FakeRateRedis:
-        async def set(self, key, value, nx=False, ex=None):
-            return True
-
-        async def incr(self, key):
-            counters[key] = counters.get(key, 0) + 1
-            return counters[key]
-
-    monkeypatch.setattr(auth, "_rate_client", _FakeRateRedis())
-    return counters
+    fake = RateLimitRedisFake()
+    monkeypatch.setattr(auth, "_rate_client", fake)
+    return fake.counters
 
 
 @pytest.fixture(autouse=True)

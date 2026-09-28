@@ -11,6 +11,7 @@ from _support import run_sync as _run
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from qdrant_client.models import Filter
+from rate_limit_fake import RateLimitRedisFake
 
 from app import auth, main
 from app.analytics import AnalyticsUnavailableError
@@ -45,22 +46,15 @@ def _public_rate_limiter(monkeypatch):
 
     /search, /facets and /analytics/click now fail CLOSED (503) when the
     limiter's Redis is unreachable, so the tests that are about search wiring
-    rather than rate limiting get a counting stub instead of a real Redis. It is
-    rebuilt per test, so no counter leaks between cases.
+    rather than rate limiting get a counting stub instead of a real Redis. The
+    shared fake models SET NX EX / INCR for real, so the limiter's window
+    bookkeeping is exercised here too. Rebuilt per test, so no counter leaks
+    between cases.
     """
-    counters: dict[str, int] = {}
+    fake = RateLimitRedisFake()
+    monkeypatch.setattr(auth, "_rate_client", fake)
 
-    class _FakeRateRedis:
-        async def set(self, key, value, nx=False, ex=None):
-            return True
-
-        async def incr(self, key):
-            counters[key] = counters.get(key, 0) + 1
-            return counters[key]
-
-    monkeypatch.setattr(auth, "_rate_client", _FakeRateRedis())
-
-    return counters
+    return fake.counters
 
 
 def _cached_search_client(monkeypatch):
