@@ -647,8 +647,12 @@ def test_search_cache_key_is_bounded(monkeypatch):
     assert cache.gets, "expected the request to build a cache key"
     digest = main._cache_key_component("q" * over)
     assert digest.startswith("h:"), "the query is long enough to be digested"
-    for key in cache.gets:
-        assert key.startswith("search:")
+    # The same request also builds the retrieve: prefetch key (#266), so the
+    # search key is selected by namespace rather than assumed to be the only
+    # one read.
+    search_keys = [k for k in cache.gets if k.startswith("search:")]
+    assert search_keys, "expected the request to build a search cache key"
+    for key in search_keys:
         assert len(key) <= MAX_KEY_LEN, f"key grew to {len(key)} chars: {key[:80]!r}"
         assert digest in key or key.startswith("search:sha256:")
         assert "q" * 100 not in key, "the raw query reached the key"
@@ -670,14 +674,13 @@ def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
     assert search_keys, "expected the request to build a search cache key"
     for key in cache.gets:
         assert len(key) <= MAX_KEY_LEN, f"key grew to {len(key)} chars: {key[:80]!r}"
-+    # A max-sized facet is ~1 KB, so the facet component is the part that has to
-+    # be digested: it reaches the key as a sha256 rather than as a kilobyte of
-+    # caller text, and the key as a whole still stays inside the bound --
-+    # bounded, but not a raw echo of the request.
-+    for key in search_keys:
-+        assert key.startswith("search:")
-+        assert ":sha256:" in key, "a max-sized facet must be digested, not spelled out"
-+        assert "v" * 100 not in key, "the raw facet reached the key"
+    # A max-sized facet is ~1 KB, so the facet component is the part that has to
+    # be digested: it reaches the key as a sha256 rather than as a kilobyte of
+    # caller text, and the key as a whole still stays inside the bound --
+    # bounded, but not a raw echo of the request.
+    for key in search_keys:
+        assert ":sha256:" in key, "a max-sized facet must be digested, not spelled out"
+        assert "v" * 100 not in key, "the raw facet reached the key"
 
 
 def test_retrieve_cache_key_is_bounded_and_control_free(monkeypatch):
