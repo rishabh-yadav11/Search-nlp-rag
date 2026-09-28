@@ -1,0 +1,15 @@
+# Canonical identity for this repository.
+#
+# The same person committed under several local identities over the years
+# (a bare "r <r@r>", the "omp" tooling identity, and a capitalised form of
+# the GitHub handle). Collapse them all onto the single GitHub account so
+# `git shortlog`, `git log` and `git blame` show one author.
+#
+# dependabot is deliberately NOT mapped: rewriting a bot's commits to a
+# human would misstate who wrote them and would break the bot's ability to
+# keep submitting dependency updates.
+
+rishabh-yadav11 <75245758+rishabh-yadav11@users.noreply.github.com> <r@r>
+rishabh-yadav11 <75245758+rishabh-yadav11@users.noreply.github.com> <omp@local>
+rishabh-yadav11 <75245758+rishabh-yadav11@users.noreply.github.com> <omp-agent@local>
+rishabh-yadav11 <75245758+rishabh-yadav11@users.noreply.github.com> RISHABH YADAV
