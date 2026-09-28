@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 
 from app.config import config
 from app.degraded import DegradedLatch
+from app.input_hygiene import normalize_text
 
 logger = logging.getLogger("analytics")
 
@@ -263,16 +264,28 @@ def _today() -> str:
 
 
 def _normalise_query(q: str) -> str:
-    """Canonical form of a query for the click-signal dedupe claim: casefolded,
-    with every run of whitespace collapsed to a single space, then length-bounded.
+    """Canonical form of a query for the click-signal dedupe claim: NFKC-normalised
+    with control characters removed and whitespace collapsed, then
+    length-bounded, then casefolded.
 
     Applied to the claim input on the write path (``record_click``) so every
     spelling of one logical query claims the same vote. It is no longer the
     per-query click key -- that is a keyed digest (see ``_click_query_key``), so
     no user text is stored under any spelling, and this form therefore needs no
     read-path counterpart to stay retrievable.
+
+    The NFKC/control-character pass is ``input_hygiene.normalize_text`` (issue
+    #252), the same canonical form the search cache keys use, so a full-width
+    or NUL-bearing spelling cannot open a second key and no NUL/CRLF from an
+    unauthenticated beacon can reach Redis at all. Casefolding stays on top of
+    it: for the boost signal "OLA" and "ola" are the same question, which is
+    the one place the two issues differ on purpose (#242's dedupe vs #252's
+    canonicalisation). The bound is applied before the casefold, so a fold
+    that expands ("ss" from a sharp s) can leave the result a character or two
+    over ``CLICK_QUERY_MAX_LEN``; the claim input is a message, not a key, and
+    key bounding is handled separately by ``_click_query_key``.
     """
-    return " ".join((q or "").split())[: config.CLICK_QUERY_MAX_LEN].casefold()
+    return normalize_text(q or "")[: config.CLICK_QUERY_MAX_LEN].casefold()
 
 
 def _click_query_key(q: str, digest_key: str) -> str:

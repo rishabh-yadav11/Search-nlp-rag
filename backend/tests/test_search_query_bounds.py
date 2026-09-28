@@ -312,7 +312,13 @@ def test_megabyte_query_produces_a_bounded_vec_key(monkeypatch):
     assert cache.gets and cache.sets
     for key in (cache.gets[0], cache.sets[0]):
         assert len(key) < 300, f"cache key grew to {len(key)} chars: {key[:80]!r}"
-        assert key.startswith("vec:dense-model|sparse-model:h:")
+        assert key.startswith("vec:")
+        assert "dense-model" in key and "sparse-model" in key
+        # #252 length-prefixes the parts, so the query digest is no longer the
+        # very next segment: what matters is that the key carries the digest of
+        # the clamped text and none of the text itself.
+        assert main._cache_key_component("A" * config.RETRIEVAL_QUERY_MAX_CHARS) in key
+        assert "A" * 200 not in key, "the raw query reached the key"
     # The key is bounded because the text is digested, not because the text was
     # quietly dropped: the encoder still got a full-length (clamped) query.
     assert dense.seen and len(dense.seen[0]) == config.RETRIEVAL_QUERY_MAX_CHARS
@@ -329,7 +335,9 @@ def test_megabyte_query_produces_a_bounded_retrieve_key(monkeypatch):
 
     assert cache.gets
     assert len(cache.gets[0]) < 300, f"cache key grew to {len(cache.gets[0])} chars"
-    assert cache.gets[0].startswith("retrieve:h:")
+    assert cache.gets[0].startswith("retrieve:")
+    assert main._cache_key_component("A" * 1_000_000) in cache.gets[0]
+    assert "A" * 200 not in cache.gets[0], "the raw query reached the key"
 
 
 def test_long_but_accepted_query_produces_a_bounded_search_key(monkeypatch):
@@ -350,27 +358,35 @@ def test_long_but_accepted_query_produces_a_bounded_search_key(monkeypatch):
     assert cache.gets
     key = cache.gets[0]
     assert len(key) < 300, f"cache key grew to {len(key)} chars"
-    assert key.startswith("search:h:")
+    assert key.startswith("search:")
+    assert main._cache_key_component("A" * 300) in key
+    assert "A" * 200 not in key, "the raw query reached the key"
+
+
+def _max_sized_facet() -> str:
+    """The longest facet #252 accepts: 10 values of 100 characters, ~1 KB of
+    query-string payload, i.e. the largest value that reaches a key or a Qdrant
+    MatchAny at all. Anything beyond it is a 400 (see
+    ``input_hygiene.split_facet_values``), so a test that wants "a long facet"
+    has to mean this one."""
+    return ",".join("B" * 100 for _ in range(10))
 
 
 def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
     """Scope of this fix, stated honestly.
 
     The six facet params (`industry`, `dealtype`, `author`, `content_type`,
-    `from_date`, `to_date`) are plain `Query(None)` strings interpolated raw
-    into the same two keys by `facet_cache_token` and `_filter_token`, so a
-    5000-char `author` still yields a ~3 KB `search:` key and a ~5 KB
-    `retrieve:` key. That is a real residual -- and it is NOT fixed here,
-    because #252 already owns it and does it strictly better: its
+    `from_date`, `to_date`) are plain `Query(None)` strings that reach the same
+    two keys through `facet_cache_token` and `_filter_token`. #252 bounds them:
     `input_hygiene.split_facet_values` rejects a facet over 10 values of 100
-    chars with a 400, and its `build_cache_key` digests any key body over
-    MAX_KEY_LEN=256, which covers the filter JSON too. Re-deriving a weaker
-    digest here would collide with that PR and would still let a megabyte of
-    facet through to the Qdrant filter.
+    chars with a 400, and `input_hygiene.build_cache_key` digests any key body
+    over MAX_KEY_LEN=256, which covers the filter JSON too.
 
-    What this PR does own, and what this asserts, is the QUERY segment: even
-    with a long facet present, the query must be a digest rather than raw
-    text, so no unbounded query can reach the key on this path either.
+    What this PR owns, and what this asserts, is the QUERY segment: with a
+    facet at that maximum in the request, the query must still be a digest
+    rather than raw text, so no unbounded query reaches the key on this path
+    either. The facet is at the cap rather than over it, because over the cap
+    the request is refused and no key is built at all.
     """
     cache = _FakeCache()
     monkeypatch.setattr(main, "cache", cache)
@@ -380,7 +396,7 @@ def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
     _wire_encoders(monkeypatch)
     monkeypatch.setattr(main, "retrieve_with_auto_facet_fallback", _fake_retrieve)
 
-    resp = _client.get("/search", params={"q": "A" * 300, "author": "B" * 5000})
+    resp = _client.get("/search", params={"q": "A" * 300, "author": _max_sized_facet()})
 
     assert resp.status_code == 200
     assert cache.gets
@@ -390,27 +406,35 @@ def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
     assert expected.startswith("h:") and len(expected) == 34
     assert expected in key, f"key does not carry the query digest: {key[:80]!r}"
     assert "A" * 200 not in key, "the raw query reached the key"
+    assert "B" * 200 not in key, "the raw facet reached the key"
+    assert len(key) <= 256, f"cache key grew to {len(key)} chars: {key[:80]!r}"
 
 
 def test_the_retrieve_key_digests_its_query_segment_under_a_long_filter(monkeypatch):
     """The retrieve: key is built at a different call site from the search:
-    key, so the query segment needs its own assertion. As above, the filter
-    segment itself remains #252's to bound."""
+    key, so the query segment needs its own assertion. The filter segment is
+    bounded by #252's caps, and this pins the maximum filter that can reach
+    this call site at all."""
     cache = _FakeCache()
     monkeypatch.setattr(main, "cache", cache)
     _wire_encoders(monkeypatch)
     monkeypatch.setattr(main, "rerank", _passthrough_rerank)
     monkeypatch.setattr(main.config, "ENABLE_ENTITY_BOOST", False)
-    qfilter = main.build_facet_filter(industry=None, dealtype=None, author="B" * 5000,
+    qfilter = main.build_facet_filter(industry=None, dealtype=None, author=_max_sized_facet(),
                                       from_date=None, to_date=None, content_type=None)
 
     _run(main.retrieve_and_rerank("A" * 300, 4, qfilter))
 
     assert cache.gets
     key = cache.gets[0]
-    expected = main._cache_key_component("A" * 300)
-    assert expected in key, f"key does not carry the query digest: {key[:80]!r}"
+    # The filter is ~1 KB, so the whole key body is digested: strictly stronger
+    # than the query digest this test used to look for, since nothing at all is
+    # spelled out any more. What still has to hold is that no caller text is
+    # present and the key is bounded.
+    assert key.startswith("retrieve:sha256:")
+    assert len(key) == len("retrieve:sha256:") + 64
     assert "A" * 200 not in key, "the raw query reached the key"
+    assert "B" * 200 not in key, "the raw facet reached the key"
 
 
 # --- nothing unbounded reaches a tokenizer --------------------------------
@@ -483,8 +507,13 @@ def test_an_8000_char_chat_message_reaches_every_encoder_in_full(monkeypatch):
     reranker = _RecordingReranker()
     monkeypatch.setitem(main.state, "reranker", reranker)
     monkeypatch.setattr(main, "cache", _FakeCache())
-    message = "zeta " * (MAX_CONTENT_LEN // 5)
-    assert len(message) <= MAX_CONTENT_LEN
+    # Filler that ends mid-word so it is exactly MAX_CONTENT_LEN with no
+    # trailing whitespace: every query is canonicalised before it reaches an
+    # encoder (#252), and a trailing space is stripped, so a message that ended
+    # in one would measure the canonicaliser rather than the clamp this test is
+    # about. MAX_CONTENT_LEN % 5 == 0, so the tail word is a whole 5 chars.
+    message = ("zeta " * (MAX_CONTENT_LEN // 5 - 1)) + "zetas"
+    assert len(message) == MAX_CONTENT_LEN
 
     _run(main.hybrid_search(message, 4))
     _run(main.rerank(message, [_article(1, 0.9), _article(2, 0.8)]))
