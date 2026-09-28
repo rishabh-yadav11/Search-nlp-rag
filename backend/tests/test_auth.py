@@ -546,25 +546,58 @@ def test_minimum_is_judged_on_the_effective_credential_not_the_raw_string(monkey
 
 
 def test_sub_floor_effective_credential_is_refused_by_every_set_path(tmp_path, monkeypatch, store):
-    """The minimum rule must hold at the endpoints, not just in the helper: a
-    caller must not be able to reach the user table with a sub-floor credential
-    by any of the three routes.
+    """The minimum rule must hold at the ENDPOINTS, not just in the helper: a
+    caller must not reach the user table with a sub-floor credential by any of
+    the three routes.
+
+    Every leg asserts the rejection REASON, not merely a 422. A bare status
+    check would pass on any refusal -- including the old 72-byte cap and any
+    Pydantic error -- so it could not tell "refused because the credential is
+    under the floor" from "refused for an unrelated reason", and this test
+    passes against pre-fix code unless the reason is pinned. The value is 88
+    bytes, so pre-fix it was refused as too long rather than too short.
     """
-    pw = "a" + "１" * 29
+    pw = "a" + "１" * 29  # 30 chars / 88 bytes / 24 effective chars
     monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", 30)
+    reason = "password must be at least 30 characters"
+    assert auth._password_rejection(pw) == reason
+
     client, s = _auth_app(tmp_path)
     try:
         r = client.post("/api/auth/signup", json={"email": "a@b.co", "password": pw})
         assert r.status_code == 422, "signup admitted a sub-floor effective credential"
+        assert r.json()["detail"] == reason
+
+        # the third route, which this test previously never exercised at all.
+        # The seeded account needs a password that CLEARS the raised floor, so
+        # the 422 below can only be about the sub-floor one.
+        seeded = "Goodpassword9-abcdefghijklmnop"
+        token = _token(client, "user@x.co", seeded)
+        cr = client.post(
+            "/api/auth/change-password",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"current_password": seeded, "new_password": pw},
+        )
+        assert cr.status_code == 422, "change_password admitted a sub-floor credential"
+        assert cr.json()["detail"] == reason
+        # and the existing credential is untouched by the refused change
+        assert client.post(
+            "/api/auth/login", json={"email": "user@x.co", "password": seeded}
+        ).status_code == 200
     finally:
         auth.store = None
         asyncio.run(s.close())
 
+    # The `store` fixture and _auth_app share one tmp_path database, so the
+    # signup leg's account is in it too: assert on the ADMIN specifically
+    # rather than on the table being empty.
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", pw)
     monkeypatch.setattr(auth, "store", store)
     asyncio.run(bootstrap_admin())
-    assert asyncio.run(store.list_users()) == [], "bootstrap admitted a sub-floor credential"
+    assert asyncio.run(store.get_user_by_email("admin@x.co")) is None, (
+        "bootstrap admitted a sub-floor credential"
+    )
 
 
 def test_change_password_accepts_the_long_passphrase_bootstrap_accepted(tmp_path):

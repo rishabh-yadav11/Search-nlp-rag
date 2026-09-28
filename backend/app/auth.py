@@ -230,11 +230,17 @@ def _password_rejection(password: str) -> str | None:
       ``hash_password`` and ``verify_password`` both go through
       ``_password_bytes()``, which keeps only the first ``_BCRYPT_MAX_BYTES``
       bytes, so nothing past that window can make a short password long.
-      Judging the minimum on the raw string is therefore the WEAKER path and
-      the one that is a security defect: it admits a password whose *effective*
-      form is under ``AUTH_PASSWORD_MIN_LEN``, so a configured floor can be
-      stepped straight under. It is judged here on ``_effective_password()``, so
-      no credential is admitted below the floor by any path.
+      Judging the minimum on the raw string is therefore the WEAKER bound: it
+      admits a password whose *effective* form is under
+      ``AUTH_PASSWORD_MIN_LEN``, so a configured floor can be stepped under.
+      On main that was latent rather than exploitable, because the raw 72-byte
+      maximum refused every value long enough to have a shortened effective
+      form (if a value fits in 72 bytes, ``_effective_password`` returns it
+      unchanged). The two bounds therefore MASKED each other, and removing the
+      maximum -- which the lockout required -- is what made the weak minimum
+      reachable. That is why both move together here: the minimum is judged on
+      ``_effective_password()``, so no credential is admitted below the floor by
+      any path, whichever bounds are in force.
 
     - **Letter+digit** is a property of the secret that was configured, not of
       the truncated prefix. It is a composition rule, not an entropy rule, so
@@ -1779,7 +1785,6 @@ async def bootstrap_admin() -> None:
     # still what gets stored, so the row and its hash are byte-identical to
     # before. See _password_rejection for why letter+digit is judged on the
     # whole value instead, and why there is no maximum.
-    _warn_truncated_password(password, "AUTH_ADMIN_PASSWORD")
     password_error = _password_rejection(password)
 
     email_error = _validator_rejection(validate_email, email)
@@ -1799,6 +1804,12 @@ async def bootstrap_admin() -> None:
             password_rejected=password_error,
         )
         return
+    # Warned only once the value is ACCEPTED. Emitted before the rejections
+    # above, this reported "stored a password of N bytes" for a credential that
+    # was refused and never stored anywhere. It still fires when the admin
+    # already exists, and that is correct: that account really was provisioned
+    # from this value, and its tail really is not part of the credential.
+    _warn_truncated_password(password, "AUTH_ADMIN_PASSWORD")
     s = _require_auth_store()
     for attempt in range(5):
         if await s.get_user_by_email(email) is not None:
