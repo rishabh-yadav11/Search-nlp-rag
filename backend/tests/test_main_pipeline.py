@@ -32,9 +32,11 @@ class _FakeDense:
     def __init__(self, vec):
         self.vec = vec
         self.calls = 0
+        self.encoded: list = []
 
     def encode(self, text):
         self.calls += 1
+        self.encoded.append(text)
         return _Arr(self.vec)
 
 
@@ -277,7 +279,12 @@ def test_hybrid_search_cache_miss(monkeypatch, fake_cache):
     assert sparse.calls == 1
     assert len(cache.sets) == 1
     key, value, ttl = cache.sets[0]
-    assert key == "vec:dense-model|sparse-model:query"
+    # The key must name both models, so swapping either invalidates the cache.
+    # (The exact encoding is covered in app.input_hygiene; what matters here is
+    # that the model names are actually part of the key.)
+    assert key.startswith("vec:")
+    assert "dense-model" in key and "sparse-model" in key
+    assert "query" in key
     assert ttl == 123
     assert value["dense"] == [0.1, 0.2, 0.3]
     assert value["si"] == [1, 3]
@@ -298,6 +305,77 @@ def test_hybrid_search_cache_miss(monkeypatch, fake_cache):
     assert kwargs["prefetch"][0].using == "dense"
     assert kwargs["prefetch"][1].using == "sparse"
     assert kwargs["prefetch"][0].limit == 32
+
+
+def _vector_key_setup(monkeypatch, fake_cache):
+    """Wire hybrid_search with the pipeline fakes and return (cache, dense)."""
+    cache = fake_cache()
+    dense = _FakeDense([0.1, 0.2, 0.3])
+    sparse = _FakeSparse([1, 3], [0.9, 0.4])
+    monkeypatch.setattr(main, "cache", cache)
+    monkeypatch.setitem(main.state, "model", dense)
+    monkeypatch.setitem(main.state, "sparse_model", sparse)
+    monkeypatch.setitem(main.state, "qdrant", _FakeQdrant(points=[]))
+    monkeypatch.setattr(main.config, "EMBED_MODEL", "dense-model")
+    monkeypatch.setattr(main.config, "SPARSE_MODEL", "sparse-model")
+    monkeypatch.setattr(main.config, "QDRANT_COLLECTION", "col")
+    return cache, dense
+
+
+def test_vector_cache_key_is_keyed_on_the_text_that_was_embedded(monkeypatch, fake_cache):
+    """The cached (dense, sparse) pair stands for one exact input string, so the
+    key has to be built from the same normalised text that gets encoded. If the
+    key normalised but the encoder did not, a full-width query and its ASCII
+    equivalent would share one cached vector -- a wrong hit of exactly the kind
+    this is meant to prevent."""
+    cache, dense = _vector_key_setup(monkeypatch, fake_cache)
+
+    _run(main.hybrid_search("ＴＥＳＴ deals", 8))
+
+    assert dense.encoded == ["TEST deals"], "the encoder saw unnormalised text"
+    key, _value, _ttl = cache.sets[0]
+    assert "TEST deals" in key
+    assert "ＴＥＳＴ" not in key
+
+
+def test_vector_cache_key_is_bounded_for_a_long_query(monkeypatch, fake_cache):
+    """The vector cache is the longest-lived key in the request path (its own
+    TTL), so an unbounded one is the most expensive to leave open."""
+    cache, _dense = _vector_key_setup(monkeypatch, fake_cache)
+
+    _run(main.hybrid_search("q" * 1000, 8))
+
+    key, _value, _ttl = cache.sets[0]
+    assert key.startswith("vec:")
+    assert len(key) <= 256, f"vec key grew to {len(key)} chars: {key[:80]!r}"
+    # The query itself is digested per CACHE_KEY_QUERY_MAX_CHARS (#241) and the
+    # key is length-prefixed (#252), so a 1000-char query costs 34 characters
+    # of digest plus a length prefix, not 1000 characters of query text.
+    assert main._cache_key_component("q" * 1000) in key
+    assert "q" * 200 not in key, "the raw query reached the key"
+
+
+def test_vector_cache_key_carries_no_control_characters(monkeypatch, fake_cache):
+    cache, _dense = _vector_key_setup(monkeypatch, fake_cache)
+
+    _run(main.hybrid_search("test\x00\r\nINJECTED", 8))
+
+    key, _value, _ttl = cache.sets[0]
+    assert "\x00" not in key
+    assert "\r" not in key and "\n" not in key
+
+
+def test_vector_cache_key_changes_when_a_model_changes(monkeypatch, fake_cache):
+    """The reason the models are in the key: a model swap must not reuse vectors
+    encoded by the previous model."""
+    cache, _dense = _vector_key_setup(monkeypatch, fake_cache)
+    _run(main.hybrid_search("query", 8))
+    first = cache.sets[0][0]
+
+    monkeypatch.setattr(main.config, "EMBED_MODEL", "different-dense")
+    _run(main.hybrid_search("query", 8))
+
+    assert cache.sets[1][0] != first
 
 
 def test_hybrid_search_cache_hit_skips_encoding(monkeypatch, fake_cache):
