@@ -65,21 +65,51 @@ const SUGGESTIONS = [
 
 const TIMEOUT_MS = 30_000
 
-function friendlyMessage(status: number): string {
+// A 422 is FastAPI's validation response, which says WHICH field failed and
+// why. Keying the message on the status alone made every 422 claim the search
+// was too long, so a `?top_k=abc` told the user to shorten a query that was
+// never the problem. Only the length case gets the length message; any other
+// validation failure gets an honest generic one.
+function friendlyMessage(status: number, detail?: string): string {
   switch (status) {
     case 400:
       return 'Invalid query. Please check your input.'
     case 422:
-      // The API caps `q` (SEARCH_QUERY_MAX_CHARS). The input's maxLength stops
-      // most of these, but the server bound is authoritative and an operator
-      // can raise it, so this message has to stand on its own.
-      return 'Query is too long — please shorten it.'
+      return isQueryTooLong(detail)
+        ? `Query is too long — please shorten it to ${SEARCH_QUERY_MAX_CHARS} characters or fewer.`
+        : 'That search is not valid. Please check your input and try again.'
     case 429:
       return 'Too many requests. Please try again shortly.'
     case 503:
       return 'Service temporarily unavailable. Please try again later.'
     default:
       return 'Something went wrong. Please try again.'
+  }
+}
+
+// Mirrors the backend's SEARCH_QUERY_MAX_CHARS DEFAULT, and is used in two
+// places: the input's maxLength below, and the number in the 422 message. The
+// PREDICATE keys on neither -- it reads the backend's own 422 body ("String
+// should have at most 512 characters" on a loc naming `q`), so the frontend
+// cannot silently disagree with the server about WHICH failure happened even
+// if the limit is retuned. The displayed number is display-only: it goes stale
+// if an operator raises the server bound, which is why maxLength stays a
+// courtesy and the server bound stays authoritative.
+const SEARCH_QUERY_MAX_CHARS = 512
+
+function isQueryTooLong(detail?: string): boolean {
+  if (!detail) return false
+  try {
+    const parsed = JSON.parse(detail) as { detail?: unknown }
+    const errors = Array.isArray(parsed.detail) ? parsed.detail : []
+    return errors.some((e) => {
+      const err = e as { type?: unknown; loc?: unknown }
+      const loc = Array.isArray(err.loc) ? err.loc.map(String) : []
+      return err.type === 'string_too_long' && loc.includes('q')
+    })
+  } catch {
+    // A non-JSON body is not something we can attribute to the query's length.
+    return false
   }
 }
 
@@ -222,7 +252,7 @@ export default function Page() {
       if (!res.ok) {
         const detail = await res.text()
         console.error(`Search API ${res.status}: ${detail}`)
-        setStatus({ kind: 'error', message: friendlyMessage(res.status) })
+        setStatus({ kind: 'error', message: friendlyMessage(res.status, detail) })
         return
       }
 
@@ -315,7 +345,7 @@ export default function Page() {
             // cut off in the browser instead of coming back as a 422 the user
             // would only see as "Something went wrong". The server bound stays
             // authoritative — this is a courtesy, not the control.
-            maxLength={512}
+            maxLength={SEARCH_QUERY_MAX_CHARS}
             placeholder="e.g. fintech startups that raised Series A"
             aria-label="Search query"
             autoComplete="off"
