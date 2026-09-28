@@ -2554,13 +2554,29 @@ async def send_message_stream(session_id: str, body: MessageIn, request: Request
             # estimate it held rather than refunded. Same rule as the
             # mid-stream-failure path below, and the reason it exists (#255).
             usage = usage_holder[0] if usage_holder else None
-            await persist_truncated_turn(
-                "".join(chunks), turn.sources,
-                usage.prompt_tokens if usage else 0,
-                usage.completion_tokens if usage else 0,
-                billed_usd(usage_holder),
-                aborted=True,
-            )
+            try:
+                await persist_truncated_turn(
+                    "".join(chunks), turn.sources,
+                    usage.prompt_tokens if usage else 0,
+                    usage.completion_tokens if usage else 0,
+                    billed_usd(usage_holder),
+                    aborted=True,
+                )
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                # The conversation was deleted while the turn was in flight,
+                # so the row this write would create has nowhere to live:
+                # there is nothing left to roll back and nothing to persist.
+                # That is a non-event, not a second failure. Re-attempting
+                # the write is what made fail_turn() itself raise, turning
+                # the turn's real error into an HTTPException that escaped
+                # the generator and broke the stream instead of closing it
+                # with its error event (#358). The spend still happened, so
+                # the holds are discharged exactly as they would have been
+                # had the write succeeded.
+                logger.info("conversation deleted mid-turn; discarding the failed turn")
+                await finish_holds(billed_usd(usage_holder))
 
         try:
             if await aborted():
