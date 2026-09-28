@@ -1594,6 +1594,171 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
     assert result.completion_tokens == 5
 
 
+
+def test_failed_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
+    """Regression (#347): a nudge that fails after burning its retries is a real
+    billed call. The turn must settle for those attempts too, not record the
+    turn as having cost only the answer call -- which is what made the daily cap
+    under-count exactly when the provider was flaky and retries were most
+    likely."""
+    calls = []
+
+    async def fake_generate(client, prompt, model, system_prompt=None):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
+        # 3 requests were really sent and billed before the nudge gave up.
+        raise chat_module.LLMUnavailableError(attempts=3)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+    budget = _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+    spend = chat_module._FailedCallSpend()
+    result = _run(
+        chat_module._answer_with_dataviz(
+            "show me a chart of top 5 deals", "PROMPT", [], spend=spend
+        )
+    )
+    assert len(calls) == 2
+    # The first answer is still served, so the turn is not an error...
+    assert result.content == "No chart here [1]."
+    # ...but the failed retry's three billed attempts are charged.
+    assert spend.usd == pytest.approx(3 * 0.02)
+
+
+def test_failed_ranking_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
+    """The ranking nudge is the same defect on a second call site: a refusal
+    followed by a failed retry must charge the retry's billed attempts."""
+    calls = []
+
+    async def fake_generate(client, prompt, model, system_prompt=None):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(
+                content="This list cannot be generated because exact amounts are not available [1].",
+                prompt_tokens=10,
+                completion_tokens=5,
+            )
+        raise chat_module.LLMUnavailableError(attempts=2)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+    _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+    spend = chat_module._FailedCallSpend()
+    result = _run(
+        chat_module._answer_ranked(
+            "top 10 ipo deals in 2025", "PROMPT", [], spend=spend
+        )
+    )
+    assert len(calls) == 2
+    assert spend.usd == pytest.approx(2 * 0.02)
+
+
+def test_zero_attempt_nudge_failure_is_not_charged(monkeypatch):
+    """`LLM_MAX_RETRIES < 0` sends no request at all, so a nudge that fails
+    having attempted nothing is genuinely free -- the honest exception, and the
+    reason charge() ignores a zero attempt count rather than charging an
+    estimate for a call that never happened."""
+    calls = []
+
+    async def fake_generate(client, prompt, model, system_prompt=None):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
+        raise chat_module.LLMUnavailableError(attempts=0)
+
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+    _pin_budget_disabled(monkeypatch)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+    spend = chat_module._FailedCallSpend()
+    _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", [], spend=spend))
+    assert len(calls) == 2
+    assert spend.usd == 0.0
+
+
+def test_run_turn_settles_failed_nudge_retries_with_the_turn(monkeypatch):
+    """End-to-end (#347): a turn whose answer succeeds while both nudges fail
+    after retries must settle ONE figure that includes the billed attempts of
+    the failed retries. Before the fix the settle carried only the answer
+    call's cost, so the daily cap silently forgave every retry the provider
+    had already billed."""
+    generate_calls = []
+    budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+    async def fake_generate(client, prompt, model, system_prompt=None):
+        generate_calls.append(prompt)
+        if len(generate_calls) == 1:
+            # A chart ask whose answer refuses, so BOTH nudges fire and both
+            # then fail after being billed.
+            return chat_module.LLMResult(
+                content="I cannot generate a ranked list [1].", prompt_tokens=100_000, completion_tokens=0
+            )
+        # dataviz nudge: 3 billed attempts; ranking nudge: 2 billed attempts.
+        raise chat_module.LLMUnavailableError(attempts=3 if len(generate_calls) == 2 else 2)
+
+    monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    answer, _sources, _note, _pt, _ct, cost = _run(
+        chat_module._run_turn("show me a chart of top 10 ipo deals in 2025", [])
+    )
+
+    assert len(generate_calls) == 3
+    assert answer.startswith("I cannot generate a ranked list")
+    # The answer call's real cost ($0.10) PLUS the failed retries' 5 billed
+    # attempts at the $0.02 estimate = $0.20. Settled ONCE, and the stored cost
+    # is that same number.
+    assert budget.writes == [("settle", 200_000)]
+    assert budget.counter == 200_000
+    assert budget.holds == {}
+    assert cost == pytest.approx(0.20)
+
+
+def test_run_turn_no_usage_still_settles_positive_reserve_estimate(monkeypatch):
+    """The #255 invariant this change must not break: a non-streaming call that
+    returns WITHOUT LLM usage must settle the POSITIVE reserve estimate, and
+    the stored message cost must be that very same number -- never a different
+    one on the accounting path than on the reserve path.
+
+    #347 adds a per-turn accumulator, which is exactly the kind of change that
+    can let the two paths drift apart, so the invariant is pinned here: the
+    settle amount and the returned cost are one number, and it is positive."""
+    budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
+    monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
+
+    async def fake_prepare(question, history):
+        return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+    async def fake_generate(client, prompt, model, system_prompt=None):
+        # A delivered answer carrying zero tokens: cost() is 0.0, which means
+        # "usage unknown", never "free".
+        return chat_module.LLMResult(content="A delivered answer [1].", prompt_tokens=0, completion_tokens=0)
+
+    monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+    monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
+    monkeypatch.setattr(chat_module, "state_llm", lambda: object())
+
+    _answer, _sources, _note, _pt, _ct, cost = _run(chat_module._run_turn("Who invested in fintech?", []))
+
+    # The POSITIVE reserve estimate, not zero...
+    assert budget.writes == [("settle", 20_000)]
+    assert budget.counter == 20_000
+    # ...and the same number on the accounting path and the stored path.
+    assert cost == pytest.approx(0.02)
+    assert cost == pytest.approx(budget.writes[0][1] / 1_000_000)
+
+
 def test_json_loads_malformed_returns_empty(caplog):
     """Decode failures on a str/bytes payload still degrade to [] but must be
     logged, so corrupt stored rows are diagnosable instead of silently empty."""
@@ -2545,7 +2710,7 @@ def test_run_turn_records_cost_and_finalizes(monkeypatch):
     async def fake_prepare(question, history):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[{"id": 1}], note="note", needs_llm=True)
 
-    async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
+    async def fake_answer_ranked(question, prompt, holds, system_prompt="", *, spend=None):
         calls["prompt"] = prompt
         return chat_module.LLMResult(
             content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
@@ -2723,7 +2888,7 @@ def test_run_turn_with_reported_usage_still_uses_the_real_cost(monkeypatch):
     async def fake_prepare(question, history):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-    async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
+    async def fake_answer_ranked(question, prompt, holds, system_prompt="", *, spend=None):
         # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10, five
         # times the $0.02 estimate -- the two must not be confused.
         return chat_module.LLMResult(content="A fully delivered answer [1].", prompt_tokens=100_000, completion_tokens=0)
@@ -4073,7 +4238,7 @@ def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypat
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
+        async def fake_answer_ranked(question, prompt, holds, system_prompt="", *, spend=None):
             return chat_module.LLMResult(content="A billed answer [1].", prompt_tokens=50, completion_tokens=10)
 
         async def dead_settle(ids, actual_usd):
@@ -4137,7 +4302,7 @@ def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
         async def fake_prepare(question, history):
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
-        async def fake_answer_ranked(question, prompt, holds, system_prompt=""):
+        async def fake_answer_ranked(question, prompt, holds, system_prompt="", *, spend=None):
             return chat_module.LLMResult(content="An unmetered answer [1].", prompt_tokens=50, completion_tokens=10)
 
         dead = _pin_budget_disabled_with_dead_store(monkeypatch)
