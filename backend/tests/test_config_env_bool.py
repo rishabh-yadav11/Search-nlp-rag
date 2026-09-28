@@ -1,18 +1,19 @@
 """The ``ENABLE_*`` feature toggles must read the way an operator writes them.
 
 Each toggle used to be parsed inline as
-``os.getenv(name, "true").lower() in ("1", "true", "yes")``. That reads every
-other spelling a person would plausibly type as OFF: ``TRUE``, ``True``,
-``on``, ``" true "``, ``"1 "``. A retrieval feature then sits switched off with
-nothing wrong visible anywhere -- the knob looks configured, ``.env.example``
-says ``true``, the API answers as though the operator had asked for off, and
-no log line exists to say so. The only way to notice is to already suspect it.
+``os.getenv(name, "true").lower() in ("1", "true", "yes")``. That already
+lowercased, so ``TRUE`` and ``True`` were fine; what it lacked was a strip and
+an ``on``, so ``on``, ``" true "`` and ``"1 "`` read as OFF. A retrieval
+feature then sits switched off with nothing wrong visible anywhere -- the knob
+looks configured, ``.env.example`` says ``true``, the API answers as though
+the operator had asked for off, and no log line exists to say so. The only
+way to notice is to already suspect it.
 
-``config._env_bool`` fixes that by normalising case and surrounding space, and
-by sharing one spelling set with ``_env_tristate`` so the same question has one
-answer in this file. Three properties of that answer are pinned here, because
-each of them was got wrong in an implementation that was written and then
-reverted:
+``config._env_bool`` fixes that by normalising surrounding space as well as
+case, and by sharing one spelling set with ``_env_tristate`` so the same
+question has one answer in this file. Three properties of that answer are
+pinned here, because each of them was got wrong in an implementation that was
+written and then reverted:
 
 1. **A blank value stays OFF.** ``KEY=`` in a .env is how an operator clears a
    knob, python-dotenv writes it as an empty string, and ``.env.example`` ships

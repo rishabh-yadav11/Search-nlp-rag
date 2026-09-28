@@ -273,9 +273,9 @@ def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> 
 
 # The spellings that mean "on" and "off" for a boolean env knob, for every knob
 # in this file. One set, two readers: _env_tristate (three-state) and _env_bool
-# (two-state). A second convention here is how ENABLE_DIVERSITY=TRUE and
-# ENABLE_DIVERSITY=" true " came to read as OFF while AUTH_TRUST_X_FORWARDED_FOR
-# understood them, so the question is answered once.
+# (two-state). A second convention here is how ENABLE_DIVERSITY=" true " came
+# to read as OFF while AUTH_TRUST_X_FORWARDED_FOR understood it, so the
+# question is answered once.
 #
 # The truthy set is load-bearing OUTSIDE this file. setup.sh's forced-true
 # warning greps exactly these four spellings, and it has to: a forced True
@@ -308,11 +308,12 @@ def _env_bool(name: str, default: bool) -> bool:
     """Read a two-state boolean knob, normalising case and surrounding space.
 
     The ENABLE_* feature toggles each used to be parsed inline as
-    ``os.getenv(name, "true").lower() in ("1", "true", "yes")``, which reads
-    every other spelling an operator would plausibly write as OFF: TRUE, True,
-    on, " true ", "1 ". A whole retrieval feature then sits disabled with
-    nothing wrong visible anywhere -- the knob looks configured, the template
-    says true, and the service answers as if the operator had asked for off.
+    ``os.getenv(name, "true").lower() in ("1", "true", "yes")``. That already
+    lowercased, so case was never the problem -- but it did not strip, and it
+    had no "on" in the set, so ``on``, " true " and "1 " all read as OFF. A
+    whole retrieval feature then sits disabled with nothing wrong visible
+    anywhere -- the knob looks configured, the template says true, and the
+    service answers as if the operator had asked for off.
 
     Three input classes, and the differences between them are deliberate:
 
