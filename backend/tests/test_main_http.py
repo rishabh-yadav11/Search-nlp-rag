@@ -2,6 +2,7 @@
 /analytics/summary endpoints of app.main (cache hit/miss wiring, qdrant/redis
 error mapping, and analytics beacons)."""
 
+import asyncio
 import json
 import os
 from types import SimpleNamespace
@@ -606,6 +607,153 @@ def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
     r = _client.get("/facets")
     assert r.status_code == 500
 
+
+def test_facets_concurrent_misses_share_one_scan_and_one_cache_write(monkeypatch):
+    """K callers that miss together must cost one scan per key, not one each.
+
+    `cache.get` then `cache.set` is a check-then-act, so every caller that
+    arrived while the first was still walking the collection used to start its
+    own walk. Counted on the scan seam, never on elapsed time: each scan refuses
+    to finish until all K callers have been through the cache, so a scan from a
+    second caller cannot hide behind the first one completing early.
+    """
+    callers = 6
+    state: dict = {}
+
+    class _ArrivalCache(FakeCache):
+        """Records how many callers have been through the cache."""
+
+        async def get(self, key):
+            value = await super().get(key)
+            if key == main.FACETS_CACHE_KEY:
+                state["arrived"] += 1
+                if state["arrived"] == callers:
+                    state["everyone_here"].set()
+            return value
+
+    async def scenario():
+        state["arrived"] = 0
+        state["everyone_here"] = asyncio.Event()
+        scans: list[str] = []
+
+        async def parking_facet_values(key):
+            scans.append(key)
+            await asyncio.wait_for(state["everyone_here"].wait(), timeout=10)
+            return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
+
+        cache = _ArrivalCache()
+        monkeypatch.setattr(main, "cache", cache)
+        monkeypatch.setattr(main, "_facet_values", parking_facet_values)
+        results = await asyncio.gather(*(main.facets() for _ in range(callers)))
+        return scans, results, cache.sets
+
+    scans, results, sets = _run(scenario())
+
+    expected = {"industry": ["Fintech"], "dealtype": ["M&A"]}
+    assert sorted(scans) == ["dealtype_names", "industry_names"]
+    assert results == [expected] * callers
+    assert sets == [(main.FACETS_CACHE_KEY, expected, None)]
+
+
+def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkeypatch):
+    """A scan that raises must leave the guard free and write nothing to the
+    cache, so the next caller scans again instead of being served -- or wedged
+    on -- the failure."""
+    attempts: list[str] = []
+
+    async def down_facet_values(key):
+        attempts.append(key)
+        raise RuntimeError("qdrant down")
+
+    async def scenario():
+        cache = FakeCache()
+        monkeypatch.setattr(main, "cache", cache)
+        monkeypatch.setattr(main, "_facet_values", down_facet_values)
+        outcomes = await asyncio.gather(main.facets(), main.facets(), return_exceptions=True)
+        # Let the scan's done callback run, so the guard is observably released.
+        await asyncio.sleep(0)
+        return cache, outcomes, main._facet_scan_task
+
+    cache, outcomes, guard = _run(scenario())
+
+    assert [type(outcome) for outcome in outcomes] == [RuntimeError, RuntimeError]
+    assert sorted(attempts) == ["dealtype_names", "industry_names"]
+    assert cache.sets == []
+    assert guard is None
+
+    async def working_facet_values(key):
+        return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
+
+    monkeypatch.setattr(main, "_facet_values", working_facet_values)
+    assert _run(main.facets()) == {"industry": ["Fintech"], "dealtype": ["M&A"]}
+    assert cache.sets == [(main.FACETS_CACHE_KEY, {"industry": ["Fintech"], "dealtype": ["M&A"]}, None)]
+
+
+def test_facets_scans_the_two_vocabularies_concurrently(monkeypatch):
+    """The keys are independent, so the second scan has to start before the
+    first finishes. Each scan refuses to finish until the other has started, so
+    the awaited-back-to-back version times out here instead of merely being
+    slower -- this is ordering, not a race on a stopwatch."""
+    async def scenario():
+        started: list[str] = []
+        both_started = asyncio.Event()
+
+        async def barrier_facet_values(key):
+            started.append(key)
+            if len(started) == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=10)
+            return [key]
+
+        cache = FakeCache()
+        monkeypatch.setattr(main, "cache", cache)
+        monkeypatch.setattr(main, "_facet_values", barrier_facet_values)
+        return started, await main.facets()
+
+    started, result = _run(scenario())
+
+    assert started == ["industry_names", "dealtype_names"]
+    assert result == {"industry": ["industry_names"], "dealtype": ["dealtype_names"]}
+
+
+@pytest.mark.parametrize("cancels", ["creator", "waiter"])
+def test_facets_cancelled_caller_does_not_abort_the_scan_the_others_share(monkeypatch, cancels):
+    """A request that goes away mid-scan (client disconnect, request timeout)
+    must not take the shared scan down with it for the callers still waiting.
+
+    Both callers who can be holding the scan are covered: the one that started
+    it and the one that joined it. A waiter that is cancelled while it awaits
+    the shared scan has to let go of it, not tear it down for everybody.
+    """
+
+    async def scenario():
+        release = asyncio.Event()
+        scans: list[str] = []
+
+        async def parked_facet_values(key):
+            scans.append(key)
+            await release.wait()
+            return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
+
+        cache = FakeCache()
+        monkeypatch.setattr(main, "cache", cache)
+        monkeypatch.setattr(main, "_facet_values", parked_facet_values)
+
+        creator = asyncio.create_task(main.facets())
+        await asyncio.sleep(0)
+        waiter = asyncio.create_task(main.facets())
+        await asyncio.sleep(0)
+        leaving, staying = (creator, waiter) if cancels == "creator" else (waiter, creator)
+        leaving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leaving
+        release.set()
+        return scans, await staying
+
+    scans, result = _run(scenario())
+
+    assert sorted(scans) == ["dealtype_names", "industry_names"]
+    assert result == {"industry": ["Fintech"], "dealtype": ["M&A"]}
 
 
 # --- /analytics/summary ---
