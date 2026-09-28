@@ -128,31 +128,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r backend/requirements-dev.txt
 
-      # Policy: fail the build on ANY advisory that is not on the explicit
-      # ignore list below. The list exists solely because fastapi==0.115.0 caps
-      # starlette below 0.39, and every fixed starlette release (0.40.0 through
-      # 1.3.1) needs a FastAPI upgrade. These are transitive findings, not
-      # direct pins. A new advisory in any other package fails the job
-      # immediately.
-      #
-      # OWNER: the maintainer who bumps `fastapi` in backend/requirements.txt.
-      # TRACKED BY: issue #331. REVIEW BY: 2026-12-27 (90 days from #245).
-      #
-      # The list is version-anchored, not time-anchored: every ID below is a
-      # starlette advisory reachable only through fastapi==0.115.0. Raising
-      # that pin re-fails this gate by construction, so the suppression cannot
-      # silently outlive the reason for it. When #331 lands, delete all seven
-      # entries and this comment together.
+      # Policy: fail the build on ANY advisory. There is no ignore list and no
+      # --ignore-vuln flag. The seven starlette advisories this gate used to
+      # suppress (PYSEC-2026-1943/1941/161/2281/2280/249/248) were reachable
+      # only through the old fastapi==0.115.0 pin, which capped starlette below
+      # 0.39; issue #331 raised fastapi to 0.141.1 and pinned starlette 1.7.0
+      # directly, so every fixed release is reachable and nothing is waived.
       - name: pip-audit (runtime dependencies)
-        run: |
-          python -m pip_audit -r backend/requirements.txt \
-            --ignore-vuln PYSEC-2026-1943 \
-            --ignore-vuln PYSEC-2026-1941 \
-            --ignore-vuln PYSEC-2026-161 \
-            --ignore-vuln PYSEC-2026-2281 \
-            --ignore-vuln PYSEC-2026-2280 \
-            --ignore-vuln PYSEC-2026-249 \
-            --ignore-vuln PYSEC-2026-248
+        run: python -m pip_audit -r backend/requirements.txt
       - name: pip-audit (dev dependencies)
         run: python -m pip_audit -r backend/requirements-dev.txt
 
