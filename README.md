@@ -510,18 +510,17 @@ an explicit timeout.
 
 ### Audit policy
 
-**`pip-audit` fails the build on any advisory that is not explicitly ignored.**
-The only current findings are 7 starlette advisories (14 rows — the resolver
-reports each twice), all transitive: `fastapi==0.115.0` caps starlette below
-0.39, and every fixed starlette release (0.40.0 → 1.3.1) requires raising the
-FastAPI pin. Those 7 IDs are listed by name in the workflow; anything new fails
-immediately. Remove an ID from the list and the job goes red again — the waiver
-is an enumerated list of 7 advisory IDs, not a blanket suppression, and the
-list is **version-anchored**: every one is reachable only through
-`fastapi==0.115.0`, so raising that pin re-fails the gate by construction and the
-suppression cannot outlive its reason. Owner: whoever bumps the `fastapi` pin.
-Tracked by [#331](https://github.com/rishabh-yadav11/Search-nlp-rag/issues/331),
-review by 2026-12-27.
+**`pip-audit` fails the build on any advisory. There are no suppressions and no
+`--ignore-vuln` flags.** The gate previously carried a 7-entry ignore list
+covering starlette advisories (PYSEC-2026-1943/1941/161/2281/2280/249/248) that
+were reachable only through `fastapi==0.115.0`, which capped starlette below 0.39
+and made every fixed release (0.40.0 → 1.3.1) unreachable. Issue #331 raised
+fastapi to 0.141.1 — the first line whose starlette constraint is uncapped
+(`starlette>=0.46.0`) — and pinned `starlette==1.7.0` explicitly. Pinning the
+transitive directly is deliberate: starlette used to float, so the fix would
+otherwise depend on whatever the resolver happened to pick rather than on a
+reviewed value. `pip-audit -r backend/requirements.txt` is clean with no ignore
+list, and a new advisory anywhere fails the build immediately.
 
 The `transformers==5.10.1` pin (which fixes CVE-2026-4372 / CVE-2026-5241 /
 CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits

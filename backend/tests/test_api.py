@@ -30,6 +30,30 @@ def _only(conds: list[FieldCondition]) -> FieldCondition:
     return conds[0]
 
 
+def _route_paths(routes) -> set[str]:
+    """Every path the app actually serves, however the routers are nested.
+
+    Since fastapi 0.141 (issue #331), ``include_router`` no longer copies each
+    route into the top-level list: it stores a single ``_IncludedRouter``
+    wrapper, and the real routes live under its ``original_router``. So a flat
+    ``{r.path for r in app.routes}`` both misses the included routes entirely
+    and raises on the wrapper. Descending into any child that carries its own
+    ``routes`` list keeps this version-agnostic and, more importantly, keeps the
+    assertions below honest -- a path counts as absent only if it is absent
+    from the whole tree, not merely from the top level.
+    """
+    paths: set[str] = set()
+    for route in routes:
+        path = getattr(route, "path", None)
+        if path is not None:
+            paths.add(path)
+        nested = getattr(route, "original_router", None)
+        children = getattr(nested, "routes", None) if nested is not None else None
+        if children:
+            paths |= _route_paths(children)
+    return paths
+
+
 class _FrozenNow(_dt):
     """datetime subclass pinned to a fixed 'now' for deterministic recency math."""
 
@@ -347,7 +371,7 @@ def test_source_context_includes_whole_body():
 def test_analytics_dashboard_is_frontend_owned():
     """The dashboard UI is a Next.js page now (frontend/app/analytics/dashboard);
     the backend only serves the JSON data endpoints, both admin-gated."""
-    paths = {r.path for r in main.app.routes}
+    paths = _route_paths(main.app.routes)
     assert "/analytics/dashboard" not in paths
     assert "/analytics/summary" in paths
     assert "/analytics/chat" in paths
