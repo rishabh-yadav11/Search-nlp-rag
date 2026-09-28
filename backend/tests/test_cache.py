@@ -20,6 +20,11 @@ class _FakeRedis:
     async def set(self, key, value, ex=None):
         raise self.error
 
+    async def mget(self, keys):
+        # A Redis that is down fails every command, so the batched read must
+        # take the same degraded branch ``get`` does.
+        raise self.error
+
     async def delete(self, *keys):
         # A Redis that is down fails every command, not just reads and writes;
         # without this the delete paths would raise AttributeError instead of
@@ -32,6 +37,7 @@ class _RecordingRedis:
 
     def __init__(self, store=None):
         self.store = store if store is not None else {}
+        self.mgets = []
         self.sets = []
         self.closed = False
         self.close_attempts = 0
@@ -42,6 +48,10 @@ class _RecordingRedis:
     async def set(self, key, value, ex=None):
         self.sets.append((key, value, ex))
         self.store[key] = value
+
+    async def mget(self, keys):
+        self.mgets.append(list(keys))
+        return [self.store.get(key) for key in keys]
 
     async def aclose(self):
         self.close_attempts += 1
@@ -80,6 +90,12 @@ class _FlakyRedis(_RecordingRedis):
             raise self.error
         self.sets.append((key, value, ex))
         self.store[key] = value
+
+    async def mget(self, keys):
+        if self.fail:
+            raise self.error
+        self.mgets.append(list(keys))
+        return [self.store.get(key) for key in keys]
 
 
 def test_set_get_round_trip():
@@ -159,6 +175,87 @@ def test_get_redis_miss_falls_through_to_mem():
     cache._redis = _RecordingRedis({})
     assert _run(cache.get("k")) == {"from": "mem"}
     assert _run(cache.get("missing")) is None
+
+
+def test_get_many_reads_every_key_in_one_round_trip():
+    """The batched read is positional and costs exactly one command."""
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    redis = _RecordingRedis({"a": '{"n": 1}', "b": '{"n": 2}'})
+    cache._redis = redis
+    assert _run(cache.get_many(["a", "b", "missing"])) == [{"n": 1}, {"n": 2}, None]
+    assert redis.mgets == [["a", "b", "missing"]]
+    assert not redis.sets, "a read must not write"
+
+
+def test_get_many_falls_back_per_key_to_the_in_process_cache():
+    """A Redis miss falls through to memory exactly as ``get`` does."""
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    # _mem entries are (value, expiry, byte cost) tuples; see the same note in
+    # test_get_redis_miss_falls_through_to_mem.
+    cache._mem["a"] = ({"from": "mem"}, time.monotonic() + 60, 60)
+    cache._redis = _RecordingRedis({})
+    assert _run(cache.get_many(["a", "b"])) == [{"from": "mem"}, None]
+
+
+def test_get_many_degrades_to_memory_when_redis_is_down(monkeypatch):
+    """A down Redis must not fail the batched read or lose the fallback.
+
+    ``get`` already degrades to the in-process cache; a batched read that did
+    not would turn a Redis outage into a /search 500, and one that degraded
+    without consulting memory would silently drop warm entries.
+    """
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    cache._redis = _FakeRedis()
+    warnings = []
+    monkeypatch.setattr("app.redis_cache.logger.warning", lambda *a, **k: warnings.append(a))
+
+    async def scenario():
+        await cache.set("k", {"n": 1})
+        assert await cache.get_many(["k", "absent"]) == [{"n": 1}, None]
+
+    _run(scenario())
+
+    assert cache._conn_warned is True
+    assert len(warnings) == 1, "the batched read must warn once, like get()"
+
+
+def test_get_many_degrades_per_key_on_a_corrupt_payload(monkeypatch):
+    """One unparseable value must not discard the rest of the batch."""
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    cache._redis = _RecordingRedis({"good": '{"n": 1}', "bad": "not json"})
+    cache._mem["bad"] = ({"from": "mem"}, time.monotonic() + 60, 60)
+    warnings = []
+    monkeypatch.setattr("app.redis_cache.logger.warning", lambda *a, **k: warnings.append(a))
+
+    assert _run(cache.get_many(["good", "bad"])) == [{"n": 1}, {"from": "mem"}]
+    assert any("decode" in str(w) for w in warnings), (
+        "a corrupt payload must be logged as a decode failure, not a connect failure"
+    )
+
+
+def test_get_many_does_not_slide_the_in_process_ttl(monkeypatch):
+    """Batched reads honour the no-slide rule that single reads do."""
+    clock = _FakeClock(1000.0)
+    monkeypatch.setattr(redis_cache, "time", clock)
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    cache._redis = _FakeRedis()
+    value = {"results": [{"id": 1}]}
+
+    async def scenario():
+        await cache.set("hot", value)
+        clock.advance(1.0)
+        assert await cache.get_many(["hot"]) == [value]
+        clock.advance(59.0)  # 60s after the write, at the TTL boundary
+        assert await cache.get_many(["hot"]) == [None], "a batched read must not slide the TTL"
+
+    _run(scenario())
+
+
+def test_get_many_with_no_keys_issues_no_command():
+    """An empty batch never opens a connection."""
+    cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
+    assert _run(cache.get_many([])) == []
+    assert cache._redis is None
 
 
 def test_set_success_writes_json_with_ttl():

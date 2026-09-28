@@ -185,6 +185,9 @@ def test_exhausting_the_search_limit_does_not_spend_the_facets_budget(monkeypatc
                 return {"industry": [], "dealtype": []}
             return [_summary_dict(1, 0.9)]
 
+        async def get_many(self, keys):
+            return [await self.get(key) for key in keys]
+
         async def set(self, key, value, ttl=None):
             return None
 
@@ -269,7 +272,7 @@ def test_search_cache_miss_runs_full_pipeline(monkeypatch, fake_cache):
     cache = fake_cache()
     articles = [_article(1, 0.9), _article(2, 0.7)]
 
-    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+    async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
         return articles
 
     async def fake_boost(q, results):
@@ -314,7 +317,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch, 
     boost_calls = []
     div_calls = []
 
-    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+    async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
         return [_article(1, 0.9)]
 
     async def fake_boost(q, results):
@@ -352,7 +355,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch, 
 def test_search_passes_built_facet_filter_to_retrieve(monkeypatch, fake_cache):
     captured = {}
 
-    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+    async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
         captured["qfilter"] = qfilter
         return [_article(1, 0.9), _article(2, 0.7)]
 
@@ -388,7 +391,7 @@ def test_search_cache_miss_does_not_cache_empty_results(monkeypatch, fake_cache)
     transiently retrieved nothing kept returning nothing for minutes."""
     cache = fake_cache()
 
-    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+    async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
         return []
 
     async def fake_record_search(*args, **kwargs):
@@ -418,7 +421,7 @@ def test_search_empty_results_are_not_served_from_cache(monkeypatch, fake_cache)
     cache = fake_cache()
     calls = []
 
-    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+    async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
         calls.append(q)
         return [_article(1, 0.9)] if len(calls) > 1 else []
 
@@ -452,7 +455,7 @@ def test_search_non_empty_results_are_still_cached(monkeypatch, fake_cache):
     cache = fake_cache()
     articles = [_article(1, 0.9)]
 
-    async def fake_retrieve(q, top_k, qfilter, need_body=False):
+    async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
         return articles
 
     async def fake_record_search(*args, **kwargs):
