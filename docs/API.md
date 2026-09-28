@@ -83,30 +83,98 @@ Chat conversations are scoped to the account that created them — a token can
 never see or modify another account's conversations. `403` means the token is
 valid but the role is not allowed; `401` means missing/expired/revoked token.
 
-### 3. Rate limits (per IP, Redis)
+### 3. Rate limits
 
-- Signup: `AUTH_SIGNUP_RATE_PER_MIN` (5) — exceed → `429`.
-- Login: `AUTH_LOGIN_RATE_PER_MIN` (10) — exceed → `429`.
-- `/search` and chat are not IP-rate-limited (chat is bounded by the global LLM
-  daily budget instead).
-- `POST /recommend/interaction` is limited on **both** axes:
-  `PUBLIC_INTERACTION_RATE_PER_MIN` (60) per client IP and
-  `INTERACTION_USER_RATE_PER_MIN` (60) per authenticated account — exceed →
-  `429`. Both are required: a per-IP bucket alone cannot bound one account
-  behind a shared NAT/proxy address, and a per-account bucket alone cannot
-  bound one account rotating addresses.
+All limits below are enforced **per client IP** against a Redis counter
+(unless a second, explicitly named axis is listed), and each one is disabled
+by setting its knob to `0`. Exceeding any of them answers `429` with
+`{"detail": "Too many attempts. Please try again shortly."}` and a
+`Retry-After` header carrying the window length in seconds.
 
-  `interaction_type` is a closed enum — `view`, `click`, `read`. Anything else
-  → `422`. An `article_id` absent from the index → `404`, and **no key is
-  written for it**. Other decline statuses: `429` when the account has already
-  interacted with `USER_MAX_DISTINCT_INTERACTIONS` (500) distinct articles, and
-  `503` when the article index or Redis is unreachable.
+| Endpoint | Knob (default) | Keyed on | Limiter-Redis down |
+|---|---|---|---|
+| `POST /api/auth/signup` | `AUTH_SIGNUP_RATE_PER_MIN` (5) | client IP | in-process fallback |
+| `POST /api/auth/login` | `AUTH_LOGIN_RATE_PER_MIN` (10) | client IP | in-process fallback |
+| `POST /api/auth/login` | `AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN` (20) | submitted address, **failed attempts only** | in-process fallback |
+| `GET /search` | `PUBLIC_SEARCH_RATE_PER_MIN` (60) | client IP | `503` (fails closed) |
+| `GET /facets` | `PUBLIC_FACETS_RATE_PER_MIN` (60) | client IP | `503` (fails closed) |
+| `POST /analytics/click` | `PUBLIC_CLICK_RATE_PER_MIN` (120) | client IP | `503` (fails closed) |
+| `GET /ready`, `GET /readyz` | `PUBLIC_READY_RATE_PER_MIN` (600) | client IP, one shared bucket | in-process fallback |
+| `POST /recommend/interaction` | `PUBLIC_INTERACTION_RATE_PER_MIN` (60) **and** `INTERACTION_USER_RATE_PER_MIN` (60) | client IP **and** authenticated account | `503` (fails closed) |
 
-  **Outage posture:** this limiter fails CLOSED — during a Redis outage the
-  endpoint answers `503` rather than serving an unlimited write path. This is
-  deliberately *not* the `/ready` exception: no load balancer probes this
-  endpoint, so there is no health check to protect here.
+The window is `AUTH_RATE_WINDOW_SECONDS` (60) for the auth limits and
+`PUBLIC_RATE_WINDOW_SECONDS` (60) for everything else. It is a **fixed**
+window opened by the first request in it, not a sliding one: a client that
+trips the limit can be served again as soon as the window that its first
+request opened expires, which may be sooner than a full window after its last
+request. The `429` `Retry-After` always quotes the whole window, so treat it
+as an upper bound and back off with your own jitter rather than a fixed sleep.
 
+**`GET /search`, `GET /facets` and `POST /analytics/click` ARE rate-limited.**
+They were unauthenticated and unrated, which allowed full-corpus scraping and
+click-analytics poisoning; all three are now bounded per client IP.
+
+**Chat is deliberately NOT rate-limited at the app layer.** No `/api/chat/...`
+route carries a limiter, and this is a decision rather than an oversight: chat
+turns are bounded by the global LLM daily budget instead (see
+`LLM_DAILY_BUDGET_USD`), which bounds spend. Other `/api/chat/...` routes are
+bounded by authentication and per-account ownership checks instead. Do not
+expect a `429` from a chat route; if you need to throttle chat clients, do it
+in the client.
+
+#### Which client IP is counted
+
+`AUTH_TRUST_X_FORWARDED_FOR` controls whether the client-supplied
+`X-Forwarded-For` header is believed. It is **unset by default (auto)**, and
+auto means: the header is honoured only when the immediate socket peer is
+loopback — i.e. a proxy on this same host, which is what the shipped nginx
+config provides. In that case the **rightmost** `X-Forwarded-For` entry is
+counted (nginx appends the real peer there; entries to its left are
+attacker-controlled). A client hitting the API directly is counted by its own
+socket address and cannot forge the header to escape its bucket. Set the
+variable to `true` when the proxy runs on another host, or `false` for
+direct-only deployments, to force one behaviour regardless of peer.
+
+#### Outage posture
+
+The two postures are different on purpose, and which one applies is a
+property of the endpoint, not a global switch:
+
+- **Fail CLOSED (`503`, `Retry-After` = window)** — the public search/abuse
+  surface: `GET /search`, `GET /facets`, `POST /analytics/click` and
+  `POST /recommend/interaction`. If the limiter's Redis is unreachable these
+  answer `503` instead of serving an unrated request, because an unrated
+  `/search` or `/analytics/click` is exactly the scraping and
+  analytics-poisoning vector the limits exist to close. `/recommend/interaction`
+  is in this group deliberately: no load balancer probes it, so there is no
+  health check to protect by failing open.
+- **In-process fallback (still limited, still `429`)** — the auth endpoints
+  and the health probes. The same limit is enforced by a bounded in-process
+  counter, so the degraded posture is single-process limiting, not "no
+  limiting" and not "no service". A correct password is never counted against
+  `AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN`, and a Redis blip therefore cannot be
+  used to lock legitimate users out of their own accounts. The accepted cost
+  is that a gunicorn deployment multiplies the effective limit by its worker
+  count while Redis is down — a finite bound rather than none.
+  `GET /ready` and `GET /readyz` are in this group for a further reason: they
+  are polled by load balancers roughly once a second, and a `429` (or a `503`
+  from a fail-closed limiter) makes a load balancer pull a healthy node from
+  rotation for a dependency the service does not need to be ready. Their
+  default of 600 sits an order of magnitude above a 1 Hz prober for the same
+  reason, while still bounding a runaway prober.
+
+`GET /health`, `GET /live` and `GET /ready/deep` carry no limiter at all.
+
+`POST /recommend/interaction` is limited on **both** axes and both are
+required: a per-IP bucket alone cannot bound one account behind a shared
+NAT/proxy address, and a per-account bucket alone cannot bound one account
+rotating addresses. The two counters are keyed separately and cannot collide.
+
+`interaction_type` is a closed enum — `view`, `click`, `read`. Anything else
+→ `422`. An `article_id` absent from the index → `404`, and **no key is
+written for it**. Other decline statuses: `429` when the account has already
+interacted with `USER_MAX_DISTINCT_INTERACTIONS` (500) distinct articles, and
+`503` when the article index is unreachable.
 ### 4. Consuming the chat SSE stream
 
 `POST /api/chat/sessions/{id}/messages/stream` returns Server-Sent Events.
