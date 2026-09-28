@@ -2397,10 +2397,10 @@ async def _start_turn(
     Both turn paths call this BEFORE their own cancellation handlers exist, so
     a cancel anywhere in it would leave the user message with no assistant
     reply and nobody able to delete it -- the dangling state the turn handlers
-    exist to prevent, one step earlier. Every await of this function is
-    therefore guarded and every guard re-raises. Nothing is ever streamed
-    before a turn starts, so the rule's side of a cancel here is always the
-    clean rollback.
+    exist to prevent, one step earlier. Every await of this function that
+    can leave a row behind is therefore guarded, and every guard re-raises.
+    Nothing is ever streamed before a turn starts, so the rule's side of a
+    cancel here is always the clean rollback.
 
     The authorisation is the one await that is NOT guarded, and that is the
     point of running it first: the INSERT that writes the user message has not
@@ -2417,13 +2417,13 @@ async def _start_turn(
         # In the INSERT's own COMMIT there is no id to delete by (`user_msg`
         # was never bound), so the row is found instead.
         await _reconcile_cancelled_turn(
-            lambda: _drop_unbound_user_row(s, session_id, user_id, question)
+            lambda: _drop_unbound_user_row(s, session, user_id, question)
         )
         raise
     try:
         history = await s.recent_turns(session_id, user_id, config.CHAT_MAX_HISTORY_TURNS)
     except asyncio.CancelledError:
-        await _reconcile_cancelled_turn(lambda: s.delete_message(session_id, user_id, user_msg.id))
+        await _reconcile_cancelled_turn(lambda: s._delete_authorized(session, user_msg.id))
         raise
     # Both caps apply: turns bound how many messages come back, chars bound how
     # many of them actually reach the prompt.
@@ -2553,18 +2553,24 @@ async def _reply_is_stored(s: ChatStore, session_id: str, user_id: str, after_id
     return bool(rows) and rows[-1].role == "assistant" and rows[-1].id > after_id
 
 
-async def _drop_unbound_user_row(s: ChatStore, session_id: str, user_id: str, question: str) -> None:
+async def _drop_unbound_user_row(s: ChatStore, session: SessionOut, user_id: str, question: str) -> None:
     """Remove a user message row whose id was never returned to the caller.
 
-    `_start_turn` can be cancelled inside the INSERT's own COMMIT, before
-    `append_message` hands back a MessageOut, so there is no id to delete by.
-    The newest message in the session is the row being written if it is a user
-    message carrying exactly this question; anything else is some other
-    turn's row and is left alone.
+    `_start_turn` can be cancelled inside the INSERT's own COMMIT, before the
+    append hands back a MessageOut, so there is no id to delete by. The newest
+    message in the session is the row being written if it is a user message
+    carrying exactly this question; anything else is some other turn's row and
+    is left alone.
+
+    `session` is the row `_start_turn` already authorised, so the delete that
+    follows is authorised by the turn's own proof rather than by another
+    `id AND user_id` SELECT on the connection the rollback is competing for.
+    `user_id` is still passed because `recent_turns` takes it, not because the
+    read needs it: the query is scoped by session id alone.
     """
-    rows = await s.recent_turns(session_id, user_id, 1)
+    rows = await s.recent_turns(session.id, user_id, 1)
     if rows and rows[-1].role == "user" and rows[-1].content == question:
-        await s.delete_message(session_id, user_id, rows[-1].id)
+        await s._delete_authorized(session, rows[-1].id)
 
 
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)
@@ -2586,7 +2592,7 @@ async def send_message(session_id: str, body: MessageIn, request: Request):
         "did the append return" flag cannot decide this -- see
         `_reply_is_stored`."""
         if not await _reply_is_stored(s, session_id, user_id, user_msg.id):
-            await s.delete_message(session_id, user_id, user_msg.id)
+            await s._delete_authorized(session, user_msg.id)
 
     try:
         answer, sources, note, prompt_tokens, completion_tokens, cost = await _run_turn(question, history)

@@ -476,6 +476,143 @@ def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monke
         _run(chat_store.close())
 
 
+
+@pytest.mark.parametrize(
+    "parked_at", ["user_insert", "history_read", "in_the_turn"]
+)
+def test_a_cancelled_turn_rolls_back_without_a_second_authorisation(
+    tmp_path, monkeypatch, parked_at
+):
+    """A cancellation reconciles through the proof the turn already holds.
+
+    #292 made a cancelled turn roll itself back, and #259 removed the
+    per-operation `id AND user_id` re-reads. On the cancel path the two meet:
+    the reconcilers (_start_turn's own guards, `_drop_unbound_user_row` and
+    `rollback_unreplied_turn`) are the most expensive place to leave a second
+    authorisation, because that is a serialized await on the one connection
+    every worker contends for, taken on the disconnect path. Whichever of the
+    three awaits the cancel lands on, the whole turn is exactly one
+    `id AND user_id` SELECT -- and the row is still gone afterwards, so the
+    cheap write removed the re-read and not the cleanup.
+    """
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+        ready = asyncio.Event()
+        parked = {"done": False}
+        real_append = store._append_authorized
+        real_recent = store.recent_turns
+
+        async def park():
+            parked["done"] = True
+            ready.set()
+            await asyncio.sleep(3600)
+
+        if parked_at == "user_insert":
+            async def slow_append(session, role, *args, **kwargs):
+                result = await real_append(session, role, *args, **kwargs)
+                if role == "user" and not parked["done"]:
+                    await park()
+                return result
+
+            monkeypatch.setattr(store, "_append_authorized", slow_append)
+        elif parked_at == "history_read":
+            async def slow_recent(session_id, user_id, max_turns):
+                if not parked["done"]:
+                    await park()
+                return await real_recent(session_id, user_id, max_turns)
+
+            monkeypatch.setattr(store, "recent_turns", slow_recent)
+        else:
+            async def stuck_turn(question, history):
+                await park()
+
+            monkeypatch.setattr(chat_module, "_run_turn", stuck_turn)
+
+        counter = _RoundTripCounter(store._db)
+        store._db = counter
+        request = _cancel_request()
+
+        async def run_it():
+            task = asyncio.create_task(
+                chat_module.send_message(sid, chat_module.MessageIn(content="what deals happened"), request)
+            )
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert _run(run_it()) is True
+
+        # Asserted before reading the rows back, which is itself a
+        # session-authorising read.
+        session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
+        assert len(session_selects) == 1, [e[1] for e in session_selects]
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
+
+
+def test_cancel_at_the_authorisation_read_writes_nothing(tmp_path, monkeypatch):
+    """The ordering inside `_start_turn`: authorise, THEN write.
+
+    The authorisation is deliberately the one await the cancellation guards
+    do not wrap, and that is only sound because it runs first: the INSERT that
+    writes the user message has not been issued, so a cancel delivered at that
+    read has nothing to reconcile and simply propagates. Move the write ahead
+    of the proof -- or read the session again after it -- and this turn would
+    park on a statement that already left a row behind. The statement log
+    pins both halves: one read, and no write at all.
+    """
+    store, sid = _store_with_session(tmp_path)
+    try:
+        _pin_budget_disabled(monkeypatch)
+        ready = asyncio.Event()
+        parked = {"done": False}
+        real_get = store.get_session
+
+        async def slow_get(session_id, user_id):
+            # Parked AFTER the read returns, the way aiosqlite resolves a
+            # statement on its worker thread: the SELECT is in the log and the
+            # turn is cancelled before it can issue anything else.
+            result = await real_get(session_id, user_id)
+            if not parked["done"]:
+                parked["done"] = True
+                ready.set()
+                await asyncio.sleep(3600)
+            return result
+
+        monkeypatch.setattr(store, "get_session", slow_get)
+
+        counter = _RoundTripCounter(store._db)
+        store._db = counter
+
+        async def run_it():
+            task = asyncio.create_task(
+                chat_module.send_message(
+                    sid, chat_module.MessageIn(content="what deals happened"), _cancel_request()
+                )
+            )
+            await asyncio.wait_for(ready.wait(), timeout=5)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        # The cancel still reaches the client of the request: swallowing it
+        # would end the task normally and hide the disconnect.
+        assert _run(run_it()) is True
+        assert [kind for kind, _sql in counter.log] == ["select"]
+        assert _turn_rows(store, sid) == []
+    finally:
+        _release_store(store)
+
+
 def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypatch):
     """#259 deleted three of the four `id AND user_id` SELECTs a turn made.
     The one survivor is the only thing keeping a user out of another user's
@@ -5786,26 +5923,31 @@ def _park_at_first_assistant_commit(monkeypatch, store, parked):
 
     aiosqlite runs each statement on a worker thread and only then resolves an
     independently cancellable future, so a cancellation delivered at a row's own
-    COMMIT finds the write already done while `append_message` never returns.
+    COMMIT finds the write already done while the append never returns.
     A local "did the append return" flag is still False in that window, which
     is what used to make the rollback delete the user message under a stored
     reply (JSON) or store a SECOND assistant row for the same turn (SSE).
+
+    Parked on `_append_authorized`, not on `append_message`: a turn that has
+    already proved it owns the conversation writes through the authorised
+    entry point (#259), so parking the authorising wrapper would never be
+    reached and the window would go untested.
 
     Only the first assistant append parks, so a reconciliation's own write
     still completes and the test measures the fix, not a deadlock.
     """
     ready = asyncio.Event()
-    real_append = store.append_message
+    real_append = store._append_authorized
 
-    async def slow_append(session_id, user_id, role, *args, **kwargs):
-        result = await real_append(session_id, user_id, role, *args, **kwargs)
+    async def slow_append(session, role, *args, **kwargs):
+        result = await real_append(session, role, *args, **kwargs)
         if role == "assistant" and not parked["done"]:
             parked["done"] = True
             ready.set()
             await asyncio.sleep(3600)
         return result
 
-    monkeypatch.setattr(store, "append_message", slow_append)
+    monkeypatch.setattr(store, "_append_authorized", slow_append)
     return ready
 
 
@@ -5883,27 +6025,29 @@ def test_stream_cancelled_at_the_reply_commit_stores_no_second_row(tmp_path, mon
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["json", "sse"])
 def test_turn_cancelled_at_the_user_insert_commit_rolls_back(tmp_path, monkeypatch, streaming):
-    """A cancel inside the INSERT that writes the user message, before
-    `append_message` returns an id: the row exists but nothing knows its id.
+    """A cancel inside the INSERT that writes the user message, before the
+    append returns an id: the row exists but nothing knows its id.
     `_start_turn` finds it instead, so neither path leaves a dangling user
-    message."""
+    message. Parked on `_append_authorized`, the write the turn makes once it
+    has authorised the session (#259); parking `append_message` would never
+    be reached."""
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)
         monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
         ready = asyncio.Event()
-        real_append = store.append_message
+        real_append = store._append_authorized
         parked = {"done": False}
 
-        async def slow_append(session_id, user_id, role, *args, **kwargs):
-            result = await real_append(session_id, user_id, role, *args, **kwargs)
+        async def slow_append(session, role, *args, **kwargs):
+            result = await real_append(session, role, *args, **kwargs)
             if role == "user" and not parked["done"]:
                 parked["done"] = True
                 ready.set()
                 await asyncio.sleep(3600)
             return result
 
-        monkeypatch.setattr(store, "append_message", slow_append)
+        monkeypatch.setattr(store, "_append_authorized", slow_append)
         request = _cancel_request()
         if streaming:
             endpoint = lambda: chat_module.send_message_stream(
