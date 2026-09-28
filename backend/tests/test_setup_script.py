@@ -4,15 +4,22 @@ setup.sh repairs an upgraded host's backend/.env in two steps: it appends the
 shipped default when the key is missing, and warns when the operator has forced
 the header to be trusted. The warning is a safety net -- a forced-true value
 means X-Forwarded-For is trusted from any peer, so a client reaching :8001
-directly can forge it to dodge a rate limit -- so it has to fire for every
-spelling the application itself reads as forced-true, not just the literal
-"true". Missing one means the operator gets the forgeable posture with no
-warning at all.
+directly can forge it to dodge a rate limit (#245) -- so it has to fire for
+every line an operator can write that the application itself reads as
+forced-true, not just the literal `KEY=true`.
 
-The pattern is extracted from setup.sh and run through real grep, so these
-tests cannot drift away from the script they are policing, and the expected
-set is derived from config._env_tristate rather than restated here, so changing
-the parser's truthy set turns this file red until setup.sh is updated too.
+The guard is EXECUTED here, not read out of the source and handed to grep.
+That is the mistake this section used to make, and it is why #388 survived: the
+regex was matched against candidates built as f"{FLAG}={value}", which cannot
+express a quoted value or a blank around the `=`, so a guard that matched
+nothing for those shapes still passed every test. `migrate_xff_trust` is
+therefore extracted verbatim and run against a throwaway .env, and what is
+asserted is the operator's stderr and the bytes left in their file.
+
+The expected answer is derived from what python-dotenv (the parser
+app/config.py reads .env with) and config._env_tristate make of the same line,
+so the script and the application cannot each hold their own idea of "forced
+true", in either direction.
 """
 
 import json
@@ -20,10 +27,12 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from itertools import product
 from pathlib import Path
 
 import pytest
+from dotenv import dotenv_values
 
 from app.config import _FALSE_SPELLINGS, _TRUE_SPELLINGS, _env_tristate
 
@@ -81,124 +90,307 @@ def _ecosystem_app(service: str) -> dict:
 
 # The key the migration repairs, and the value it appends when absent.
 FLAG = "AUTH_TRUST_X_FORWARDED_FOR"
+# The shell function that carries the whole repair. Named here so a rename in
+# setup.sh fails in one place with a message that says what broke.
+XFF_FUNCTION = "migrate_xff_trust"
+
 SHIPPED_DEFAULT = "auto"
+APPEND_LINE = f"{FLAG}={SHIPPED_DEFAULT}"
 
-# Spellings grouped by what _env_tristate does with them. The truthy group is
-# what the warning must cover; the others must stay silent.
-TRUTHY_SPELLINGS = ("1", "true", "yes", "on")
-FALSY_SPELLINGS = ("0", "false", "no", "off")
-SILENT_SPELLINGS = ("auto", "", "maybe", "1 2", "yes-no")
+# Every way an operator writes the key that python-dotenv resolves to the same
+# assignment. Each one reaches config._env_tristate as a forced True -- which
+# every test below proves against the parser rather than taking it on trust --
+# and each one has to warn. The bare form is the only SHAPE the pre-#388 guard
+# matched at all -- the truthy spellings and the case variants around it were
+# already covered, and were never the gap. Everything below it is a way of
+# writing the same assignment that the application reads as a forced True and
+# the guard did not, which is the forgeable posture with no signal anywhere.
+FORCED_TRUE_LINES = [
+    f"{FLAG}=true",
+    f'{FLAG}="true"',
+    f"{FLAG}='true'",
+    f"{FLAG} = true",
+    f"{FLAG}= true",
+    f"{FLAG} =true",
+    f'{FLAG} = "true"',
+    f"export {FLAG}=true",
+    f'export {FLAG} = "yes"',
+    f"\t{FLAG}=on",
+    f"  {FLAG} = 1  ",
+    f"{FLAG}=TRUE",
+    f"{FLAG}=On",
+    f'{FLAG}=" true "',
+    f"{FLAG}=true # forced",
+    f'{FLAG}="true" # forced',
+    f"{FLAG}=true\r",
+]
+
+# Shapes that carry the key but not a forced true. Each has to stay silent: a
+# warning the operator cannot act on is a warning they learn to ignore. The
+# last four are the precision cases -- dotenv either refuses the line outright
+# or keeps the punctuation as part of the value, so none of them is a forced
+# True and a guard loose enough to match them is warning about a posture the
+# operator is not in.
+KEY_PRESENT_SILENT_LINES = [
+    f"{FLAG}=auto",
+    f"{FLAG}=false",
+    f"{FLAG}=0",
+    f"{FLAG}=",
+    f"{FLAG}=maybe",
+    f"{FLAG}=1 2",
+    f"{FLAG}=truee",
+    f"{FLAG}=true#note",
+    f"{FLAG} = auto",
+    f'export {FLAG}="false"',
+    f'{FLAG}="true',  # unterminated: python-dotenv cannot parse the line
+    f"{FLAG}=true\"",  # the quote is part of the value, so the value is 'true"'
+    f"{FLAG}=\"true'",  # mismatched quotes: a parse error, not a forced true
+]
+
+# Lines with no assignment to our key at all. The key is absent here, which is
+# the one case setup.sh is allowed to write to: a .env that predates the per-IP
+# rate limits has no trust setting, and every proxied request then keys on the
+# nginx peer. A commented-out line is the operator's own off switch and must
+# read as absent, or commenting it out would do nothing.
+KEY_ABSENT_LINES = [
+    f"# {FLAG}=true",
+    f"  # {FLAG} = \"true\"",
+    f"{FLAG}_MAX=1",
+    f"{FLAG}_URL=https://example.invalid",
+    "SOME_OTHER_SETTING=1",
+]
+
+# Templates for the spelling sweep below. The value half of the guard is one
+# alternation and the assignment half is a separate pattern built in front of
+# it, so the sweep has to cross the two: three value forms (bare, double
+# quoted, single quoted) against a plain, a spaced, an exported and a
+# comment-tailed assignment.
+LINE_TEMPLATES = [
+    "{key}={value}",
+    '{key}="{value}"',
+    "{key}='{value}'",
+    "{key} = {value}",
+    'export {key} = "{value}"',
+    "{key}={value} # note",
+]
 
 
-def _guard_flags():
-    """The -i/-E flags and the regex the warning branch of setup.sh greps with.
+def _xff_function() -> str:
+    """setup.sh's `migrate_xff_trust`, verbatim, or a loud failure.
 
-    Read out of the script rather than duplicated, so fixing the script is what
-    makes these tests pass. Fails loudly if the branch moves or is renamed.
-    """
-    script = SETUP_SH.read_text()
-    match = re.search(
-        r"^\s*elif grep (?P<flags>-q[a-zA-Z]*) '(?P<pattern>[^']+)' \"\$ENV_FILE\"; then$",
-        script,
-        re.MULTILINE,
+    These tests run the function rather than a copy of its regex, so a rename,
+    a move or a deletion has to be answered here rather than leaving a test
+    that greps a pattern nothing calls.
+ """
+    source = SETUP_SH.read_text()
+    assert f"{XFF_FUNCTION}() {{" in source, (
+        f"setup.sh no longer defines {XFF_FUNCTION}(), so the forced-true "
+        "warning has nowhere to live; the tests in this section EXECUTE it"
     )
-    assert match, f"could not find the {FLAG} warning guard in {SETUP_SH}"
-    assert FLAG in match.group("pattern"), "the guard must key on the flag it repairs"
-    return match.group("flags"), match.group("pattern")
+    return _extract_function(XFF_FUNCTION)
 
 
-def _warns(env_line, flags, pattern):
-    """Run the real grep against a one-line .env and report whether it matches."""
-    if env_line is not None:
-        contents = f"{env_line}\n"
-    else:
-        contents = "SOME_OTHER_SETTING=1\n"  # key absent
+XFF_HARNESS = """\
+@FUNCTION@
+
+# One candidate per line on stdin, in order. Each gets a .env holding exactly
+# that line and the real function, and reports what the operator would see:
+# warned or not, and whether their file came back byte-identical.
+dir=$(mktemp -d)
+count=0
+while IFS= read -r line || [ -n "$line" ]; do
+    count=$((count + 1))
+    printf '%s\\n' "$line" > "$dir/$count.line"
+done
+
+probe() {
+    local i=$1 line after verdict touched
+    IFS= read -r line < "$dir/$i.line"
+    printf '%s\\n' "$line" > "$dir/$i.env"
+    migrate_xff_trust "$dir/$i.env" 2> "$dir/$i.err" > /dev/null
+    if [ -s "$dir/$i.err" ]; then verdict=warn; else verdict=silent; fi
+    # `$(<file)`, not `read`: read stops at the first newline, so an APPENDED
+    # second line would compare equal and every probe would report the
+    # operator's file as untouched -- which is precisely the write this has to
+    # catch, since the presence check missing a shape is what let setup.sh
+    # append `=auto` under a forced true. `$(<file)` is a bash builtin, so
+    # reading the whole file costs no fork.
+    after="$(<"$dir/$i.env")"
+    if [ "$after" = "$line" ]; then touched=untouched; else touched=rewritten; fi
+    printf '%s %s\\n' "$verdict" "$touched" > "$dir/$i.res"
+}
+
+# The sweep below runs tens of thousands of probes, and each one is two grep
+# processes. Spread them over a few workers so the check stays cheap enough to
+# keep exhaustive; the results are written per candidate and printed in order,
+# so the parallelism cannot reorder the answer.
+worker=1
+while [ "$worker" -le "@WORKERS@" ]; do
+    (
+        i=$worker
+        while [ "$i" -le "$count" ]; do
+            probe "$i"
+            i=$((i + @WORKERS@))
+        done
+    ) &
+    worker=$((worker + 1))
+done
+wait
+
+i=1
+while [ "$i" -le "$count" ]; do
+    IFS= read -r result < "$dir/$i.res"
+    printf '%s\\n' "$result"
+    i=$((i + 1))
+done
+rm -rf "$dir"
+"""
+
+
+def run_xff_guard(candidates, workers=8):
+    """Run the real guard against one throwaway .env per candidate line.
+
+    Returns one ``(warned, untouched, line)`` per candidate, in order. A single
+    bash process handles the whole batch so a sweep of the spelling space costs
+    one interpreter rather than thousands.
+ """
+    harness = (
+        XFF_HARNESS.replace("@FUNCTION@", _xff_function()).replace("@WORKERS@", str(workers))
+    )
     proc = subprocess.run(
-        ["grep", flags, "-e", pattern],
-        input=contents,
+        ["bash", "-c", harness],
+        input="".join(f"{line}\n" for line in candidates),
         capture_output=True,
         text=True,
+        timeout=900,
         check=False,
     )
-    # grep exits 0 on match, 1 on no match, >1 on a usage error.
-    assert proc.returncode in (0, 1), f"grep failed: {proc.returncode} {proc.stderr}"
-    return proc.returncode == 0
+    assert proc.returncode == 0, f"the {XFF_FUNCTION} harness failed:\n{proc.stderr}"
+    results = [line.split() for line in proc.stdout.splitlines()]
+    assert len(results) == len(candidates), (
+        f"the harness answered {len(results)} of {len(candidates)} candidates"
+    )
+    return [
+        (verdict == "warn", touched == "untouched", line)
+        for (verdict, touched), line in zip(results, candidates)
+    ]
 
 
-@pytest.mark.parametrize("value", TRUTHY_SPELLINGS)
-def test_warning_guard_matches_every_forced_true_spelling(value):
-    """1/true/yes/on all force trust, so all must warn.
+def _config_reads_as_forced_true(line: str) -> bool:
+    """What app.config makes of this .env LINE, through the parser it uses.
 
-    This is the defect: matching only the literal "true" left an operator who
-    wrote "1" or "yes" in the forgeable posture with nothing printed.
-    """
-    flags, pattern = _guard_flags()
-    assert _warns(f"{FLAG}={value}", flags, pattern), f"forced-true {value!r} did not warn"
-
-
-@pytest.mark.parametrize("value", ["TRUE", "True", "YES", "On", f"  {TRUTHY_SPELLINGS[1]}  "])
-def test_warning_guard_is_case_and_whitespace_insensitive(value):
-    """_env_tristate strips and lowercases before matching, so the guard must too."""
-    flags, pattern = _guard_flags()
-    assert _warns(f"{FLAG}={value}", flags, pattern), f"{value!r} did not warn"
-
-
-@pytest.mark.parametrize("value", FALSY_SPELLINGS + SILENT_SPELLINGS)
-def test_warning_guard_stays_silent_for_everything_else(value):
-    """A falsy value is a deliberate local/direct choice and 'auto' is the new
-    default; neither is the forgeable posture, so neither should nag."""
-    flags, pattern = _guard_flags()
-    assert not _warns(f"{FLAG}={value}", flags, pattern), f"{value!r} wrongly warned"
-
-
-def test_warning_guard_stays_silent_when_the_key_is_absent():
-    """An absent key is the case setup.sh appends to, not one it warns about."""
-    flags, pattern = _guard_flags()
-    assert not _warns(None, flags, pattern)
+    The line is written to a real file and read back with python-dotenv -- the
+    parser `load_dotenv()` uses, and the thing that strips the quotes, the
+    `export` prefix and the blanks around the `=` before any value reaches
+    `_env_tristate`. Asking about a LINE rather than about a value is the whole
+    point: a value cannot be spelled two ways, and a test that only ever builds
+    `f"{FLAG}={value}"` cannot see a shape the guard is missing.
+ """
+    with tempfile.TemporaryDirectory() as tmp:
+        env_file = Path(tmp) / ".env"
+        env_file.write_text(line + "\n", encoding="utf-8")
+        value = dotenv_values(env_file).get(FLAG)
+    previous = os.environ.pop(FLAG, None)
+    try:
+        if value is not None:
+            os.environ[FLAG] = value
+        return _env_tristate(FLAG) is True
+    finally:
+        os.environ.pop(FLAG, None)
+        if previous is not None:
+            os.environ[FLAG] = previous
 
 
-def test_guard_covers_exactly_the_spellings_the_parser_calls_true():
-    """The guard and the parser must agree, or the warning covers the wrong set.
+@pytest.mark.parametrize("line", FORCED_TRUE_LINES)
+def test_every_forced_true_line_shape_warns(line):
+    """A forced True in any shape is the #245 posture, so all of them warn.
 
-    Driven off _env_tristate itself: widen or narrow the parser's truthy set and
-    this fails until setup.sh follows, which is the point -- the script and the
-    application cannot each maintain their own idea of "forced true".
-    """
-    flags, pattern = _guard_flags()
-    for candidate in TRUTHY_SPELLINGS + FALSY_SPELLINGS + SILENT_SPELLINGS:
-        # Drive the real parser by putting the value in the environment.
-        old = os.environ.get(FLAG)
-        os.environ[FLAG] = candidate
-        try:
-            truthy = _env_tristate(FLAG) is True
-        finally:
-            if old is None:
-                os.environ.pop(FLAG, None)
-            else:
-                os.environ[FLAG] = old
-        assert _warns(f"{FLAG}={candidate}", flags, pattern) is truthy, (
-            f"{candidate!r}: parser says truthy={truthy}, but the guard disagrees"
-        )
+    The value half of this was covered before #388 and `KEY=1` / `KEY=yes` were
+    the fix; the shape half was not, and `KEY="true"` reached the application
+    as a forced True while the guard matched nothing at all.
+ """
+    (warned, untouched, _), = run_xff_guard([line])
+    assert _config_reads_as_forced_true(line), (
+        f"{line!r} is not a forced true to the app, so it is not this test's case"
+    )
+    assert warned, f"the operator wrote {line!r} and setup.sh warned about nothing"
+    assert untouched, f"setup.sh must not touch an operator's value: {line!r}"
 
 
-def _guard_matches(flags, pattern, values):
-    """The values in ``values`` the guard's regex actually matches, in one grep.
+def test_the_quoted_and_spaced_lines_of_issue_388_warn():
+    """The three rows of the issue's table, end to end.
 
-    A single invocation over a whole candidate space, because the point of this
-    check is breadth: spawning grep per value would make an exhaustive sweep
-    too slow to keep, and a check too slow to keep is a check that gets
-    narrowed. ``-q`` is dropped because the matched lines are the answer here.
-    """
-    candidates = [f"{FLAG}={v}" for v in values]
+    `AUTH_TRUST_X_FORWARDED_FOR="true"` and `AUTH_TRUST_X_FORWARDED_FOR = true`
+    are read as a forced True by the application and matched by nothing in the
+    script, which is a warning that fires only for the spelling nobody bothers
+    to write. Asserted as a unit because these two rows are the reported
+    defect; the parametrized test above carries the rest of the shapes.
+ """
+    lines = [f"{FLAG}=true", f'{FLAG}="true"', f"{FLAG} = true"]
+    results = run_xff_guard(lines)
+    assert [warned for warned, _, _ in results] == [True, True, True], results
+    assert all(_config_reads_as_forced_true(line) for line in lines), (
+        "the app no longer reads any of these as a forced true; this test's "
+        "premise has changed and the shapes need re-measuring"
+    )
+
+
+@pytest.mark.parametrize("line", KEY_PRESENT_SILENT_LINES)
+def test_a_value_that_is_not_a_forced_true_stays_silent(line):
+    """`auto`, a falsy spelling and a typo are not the forgeable posture.
+
+    A warning the operator cannot act on trains them to skip the one that
+    matters, and the last four here are the precision cases: python-dotenv
+    either refuses the line or keeps the punctuation as part of the value, so a
+    guard that matched them would be warning about a posture nobody is in.
+ """
+    (warned, untouched, _), = run_xff_guard([line])
+    assert not _config_reads_as_forced_true(line), (
+        f"{line!r} IS a forced true to the app; move it to FORCED_TRUE_LINES"
+    )
+    assert not warned, f"setup.sh warned about {line!r}, which is not a forced true"
+    assert untouched, f"setup.sh rewrote the operator's value: {line!r}"
+
+
+@pytest.mark.parametrize("line", KEY_ABSENT_LINES)
+def test_a_missing_key_is_appended_once_and_never_warned_about(line, tmp_path):
+    """The absent case is the one case setup.sh may write to.
+
+    A .env that predates the per-IP rate limits has no trust setting at all, so
+    every proxied request keys on the nginx peer and the whole site shares one
+    rate-limit bucket; appending the shipped default is what closes that. Run
+    twice, because a presence check that keeps missing appends a second
+    `=auto` on every deploy, and python-dotenv resolves a repeated key to the
+    last one -- so the operator who later forces the value finds it reset with
+    no warning. A commented-out line and a longer key that starts the same way
+    both read as absent, and commenting the knob out is how an operator turns
+    it off, so it has to keep reading that way.
+ """
+    env_file = tmp_path / ".env"
+    env_file.write_text(line + "\n", encoding="utf-8", newline="\n")
+    script = "\n".join(
+        [
+            _xff_function(),
+            f'{XFF_FUNCTION} "$ENV_FILE"',
+            f'{XFF_FUNCTION} "$ENV_FILE"',
+        ]
+    )
     proc = subprocess.run(
-        ["grep", flags.replace("q", ""), "-e", pattern],
-        input="\n".join(candidates) + "\n",
+        ["bash", "-c", script],
+        env={**os.environ, "ENV_FILE": str(env_file)},
         capture_output=True,
         text=True,
+        timeout=60,
         check=False,
     )
-    assert proc.returncode in (0, 1), f"grep failed: {proc.returncode} {proc.stderr}"
-    return {line.split("=", 1)[1] for line in proc.stdout.splitlines()}
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == "", (
+        f"setup.sh warned about a .env with no {FLAG} assignment: {line!r}\n{proc.stderr}"
+    )
+    assert env_file.read_text(encoding="utf-8").splitlines() == [line, APPEND_LINE], (
+        f"setup.sh must append {APPEND_LINE} exactly once and leave the "
+        f"operator's line alone, got {env_file.read_text(encoding='utf-8').splitlines()}"
+    )
 
 
 def _candidate_spellings():
@@ -211,7 +403,7 @@ def _candidate_spellings():
     X-Forwarded-For to be trusted from any peer (#245), and the operator would
     get that posture with no warning anywhere. This space is built to contain
     whatever the parser is asked about, so the comparison is symmetric.
-    """
+ """
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 -_."
     # Every one- and two-character token: that already contains every spelling
     # a person would write, plus all the near-misses worth a warning.
@@ -229,34 +421,39 @@ def _candidate_spellings():
 
 
 def test_guard_and_parser_agree_on_every_spelling_in_both_directions():
-    """setup.sh's regex must match precisely the values config reads as True.
+    """setup.sh's guard must match precisely the values config reads as True.
 
     Bidirectional, because either drift is a defect and in opposite directions:
 
-    * the parser is widened (a spelling becomes forced-True) and the regex is
+    * the parser is widened (a spelling becomes forced-True) and the guard is
       not, so the operator is left trusting X-Forwarded-For from any peer with
       no warning;
-    * the regex is widened, so the operator is nagged about a posture they are
+    * the guard is widened, so the operator is nagged about a posture they are
       not in, and a working setup.sh grows a warning nobody can act on.
 
-    Derived from ``_TRUE_SPELLINGS`` -- the set ``_env_tristate`` itself reads --
-    rather than from the literals at the top of this file, so the two files
-    cannot each hold their own idea of "forced true".
-    """
-    flags, pattern = _guard_flags()
-    assert "i" in flags, (
-        f"the guard greps with {flags!r}, so it is case-sensitive while "
-        f"_env_tristate lowercases first; the two can never agree"
-    )
-    candidates = _candidate_spellings()
-    matched = _guard_matches(flags, pattern, candidates)
-    expected = {v for v in candidates if v.strip().lower() in _TRUE_SPELLINGS}
-    assert matched == expected, (
-        f"setup.sh's forced-true warning and config's truthy set disagree.\n"
-        f"  the regex matches but config does not read as True: "
-        f"{sorted(matched - expected)}\n"
-        f"  config reads as True but the regex does not match (a forced-True "
-        f"with no warning, see #245): {sorted(expected - matched)}\n"
+    Derived from ``_env_tristate`` reading a line through python-dotenv -- the
+    same two steps app/config.py performs -- rather than from the literals at
+    the top of this file, so neither the script nor the application can hold
+    its own idea of "forced true", and crossed with the line shapes above so
+    the answer is a statement about .env files rather than about values.
+ """
+    candidates = [
+        template.format(key=FLAG, value=value)
+        for template in LINE_TEMPLATES
+        for value in _candidate_spellings()
+    ]
+    results = run_xff_guard(candidates)
+    wrong_way = [
+        line for warned, _, line in results if warned and not _config_reads_as_forced_true(line)
+    ]
+    missing = [
+        line for warned, _, line in results if not warned and _config_reads_as_forced_true(line)
+    ]
+    assert not wrong_way and not missing, (
+        f"setup.sh's forced-true warning and config's truthy set disagree over "
+        f"{len(candidates)} lines.\n"
+        f"  warns but config does not read a forced True: {sorted(wrong_way)[:20]}\n"
+        f"  a forced True with no warning, see #245: {sorted(missing)[:20]}\n"
         f"  truthy spellings are {sorted(_TRUE_SPELLINGS)}"
     )
 
@@ -264,50 +461,41 @@ def test_guard_and_parser_agree_on_every_spelling_in_both_directions():
 def test_the_parser_and_the_guard_share_one_spelling_set():
     """The application must not be the only side with a list of its own.
 
-    ``_env_bool`` and ``_env_tristate`` read the same ``_TRUE_SPELLINGS``; this
-    pins that the shared set is the one the guard is checked against, so
-    introducing a second convention for the same question fails here.
-    """
-
+    ``_env_bool`` and ``_env_tristate`` read the same ``_TRUE_SPELLINGS``, and
+    setup.sh's guard is a third copy of it in a language that cannot import the
+    first two -- it runs before the venv is guaranteed to exist. That is a real
+    coupling, so it is pinned here rather than left to a comment in the shell:
+    every spelling the module calls true has to be one the guard warns about,
+    in every shape a forced true can be written.
+ """
     assert not _TRUE_SPELLINGS & _FALSE_SPELLINGS
-    flags, pattern = _guard_flags()
-    assert _warns(f"{FLAG}=1", flags, pattern)
-    for spelling in _TRUE_SPELLINGS:
-        assert _warns(f"{FLAG}={spelling}", flags, pattern), spelling
-
-
-def test_missing_key_is_appended_and_an_existing_value_is_never_rewritten():
-    """The migration only ever appends, and only when the key is absent.
-
-    Rewriting an operator's value would break the supported "proxy on another
-    host" deployment, which is exactly what a forced-true setting is for.
-    """
-    lines = [line.strip() for line in SETUP_SH.read_text().splitlines()]
-    append_line = f'echo "{FLAG}={SHIPPED_DEFAULT}" >> "$ENV_FILE"'
-    assert append_line in lines, "setup.sh should append the shipped default when the key is absent"
-
-    # The append must sit inside a presence check on the key, so it cannot run
-    # for a value the operator already set.
-    at = lines.index(append_line)
-    opener = lines[at - 1]
-    assert opener.startswith("if ! grep -q ") and f"^{FLAG}=" in opener, (
-        f"the append must be guarded by a presence check on the key, got: {opener!r}"
-    )
-
-    # And nothing anywhere may rewrite an operator's value in place: silently
-    # downgrading a forced-true would break the supported "proxy on another
-    # host" deployment, which is exactly what a forced-true setting is for.
-    # Only the guarded append may write to $ENV_FILE, and nothing may sed it in
-    # place. (The warning lines mention the flag and >&2, so they are excluded
-    # by requiring a write to $ENV_FILE or a sed.)
-    writes = [
-        line
-        for line in lines
-        if FLAG in line and ("sed -i" in line or ('"$ENV_FILE"' in line and ">>" in line))
+    candidates = [
+        template.format(key=FLAG, value=spelling)
+        for template in LINE_TEMPLATES
+        for spelling in sorted(_TRUE_SPELLINGS)
     ]
-    for line in writes:
-        assert line == append_line, f"setup.sh must not rewrite the operator's value: {line!r}"
+    for warned, _, line in run_xff_guard(candidates):
+        assert warned, f"setup.sh does not warn about {line!r}"
 
+
+def test_run_backend_still_calls_the_migration():
+    """A guard nothing calls prints nothing.
+
+    The rest of this section executes `migrate_xff_trust` directly, which says
+    nothing about whether the backend stage reaches it, so the call site is
+    checked here. The value is passed on, not read from a global, because a
+    function that reaches into `$ENV_FILE` cannot be run against a throwaway
+    file at all.
+ """
+    source = SETUP_SH.read_text()
+    body = re.search(
+        r"^run_backend\(\) \{\n(?P<body>.*?)\n\}", source, re.MULTILINE | re.DOTALL
+    )
+    assert body, "could not find run_backend() in setup.sh"
+    assert re.search(rf'^\s*{XFF_FUNCTION} "\$ENV_FILE"$', body.group("body"), re.MULTILINE), (
+        f"run_backend() never calls {XFF_FUNCTION} \"$ENV_FILE\", so the .env it "
+        "just created is never repaired and never warned about"
+    )
 
 
 

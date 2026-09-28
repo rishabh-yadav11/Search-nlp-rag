@@ -552,6 +552,76 @@ run_deps() {
     ensure_node
 }
 
+# Repair the AUTH_TRUST_X_FORWARDED_FOR line in a backend .env: append the
+# shipped default when the key is absent, warn when the operator has forced the
+# header to be trusted from any peer.
+#
+# A forced True is a legitimate setting -- it is what a host whose reverse proxy
+# runs on another host needs -- so nothing here ever rewrites a value. The
+# warning is the point of the branch: with the header trusted from ANY peer, a
+# client that reaches the API port directly can forge its rate-limit bucket
+# (#245), and this is the only place an operator is ever told.
+#
+# Both greps match the line SHAPE python-dotenv accepts, not "KEY=value" and
+# nothing else. The application reads .env through load_dotenv (app/config.py),
+# which strips an `export` prefix, blanks around the `=` and the quotes around
+# a value before the value ever reaches config._env_tristate -- so
+# `AUTH_TRUST_X_FORWARDED_FOR = "true"` is a forced True in the app while a
+# guard anchored at `^AUTH_TRUST_X_FORWARDED_FOR=` sees no key at all. That is
+# not merely a missing warning. The presence check missed the same shape, so
+# the script appended a SECOND `AUTH_TRUST_X_FORWARDED_FOR=auto`; python-dotenv
+# resolves a repeated key to the last one, so the operator's forced True was
+# silently downgraded on every run, into the branch that was supposed to warn
+# about it, which never ran.
+#
+# The spellings in the three value patterns are config._TRUE_SPELLINGS and they
+# have to be: that set is the definition of a forced True, and
+# backend/tests/test_setup_script.py fails if the two disagree in EITHER
+# direction -- a value that forces trust unmentioned, and a posture the
+# operator is not actually in. This is a copy in shell rather than an import
+# because it runs before the venv is guaranteed to exist, so the test is what
+# holds the copy to the set. Scope: ASCII whitespace only. A POSIX bracket
+# expression is ASCII in GNU grep under the C locale and under a UTF-8 one
+# alike (measured on this host), so a value padded with U+00A0 is still read as
+# a forced True by config and is still not matched here.
+migrate_xff_trust() {
+    local env_file="$1"
+    # KEY= in every shape load_dotenv accepts: leading blanks, an optional
+    # `export`, blanks around the `=`.
+    local assignment='^[[:space:]]*(export[[:space:]]+)?AUTH_TRUST_X_FORWARDED_FOR[[:space:]]*='
+    # The value in the three forms that mean a forced True: bare, double quoted,
+    # single quoted. The two quotes must match -- `"true'` is a dotenv parse
+    # error rather than a forced True, and a guard that matched it would be
+    # warning about a posture the operator is not in. dotenv also allows a
+    # trailing comment, after at least one blank on a bare value and after
+    # none inside quotes, so the two tails differ.
+    # `.` and not `[^\r\n]`: a backslash inside a POSIX bracket expression is a
+    # literal, so that class excluded `r` and `n` as well and every comment
+    # containing a word stopped matching.
+    local bare="$assignment[[:space:]]*(1|true|yes|on)([[:space:]]+#.*)?[[:space:]]*$"
+    local double_quoted="$assignment[[:space:]]*\"[[:space:]]*(1|true|yes|on)[[:space:]]*\"([[:space:]]*#.*)?[[:space:]]*$"
+    local single_quoted="$assignment[[:space:]]*'[[:space:]]*(1|true|yes|on)[[:space:]]*'([[:space:]]*#.*)?[[:space:]]*$"
+
+    if ! grep -qE "$assignment" "$env_file"; then
+        echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$env_file"
+    elif grep -qiE -e "$bare" -e "$double_quoted" -e "$single_quoted" "$env_file"; then
+        # Warn, never rewrite. A forced True is the correct setting when the
+        # proxy runs on ANOTHER host, and silently downgrading it to 'auto'
+        # would collapse exactly that deployment back into the single-bucket
+        # outage. Such a host is already rate-limiting per IP correctly; its
+        # residual risk is that the header is trusted from ANY peer, which only
+        # matters when :8001 is also reachable directly (gunicorn binds
+        # 0.0.0.0 -- see issue #245). 'auto' closes that and is safe whenever
+        # the proxy is on this host, but the operator's value is theirs.
+        echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR is set to a forced-true value" >&2
+        echo "         (1/true/yes/on), which trusts X-Forwarded-For from ANY" >&2
+        echo "         peer, so a client reaching :8001 directly can forge it to" >&2
+        echo "         dodge a rate limit. Set it to 'auto' (the new default) if" >&2
+        echo "         your reverse proxy runs on this host; keep it forced if the" >&2
+        echo "         proxy runs on another host." >&2
+    fi
+}
+
 run_backend() {
     stage "backend"
     check_python python3
@@ -627,29 +697,11 @@ run_backend() {
     # Per-IP rate limiting keys on the client IP, which behind nginx comes from
     # X-Forwarded-For. An .env that predates the per-IP public rate limits has
     # no trust setting at all, so every proxied request keys on the nginx peer
-    # (127.0.0.1) and the whole site shares one rate-limit bucket. Append the
-    # shipped default in that one case.
-    if ! grep -q '^AUTH_TRUST_X_FORWARDED_FOR=' "$ENV_FILE"; then
-        echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$ENV_FILE"
-    elif grep -qiE '^AUTH_TRUST_X_FORWARDED_FOR=[[:space:]]*(1|true|yes|on)[[:space:]]*$' "$ENV_FILE"; then
-        # The spellings above are exactly the ones config._env_tristate reads as
-        # a forced True, so this warning covers every value that leaves the
-        # header trusted from any peer -- not just the literal "true".
-        # Warn, never rewrite. A forced True is the correct setting when the
-        # proxy runs on ANOTHER host, and silently downgrading it to 'auto'
-        # would collapse exactly that deployment back into the single-bucket
-        # outage. Such a host is already rate-limiting per IP correctly; its
-        # residual risk is that the header is trusted from ANY peer, which only
-        # matters when :8001 is also reachable directly (gunicorn binds
-        # 0.0.0.0 -- see issue #245). 'auto' closes that and is safe whenever
-        # the proxy is on this host, but the operator's value is theirs.
-        echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR is set to a forced-true value" >&2
-        echo "         (1/true/yes/on), which trusts X-Forwarded-For from ANY" >&2
-        echo "         peer, so a client reaching :8001 directly can forge it to" >&2
-        echo "         dodge a rate limit. Set it to 'auto' (the new default) if" >&2
-        echo "         your reverse proxy runs on this host; keep it forced if the" >&2
-        echo "         proxy runs on another host." >&2
-    fi
+    # (127.0.0.1) and the whole site shares one rate-limit bucket.
+    # migrate_xff_trust appends the shipped default in that one case and warns
+    # when the operator has forced the header to be trusted; the reasoning, and
+    # the line shapes it has to recognise, live with the function.
+    migrate_xff_trust "$ENV_FILE"
     echo "backend ready"
     harden_permissions
 }
