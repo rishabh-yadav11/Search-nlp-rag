@@ -24,7 +24,7 @@ from itertools import islice
 import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.auth import require_auth, require_permission
 from app.config import config
@@ -125,7 +125,15 @@ class SessionStatsOut(BaseModel):
 
 
 class MessageIn(BaseModel):
-    content: str
+    # The length bound belongs to the model, not to one route's validation
+    # helper: a helper is a bound the next route forgets to call. Declared
+    # here it covers the two message routes, the SSE stream and the session
+    # rename at once, and any route added later inherits it. Over the limit
+    # the request is REJECTED with a 422 naming the field, never truncated --
+    # a silently shortened question is answered as though it were the whole
+    # one. MAX_CONTENT_LEN is the same bound the service has always applied to
+    # a chat message, now enforced before the handler runs (#350).
+    content: str = Field(max_length=MAX_CONTENT_LEN)
 
 
 class TurnOut(BaseModel):
@@ -2192,11 +2200,11 @@ def _require_store() -> ChatStore:
 
 
 def _validate_question(body: MessageIn) -> str:
+    """Normalise an accepted message. The length bound is ``MessageIn``'s own
+    (see the model), so an oversized message never reaches this function."""
     question = (body.content or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="empty message")
-    if len(question) > MAX_CONTENT_LEN:
-        raise HTTPException(status_code=400, detail=f"message too long (max {MAX_CONTENT_LEN} chars)")
     return question
 
 
