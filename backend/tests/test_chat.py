@@ -3501,6 +3501,73 @@ def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypa
         _run(chat_store.close())
 
 
+def _delete_mid_turn_scenario(tmp_path, monkeypatch, delete_after_deltas):
+    """Drive an SSE turn whose conversation is deleted while it is in flight.
+
+    `delete_after_deltas` picks the side of the abort rule that matters: False
+    deletes before any delta is streamed, True deletes once the client is
+    already showing text. Both must end the same way -- a closed stream
+    carrying an `error` event -- because the conversation is gone and there is
+    nothing left to roll back or persist (#358).
+
+    Returns the raw response body, which the caller inspects: the assertion
+    under test is what the CLIENT sees, so a body that cannot even be collected
+    (the pre-fix behaviour, where the escaping 404 aborted the response) fails
+    the test by raising out of _stream_body.
+    """
+    client, chat_store, auth_store = _make_client(tmp_path)
+    try:
+        h = _auth_headers(auth_store)
+        sid = client.post("/api/chat/sessions", headers=h).json()["id"]
+        user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
+
+        async def fake_prepare(question, history):
+            return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
+
+        async def fake_stream(client_, prompt, model, usage_holder=None, system_prompt=None):
+            if not delete_after_deltas:
+                await chat_store.delete_session(sid, user_id)
+            yield "first chunk "
+            if delete_after_deltas:
+                await chat_store.delete_session(sid, user_id)
+            yield "second chunk"
+            if usage_holder is not None:
+                usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
+
+        _pin_budget_disabled(monkeypatch)
+        monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
+        monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
+
+        return _stream_body(client, h, sid, "Who invested in fintech?")
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+
+@pytest.mark.parametrize("delete_after_deltas", [False, True], ids=["before_any_delta", "after_first_delta"])
+def test_stream_conversation_deleted_mid_turn_closes_with_error_event(tmp_path, monkeypatch, delete_after_deltas):
+    """Deleting the conversation mid-turn must not break the stream (#358).
+
+    The turn's final write is the assistant append, and once the conversation
+    is gone that write raises 404. That failure lands in the catch-all handler,
+    which called fail_turn() -- and fail_turn() re-entered the very write that
+    had just failed and re-raised, so the exception escaped the generator and
+    Starlette's task group surfaced it as an ExceptionGroup. Headers were
+    already sent, so the client just saw the response break with no terminal
+    event at all.
+
+    A deleted conversation is a non-event: there is no row to roll back and
+    nowhere to store the partial turn, so the stream must close the way every
+    other turn failure does -- with a terminal `error` event."""
+    body = _delete_mid_turn_scenario(tmp_path, monkeypatch, delete_after_deltas)
+
+    assert "event: start" in body
+    assert "event: error" in body
+    # A deleted conversation can never yield a completed turn, and the bytes
+    # already on the wire must not be reported as a stored answer.
+    assert "event: done" not in body
+
+
 def test_send_message_disconnect_rolls_back_without_assistant(tmp_path, monkeypatch):
     """The non-stream path never checked the client at all. A JSON client
     receives nothing until the turn is persisted, so a disconnect is a clean
