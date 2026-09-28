@@ -1461,9 +1461,9 @@ def test_lifespan_teardown_survives_a_broken_step(monkeypatch, caplog, faulty, k
     assert faulty in caplog.text
     if kind == "hang" and faulty in _TASK_STEPS:
         # A hanging background task is abandoned by the inner asyncio.wait
-        # budget inside _cancel_and_wait. If that budget were ever loosened
-        # past the outer one, the outer wait_for would cancel the step first
-        # instead -- and since CancelledError is a BaseException the step
-        # guard does not swallow, every later step would be skipped with no
-        # warning at all. This pins which bound actually fired.
+        # budget inside _cancel_and_wait. Loosening that budget past the outer
+        # one makes the outer wait_for fire first, so the step is reported as a
+        # generic close timeout and this line never appears -- which is how the
+        # halving stays pinned. Teardown would still reach the later steps;
+        # what changes is that the refusal goes unreported.
         assert "ignored cancellation" in caplog.text

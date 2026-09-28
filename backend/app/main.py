@@ -371,12 +371,20 @@ async def _cancel_and_wait(resource_name: str, task: asyncio.Task) -> None:
     one step and every later resource is still released.
 
     The inner budget is strictly shorter than the ``_TEARDOWN_CLOSE_TIMEOUT``
-    the caller wraps this in. With the two equal, the outer ``wait_for`` would
-    always fire first and cancel *this* coroutine, and since
-    ``CancelledError`` is a ``BaseException`` it would escape ``close_quietly``
-    and abort the remaining teardown steps -- the exact leak this guards
-    against. Halving it keeps the inner decision (log and abandon) the one
-    that happens. The abandoned task is left to the loop's own cancellation.
+    the caller wraps this in, and that ordering is load-bearing rather than
+    cosmetic. Both timers start within microseconds of each other, so with the
+    two equal the outer ``wait_for`` always wins: it cancels this coroutine
+    before the inner wait can report anything, and ``wait_for`` surfaces that
+    as ``TimeoutError``, which ``close_quietly`` catches and logs as a generic
+    close timeout. Teardown still continues to the later steps in that case --
+    but the step is misreported, and the "ignored cancellation" line an
+    operator needs never appears. Halving the inner budget keeps this
+    coroutine's own decision the one that happens, so a task that refuses to
+    die is named as such. Verified by mutation: setting this budget to 10x the
+    outer one fails the two task-step hang tests in tests/test_main_pipeline.py,
+    which assert that abandon message. Do not "simplify" the ratio. The
+    abandoned task is left to the loop's own cancellation.
+
     """
     task.cancel()
     done, _pending = await asyncio.wait({task}, timeout=_TEARDOWN_CLOSE_TIMEOUT / 2)
