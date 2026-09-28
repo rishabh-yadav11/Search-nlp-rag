@@ -552,16 +552,25 @@ history for any account holding `analytics:read`.
 
 The digest is stable, so identical queries still aggregate into one row and the
 dashboard can still rank and compare them — but it is a keyed HMAC, so it
-cannot be reversed into the query it stands for. This is the same treatment
-`/analytics/chat` gives session titles.
+cannot be turned back into the query by anyone who sees the digest without the
+key. This is the same treatment `/analytics/chat` gives session titles.
 
-The query text is not stored in the analytics Redis at all — not as a
-sorted-set member and not inside the `analytics:query_click:{...}` key — so
-there is nothing there for another reader to expose. The key is
+The query text is **never written** — not as a sorted-set member, and not
+inside the `analytics:query_click:{...}` key — so no reader of these
+aggregates, present or future, can hand the text back. The key is
 `ANALYTICS_QUERY_KEY` when set; otherwise the app generates a random one on
-first use and persists it in the analytics Redis, so all workers and restarts
-share it with no operator action. Changing it invalidates existing digests,
-which empties the two top-query lists but leaks nothing.
+first use and persists it **in the analytics Redis** (DB 1), so all workers
+and restarts share it with no operator action. Changing it invalidates existing
+digests, which empties the two top-query lists but leaks nothing.
+
+That last point is the operational caveat: by default the digest key sits in
+the same DB as the data it keys, so **direct read access to the analytics
+Redis DB is a stronger capability than `analytics:read`** — such a reader can
+recompute a digest for any candidate query and confirm the match offline. This
+endpoint's fix is about the HTTP surface, where an ordinary admin account is
+not entitled to read users' search history. Treat DB 1 as sensitive data
+(which it already is: it holds the aggregates), or set `ANALYTICS_QUERY_KEY` to
+keep the key outside the database.
 
 Rows recorded **before** this change hold verbatim queries. They are never
 returned — the read path drops any member that is not a digest — and they are
