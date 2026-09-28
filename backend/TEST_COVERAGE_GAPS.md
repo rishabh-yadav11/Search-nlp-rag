@@ -435,6 +435,22 @@ Added by this change, all exercised end to end through the HTTP handlers:
       contradict what is already on the client's screen. `persist_truncated_turn`
       (lines 1903-1924) is the single writer for every partial turn, including
       the mid-stream-failure path.
+- [x] **a CANCELLED turn, which is not a polled disconnect**
+      (`send_message_stream` and `send_message`): `asyncio.CancelledError` is a
+      `BaseException`, so it bypasses every `except Exception` on both turn
+      paths. Starlette cancels the SSE body iterator from its anyio task group
+      on `http.disconnect`, and a cancel that lands inside `stream_answer`'s own
+      await never reaches an `await aborted()` gate at all. Cancellation is
+      reconciled under the ONE abort rule above, inside a shielded
+      `anyio.CancelScope` (anyio re-raises at every await while its cancel scope
+      is live, so a plain `await` in the handler is interrupted before the write
+      lands — `asyncio.shield` is no help either, its own await is re-cancelled
+      the same way), and the cancellation is re-raised so the task still ends
+      cancelled. A turn that already stored its reply is left alone, and a
+      cancelled turn that had passed the budget gate settles its hold rather
+      than releasing it. Covered at six separate checkpoints, plus two runs
+      through the real ASGI stack (`http.disconnect` delivered by Starlette's
+      own task group).
 - [x] **a billed call is charged, never refunded, on a disconnect** (lines
       2030, 2091-2100, 2123-2132): a disconnect in the gate-to-first-delta
       window settles the hold at the estimate the gate took it at, and the two

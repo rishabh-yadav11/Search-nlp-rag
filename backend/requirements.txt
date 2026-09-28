@@ -7,6 +7,10 @@
 # .github/workflows/ci.yml now runs with no --ignore-vuln suppressions.
 fastapi==0.141.1
 starlette==1.7.0
+# Pinned directly, not just inherited from starlette: app/chat.py uses a
+# shielded anyio.CancelScope to finish a cancelled chat turn's database
+# rollback, and it relies on anyio 4's level-cancellation semantics to do so.
+anyio==4.14.2
 uvicorn[standard]==0.30.6
 gunicorn==23.0.0
 aiomysql==0.3.0
