@@ -15,6 +15,7 @@ and assert on the messages that actually reach the OpenAI-compatible transport:
 
 import pytest
 from _support import run_sync as _run
+from conftest import auth_cookie
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -211,9 +212,9 @@ def test_streaming_turn_sends_system_role_first(retrieval, no_billing, poison_cl
     """The SSE path must ship the same split prompt as the non-streaming path."""
     client, chat_store, auth_store = _api_client(tmp_path)
     try:
-        headers = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
-        body = _stream(client, headers, sid, "who invested in Ola Electric?")
+        cookies = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=cookies).json()["id"]
+        body = _stream(client, cookies, sid, "who invested in Ola Electric?")
 
         assert "event: done" in body
         assert "event: error" not in body
@@ -447,9 +448,9 @@ def test_streaming_retry_nudges_land_in_the_system_role(retrieval, no_billing, p
     rather than in the untrusted user turn."""
     client, chat_store, auth_store = _api_client(tmp_path)
     try:
-        headers = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
-        _stream(client, headers, sid, "show me a chart of the top 5 ipo deals")
+        cookies = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=cookies).json()["id"]
+        _stream(client, cookies, sid, "show me a chart of the top 5 ipo deals")
 
         retries = [
             (next(m["content"] for m in call["messages"] if m["role"] == "system"),
@@ -492,9 +493,9 @@ def test_streaming_ranking_retry_nudge_lands_in_the_system_role(
     monkeypatch.setattr(poison_client.completions, "create", create)
     client, chat_store, auth_store = _api_client(tmp_path)
     try:
-        headers = _auth_headers(auth_store)
-        sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
-        _stream(client, headers, sid, "top 5 ipo deals in 2025")
+        cookies = _auth_cookies(auth_store)
+        sid = client.post("/api/chat/sessions", cookies=cookies).json()["id"]
+        _stream(client, cookies, sid, "top 5 ipo deals in 2025")
 
         retry = poison_client.completions.calls[-1]["messages"]
         system = next(m["content"] for m in retry if m["role"] == "system")
@@ -612,16 +613,21 @@ def _api_client(tmp_path):
     return TestClient(app), chat_store, auth_store
 
 
-def _auth_headers(auth_store, email=EMAIL, role="user"):
+def _auth_cookies(auth_store, email=EMAIL, role="user"):
+    """Create the account and return the auth cookie for it.
+
+    The credential is an HttpOnly cookie, so a test authenticates the way a
+    browser does: by cookie, never by an ``Authorization`` header.
+    """
     user = _run(auth_store.get_user_by_email(email))
     if user is None:
         user = _run(auth_store.create_user(email, "secret1", email.split("@")[0], role))
     token = _run(auth_store.issue_token(user.id, 7))
-    return {"Authorization": f"Bearer {token}"}
+    return auth_cookie(token)
 
 
-def _stream(client, headers, sid, content):
+def _stream(client, cookies, sid, content):
     url = f"/api/chat/sessions/{sid}/messages/stream"
-    with client.stream("POST", url, headers=headers, json={"content": content}) as r:
+    with client.stream("POST", url, cookies=cookies, json={"content": content}) as r:
         assert r.status_code == 200
         return "".join(r.iter_text())

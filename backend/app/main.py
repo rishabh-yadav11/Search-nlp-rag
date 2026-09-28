@@ -427,6 +427,13 @@ app.add_middleware(
     allow_origins=config.CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    # Required now that the auth credential is a cookie: without it the
+    # browser drops the cross-origin response and the frontend never sees the
+    # session. Safe because allow_origins is an explicit list, never "*" (a
+    # wildcard with credentials is rejected by the browser anyway, and would
+    # hand any site a readable authenticated response). Moot in production,
+    # where nginx serves the frontend and the API from one origin.
+    allow_credentials=True,
 )
 app.add_middleware(
     # Reject requests whose Host is not one this deployment answers to. The

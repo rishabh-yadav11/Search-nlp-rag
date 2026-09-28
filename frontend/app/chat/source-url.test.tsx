@@ -10,7 +10,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import type * as DataVizModule from './DataViz'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { TOKEN_KEY } from '../lib/auth'
+import { clearMeCache } from '../lib/auth'
 import ChatPage from './page'
 
 // `SourceList` renders `SimilarArticles` per source, which fetches on mount.
@@ -84,13 +84,21 @@ function jsonResponse(data: unknown): StubResponse {
   return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) }
 }
 
+// The signed-in user the /api/auth/me stub reports. The page decides whether to
+// redirect based on this, and there is no longer any storage-based session to
+// seed.
+const ME_USER = { id: 'u1', email: 'user@example.com', name: 'User', role: 'user', is_active: true }
+
 beforeEach(() => {
-  localStorage.setItem(TOKEN_KEY, 'test-token')
+  clearMeCache()
   Element.prototype.scrollTo = function scrollTo() {}
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL): Promise<StubResponse> => {
       const url = String(input)
+      // The session guard goes through /api/auth/me; without this the page
+      // treats the visitor as signed out and redirects to /login.
+      if (url.endsWith('/api/auth/me')) return jsonResponse(ME_USER)
       if (url.endsWith('/api/chat/sessions')) return jsonResponse([SESSION])
       if (url.includes('/api/chat/sessions/')) return jsonResponse({ ...SESSION, messages: MESSAGES })
       return jsonResponse({ similar_articles: [] })

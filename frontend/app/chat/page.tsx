@@ -8,7 +8,7 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
 import SimilarArticles from '../components/SimilarArticles'
-import { API_BASE, authHeaders, getToken, logout, redirectToLogin } from '../lib/auth'
+import { API_BASE, authRequestInit, getMe, logout, redirectToLogin } from '../lib/auth'
 import { isSafeUrl } from '../lib/safe-url'
 import { formatCost, formatEpochRelative } from '../lib/format'
 import { createDeadline, CHAT_API_DEADLINE_MS, RequestTimeoutError } from '../lib/deadline'
@@ -106,11 +106,15 @@ function walk(node: any, fn: (node: any, parent: any, index: number) => void) {
 async function api(path: string, init?: RequestInit) {
   const deadline = createDeadline(CHAT_API_DEADLINE_MS, init?.signal ?? null)
   try {
-    const res = await fetch(`${API_BASE}${path}`, {
-      ...init,
-      signal: deadline.signal,
-      headers: authHeaders(init),
-    })
+    // The session is an httpOnly cookie the browser attaches for us and JS
+    // cannot read, so this call is credentialed rather than header-bearing:
+    // `authRequestInit` attaches the cookie when API_BASE is a trusted backend
+    // and omits `credentials` when it is not. There is no `Authorization`
+    // header any more.
+    const res = await fetch(
+      `${API_BASE}${path}`,
+      authRequestInit({ ...init, signal: deadline.signal })
+    )
     if (!res.ok) {
       if (res.status === 401) redirectToLogin()
       const detail = await res.text()
@@ -257,7 +261,16 @@ export default function ChatPage() {
   }, [])
 
   useEffect(() => {
-    if (!getToken()) redirectToLogin()
+    // The session is an httpOnly cookie that JS cannot read, so `/api/auth/me`
+    // is the only way to tell whether this visitor is signed in. A network
+    // failure is not a logout, so it must not redirect.
+    getMe()
+      .then((me) => {
+        if (!me) redirectToLogin()
+      })
+      .catch(() => {
+        /* offline or backend down: keep the page rather than force a redirect */
+      })
   }, [])
 
   useEffect(() => {
@@ -403,12 +416,15 @@ export default function ChatPage() {
           }
         }, 5000)  // Check every 5 seconds
         try {
-          res = await fetch(`${API_BASE}/api/chat/sessions/${sessionId}/messages/stream`, {
-            method: 'POST',
-            headers: authHeaders({ headers: { 'Content-Type': 'application/json' } }),
-            body: JSON.stringify({ content: question }),
-            signal: ctrl.signal,
-          })
+          res = await fetch(
+            `${API_BASE}/api/chat/sessions/${sessionId}/messages/stream`,
+            authRequestInit({
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ content: question }),
+              signal: ctrl.signal,
+            })
+          )
           lastErr = null
           break
         } catch (e) {

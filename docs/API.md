@@ -9,8 +9,13 @@ Most endpoints return JSON. Search and analytics are `GET`; chat is JSON or
 Server-Sent-Events (SSE).
 
 **Authentication:** chat, analytics and user-management endpoints require a
-bearer token issued by `POST /api/auth/login`
-(`Authorization: Bearer <token>`). Tokens are opaque, expire after
+session cookie issued by `POST /api/auth/login`. The opaque token is returned
+only in a `Set-Cookie` header (`AUTH_COOKIE_NAME`, default
+`vccircle_session`), marked `HttpOnly`, `Secure` and `SameSite=Lax`, on
+`Path=/` with no `Domain`. It is **never** in a response body and is **not**
+accepted in an `Authorization` header — a credential that script can read is
+one XSS bug away from account takeover. Send the cookie on every protected
+request; the browser does this automatically. Tokens expire after
 `AUTH_TOKEN_TTL_DAYS` (7) and can be revoked (`POST /api/auth/logout`). Access
 is role-based: `user` (the only role public signup can grant — it is not
 configurable) may use chat; `admin` also has
@@ -25,15 +30,32 @@ rate-limited); all inputs are validated server-side.
 Internal machine clients may authenticate with `X-Service-Token` (config
 `AUTH_SERVICE_TOKEN`) — a scoped, expiring credential, not an open admin grant.
 
+**CSRF:** because the browser attaches the cookie on its own, every
+cookie-authenticated unsafe request (`POST`/`PUT`/`PATCH`/`DELETE`) is checked.
+A request is refused with `403` when `Sec-Fetch-Site: cross-site`, when an
+`Origin` is present whose host differs from the request's own host (ports
+ignored, so `localhost:3000` → `localhost:8001` is fine), or when `Origin` is
+the literal `null`. Safe methods are not checked. A non-browser client that
+sends neither header is allowed through, since it has no ambient cookie to
+ride; requiring the headers unconditionally would break every such client for
+no added protection. Note that the API is same-origin behind nginx, so in
+production these headers are same-origin and pass.
+
+**Deployment dependency:** the cookie is `Secure` by default, so the API must
+be served over HTTPS. A plain-HTTP deployment (`setup.sh` with `NGINX_TLS=off`)
+must set `AUTH_COOKIE_SECURE=false`, or the browser drops the cookie and login
+will not persist. This is not auto-detected — behind TLS termination the app
+cannot trust the request scheme to work it out.
+
 ### Auth endpoints
 
 | Method & path | Access | Purpose |
 |---|---|---|
 | `POST /api/auth/signup` | public | Create account → `{message}` (no token; then log in) |
-| `POST /api/auth/login` | public | Exchange email+password → `{token, user}` |
+| `POST /api/auth/login` | public | Exchange email+password → `{user}` + `Set-Cookie` session |
 | `GET /api/auth/me` | auth | Current user profile |
 | `POST /api/auth/logout` | auth | Revoke current token |
-| `POST /api/auth/change-password` | auth | Change password; revokes other tokens → `{token, user}` |
+| `POST /api/auth/change-password` | auth | Change password; revokes other tokens, re-issues the cookie → `{user}` |
 | `GET /api/auth/users` | `admin` | List users |
 | `GET /api/auth/users/{id}` | `admin` | User detail |
 | `PATCH /api/auth/users/{id}` | `admin` | Update name/role/is_active |
@@ -65,17 +87,28 @@ role carries all three.
 
 1. **Sign up** (`POST /api/auth/signup`), then **log in**
    (`POST /api/auth/login`) — signup returns only
-   `{ "message": "..." }`, and login returns
-   `{ "token": "<opaque bearer token>", "user": {...} }`.
-2. Send the token on every protected request:
-   `Authorization: Bearer <token>`.
-3. Tokens expire after `AUTH_TOKEN_TTL_DAYS` (7). When a call returns `401`,
-   re-authenticate with `POST /api/auth/login` to mint a fresh token — do not
-   try to refresh an expired token. `POST /api/auth/logout` revokes the current
-   token server-side (treat the client copy as dead after that).
-4. Store tokens server-side only if your client needs to act on behalf of users;
-   otherwise log in per user session. Never store raw passwords or tokens in
-   browser-side JavaScript that ships to visitors.
+   `{ "message": "..." }`, and login returns `{ "user": {...} }` plus a
+   `Set-Cookie` header carrying the session token. The token is never in the
+   body.
+2. Send the cookie on every protected request. Browsers do this
+   automatically; a non-browser client must manage the cookie itself:
+
+   ```bash
+   # log in, saving the cookie to a jar
+   curl -s -c jar.txt -X POST http://localhost:8001/api/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"email":"you@example.com","password":"secret12"}'
+   # reuse it (-b reads the jar back)
+   curl -b jar.txt http://localhost:8001/api/chat/sessions
+   ```
+3. Cookies expire after `AUTH_TOKEN_TTL_DAYS` (7). When a call returns `401`,
+   re-authenticate with `POST /api/auth/login` — there is no refresh, and an
+   expired token cannot be renewed. `POST /api/auth/logout` revokes the token
+   server-side and expires the cookie.
+4. Never read, store or replay the token in browser-side JavaScript. The cookie
+   is `HttpOnly` precisely so that script cannot: there is no API that returns
+   it. Treat it like a password. (A non-browser client must hold the cookie
+   itself, which is what a cookie jar does.)
 
 ### 2. Protection matrix
 
@@ -301,9 +334,9 @@ unreachable. See [Rate limits](#3-rate-limits).
 
 Conversations are stored per authenticated account in SQLite and survive
 restarts; they are purged after `CHAT_RETENTION_DAYS` (180) of inactivity.
-**Every chat request must send `Authorization: Bearer <token>`** (or the
-`X-Service-Token` machine credential). Conversations are scoped to the account, so
-other users can never see or modify them.
+**Every chat request must send the session cookie** (or the `X-Service-Token`
+machine credential). Conversations are scoped to the account, so other users can
+never see or modify them.
 
 ### Identity & session shape
 
@@ -387,11 +420,12 @@ named events:
 Example consumption:
 
 ```bash
-TOKEN=$(curl -s -X POST http://localhost:8001/api/auth/login \
+# log in, saving the session cookie to a jar (-c writes it, -b reads it back)
+curl -s -c /tmp/jar.txt -X POST http://localhost:8001/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"secret12"}' | jq -r .token)
-curl -N -X POST http://localhost:8001/api/chat/sessions/abc/messages/stream \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"secret12"}'
+curl -N -b /tmp/jar.txt -X POST http://localhost:8001/api/chat/sessions/abc/messages/stream \
+  -H "Content-Type: application/json" \
   -d '{"content":"who invested in Ola Electric?"}'
 ```
 
@@ -512,8 +546,8 @@ auth endpoints (see Rate limits).
 ## `GET /analytics/summary`
 
 Aggregated search-quality and click metrics, stored in Redis DB 1
-(`ANALYTICS_REDIS_DB`). Admin-only: requires a bearer token for an account with
-the `analytics:read` permission (`Authorization: Bearer <token>`).
+(`ANALYTICS_REDIS_DB`). Admin-only: requires the session cookie for an account
+with the `analytics:read` permission.
 
 ### Response
 
@@ -676,7 +710,7 @@ The dashboard UI is a Next.js page at `/analytics/dashboard` (proxied by nginx
 to the frontend; not part of this API). It renders KPI cards for search quality
 and chat usage, top-query tables, clicks-by-position and
 conversations-by-cost/tokens tables by calling the two admin-gated JSON
-endpoints below with the bearer token, and refreshes every 30s.
+endpoints below with the session cookie, and refreshes every 30s.
 
 ---
 
@@ -746,22 +780,21 @@ curl "http://<host>/facets"
 curl -X POST "http://<host>/api/auth/signup" -H "Content-Type: application/json" \
   -d '{"email":"you@example.com","password":"secret12","name":"You"}'
 
-# Log in and capture a bearer token
-TOKEN=$(curl -s -X POST "http://<host>/api/auth/login" -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"secret12"}' | jq -r .token)
-
-# Create a chat conversation
-curl -X POST "http://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
+# Log in and save the session cookie to a jar
+curl -s -c /tmp/jar.txt -X POST "http://<host>/api/auth/login" -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"secret12"}'
+# Create a chat conversation (-b sends the saved cookie)
+curl -b /tmp/jar.txt -X POST "http://<host>/api/chat/sessions"
 
 # List conversations
-curl "http://<host>/api/chat/sessions" -H "Authorization: Bearer $TOKEN"
+curl -b /tmp/jar.txt "http://<host>/api/chat/sessions"
 
 # Per-user token/cost usage
-curl "http://<host>/api/chat/usage" -H "Authorization: Bearer $TOKEN"
+curl -b /tmp/jar.txt "http://<host>/api/chat/usage"
 
 # Stream a chat turn (SSE)
-curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+curl -N -b /tmp/jar.txt -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
+  -H "Content-Type: application/json" \
   -d '{"content":"who invested in Ola Electric?"}'
 ```
 
@@ -769,21 +802,26 @@ curl -N -X POST "http://<host>/api/chat/sessions/<id>/messages/stream" \
 
 ## Notes & limitations
 
-- **Auth**: bearer tokens (7-day expiry, revocable) gate chat, analytics and
-  user management; `/search`, `/facets`, `/analytics/click` and the auth
-  endpoints are public. Signup/login are rate-limited per IP via Redis and login additionally per
-  submitted address, counting failed logins only so the per-address limit
-  cannot be used to lock a known account out. The per-address limit caps the
-  *rate* of attempts on one account, not an attacker's cost — it is checked
-  after the password verify, so being refused is free; the per-IP limit is
-  what bounds cost. `/search`, `/facets` and `/analytics/click` are rate
-  limited per IP too (60/60/120 per minute) and, unlike the auth endpoints,
-  **fail closed** with `503` when the limiter's Redis is unreachable. See
+- **Auth**: an HttpOnly session cookie (7-day expiry, revocable) gates chat,
+  analytics and user management; the token is never in a response body and is
+  not accepted in an `Authorization` header. `/search`, `/facets`,
+  `/analytics/click` and the auth endpoints are public. Cross-site unsafe
+  requests are refused with 403. Signup/login are rate-limited per IP via
+  Redis and login additionally per submitted address, counting failed logins
+  only so the per-address limit cannot be used to lock a known account out.
+  The per-address limit caps the *rate* of attempts on one account, not an
+  attacker's cost — it is checked after the password verify, so being refused
+  is free; the per-IP limit is what bounds cost. `/search`, `/facets` and
+  `/analytics/click` are rate limited per IP too (60/60/120 per minute) and,
+  unlike the auth endpoints, **fail closed** with `503` when the limiter's
+  Redis is unreachable; the auth endpoints instead fall back to a bounded
+  in-process limiter rather than switching limiting off. See
   [Rate limits](#3-rate-limits) for the full table and the outage posture of
-  each surface. A user
-  holds at most `AUTH_MAX_ACTIVE_TOKENS_PER_USER` active tokens; logging in
-  past that revokes the oldest. `AUTH_SERVICE_TOKEN` lets internal scripts
-  authenticate as a scoped, expiring machine user.
+  each surface. A user holds at most `AUTH_MAX_ACTIVE_TOKENS_PER_USER` active
+  tokens; logging in past that revokes the oldest. `AUTH_SERVICE_TOKEN` lets
+  internal scripts authenticate as a scoped, expiring machine user. The
+  session cookie is `Secure` by default, so a plain-HTTP deployment must set
+  `AUTH_COOKIE_SECURE=false` or login will not persist.
 - **Data freshness**: the index is refreshed by an incremental sync every 15 minutes
   via cron (`update_index.py`).
 - **Caching**: `/search` responses are cached (TTL `CACHE_TTL_SECONDS`, default 300s) keyed by effective query + filters. `cached: true` indicates a cache hit. Chat turns are not cached. When Redis is unreachable the *cache* degrades to an in-process store, so search keeps working — but the *rate limiter* is a separate dependency on the same Redis and fails closed, so `/search` still answers `503` in that state (see [Rate limits](#3-rate-limits)).
