@@ -18,11 +18,12 @@ the parser's truthy set turns this file red until setup.sh is updated too.
 import os
 import re
 import subprocess
+from itertools import product
 from pathlib import Path
 
 import pytest
 
-from app.config import _env_tristate
+from app.config import _FALSE_SPELLINGS, _TRUE_SPELLINGS, _env_tristate
 
 SETUP_SH = Path(__file__).resolve().parents[2] / "setup.sh"
 
@@ -126,6 +127,101 @@ def test_guard_covers_exactly_the_spellings_the_parser_calls_true():
         assert _warns(f"{FLAG}={candidate}", flags, pattern) is truthy, (
             f"{candidate!r}: parser says truthy={truthy}, but the guard disagrees"
         )
+
+
+def _guard_matches(flags, pattern, values):
+    """The values in ``values`` the guard's regex actually matches, in one grep.
+
+    A single invocation over a whole candidate space, because the point of this
+    check is breadth: spawning grep per value would make an exhaustive sweep
+    too slow to keep, and a check too slow to keep is a check that gets
+    narrowed. ``-q`` is dropped because the matched lines are the answer here.
+    """
+    candidates = [f"{FLAG}={v}" for v in values]
+    proc = subprocess.run(
+        ["grep", flags.replace("q", ""), "-e", pattern],
+        input="\n".join(candidates) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode in (0, 1), f"grep failed: {proc.returncode} {proc.stderr}"
+    return {line.split("=", 1)[1] for line in proc.stdout.splitlines()}
+
+
+def _candidate_spellings():
+    """A generated token space, not a hand-written list of the known spellings.
+
+    The lists above pin the values anyone thought of. They cannot catch a
+    spelling nobody thought of, which is precisely how ``y`` reached the
+    parser's truthy set in a reverted change while every test here stayed
+    green: the guard would then stop warning about a value that forces
+    X-Forwarded-For to be trusted from any peer (#245), and the operator would
+    get that posture with no warning anywhere. This space is built to contain
+    whatever the parser is asked about, so the comparison is symmetric.
+    """
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 -_."
+    # Every one- and two-character token: that already contains every spelling
+    # a person would write, plus all the near-misses worth a warning.
+    space = {"".join(p) for n in (1, 2) for p in product(alphabet, repeat=n)}
+    # Three-character tokens over the letters the spellings are built from,
+    # to cover typos of a real spelling ("ture", "onn") as well.
+    narrow = "tfynos01 -"
+    space |= {"".join(p) for p in product(narrow, repeat=3)}
+    # Shapes a fixed-width sweep cannot produce.
+    space |= {
+        "", " ", "\t", "true ", " true", "  true  ", "TRUE", "True", "On", "ON",
+        "1 2", "yes-no", "auto", "maybe", "enabled", "disable", "y", "t",
+    }
+    return space
+
+
+def test_guard_and_parser_agree_on_every_spelling_in_both_directions():
+    """setup.sh's regex must match precisely the values config reads as True.
+
+    Bidirectional, because either drift is a defect and in opposite directions:
+
+    * the parser is widened (a spelling becomes forced-True) and the regex is
+      not, so the operator is left trusting X-Forwarded-For from any peer with
+      no warning;
+    * the regex is widened, so the operator is nagged about a posture they are
+      not in, and a working setup.sh grows a warning nobody can act on.
+
+    Derived from ``_TRUE_SPELLINGS`` -- the set ``_env_tristate`` itself reads --
+    rather than from the literals at the top of this file, so the two files
+    cannot each hold their own idea of "forced true".
+    """
+    flags, pattern = _guard_flags()
+    assert "i" in flags, (
+        f"the guard greps with {flags!r}, so it is case-sensitive while "
+        f"_env_tristate lowercases first; the two can never agree"
+    )
+    candidates = _candidate_spellings()
+    matched = _guard_matches(flags, pattern, candidates)
+    expected = {v for v in candidates if v.strip().lower() in _TRUE_SPELLINGS}
+    assert matched == expected, (
+        f"setup.sh's forced-true warning and config's truthy set disagree.\n"
+        f"  the regex matches but config does not read as True: "
+        f"{sorted(matched - expected)}\n"
+        f"  config reads as True but the regex does not match (a forced-True "
+        f"with no warning, see #245): {sorted(expected - matched)}\n"
+        f"  truthy spellings are {sorted(_TRUE_SPELLINGS)}"
+    )
+
+
+def test_the_parser_and_the_guard_share_one_spelling_set():
+    """The application must not be the only side with a list of its own.
+
+    ``_env_bool`` and ``_env_tristate`` read the same ``_TRUE_SPELLINGS``; this
+    pins that the shared set is the one the guard is checked against, so
+    introducing a second convention for the same question fails here.
+    """
+
+    assert not _TRUE_SPELLINGS & _FALSE_SPELLINGS
+    flags, pattern = _guard_flags()
+    assert _warns(f"{FLAG}=1", flags, pattern)
+    for spelling in _TRUE_SPELLINGS:
+        assert _warns(f"{FLAG}={spelling}", flags, pattern), spelling
 
 
 def test_missing_key_is_appended_and_an_existing_value_is_never_rewritten():

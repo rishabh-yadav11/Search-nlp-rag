@@ -271,6 +271,24 @@ def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> 
     return tuple(dict.fromkeys(hosts))
 
 
+# The spellings that mean "on" and "off" for a boolean env knob, for every knob
+# in this file. One set, two readers: _env_tristate (three-state) and _env_bool
+# (two-state). A second convention here is how ENABLE_DIVERSITY=" true " came
+# to read as OFF while AUTH_TRUST_X_FORWARDED_FOR understood it, so the
+# question is answered once.
+#
+# The truthy set is load-bearing OUTSIDE this file. setup.sh's forced-true
+# warning greps exactly these four spellings, and it has to: a forced True
+# trusts X-Forwarded-For from ANY peer, so a client reaching the API port
+# directly can forge it to dodge a per-IP rate limit (#245), and that warning
+# is the only signal the operator gets. Add a spelling here and setup.sh's
+# regex must add it in the same commit, or AUTH_TRUST_X_FORWARDED_FOR=<new>
+# forces header trust with no warning anywhere. The two are tied together by
+# test, not by comment.
+_TRUE_SPELLINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_SPELLINGS = frozenset({"0", "false", "no", "off"})
+
+
 def _env_tristate(name: str) -> bool | None:
     """Read a three-state boolean env var: True/False force a behaviour, None
     means "auto" (the variable is unset, or says so explicitly).
@@ -279,11 +297,75 @@ def _env_tristate(name: str) -> bool | None:
     a typo in an operator's .env can never silently pick the unsafe one.
     """
     raw = os.getenv(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
+    if raw in _TRUE_SPELLINGS:
         return True
-    if raw in ("0", "false", "no", "off"):
+    if raw in _FALSE_SPELLINGS:
         return False
     return None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a two-state boolean knob, normalising case and surrounding space.
+
+    The ENABLE_* feature toggles each used to be parsed inline as
+    ``os.getenv(name, "true").lower() in ("1", "true", "yes")``. That already
+    lowercased, so case was never the problem -- but it did not strip, and it
+    had no "on" in the set, so ``on``, " true " and "1 " all read as OFF. A
+    whole retrieval feature then sits disabled with nothing wrong visible
+    anywhere -- the knob looks configured, the template says true, and the
+    service answers as if the operator had asked for off.
+
+    Three input classes, and the differences between them are deliberate:
+
+    - unset -> ``default``. The shipped value applies, as it always did.
+    - a known spelling -> that side, after strip/lower. This is the fix.
+    - set but BLANK -> False, with a warning. Blank keeps meaning exactly what
+      it means today, which is off, because ``KEY=`` in a .env is how an
+      operator clears a knob and python-dotenv writes it as an empty string.
+      Falling back to ``default`` here would be the worst possible bug in this
+      function: .env.example ships all eight toggles as ``true``, so a
+      deployment that blanked one to turn it off would silently get the
+      feature switched back ON by an edit that changes no behaviour the
+      operator asked for. The warning is there because the value alone is
+      indistinguishable from an intentional off, and .env.example shipping
+      ``=true`` means a blank line is far more likely to be a mistake.
+    - anything else -> ``default``, with a warning. Warn-and-default, agreeing
+      with _clamped_int rather than the strictest available option: raising
+      ValueError here would turn a mistyped deployment value into a boot
+      failure of the whole API, because this module is imported at process
+      start, and a knob that only picks a feature is a bad trade for an
+      outage. The WARNING names the key, the rejected value and the spellings
+      that would have worked, so the misconfiguration stays visible instead of
+      being papered over.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_SPELLINGS:
+        return True
+    if value in _FALSE_SPELLINGS:
+        return False
+    accepted = "/".join(sorted(_TRUE_SPELLINGS | _FALSE_SPELLINGS))
+    if not value:
+        # Checked before the warning below so the two failures read
+        # differently: a blank knob is off, a mistyped one is the default.
+        logger.warning(
+            "%s is set but blank, which reads as OFF; set it to one of %s to "
+            "choose, or delete the line to use the default (%s)",
+            name,
+            accepted,
+            str(default).lower(),
+        )
+        return False
+    logger.warning(
+        "%s=%r is not a boolean; using default %s (accepted: %s)",
+        name,
+        raw,
+        str(default).lower(),
+        accepted,
+    )
+    return default
 
 
 def _ensure_data_dir(path: str, env_var: str) -> None:
@@ -622,16 +704,16 @@ class Config:
 
     # Retrieval-quality tuning (see app/query_expand.py, app/rerank_boost.py,
     # app/answer_fallback.py, app/query_fix.py). Toggles can be disabled per-deployment.
-    ENABLE_QUERY_EXPANSION = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() in ("1", "true", "yes")
-    ENABLE_ENTITY_BOOST = os.getenv("ENABLE_ENTITY_BOOST", "true").lower() in ("1", "true", "yes")
-    ENABLE_WEAK_FALLBACK = os.getenv("ENABLE_WEAK_FALLBACK", "true").lower() in ("1", "true", "yes")
+    ENABLE_QUERY_EXPANSION = _env_bool("ENABLE_QUERY_EXPANSION", True)
+    ENABLE_ENTITY_BOOST = _env_bool("ENABLE_ENTITY_BOOST", True)
+    ENABLE_WEAK_FALLBACK = _env_bool("ENABLE_WEAK_FALLBACK", True)
 
     # Query-string typo correction (app/query_fix.py): symspellpy over a
     # corpus-derived vocabulary + curated entities, applied before embedding.
     # The vocab is generated by scripts/build_query_vocab.py; when absent the
     # fixer is a no-op. Corrected strings also normalize the cache keys, so
     # repeated typos of the same query reuse the same cached results.
-    ENABLE_QUERY_FIX = os.getenv("ENABLE_QUERY_FIX", "true").lower() in ("1", "true", "yes")
+    ENABLE_QUERY_FIX = _env_bool("ENABLE_QUERY_FIX", True)
     QUERY_FIX_VOCAB_PATH = _data_path("QUERY_FIX_VOCAB_PATH", "data/query_vocab.json.gz")
     QUERY_FIX_MAX_EDIT = int(os.getenv("QUERY_FIX_MAX_EDIT", "2"))
     QUERY_FIX_MIN_COUNT = int(os.getenv("QUERY_FIX_MIN_COUNT", "5"))
@@ -641,7 +723,7 @@ class Config:
     # avoid near-duplicate headlines filling the top-k. LAMBDA near 1 favours
     # pure relevance; lower trades relevance for headline diversity. Applied in
     # /search before the final top-k slice.
-    ENABLE_DIVERSITY = os.getenv("ENABLE_DIVERSITY", "true").lower() in ("1", "true", "yes")
+    ENABLE_DIVERSITY = _env_bool("ENABLE_DIVERSITY", True)
     DIVERSITY_LAMBDA = float(os.getenv("DIVERSITY_LAMBDA", "0.7"))
     DIVERSITY_SIM_THRESHOLD = float(os.getenv("DIVERSITY_SIM_THRESHOLD", "0.4"))
 
@@ -650,7 +732,7 @@ class Config:
     # a query accumulates >= CLICK_BOOST_MIN_CLICKS clicks and an article holds
     # >= CLICK_BOOST_MIN_ARTICLE_CLICKS clicks (>= CLICK_BOOST_MIN_SHARE of the
     # query's total), so it never fires on sparse/noisy traffic.
-    ENABLE_CLICK_BOOST = os.getenv("ENABLE_CLICK_BOOST", "true").lower() in ("1", "true", "yes")
+    ENABLE_CLICK_BOOST = _env_bool("ENABLE_CLICK_BOOST", True)
     CLICK_BOOST_MIN_CLICKS = int(os.getenv("CLICK_BOOST_MIN_CLICKS", "5"))
     CLICK_BOOST_MIN_ARTICLE_CLICKS = int(os.getenv("CLICK_BOOST_MIN_ARTICLE_CLICKS", "3"))
     CLICK_BOOST_MIN_SHARE = float(os.getenv("CLICK_BOOST_MIN_SHARE", "0.3"))
@@ -680,7 +762,7 @@ class Config:
     # three clamped knobs below instead — the expensive part is the second
     # cross-encoder pass, not the body scan (a 50K body scans in ~0.25ms at
     # these defaults), so that is what BODY_RESCUE_MAX_CANDIDATES bounds.
-    ENABLE_BODY_RESCUE = os.getenv("ENABLE_BODY_RESCUE", "true").lower() in ("1", "true", "yes")
+    ENABLE_BODY_RESCUE = _env_bool("ENABLE_BODY_RESCUE", True)
     BODY_RESCUE_THRESHOLD = float(os.getenv("BODY_RESCUE_THRESHOLD", "0.3"))
     # WINDOW is the size of the excerpt handed to the cross-encoder. Below 200
     # the excerpt is too small to carry a useful passage (and a 0 window makes
@@ -749,7 +831,7 @@ class Config:
     CHAT_MESSAGE_SOURCE_LIMIT = int(os.getenv("CHAT_MESSAGE_SOURCE_LIMIT", "20"))
 
     # Recommendation engine
-    ENABLE_RECOMMENDATIONS = os.getenv("ENABLE_RECOMMENDATIONS", "true").lower() in ("1", "true", "yes")
+    ENABLE_RECOMMENDATIONS = _env_bool("ENABLE_RECOMMENDATIONS", True)
     # Hybrid scoring weights
     RECOMMEND_SIMILARITY_WEIGHT = float(os.getenv("RECOMMEND_SIMILARITY_WEIGHT", "0.4"))
     RECOMMEND_CATEGORY_WEIGHT = float(os.getenv("RECOMMEND_CATEGORY_WEIGHT", "0.3"))
