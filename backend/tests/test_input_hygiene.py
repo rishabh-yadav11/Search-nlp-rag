@@ -219,6 +219,88 @@ def test_build_cache_key_keeps_normal_keys_readable_and_namespaced():
     assert len(key) <= MAX_KEY_LEN
 
 
+# --- no token collision over a corpus of near-miss inputs --------------------
+
+# A single hand-picked example proves nothing about injectivity: the delimiter
+# collision that started this issue was invisible to every pairwise test until
+# one pair happened to move a '|' across a field boundary. The property that
+# actually matters is over *many* near-misses at once, so the corpus is driven
+# end to end through the real /search endpoint and the keys the real cache
+# actually received are compared. These are all semantically DIFFERENT
+# questions, so every one of them has to keep its own cache entry.
+_NEAR_MISS_CORPUS = [
+    "fintech funding",
+    "Fintech funding",          # case reaches the embedder, so it is not folded
+    "fintech funding.",         # trailing punctuation
+    "fintech funding?",
+    "fintech  funding!",        # collapses to the same text, but differs from all
+    "fintech funding 2025",     # an extra token
+    "fintech fundin",           # a typo is a different question
+    "fintech funcing",
+    "fintaech funding",
+    "fintech fundingx",
+    "fintech funding 2026",     # same length, different year
+    "merchant funding",
+]
+
+
+def test_near_miss_corpus_never_collides_on_the_search_cache_key(monkeypatch):
+    """Two different inputs that hash to one key serve the WRONG cached answer
+    with no error anywhere -- a silent correctness bug. Proving it cannot happen
+    needs a corpus, not one example: every one of these is a different question
+    and every one must get its own entry in the real cache the endpoint uses.
+    """
+    normalised = {q: normalize_text(q) for q in _NEAR_MISS_CORPUS}
+    # Precondition, and the point of the test: normalisation must not merge two
+    # genuinely different questions. If it did, the key assertions below would
+    # be asserting a merge rather than a collision.
+    assert len(set(normalised.values())) == len(_NEAR_MISS_CORPUS), (
+        "normalisation merged distinct queries: "
+        f"{normalised}"
+    )
+
+    cache, _retrieved, _recorded = _wire(monkeypatch)
+    for q in _NEAR_MISS_CORPUS:
+        response = _client.get("/search", params={"q": q})
+        assert response.status_code == 200, f"{q!r} did not search: {response.text}"
+
+    keys = [k for k in cache.gets if k.startswith("search:")]
+    assert len(keys) == len(_NEAR_MISS_CORPUS), (
+        f"expected one search key per request, got {keys}"
+    )
+    assert len(set(keys)) == len(keys), (
+        f"distinct queries shared a cache key: {keys}"
+    )
+    # And they really are distinct cache entries, not one entry read twice.
+    assert len(cache.sets) == len(_NEAR_MISS_CORPUS)
+
+
+def test_equivalent_spellings_share_one_search_cache_key(monkeypatch):
+    """The other half of the property, and what stops the test above from
+    passing on a no-op: if normalisation did nothing, every key would trivially
+    be distinct. One question spelled several ways is one entry.
+    """
+    spellings = [
+        "fintech funding",
+        "  fintech   funding  ",
+        "ＴＥＳＴ deals",
+        "TEST  deals",
+        "TEST deals\x00\r\n",
+        "ﬁntech funding",
+    ]
+    distinct_after_normalising = {normalize_text(s) for s in spellings}
+    assert distinct_after_normalising == {"fintech funding", "TEST deals"}, (
+        "the corpus no longer describes two questions"
+    )
+
+    cache, _retrieved, _recorded = _wire(monkeypatch)
+    for q in spellings:
+        assert _client.get("/search", params={"q": q}).status_code == 200
+
+    keys = [k for k in cache.gets if k.startswith("search:")]
+    assert len(set(keys)) == 2, f"expected one entry per question, got {keys}"
+
+
 # --- facet bounds -----------------------------------------------------------
 
 
