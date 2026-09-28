@@ -102,11 +102,11 @@ def test_the_old_parser_mislabelled_these_as_off(monkeypatch):
     is the only thing the new parse has to disagree with. Every variant above
     that this asserts is OFF is a value an operator wrote meaning ON.
     """
-    old_parser = lambda raw: raw.lower() in ("1", "true", "yes")  # noqa: E731
-    for value in TRUTHY_VARIANTS:
-        if old_parser(value) is False:
-            monkeypatch.setenv("SOME_TOGGLE", value)
-            assert _env_bool("SOME_TOGGLE", False) is True, value
+    old_reads_off = [v for v in TRUTHY_VARIANTS if v.lower() not in ("1", "true", "yes")]
+    assert old_reads_off, "no variant distinguishes the two parsers; the table is vacuous"
+    for value in old_reads_off:
+        monkeypatch.setenv("SOME_TOGGLE", value)
+        assert _env_bool("SOME_TOGGLE", False) is True, value
 
 
 # --------------------------------------------------------------------------
