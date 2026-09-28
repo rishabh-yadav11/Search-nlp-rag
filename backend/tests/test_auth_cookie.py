@@ -174,6 +174,29 @@ def test_sibling_subdomain_origin_is_rejected(client):
     assert r.status_code == 403
 
 
+def test_attacker_forwarded_host_cannot_launder_a_cross_site_origin(client):
+    """A cross-site Origin stays refused even when the attacker names the
+    victim's own host in ``X-Forwarded-Host``.
+
+    It is not a forbidden header name, so script on the hostile page can set it,
+    and the shipped nginx config neither overwrites nor strips it -- it arrives
+    verbatim. A guard that trusted it as the expected host would let the page
+    name the same value in both headers and walk straight through the check, so
+    the comparison is made against the browser-set ``Host`` and nothing else.
+    """
+    cookie, _, _ = _logged_in(client)
+    r = client.post(
+        "/api/chat/sessions",
+        cookies=cookie,
+        headers={
+            "Origin": "https://evil.example",
+            "Host": "example.com",
+            "X-Forwarded-Host": "example.com",
+        },
+    )
+    assert r.status_code == 403
+
+
 def test_null_origin_is_rejected(client):
     """Origin: null (sandboxed iframe, privacy browser) names no host, so it can
     never be shown to be ours and is refused."""
