@@ -307,9 +307,9 @@ def test_hybrid_search_cache_miss(monkeypatch, fake_cache):
     assert kwargs["prefetch"][0].limit == 32
 
 
-def _vector_key_setup(monkeypatch, query):
-    """Wire hybrid_search with the pipeline fakes and return (cache, dense, qdrant)."""
-    cache = _FakeCache()
+def _vector_key_setup(monkeypatch, fake_cache):
+    """Wire hybrid_search with the pipeline fakes and return (cache, dense)."""
+    cache = fake_cache()
     dense = _FakeDense([0.1, 0.2, 0.3])
     sparse = _FakeSparse([1, 3], [0.9, 0.4])
     monkeypatch.setattr(main, "cache", cache)
@@ -322,13 +322,13 @@ def _vector_key_setup(monkeypatch, query):
     return cache, dense
 
 
-def test_vector_cache_key_is_keyed_on_the_text_that_was_embedded(monkeypatch):
+def test_vector_cache_key_is_keyed_on_the_text_that_was_embedded(monkeypatch, fake_cache):
     """The cached (dense, sparse) pair stands for one exact input string, so the
     key has to be built from the same normalised text that gets encoded. If the
     key normalised but the encoder did not, a full-width query and its ASCII
     equivalent would share one cached vector -- a wrong hit of exactly the kind
     this is meant to prevent."""
-    cache, dense = _vector_key_setup(monkeypatch, "ＴＥＳＴ deals")
+    cache, dense = _vector_key_setup(monkeypatch, fake_cache)
 
     _run(main.hybrid_search("ＴＥＳＴ deals", 8))
 
@@ -338,10 +338,10 @@ def test_vector_cache_key_is_keyed_on_the_text_that_was_embedded(monkeypatch):
     assert "ＴＥＳＴ" not in key
 
 
-def test_vector_cache_key_is_bounded_for_a_long_query(monkeypatch):
+def test_vector_cache_key_is_bounded_for_a_long_query(monkeypatch, fake_cache):
     """The vector cache is the longest-lived key in the request path (its own
     TTL), so an unbounded one is the most expensive to leave open."""
-    cache, _dense = _vector_key_setup(monkeypatch, "q" * 1000)
+    cache, _dense = _vector_key_setup(monkeypatch, fake_cache)
 
     _run(main.hybrid_search("q" * 1000, 8))
 
@@ -350,8 +350,8 @@ def test_vector_cache_key_is_bounded_for_a_long_query(monkeypatch):
     assert len(key) == len("vec:sha256:") + 64
 
 
-def test_vector_cache_key_carries_no_control_characters(monkeypatch):
-    cache, _dense = _vector_key_setup(monkeypatch, "test\x00\r\nINJECTED")
+def test_vector_cache_key_carries_no_control_characters(monkeypatch, fake_cache):
+    cache, _dense = _vector_key_setup(monkeypatch, fake_cache)
 
     _run(main.hybrid_search("test\x00\r\nINJECTED", 8))
 
@@ -360,10 +360,10 @@ def test_vector_cache_key_carries_no_control_characters(monkeypatch):
     assert "\r" not in key and "\n" not in key
 
 
-def test_vector_cache_key_changes_when_a_model_changes(monkeypatch):
+def test_vector_cache_key_changes_when_a_model_changes(monkeypatch, fake_cache):
     """The reason the models are in the key: a model swap must not reuse vectors
     encoded by the previous model."""
-    cache, _dense = _vector_key_setup(monkeypatch, "query")
+    cache, _dense = _vector_key_setup(monkeypatch, fake_cache)
     _run(main.hybrid_search("query", 8))
     first = cache.sets[0][0]
 
@@ -373,7 +373,7 @@ def test_vector_cache_key_changes_when_a_model_changes(monkeypatch):
     assert cache.sets[1][0] != first
 
 
-def test_hybrid_search_cache_hit_skips_encoding(monkeypatch):
+def test_hybrid_search_cache_hit_skips_encoding(monkeypatch, fake_cache):
     vec = {"dense": [0.1, 0.2], "si": [1], "sv": [0.7]}
     monkeypatch.setattr(main, "cache", fake_cache(get_result=vec))
     dense = _FakeDense([9.9, 9.9])
