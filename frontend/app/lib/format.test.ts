@@ -24,12 +24,22 @@ import {
 type Fn = (s: string) => string
 
 describe('parseLocalDate — a bare YYYY-MM-DD is a local calendar date', () => {
-  it('parses a bare date at local midnight, not UTC midnight', () => {
+  it('parses a bare date at local midnight, offset from UTC by the local zone', () => {
     // A local Date constructor is what makes this a local calendar date.
-    // `Date.parse('2024-05-01')` would give UTC midnight instead, which is
-    // 2024-04-30 for any viewer west of Greenwich.
-    expect(parseLocalDate('2024-05-01')).toBe(new Date(2024, 4, 1).getTime())
-    expect(parseLocalDate('2024-05-01')).not.toBe(Date.parse('2024-05-01'))
+    // `Date.parse('2024-05-01')` yields UTC midnight instead, so the two
+    // instants differ by exactly the local UTC offset: 0 in UTC, and
+    // -19800000 ms in IST, where that UTC midnight is still 2024-04-30.
+    // Asserting "the two are not equal" only holds for a non-zero offset and
+    // is false on a UTC runner, so the invariant is stated as the offset.
+    // `getTimezoneOffset()` is minutes west of UTC, so it carries the sign
+    // directly; negating it would both invert the comparison and make UTC
+    // yield -0, which `toBe`'s Object.is check rejects against +0.
+    const localMidnight = new Date(2024, 4, 1).getTime()
+    const utcMidnight = Date.parse('2024-05-01')
+    expect(parseLocalDate('2024-05-01')).toBe(localMidnight)
+    expect(parseLocalDate('2024-05-01') - utcMidnight).toBe(
+      new Date(2024, 4, 1).getTimezoneOffset() * 60_000,
+    )
   })
 
   it('reads a full timestamp as the instant it is', () => {
