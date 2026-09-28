@@ -138,35 +138,64 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
     expect(console.error).toHaveBeenCalledWith('getMe: failed to reach the auth service', expect.anything())
   })
 
-  it('aborts a response whose headers arrived but whose body never completes', async () => {
-    // The deadline must stay armed across the body read, not just the header
-    // read: otherwise this leaks the socket and hangs getMe() forever.
-    const bodySignal = new AbortController()
+  it('rejects, not resolves null, when a stalled body is cut off by the deadline', async () => {
+    // undici's behaviour: the headers resolve, and the body read rejects with
+    // an AbortError once the signal fires. A stub that never settles cannot
+    // model that, and would leave getMe()'s RESULT unobserved — the very thing
+    // this test exists to pin. `null` is getMe's "definitive logged out"
+    // sentinel, so a cancelled read that resolves null is a forced logout.
     vi.stubGlobal(
       'fetch',
       vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
         signals = [init?.signal ?? null]
-        init?.signal?.addEventListener('abort', () => bodySignal.abort())
+        const { promise, reject } = Promise.withResolvers<never>()
+        init?.signal?.addEventListener('abort', () => {
+          const err = new Error('The operation was aborted')
+          err.name = 'AbortError'
+          reject(err)
+        })
+        // Headers arrive immediately; the body stalls until the abort lands.
         return Promise.resolve({
           ok: true,
           status: 200,
-          // A body stream that never produces and never errors.
-          json: () => new Promise<never>(() => {}),
+          json: () => promise,
         } as unknown as Response)
       })
     )
 
     const pending = track(getMe())
-    let settled = false
-    void pending.then(() => {
-      settled = true
-    })
+    await advance(ME_DEADLINE_MS)
 
-    await advance(ME_DEADLINE_MS - 1)
-    expect(settled).toBe(false)
-
-    await advance(1)
+    const result = await pending
+    // Must reject. Resolving `null` here would tell the dashboard the user is
+    // logged out when the auth service merely never finished sending a body.
+    expect(result.ok).toBe(false)
     expect(signals[0]?.aborted).toBe(true)
-    expect(bodySignal.signal.aborted).toBe(true)
+    // And it must not be misreported as a malformed payload either.
+    expect(console.error).not.toHaveBeenCalledWith(
+      'getMe: failed to parse /api/auth/me response',
+      expect.anything()
+    )
+  })
+
+  it('still returns null (not a throw) for a genuinely malformed 200 body', async () => {
+    // The pre-existing lenient behaviour must survive the abort guard: callers
+    // may lack a .catch, so a real parse failure resolves null.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.reject(new SyntaxError('Unexpected token <')),
+        } as unknown as Response)
+      )
+    )
+
+    const pending = track(getMe())
+    await advance(0)
+    const result = await pending
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.value).toBeNull()
   })
 })

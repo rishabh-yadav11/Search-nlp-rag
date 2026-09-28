@@ -280,8 +280,13 @@ export async function getMe(force = false, signal?: AbortSignal | null): Promise
     if (!res.ok) return null
     try {
       meCache = (await res.json()) as AuthUser
-    } catch {
-      // Malformed/non-JSON 200 response: don't throw (callers may lack a
+    } catch (err) {
+      // The body read is inside the deadline's scope, so an abort here is a
+      // cancellation or a timeout, NOT a malformed payload. Swallowing it
+      // would resolve `null` — this function's "definitive logged out"
+      // sentinel — and the outer classification below would never run, so a
+      // hung auth service would masquerade as a rejected token.
+      // Genuine malformed/non-JSON 200: don't throw (callers may lack a
       // .catch); treat as an unexpected payload and return null safely.
       console.error('getMe: failed to parse /api/auth/me response')
       return null
