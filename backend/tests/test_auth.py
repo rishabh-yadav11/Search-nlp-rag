@@ -482,10 +482,16 @@ def test_all_three_set_paths_agree_on_one_policy():
 
     Asserted structurally (one function backs all three) rather than by
     re-listing the rules, because a second copy of the rules is exactly the bug.
+    The check is that each endpoint DELEGATES and adds no bound of its own: an
+    endpoint that calls ``validate_password`` and then also compares a length
+    has reintroduced exactly the drift this issue removed.
     """
     for name in ("signup", "change_password"):
         src = inspect.getsource(getattr(auth, name))
         assert "validate_password(" in src, f"{name} must go through validate_password"
+        for stray in ("AUTH_PASSWORD_MIN_LEN", "_effective_password", "too long", "at least"):
+            assert stray not in src, f"{name} restates a bound ({stray}); it must delegate only"
+
 
     boot = inspect.getsource(auth.bootstrap_admin)
     assert "_password_rejection(" in boot and "validate_password(" not in boot
