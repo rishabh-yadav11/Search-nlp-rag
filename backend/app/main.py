@@ -1773,6 +1773,39 @@ class SimilarArticlesResponse(BaseModel):
 # verbatim, so a versioned key is what stops those pre-deploy entries from
 # being served for their remaining TTL.
 RECOMMEND_CACHE_VERSION = "v2"
+# One search view renders one similar list per result, so this cap is what
+# keeps a single request from asking for a whole page of them over and over:
+# each id costs the one Qdrant point-id query the per-article route would
+# have spent anyway, and the cap bounds how many of those one request can ask
+# for at once.
+SIMILAR_BATCH_MAX_IDS = 20
+
+
+class SimilarArticlesBatchRequest(BaseModel):
+    """Request body for the batched similar articles endpoint."""
+
+    article_ids: list[int] = Field(
+        ...,
+        min_length=1,
+        max_length=SIMILAR_BATCH_MAX_IDS,
+        description="Indexed article ids",
+    )
+    limit: int = Field(config.RECOMMEND_DEFAULT_LIMIT, ge=1, le=20)
+    same_category: bool = False
+
+
+class SimilarArticlesGroup(BaseModel):
+    """One article's similar list, as returned inside a batch response."""
+
+    article_id: int
+    similar_articles: list[dict]
+    cached: bool = False
+
+
+class SimilarArticlesBatchResponse(BaseModel):
+    """Response for the batched similar articles endpoint."""
+
+    results: list[SimilarArticlesGroup]
 
 
 class RecommendationsResponse(BaseModel):
@@ -1891,7 +1924,7 @@ async def get_similar(
 
     Uses dense vector similarity from Qdrant with optional category filtering.
     """
-    cached_key = f"recommend:similar:{RECOMMEND_CACHE_VERSION}:{article_id}:{limit}:{same_category}"
+    cached_key = _similar_cache_key(article_id, limit, same_category)
     cached = await cache.get(cached_key)
     if cached:
         return SimilarArticlesResponse(
@@ -1914,6 +1947,90 @@ async def get_similar(
         similar_articles=articles,
         limit=limit,
         cached=False,
+    )
+
+
+def _similar_cache_key(article_id: int, limit: int, same_category: bool) -> str:
+    """Cache key for one article's similar list.
+
+    The single and the batched route share this so they cannot drift: two
+    spellings of the same key would each miss the other's entries and re-run
+    the Qdrant query the cache exists to avoid, which is the exact cost #353
+    set out to remove.
+
+    The version is part of it for the reason RECOMMEND_CACHE_VERSION exists:
+    entries written before the payload narrowed still carry the full article
+    body, and both routes return a cached value verbatim, so a key without the
+    version would serve those pre-deploy entries for the rest of their TTL.
+    """
+    return f"recommend:similar:{RECOMMEND_CACHE_VERSION}:{article_id}:{limit}:{same_category}"
+
+
+@app.post("/recommend/similar/batch", response_model=SimilarArticlesBatchResponse)
+async def get_similar_batch(
+    body: SimilarArticlesBatchRequest,
+    _auth: None = Depends(require_auth),
+):
+    """Get articles similar to several articles in one request.
+
+    The same answer ``/recommend/similar/{id}`` gives, for a whole view at
+    once: the cached lists are read with a single MGET rather than one GET
+    per article, and the caller spends one round trip per view rather than one
+    per search result. Ids are answered in request order, and an article with
+    no similar rows is reported as an empty list exactly as the per-article
+    route reports it.
+    """
+    # dict.fromkeys drops a repeated id while keeping the caller's order, so an
+    # id listed twice costs one Qdrant query and one response group.
+    article_ids = list(dict.fromkeys(body.article_ids))
+    cached = await cache.get_many(
+        [
+            _similar_cache_key(article_id, body.limit, body.same_category)
+            for article_id in article_ids
+        ]
+    )
+
+    groups: dict[int, SimilarArticlesGroup] = {}
+    missing: list[int] = []
+    for article_id, value in zip(article_ids, cached):
+        if value:
+            groups[article_id] = SimilarArticlesGroup(
+                article_id=article_id, similar_articles=value, cached=True
+            )
+        else:
+            missing.append(article_id)
+
+    if missing:
+        computed = await asyncio.gather(
+            *(
+                get_similar_articles(
+                    article_id=article_id,
+                    limit=body.limit,
+                    same_category=body.same_category,
+                )
+                for article_id in missing
+            )
+        )
+        # Same rule as the per-article route: an empty result is not worth
+        # caching for an hour, since it is usually a transient Qdrant miss.
+        await asyncio.gather(
+            *(
+                cache.set(
+                    _similar_cache_key(article_id, body.limit, body.same_category),
+                    articles,
+                    ttl=SIMILAR_ARTICLES_TTL_SECONDS,
+                )
+                for article_id, articles in zip(missing, computed)
+                if articles
+            )
+        )
+        for article_id, articles in zip(missing, computed):
+            groups[article_id] = SimilarArticlesGroup(
+                article_id=article_id, similar_articles=articles, cached=False
+            )
+
+    return SimilarArticlesBatchResponse(
+        results=[groups[article_id] for article_id in article_ids]
     )
 
 

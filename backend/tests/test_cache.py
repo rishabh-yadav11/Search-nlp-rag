@@ -20,7 +20,19 @@ class _FakeRedis:
     async def set(self, key, value, ex=None):
         raise self.error
 
-    async def mget(self, keys):
+    async def mget(self, keys, *_rest):
+
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+
+        if isinstance(keys, str):
+
+            keys = [keys, *_rest]
+
+        else:
+
+            keys = [*keys, *_rest]
         # A Redis that is down fails every command, so the batched read must
         # take the same degraded branch ``get`` does.
         raise self.error
@@ -49,7 +61,19 @@ class _RecordingRedis:
         self.sets.append((key, value, ex))
         self.store[key] = value
 
-    async def mget(self, keys):
+    async def mget(self, keys, *_rest):
+
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+
+        if isinstance(keys, str):
+
+            keys = [keys, *_rest]
+
+        else:
+
+            keys = [*keys, *_rest]
         self.mgets.append(list(keys))
         return [self.store.get(key) for key in keys]
 
@@ -91,7 +115,19 @@ class _FlakyRedis(_RecordingRedis):
         self.sets.append((key, value, ex))
         self.store[key] = value
 
-    async def mget(self, keys):
+    async def mget(self, keys, *_rest):
+
+        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
+
+        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+
+        if isinstance(keys, str):
+
+            keys = [keys, *_rest]
+
+        else:
+
+            keys = [*keys, *_rest]
         if self.fail:
             raise self.error
         self.mgets.append(list(keys))
