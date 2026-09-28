@@ -14,6 +14,7 @@ import ast
 import pathlib
 
 import pytest
+from _support import run_sync as _run
 
 from app import config as _config_module
 from app import cost_budget
@@ -610,12 +611,6 @@ def _wire(monkeypatch, store):
     monkeypatch.setattr(cost_budget, "_BUDGET_SCRIPT", None)
     monkeypatch.setattr(cost_budget, "_now_ts", lambda: _BASE_TS)
     return store
-
-
-def _run(coro):
-    import asyncio
-
-    return asyncio.run(coro)
 
 
 def _gather(*coros):

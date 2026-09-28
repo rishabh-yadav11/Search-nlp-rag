@@ -1,8 +1,7 @@
 """Analytics recording/summary uses Redis aggregates and is best-effort."""
 
-import asyncio
-
 import pytest
+from _support import run_sync as _run
 
 from app import analytics
 
@@ -64,10 +63,6 @@ class _SignalsRedis:
     async def zrevrange(self, key, start, stop, withscores=False):
         self.queries.append(key)
         return self.raw
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def test_record_search_increments_counters(monkeypatch):
