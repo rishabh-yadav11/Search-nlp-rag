@@ -180,6 +180,11 @@ def test_rerank_candidates_below_min_reaches_call_site_clamped(effective_config)
         ({"BODY_RESCUE_MAX_CANDIDATES": "5000"}, 50),
         ({"SEARCH_QUERY_MAX_CHARS": "1"}, 32),
         ({"SEARCH_QUERY_MAX_CHARS": "100000"}, 4000),
+        ({"CACHE_KEY_QUERY_MAX_CHARS": "0"}, 8),       # 0 would digest EVERY key
+        ({"CACHE_KEY_QUERY_MAX_CHARS": "999999"}, 4096),
+        ({"RETRIEVAL_QUERY_MAX_CHARS": "0"}, 64),      # 0 would slice every query to ""
+        ({"RETRIEVAL_QUERY_MAX_CHARS": "-5"}, 64),
+        ({"RETRIEVAL_QUERY_MAX_CHARS": "10000000"}, 65536),
     ],
 )
 def test_body_rescue_and_search_knobs_are_clamped(env, expected):
@@ -202,3 +207,8 @@ def test_body_rescue_knobs_default_sane_on_a_clean_environment():
     assert cfg.BODY_RESCUE_WINDOW >= 200
     assert cfg.BODY_RESCUE_MAX_CANDIDATES >= 1
     assert cfg.SEARCH_QUERY_MAX_CHARS >= 32
+    # A 0 here is the dangerous case: it would truncate every query to the
+    # empty string at all three clamp sites and silently empty every result
+    # set, so the floor is part of the contract, not a formality.
+    assert cfg.RETRIEVAL_QUERY_MAX_CHARS >= 64
+    assert cfg.CACHE_KEY_QUERY_MAX_CHARS >= 8
