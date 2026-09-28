@@ -527,9 +527,9 @@ the `analytics:read` permission (`Authorization: Bearer <token>`).
   "cache_hit_rate": 61.0,
   "avg_latency_ms": 214.3,
   "clicks_total": 33,
-  "top_queries": [["fintech funding", 22], ...],
+  "top_queries": [["q1:3f2a91c0b4d5e6f7a8b9c0d1e2f3a4b", 22], ...],
   "click_positions": { "1": 12, "2": 8, ... },
-  "click_top_queries": [["fintech funding", 9], ...]
+  "click_top_queries": [["q1:3f2a91c0b4d5e6f7a8b9c0d1e2f3a4b", 9], ...]
 }
 ```
 
@@ -541,6 +541,34 @@ Counters reset when the analytics Redis DB is cleared (`redis-cli -n 1 FLUSHDB`)
 that range is clamped to the nearest bound, so every reported bucket is one the
 backend can record. `top_queries` returns at most `TOP_QUERIES_N` (20) entries
 and `click_top_queries` at most `TOP_CLICKED_QUERIES_N` (10).
+
+### Query identifiers are digests, never query text
+
+The first element of each `top_queries` / `click_top_queries` row is an opaque
+**query digest** (`q1:` + 32 hex characters), not the search text. A search
+query is user-authored content and these sets aggregate by query text, so
+returning it verbatim made this a cross-user read of every user's search
+history for any account holding `analytics:read`.
+
+The digest is stable, so identical queries still aggregate into one row and the
+dashboard can still rank and compare them — but it is a keyed HMAC, so it
+cannot be reversed into the query it stands for. This is the same treatment
+`/analytics/chat` gives session titles.
+
+The query text is not stored in the analytics Redis at all — not as a
+sorted-set member and not inside the `analytics:query_click:{...}` key — so
+there is nothing there for another reader to expose. The key is
+`ANALYTICS_QUERY_KEY` when set; otherwise the app generates a random one on
+first use and persists it in the analytics Redis, so all workers and restarts
+share it with no operator action. Changing it invalidates existing digests,
+which empties the two top-query lists but leaks nothing.
+
+Rows recorded **before** this change hold verbatim queries and are dropped
+from these lists rather than returned, so an upgraded deployment stops
+reporting them immediately instead of at the end of their TTL.
+
+Each read of this endpoint is recorded in the admin audit trail as
+`analytics.summary.read`, as `/analytics/chat` is.
 
 ### Errors
 

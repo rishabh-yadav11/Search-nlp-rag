@@ -1,5 +1,7 @@
 """Analytics recording/summary uses Redis aggregates and is best-effort."""
 
+import json
+
 import pytest
 from _support import run_sync as _run
 
@@ -12,6 +14,14 @@ class _FakeRedis:
     def __init__(self):
         self.store: dict = {}
         self.last_pipe = []
+        # Every sorted-set member ever written, as (key, member). The store
+        # itself collapses a zset to a running total, so this is the only way a
+        # test can assert on WHAT was stored -- which is the whole question
+        # #348 turns on.
+        self.zsets: list = []
+
+    def zincrby_members(self, key):
+        return [m for k, m in self.zsets if k == key]
 
     def pipeline(self):
         return self
@@ -22,6 +32,7 @@ class _FakeRedis:
 
     def zincrby(self, key, amount, member):
         self.last_pipe.append(("zincrby", key, amount, member))
+        self.zsets.append((key, member))
         return self
 
     def incrbyfloat(self, key, amount):
@@ -49,8 +60,29 @@ class _FakeRedis:
     async def get(self, key):
         return self.store.get(key)
 
+    async def set(self, key, value, nx=False):
+        # ``nx`` is how the digest key is seeded without two workers minting
+        # two different keys for one deployment.
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
     async def zrevrange(self, key, start, stop, withscores=False):
         return []
+
+
+@pytest.fixture(autouse=True)
+def _reset_digest_key():
+    """Clear the process-wide digest key around every test.
+
+    ``_QUERY_DIGEST_KEY`` is deliberately cached for the life of the process
+    (it is the secret shared by all workers), so without this a key seeded
+    through one test's fake Redis would still be in force for the next test.
+    """
+    analytics._QUERY_DIGEST_KEY = None
+    yield
+    analytics._QUERY_DIGEST_KEY = None
 
 
 class _SignalsRedis:
@@ -59,6 +91,16 @@ class _SignalsRedis:
     def __init__(self, raw):
         self.raw = raw
         self.queries = []
+        self.keys: dict = {}
+
+    async def get(self, key):
+        return self.keys.get(key)
+
+    async def set(self, key, value, nx=False):
+        if nx and key in self.keys:
+            return None
+        self.keys[key] = value
+        return True
 
     async def zrevrange(self, key, start, stop, withscores=False):
         self.queries.append(key)
@@ -158,6 +200,12 @@ class _SummaryRedis:
     async def get(self, key):
         return str(self.store[key]) if key in self.store else None
 
+    async def set(self, key, value, nx=False):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
     async def zrevrange(self, key, start, stop, withscores=False):
         self.calls.append((key, start, stop))
         items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: (-kv[1], kv[0]))
@@ -213,16 +261,20 @@ def test_summary_top_lists_window_sizes_are_exact(monkeypatch):
     """Named top-N limits must yield exactly N members, not N or N+1, which is
     what a mis-transcribed inclusive zrevrange end index would cause."""
     fake = _SummaryRedis()
-    fake.zsets["analytics:top_queries"] = {f"q{i}": 100 - i for i in range(1, 31)}
-    fake.zsets["analytics:click_top_queries"] = {f"c{i}": 100 - i for i in range(1, 21)}
+    # Members are digests now, so seed the store with members the read path
+    # will actually keep -- a non-digest member is dropped, which would make
+    # this test measure the filter instead of the window size.
+    fake.zsets["analytics:top_queries"] = {f"q1:{i:032x}": 100 - i for i in range(1, 31)}
+    fake.zsets["analytics:click_top_queries"] = {f"q1:{i:032x}": 100 - i for i in range(1, 21)}
     monkeypatch.setattr(analytics, "_client", lambda: fake)
+
 
     s = _run(analytics.summary())
 
     assert len(s["top_queries"]) == analytics.TOP_QUERIES_N == 20
-    assert [q for q, _ in s["top_queries"]] == [f"q{i}" for i in range(1, 21)]
+    assert [q for q, _ in s["top_queries"]] == [f"q1:{i:032x}" for i in range(1, 21)]
     assert len(s["click_top_queries"]) == analytics.TOP_CLICKED_QUERIES_N == 10
-    assert [q for q, _ in s["click_top_queries"]] == [f"c{i}" for i in range(1, 11)]
+    assert [q for q, _ in s["click_top_queries"]] == [f"q1:{i:032x}" for i in range(1, 11)]
 
 
 def test_recording_never_raises_when_redis_down(monkeypatch):
@@ -365,6 +417,56 @@ def test_analytics_endpoints_still_serve_200_when_stores_are_up(analytics_client
     assert chat_res.json()["sessions"] == 0
 
 
+def test_summary_read_is_recorded_in_the_admin_audit_trail(analytics_client, monkeypatch):
+    """The cross-user read leaves a trail, as #273 established for
+    /analytics/chat. Without one, an admin reading these aggregates is
+    indistinguishable from nobody having looked."""
+    client, headers, chat_store = analytics_client
+    monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
+
+    before = len(_run(chat_store.admin_audit_log(limit=1000)))
+    res = client.get("/analytics/summary", headers=headers)
+    assert res.status_code == 200
+
+    log = _run(chat_store.admin_audit_log(limit=1000))
+    assert len(log) == before + 1
+    assert log[0]["action"] == "analytics.summary.read"
+
+
+def test_summary_serves_text_free_rows_over_http(analytics_client, monkeypatch):
+    """End-to-end: what the admin dashboard actually receives contains no
+    search text, only digests."""
+    client, headers, _ = analytics_client
+    secret = "who bought northwind capital"
+    fake = _SummaryRedis()
+    fake.store["analytics:search:total"] = 12
+    fake.zsets["analytics:top_queries"] = {analytics.query_digest(secret, "k"): 12}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    body = client.get("/analytics/summary", headers=headers).json()
+
+    assert secret not in json.dumps(body)
+    assert body["top_queries"] == [[analytics.query_digest(secret, "k"), 12]]
+
+
+def test_summary_still_serves_when_the_audit_write_fails(analytics_client, monkeypatch):
+    """The audit is best-effort: if it cannot be written the (text-free) read
+    must still succeed, or a broken audit table would take the dashboard down
+    with it."""
+    client, headers, chat_store = analytics_client
+    monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("audit db gone")
+
+    monkeypatch.setattr(chat_store, "record_admin_audit", boom)
+
+    res = client.get("/analytics/summary", headers=headers)
+
+    assert res.status_code == 200
+    assert "searches_total" in res.json()
+
+
 # --- _client / _degraded / close ---
 
 
@@ -430,8 +532,14 @@ def test_record_click_with_article_id_tallies_query_click(monkeypatch):
     monkeypatch.setattr(analytics, "_client", lambda: fake)
     _run(analytics.record_click("fintech funding", 3, article_id=42))
     _run(analytics.record_click("fintech funding", 1, article_id=42))  # repeat click
+    # Keyed by the query's digest, not the query: click_signals can still reach
+    # the set, without the text ever becoming a Redis key.
     assert fake.store["analytics:click:total"] == 2
-    assert fake.store["analytics:query_click:fintech funding"] == 2
+    qkey = next(k for k in fake.store if k.startswith("analytics:query_click:"))
+    assert qkey == "analytics:query_click:" + analytics.query_digest(
+        "fintech funding", analytics._QUERY_DIGEST_KEY
+    )
+    assert fake.store[qkey] == 2
 
 
 def test_record_click_without_article_id_skips_query_key(monkeypatch):
@@ -448,7 +556,9 @@ def test_click_signals_no_raw_returns_none(monkeypatch):
     fake = _SignalsRedis([])
     monkeypatch.setattr(analytics, "_client", lambda: fake)
     assert _run(analytics.click_signals("q")) is None
-    assert fake.queries == ["analytics:query_click:q"]
+    assert fake.queries == [
+        "analytics:query_click:" + analytics.query_digest("q", analytics._QUERY_DIGEST_KEY)
+    ]
 
 
 def test_click_signals_below_min_clicks_returns_none(monkeypatch):
@@ -496,3 +606,224 @@ def test_i_and_f_parse_values():
     assert analytics._i("") == 0
     assert analytics._f("2.5") == 2.5
     assert analytics._f(None) == 0.0
+
+
+# --- #348: cross-user search text must not be stored or reported ---
+
+
+def test_recorded_search_never_stores_the_query_text(monkeypatch):
+    """The store must not hold user-authored search text at all.
+
+    Load-bearing for #348: redacting the response alone would leave the corpus
+    in Redis for the next reader to return, so this asserts on what was
+    WRITTEN, not on how the response looks.
+    """
+    fake = _FakeRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    secret = "acme corp series b"
+
+    _run(analytics.record_search(secret, 5, weak=False, cached=False, latency_ms=10, filtered=False))
+
+    assert secret not in repr(fake.store)
+    # The only member written to top_queries is the digest, not the query.
+    assert fake.zincrby_members("analytics:top_queries") == [
+        analytics.query_digest(secret, analytics._QUERY_DIGEST_KEY)
+    ]
+
+
+def test_summary_never_reports_the_query_text(monkeypatch):
+    """A digest is what the dashboard receives, and the text is not in it."""
+    secret = "who acquired northwind capital"
+    fake = _SummaryRedis()
+    digest = analytics.query_digest(secret, "test-key")
+    fake.zsets["analytics:top_queries"] = {digest: 12}
+    fake.zsets["analytics:click_top_queries"] = {digest: 4}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    s = _run(analytics.summary())
+
+    assert secret not in repr(s)
+    assert s["top_queries"] == [[digest, 12]]
+    assert s["click_top_queries"] == [[digest, 4]]
+
+
+def test_summary_drops_legacy_verbatim_members(monkeypatch):
+    """Rows written before this change are verbatim queries and sit in the store
+    until their TTL lapses. An upgraded deployment must not keep serving them
+    for the length of that TTL, so the read path drops any non-digest member."""
+    fake = _SummaryRedis()
+    legacy = "project falcon acquisition terms"
+    fake.zsets["analytics:top_queries"] = {legacy: 30, analytics.query_digest("ok", "k"): 5}
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    s = _run(analytics.summary())
+
+    assert legacy not in repr(s)
+    assert [q for q, _ in s["top_queries"]] == [analytics.query_digest("ok", "k")]
+
+
+def test_click_beacon_never_stores_the_query_text(monkeypatch):
+    """The unauthenticated beacon is the widest door in: its query reaches the
+    top-click set AND becomes a Redis key. Neither may contain the text."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    secret = "private acquisition rumour"
+
+    _run(analytics.record_click(secret, 2, article_id=7))
+
+    assert secret not in repr(fake.store)
+
+
+def test_click_signals_still_finds_its_own_signal_after_hashing(monkeypatch):
+    """Hashing the key must not break the click-boost layer: the signal recorded
+    for a query must still be found by looking that same query up. This is the
+    regression the hashing could have caused, and why the digest is a stable
+    function of the query rather than a random id.
+
+    The fake needs real sorted sets: the point is that the write and the read
+    agree on the key, which a stub that ignores keys cannot demonstrate.
+    """
+
+    class _RoundTripRedis(_SummaryRedis):
+        def pipeline(self):
+            return self
+
+        def incr(self, key, amount=1):
+            return self
+
+        def zincrby(self, key, amount, member):
+            self.zsets.setdefault(key, {})
+            self.zsets[key][member] = self.zsets[key].get(member, 0) + amount
+            return self
+
+        def expire(self, key, seconds):
+            return self
+
+        async def execute(self):
+            return []
+
+    fake = _RoundTripRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics.config, "CLICK_BOOST_MIN_CLICKS", 2)
+    _run(analytics.record_click("fintech funding", 1, article_id=42))
+    _run(analytics.record_click("fintech funding", 2, article_id=42))
+
+    assert _run(analytics.click_signals("fintech funding")) == {"total": 2, "by_id": {42: 2}}
+
+
+def test_digest_is_stable_across_calls_so_counts_aggregate():
+    """Same query, same digest, always -- otherwise a query's searches scatter
+    across per-worker digests and the counts mean nothing."""
+    a = analytics.query_digest("fintech funding", "k")
+    assert a == analytics.query_digest("fintech funding", "k")
+    assert a != analytics.query_digest("healthtech funding", "k")
+
+
+def test_digest_is_keyed_not_a_bare_hash():
+    """The key has to matter. Under a published key the digest of any guessed
+    query is computable by whoever can read the dashboard, which would leave
+    the fix cosmetic."""
+    assert analytics.query_digest("fintech funding", "key-one") != analytics.query_digest(
+        "fintech funding", "key-two"
+    )
+
+
+def test_digest_key_is_generated_once_and_shared(monkeypatch):
+    """With no ANALYTICS_QUERY_KEY the key is minted and persisted, so every
+    worker resolves the same one instead of each inventing a private namespace
+    (which would split one query's counts four ways)."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics.config, "ANALYTICS_QUERY_KEY", "")
+
+    first = _run(analytics._digest_key(fake))
+    assert first
+    assert fake.store[analytics.QUERY_DIGEST_KEY_REDIS_KEY] == first
+    analytics._QUERY_DIGEST_KEY = None
+    assert _run(analytics._digest_key(fake)) == first
+
+
+def test_configured_query_key_overrides_the_stored_one(monkeypatch):
+    """ANALYTICS_QUERY_KEY pins the namespace so digests survive a rebuild."""
+    fake = _FakeRedis()
+    fake.store[analytics.QUERY_DIGEST_KEY_REDIS_KEY] = "stored-key"
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    monkeypatch.setattr(analytics.config, "ANALYTICS_QUERY_KEY", "configured-key")
+
+    assert _run(analytics._digest_key(fake)) == "configured-key"
+
+
+def test_counters_survive_a_digest_key_failure(monkeypatch):
+    """A Redis hiccup resolving the key must cost the top-query member only.
+    The volume/latency/cache counters carry no user text, so losing them would
+    be a reporting regression worse than the leak being closed."""
+
+    class _NoKeyRedis(_FakeRedis):
+        async def set(self, key, value, nx=False):
+            raise ConnectionError("redis unreachable")
+
+    fake = _NoKeyRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    _run(analytics.record_search("fintech funding", 5, weak=False, cached=False, latency_ms=210, filtered=True))
+
+    assert fake.store["analytics:search:total"] == 1
+    assert fake.store["analytics:search:latency:sum"] == 210
+    assert "analytics:top_queries" not in fake.store
+
+
+def test_click_signals_without_a_key_returns_none_rather_than_looking_up_raw_text(monkeypatch):
+    """With the key unresolvable the only options are no signal, or a lookup
+    keyed by the raw query. It must be no signal -- the raw fallback would
+    reintroduce exactly the text this removed."""
+
+    class _NoKeyRedis:
+        def pipeline(self):
+            return self
+
+        async def get(self, key):
+            raise ConnectionError("redis unreachable")
+
+        async def set(self, key, value, nx=False):
+            raise ConnectionError("redis unreachable")
+
+        async def zrevrange(self, key, start, stop, withscores=False):
+            raise AssertionError("must not query using a raw-query key")
+
+    monkeypatch.setattr(analytics, "_client", lambda: _NoKeyRedis())
+
+    assert _run(analytics.click_signals("fintech funding")) is None
+
+
+def test_empty_query_still_records_counters(monkeypatch):
+    """An empty query has no text to leak and must not crash the writer."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+
+    _run(analytics.record_search("", 0, weak=False, cached=False, latency_ms=5, filtered=False))
+    _run(analytics.record_click("", 1, article_id=3))
+
+    assert fake.store["analytics:search:total"] == 1
+    assert fake.store["analytics:search:zero_results"] == 1
+    assert fake.store["analytics:click:total"] == 1
+
+
+def test_unicode_query_is_never_stored_verbatim(monkeypatch):
+    """Non-ASCII search text must not raise and must not appear in the store.
+    The digest is computed from encoded bytes, so it also cannot split a
+    codepoint the way a raw str slice can."""
+    fake = _FakeRedis()
+    monkeypatch.setattr(analytics, "_client", lambda: fake)
+    secret = "acquisition of Ünicode çompany 株式会社"
+
+    _run(analytics.record_search(secret, 1, weak=False, cached=False, latency_ms=1, filtered=False))
+
+    assert secret not in repr(fake.store)
+
+
+def test_digest_width_is_bounded_regardless_of_query_length(monkeypatch):
+    """A fixed-width digest means the stored member cannot grow with beacon
+    input, which is what the old length cap existed to prevent."""
+    monkeypatch.setattr(analytics.config, "CLICK_QUERY_MAX_LEN", 256)
+    digest = analytics.query_digest("x" * 10_000, "k")
+    assert len(digest) == len(analytics.QUERY_DIGEST_PREFIX) + analytics.QUERY_DIGEST_HEX_LEN

@@ -758,6 +758,15 @@ class Config:
     CLICK_QUERY_MAX_LEN = int(os.getenv("CLICK_QUERY_MAX_LEN", "256"))
     CLICK_QUERY_TTL_SECONDS = int(os.getenv("CLICK_QUERY_TTL_SECONDS", str(7 * 24 * 3600)))
 
+    # Secret mixed into the per-query digest that stands in for a search query
+    # in the analytics aggregates (#348). Left empty, the app generates a random
+    # key on first use and persists it in the analytics Redis, so every gunicorn
+    # worker and every restart shares one key and no operator action is needed.
+    # Set it only to pin the digest namespace across an analytics-Redis rebuild;
+    # changing it makes previously stored digests unreachable, which resets the
+    # top-query lists (their counters are per-digest) but leaks nothing.
+    ANALYTICS_QUERY_KEY = os.getenv("ANALYTICS_QUERY_KEY", "")
+
     # Daily LLM cost counter TTL: kept well past the day it tracks so the budget
     # guardrail survives brief outages, then auto-expires instead of accumulating.
     COST_DAY_TTL_SECONDS = int(os.getenv("COST_DAY_TTL_SECONDS", str(7 * 24 * 3600)))
