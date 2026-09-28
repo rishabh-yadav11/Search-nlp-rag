@@ -25,14 +25,20 @@ What is pinned here, all through the real ``_prepare_multi_entity_turn`` /
 """
 
 import asyncio
+import json
 import time
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from app import auth as auth_module
 from app import chat as chat_module
 from app import main as main_module
+from app.auth import AuthStore
+from app.chat import ChatStore
 from app.main import SourceArticle
-from app.query_intent import MultiEntityQuery
+from app.query_intent import MultiEntityQuery, detect_multi_entity
 
 # Long enough that source_context() truncates it, so the compared prompt is
 # sensitive to the body budget as well as to article identity and order.
@@ -66,6 +72,10 @@ class _Leg:
         self.in_flight = 0
         self.max_in_flight = 0
         self._barrier: tuple[asyncio.Event, object] | None = None
+        self.rescue_delay = 0.0
+        self.rescues = 0
+        self.rescue_in_flight = 0
+        self.max_rescue_in_flight = 0
         self._slow_entities: frozenset[str] = frozenset()
 
     def arm_barrier(self, parties: int) -> None:
@@ -122,10 +132,20 @@ class _Leg:
 
     async def rescue(self, query, articles):
         # A rescued article gets a distinct score, so a test can tell a rescue
-        # that ran from one that did not.
-        for a in articles:
-            a.score = 0.99
-        return articles
+        # that ran from one that did not. The in-flight counters exist because
+        # the concurrency cap is held across BOTH of a leg's awaits: bounding
+        # only the retrieval would leave the body fetch unbounded.
+        self.rescues += 1
+        self.rescue_in_flight += 1
+        self.max_rescue_in_flight = max(self.max_rescue_in_flight, self.rescue_in_flight)
+        try:
+            if self.rescue_delay:
+                await asyncio.sleep(self.rescue_delay)
+            for a in articles:
+                a.score = 0.99
+            return articles
+        finally:
+            self.rescue_in_flight -= 1
 
     def _entity_of(self, rq: str) -> str:
         return rq.split(" ")[0]
@@ -510,6 +530,37 @@ def test_zero_concurrency_knob_does_not_hang(stub_pipeline, monkeypatch):
     assert [s["title"] for s in turn.sources] == ["alpha deal", "bravo deal"]
 
 
+def test_concurrency_cap_covers_body_rescue(stub_pipeline, monkeypatch):
+    """The rescue is part of the leg, so the cap has to bound it too.
+
+    The semaphore is held across both of a leg's awaits. Bounding only the
+    retrieval would leave the body fetch -- the other half of a leg's cost --
+    unbounded, and nothing that measures concurrency inside retrieve() could
+    see it. So the concurrency is measured in the rescue itself, and the last
+    assertion pins that rescues really do overlap, without which the others
+    would be satisfied by a rescue that never ran.
+
+    The rescue has to outlast the retrieval: an unbounded rescue only piles up
+    if a leg is still fetching bodies when the next one starts, so the second
+    delay is the longer of the two on purpose.
+    """
+    entities = ["alpha", "bravo", "charlie", "delta"]
+    monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", True)
+    monkeypatch.setattr(chat_module.config, "CHAT_MULTI_ENTITY_CONCURRENCY", 2)
+    leg = stub_pipeline(
+        entity_articles={e: [_article(i + 1, f"{e} deal", 0.01)] for i, e in enumerate(entities)}
+    )
+    leg.slow_for(*entities)
+    leg.delay = 0.01
+    leg.rescue_delay = 0.05
+
+    _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
+
+    assert leg.rescues == len(entities), "capping must not skip a leg's rescue"
+    assert leg.max_in_flight == 2
+    assert leg.max_rescue_in_flight == 2, "rescues must overlap, and stay under the cap"
+
+
 @pytest.mark.parametrize("cap", [0, 1, -5])
 def test_tiny_entity_cap_keeps_the_feature_alive(stub_pipeline, monkeypatch, cap):
     """A comparison needs at least two entities, so a cap below that floors to 2.
@@ -528,3 +579,173 @@ def test_tiny_entity_cap_keeps_the_feature_alive(stub_pipeline, monkeypatch, cap
 
     assert sorted(leg.started) == sorted(entities), "a two-entity comparison must still run"
     assert "## Multi-entity comparison" in (turn.system or "")
+
+
+# --- the wire: event order and what the turn is charged ---
+
+
+_QUESTION = "compare Acme and Bravo and Cirrus funding rounds"
+_EMAIL = "user-a@example.com"
+
+
+def _events(body: str) -> list[str]:
+    """The event names of an SSE body, in the order the client receives them."""
+    return [line[len("event: "):] for line in body.splitlines() if line.startswith("event: ")]
+
+
+def _done_payload(body: str) -> dict:
+    return json.loads(body.split("event: done\ndata: ", 1)[1])
+
+
+class _Budget:
+    """The daily cap, standing in for the Redis one and counting what it is asked.
+
+    reserve/settle/release are the turn's only contact with the cap, so what
+    they are asked for is what the turn is charged: one hold taken, one settle
+    recorded, no release, whatever the turn's fan-out was.
+    """
+
+    def __init__(self):
+        self.reserved: list[float] = []
+        self.settled: list[float] = []
+        self.released: list[list[str]] = []
+
+    async def reserve(self, estimate_usd: float = 0.0) -> str:
+        self.reserved.append(estimate_usd)
+        return f"hold-{len(self.reserved)}"
+
+    async def settle(self, ids, actual_usd: float) -> None:
+        self.settled.append(actual_usd)
+
+    async def release(self, ids) -> None:
+        self.released.append(list(ids))
+
+    def install(self, monkeypatch) -> "_Budget":
+        monkeypatch.setattr(chat_module, "reserve", self.reserve)
+        monkeypatch.setattr(chat_module, "settle", self.settle)
+        monkeypatch.setattr(chat_module, "release", self.release)
+        return self
+
+
+def _stream_client(tmp_path):
+    """A TestClient over the real chat router, on real stores in tmp_path."""
+    chat_store = ChatStore(str(tmp_path / "chat.db"))
+    auth_store = AuthStore(str(tmp_path / "auth.db"))
+    _run(chat_store.connect())
+    _run(auth_store.connect())
+    app = FastAPI()
+    app.include_router(chat_module.router)
+    chat_module.store = chat_store
+    auth_module.store = auth_store
+    return TestClient(app), chat_store, auth_store
+
+
+def _bearer(auth_store) -> dict[str, str]:
+    user = _run(auth_store.get_user_by_email(_EMAIL))
+    if user is None:
+        user = _run(auth_store.create_user(_EMAIL, "secret1", "user-a", "user"))
+    return {"Authorization": f"Bearer {_run(auth_store.issue_token(user.id, 7))}"}
+
+
+def _post_turn(client, headers, question: str) -> str:
+    """Drive one SSE turn through the real route and hand back the raw body."""
+    sid = client.post("/api/chat/sessions", headers=headers).json()["id"]
+    with client.stream(
+        "POST", f"/api/chat/sessions/{sid}/messages/stream",
+        headers=headers, json={"content": question},
+    ) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        return "".join(r.iter_text())
+
+
+def _fake_llm(pieces, calls):
+    """A stand-in provider that records the prompts it was actually sent."""
+
+    async def stream(client, prompt, model, usage_holder=None, system_prompt=None):
+        calls.append(prompt)
+        for piece in pieces:
+            yield piece
+        if usage_holder is not None:
+            usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=4, completion_tokens=2))
+
+    return stream
+
+
+def test_stream_event_order_is_unchanged(stub_pipeline, monkeypatch, tmp_path):
+    """The gathered turn must put the SAME events on the wire, in the SAME order.
+
+    The frontend switches on the event name and on its position in the stream,
+    so "the legs ran" is not the property at stake -- the sequence is. Every leg
+    has to be in flight at once (a barrier each must reach, so a sequential
+    implementation deadlocks rather than merely being slower), and the body must
+    still read start -> delta... -> done with no error, carrying the combined
+    sources in the order the combine step produces for them.
+    """
+    # The detector's own order and spelling, so the question goes through the
+    # real expansion rather than a monkeypatched stand-in.
+    entities = ["cirrus", "bravo", "acme"]
+    assert detect_multi_entity(_QUESTION).entities == entities
+    leg = stub_pipeline(entity_articles={
+        # A shared id, so the dedupe and the per-article entity list are on the
+        # wire too, and the middle entity finishing LAST, so the order the
+        # sources come out in is not simply the order the legs completed in.
+        "cirrus": [_article(1, "cirrus deal", 0.9), _article(9, "shared", 0.6)],
+        "bravo": [_article(2, "bravo deal", 0.9)],
+        "acme": [_article(3, "acme deal", 0.9), _article(9, "shared", 0.6)],
+    })
+    leg.arm_barrier(len(entities))
+    leg.slow_for("bravo")
+    leg.delay = 0.05
+
+    monkeypatch.setattr(chat_module, "stream_answer", _fake_llm(["Both ", "raised."], []))
+    _Budget().install(monkeypatch)
+
+    client, chat_store, auth_store = _stream_client(tmp_path)
+    try:
+        body = _post_turn(client, _bearer(auth_store), _QUESTION)
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+    assert leg.max_in_flight == len(entities), "the legs must really have overlapped"
+    assert _events(body) == ["start", "delta", "delta", "done"]
+    # The two-entity article sorts first (the most entities match it), then the
+    # rest by score, so this is the order the combine step produces.
+    assert [s["title"] for s in _done_payload(body)["message"]["sources"]] == [
+        "shared", "cirrus deal", "bravo deal", "acme deal",
+    ]
+
+
+def test_entity_count_does_not_multiply_billed_calls(stub_pipeline, monkeypatch, tmp_path):
+    """One provider call and one budget hold per turn, whatever the fan-out.
+
+    A leg is retrieval only -- it never reaches the provider -- so gathering
+    them must not multiply what the turn costs. The cap's own counters are the
+    thing that would double: a hold taken per leg, or a settle per leg, would
+    write the day's spend that many times over.
+    """
+    entities = ["cirrus", "bravo", "acme"]
+    leg = stub_pipeline(
+        entity_articles={e: [_article(i + 1, f"{e} deal", 0.9)] for i, e in enumerate(entities)}
+    )
+    leg.arm_barrier(len(entities))
+
+    calls: list[str] = []
+    monkeypatch.setattr(chat_module, "stream_answer", _fake_llm(["One answer."], calls))
+    budget = _Budget().install(monkeypatch)
+
+    client, chat_store, auth_store = _stream_client(tmp_path)
+    try:
+        body = _post_turn(client, _bearer(auth_store), _QUESTION)
+    finally:
+        _run(auth_store.close())
+        _run(chat_store.close())
+
+    assert leg.max_in_flight == len(entities)
+    assert len(calls) == 1, f"one billed LLM call for the turn, not one per entity (got {len(calls)})"
+    assert len(budget.reserved) == 1, "one hold taken up front, before the billed call"
+    assert len(budget.settled) == 1, "one settle, recording what the turn really cost"
+    assert not budget.released, "an answered turn settles its hold, it never releases it"
+    assert budget.settled[0] > 0
+    assert _events(body) == ["start", "delta", "done"]
