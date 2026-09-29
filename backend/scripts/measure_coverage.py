@@ -19,6 +19,8 @@ Exit codes:
   0  the document matches the fresh measurement (or ``--write`` regenerated it)
   1  the document is stale; a unified diff and the module-level delta print
   2  the measurement itself failed, or the document has no usable block
+  3  the running interpreter is not the one the block must be measured under;
+     refused before any measurement, in check and ``--write`` alike
 
 One consequence of the gate measuring the same suite the document describes:
 `tests/test_coverage_doc.py` is part of that suite and polices the very block
@@ -66,8 +68,8 @@ GENERATED_NOTICE = (
 COMMAND_LINE = "Command: `python -m pytest --cov=app --cov-report=term-missing`"
 
 # The interpreter that produced the block. Statement counts are a property of
-# the source AND the parser: CPython 3.11 finds 5137 statements in app/ where
-# 3.14 finds 5075, from byte-identical source, and the difference is identical
+# the source AND the parser: CPython 3.11 finds 5135 statements in app/ where
+# 3.14 finds 5073, from byte-identical source, and the difference is identical
 # under coverage 7.15.4 and 7.16.2. A block written on one and compared on the
 # other is a 62-statement diff with no visible cause, which is how a green
 # local run and a red CI run coexisted unnoticed. Recording it lets the gate
@@ -325,8 +327,8 @@ def build_block(report: dict, counts: dict[str, int], root: Path = BACKEND_DIR) 
 
     This is the only place the document's numbers are produced. It takes no
     clock and no git state. It does record the measuring interpreter, because
-    statement counts are interpreter-dependent: the same source yields 5137
-    statements under 3.11 and 5075 under 3.14. Omitting it did not make the
+    statement counts are interpreter-dependent: the same source yields 5135
+    statements under 3.11 and 5073 under 3.14. Omitting it did not make the
     block reproducible, it only made the disagreement invisible.
     """
     rows = build_rows(report, root)
@@ -579,7 +581,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # editing the document will fix it -- is not visible anywhere in it.
     # Compare the interpreter only. The coverage.py version is recorded for
     # provenance but is deliberately NOT part of the comparison: it was
-    # measured to make no difference to statement counts (identical 5137/5075
+    # measured to make no difference to statement counts (identical 5135/5073
     # under both 7.15.4 and 7.16.2), so gating on it would report a mismatch
     # that is not one and send the reader after a cause that does not exist.
     committed_interp = next(
@@ -594,8 +596,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         print(
-            "Statement counts are interpreter-dependent (the same source yields 5137 "
-            "statements under Python 3.11 and 5075 under 3.14), so this diff is not "
+            "Statement counts are interpreter-dependent (the same source yields 5135 "
+            "statements under Python 3.11 and 5073 under 3.14), so this diff is not "
             "staleness, and re-running --write here would only trade one wrong "
             "interpreter for another.",
             file=sys.stderr,

@@ -324,8 +324,8 @@ def test_generated_block_carries_no_environment_specific_values():
     The block must be identical on every checkout so a diff means the document
     rotted. That is true of everything here except the interpreter, and the
     interpreter was the one thing that had to be recorded: statement counts are
-    parser-dependent (the same source yields 5137 statements under 3.11 and
-    5075 under 3.14), so a block written on 3.14 and compared on CI's 3.11 was a
+    parser-dependent (the same source yields 5135 statements under 3.11 and
+    5073 under 3.14), so a block written on 3.14 and compared on CI's 3.11 was a
     62-statement diff whose cause appeared nowhere. Recording it converts an
     unreadable diff into a named mismatch, and the gate now fails with that
     name instead of the arithmetic.
