@@ -615,6 +615,33 @@ def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
     r = _client.get("/facets")
     assert r.status_code == 500
 
+def test_facets_survives_a_failed_tag_scan(monkeypatch, fake_cache):
+    """The tag walk is the slowest scan and the only optional one.
+
+    It ranks the whole collection with no early exit where industry/dealtype
+    stop early, so it is the one most likely to time out -- and a timeout must
+    not 500 the two controlled vocabularies the UI's autocomplete already
+    depends on. The tag input is free text, so an empty suggestion list still
+    filters correctly on a typed tag.
+    """
+    async def fake_facet_values(key):
+        return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
+
+    async def failing_top_facet_values(key, limit):
+        raise TimeoutError("tag walk exceeded the client timeout")
+
+    cache = fake_cache()
+    monkeypatch.setattr(main, "cache", cache)
+    monkeypatch.setattr(main, "_facet_values", fake_facet_values)
+    monkeypatch.setattr(main, "_top_facet_values", failing_top_facet_values)
+
+    r = _client.get("/facets")
+
+    assert r.status_code == 200
+    expected = {"industry": ["Fintech"], "dealtype": ["M&A"], "tags": []}
+    assert r.json() == expected
+    assert cache.sets == [(main.FACETS_CACHE_KEY, expected, None)]
+
 
 def test_facets_concurrent_misses_share_one_scan_and_one_cache_write(monkeypatch):
     """K callers that miss together must cost one scan per key, not one each.
