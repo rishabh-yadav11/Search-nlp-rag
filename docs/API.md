@@ -288,6 +288,7 @@ unreachable. See [Rate limits](#3-rate-limits).
 | `dealtype`  | string | no       | —       | Comma-separated deal-type values (filter) |
 | `author`    | string | no       | —       | Comma-separated author names (filter) |
 | `content_type` | string | no     | —       | Comma-separated content-type values (filter); part of the cache key |
+| `tag`       | string | no       | —       | Comma-separated tag values (filter, at most 10 values of 200 characters); part of the cache key |
 | `from_date` | string | no       | —       | `YYYY-MM-DD`, inclusive |
 | `to_date`   | string | no       | —       | `YYYY-MM-DD`, inclusive (end of day) |
 
@@ -315,6 +316,7 @@ unreachable. See [Rate limits](#3-rate-limits).
       "author_names": ["Priya Sharma"],
       "industry_names": ["Fintech"],
       "dealtype_names": ["M&A"],
+      "tag_names": ["IPO", "VCC Startups"],
       "score": 0.998
     }
   ],
@@ -510,9 +512,17 @@ unreachable. See [Rate limits](#3-rate-limits).
 ```json
 {
   "industry": ["Cleantech", "Consumer", "Fintech", ...],
-  "dealtype": ["Credit", "M&A", "Private Equity", "Venture Capital", ...]
+  "dealtype": ["Credit", "M&A", "Private Equity", "Venture Capital", ...],
+  "tags": ["IPO", "VCC Startups", "startups", "Sensex", "Nifty", ...]
 }
 ```
+
+`industry` and `dealtype` are the distinct values of the two controlled
+vocabularies, sorted alphabetically. `tags` is the **200 most frequently used**
+tag values, most frequent first, truncated to that 200 only after the whole
+corpus has been ranked — the two orders are not interchangeable, since most tags
+are used by a single article and an alphabetical list of them is not a filter
+anybody wants. Feed the values back as `tag` on `/search`.
 
 ---
 
@@ -768,6 +778,9 @@ curl "http://<host>/search?q=fintech%20funding&top_k=5"
 
 # Filter by industry + date range
 curl "http://<host>/search?q=funding&industry=Fintech,Healthtech&from_date=2024-01-01&to_date=2025-12-31"
+
+# Filter by tag
+curl "http://<host>/search?q=funding&tag=IPO,Flipkart"
 
 # Year-in-review / top-N (auto Flashback handling)
 curl "http://<host>/search?q=top%2010%20fintech%20deals%20in%202025&top_k=10"

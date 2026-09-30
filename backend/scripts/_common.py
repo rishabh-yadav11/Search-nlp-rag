@@ -66,16 +66,16 @@ def make_point(rec: dict, dvec, svec) -> PointStruct:
 
     This is the single definition of the indexed payload, shared by every write
     path, so two scripts can no longer store a different set of keys for the
-    same article. The key set is deliberately fixed at the ten fields the
+    same article. The key set is deliberately fixed at the eleven fields the
     search read path uses; a field that is not stored here is not stored by any
     script.
 
-    ``content_type`` is the tenth key, and every value is normalised to ``str``
-    (never ``None``): it carries a KEYWORD payload index, and a field that is
-    ``str`` on some points and ``None`` on others is a mixed-type field that
-    Qdrant indexes inconsistently. The read side maps a falsy value back to
-    ``None`` (``payload.get("content_type") or None``), so an article with no
-    content type in MySQL round-trips as absent exactly as before.
+    Every value is normalised to ``str`` (never ``None``) where it carries a
+    KEYWORD index, and a field that is ``str`` on some points and ``None`` on
+    others is a mixed-type field that Qdrant indexes inconsistently. The read
+    side maps a falsy value back to ``None`` (``payload.get("content_type") or
+    None``), so an article with no content type in MySQL round-trips as absent
+    exactly as before.
     """
     payload = {
         "title": rec["title"],
@@ -88,6 +88,7 @@ def make_point(rec: dict, dvec, svec) -> PointStruct:
         "author_names": rec.get("author_names") or [],
         "industry_names": rec.get("industry_names") or [],
         "dealtype_names": rec.get("dealtype_names") or [],
+        "tag_names": rec.get("tag_names") or [],
     }
     return PointStruct(
         id=rec["id"],
@@ -121,6 +122,7 @@ def create_payload_indexes(client):
         ("author_names", PayloadSchemaType.KEYWORD),
         ("industry_names", PayloadSchemaType.KEYWORD),
         ("dealtype_names", PayloadSchemaType.KEYWORD),
+        ("tag_names", PayloadSchemaType.KEYWORD),
         # content_type is single-valued, so it gets a plain KEYWORD index (the
         # *_names fields are keyword too, but they hold lists).
         ("content_type", PayloadSchemaType.KEYWORD),

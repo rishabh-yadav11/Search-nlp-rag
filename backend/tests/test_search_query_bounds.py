@@ -19,6 +19,7 @@ from qdrant_client.models import FusionQuery, SparseVector
 
 from app import auth, main
 from app.config import config
+from app.input_hygiene import MAX_FACET_VALUE_LEN, MAX_FACET_VALUES
 from app.main import SourceArticle
 
 
@@ -364,23 +365,26 @@ def test_long_but_accepted_query_produces_a_bounded_search_key(monkeypatch):
 
 
 def _max_sized_facet() -> str:
-    """The longest facet #252 accepts: 10 values of 100 characters, ~1 KB of
-    query-string payload, i.e. the largest value that reaches a key or a Qdrant
-    MatchAny at all. Anything beyond it is a 400 (see
+    """The longest facet #252 accepts: 10 values of MAX_FACET_VALUE_LEN
+    characters, ~2 KB of query-string payload, i.e. the largest value that
+    reaches a key or a Qdrant MatchAny at all. Anything beyond it is a 400 (see
     ``input_hygiene.split_facet_values``), so a test that wants "a long facet"
     has to mean this one."""
-    return ",".join("B" * 100 for _ in range(10))
+    return ",".join("B" * MAX_FACET_VALUE_LEN for _ in range(MAX_FACET_VALUES))
+
 
 
 def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
     """Scope of this fix, stated honestly.
 
-    The six facet params (`industry`, `dealtype`, `author`, `content_type`,
-    `from_date`, `to_date`) are plain `Query(None)` strings that reach the same
-    two keys through `facet_cache_token` and `_filter_token`. #252 bounds them:
-    `input_hygiene.split_facet_values` rejects a facet over 10 values of 100
-    chars with a 400, and `input_hygiene.build_cache_key` digests any key body
-    over MAX_KEY_LEN=256, which covers the filter JSON too.
+    The facet params (`industry`, `dealtype`, `author`, `content_type`, `tag`)
+    are plain `Query(None)` strings that reach the same two keys through
+    `facet_cache_token` and `_filter_token`; `from_date`/`to_date` reach them
+    through the filter JSON. #252 bounds them:
+    `input_hygiene.split_facet_values` rejects a facet over
+    MAX_FACET_VALUES values of MAX_FACET_VALUE_LEN chars with a 400, and
+    `input_hygiene.build_cache_key` digests any key body over MAX_KEY_LEN=256,
+    which covers the filter JSON too.
 
     What this PR owns, and what this asserts, is the QUERY segment: with a
     facet at that maximum in the request, the query must still be a digest

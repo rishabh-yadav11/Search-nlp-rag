@@ -8,17 +8,21 @@ or removed, never bulk-recreated).
 
 State lives in data/index_state.json: {updated_at, fingerprints}.
 A fingerprint is the md5 of the *indexed* row values (title, summary, url,
-published_date, category, content_type, body and the facet lists), so any edit
-that would change the payload or the embedded text is caught.
+published_date, category, content_type, body and the facet lists including
+tag_names), so any edit that would change the payload or the embedded text is
+caught.
 
-Operator note — one-time re-seed: content_type was added to the fingerprint when
-it became a stored payload field. That changed the hash of EVERY record, so an
-index_state.json written by the previous version no longer matches any row and
-the first normal run would re-embed the whole corpus. Run
+Operator note — one-time re-seed: content_type and tag_names were added to the
+fingerprint when they became stored payload fields. That changed the hash of
+EVERY record, so an index_state.json written by a previous version no longer
+matches any row and the first normal run would re-embed the whole corpus. Run
 `python scripts/update_index.py --init` ONCE after deploying that change to
 re-seed from current MySQL state and avoid it; main() logs a WARNING when it
 sees this signature. This is not a recurring requirement — after the re-seed the
-hashes are stable again.
+hashes are stable again. Re-seeding is the right remedy only when the stored
+text of already-indexed rows did not change: tag_names also enters the composed
+lead (app/index_text._lead), so those points need the destructive rebuild in the
+README before `--init` is run.
 
 Durability & reconciliation:
   * Upserts are acknowledged (wait=True); state fingerprints are
@@ -86,20 +90,25 @@ def fingerprint(rec: dict, include_body: bool = True) -> str:
             ",".join(rec.get("industry_names") or []),
             ",".join(rec.get("dealtype_names") or []),
             rec.get("content_type") or "",
-            # content_type is part of the stored payload (see _common.make_point),
-            # so it MUST be part of the change fingerprint: without it a row
-            # whose content_type alone changed in MySQL hashes identically, is
-            # classified unchanged by sync_delta, and the indexed payload goes
-            # stale forever with nothing logged.
+            ",".join(rec.get("tag_names") or []),
+            # content_type and tag_names are part of the stored payload (see
+            # _common.make_point), so they MUST be part of the change
+            # fingerprint: without a term a row whose tags alone changed in
+            # MySQL hashes identically, is classified unchanged by sync_delta,
+            # and the stored payload — plus the tag text now inside the
+            # embedded lead — goes stale forever with nothing logged.
             #
             # Adding a term changes the hash of EVERY record, so every
-            # fingerprint in an index_state.json written by the previous
-            # 9-field version now mismatches: the first incremental run after
-            # this ships sees the whole corpus as "changed" and re-embeds it.
-            # Field order is irrelevant to that — it is a content change, not a
-            # reordering. The remedy is `python scripts/update_index.py --init`
-            # once after deploy, which re-seeds the fingerprints from current
-            # MySQL state and returns before any embedding work.
+            # fingerprint in an index_state.json written by a previous version
+            # now mismatches: the first incremental run after this ships sees
+            # the whole corpus as "changed" and re-embeds it. Field order is
+            # irrelevant to that — it is a content change, not a reordering.
+            #
+            # `--init` re-seeds the hashes without embedding, which is the right
+            # remedy only when the stored text of already-indexed rows did not
+            # change. tag_names DOES change it (compose_* puts tags in the
+            # lead), so points indexed before this need the full destructive
+            # rebuild documented in the README first, and `--init` after it.
         ]
     )
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -138,7 +147,8 @@ async def fetch_records(
             content_type,
             author_names,
             industry_names,
-            dealtype_names
+            dealtype_names,
+            tag_names
         FROM {config.MYSQL_TABLE}
         {where}
     """

@@ -94,7 +94,8 @@ async def fetch_all():
             content_type,
             author_names,
             industry_names,
-            dealtype_names
+            dealtype_names,
+            tag_names
         FROM {config.MYSQL_TABLE}
         WHERE status = 1 AND feid > %s
         ORDER BY feid ASC

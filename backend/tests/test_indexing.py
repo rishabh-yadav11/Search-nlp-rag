@@ -18,6 +18,7 @@ def _rec(**overrides) -> dict:
         "industry_names": ["Fintech"],
         "dealtype_names": ["Series A"],
         "content_type": "Interview",
+        "tag_names": ["IPO"],
     }
     base.update(overrides)
     return base
@@ -40,6 +41,7 @@ def test_fingerprint_stable_for_identical_records():
         "industry_names",
         "dealtype_names",
         "content_type",
+        "tag_names",
     ],
 )
 def test_fingerprint_sensitive_to_each_field(field):

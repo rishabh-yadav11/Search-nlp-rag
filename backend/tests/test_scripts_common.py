@@ -33,6 +33,7 @@ def _record(**overrides) -> dict:
         "author_names": ["Alice", "Bob"],
         "industry_names": ["Fintech"],
         "dealtype_names": ["Series A", "M&A"],
+        "tag_names": ["IPO", "VCC Startups"],
     }
     rec.update(overrides)
     return rec
@@ -61,6 +62,7 @@ def test_make_point_payload_is_exactly_the_expected_dict():
         "author_names": ["Alice", "Bob"],
         "industry_names": ["Fintech"],
         "dealtype_names": ["Series A", "M&A"],
+        "tag_names": ["IPO", "VCC Startups"],
     }
     assert point.id == 42
 
@@ -85,7 +87,7 @@ def test_make_point_truncates_body_to_the_configured_limit():
 def test_make_point_normalises_missing_optional_fields():
     """Absent/None optional fields get the same defaults the old copies used."""
     rec = _record(summary=None, body=None, published_date=None, category=None)
-    rec.update({"author_names": None, "industry_names": None, "dealtype_names": None})
+    rec.update({"author_names": None, "industry_names": None, "dealtype_names": None, "tag_names": None})
 
     payload = make_point(rec, DENSE, SPARSE).payload
 
@@ -96,6 +98,7 @@ def test_make_point_normalises_missing_optional_fields():
     assert payload["author_names"] == []
     assert payload["industry_names"] == []
     assert payload["dealtype_names"] == []
+    assert payload["tag_names"] == []
 
 
 def test_content_type_is_in_the_payload():

@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -478,6 +479,7 @@ class SourceArticle(BaseModel):
     author_names: list[str] = []
     industry_names: list[str] = []
     dealtype_names: list[str] = []
+    tag_names: list[str] = []
     content_type: str | None = None
     score: float
 
@@ -495,6 +497,7 @@ class SourceSummary(BaseModel):
     author_names: list[str] = []
     industry_names: list[str] = []
     dealtype_names: list[str] = []
+    tag_names: list[str] = []
     content_type: str | None = None
     score: float
 
@@ -519,6 +522,7 @@ def to_summary(a: SourceArticle) -> SourceSummary:
         author_names=a.author_names,
         industry_names=a.industry_names,
         dealtype_names=a.dealtype_names,
+        tag_names=a.tag_names,
         content_type=a.content_type,
     )
 
@@ -547,6 +551,7 @@ def build_facet_filter(
     from_date: str | None,
     to_date: str | None,
     content_type: str | None = None,
+    tag: str | None = None,
 ) -> Filter | None:
     """Qdrant filter for the faceted search params, or None when unfiltered.
 
@@ -562,6 +567,7 @@ def build_facet_filter(
         ("dealtype_names", "dealtype", dealtype),
         ("author_names", "author", author),
         ("content_type", "content_type", content_type),
+        ("tag_names", "tag", tag),
     ):
         values = split_facet_values(field, raw)
         if values:
@@ -591,6 +597,7 @@ def facet_cache_token(
     from_date: str | None,
     to_date: str | None,
     content_type: str | None = None,
+    tag: str | None = None,
 ) -> str:
     """Cache-key fragment for the faceted search params.
 
@@ -599,11 +606,14 @@ def facet_cache_token(
     components are length-prefixed rather than joined with a delimiter: the
     pipe-join this replaces was ambiguous, and ``industry='a', dealtype='b|c'``
     and ``industry='a|b', dealtype='c'`` produced one token for two different
-    filters -- a request was then served the other one's cached results.
+    filters -- a request was then served the other one's cached results. That
+    prefixing is also what makes adding a field safe: a new component cannot
+    be made to collide with the fields around it by shifting a delimiter
+    across a boundary, so the tuple grows without re-opening the hole.
     """
     return build_cache_key(
         *(normalize_text(value or "") for value in
-          (industry, dealtype, author, from_date, to_date, content_type))
+          (industry, dealtype, author, from_date, to_date, content_type, tag))
     )
 
 
@@ -740,6 +750,7 @@ _PAYLOAD_FIELDS = [
     "author_names",
     "industry_names",
     "dealtype_names",
+    "tag_names",
     "content_type",
 ]
 
@@ -830,6 +841,7 @@ async def hybrid_search(
             author_names=payload.get("author_names") or [],
             industry_names=payload.get("industry_names") or [],
             dealtype_names=payload.get("dealtype_names") or [],
+            tag_names=payload.get("tag_names") or [],
             content_type=payload.get("content_type") or None,
             score=p.score,
         )
@@ -1347,6 +1359,7 @@ async def retrieve_with_auto_facet_fallback(
     dealtype: str | None,
     author: str | None,
     content_type: str | None = None,
+    tag: str | None = None,
     eff_from: str | None,
     eff_to: str | None,
     auto_industry: str | None,
@@ -1372,6 +1385,12 @@ async def retrieve_with_auto_facet_fallback(
     explicit user-supplied facet and the date window always stay, so a genuinely
     empty corpus still reports an honest "no results".
 
+    ``tag`` has no auto counterpart — a tag is an entity or topic name, not a
+    semantic guess — so it is always explicit, and it is carried into the
+    relaxed retry unchanged like every other explicit facet. Dropping it would
+    answer a different question than the one asked, and it is not part of the
+    returned facet triple because it can never be relaxed.
+
     The fallback is deliberately bounded: it fires only when the first retrieval
     returned nothing AND an auto facet is present, and the retry itself re-runs
     retrieval (so a transient miss that then succeeds simply restores the good
@@ -1390,7 +1409,9 @@ async def retrieve_with_auto_facet_fallback(
     eff_industry = industry or auto_industry
     eff_dealtype = dealtype or auto_dealtype
     eff_content_type = content_type or auto_content_type
-    qfilter = build_facet_filter(eff_industry, eff_dealtype, author, eff_from, eff_to, eff_content_type)
+    qfilter = build_facet_filter(
+        eff_industry, eff_dealtype, author, eff_from, eff_to, eff_content_type, tag
+    )
     # The prefetch belongs to *this* (effective, pre-relaxation) filter only; the
     # relaxed retry below keys on a different filter and does its own lookup.
     if prefetched is _NO_PREFETCH:
@@ -1408,7 +1429,7 @@ async def retrieve_with_auto_facet_fallback(
     lone_weak_hit = len(results) == 1 and results[0].score < config.ASK_MIN_SCORE
     if (results and not lone_weak_hit) or not (auto_industry or auto_dealtype or auto_content_type):
         results = await _temporal_date_fallback(
-            results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, need_body
+            results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, tag, need_body
         )
         return results, eff_industry, eff_dealtype, eff_content_type
     # An auto facet zeroed the set: drop each auto facet that wasn't explicitly
@@ -1416,15 +1437,18 @@ async def retrieve_with_auto_facet_fallback(
     relaxed_industry = eff_industry if not (auto_industry and industry is None) else None
     relaxed_dealtype = eff_dealtype if not (auto_dealtype and dealtype is None) else None
     relaxed_content_type = eff_content_type if not (auto_content_type and content_type is None) else None
-    relaxed = build_facet_filter(relaxed_industry, relaxed_dealtype, author, eff_from, eff_to, relaxed_content_type)
+    relaxed = build_facet_filter(
+        relaxed_industry, relaxed_dealtype, author, eff_from, eff_to, relaxed_content_type, tag
+    )
     if relaxed == qfilter:
         results = await _temporal_date_fallback(
-            results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, need_body
+            results, top_k, eff_from, eff_to, eff_industry, eff_dealtype, author, tag, need_body
         )
         return results, eff_industry, eff_dealtype, eff_content_type
     relaxed_results = await retrieve_and_rerank(retrieval_q, top_k, relaxed, need_body=need_body)
     relaxed_results = await _temporal_date_fallback(
-        relaxed_results, top_k, eff_from, eff_to, relaxed_industry, relaxed_dealtype, author, need_body
+        relaxed_results, top_k, eff_from, eff_to, relaxed_industry, relaxed_dealtype, author, tag,
+        need_body,
     )
     return relaxed_results, relaxed_industry, relaxed_dealtype, relaxed_content_type
 
@@ -1444,6 +1468,7 @@ async def _temporal_date_fallback(
     industry: str | None,
     dealtype: str | None,
     author: str | None,
+    tag: str | None,
     need_body: bool,
 ) -> list[SourceArticle]:
     """When a date-scoped query has too few relevance-passing hits, fill the gap
@@ -1461,7 +1486,7 @@ async def _temporal_date_fallback(
         return results
     date_only = await retrieve_by_date_window(
         top_k, from_date, to_date,
-        industry=industry, dealtype=dealtype, author=author, need_body=need_body,
+        industry=industry, dealtype=dealtype, author=author, tag=tag, need_body=need_body,
     )
     if not date_only:
         return results
@@ -1477,15 +1502,17 @@ async def retrieve_by_date_window(
     industry: str | None = None,
     dealtype: str | None = None,
     author: str | None = None,
+    tag: str | None = None,
     need_body: bool = False,
 ) -> list[SourceArticle]:
     """Date-scoped retrieval that ignores the lexical query entirely: returns the
-    most recent articles published in [from_date, to_date], optionally narrowed by
-    category facets. Used as the temporal fallback when lexical matching is too
-    weak to surface anything — recency within the window becomes the relevance
-    signal. Articles are scored by recency so they clear the chat relevance gate
-    and sort newest-first."""
-    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date)
+    most recent articles published in [from_date, to_date], narrowed by the same
+    facets the lexical leg was given, so filling a gap cannot widen the caller's
+    filter. Used as the temporal fallback when lexical matching is too weak to
+    surface anything — recency within the window becomes the relevance signal.
+    Articles are scored by recency so they clear the chat relevance gate and sort
+    newest-first."""
+    qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date, None, tag)
     if qfilter is None:
         return []
     # `published_date` carries a DATETIME payload index, so `order_by` returns the
@@ -1556,6 +1583,7 @@ async def search(
     dealtype: str | None = Query(None),
     author: str | None = Query(None),
     content_type: str | None = Query(None),
+    tag: str | None = Query(None),
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
 ):
@@ -1574,7 +1602,8 @@ async def search(
     # down, but the cache key below is built from these same values, and it
     # must not be reachable with an oversized facet.
     for facet_field, facet_raw in (("industry", industry), ("dealtype", dealtype),
-                                   ("author", author), ("content_type", content_type)):
+                                   ("author", author), ("content_type", content_type),
+                                   ("tag", tag)):
         split_facet_values(facet_field, facet_raw)
     q_fixed, _ = fix_query(q)
     retrieval_q, eff_from, eff_to, auto_dealtype, auto_industry = _effective_intent(q_fixed, from_date, to_date)
@@ -1597,9 +1626,9 @@ async def search(
     # entry (#252).
     cache_key = search_cache_key(
         retrieval_q, eff_top_k,
-        facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type),
+        facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type, tag),
     )
-    filtered = any((industry, dealtype, author, content_type, from_date, to_date))
+    filtered = any((industry, dealtype, author, content_type, tag, from_date, to_date))
     # This request needs two cache entries: its own summary page, and the
     # retrieval result set underneath it (retrieve_with_auto_facet_fallback ->
     # retrieve_and_rerank reads the retrieve: key for the same query and the
@@ -1616,7 +1645,7 @@ async def search(
     # applies the same fix_query), so the prefetched key is the real one.
     prefetch_key = retrieve_cache_key(
         fix_query(retrieval_q)[0], eff_top_k,
-        build_facet_filter(industry, dealtype, author, eff_from, eff_to, content_type),
+        build_facet_filter(industry, dealtype, author, eff_from, eff_to, content_type, tag),
     )
     cached_results, cached_articles = await cache.get_many([cache_key, prefetch_key])
     if cached_results is not None:
@@ -1635,7 +1664,7 @@ async def search(
     reranked, final_industry, final_dealtype, final_content_type = await retrieve_with_auto_facet_fallback(
         retrieval_q, eff_top_k,
         industry=explicit_industry, dealtype=explicit_dealtype, author=author,
-        content_type=explicit_content_type,
+        content_type=explicit_content_type, tag=tag,
         eff_from=eff_from, eff_to=eff_to,
         auto_industry=auto_industry, auto_dealtype=auto_dealtype,
         auto_content_type=auto_content_type, prefetched=cached_articles,
@@ -1654,6 +1683,9 @@ async def search(
     # but their cache key (which still names the auto facet) would collide with
     # an explicit-facet request, so the /search cache is skipped for them (the
     # retrieve_and_rerank cache, keyed by the actual filter, still applies).
+    # `tag` is absent from this comparison on purpose: it has no auto counterpart
+    # to be relaxed into, so it can never make a result set that was filtered on
+    # it look unfiltered here.
     fell_back = final_industry != industry or final_dealtype != dealtype or final_content_type != content_type
     if results and not fell_back:
         await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
@@ -1698,8 +1730,22 @@ def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) ->
     return "\n".join(parts)
 
 
-FACETS_CACHE_KEY = "facets:v1"
+# v2, not v1: a v1 entry has no ``tags`` key, and serving it as if it did would
+# hand every caller an empty tag filter list until the TTL expired on its own.
+FACETS_CACHE_KEY = "facets:v2"
 FACETS_LIMIT = 200
+# How many of the most frequent tags /facets returns, for the same autocomplete
+# purpose FACETS_LIMIT serves on the other two vocabularies.
+#
+# Its own constant because the two caps are NOT the same kind of cut. A tag
+# vocabulary is ~60k values, so the alphabetical scan above cannot be truncated
+# at the first N distinct values seen: which values those are depends on the
+# collection's scroll order, and the singletons (63% of all tags) would crowd out
+# the tags a UI actually offers. This cap is applied to a finished frequency
+# ranking instead, so the answer is the true top N by article count and
+# independent of scroll order and page size; a tie is broken alphabetically so
+# the cached payload is stable rather than dependent on insertion order.
+TAGS_FACET_LIMIT = 200
 # How often the FACETS_LIMIT cap is evaluated, counted in POINTS CONSUMED rather
 # than in round trips. A capped scan stops the moment the cap is reached, so where
 # it stops has to be a property of the collection's scroll order: if the check only
@@ -1741,23 +1787,30 @@ def _release_facet_scan(task: asyncio.Task) -> None:
 
 
 async def _facets_uncached() -> dict[str, list[str]]:
-    """Both facet vocabularies, scanned concurrently, then cached.
+    """The facet vocabularies, scanned concurrently, then cached.
 
-    The two keys are independent, so they are gathered rather than awaited back
-    to back. return_exceptions keeps the sibling outcome retrieved (no orphaned
-    task warning) and stops a late sibling failure from being masked by the first
-    one; the first failure still propagates, and nothing is cached on the way
-    out, so a half-finished scan is never served back as a vocabulary.
+    The keys are independent, so they are gathered rather than awaited back to
+    back. return_exceptions keeps every sibling outcome retrieved (no orphaned
+    task warning) and stops a late sibling failure from being masked by the
+    first one; the first failure still propagates, and nothing is cached on the
+    way out, so a half-finished scan is never served back as a vocabulary.
+
+    ``tags`` is the exception to the "same scan" shape: it ranks a free-text
+    vocabulary by frequency over the whole collection (_top_facet_values) where
+    the other two collect a controlled vocabulary and stop early
+    (_facet_values). Both are gathered, so the tag walk does not serialise the
+    two cheap scans behind it.
     """
-    industry, dealtype = await asyncio.gather(
+    industry, dealtype, tags = await asyncio.gather(
         _facet_values("industry_names"),
         _facet_values("dealtype_names"),
+        _top_facet_values("tag_names", TAGS_FACET_LIMIT),
         return_exceptions=True,
     )
-    for outcome in (industry, dealtype):
+    for outcome in (industry, dealtype, tags):
         if isinstance(outcome, BaseException):
             raise outcome
-    result = {"industry": industry, "dealtype": dealtype}
+    result = {"industry": industry, "dealtype": dealtype, "tags": tags}
     await cache.set(FACETS_CACHE_KEY, result)
     return result
 
@@ -1786,6 +1839,23 @@ async def _facets_single_flight() -> dict[str, list[str]]:
     _facet_scan_task = task
     task.add_done_callback(_release_facet_scan)
     return await asyncio.shield(task)
+
+
+def _facet_point_values(payload: dict, key: str) -> list[str]:
+    """The non-empty string values one point contributes to ``key``.
+
+    An array-valued keyword field (industry_names, tag_names) contributes each of
+    its elements and a scalar field its own value. Anything that is not a
+    non-empty string is dropped rather than stringified, so a malformed payload
+    cannot put ``'42'`` or ``'None'`` into a vocabulary a user can then select.
+    """
+    value = payload.get(key)
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        return [item for item in value if isinstance(item, str) and item]
+    return []
+
 
 
 async def _facet_values(key: str) -> list[str]:
@@ -1823,14 +1893,7 @@ async def _facet_values(key: str) -> list[str]:
         )
         for start in range(0, len(pts), FACET_CAP_CHECK_EVERY):
             for p in pts[start : start + FACET_CAP_CHECK_EVERY]:
-                v = (p.payload or {}).get(key)
-                if isinstance(v, str):
-                    if v:
-                        values.add(v)
-                elif isinstance(v, (list, tuple)):
-                    for item in v:
-                        if isinstance(item, str) and item:
-                            values.add(item)
+                values.update(_facet_point_values(p.payload or {}, key))
             if len(values) >= FACETS_LIMIT:
                 truncated = True
                 break
@@ -1846,15 +1909,54 @@ async def _facet_values(key: str) -> list[str]:
     return sorted(values)[:FACETS_LIMIT]
 
 
+async def _top_facet_values(key: str, limit: int) -> list[str]:
+    """The ``limit`` most frequent values for ``key``, most frequent first.
+
+    The counterpart to :func:`_facet_values` for a vocabulary too large to
+    alphabetise. A tag is a free-text label rather than a controlled one, so the
+    values worth offering are the ones many articles share, and the top N cannot
+    be known without counting every value on every point: hence the full walk
+    with no early exit, and a Counter rather than a set. Memory is one entry per
+    distinct value (tens of thousands of strings), not one list per point —
+    values are tallied and dropped as the pages go by.
+
+    Ordering is by frequency with an alphabetical tie-break, so the result is a
+    property of the corpus rather than of the scroll order or the page size, and
+    the cached payload stays byte-stable across scans.
+    """
+    counts: Counter[str] = Counter()
+    next_offset = None
+    while True:
+        pts, next_offset = await state["qdrant"].scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            limit=FACET_SCROLL_PAGE,
+            with_payload=[key],
+            with_vectors=False,
+            offset=next_offset,
+        )
+        for p in pts:
+            counts.update(_facet_point_values(p.payload or {}, key))
+        if next_offset is None or not pts:
+            # The same `not pts` guard as _facet_values: a client that returns an
+            # empty page without clearing the offset would loop forever.
+            break
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [value for value, _count in ranked[:limit]]
+
+
 @app.get(
     "/facets",
     dependencies=[Depends(public_rate_limit("facets", "PUBLIC_FACETS_RATE_PER_MIN"))],
 )
 async def facets():
-    """Distinct industry_names and dealtype_names values across the collection,
-    used for filter autocomplete. Cached in Redis (small controlled vocab).
+    """Filter vocabularies for autocomplete, cached in Redis.
 
-    A miss is single-flight: one pair of scans and one cache write shared by all
+    ``industry`` and ``dealtype`` are the distinct values of the two controlled
+    vocabularies, alphabetically. ``tags`` is the ``TAGS_FACET_LIMIT`` most
+    frequent tag values, most frequent first, truncated after the ranking rather
+    than during the walk.
+
+    A miss is single-flight: one set of scans and one cache write shared by all
     the callers that miss together, instead of one full-collection walk each.
     """
     cached = await cache.get(FACETS_CACHE_KEY)

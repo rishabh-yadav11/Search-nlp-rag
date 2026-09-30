@@ -45,6 +45,7 @@ type SortBy = 'relevance' | 'date_desc' | 'date_asc' | 'score'
 type Filters = {
   industry: string
   dealtype: string
+  tag: string
   from_date: string
   to_date: string
 }
@@ -52,6 +53,7 @@ type Filters = {
 const EMPTY_FILTERS: Filters = {
   industry: '',
   dealtype: '',
+  tag: '',
   from_date: '',
   to_date: '',
 }
@@ -174,9 +176,10 @@ export default function Page() {
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
   const [showFilters, setShowFilters] = useState(false)
   const [hideLow, setHideLow] = useState(false)
-  const [facetOptions, setFacetOptions] = useState<{ industry: string[]; dealtype: string[] }>({
+  const [facetOptions, setFacetOptions] = useState<{ industry: string[]; dealtype: string[]; tags: string[] }>({
     industry: [],
     dealtype: [],
+    tags: [],
   })
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
   const requestSeqRef = useRef(0)
@@ -202,6 +205,7 @@ export default function Page() {
         setFacetOptions({
           industry: Array.isArray(data.industry) ? data.industry : [],
           dealtype: Array.isArray(data.dealtype) ? data.dealtype : [],
+          tags: Array.isArray(data.tags) ? data.tags : [],
         })
       })
       .catch(() => {})
@@ -433,6 +437,28 @@ export default function Page() {
                 </label>
                 <datalist id="dealtype-options">
                   {facetOptions.dealtype.map((v) => (
+                    <option key={v} value={v} />
+                  ))}
+                </datalist>
+                <label className="filter-field">
+                  {/* The label carries the truncation note because the tag
+                      vocabulary runs to tens of thousands of values and /facets
+                      ships only the 200 most-used: without it the datalist reads
+                      as the complete list. It rides on the label rather than a
+                      second line, which would break the grid's bottom-aligned
+                      inputs. */}
+                  <span className="filter-label">tag &middot; top 200 by use</span>
+                  <input
+                    type="text"
+                    list="tag-options"
+                    value={filters.tag}
+                    onChange={(e) => updateFilter('tag', e.target.value)}
+                    placeholder="e.g. IPO"
+                    aria-label="Tag filter"
+                  />
+                </label>
+                <datalist id="tag-options">
+                  {facetOptions.tags.map((v) => (
                     <option key={v} value={v} />
                   ))}
                 </datalist>

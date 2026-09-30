@@ -121,6 +121,7 @@ _ROW = {
     "author_names": ["Alice"],
     "industry_names": ["Fintech"],
     "dealtype_names": ["Series A"],
+    "tag_names": ["IPO", "VCC Startups"],
 }
 
 
@@ -164,6 +165,23 @@ def test_resumed_build_stores_content_type_on_the_points_it_upserts(monkeypatch,
 
     assert client.upserted, "the build must upsert something"
     assert [p.payload["content_type"] for p in client.upserted] == ["Interview"]
+
+
+def test_resumed_build_indexes_and_stores_tag_names(monkeypatch, tmp_path, fake_models):
+    """A tag filter needs both halves at once, on the resumed path.
+
+    A resumed build is the state every deployed collection is in, and it is the
+    path where the index call was historically skipped — so a stored-but-
+    unindexed tag_names would make every /tag request match nothing.
+    """
+    client = _FakeQdrant(exists=True, compatible=True)
+    monkeypatch.setattr(build_index, "QdrantClient", lambda *a, **k: client)
+    _write_dataset(tmp_path, monkeypatch, [_ROW])
+
+    build_index.main()
+
+    assert {f: s for f, s in client.index_calls}["tag_names"] == PayloadSchemaType.KEYWORD
+    assert [p.payload["tag_names"] for p in client.upserted] == [["IPO", "VCC Startups"]]
 
 
 def test_incompatible_collection_is_recreated_and_indexed(monkeypatch, tmp_path, fake_models):

@@ -2,13 +2,13 @@
 Helpers shared by the index scripts (fetch/build/update) and the API.
 
 * compose_dense_text(): input for the DENSE embedder. Title + facets
-  (authors, industry, dealtype) + summary — metadata first so the facet values
-  survive the embedder's 512-token truncation. NO body: the dense transformer
-  is token-bound, so keeping this short keeps builds fast, and semantic
-  matching keys on the headline + facets + summary.
-* compose_sparse_text(): input for the SPARSE (BM25/lexical) embedder. Metadata
-  + summary + FULL body, so keyword matches inside the article body stay
-  searchable at cheap lexical cost.
+  (authors, industry, dealtype, tags) + summary — metadata first so the facet
+  values survive the embedder's 512-token truncation. NO body: the dense
+  transformer is token-bound, so keeping this short keeps builds fast, and
+  semantic matching keys on the headline + facets + summary.
+* compose_sparse_text(): input for the SPARSE (BM25/lexical) embedder. The same
+  metadata lead (so a tag is a lexical term too) + summary + FULL body, so
+  keyword matches inside the article body stay searchable at cheap lexical cost.
 * split_names(): normalizes the comma/delimiter-separated *_names columns into
   a clean, de-duplicated list (used for the payload facet fields).
 * normalize_date(): converts MySQL datetime values into RFC 3339 so Qdrant's
@@ -100,6 +100,10 @@ def record_from_row(row: dict) -> dict:
         "author_names": split_names(row["author_names"]),
         "industry_names": split_names(row["industry_names"]),
         "dealtype_names": split_names(row["dealtype_names"]),
+        # row.get(), not row[...]: backfill_body.py and backfill_missing.py
+        # reuse this builder with a narrower SELECT that has no tag_names
+        # column, and a KeyError there would fail an unrelated payload repair.
+        "tag_names": split_names(row.get("tag_names")),
     }
 
 
@@ -150,7 +154,7 @@ def _join_vals(vals):
 
 
 def _lead(rec: dict) -> str:
-    """Title + facet values (authors, industry, dealtype), metadata first."""
+    """Title + facet values (authors, industry, dealtype, tags), metadata first."""
     return ". ".join(
         _seg(p)
         for p in [
@@ -158,6 +162,7 @@ def _lead(rec: dict) -> str:
             _join_vals(rec.get("author_names")),
             _join_vals(rec.get("industry_names")),
             _join_vals(rec.get("dealtype_names")),
+            _join_vals(rec.get("tag_names")),
         ]
         if p
     )

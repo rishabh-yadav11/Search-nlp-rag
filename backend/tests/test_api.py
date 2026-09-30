@@ -91,6 +91,105 @@ def test_build_facet_filter_none_when_unfiltered():
     assert build_facet_filter(None, None, None, None, None) is None
 
 
+def test_build_facet_filter_tag():
+    """The tag param is a MatchAny on tag_names, like the other name facets."""
+    f = build_facet_filter(None, None, None, None, None, None, "IPO,Flipkart")
+    conds = _conditions(f)
+    assert _only(conds["tag_names"]).match.any == ["IPO", "Flipkart"]
+    assert list(conds) == ["tag_names"], "the tag param must not drag in another facet"
+    assert build_facet_filter(None, None, None, None, None, None, None) is None
+
+
+def test_the_auto_facet_retry_never_drops_an_explicit_tag(monkeypatch):
+    """A tag survives the relaxation retry, because it is never relaxed.
+
+    Only the three auto-guessed facets are recomputed for the retry, so a tag
+    forgotten there would silently widen a tagged query precisely when an auto
+    facet zeroed the set — the one path the user did not choose.
+    """
+    filters = []
+
+    async def fake_retrieve_and_rerank(q, top_k, qfilter, **kwargs):
+        filters.append(qfilter)
+        return []
+
+    monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve_and_rerank)
+
+    asyncio.run(main.retrieve_with_auto_facet_fallback(
+        "edtech", 5,
+        industry=None, dealtype=None, author=None, content_type=None, tag="IPO",
+        eff_from=None, eff_to=None, auto_industry="TMT", auto_dealtype=None,
+    ))
+
+    assert len(filters) == 2, "the relaxation retry never ran"
+    assert {c.key for c in filters[0].must} == {"industry_names", "tag_names"}
+    assert {c.key for c in filters[1].must} == {"tag_names"}, \
+        "the retry dropped the explicit tag filter"
+
+
+class _ScoredPoint:
+    def __init__(self, tags):
+        self.payload = {"tag_names": tags}
+
+
+def _tag_scroll_qdrant():
+    """A scroll source over three pages, re-served from the start per instance.
+
+    Sensex is seen first and IPO last, so a scan that returned values in the
+    order it met them (or stopped once it had enough) would answer differently
+    from one that counts.
+    """
+    pages = [
+        ([_ScoredPoint(["Sensex"]), _ScoredPoint(["Sensex"])], 2),
+        ([_ScoredPoint(["IPO"]), _ScoredPoint(["IPO"]), _ScoredPoint(["IPO"])], 5),
+        ([_ScoredPoint(["Flipkart"]), _ScoredPoint(["VCC Startups"])], None),
+    ]
+
+    class _Qdrant:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def scroll(self, *, collection_name, limit, with_payload, with_vectors, offset):
+            self.calls.append({"collection_name": collection_name, "limit": limit,
+                               "with_payload": with_payload, "offset": offset})
+            return pages[len(self.calls) - 1]
+
+    return _Qdrant()
+
+
+def test_the_tag_vocabulary_is_ranked_by_frequency_over_every_point(monkeypatch):
+    """The cap truncates a finished ranking, it does not end the walk.
+
+    The top N by frequency is unknowable until every value on every point has
+    been counted, so this has to read all three pages and then drop the tail —
+    an early exit (the shape the other two vocabularies use) would return
+    Sensex and Flipkart here, the two least useful values a filter can offer.
+    """
+    qdrant = _tag_scroll_qdrant()
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+
+    out = asyncio.run(main._top_facet_values("tag_names", 2))
+
+    assert out == ["IPO", "Sensex"]
+    assert [c["offset"] for c in qdrant.calls] == [None, 2, 5], \
+        "the walk stopped before the collection was exhausted"
+    # Requesting one keyword field per page, not the whole payload: ~6KB of body
+    # per point would make this scan the most expensive thing the app does.
+    assert all(c["with_payload"] == ["tag_names"] for c in qdrant.calls)
+
+
+def test_equal_tag_counts_break_alphabetically(monkeypatch):
+    """Two tags used by the same number of articles have no frequency order
+    between them, so the tie is broken by name — otherwise the cached payload
+    would depend on the order the pages happened to arrive in."""
+    qdrant = _tag_scroll_qdrant()
+    monkeypatch.setitem(main.state, "qdrant", qdrant)
+
+    out = asyncio.run(main._top_facet_values("tag_names", 4))
+
+    assert out == ["IPO", "Sensex", "Flipkart", "VCC Startups"]
+
+
 @pytest.mark.parametrize("field", ["from_date", "to_date"])
 def test_build_facet_filter_invalid_date_raises_400(field):
     kwargs = {"industry": None, "dealtype": None, "author": None, "from_date": None, "to_date": None}

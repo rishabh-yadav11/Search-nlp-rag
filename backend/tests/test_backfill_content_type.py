@@ -219,7 +219,7 @@ def test_every_field_the_search_can_filter_on_has_a_payload_index():
     create_payload_indexes(client)
     indexed = {field for field, _ in client.index_calls}
 
-    filtered = build_facet_filter("Fin", "M&A", "A", "2025-01-01", "2025-12-31", "Interview")
+    filtered = build_facet_filter("Fin", "M&A", "A", "2025-01-01", "2025-12-31", "Interview", "IPO")
     filter_keys = {c.key for c in filtered.must}
 
     assert filter_keys == {
@@ -228,6 +228,7 @@ def test_every_field_the_search_can_filter_on_has_a_payload_index():
         "author_names",
         "published_date",
         "content_type",
+        "tag_names",
     }
     assert filter_keys <= indexed, f"unindexed filter fields: {filter_keys - indexed}"
 

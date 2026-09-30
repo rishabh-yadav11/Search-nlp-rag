@@ -195,6 +195,43 @@ def test_facet_cache_token_never_collides_across_field_boundaries(left, right):
         main.build_facet_filter(*right, None, None, None, None)
 
 
+@pytest.mark.parametrize("left,right", [
+    # (author, tag). The same delimiter shift as the family above, now across
+    # the tag boundary: a value carrying '|' must not be able to impersonate a
+    # different field's value, and the tag slot is a component like any other.
+    (("b|c", "a"), ("b", "a|c")),
+    (("b|c", "a"), ("b|c", "a|b")),
+    (("b", "a|c"), ("b", "a|c|")),
+])
+def test_facet_cache_token_never_collides_across_the_tag_field(left, right):
+    assert left != right, "the pair under test must be genuinely different"
+    assert main.facet_cache_token(None, None, left[0], None, None, None, left[1]) != \
+        main.facet_cache_token(None, None, right[0], None, None, None, right[1])
+    # And they really do select different filters, so the key has to differ.
+    assert main.build_facet_filter(None, None, left[0], None, None, None, left[1]) != \
+        main.build_facet_filter(None, None, right[0], None, None, None, right[1])
+
+
+def test_two_different_tag_filters_get_distinct_cache_entries(monkeypatch):
+    """`tag` is part of the cache identity, on both the summary and the
+    retrieval leg. If it reached only the search: key, the second request would
+    be served the first tag's cached results from the retrieve: entry."""
+    cache, retrieved, _ = _wire(monkeypatch)
+
+    first = _client.get("/search", params={"q": "test", "tag": "IPO"})
+    second = _client.get("/search", params={"q": "test", "tag": "Flipkart"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["cached"] is False, "the second tag was served the first one's results"
+    assert len(retrieved) == 2, "the second request reused the first one's retrieval"
+    search_keys = [k for k in cache.gets if k.startswith("search:")]
+    retrieve_keys = [k for k in cache.gets if k.startswith("retrieve:")]
+    assert len(set(search_keys)) == 2, "the two tag filters share one search key"
+    assert len(set(retrieve_keys)) == 2, "the two tag filters share one retrieve key"
+    assert len([k for k in cache.store if k.startswith("search:")]) == 2
+
+
 def test_build_cache_key_is_injective():
     """A length-prefixed encoding is unambiguous: shifting content between
     parts cannot produce the same key."""
@@ -367,7 +404,7 @@ def test_facet_value_length_over_the_cap_is_rejected():
     # Fixed length, not MAX_FACET_VALUE_LEN + 1, for the same reason as the
     # count test above: a mutated-up cap must not turn this into a gigabyte.
     with pytest.raises(HTTPException) as excinfo:
-        split_facet_values("author", "n" * 200)
+        split_facet_values("author", "n" * 400)
     assert excinfo.value.status_code == 400
     assert "author" in excinfo.value.detail
     assert "n" * 20 not in excinfo.value.detail
@@ -406,16 +443,28 @@ def test_ten_values_is_accepted_at_the_shipped_cap():
     assert len(split_facet_values("industry", ",".join(f"v{i}" for i in range(10)))) == 10
 
 
-def test_a_101_character_value_is_rejected_at_the_shipped_cap():
+def test_a_201_character_value_is_rejected_at_the_shipped_cap():
     """The literal length boundary. Scaling from MAX_FACET_VALUE_LEN has the
     same tautology as above."""
     with pytest.raises(HTTPException) as excinfo:
-        split_facet_values("author", "n" * 101)
+        split_facet_values("author", "n" * 201)
     assert excinfo.value.status_code == 400
 
 
-def test_a_100_character_value_is_accepted_at_the_shipped_cap():
-    assert split_facet_values("author", "n" * 100) == ["n" * 100]
+def test_a_200_character_value_is_accepted_at_the_shipped_cap():
+    assert split_facet_values("author", "n" * 200) == ["n" * 200]
+
+
+def test_the_longest_tag_in_the_corpus_is_filterable():
+    """The cap is set by the corpus, not by a round number: the longest real
+    tag is 112 characters, and a filter that cannot name a tag that exists is
+    a dead control. Scaled from a literal for the same reason as the tests
+    above — the length IS the property under test."""
+    longest_tag = "n" * 112
+    assert split_facet_values("tag", longest_tag) == [longest_tag]
+    filt = main.build_facet_filter(None, None, None, None, None, None, longest_tag)
+    assert filt.must[0].key == "tag_names"
+    assert filt.must[0].match.any == [longest_tag]
 
 
 def test_facet_filter_never_builds_an_oversized_match_any():
@@ -432,10 +481,10 @@ def test_facets_at_the_cap_are_still_accepted():
     product of those two constants is what this builds, so a mutated-up cap
     made it allocate gigabytes and the suite was OOM-killed before it could
     report a failure."""
-    values = ["v" * 100] * 10
+    values = ["v" * 200] * 10
     accepted = split_facet_values("industry", ",".join(values))
     assert len(accepted) == 10
-    assert all(len(v) == 100 for v in accepted)
+    assert all(len(v) == 200 for v in accepted)
     filt = main.build_facet_filter(",".join(values), None, None, None, None, None)
     assert len(filt.must[0].match.any) == 10
 
@@ -665,7 +714,7 @@ def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
     cache, _, _ = _wire(monkeypatch)
     # Literals, not the cap constants -- same reason as the other facet tests:
     # this multiplies MAX_FACET_VALUE_LEN by MAX_FACET_VALUES.
-    values = ",".join("v" * 100 for _ in range(10))
+    values = ",".join("v" * 200 for _ in range(10))
     response = _client.get("/search", params={"q": "test", "industry": values})
     assert response.status_code == 200
     # The request also builds the retrieve: prefetch key (#266); only the
@@ -680,7 +729,7 @@ def test_search_cache_key_stays_bounded_with_a_max_sized_facet(monkeypatch):
     # bounded, but not a raw echo of the request.
     for key in search_keys:
         assert ":sha256:" in key, "a max-sized facet must be digested, not spelled out"
-        assert "v" * 100 not in key, "the raw facet reached the key"
+        assert "v" * 200 not in key, "the raw facet reached the key"
 
 
 def test_retrieve_cache_key_is_bounded_and_control_free(monkeypatch):
