@@ -223,6 +223,11 @@ python scripts/update_index.py --init  # re-seed fingerprints (no embedding)
 
 `reset_index.py` snapshots the collection under `backend/backups/` first and aborts when it cannot verify that snapshot; `--yes` only skips the interactive confirmation. `update_index.py --init` on its own is **not** enough: it re-seeds the fingerprints from current MySQL rows and returns before any embedding work, so it would mark the stale points "current" and skip exactly the re-embed they need. It is step 4, not a replacement for the rebuild.
 
+**Stop the API for the duration too.** It serves from the collection the reset
+just dropped, so every `/search` and `/facets` 500s until the rebuild finishes.
+Stopping it does **not** stop the cron below — that is a separate writer, and it
+is the one that corrupts the rebuild rather than just reading it.
+
 **Suspend the `*/15 update_index.py` cron for the duration.** It is the one writer that is not in this shell: a tick landing after the reset reads an empty `index_state.json`, classifies all ~67k rows as new, and upserts concurrently with `build_index.py`'s checkpointed run — two writers on one collection, plus a `--init` in step 4 that would otherwise re-seed fingerprints while the rebuild is still embedding. Stopping the API does not stop it. Comment the line out and put it back afterwards:
 
 ```bash

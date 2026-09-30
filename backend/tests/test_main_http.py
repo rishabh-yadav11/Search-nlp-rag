@@ -706,15 +706,20 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
         attempts.append(key)
         raise RuntimeError("qdrant down")
 
-    async def down_top_facet_values(key, limit):
+    async def working_top_facet_values(key, limit):
+        # The tag scan degrades to [] on failure instead of propagating (see
+        # _facets_uncached), so this test keeps it healthy: what it is about is
+        # the guard being released when a CONTROLLED vocabulary fails, and a tag
+        # failure no longer reaches the caller at all.
         attempts.append(key)
-        raise RuntimeError("qdrant down")
+        return ["IPO"]
+
 
     async def scenario():
         cache = FakeCache()
         monkeypatch.setattr(main, "cache", cache)
         monkeypatch.setattr(main, "_facet_values", down_facet_values)
-        monkeypatch.setattr(main, "_top_facet_values", down_top_facet_values)
+        monkeypatch.setattr(main, "_top_facet_values", working_top_facet_values)
         outcomes = await asyncio.gather(main.facets(), main.facets(), return_exceptions=True)
         # Let the scan's done callback run, so the guard is observably released.
         await asyncio.sleep(0)
@@ -729,9 +734,6 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
 
     async def working_facet_values(key):
         return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
-
-    async def working_top_facet_values(key, limit):
-        return ["IPO"]
 
     monkeypatch.setattr(main, "_facet_values", working_facet_values)
     monkeypatch.setattr(main, "_top_facet_values", working_top_facet_values)
