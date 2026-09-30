@@ -1795,11 +1795,20 @@ async def _facets_uncached() -> dict[str, list[str]]:
     first one; the first failure still propagates, and nothing is cached on the
     way out, so a half-finished scan is never served back as a vocabulary.
 
-    ``tags`` is the exception to the "same scan" shape: it ranks a free-text
-    vocabulary by frequency over the whole collection (_top_facet_values) where
-    the other two collect a controlled vocabulary and stop early
-    (_facet_values). Both are gathered, so the tag walk does not serialise the
-    two cheap scans behind it.
+    ``tags`` is the exception on two counts. It ranks a free-text vocabulary by
+    frequency over the whole collection (_top_facet_values), where the other two
+    collect a controlled vocabulary and stop early (_facet_values) -- so it is
+    both the slowest scan and the one most likely to hit a client timeout, while
+    the other two finish in a fraction of it. It is also the only one whose
+    absence is survivable: the tag input is free text, so an empty suggestion
+    list still filters correctly on a typed tag, whereas losing industry or
+    dealtype empties the autocomplete the UI cannot work without.
+
+    So a failed or timed-out tag walk degrades to an empty list and is served
+    alongside the two vocabularies that did answer, rather than turning a slow
+    optional scan into a 500 for the whole endpoint. The failure is logged at
+    WARNING: it is a real degradation, and a silently empty tag list would read
+    as "this corpus has no tags".
     """
     industry, dealtype, tags = await asyncio.gather(
         _facet_values("industry_names"),
@@ -1807,9 +1816,17 @@ async def _facets_uncached() -> dict[str, list[str]]:
         _top_facet_values("tag_names", TAGS_FACET_LIMIT),
         return_exceptions=True,
     )
-    for outcome in (industry, dealtype, tags):
+    for outcome in (industry, dealtype):
         if isinstance(outcome, BaseException):
             raise outcome
+    if isinstance(tags, BaseException):
+        logger.warning(
+            "tag facet scan failed (%s: %s); serving industry/dealtype without tag suggestions",
+            type(tags).__name__,
+            tags,
+            exc_info=tags,
+        )
+        tags = []
     result = {"industry": industry, "dealtype": dealtype, "tags": tags}
     await cache.set(FACETS_CACHE_KEY, result)
     return result

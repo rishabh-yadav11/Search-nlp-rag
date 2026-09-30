@@ -221,7 +221,18 @@ python scripts/build_index.py          # embed + upsert into a new collection
 python scripts/update_index.py --init  # re-seed fingerprints (no embedding)
 ```
 
-`reset_index.py` snapshots the collection under `backend/backups/` first and aborts when it cannot verify that snapshot; `--yes` only skips the interactive confirmation. Stop the API before the reset — it 500s until the rebuild finishes. `update_index.py --init` on its own is **not** enough: it re-seeds the fingerprints from current MySQL rows and returns before any embedding work, so it would mark the stale points "current" and skip exactly the re-embed they need. It is step 4, not a replacement for the rebuild.
+`reset_index.py` snapshots the collection under `backend/backups/` first and aborts when it cannot verify that snapshot; `--yes` only skips the interactive confirmation. `update_index.py --init` on its own is **not** enough: it re-seeds the fingerprints from current MySQL rows and returns before any embedding work, so it would mark the stale points "current" and skip exactly the re-embed they need. It is step 4, not a replacement for the rebuild.
+
+**Suspend the `*/15 update_index.py` cron for the duration.** It is the one writer that is not in this shell: a tick landing after the reset reads an empty `index_state.json`, classifies all ~67k rows as new, and upserts concurrently with `build_index.py`'s checkpointed run — two writers on one collection, plus a `--init` in step 4 that would otherwise re-seed fingerprints while the rebuild is still embedding. Stopping the API does not stop it. Comment the line out and put it back afterwards:
+
+```bash
+crontab -l > /tmp/cron.bak
+crontab -l | grep -v 'update_index.py' | crontab -   # suspend
+# ... run the four steps above ...
+crontab /tmp/cron.bak && rm /tmp/cron.bak             # restore
+```
+
+Verify it is really gone before starting (`crontab -l | grep update_index` must print nothing), and confirm the first scheduled run after you restore it is a normal delta rather than a full re-embed.
 
 ## Log Management
 
