@@ -1,8 +1,9 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import Link from 'next/link'
-import { API_BASE, authRequestInit, getMe, logout, redirectToLogin } from '../../lib/auth'
+import { API_BASE, authRequestInit, getMe, redirectToLogin } from '../../lib/auth'
+import type { AuthUser } from '../../lib/auth'
+import TopBar from '../../components/TopBar'
 import { formatClockTime, formatCost, formatEpochDateTime } from '../../lib/format'
 
 interface Summary {
@@ -164,6 +165,12 @@ export default function AnalyticsDashboardPage() {
   const [updated, setUpdated] = useState('loading…')
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
+  // The signed-in user, shared with the top bar so it does not run a second
+  // `/api/auth/me` of its own. `load` below resolves it from the same call the
+  // admin gate uses. Seeded `undefined` so the bar renders no account control
+  // until the identity check answers, rather than flashing "Sign in" at a
+  // signed-in admin.
+  const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
 
   // Which feeds the last poll could not read, and why. A feed listed here is
   // NOT rendered as zeros: the page shows an explicit unavailable state in its
@@ -223,8 +230,8 @@ export default function AnalyticsDashboardPage() {
         if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
         return
       }
-      const me = meResult.value
-      if (!me) {
+      const user = meResult.value
+      if (!user) {
         // A genuine auth rejection (401 / no session). A network failure never
         // reaches here: getMe rethrows it, and it is surfaced as an error below
         // rather than being mistaken for a logout.
@@ -232,10 +239,11 @@ export default function AnalyticsDashboardPage() {
         return
       }
       if (!mountedRef.current) return
+      setMe(user)
       // Client-side admin gate is a UX convenience only. Authoritative
       // enforcement happens in the backend API (which rejects non-admin
       // requests), so this check can never be the source of truth.
-      if (me.role !== 'admin') {
+      if (user.role !== 'admin') {
         if (mountedRef.current) setForbidden(true)
         return
       }
@@ -295,19 +303,7 @@ export default function AnalyticsDashboardPage() {
 
   return (
     <div className="dash-wrap">
-      <header className="dash-topbar">
-        <div className="dash-brand">
-          VCCircle <span className="dash-dot">·</span> ASK — Analytics
-        </div>
-        <div className="dash-topbar-links">
-          <Link href="/" className="dash-link">
-            ← Back to search
-          </Link>
-          <button type="button" className="dash-logout" onClick={logout}>
-            Log out
-          </button>
-        </div>
-      </header>
+      <TopBar me={me} />
       <div className="dash-main">
         <div className="dash-updated">{updated}</div>
         {forbidden ? (

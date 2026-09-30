@@ -13,11 +13,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { clearMeCache } from '../lib/auth'
 import ChatPage from './page'
 
-// `SourceList` renders `SimilarArticles` per source, which fetches on mount.
-vi.mock('../components/SimilarArticles', () => ({
-  default: ({ articleId }: { articleId: number }) => <span data-testid={`similar-${articleId}`} />,
-}))
-
 // `AnswerBody` renders chart blocks through DataViz; nothing here is about them.
 vi.mock('./DataViz', async () => {
   const actual = await vi.importActual<typeof DataVizModule>('./DataViz')

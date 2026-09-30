@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import SafeArticleLink from '../components/SafeArticleLink'
+import TopBar from '../components/TopBar'
 import { API_BASE, authRequestInit } from '../lib/auth'
 import { formatArticleDate } from '../lib/format'
 import { createDeadline, RECOMMEND_DEADLINE_MS } from '../lib/deadline'
@@ -119,66 +120,69 @@ export default function ForYouPage() {
   }
 
   return (
-    <div className={styles['for-you-page']}>
-      <div className={styles['for-you-header']}>
-        <h1>For You</h1>
-        <div className={styles['for-you-tabs']}>
-          <button
-            type="button"
-            className={`${styles.tab} ${feedType === 'personalized' ? styles.active : ''}`}
-            onClick={() => setFeedType('personalized')}
-          >
-            Recommended
-          </button>
-          <button
-            type="button"
-            className={`${styles.tab} ${feedType === 'trending' ? styles.active : ''}`}
-            onClick={() => setFeedType('trending')}
-          >
-            Trending
-          </button>
-          <button
-            type="button"
-            className={`${styles.tab} ${feedType === 'latest' ? styles.active : ''}`}
-            onClick={() => setFeedType('latest')}
-          >
-            Latest
-          </button>
-        </div>
-      </div>
-
-      {coldStart && (
-        <div className={styles['cold-start-notice']}>
-          You have not interacted with any articles yet. We are showing the latest stories.
-          Start clicking on articles to get personalized recommendations!
-        </div>
-      )}
-
-      {loading ? (
-        <div className={styles.loading}>Loading...</div>
-      ) : error ? (
-        <div className={styles.error}>
-          {error}
-          <div>
-            <button type="button" className={styles.retry} onClick={() => setRetryCount((n) => n + 1)}>
-              Retry
+    <>
+      <TopBar />
+      <div className={styles['for-you-page']}>
+        <div className={styles['for-you-header']}>
+          <h1>For You</h1>
+          <div className={styles['for-you-tabs']}>
+            <button
+              type="button"
+              className={`${styles.tab} ${feedType === 'personalized' ? styles.active : ''}`}
+              onClick={() => setFeedType('personalized')}
+            >
+              Recommended
+            </button>
+            <button
+              type="button"
+              className={`${styles.tab} ${feedType === 'trending' ? styles.active : ''}`}
+              onClick={() => setFeedType('trending')}
+            >
+              Trending
+            </button>
+            <button
+              type="button"
+              className={`${styles.tab} ${feedType === 'latest' ? styles.active : ''}`}
+              onClick={() => setFeedType('latest')}
+            >
+              Latest
             </button>
           </div>
         </div>
-      ) : articles.length === 0 ? (
-        <div className={styles.empty}>No articles found.</div>
-      ) : (
-        <div className={styles['articles-grid']}>
-          {articles.map((article) => (
-            <ArticleCard
-              key={article.id}
-              article={article}
-              onInteraction={(e) => handleInteraction(article.id, e)}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+
+        {coldStart && (
+          <div className={styles['cold-start-notice']}>
+            You have not interacted with any articles yet. We are showing the latest stories.
+            Start clicking on articles to get personalized recommendations!
+          </div>
+        )}
+
+        {loading ? (
+          <div className={styles.loading}>Loading...</div>
+        ) : error ? (
+          <div className={styles.error}>
+            {error}
+            <div>
+              <button type="button" className={styles.retry} onClick={() => setRetryCount((n) => n + 1)}>
+                Retry
+              </button>
+            </div>
+          </div>
+        ) : articles.length === 0 ? (
+          <div className={styles.empty}>No articles found.</div>
+        ) : (
+          <div className={styles['articles-grid']}>
+            {articles.map((article) => (
+              <ArticleCard
+                key={article.id}
+                article={article}
+                onInteraction={(e) => handleInteraction(article.id, e)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </>
   )
 }
 

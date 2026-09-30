@@ -10,6 +10,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CHAT_API_DEADLINE_MS } from '../lib/deadline'
+import { clearMeCache } from '../lib/auth'
 import ChatPage from './page'
 
 /**
@@ -66,6 +67,12 @@ beforeEach(() => {
   vi.useFakeTimers()
   calls = []
   Element.prototype.scrollTo = function scrollTo() {}
+  // `getMe` memoises the session in module state for 60s and only
+  // `clearMeCache()` resets it, and vitest shares one module registry across
+  // every test in this file. An earlier test whose stub answers
+  // `/api/auth/me` would otherwise satisfy the later ones from cache, so the
+  // per-test stub below would never be reached.
+  clearMeCache()
   vi.stubGlobal('fetch', hangingApi())
 })
 
@@ -185,11 +192,20 @@ describe('ChatPage — the logout beacon is bounded too', () => {
           })
           return promise
         }
+        // The sign-out control now lives in the shared top bar, which renders
+        // it only once the page's own identity check has answered. Hanging this
+        // one would leave nothing to click, so sign the visitor in.
+        if (String(input).includes('/api/auth/me')) {
+          return Promise.resolve(
+            jsonResponse({ id: 'u1', email: 'user@example.com', name: 'User', role: 'user', is_active: true })
+          )
+        }
         return hangOthers(input, init)
       })
     )
 
     render(<ChatPage />)
+    await advance(0)
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
     })
