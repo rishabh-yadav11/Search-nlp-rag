@@ -1,15 +1,9 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import Link from 'next/link'
 import SimilarArticles from './components/SimilarArticles'
-import {
-  API_BASE,
-  API_BASE_TRUSTED,
-  AuthUser,
-  getMe,
-  logout,
-} from './lib/auth'
+import TopBar from './components/TopBar'
+import { API_BASE, API_BASE_TRUSTED } from './lib/auth'
 import { formatDate, parseLocalDate } from './lib/format'
 import { isSafeUrl } from './lib/safe-url'
 
@@ -183,14 +177,9 @@ export default function Page() {
   })
   const submittedRef = useRef<{ controller: AbortController } | null>(null)
   const requestSeqRef = useRef(0)
-  const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
   const configError = !API_BASE_TRUSTED
     ? 'API base is configured to an untrusted host. Requests will be sent without session credentials. If you are using a custom backend, ensure NEXT_PUBLIC_TRUSTED_API_HOSTS includes the host and that NEXT_PUBLIC_API_BASE uses https.'
     : ''
-
-  useEffect(() => {
-    // Keep this component purely client-side and derived from lib/auth.
-  }, [])
 
   useEffect(() => {
     return () => submittedRef.current?.controller.abort()
@@ -287,49 +276,7 @@ export default function Page() {
 
   return (
     <div className="app">
-      <header className="topbar">
-        <div className="topbar-inner">
-          <div className="brand">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img className="logo" src="/vccircle-wordmark.svg" alt="VCCircle" width={154} height={40} />
-          </div>
-          <nav className="topbar-nav" aria-label="Primary">
-            <Link href="/" className="topbar-nav-link active">
-              Search
-            </Link>
-            <Link href="/for-you" className="topbar-nav-link">
-              For You
-            </Link>
-            <Link href="/chat" className="topbar-nav-link">
-              Chat
-            </Link>
-            {me?.role === 'admin' ? (
-              <a href="/analytics/dashboard" className="topbar-nav-link">
-                Analytics
-              </a>
-            ) : null}
-          </nav>
-          <div className="topbar-right">
-            <Link href="/chat" className="topbar-cta" aria-label="Open chat assistant">
-              ASK VCCircle
-            </Link>
-            {me === undefined ? null : me ? (
-              <span className="topbar-user">
-                <span className="topbar-user-email" title={me.email}>
-                  {me.name || me.email}
-                </span>
-                <button type="button" className="topbar-logout" onClick={logout}>
-                  Log out
-                </button>
-              </span>
-            ) : (
-              <Link href="/login" className="topbar-signin">
-                Sign in
-              </Link>
-            )}
-          </div>
-        </div>
-      </header>
+      <TopBar />
 
       <main>
         <form

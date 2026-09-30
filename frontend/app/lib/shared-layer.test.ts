@@ -254,27 +254,19 @@ describe('shared layer — pages consume the shared helpers', () => {
 
   it('wires the shared logout() to every log-out button', () => {
     // Asserting the substring `logout` is worthless on its own: every one of
-    // these files matches it through a CSS class (`topbar-logout`,
-    // `chat-logout`, `dash-logout`) and through the import alone, so it would
-    // stay green with the handler re-pointed at something local. Require the
-    // button to actually be wired to it.
+    // these files matches it through a CSS class (`topbar-logout`) and through
+    // the import alone, so it would stay green with the handler re-pointed at
+    // something local. Require the button to actually be wired to it.
     //
-    // The rule is "these three pages must be wired", NOT "exactly these three
-    // pages exist". Pinning the list exhaustively would go red the first time
-    // someone correctly adds a page with a log-out button — a guard that
-    // punishes correct behaviour is a guard that gets deleted, and then the
-    // regression it was written for comes straight back. So this is a
-    // superset check: the known pages are required, further ones are allowed,
-    // and every page found must be wired to the shared helper.
-    const pagesWithLogoutButton = files.filter((file) => /Log out|Log Out/.test(read(file)))
-    expect(pagesWithLogoutButton).toEqual(
-      expect.arrayContaining([
-        'app/analytics/dashboard/page.tsx',
-        'app/chat/page.tsx',
-        'app/page.tsx',
-      ]),
-    )
-    for (const file of pagesWithLogoutButton) {
+    // The log-out control lives in the shared top bar, which every app route
+    // mounts, so the bar is the file that must hold it: if that button ever
+    // disappears, every route loses its sign-out at once. The scan covers the
+    // whole frontend root, so a page that grows its own log-out button later
+    // is still caught by the loop below — the rule is "every button is wired",
+    // not "only the bar has one".
+    const filesWithLogoutButton = files.filter((file) => /Log out|Log Out/.test(read(file)))
+    expect(filesWithLogoutButton).toContain('app/components/TopBar.tsx')
+    for (const file of filesWithLogoutButton) {
       expect(read(file), `${file} must wire its log-out button to logout()`).toMatch(
         /onClick=\{logout\}/,
       )
