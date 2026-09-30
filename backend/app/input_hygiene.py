@@ -41,11 +41,13 @@ from fastapi import HTTPException
 
 # Facet params build a Qdrant MatchAny and a cache-key component, so both the
 # number of values and the size of each value have to be bounded. Ten values of
-# 100 characters is already far more than the facet vocabulary ever contains
-# (the live vocabularies are single-digit per field), so these caps reject
-# abuse without constraining real UI selections.
+# 200 characters is still far more than any single UI selection needs: the
+# industry/dealtype vocabularies are single-digit per field, and the widest
+# real value the tag vocabulary contains is 112 characters, so the cap sits
+# above every real filter while still bounding the abuse (10 x 200 plus
+# separators) by orders of magnitude.
 MAX_FACET_VALUES = 10
-MAX_FACET_VALUE_LEN = 100
+MAX_FACET_VALUE_LEN = 200
 
 # Above this many characters a key is replaced by its SHA-256 digest. Normal
 # (query, filter) pairs stay readable in Redis for debugging; a pathological one

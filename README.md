@@ -209,6 +209,20 @@ Every 15 minutes via cron, deprioritized with `nice` (installed by `setup.sh cro
   >> ~/search-nlp-rag/logs/update_index.log 2>&1
 ```
 
+### Re-index after a change to the indexed payload or embedded text
+
+Deploying a change to what gets embedded or stored leaves already-indexed points holding the old vectors and the old payload — the `tag_names` facet does both, because tag values now enter the composed dense **and** sparse text. A filter on the new field then matches nothing, and only a re-embed of the existing points fixes it. That is a **destructive** rebuild: it recreates the collection.
+
+```bash
+cd backend
+python scripts/reset_index.py --yes   # DESTRUCTIVE: drops the collection + data artifacts
+python scripts/fetch_data.py           # MySQL -> data/articles.jsonl
+python scripts/build_index.py          # embed + upsert into a new collection
+python scripts/update_index.py --init  # re-seed fingerprints (no embedding)
+```
+
+`reset_index.py` snapshots the collection under `backend/backups/` first and aborts when it cannot verify that snapshot; `--yes` only skips the interactive confirmation. Stop the API before the reset — it 500s until the rebuild finishes. `update_index.py --init` on its own is **not** enough: it re-seeds the fingerprints from current MySQL rows and returns before any embedding work, so it would mark the stale points "current" and skip exactly the re-embed they need. It is step 4, not a replacement for the rebuild.
+
 ## Log Management
 
 I capped logs so they can't fill the disk long-term:

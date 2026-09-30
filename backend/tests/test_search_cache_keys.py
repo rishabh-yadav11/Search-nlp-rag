@@ -247,7 +247,7 @@ class _SparseEmbedding:
 
 def _search(**kwargs):
     params = {"q": "fintech funding", "top_k": 8, "industry": None, "dealtype": None,
-              "author": None, "content_type": None, "from_date": None, "to_date": None}
+              "author": None, "content_type": None, "tag": None, "from_date": None, "to_date": None}
     params.update(kwargs)
     return asyncio.run(main.search(**params))
 

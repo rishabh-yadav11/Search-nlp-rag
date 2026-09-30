@@ -253,7 +253,7 @@ def test_search_cache_hit_returns_cached_summaries(monkeypatch):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                            author=None, content_type=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None, tag=None))
 
     assert resp.cached is True
     assert [r.id for r in resp.results] == [1, 2]
@@ -298,7 +298,7 @@ def test_search_cache_miss_runs_full_pipeline(monkeypatch, fake_cache):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                            author=None, content_type=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None, tag=None))
 
     assert boost_calls, "apply_click_boost should have been called"
     assert div_calls, "diversify should have been called"
@@ -345,7 +345,7 @@ def test_search_cache_miss_skips_boost_and_diversity_when_disabled(monkeypatch, 
     monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                            author=None, content_type=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None, tag=None))
 
     assert resp.cached is False
     assert boost_calls == []
@@ -363,7 +363,7 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch, fake_cache):
     async def fake_record_search(*args, **kwargs):
         pass
 
-    async def fake_temporal_fallback(results, top_k, from_date, to_date, industry, dealtype, author, need_body):
+    async def fake_temporal_fallback(results, top_k, from_date, to_date, industry, dealtype, author, tag, need_body):
         return results
 
     monkeypatch.setattr(main, "cache", fake_cache())
@@ -377,7 +377,7 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch, fake_cache):
     monkeypatch.setattr(main.config, "ENABLE_DIVERSITY", False)
 
     resp = _run(main.search(q="fintech funding", top_k=8, industry="Fintech", dealtype=None,
-                            author=None, content_type=None, from_date="2025-01-01", to_date=None))
+                            author=None, content_type=None, from_date="2025-01-01", to_date=None, tag=None))
 
     qfilter = captured["qfilter"]
     assert isinstance(qfilter, Filter)
@@ -409,7 +409,7 @@ def test_search_cache_miss_does_not_cache_empty_results(monkeypatch, fake_cache)
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     resp = _run(main.search(q="edtech startups 2020", top_k=8, industry=None, dealtype=None,
-                            author=None, content_type=None, from_date=None, to_date=None))
+                            author=None, content_type=None, from_date=None, to_date=None, tag=None))
 
     assert resp.results == []
     assert resp.cached is False
@@ -440,7 +440,7 @@ def test_search_empty_results_are_not_served_from_cache(monkeypatch, fake_cache)
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     kwargs = {"top_k": 8, "industry": None, "dealtype": None, "author": None, "content_type": None,
-              "from_date": None, "to_date": None}
+              "from_date": None, "to_date": None, "tag": None}
     first = _run(main.search(q="edtech startups 2020", **kwargs))
     second = _run(main.search(q="edtech startups 2020", **kwargs))
 
@@ -473,7 +473,7 @@ def test_search_non_empty_results_are_still_cached(monkeypatch, fake_cache):
     monkeypatch.setattr(main, "record_search", fake_record_search)
 
     _run(main.search(q="fintech funding", top_k=8, industry=None, dealtype=None,
-                     author=None, content_type=None, from_date=None, to_date=None))
+                     author=None, content_type=None, from_date=None, to_date=None, tag=None))
 
     assert len(cache.sets) == 1
     assert cache.sets[0][0].startswith("search:")
@@ -587,22 +587,30 @@ def test_facets_cache_miss(monkeypatch, fake_cache):
     async def fake_facet_values(key):
         return {"industry_names": ["Fintech", "Healthtech"], "dealtype_names": ["M&A"]}[key]
 
-    monkeypatch.setattr(main, "_facet_values", fake_facet_values)
+    async def fake_top_facet_values(key, limit):
+        return ["IPO", "VCC Startups"][:limit]
 
+    monkeypatch.setattr(main, "_facet_values", fake_facet_values)
+    monkeypatch.setattr(main, "_top_facet_values", fake_top_facet_values)
+
+    expected = {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A"],
+                "tags": ["IPO", "VCC Startups"]}
     r = _client.get("/facets")
     assert r.status_code == 200
-    assert r.json() == {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A"]}
-    assert cache.sets == [
-        (main.FACETS_CACHE_KEY, {"industry": ["Fintech", "Healthtech"], "dealtype": ["M&A"]}, None)
-    ]
+    assert r.json() == expected
+    assert cache.sets == [(main.FACETS_CACHE_KEY, expected, None)]
 
 
 def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
     async def fake_facet_values(key):
         raise RuntimeError("qdrant down")
 
+    async def fake_top_facet_values(key, limit):
+        raise RuntimeError("qdrant down")
+
     monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setattr(main, "_facet_values", fake_facet_values)
+    monkeypatch.setattr(main, "_top_facet_values", fake_top_facet_values)
 
     r = _client.get("/facets")
     assert r.status_code == 500
@@ -641,16 +649,22 @@ def test_facets_concurrent_misses_share_one_scan_and_one_cache_write(monkeypatch
             await asyncio.wait_for(state["everyone_here"].wait(), timeout=10)
             return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
 
+        async def parking_top_facet_values(key, limit):
+            scans.append(key)
+            await asyncio.wait_for(state["everyone_here"].wait(), timeout=10)
+            return ["IPO"]
+
         cache = _ArrivalCache()
         monkeypatch.setattr(main, "cache", cache)
         monkeypatch.setattr(main, "_facet_values", parking_facet_values)
+        monkeypatch.setattr(main, "_top_facet_values", parking_top_facet_values)
         results = await asyncio.gather(*(main.facets() for _ in range(callers)))
         return scans, results, cache.sets
 
     scans, results, sets = _run(scenario())
 
-    expected = {"industry": ["Fintech"], "dealtype": ["M&A"]}
-    assert sorted(scans) == ["dealtype_names", "industry_names"]
+    expected = {"industry": ["Fintech"], "dealtype": ["M&A"], "tags": ["IPO"]}
+    assert sorted(scans) == ["dealtype_names", "industry_names", "tag_names"]
     assert results == [expected] * callers
     assert sets == [(main.FACETS_CACHE_KEY, expected, None)]
 
@@ -665,10 +679,15 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
         attempts.append(key)
         raise RuntimeError("qdrant down")
 
+    async def down_top_facet_values(key, limit):
+        attempts.append(key)
+        raise RuntimeError("qdrant down")
+
     async def scenario():
         cache = FakeCache()
         monkeypatch.setattr(main, "cache", cache)
         monkeypatch.setattr(main, "_facet_values", down_facet_values)
+        monkeypatch.setattr(main, "_top_facet_values", down_top_facet_values)
         outcomes = await asyncio.gather(main.facets(), main.facets(), return_exceptions=True)
         # Let the scan's done callback run, so the guard is observably released.
         await asyncio.sleep(0)
@@ -677,43 +696,60 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
     cache, outcomes, guard = _run(scenario())
 
     assert [type(outcome) for outcome in outcomes] == [RuntimeError, RuntimeError]
-    assert sorted(attempts) == ["dealtype_names", "industry_names"]
+    assert sorted(attempts) == ["dealtype_names", "industry_names", "tag_names"]
     assert cache.sets == []
     assert guard is None
 
     async def working_facet_values(key):
         return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
 
+    async def working_top_facet_values(key, limit):
+        return ["IPO"]
+
     monkeypatch.setattr(main, "_facet_values", working_facet_values)
-    assert _run(main.facets()) == {"industry": ["Fintech"], "dealtype": ["M&A"]}
-    assert cache.sets == [(main.FACETS_CACHE_KEY, {"industry": ["Fintech"], "dealtype": ["M&A"]}, None)]
+    monkeypatch.setattr(main, "_top_facet_values", working_top_facet_values)
+    expected = {"industry": ["Fintech"], "dealtype": ["M&A"], "tags": ["IPO"]}
+    assert _run(main.facets()) == expected
+    assert cache.sets == [(main.FACETS_CACHE_KEY, expected, None)]
 
 
-def test_facets_scans_the_two_vocabularies_concurrently(monkeypatch):
+def test_facets_scans_the_vocabularies_concurrently(monkeypatch):
     """The keys are independent, so the second scan has to start before the
-    first finishes. Each scan refuses to finish until the other has started, so
+    first finishes. Each scan refuses to finish until the others have started, so
     the awaited-back-to-back version times out here instead of merely being
     slower -- this is ordering, not a race on a stopwatch."""
+    scans_expected = 3
+
     async def scenario():
         started: list[str] = []
-        both_started = asyncio.Event()
+        all_started = asyncio.Event()
 
         async def barrier_facet_values(key):
             started.append(key)
-            if len(started) == 2:
-                both_started.set()
-            await asyncio.wait_for(both_started.wait(), timeout=10)
+            if len(started) == scans_expected:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), timeout=10)
             return [key]
+
+        async def barrier_top_facet_values(key, limit):
+            return await barrier_facet_values(key)
 
         cache = FakeCache()
         monkeypatch.setattr(main, "cache", cache)
         monkeypatch.setattr(main, "_facet_values", barrier_facet_values)
+        monkeypatch.setattr(main, "_top_facet_values", barrier_top_facet_values)
         return started, await main.facets()
 
     started, result = _run(scenario())
 
-    assert started == ["industry_names", "dealtype_names"]
-    assert result == {"industry": ["industry_names"], "dealtype": ["dealtype_names"]}
+    assert sorted(started) == ["dealtype_names", "industry_names", "tag_names"]
+    assert result == {"industry": ["industry_names"], "dealtype": ["dealtype_names"],
+                      "tags": ["tag_names"]}
+
+    # The point of the test is that no scan ran to completion before the others
+    # started, so the industry scan is not necessarily the one recorded first.
+    assert len(started) == scans_expected
+
 
 
 @pytest.mark.parametrize("cancels", ["creator", "waiter"])
@@ -735,9 +771,15 @@ def test_facets_cancelled_caller_does_not_abort_the_scan_the_others_share(monkey
             await release.wait()
             return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
 
+        async def parked_top_facet_values(key, limit):
+            scans.append(key)
+            await release.wait()
+            return ["IPO"]
+
         cache = FakeCache()
         monkeypatch.setattr(main, "cache", cache)
         monkeypatch.setattr(main, "_facet_values", parked_facet_values)
+        monkeypatch.setattr(main, "_top_facet_values", parked_top_facet_values)
 
         creator = asyncio.create_task(main.facets())
         await asyncio.sleep(0)
@@ -752,8 +794,8 @@ def test_facets_cancelled_caller_does_not_abort_the_scan_the_others_share(monkey
 
     scans, result = _run(scenario())
 
-    assert sorted(scans) == ["dealtype_names", "industry_names"]
-    assert result == {"industry": ["Fintech"], "dealtype": ["M&A"]}
+    assert sorted(scans) == ["dealtype_names", "industry_names", "tag_names"]
+    assert result == {"industry": ["Fintech"], "dealtype": ["M&A"], "tags": ["IPO"]}
 
 
 # --- /analytics/summary ---
