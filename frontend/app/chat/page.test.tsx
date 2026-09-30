@@ -10,6 +10,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as DataVizModule from './DataViz'
+import type * as SafeUrlModule from '../lib/safe-url'
 import ChatPage from './page'
 
 const { splitCalls } = vi.hoisted(() => ({ splitCalls: [] as string[] }))
@@ -25,17 +26,22 @@ vi.mock('./DataViz', async () => {
   }
 })
 
-const { similarRenders } = vi.hoisted(() => ({ similarRenders: [] as number[] }))
+const { safeUrlCalls } = vi.hoisted(() => ({ safeUrlCalls: [] as string[] }))
 
-// `SimilarArticles` is rendered by `SourceList` and nothing else, so its
-// render count is an exact count of `SourceList` renders for a message whose
-// sources are expanded. Stubbed so the measurement needs no network.
-vi.mock('../components/SimilarArticles', () => ({
-  default: ({ articleId }: { articleId: number }) => {
-    similarRenders.push(articleId)
-    return <span data-testid={`similar-${articleId}`} />
-  },
-}))
+// `SourceList` is the only thing in the chat tree that calls `isSafeUrl`, once
+// per source, so its call count is an exact count of `SourceList` renders for a
+// message whose sources are expanded. The spy delegates to the real guard, so
+// the verdicts the assertions below rely on are the production ones.
+vi.mock('../lib/safe-url', async () => {
+  const actual = await vi.importActual<typeof SafeUrlModule>('../lib/safe-url')
+  return {
+    ...actual,
+    isSafeUrl: (url: string) => {
+      safeUrlCalls.push(url)
+      return actual.isSafeUrl(url)
+    },
+  }
+})
 
 const SESSION = { id: 's1', title: 'Budget', created_at: 1_700_000_000, updated_at: 1_700_000_100 }
 
@@ -91,7 +97,7 @@ function jsonResponse(data: unknown): StubResponse {
 
 beforeEach(() => {
   splitCalls.length = 0
-  similarRenders.length = 0
+  safeUrlCalls.length = 0
   streamCtrl = null
   streamInits = []
   // jsdom implements neither; ChatPage scrolls the thread on every message.
@@ -206,12 +212,13 @@ describe('ChatPage — settled answers are not re-parsed while a new answer stre
     await openConversation()
 
     fireEvent.click(screen.getByRole('button', { name: /Show sources/ }))
-    const before = similarRenders.length
+    const before = safeUrlCalls.length
+    // The one expanded source, decided once: the list rendered exactly once.
     expect(before).toBe(1)
 
     await streamABurst()
 
-    expect(similarRenders.length).toBe(before)
+    expect(safeUrlCalls.length).toBe(before)
   })
 })
 

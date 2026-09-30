@@ -16,10 +16,26 @@ import ForYouPage from './page'
 type SignalCapture = { url: string; signal: AbortSignal | null }
 
 let captures: SignalCapture[] = []
+
+/** A signed-out answer for the shared top bar's identity check. */
+const SIGNED_OUT = { ok: false, status: 401, json: async () => null } as unknown as Response
+
+/**
+ * Feed and beacon requests only. The page's shared top bar asks who the
+ * visitor is on mount, which the stubs below answer immediately: the deadline
+ * under test is the feed's, and a hung `/api/auth/me` would be a second,
+ * unrelated thing to account for.
+ */
+function feedCaptures(): SignalCapture[] {
+  return captures.filter((c) => !c.url.includes('/api/auth/me'))
+}
+
 function hangingFetch() {
   return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input)
+    if (url.includes('/api/auth/me')) return Promise.resolve(SIGNED_OUT)
     const signal = init?.signal ?? null
-    captures.push({ url: String(input), signal })
+    captures.push({ url, signal })
     const { promise, reject } = Promise.withResolvers<Response>()
     if (signal) {
       signal.addEventListener('abort', () => {
@@ -65,28 +81,28 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
 
   it('aborts the in-flight request on timeout instead of leaving it open', async () => {
     render(<ForYouPage />)
-    expect(captures).toHaveLength(1)
-    expect(captures[0].signal?.aborted).toBe(false)
+    expect(feedCaptures()).toHaveLength(1)
+    expect(feedCaptures()[0].signal?.aborted).toBe(false)
 
     await advance(RECOMMEND_DEADLINE_MS)
 
-    expect(captures[0].signal?.aborted).toBe(true)
+    expect(feedCaptures()[0].signal?.aborted).toBe(true)
   })
 
   it('refetches with a fresh deadline when Retry is pressed', async () => {
     render(<ForYouPage />)
     await advance(RECOMMEND_DEADLINE_MS)
-    expect(captures).toHaveLength(1)
+    expect(feedCaptures()).toHaveLength(1)
 
     await act(async () => {
       screen.getByRole('button', { name: 'Retry' }).click()
     })
-    expect(captures).toHaveLength(2)
+    expect(feedCaptures()).toHaveLength(2)
     expect(screen.getByText('Loading...')).toBeTruthy()
     // The retry must be able to reach the same deadline again.
-    expect(captures[1].signal?.aborted).toBe(false)
+    expect(feedCaptures()[1].signal?.aborted).toBe(false)
     await advance(RECOMMEND_DEADLINE_MS)
-    expect(captures[1].signal?.aborted).toBe(true)
+    expect(feedCaptures()[1].signal?.aborted).toBe(true)
   })
 
   it('keeps a still-mounted feed out of the cancelled request’s error path', async () => {
@@ -104,8 +120,9 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input)
+        if (url.includes('/api/auth/me')) return Promise.resolve(SIGNED_OUT)
         captures.push({ url, signal: init?.signal ?? null })
-        if (captures.length > 1) {
+        if (feedCaptures().length > 1) {
           return Promise.resolve({
             ok: true,
             status: 200,
@@ -126,16 +143,16 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
 
     render(<ForYouPage />)
     await advance(0)
-    expect(captures).toHaveLength(1)
+    expect(feedCaptures()).toHaveLength(1)
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Trending' }))
     })
-    expect(captures).toHaveLength(2)
+    expect(feedCaptures()).toHaveLength(2)
 
     // Past the deadline, so the abandoned request #1 fails for real.
     await advance(RECOMMEND_DEADLINE_MS)
-    expect(captures[0].signal?.aborted).toBe(true)
+    expect(feedCaptures()[0].signal?.aborted).toBe(true)
 
     // The feed the user is actually on moved on, so #1's timeout must not be
     // reported...
@@ -152,6 +169,7 @@ describe('ForYouPage — the click-tracking beacon is bounded too', () => {
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input)
+        if (url.includes('/api/auth/me')) return Promise.resolve(SIGNED_OUT)
         captures.push({ url, signal: init?.signal ?? null })
         if (url.includes('/recommend/interaction')) {
           const { promise, reject } = Promise.withResolvers<Response>()

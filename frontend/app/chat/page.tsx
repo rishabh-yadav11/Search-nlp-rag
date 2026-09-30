@@ -1,14 +1,13 @@
 'use client'
 
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
-import Link from 'next/link'
 import ReactMarkdown from 'react-markdown'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import DataViz, { splitContent } from './DataViz'
-import SimilarArticles from '../components/SimilarArticles'
-import { API_BASE, authRequestInit, getMe, logout, redirectToLogin } from '../lib/auth'
+import TopBar from '../components/TopBar'
+import { API_BASE, type AuthUser, authRequestInit, getMe, redirectToLogin } from '../lib/auth'
 import { isSafeUrl } from '../lib/safe-url'
 import { formatCost, formatEpochRelative } from '../lib/format'
 import { createDeadline, CHAT_API_DEADLINE_MS, RequestTimeoutError } from '../lib/deadline'
@@ -180,7 +179,6 @@ const SourceList = memo(function SourceList({ sources, msg }: { sources: Source[
                     <span>{s.title || `Source ${s.id}`}</span>
                   )}
                   {s.published_date ? <span className="chat-sources-date">{s.published_date.slice(0, 10)}</span> : null}
-                  <SimilarArticles articleId={s.id} limit={3} compact />
                 </li>
               ))}
             </ol>
@@ -229,6 +227,12 @@ export default function ChatPage() {
   // Set when the server dropped older messages from the loaded thread (#258).
   const [historyTruncated, setHistoryTruncated] = useState<{ hidden: number } | null>(null)
   const [error, setError] = useState('')
+  // The signed-in user, handed to the shared `TopBar` so it renders the account
+  // control from a value this page already fetched instead of issuing its own
+  // `/api/auth/me` round trip. Seeded `undefined` so the bar shows no account
+  // control until the answer lands — seeding `null` would flash "Sign in" at a
+  // signed-in user on every load.
+  const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
   // Force a re-render each minute so relative timestamps ("5m ago") keep
   // advancing while the page stays open. No fetch — purely to recompute time.
   const [, setTick] = useState(0)
@@ -265,8 +269,9 @@ export default function ChatPage() {
     // is the only way to tell whether this visitor is signed in. A network
     // failure is not a logout, so it must not redirect.
     getMe()
-      .then((me) => {
-        if (!me) redirectToLogin()
+      .then((user) => {
+        setMe(user)
+        if (!user) redirectToLogin()
       })
       .catch(() => {
         /* offline or backend down: keep the page rather than force a redirect */
@@ -632,165 +637,151 @@ export default function ChatPage() {
   )
 
   return (
-    <div className="chat-app">
-      <aside className="chat-sidebar">
-        <div className="chat-sidebar-head">
-          <button type="button" className="chat-new-btn" onClick={newSession}>
-            + New chat
-          </button>
-        </div>
-        <nav className="chat-session-list" aria-label="Conversations">
-          {sessions.map((s) => (
-            <div
-              key={s.id}
-              className={`chat-session-item${s.id === activeId ? ' active' : ''}`}
-            >
-              <button
-                type="button"
-                className="chat-session-main"
-                onClick={() => openSession(s.id)}
-                aria-label={`Open conversation: ${s.title || 'New chat'}`}
-                style={{
-                  border: 'none',
-                  background: 'none',
-                  padding: 0,
-                  margin: 0,
-                  font: 'inherit',
-                  color: 'inherit',
-                  textAlign: 'left',
-                  cursor: 'pointer',
-                  flex: 1,
-                  minWidth: 0,
-                }}
-              >
-                <div className="chat-session-title" title={s.title}>
-                  {s.title || 'New chat'}
-                </div>
-                <div className="chat-session-meta">
-                  <span suppressHydrationWarning>{formatEpochRelative(s.updated_at)}</span>
-                  {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
-                </div>
-              </button>
-              <button
-                type="button"
-                className="chat-session-del"
-                aria-label="Delete conversation"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  removeSession(s.id)
-                }}
-              >
-                ✕
-              </button>
-            </div>
-          ))}
-        </nav>
-        <div className="chat-sidebar-foot">
-          <Link href="/" className="chat-back-link">
-            ← Back to search
-          </Link>
-          <button type="button" className="chat-logout" onClick={logout}>
-            Log out
-          </button>
-        </div>
-      </aside>
-
-      <section className="chat-main">
-        <header className="chat-main-head">
-          <Link href="/" className="chat-main-brand">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/vccircle-wordmark.svg" alt="VCCircle" width={110} height={30} />
-          </Link>
-          <span className="chat-main-title">ASK VCCircle</span>
-          {activeId ? <span className="chat-main-sub">Conversation</span> : null}
-        </header>
-
-        <div className="chat-thread" ref={scrollRef} aria-live="polite">
-          {historyTruncated ? (
-            <div className="chat-note" role="status">
-              {historyTruncated.hidden} earlier message{historyTruncated.hidden === 1 ? '' : 's'} not shown —
-              this conversation is too long to display in full.
-            </div>
-          ) : null}
-          {messages.length === 0 && !sending ? (
-            <div className="chat-empty">
-              <h1>Ask VCCircle</h1>
-              <p>Ask a question about VCCircle&apos;s news archive. Conversations are saved to your account and kept for 6 months.</p>
-            </div>
-          ) : (
-            messages.map((m) => (
-              <div key={m.id} className={`chat-msg chat-${m.role}`}>
-                <div className="chat-msg-bubble">
-                  {m.role === 'user' ? (
-                    <div className="chat-msg-plain">{m.content}</div>
-                  ) : (
-                    <div className="chat-msg-answer">
-                      <AnswerBody content={m.content} />
-                      <SourceList sources={m.sources ?? NO_SOURCES} msg={m} />
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))
-          )}
-          {sending && !streaming ? (
-            <div className="chat-msg chat-assistant">
-              <div className="chat-msg-bubble">
-                <div className="chat-typing">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-              </div>
-            </div>
-          ) : streamingContent ? (
-            <div className="chat-msg chat-assistant">
-              <div className="chat-msg-bubble">
-                <div className="chat-msg-answer">
-                  <AnswerBody content={streamingContent} />
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </div>
-
-        <div className="chat-composer">
-          {note ? (
-            <div className="chat-note">
-              {note}
-            </div>
-          ) : null}
-          {error ? (
-            <div className="chat-error" role="alert">
-              {error}
-            </div>
-          ) : null}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault()
-              send()
-            }}
-          >
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  send()
-                }
-              }}
-              placeholder="Ask about deals, funding, IPOs, companies…"
-              rows={1}
-              disabled={sending}
-              aria-label="Message"
-            />
-            <button type="submit" disabled={sending || !input.trim()}>
-              Send
+    <div className="chat-page">
+      <TopBar me={me} subtitle={activeId ? 'Conversation' : null} />
+      <div className="chat-app">
+        <aside className="chat-sidebar">
+          <div className="chat-sidebar-head">
+            <button type="button" className="chat-new-btn" onClick={newSession}>
+              + New chat
             </button>
-          </form>
-        </div>
-      </section>
+          </div>
+          <nav className="chat-session-list" aria-label="Conversations">
+            {sessions.map((s) => (
+              <div
+                key={s.id}
+                className={`chat-session-item${s.id === activeId ? ' active' : ''}`}
+              >
+                <button
+                  type="button"
+                  className="chat-session-main"
+                  onClick={() => openSession(s.id)}
+                  aria-label={`Open conversation: ${s.title || 'New chat'}`}
+                  style={{
+                    border: 'none',
+                    background: 'none',
+                    padding: 0,
+                    margin: 0,
+                    font: 'inherit',
+                    color: 'inherit',
+                    textAlign: 'left',
+                    cursor: 'pointer',
+                    flex: 1,
+                    minWidth: 0,
+                  }}
+                >
+                  <div className="chat-session-title" title={s.title}>
+                    {s.title || 'New chat'}
+                  </div>
+                  <div className="chat-session-meta">
+                    <span suppressHydrationWarning>{formatEpochRelative(s.updated_at)}</span>
+                    {typeof s.total_cost === 'number' && s.total_cost > 0 ? ` · ${formatCost(s.total_cost)}` : ''}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  className="chat-session-del"
+                  aria-label="Delete conversation"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    removeSession(s.id)
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </nav>
+        </aside>
+
+        <section className="chat-main">
+          <div className="chat-thread" ref={scrollRef} aria-live="polite">
+            {historyTruncated ? (
+              <div className="chat-note" role="status">
+                {historyTruncated.hidden} earlier message{historyTruncated.hidden === 1 ? '' : 's'} not shown —
+                this conversation is too long to display in full.
+              </div>
+            ) : null}
+            {messages.length === 0 && !sending ? (
+              <div className="chat-empty">
+                <h1>Ask VCCircle</h1>
+                <p>Ask a question about VCCircle&apos;s news archive. Conversations are saved to your account and kept for 6 months.</p>
+              </div>
+            ) : (
+              messages.map((m) => (
+                <div key={m.id} className={`chat-msg chat-${m.role}`}>
+                  <div className="chat-msg-bubble">
+                    {m.role === 'user' ? (
+                      <div className="chat-msg-plain">{m.content}</div>
+                    ) : (
+                      <div className="chat-msg-answer">
+                        <AnswerBody content={m.content} />
+                        <SourceList sources={m.sources ?? NO_SOURCES} msg={m} />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+            {sending && !streaming ? (
+              <div className="chat-msg chat-assistant">
+                <div className="chat-msg-bubble">
+                  <div className="chat-typing">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                </div>
+              </div>
+            ) : streamingContent ? (
+              <div className="chat-msg chat-assistant">
+                <div className="chat-msg-bubble">
+                  <div className="chat-msg-answer">
+                    <AnswerBody content={streamingContent} />
+                  </div>
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="chat-composer">
+            {note ? (
+              <div className="chat-note">
+                {note}
+              </div>
+            ) : null}
+            {error ? (
+              <div className="chat-error" role="alert">
+                {error}
+              </div>
+            ) : null}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                send()
+              }}
+            >
+              <textarea
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    send()
+                  }
+                }}
+                placeholder="Ask about deals, funding, IPOs, companies…"
+                rows={1}
+                disabled={sending}
+                aria-label="Message"
+              />
+              <button type="submit" disabled={sending || !input.trim()}>
+                Send
+              </button>
+            </form>
+          </div>
+        </section>
+      </div>
     </div>
   )
 }
