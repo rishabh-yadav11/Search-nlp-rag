@@ -1,27 +1,9 @@
-"""Multi-entity chat turns must gather their per-entity legs, and bound them (#260).
-
-``_prepare_multi_entity_turn`` used to ``await`` each entity's retrieval leg
-inside a ``for`` loop, so an N-entity comparison ran N full pipelines back to
-back (up to 2N once the auto-facet fallback retries). The legs are independent,
-so they now run under a bounded gather.
+"""Multi-entity chat turns gather their per-entity legs under a bounded gather.
 
 The equivalence oracle throughout is the SAME function run with
 ``CHAT_MULTI_ENTITY_CONCURRENCY = 1``, which admits one leg at a time and is
-therefore the old sequential loop. It is preferred over a copied-out reference
-implementation because it exercises the real prompt assembly, not a copy of it
-that can drift.
-
-What is pinned here, all through the real ``_prepare_multi_entity_turn`` /
-``_prepare_turn`` with retrieval stubbed:
-
-- the legs actually OVERLAP -- a barrier every leg must reach, so a sequential
-  implementation deadlocks and fails rather than merely being slower;
-- the gathered result is IDENTICAL to the sequential one: same articles, same
-  order, same per-article "Entities:" annotation, same prompt, same retrieval
-  arguments, for both comparison and intersection;
-- the fan-out is BOUNDED: the semaphore caps legs in flight, and a question
-  naming more entities than ``CHAT_MAX_MULTI_ENTITIES`` never reaches the
-  multi-entity path at all.
+therefore the old sequential loop -- preferred over a copied-out reference
+implementation because it exercises the real prompt assembly.
 """
 
 import asyncio
@@ -41,8 +23,7 @@ from app.chat import ChatStore
 from app.main import SourceArticle
 from app.query_intent import MultiEntityQuery, detect_multi_entity
 
-# Long enough that source_context() truncates it, so the compared prompt is
-# sensitive to the body budget as well as to article identity and order.
+# Long enough that source_context() truncates it, so the compared prompt is sensitive to the body budget too.
 BODY = "b" * 400
 
 
@@ -51,11 +32,7 @@ def _run(coro):
 
 
 class _Leg:
-    """Stubbed retrieval pipeline, with the knobs the tests turn.
-
-    One instance stands in for every entity leg, so it can count how many are
-    in flight at once and record exactly what each was asked for.
-    """
+    """Stubbed retrieval pipeline; one instance stands in for every entity leg."""
 
     def __init__(
         self,
@@ -82,10 +59,8 @@ class _Leg:
     def arm_barrier(self, parties: int) -> None:
         """No leg may leave until ``parties`` legs have arrived.
 
-        Under a sequential loop the first leg waits for arrivals that can only
-        happen after it returns, so the barrier is never satisfied and the wait
-        times out: the test fails on the absence of overlap, not on a wall-clock
-        threshold that a slow machine could trip.
+        A sequential loop never satisfies the barrier, so the wait times out: the
+        test fails on the absence of overlap, not on a wall-clock threshold.
         """
         arrived = asyncio.Event()
         seen = 0
@@ -99,11 +74,7 @@ class _Leg:
         self._barrier = (arrived, _mark)
 
     def slow_for(self, *entities: str) -> None:
-        """These entities sleep before returning; everything else does not.
-
-        Combined with the default ``delay=0`` (a bare checkpoint), this is what
-        gives the fast legs something to overlap with.
-        """
+        """These entities sleep for ``delay``; every other leg is a bare checkpoint."""
         self._slow_entities = frozenset(entities)
 
     async def retrieve(self, rq, top_k, **kwargs):
@@ -120,7 +91,7 @@ class _Leg:
             # Always yield once, so two legs with no delay can still overlap.
             await asyncio.sleep(self.delay if entity in self._slow_entities else 0)
             # Copy, don't alias: body_rescue rewrites a.score in place, so a
-            # shared fixture object would carry one test's rescue into the next.
+            # shared object would carry one test's rescue into the next.
             return (
                 [a.model_copy(deep=True) for a in self.articles.get(entity, [])],
                 self.facts.get(f"{entity}.industry"),
@@ -132,10 +103,8 @@ class _Leg:
             self.finished.append(entity)
 
     async def rescue(self, query, articles):
-        # A rescued article gets a distinct score, so a test can tell a rescue
-        # that ran from one that did not. The in-flight counters exist because
-        # the concurrency cap is held across BOTH of a leg's awaits: bounding
-        # only the retrieval would leave the body fetch unbounded.
+        # The cap is held across both of a leg's awaits, so the rescue needs its
+        # own in-flight counters: bounding only the retrieval would leave it unbounded.
         self.rescues += 1
         self.rescue_in_flight += 1
         self.max_rescue_in_flight = max(self.max_rescue_in_flight, self.rescue_in_flight)
@@ -185,9 +154,9 @@ def _multi(entities: list[str], mode: str = "comparison", scaffold: str = "fundi
     return MultiEntityQuery(mode=mode, entities=entities, scaffold=scaffold)
 
 
-# The article set every equivalence test shares: a shared id (3) so the dedupe
-# and the per-article entity list are exercised, and an id (1) matched by two
-# entities with different scores so the rank key has something to order.
+# A shared id (3) so the dedupe and the per-article entity list are exercised,
+# and an id (1) matched by two entities with different scores so the rank key has
+# something to order.
 _ARTICLES = {
     "alpha": [_article(1, "alpha one", 0.9), _article(3, "shared", 0.7)],
     "bravo": [_article(2, "bravo two", 0.9), _article(3, "shared", 0.7)],
@@ -199,11 +168,6 @@ _ARTICLES = {
 
 
 def test_legs_run_concurrently(stub_pipeline, monkeypatch):
-    """Every leg must be in flight at the same time.
-
-    A barrier, not a stopwatch: no leg may leave until all have arrived, so a
-    sequential implementation deadlocks and the wait times out.
-    """
     entities = ["alpha", "bravo", "charlie"]
     leg = stub_pipeline(
         entity_articles={e: [_article(i + 1, f"{e} deal", 0.9)] for i, e in enumerate(entities)}
@@ -218,12 +182,8 @@ def test_legs_run_concurrently(stub_pipeline, monkeypatch):
 
 
 def test_body_rescue_leg_also_overlaps(stub_pipeline, monkeypatch):
-    """The rescue is inside the gathered leg, so its awaits overlap too.
-
-    body_rescue only runs on a weak result set, so each leg is given a
-    below-gate score; the rescue is what lifts the articles into the answer,
-    which also proves each leg's rescue saw ITS OWN results.
-    """
+    """Each leg gets a below-gate score, so only its own body rescue can lift its
+    articles into the answer."""
     entities = ["alpha", "bravo"]
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", True)
     leg = stub_pipeline(
@@ -234,7 +194,6 @@ def test_body_rescue_leg_also_overlaps(stub_pipeline, monkeypatch):
     turn = _run(chat_module._prepare_multi_entity_turn(_multi(entities), "q", []))
 
     assert leg.max_in_flight == len(entities)
-    # Unrescued these would score 0.01 and be gated out entirely.
     assert [s["title"] for s in turn.sources] == ["alpha deal", "bravo deal"]
     assert all(s["score"] == pytest.approx(0.99) for s in turn.sources)
 
@@ -244,13 +203,7 @@ def test_body_rescue_leg_also_overlaps(stub_pipeline, monkeypatch):
 
 @pytest.mark.parametrize("mode", ["comparison", "intersection"])
 def test_gathered_result_identical_to_sequential(stub_pipeline, monkeypatch, mode):
-    """Same articles, order, annotation and prompt as the sequential loop.
-
-    The oracle is the real function with concurrency pinned to 1, so the
-    prompt assembly, the dedupe, the per-article entity list (which feeds both
-    the "Entities:" line and the rank key) and the retrieval arguments are all
-    compared -- not just the source ids.
-    """
+    """Same articles, order, annotation and prompt as the sequential loop."""
     entities = ["alpha", "bravo", "charlie"]
     facts = {"alpha.industry": "Finance", "bravo.industry": "Tech", "charlie.industry": "Tech"}
     monkeypatch.setattr(chat_module.config, "CHAT_MULTI_ENTITY_CONCURRENCY", 4)
@@ -265,19 +218,16 @@ def test_gathered_result_identical_to_sequential(stub_pipeline, monkeypatch, mod
     assert leg_seq.max_in_flight == 1, "concurrency 1 must be the sequential oracle"
     assert leg_seq.started == entities
 
-    # Sources, order, and the full prompt/system/note.
     assert gathered.sources == sequential.sources
     assert [s["id"] for s in gathered.sources] == [s["id"] for s in sequential.sources]
     assert gathered.answer == sequential.answer
     assert gathered.system == sequential.system
     assert gathered.note == sequential.note
 
-    # What each leg was asked for, so a change to the per-entity arguments
-    # (top_k, auto facets, need_body) cannot pass as "same result".
+    # Per-entity arguments too, so a change there cannot pass as "same result".
     assert leg.calls == leg_seq.calls
     assert [c[0] for c in leg.calls] == entities
     assert all(c[2]["need_body"] is True for c in leg.calls)
-    # The shared article is annotated with both of its entities, in entity order.
     assert "Entities: alpha, bravo" in gathered.answer
     assert "Entities: alpha, charlie" in gathered.answer
 
@@ -285,13 +235,11 @@ def test_gathered_result_identical_to_sequential(stub_pipeline, monkeypatch, mod
 def _entities_by_article(answer: str) -> dict[str, str]:
     """Map each article's title to the entity list annotated on its own block.
 
-    Asserting "Entities: alpha, bravo" appears somewhere is symmetric: a
-    mispairing still produces it, just on the wrong articles. Binding the
-    annotation to the article it names is what actually detects a swap.
+    Asserting the annotation text appears somewhere is symmetric: a mispairing
+    still produces it, just on the wrong articles.
     """
-    # A block is "<<<ARTICLE n>>>\n[n] <title> (<date>)\n<body>\nEntities: <...>",
-    # so the "n>>>" that closes the ARTICLE header is its own line and the
-    # title line follows it.
+    # Block shape: "<<<ARTICLE n>>>\n[n] <title> (<date>)\n<body>\nEntities: <...>",
+    # so the title line is the one after the ARTICLE header.
     out = {}
     for block in answer.split("<<<ARTICLE ")[1:]:
         title = block.splitlines()[1].split("] ", 1)[1].rsplit(" (", 1)[0]
@@ -301,12 +249,6 @@ def _entities_by_article(answer: str) -> dict[str, str]:
 
 
 def test_each_article_is_annotated_with_its_own_entities(stub_pipeline, monkeypatch):
-    """A completion-order swap must be visible on the articles themselves.
-
-    Pairing bravo's results to alpha is not detectable by asserting the
-    annotation text exists; it is detectable by checking WHICH article carries
-    WHICH annotation.
-    """
     entities = ["alpha", "bravo", "charlie"]
     leg = stub_pipeline(entity_articles={
         "alpha": [_article(1, "alpha one", 0.9), _article(4, "shared ab", 0.7)],
@@ -373,11 +315,8 @@ def test_concurrency_cap_still_overlaps(stub_pipeline, monkeypatch):
 
 
 def test_oversized_entity_list_never_fans_out(stub_pipeline, monkeypatch):
-    """A question naming more entities than the cap takes the single-query path.
-
-    The question below yields far more entities than the cap, so the
-    multi-entity expansion -- one pipeline per entity -- must not run at all.
-    """
+    """The question yields far more entities than the cap, so the per-entity
+    expansion must not run at all."""
     from app.query_intent import detect_multi_entity
 
     monkeypatch.setattr(chat_module.config, "CHAT_MAX_MULTI_ENTITIES", 6)
@@ -429,13 +368,9 @@ def test_entity_list_at_the_cap_still_compares(stub_pipeline, monkeypatch):
 
 
 def test_gathered_turn_beats_the_sequential_turn(stub_pipeline, monkeypatch):
-    """Measure the win the gather actually buys, against the sequential oracle.
-
-    The stub's delay stands in for the Qdrant I/O each leg does; the CPU rerank
-    it stands in for is serialized by the shared ``inference_lock``, so the
-    honest ceiling here is the I/O overlap alone. Asserted with a margin, since
-    the number is a property of the stub rather than of the production path.
-    """
+    """The stub's delay stands in for the Qdrant I/O each leg does; the CPU rerank
+    it stands in for is serialized by the shared ``inference_lock``, so the honest
+    ceiling here is the I/O overlap alone."""
     entities = [f"e{i}" for i in range(4)]
     articles = {e: [_article(i + 1, f"{e} deal", 0.9)] for i, e in enumerate(entities)}
     monkeypatch.setattr(chat_module.config, "CHAT_MULTI_ENTITY_CONCURRENCY", 4)
@@ -458,8 +393,7 @@ def test_gathered_turn_beats_the_sequential_turn(stub_pipeline, monkeypatch):
 
     assert sequential >= len(entities) * 0.05, "the sequential turn must pay every delay"
     assert gathered < sequential, f"gathered {gathered:.3f}s should beat sequential {sequential:.3f}s"
-    # Never better than one delay plus changeover: the legs cannot overlap
-    # more than the slowest one.
+    # Never better than one delay plus changeover: the legs cannot overlap past the slowest one.
     assert gathered >= 0.05
 
 
@@ -467,21 +401,14 @@ def test_gathered_turn_beats_the_sequential_turn(stub_pipeline, monkeypatch):
 
 
 def test_error_is_the_first_entity_s_not_the_race_winner(stub_pipeline, monkeypatch):
-    """The surfaced error is entity 0's, not whichever leg happened to lose the race.
+    """Plain gather() raises whichever leg failed first in wall-clock time; the
+    sequential loop raised the first ENTITY's. Alpha is first in entity order but
+    raises last in wall-clock, and the two failing legs raise different types.
 
-    Plain gather() raises whichever leg failed first in wall-clock time; the
-    sequential loop this replaced raised the first ENTITY's. Alpha is first in
-    entity order but raises last in wall-clock, and the two failing legs raise
-    different exception types, so a race surfaces ValueError("bravo failed")
-    where the code must surface RuntimeError("alpha failed"). Repeated three
-    times, since a race could not be relied on to reproduce.
-
-    The await-all property -- that no leg keeps running against Qdrant after
-    the turn has already failed -- is NOT asserted here. It was tried and
-    dropped as vacuous: a coroutine's ``finally`` runs during asyncio.run's
-    shutdown cancellation too, so the bookkeeping showed every leg finished
-    under plain gather as well. That property rests on the implementation
-    (return_exceptions=True awaits all legs before the re-raise), not on a test.
+    The await-all property -- that no leg keeps running against Qdrant after the
+    turn has failed -- is not asserted here: a coroutine's ``finally`` also runs
+    during asyncio.run's shutdown cancellation, so bookkeeping of it would pass
+    under plain gather too.
     """
     entities = ["alpha", "bravo", "charlie"]
     _Leg(entity_articles=_ARTICLES)  # installs the fixture patch we then replace
@@ -508,15 +435,11 @@ def test_error_is_the_first_entity_s_not_the_race_winner(stub_pipeline, monkeypa
         main.retrieve_with_auto_facet_fallback = saved
 
 
-# --- the config knobs cannot be misconfigured into a hang or a dead feature ---
+# --- the config knobs ---
 
 
 def test_zero_concurrency_knob_does_not_hang(stub_pipeline, monkeypatch):
-    """CHAT_MULTI_ENTITY_CONCURRENCY=0 would make the semaphore never release.
-
-    asyncio.Semaphore(0) blocks every leg forever, which is strictly worse than
-    the sequential bug being fixed, so the value is floored at 1.
-    """
+    """``asyncio.Semaphore(0)`` blocks every leg forever, so the knob is floored at 1."""
     entities = ["alpha", "bravo"]
     monkeypatch.setattr(chat_module.config, "CHAT_MULTI_ENTITY_CONCURRENCY", 0)
     leg = stub_pipeline(
@@ -532,18 +455,12 @@ def test_zero_concurrency_knob_does_not_hang(stub_pipeline, monkeypatch):
 
 
 def test_concurrency_cap_covers_body_rescue(stub_pipeline, monkeypatch):
-    """The rescue is part of the leg, so the cap has to bound it too.
-
-    The semaphore is held across both of a leg's awaits. Bounding only the
+    """The semaphore is held across both of a leg's awaits, so bounding only the
     retrieval would leave the body fetch -- the other half of a leg's cost --
-    unbounded, and nothing that measures concurrency inside retrieve() could
-    see it. So the concurrency is measured in the rescue itself, and the last
-    assertion pins that rescues really do overlap, without which the others
-    would be satisfied by a rescue that never ran.
+    unbounded. The last assertion pins that rescues really do overlap.
 
-    The rescue has to outlast the retrieval: an unbounded rescue only piles up
-    if a leg is still fetching bodies when the next one starts, so the second
-    delay is the longer of the two on purpose.
+    The rescue delay is the longer of the two on purpose: an unbounded rescue
+    only piles up if a leg is still fetching bodies when the next one starts.
     """
     entities = ["alpha", "bravo", "charlie", "delta"]
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", True)
@@ -564,11 +481,7 @@ def test_concurrency_cap_covers_body_rescue(stub_pipeline, monkeypatch):
 
 @pytest.mark.parametrize("cap", [0, 1, -5])
 def test_tiny_entity_cap_keeps_the_feature_alive(stub_pipeline, monkeypatch, cap):
-    """A comparison needs at least two entities, so a cap below that floors to 2.
-
-    Otherwise a typo in the env would silently disable multi-entity turns
-    entirely rather than mean anything.
-    """
+    """A comparison needs at least two entities, so a cap below that floors to 2."""
     entities = ["alpha", "bravo"]
     monkeypatch.setattr(chat_module.config, "CHAT_MAX_MULTI_ENTITIES", cap)
     leg = stub_pipeline(
@@ -599,12 +512,8 @@ def _done_payload(body: str) -> dict:
 
 
 class _Budget:
-    """The daily cap, standing in for the Redis one and counting what it is asked.
-
-    reserve/settle/release are the turn's only contact with the cap, so what
-    they are asked for is what the turn is charged: one hold taken, one settle
-    recorded, no release, whatever the turn's fan-out was.
-    """
+    """The daily cap, standing in for the Redis one and counting what it is asked:
+    one hold taken, one settle recorded, no release."""
 
     def __init__(self):
         self.reserved: list[float] = []
@@ -642,11 +551,8 @@ def _stream_client(tmp_path):
 
 
 def _auth_cookie(auth_store) -> dict[str, str]:
-    """Create the account and return the session cookie the browser would send.
-
-    The credential is an HttpOnly cookie (#247), so there is no ``Authorization``
-    header left to build: the tests authenticate exactly the way the app does.
-    """
+    """Create the account and return the session cookie the browser would send: the
+    credential is an HttpOnly cookie, so there is no ``Authorization`` header."""
     user = _run(auth_store.get_user_by_email(_EMAIL))
     if user is None:
         user = _run(auth_store.create_user(_EMAIL, "secret1", "user-a", "user"))
@@ -679,23 +585,15 @@ def _fake_llm(pieces, calls):
 
 
 def test_stream_event_order_is_unchanged(stub_pipeline, monkeypatch, tmp_path):
-    """The gathered turn must put the SAME events on the wire, in the SAME order.
-
-    The frontend switches on the event name and on its position in the stream,
-    so "the legs ran" is not the property at stake -- the sequence is. Every leg
-    has to be in flight at once (a barrier each must reach, so a sequential
-    implementation deadlocks rather than merely being slower), and the body must
-    still read start -> delta... -> done with no error, carrying the combined
-    sources in the order the combine step produces for them.
-    """
-    # The detector's own order and spelling, so the question goes through the
-    # real expansion rather than a monkeypatched stand-in.
+    """The frontend switches on the event name and on its position in the stream,
+    so "the legs ran" is not the property at stake -- the sequence is."""
+    # The detector's own order and spelling, so the expansion is not a monkeypatched stand-in.
     entities = ["cirrus", "bravo", "acme"]
     assert detect_multi_entity(_QUESTION).entities == entities
     leg = stub_pipeline(entity_articles={
-        # A shared id, so the dedupe and the per-article entity list are on the
-        # wire too, and the middle entity finishing LAST, so the order the
-        # sources come out in is not simply the order the legs completed in.
+        # A shared id puts the dedupe and the per-article entity list on the wire
+        # too, and the middle entity finishing LAST means the output order is not
+        # completion order.
         "cirrus": [_article(1, "cirrus deal", 0.9), _article(9, "shared", 0.6)],
         "bravo": [_article(2, "bravo deal", 0.9)],
         "acme": [_article(3, "acme deal", 0.9), _article(9, "shared", 0.6)],
@@ -716,21 +614,15 @@ def test_stream_event_order_is_unchanged(stub_pipeline, monkeypatch, tmp_path):
 
     assert leg.max_in_flight == len(entities), "the legs must really have overlapped"
     assert _events(body) == ["start", "delta", "delta", "done"]
-    # The two-entity article sorts first (the most entities match it), then the
-    # rest by score, so this is the order the combine step produces.
+    # The two-entity article sorts first (the most entities match it), then by score.
     assert [s["title"] for s in _done_payload(body)["message"]["sources"]] == [
         "shared", "cirrus deal", "bravo deal", "acme deal",
     ]
 
 
 def test_entity_count_does_not_multiply_billed_calls(stub_pipeline, monkeypatch, tmp_path):
-    """One provider call and one budget hold per turn, whatever the fan-out.
-
-    A leg is retrieval only -- it never reaches the provider -- so gathering
-    them must not multiply what the turn costs. The cap's own counters are the
-    thing that would double: a hold taken per leg, or a settle per leg, would
-    write the day's spend that many times over.
-    """
+    """A leg is retrieval only -- it never reaches the provider -- so gathering them
+    must not multiply what the turn costs."""
     entities = ["cirrus", "bravo", "acme"]
     leg = stub_pipeline(
         entity_articles={e: [_article(i + 1, f"{e} deal", 0.9)] for i, e in enumerate(entities)}

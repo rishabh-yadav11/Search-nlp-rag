@@ -1,24 +1,20 @@
 """Session-cookie + RBAC authentication for the API.
 
-Signup issues no cookie and always answers the same thing (see the endpoint);
-login issues an opaque token (hashed with SHA-256 in storage, expiring after
-AUTH_TOKEN_TTL_DAYS, individually revocable, multiple per user) and delivers it
-ONLY as an HttpOnly cookie named ``config.AUTH_COOKIE_NAME``. The token is
-never in a response body and is never read from a header: a token a browser
-has to hold in script-readable storage is one XSS bug away from a durable
-account takeover, and a header path stays reachable from ``fetch()``, so
-keeping one alongside the cookie would leave the exfiltration surface open.
+Signup issues no cookie and always answers the same thing (see the endpoint).
+Login issues an opaque token (hashed with SHA-256 in storage, expiring after
+AUTH_TOKEN_TTL_DAYS, individually revocable, several per user but capped at
+AUTH_MAX_ACTIVE_TOKENS_PER_USER active ones, oldest revoked past the cap) and
+delivers it ONLY as an HttpOnly cookie named ``config.AUTH_COOKIE_NAME``. The
+token is never in a response body and is never read from a header: a token a
+browser has to hold in script-readable storage is one XSS bug away from a
+durable account takeover, and a header path stays reachable from ``fetch()``,
+so keeping one alongside the cookie would leave the exfiltration surface open.
 
 Because the cookie is attached by the browser automatically, every
 cookie-authenticated unsafe request is forgeable by a page the user visits, so
 ``enforce_same_origin`` guards them (see its docstring). It runs inside
 ``require_auth``, which means coverage cannot be forgotten on a new route.
 
-Signup issues no token and always answers the same thing (see the endpoint);
-login issues opaque session tokens (hashed with SHA-256 in storage, expiring
-after AUTH_TOKEN_TTL_DAYS, individually revocable, several per user but capped
-at AUTH_MAX_ACTIVE_TOKENS_PER_USER active ones, oldest revoked past the cap) and
-delivers them ONLY as the HttpOnly cookie described above.
 A role-based access-control layer maps roles to permissions; endpoints assert
 the permission they need via ``require_permission``. A bootstrap admin account
 is seeded from AUTH_ADMIN_EMAIL / AUTH_ADMIN_PASSWORD at startup.
@@ -30,9 +26,8 @@ Roles:
 Machine clients (eval scripts) may authenticate with the AUTH_SERVICE_TOKEN
 header, which is a SCOPED, EXPIRING credential rather than an unconditional
 admin bypass: it carries an explicit permission set, stops working after
-AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS, and can be revoked or rotated. That header
-path is unchanged by the cookie migration: it is not a browser credential, and
-browsers cannot be made to attach it. All inputs are validated server-side.
+AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS, and can be revoked or rotated. All inputs are
+validated server-side.
 """
 
 import asyncio
@@ -68,8 +63,8 @@ store: "AuthStore | None" = None
 
 VALID_ROLES = ("admin", "user")
 
-# The only role public self-service signup can ever grant. Not configurable:
-# see the signup docstring.
+# The only role public self-service signup can ever grant (see the signup
+# docstring for why it is not configurable).
 SIGNUP_ROLE = "user"
 
 # Role -> permissions. Single source of truth for access control; add a
@@ -87,17 +82,13 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 # How a password reaches bcrypt.
 #
 # bcrypt hashes AT MOST the first 72 bytes of its input and silently discards
-# the rest. Handed the password itself, that makes every long password a prefix
-# of itself: a 103-byte passphrase authenticates from its first 72 bytes, any
-# two values sharing a 72-byte prefix are the same credential, and bytes past
-# the cut add no entropy at all. No application-level maximum can fix that,
-# because the cut happens inside bcrypt rather than in validation -- which is
-# why the policy deliberately has no maximum (#290, #334).
+# the rest, which would make every long password a prefix of itself. No
+# application-level maximum can fix that, because the cut happens inside bcrypt
+# rather than in validation -- which is why the policy has no maximum.
 #
 # So bcrypt is handed a fixed-width SHA-256 pre-image instead. The digest is
 # always 32 bytes, so nothing is ever truncated, the prefix collision is gone,
-# and a 200-byte passphrase is worth 200 bytes. This is the standard remedy for
-# bcrypt's limit.
+# and a 200-byte passphrase is worth 200 bytes.
 #
 # It changes what a stored hash MEANS, so the two schemes must be tellable
 # apart. A current hash is this marker followed by a plain bcrypt string;
@@ -107,8 +98,7 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 _PASSWORD_SCHEME = "$bcrypt-sha256$"
 
 # The width of the credential a pre-migration hash represents. Kept ONLY so
-# those hashes can still be verified: no password is handed to bcrypt raw any
-# more, so nothing truncates and this bounds nothing.
+# those hashes can still be verified.
 _LEGACY_BCRYPT_MAX_BYTES = 72
 
 
@@ -157,11 +147,9 @@ class UserOut(BaseModel):
 class AuthOut(BaseModel):
     """The body of a successful ``POST /api/auth/login`` / ``/change-password``.
 
-    Carries the user record and deliberately NOT the session token. The token
-    is delivered only in an HttpOnly ``Set-Cookie``, never in a field script
-    can read: publishing it in the body would hand every XSS on the site a
-    durable account takeover, which is the exact exposure the cookie moves the
-    credential out of.
+    Carries the user record and deliberately NOT the session token: publishing
+    it in the body would hand every XSS on the site a durable account takeover,
+    which is the exact exposure the cookie moves the credential out of.
     """
 
     user: UserOut
@@ -182,8 +170,8 @@ class SignupOut(BaseModel):
 # The single response body every accepted signup gets. It must state the two
 # possible outcomes without favouring one: this app has no confirmation-email
 # flow, so a returning user who re-submits a registered address gets no mail
-# and no error -- the message is their recovery route ("just sign in with
-# your existing password"), and it is deliberately the same string a brand new
+# and no error -- the message is their recovery route ("just sign in with your
+# existing password"), and it is deliberately the same string a brand new
 # address receives.
 SIGNUP_ACCEPTED_MESSAGE = (
     "If this email is not already registered, your account is ready. "
@@ -207,8 +195,8 @@ class StoredUser:
 class StoredServiceToken:
     """A machine credential (X-Service-Token) as stored.
 
-    ``scope`` is the explicit set of permissions the token may exercise --
-    it is NOT the full admin permission set, and it is enforced per route by
+    ``scope`` is the explicit set of permissions the token may exercise -- it is
+    NOT the full admin permission set, and it is enforced per route by
     ``require_permission``. ``expires_at`` bounds the credential's life, so a
     leaked service token stops working on its own instead of forever.
     """
@@ -253,34 +241,25 @@ def _password_rejection(password: str) -> str | None:
 
     THE SINGLE SOURCE OF TRUTH for the password policy. Every path that can set
     a password -- ``signup``, ``change_password`` and ``bootstrap_admin`` -- must
-    reach this function. The three of them used to state the same two rules
-    against different values, so they admitted different passwords (#334).
+    reach this function, so they cannot admit different passwords.
 
     Both rules are judged on the WHOLE value, because the whole value is what
     authenticates: ``hash_password`` hands bcrypt a fixed-width SHA-256
-    pre-image, so no byte of the password is ever dropped. That is the second
-    half of the argument #334 made. It had to judge the length floor on
-    ``_effective_password()`` -- the 72-byte prefix bcrypt could actually see --
-    because a floor judged on the raw string was then the weaker bound: a
-    30-character password of 3-byte characters cleared a 30-character floor
-    while only 24 characters of it became the credential. That weaker bound was
-    safe only because the raw 72-byte maximum refused every value long enough to
-    have a shortened effective form, so the two bounds masked each other.
-    Pre-hashing removes the shortening that made the raw bound weaker, and with
-    it the reason the two bounds had to differ at all.
+    pre-image, so no byte of the password is ever dropped. A length floor judged
+    on the 72-byte prefix bcrypt could see used to be the weaker bound (30
+    three-byte characters cleared a 30-character floor while only 24 of them
+    became the credential), and pre-hashing removes the shortening that made it
+    weaker.
 
-    **Letter+digit** is a composition rule, not an entropy rule, and has always
-    been judged on the configured secret. It stays that way: judging it on a
-    truncated prefix used to refuse credentials ``login`` already accepted (a
-    passphrase whose only digit sat past byte 72), and with nothing truncated
-    there is no second value to judge it on.
+    **Letter+digit** is a composition rule, not an entropy rule, and stays judged
+    on the configured secret: judging it on a truncated prefix used to refuse
+    credentials ``login`` already accepted.
 
     There is deliberately NO maximum. The 72-byte cut was a property of bcrypt,
     not a policy the application could enforce, and refusing over-long values is
     what stopped ``bootstrap_admin`` -- the only path that can ever create an
     admin -- from seeding one, while leaving the very same working passphrase
-    unsettable through ``change_password`` (#290, #334). All three set paths
-    accept a value of any length, and every byte of it now counts.
+    unsettable through ``change_password``. Every byte of the value now counts.
     """
     if len(password) < config.AUTH_PASSWORD_MIN_LEN:
         return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
@@ -347,12 +326,10 @@ def needs_rehash(hashed: str) -> bool:
     """Whether ``hashed`` is a pre-migration hash a verified password should be
     rewritten into the current scheme.
 
-    A pure test of the stored marker: no bcrypt, no secret, no user input. It
-    reads the same string ``verify_password`` dispatches on, so the two can
-    never disagree about which scheme a row is in. Callers only ask after a
-    successful verify, and a row whose hash is unreadable or empty (a
-    non-account's placeholder, a corrupt value) can never reach that point,
-    because a hash that verifies is a hash bcrypt produced.
+    A pure test of the stored marker, so the two can never disagree about which
+    scheme a row is in. Callers only ask after a successful verify, and a row
+    whose hash is unreadable or empty can never reach that point, because a hash
+    that verifies is a hash bcrypt produced.
     """
     return not hashed.startswith(_PASSWORD_SCHEME)
 
@@ -365,21 +342,15 @@ def verify_password(password: str, hashed: str) -> bool:
     That is what makes the migration safe in both directions:
 
     - A current-scheme row is only ever checked against the pre-image, so
-      nobody can authenticate it with a raw 72-byte prefix. The collision
-      cannot survive the upgrade for exactly the accounts that were upgraded.
+      nobody can authenticate it with a raw 72-byte prefix.
     - A pre-migration row is only ever checked against ``raw[:72]`` -- the
       credential it was created to represent -- so an account that predates the
       change keeps logging in unchanged.
 
     Trying both, or picking the scheme by what the caller submitted, would leave
     the shorter of the two as a working alternative for whichever row an
-    attacker targeted: a current row would still fall back to the prefix, which
-    is the whole bug, and a legacy row would accept a value the owner never set.
-
-    Dispatching on the row also keeps the cost at exactly one bcrypt either way,
-    so a pre-migration account is not distinguishable by timing from a current
-    one, and the unknown-address path keeps paying the same
-    ``_DUMMY_PASSWORD_HASH`` cost it always did.
+    attacker targeted. Dispatching on the row also keeps the cost at exactly
+    one bcrypt either way, so the two row kinds are indistinguishable by timing.
     """
     if hashed.startswith(_PASSWORD_SCHEME):
         stored, preimage = hashed[len(_PASSWORD_SCHEME):], _prehash(password)
@@ -402,8 +373,7 @@ def verify_password(password: str, hashed: str) -> bool:
 # costs the same wall-clock time as a wrong-password login. Without it the
 # missing short-circuit is a remote account-existence oracle even though both
 # paths return the identical 401 body. It must never be a cheaper hash: the
-# cost factor is the whole point, so it is derived rather than hard-coded. The
-# secret is discarded immediately and is never a valid password for anyone.
+# cost factor is the whole point, so it is derived rather than hard-coded.
 _DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(32))
 
 
@@ -635,19 +605,14 @@ class AuthStore:
         row still holds the hash that was just verified. Returns rows changed.
 
         The compare-and-swap on ``observed_hash`` is what makes the
-        opportunistic upgrade safe to run from a login. A concurrent
-        ``change_password``, or a second worker upgrading the same account,
-        that committed after this request read the row must not be clobbered
-        with a hash derived from a credential its owner has already replaced.
-        Losing that race is the correct outcome -- the winning writer's hash is
+        opportunistic upgrade safe to run from a login. Losing the race to a
+        concurrent writer is the correct outcome -- the winning writer's hash is
         the newer one -- so the rowcount is returned for the caller to log, not
         retried: a retry would reopen the same race.
 
         One statement, so it is atomic on its own and needs no transaction
-        around it: the row is on the old hash or the new one, never anything in
-        between, and a worker killed mid-write leaves the pre-migration hash in
-        place -- which still authenticates, so a crash here cannot lock anyone
-        out.
+        around it: a worker killed mid-write leaves the pre-migration hash in
+        place, which still authenticates, so a crash here cannot lock anyone out.
         """
         cur = await self._db.execute(
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
@@ -661,9 +626,8 @@ class AuthStore:
 
         An upper bound on the at-risk set, not an exact one: a row records
         nothing about how long the original password was, so a pre-migration
-        account whose password fitted inside bcrypt's window -- and which
-        therefore carries no prefix-collision exposure at all -- is counted
-        here too. Nothing in the row can tell those apart.
+        account whose password fitted inside bcrypt's window is counted here
+        too. Nothing in the row can tell those apart.
 
         ``substr`` with a bound parameter rather than ``NOT LIKE``: ``%`` and
         ``_`` are LIKE wildcards, so a scheme marker containing one would
@@ -707,13 +671,8 @@ class AuthStore:
         The surplus rows are DELETED, not just hidden: ``user_for_token``
         resolves a token by looking its hash up in this very table, so a
         deleted row means the credential no longer authenticates (401) the
-        moment it is evicted. Leaving the row in place and merely not listing
-        it would keep a live credential alive, which is the opposite of what a
-        cap is for.
-
-        Only unexpired rows count toward the cap and are candidates for
-        eviction, so already-dead rows (the purge loop's job) neither occupy a
-        slot nor get churned by this.
+        moment it is evicted. Only unexpired rows count toward the cap, so
+        already-dead rows neither occupy a slot nor get churned by this.
         """
         cap = int(getattr(config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 0))
         if cap <= 0:
@@ -833,9 +792,8 @@ class AuthStore:
 
         So when the value has no row, INSERT a tombstone: a row that exists and
         is already revoked. Seeding is INSERT OR IGNORE, so a later request
-        cannot overwrite it and cannot revive the credential. INSERT OR IGNORE
-        also means a value that already has a row is left exactly as it is, so
-        this can only ever make a credential deader, never younger.
+        cannot overwrite it, and a value that already has a row is left exactly
+        as it is, so this can only ever make a credential deader, never younger.
 
         Returns the number of rows this call changed (1 for a fresh tombstone,
         1 for revoking a live row, 0 if it was already dead).
@@ -866,9 +824,7 @@ class AuthStore:
         which stops a revoked or expired configured ``AUTH_SERVICE_TOKEN`` from
         being re-seeded with a fresh lifetime on the next request. Delete it and
         the reaper would hand the credential straight back, which is the
-        permanent-grant failure this table exists to prevent. Once the operator
-        points the env var at a different value the old row is no longer
-        excluded and is collected like any other dead row.
+        permanent-grant failure this table exists to prevent.
         """
         now = _now()
         cur = await self._db.execute(
@@ -909,41 +865,27 @@ class AuthStore:
         These three writes only mean anything together, so they are applied
         inside a single ``BEGIN IMMEDIATE`` .. ``COMMIT``: SQLite keeps an
         uncommitted transaction invisible to every other connection and
-        discards it outright if the process dies, so the database is always on
-        one side of the change or the other and never inside it.
+        discards it outright if the process dies.
 
-        The shared connection would in fact hold these three writes in a single
-        implicit transaction -- sqlite3 opens one at the first DML and keeps it
-        until ``commit()``, and the three separate commits this replaced were
-        exactly what cut it into three. What it cannot do is hold one open
-        safely for the length of this change: that connection serialises every
-        request in the worker, so another coroutine's ``commit()`` landing
-        between two of these statements would publish a half-finished password
-        change early, and its ``rollback()`` would throw this one away -- the
-        very "one connection is never shared across concurrent coroutines"
-        hazard ``create_user`` already rolls back on. Hence a short-lived
-        dedicated connection to the same file: WAL lets it read and write
-        alongside the shared one, SQLite's own write lock serialises it against
-        other writers, and ``BEGIN IMMEDIATE`` takes that lock up front so this
-        waits out the same 5 s busy timeout rather than failing on a
-        mid-transaction lock upgrade. It is opened with
-        ``isolation_level=None`` so this ``BEGIN`` is the connection's only
-        transaction, not a nested one sqlite3 would refuse.
+        The shared connection cannot hold one open safely for the length of this
+        change: it serialises every request in the worker, so another
+        coroutine's ``commit()`` landing between two of these statements would
+        publish a half-finished password change early, and its ``rollback()``
+        would throw this one away. Hence a short-lived dedicated connection to
+        the same file: WAL lets it read and write alongside the shared one,
+        SQLite's own write lock serialises it against other writers, and
+        ``BEGIN IMMEDIATE`` takes that lock up front so this waits out the same
+        5 s busy timeout rather than failing on a mid-transaction lock upgrade.
+        It is opened with ``isolation_level=None`` so this ``BEGIN`` is the
+        connection's only transaction, not a nested one sqlite3 would refuse.
 
         The statements are ALSO ordered revoke -> set hash -> mint. That is
-        defence in depth, not the guarantee: it is what keeps the change safe
-        if this ever runs somewhere the transaction does not hold. An
-        interruption after the revoke leaves the old password and no live
-        tokens; one after the hash write leaves the new password and no live
-        tokens. Either way the user logs back in, and no interruption point
-        leaves a changed password standing next to a token minted before it.
-        The transaction above is what the tests pin, and on its own it holds
-        whatever order the statements are written in.
+        defence in depth, not the guarantee: no interruption point leaves a
+        changed password standing next to a token minted before it.
 
         The per-user token cap is not re-applied here: every other token was
         deleted in this same transaction, so the user can hold at most the one
-        row inserted below. Measured rather than assumed -- with the cap set to
-        0, 1, 2 and 10 the user holds exactly one live row after the change.
+        row inserted below.
         """
         if self._db is None:
             raise RuntimeError("auth store is not connected")
@@ -999,8 +941,7 @@ def _rate_redis() -> aioredis.Redis:
         # in DB 0, which is the query cache and is flushed during deploys --
         # a flush there would reset every bucket and briefly disable the
         # throttle. The ``db`` kwarg overrides any db segment in REDIS_URL, so
-        # this is safe whether or not the URL carries a db index. Matches the
-        # convention in analytics.py and cost_budget.py. This client is
+        # this is safe whether or not the URL carries a db index. This client is
         # module-local to the limiter (closed by close_rate_redis), so pinning
         # it cannot move anyone else's data.
         _rate_client = aioredis.from_url(
@@ -1139,23 +1080,15 @@ async def _check_account_rate_limit(
     source address, so rotating IPs cannot buy an attacker a fresh bucket.
 
     The key is the address folded to lower case and stripped, so one account
-    cannot be handed a second bucket by changing case or padding -- the
-    invariant is enforced here rather than left to the caller.
+    cannot be handed a second bucket by changing case or padding.
 
     THIS HELPER PERFORMS NO LOOKUP: given the same submitted string it computes
     the same key, the same counter update and the same answer whether or not
     the address has an account, which is what keeps it from being an
     account-existence oracle. Its caller decides WHETHER to call it, and that
-    is where existence enters -- login only counts a failed credential check.
-    That is not an enumeration channel: the only thing that skips the increment
-    is supplying the correct password, which is exactly what the attacker does
-    not have. A registered address and an unregistered address both pay a
-    bcrypt verify, both increment on failure, and both return the identical
-    401 or 429.
-
-    Keep it that way. A version of this that consulted the users table, or one
-    the caller invoked before the credential check, would reintroduce the
-    account-existence oracle the dummy-hash login path exists to close.
+    is where existence enters -- login only counts a failed credential check,
+    which is not an enumeration channel because the only thing that skips the
+    increment is the correct password.
     """
     key_account = (account or "").strip().lower()
     if limit_per_min <= 0 or not key_account:
@@ -1180,30 +1113,20 @@ async def _consume_counter(
     """Count one hit against ``key`` and reject past ``limit``.
 
     Redis is the shared counter, so the limit is global across every worker
-    process. When it is unreachable the choice is between three behaviours and
-    the two obvious ones are both wrong on their own:
-
-    * admit the request (the historical behaviour here) makes a Redis outage
-      -- which an attacker can often induce, and which lasts exactly as long
-      as they want -- into an unlimited credential-stuffing window on the
-      login and signup endpoints. That is the hole this function exists to
-      close.
-    * reject every request turns the same outage into a total login outage.
-      Credential stuffing is an attacker's problem; a Redis blip locking every
-      legitimate user out of their own account is the defender's, and it hands
-      a denial-of-service to whoever can disturb Redis without helping anyone
-      guess a password.
+    process. When it is unreachable the two obvious behaviours are both wrong:
+    admitting the request turns an inducible outage into an unlimited
+    credential-stuffing window, and rejecting every one turns it into a total
+    login outage that hands a denial-of-service to whoever can disturb Redis
+    without helping anyone guess a password.
 
     So the fallback is a third option: a bounded in-process limiter with the
     SAME limit. The degraded posture is "single-process limiting" rather than
     "no limiting" or "no service". It stays bounded under an unbounded key
     flood (see ``_local_rate_hit``), and it is not a hidden fail-open: past the
-    limit the caller still gets 429, exactly as it would from Redis.
-
-    The per-worker weakening is inherent to an in-process fallback and is
-    accepted deliberately: a gunicorn deployment multiplies the effective limit
-    by its worker count during a Redis outage, which is still a finite bound
-    rather than none.
+    limit the caller still gets 429, exactly as it would from Redis. The
+    per-worker weakening is inherent and accepted deliberately: a gunicorn
+    deployment multiplies the effective limit by its worker count during an
+    outage, which is still a finite bound rather than none.
     """
     try:
         rc = _rate_redis()
@@ -1252,8 +1175,7 @@ _local_rate_counters: dict[str, tuple[int, float]] = {}
 # are actually being throttled by. So the dict is kept in least-recently-used
 # order (every hit re-inserts its key at the tail) and eviction drops from the
 # head, which makes an actively-attacked bucket the last thing to go rather
-# than the first. Windows that have already closed are reclaimed first,
-# before any live bucket is touched -- they are worth nothing to anyone.
+# than the first. Windows that have already closed are reclaimed first.
 _LOCAL_RATE_MAX_KEYS = 20_000
 
 
@@ -1286,9 +1208,7 @@ def _prune_local_rate_counters(now: float) -> None:
     over = len(_local_rate_counters) - _LOCAL_RATE_MAX_KEYS
     if over <= 0:
         return
-    # Head first == least recently used first. A live bucket is only ever
-    # dropped when the attacker is generating keys faster than the windows
-    # close, and then only in recency order.
+    # Head first == least recently used first, and then only in recency order.
     for stale in list(_local_rate_counters)[:over]:
         del _local_rate_counters[stale]
 
@@ -1316,12 +1236,10 @@ def public_rate_limit(
 
     ``fail_closed`` defaults to True because every current caller is on the
     public search surface. ``/ready`` is the one deliberate exception: it is
-    polled by load balancers and orchestrators, and this service treats a Redis
-    outage as a degraded-but-serving state (the HybridCache falls back to an
-    in-process cache), so failing its limiter closed would pull healthy nodes
-    out of rotation for a dependency the service does not require to be ready.
-    It still counts and still answers 429 -- only a broken limiter store is
-    tolerated there.
+    polled by load balancers and orchestrators, so failing its limiter closed
+    would pull healthy nodes out of rotation for a dependency the service does
+    not require to be ready. It still counts and still answers 429 -- only a
+    broken limiter store is tolerated there.
     """
 
     async def dependency(request: Request) -> None:
@@ -1346,8 +1264,7 @@ def user_rate_limit(
     """Build the FastAPI dependency that rate-limits one endpoint per ACCOUNT.
 
     Same counter, window, Redis path and in-process fallback as
-    ``public_rate_limit`` -- both go through ``_check_rate_limit`` and
-    ``_consume_counter``, so neither axis can drift into weaker enforcement
+    ``public_rate_limit``, so neither axis can drift into weaker enforcement
     than the other. Only the bucket identity and the key prefix differ: this
     one counts the authenticated user id, under ``user:rl`` so it can never
     collide with the per-IP bucket even when the action name matches.
@@ -1358,9 +1275,7 @@ def user_rate_limit(
     bound one account rotating addresses.
 
     Depends on ``require_auth`` rather than reading ``request.state`` blindly,
-    so the user id is guaranteed resolved before the counter is keyed. It is
-    declared in the signature so FastAPI resolves it in dependency order even
-    though the endpoint body has its own ``Depends(require_auth)``.
+    so the user id is guaranteed resolved before the counter is keyed.
     """
 
     async def dependency(request: Request, _auth: None = Depends(require_auth)) -> None:
@@ -1395,13 +1310,14 @@ def _host_only(authority: str) -> str:
     """Lowercase an authority and drop its port, IPv6 literals included.
 
     ``host``, ``host:port``, ``[::1]:8001`` and a bare ``::1`` all reduce to
-    their host. A split on the FIRST colon would turn ``[::1]:8001`` into
-    ``[`` and let any bracketed address match any other, so brackets are peeled
+    their host. A split on the FIRST colon would turn ``[::1]:8001`` into ``[``
+    and let any bracketed address match any other, so brackets are peeled
     before the port. The bare form matters too: ``urlsplit(...).hostname``
     returns an IPv6 address with its brackets already removed, and that value
     is fed straight back through here for the comparison — without this the
     two sides of an IPv6 comparison reduce differently (``::1`` vs ``''``) and
     a legitimate same-origin request is refused.
+
     Port is not part of the comparison because a port is not a security
     boundary for a cookie or for CSRF: the dev stack legitimately serves the
     frontend on :3000 and the API on :8001 under one host.
@@ -1439,15 +1355,11 @@ def _request_host(request: Request) -> str | None:
 
     ``X-Forwarded-Host`` is deliberately NOT consulted. It is not one of the
     Fetch spec's forbidden header names, so a page can set it, and the shipped
-    nginx config neither overwrites nor strips it — it arrives verbatim. A
-    host the client chooses cannot be the basis of the CSRF comparison, since
-    the client chooses ``Origin`` too: naming the same value in both would
-    defeat the check completely. ``Host`` is the right basis because
-    ``TrustedHostMiddleware`` already constrains it to this deployment's own
-    allow-list, and a cross-site page cannot pick it — the browser sets it to
-    the victim's own domain. Nothing is lost by ignoring the forwarded
-    variant: every location in ``nginx_locations`` (setup.sh) now sets
-    ``proxy_set_header Host $host``, so the backend sees the public host.
+    nginx config neither overwrites nor strips it. A host the client chooses
+    cannot be the basis of the CSRF comparison, since the client chooses
+    ``Origin`` too. ``Host`` is the right basis because ``TrustedHostMiddleware``
+    already constrains it to this deployment's own allow-list, and a cross-site
+    page cannot pick it — the browser sets it to the victim's own domain.
     """
     host = request.headers.get("host")
     return host.strip() if host and host.strip() else None
@@ -1466,23 +1378,18 @@ async def enforce_same_origin(request: Request) -> None:
     are not redundant with one another — neither covers the other's gap:
 
     - ``Sec-Fetch-Site: cross-site`` is set by the browser and cannot be set
-      by script, so on its own it is decisive for every current browser: the
-      browser sends it on any cross-site unsafe request, whatever the page's
-      origin. It says nothing at all about a client that omits it (curl, an
-      eval script, a non-browser agent, a pre-2021 browser), and that is the
-      gap the second signal closes. It is checked first because it needs no
-      host comparison and stays correct behind any proxy.
+      by script, so on its own it is decisive for every current browser. It says
+      nothing about a client that omits it (curl, an eval script, a non-browser
+      agent), and that is the gap the second signal closes. It is checked first
+      because it needs no host comparison and stays correct behind any proxy.
     - ``Origin`` is compared against the request's own ``Host``. This is a
-      self-consistency check, not an allow-list, and it is the signal that
-      still stands when ``Sec-Fetch-Site`` is absent or has been tampered
-      with: a foreign ``Origin`` is refused on its own. In turn it catches
-      nothing when the client omits ``Origin`` as well, and it is only as
-      trustworthy as the ``Host`` it is compared to — which is why
-      ``_request_host`` refuses to let a client-settable
-      ``X-Forwarded-Host`` pick that answer. Hosts are compared with ports
-      stripped because the app sits behind TLS termination and cannot trust
-      ``request.url.scheme``, and because the dev stack serves :3000 and
-      :8001 under one host.
+      self-consistency check, not an allow-list, and it is the signal that still
+      stands when ``Sec-Fetch-Site`` is absent or has been tampered with. In
+      turn it catches nothing when the client omits ``Origin`` as well, and it is
+      only as trustworthy as the ``Host`` it is compared to — which is why
+      ``_request_host`` refuses to let a client-settable ``X-Forwarded-Host``
+      pick that answer. Hosts are compared with ports stripped because the app
+      sits behind TLS termination and cannot trust ``request.url.scheme``.
 
     ``CORS_ORIGINS`` is deliberately NOT used here: it is a localhost-only dev
     default that does not contain the production host, so an allow-list built
@@ -1491,20 +1398,16 @@ async def enforce_same_origin(request: Request) -> None:
     The honest limitation: a request with NEITHER header is allowed through.
     Every browser sends both on an unsafe method, so their absence means a
     non-browser client (curl, an eval script) which has no ambient cookie to
-    ride in the first place. This is therefore not fail-closed — a
-    hypothetical client able to suppress both headers while still holding the
-    cookie would pass — but the browser is the only thing that attaches
-    cookies unasked, and demanding these headers outright would break every
-    non-browser caller for no added protection.
+    ride in the first place. This is therefore not fail-closed — but the
+    browser is the only thing that attaches cookies unasked, and demanding
+    these headers outright would break every non-browser caller for no added
+    protection.
 
     Scope: applied to every cookie-authenticated request via ``require_auth``
     and to ``POST /api/auth/login``. The routes with neither ``require_auth``
-    nor a direct ``enforce_same_origin`` are: the public ``GET /search`` and
-    ``GET /facets``; the health probes ``/health``, ``/live``, ``/ready`` and
-    ``/readyz``; and the two public unsafe routes ``POST /analytics/click``
-    and ``POST /api/auth/signup``. Every other route — including
-    ``POST /recommend/interaction`` and the whole ``/api/chat`` router —
-    carries ``require_auth`` and is therefore guarded. The unguarded ones
+    nor a direct ``enforce_same_origin`` are the public ``GET /search`` and
+    ``GET /facets``, the health probes, and the two public unsafe routes
+    ``POST /analytics/click`` and ``POST /api/auth/signup``. The unguarded ones
     are all either safe methods, which the guard ignores anyway, or
     unauthenticated endpoints that have no session to ride.
     """
@@ -1640,8 +1543,7 @@ async def require_auth(request: Request) -> None:
             return
         # Debug, not warning: this sits on an unauthenticated, attacker-
         # controlled path, so at warning level any anonymous request with a
-        # junk header writes a log line -- a log-flood amplifier, and a steady
-        # stream of noise from a machine client that has outlived its token.
+        # junk header writes a log line -- a log-flood amplifier.
         logger.debug("auth: a presented service token did not resolve")
     token = _token_from_request(request)
     if token is None:
@@ -1688,14 +1590,13 @@ async def signup(body: SignupIn, request: Request):
     this endpoint to learn which addresses have accounts here. It therefore
     sets no cookie: a session present only for fresh addresses would be the
     oracle all over again, and minting one for an existing account would hand
-    an anonymous caller someone else's session. Callers follow up with
-    ``POST /api/auth/login``.
+    an anonymous caller someone else's session.
 
     The role is hardcoded to 'user': public signups always land with the least
     privilege. There is deliberately no configuration knob here — a role that
     can be flipped by an env var (or a request field) turns a config mistake
-    into a full account compromise. Privilege is granted only by an
-    authenticated admin via PATCH /api/auth/users/{id}."""
+    into a full account compromise.
+    """
     await _check_rate_limit(request, "signup", config.AUTH_SIGNUP_RATE_PER_MIN)
     email = validate_email(body.email)
     password = validate_password(body.password)
@@ -1704,19 +1605,17 @@ async def signup(body: SignupIn, request: Request):
     # No pre-flight "does this address exist" lookup: create_user hashes the
     # password and attempts the INSERT either way, so a duplicate costs the
     # same wall-clock time as a fresh registration. A pre-check would skip
-    # that bcrypt work and leak existence through timing, exactly as login
-    # did. The users.email UNIQUE constraint is the single source of truth.
+    # that bcrypt work and leak existence through timing. The users.email
+    # UNIQUE constraint is the single source of truth.
     try:
         await s.create_user(email, password, name, role=SIGNUP_ROLE)
     except DuplicateEmailError:
         # Already registered (including losing a concurrent-creation race).
         # Swallow it into the same success-shaped answer a fresh address gets
-        # and leave the stored row untouched: no re-hash, no rename, no
-        # re-activation, no duplicate, no session.
+        # and leave the stored row untouched.
         logger.info("signup for an already-registered address: reported as accepted")
     # No cookie is set here on purpose (see the docstring): minting a session
-    # on signup is what the anti-enumeration rule forbids. Login-CSRF is
-    # covered by running the same-origin guard on /login instead.
+    # on signup is what the anti-enumeration rule forbids.
     return SignupOut(message=SIGNUP_ACCEPTED_MESSAGE)
 
 
@@ -1742,8 +1641,7 @@ async def login(
     the identical full bcrypt verify cost, because the unknown-address path
     verifies the supplied password against a fixed dummy hash at the same
     cost factor instead of skipping the check. A deactivated account is
-    verified the same way, so it is not distinguishable either.
-    The per-account rate limit is held to the same rule: it is keyed on the
+    verified the same way. The per-account rate limit is keyed on the
     submitted address alone, so a registered and an unregistered address reach
     the same counter, the same 429 and the same amount of work.
 
@@ -1752,33 +1650,19 @@ async def login(
     gating on the counter first, made the throttle an account-lockout weapon:
     twenty anonymous wrong-password requests against a known address, from
     twenty source addresses, would lock the real owner out of their own
-    account indefinitely without ever guessing a password -- an unauthenticated
-    DoS aimed at anyone whose address the attacker already had. A correct
-    password must never be rate-limited, so it never touches the counter.
-
-    WHAT THIS COUNTER IS AND IS NOT. It bounds the RATE of attempts directed at
-    one account, and gives a per-account signal that a per-IP limit cannot:
-    twenty addresses all failing against the same victim is visible here and
-    invisible per-IP. It does NOT bound an attacker's COST. Because the check
-    runs after the bcrypt verify, being refused is free -- the verify has
-    already been paid. Measured, an over-budget request costs within ~1% of an
-    under-budget one, so the attacker gains nothing from tripping the limit.
-
-    The per-IP limiter is the control that bounds attacker cost. Anything that
-    wants to make this counter do that job has to consult it BEFORE the
-    verify, and that is precisely the change already made and rejected: it
-    reinstates the account-lockout primitive, and it reinstates the existence
-    timing oracle, because a cheap 429 for a known address and an expensive
-    verify for an unknown one is a perfect enumeration signal. The counter is
-    deliberately second-line.
-
+    account indefinitely without ever guessing a password. A correct password
+    must never be rate-limited, so it never touches the counter.
+    WHAT THIS COUNTER IS AND IS NOT: it bounds the RATE of attempts directed
+    at one account, which the per-IP limit cannot see. It does NOT bound an
+    attacker's COST, because being refused is free -- the bcrypt verify has
+    already been paid. The per-IP limiter bounds attacker cost, and anything
+    that makes this counter do that job has to consult it BEFORE the verify,
+    which would reinstate both the account-lockout primitive and the existence
+    timing oracle.
     A successful login also REWRITES the stored hash if it predates the
-    pre-image scheme (#387). That is a write on the read-looking path, and it
-    is deliberate: the plaintext exists in this request and nowhere else, so
-    this is the only moment a pre-migration credential can be re-expressed
-    without the account owner doing anything but logging in as they already do.
-    It never revokes anything -- the credential is unchanged, only how it is
-    stored -- and it can never fail the login (see ``_upgrade_password_hash``).
+    pre-image scheme. That is deliberate: the plaintext exists in this request
+    and nowhere else, so this is the only moment a pre-migration credential can
+    be re-expressed. It never revokes anything and can never fail the login.
     """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
@@ -1793,25 +1677,21 @@ async def login(
         user.password_hash if user is not None else _DUMMY_PASSWORD_HASH,
     )
     if password_ok and user is not None and user.is_active:
-        # A real user with a real password is never counted, never gated, and
-        # never rate-limited. Only failures consume the account's budget.
+        # A real user with a real password is never counted or rate-limited.
         if needs_rehash(user.password_hash):
             # Opportunistic migration. The plaintext exists only in this
-            # request, and this is the one moment the pre-migration hash can be
-            # re-expressed in the current scheme -- so the migration completes
-            # without a bulk reset, an operator action, or the account owner
-            # doing anything but logging in as they already do.
+            # request, so this is the one moment the pre-migration hash can be
+            # re-expressed in the current scheme.
             await _upgrade_password_hash(s, user, body.password)
         token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
-        # The session is delivered ONLY as the HttpOnly cookie. It is never put
-        # in the response body, so there is nothing for script on the page --
-        # including script injected by an XSS -- to read and exfiltrate.
+        # The session is delivered ONLY as the HttpOnly cookie: nothing in the
+        # body for script on the page to read and exfiltrate.
         _set_session_cookie(response, token)
         return AuthOut(user=UserOut.from_user(user))
 
     # Failed. Count it against the address, keyed on the submitted string alone
     # (no lookup feeds this), so a registered and an unregistered address are
-    # indistinguishable here too. Raises 429 past the limit.
+    # indistinguishable here too.
     await _check_account_rate_limit(
         request, "login", config.AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN, email
     )
@@ -1822,15 +1702,12 @@ async def _upgrade_password_hash(s: AuthStore, user: StoredUser, password: str) 
     """Re-store ``user``'s just-verified password in the current scheme.
 
     Only ever called after ``verify_password`` accepted ``password`` against
-    ``user.password_hash``, so the credential cannot change meaning here: the
-    owner keeps logging in with the same value and every token already issued
-    stays valid. Nothing is revoked, because this rewrites how one secret is
-    stored, not which secret it is -- the opposite of ``change_password``, which
-    is why that path is deliberately not reused.
+    ``user.password_hash``, so the credential cannot change meaning here:
+    nothing is revoked, because this rewrites how one secret is stored, not
+    which secret it is -- the opposite of ``change_password``.
 
     Never raises. A failure here is logged and dropped: the row is untouched
-    and its pre-migration hash still authenticates, so the user is logged in,
-    the upgrade is retried on their next login, and a housekeeping write can
+    and its pre-migration hash still authenticates, so a housekeeping write can
     never turn into an authentication outage. The user id is logged rather than
     the address so this line cannot be read back as a record of who has
     successfully authenticated.
@@ -1860,13 +1737,10 @@ async def logout(request: Request, response: Response, _: None = Depends(require
     """Revoke the credential this request authenticated with, and expire the cookie.
 
     For a service token that revocation is real: the token is marked revoked,
-    so it stops working immediately. It used to be a no-op here -- logout only
-    ever looked at a bearer token, so a machine credential answered ``ok`` and
-    then went on working for as long as the process did.
-
-    For a user session the token is read from the cookie, which is the only
-    place it can now be: re-parsing a header here would leave the stored token
-    live and turn logout into a silent no-op that still answers ``{"ok": true}``.
+    so it stops working immediately. For a user session the token is read from
+    the cookie, which is the only place it can now be: re-parsing a header here
+    would leave the stored token live and turn logout into a silent no-op that
+    still answers ``{"ok": true}``.
     """
     service = getattr(request.state, "service_token", None)
     if service is not None:
@@ -1912,9 +1786,9 @@ async def change_password(
     new_hash = await asyncio.to_thread(hash_password, new_password)
     # ONE transaction for the hash write, the revocation and the replacement
     # token. Do not split this back into set_password / revoke_all_tokens /
-    # issue_token: that is the three-transaction shape #285 closed, and it
-    # leaves a durable new password valid alongside still-authenticating
-    # pre-existing tokens whenever the worker dies between them.
+    # issue_token: that leaves a durable new password valid alongside
+    # still-authenticating pre-existing tokens whenever the worker dies between
+    # them.
     token = await s.change_password(user.id, new_hash, config.AUTH_TOKEN_TTL_DAYS)
     # Revocation above killed every token this user held, including the one in
     # the cookie, so the cookie has to be re-issued with the new token or the
@@ -2049,10 +1923,8 @@ async def revoke_service_tokens(
     The value in ``AUTH_SERVICE_TOKEN`` is handled specially in both forms. It
     is the one credential whose seeding is lazy, so before it has ever been
     presented there is no row to UPDATE and a plain revoke would report 0 while
-    leaving it live -- the next request would seed it with a fresh full
-    lifetime. Revoking it writes a revoked tombstone instead, so "kill this
-    now" works from a cold start, which is exactly the case an operator
-    containing a leak needs.
+    leaving it live. Revoking it writes a revoked tombstone instead, so "kill
+    this now" works from a cold start.
     """
     s = _require_auth_store()
     configured = config.AUTH_SERVICE_TOKEN or ""
@@ -2074,18 +1946,14 @@ async def report_legacy_password_hashes() -> int | None:
     The migration is completed by each account owner logging in, and nothing
     here can finish it for them: a hash that means "the first 72 bytes" can
     only become a pre-image hash by someone supplying the plaintext. What the
-    operator can do is SEE whether it is draining, which is the difference
-    between "three dormant accounts still authenticate on a 72-byte prefix" and
-    "the migration completed on day one".
+    operator can do is SEE whether it is draining.
 
     There is deliberately no force option alongside this. Revoking a
     pre-migration hash is the only way to finish one without the plaintext, and
     this codebase has no password-reset path to revoke one with: a force switch
     would not migrate anything, it would permanently lock out every account
-    that has not logged in since the upgrade, including on a fresh deploy an
-    operator has flipped the switch on to be thorough. Reporting the remainder
-    costs nothing and locks nobody out; a forced cutoff would have to wait for
-    a reset flow to exist (#387).
+    that has not logged in since the upgrade. Reporting the remainder costs
+    nothing and locks nobody out.
 
     Never raises and never blocks startup. A count that fails is not worth
     failing a boot over, and the next restart tries again.
@@ -2142,18 +2010,16 @@ async def bootstrap_admin() -> None:
     #
     # The rejection is a permanent, config-level fault: retrying it five times
     # inside the write-lock loop below would re-log the identical error five
-    # times and change nothing, so it returns before reaching that loop. The loop
-    # still retries genuine transient faults (SQLite write locks) as before.
-    # The password is validated first, and unconditionally, so that the advice
-    # given for an EMAIL fault can still say whether the account sitting behind
-    # it is on a weak password. A deploy that ran pre-validator main can have
-    # both faults at once, and reporting only the address would hide a live
-    # 1-character admin password.
+    # times and change nothing, so it returns before reaching that loop. The
+    # loop still retries genuine transient faults (SQLite write locks) as before.
+    # The password is validated first, and unconditionally, so the advice given
+    # for an EMAIL fault can still say whether the account behind it is on a
+    # weak password: reporting only the address would hide a live 1-character
+    # admin password.
     #
     # Length is judged on the whole configured value, and so is everything else
-    # about it: hash_password hands bcrypt a fixed-width pre-image, so every
-    # byte of this passphrase becomes part of the credential and none of it is
-    # dropped. See _password_rejection for why there is still no maximum.
+    # about it: hash_password hands bcrypt a fixed-width pre-image, so no byte
+    # of this passphrase is dropped.
     password_error = _password_rejection(password)
 
     email_error = _validator_rejection(validate_email, email)
@@ -2230,17 +2096,14 @@ async def _reject_bootstrap(
             # password must actually be the configured one (proving this account
             # was provisioned from the bad config), AND the password must itself
             # have failed validation. Requiring both means an email fault on a
-            # healthy admin never nags, while a pre-validator deploy carrying
-            # both faults is still told to rotate -- a live 1-character admin
-            # password is exactly what an operator must hear about.
+            # healthy admin never nags.
             if password_rejected and verify_password(
                 config.AUTH_ADMIN_PASSWORD or "", existing.password_hash
             ):
                 # The remedy here is a PASSWORD rotation, so the hint must be the
                 # password one. Passing through `hint` unchanged would pair
-                # "Rotate that account's password" with an email remedy
-                # ("set it to a valid address") on the email axis, sending the
-                # operator to fix the wrong variable.
+                # "Rotate that account's password" with an email remedy, sending
+                # the operator to fix the wrong variable.
                 logger.error(
                     "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
                     "No account was created, and the pre-existing admin account (id %s) -- whose "

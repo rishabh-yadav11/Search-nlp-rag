@@ -1,30 +1,13 @@
 """`setup.sh services` and `ecosystem.config.js` must define the same pm2 processes.
 
-Both paths can start the API and they describe the same two pm2 apps, but the
-mechanism by which they could drift changed. `./setup.sh services` no longer
-re-registers the process from an inline `pm2 start` line: pm2's CLI has no
-`--min-uptime` flag in any released version, so it starts from
-`ecosystem.config.js` and EXPORTS the knobs to it. A hand-run
-`pm2 start ecosystem.config.js` instead gets whatever the ecosystem file falls
-back to.
-
-The two definitions are therefore still independent -- setup.sh's
-`${VAR:-default}` declarations versus the ecosystem file's own fallbacks -- and
-they can still drift, in two ways that matter:
-
-* a process option the ecosystem file declares that no exported knob drives, so
-  `./setup.sh services` cannot influence it and a hand-run start applies a
-  value nobody chose;
-* a knob whose default in `setup.sh` differs from the fallback in
-  `ecosystem.config.js`, so the two startup paths produce differently-shaped
-  processes on the same host.
-
-Both are compared here, option by option, and the option set is read from
-`ecosystem.config.js` itself rather than from a hardcoded list, so an option
-added there later is covered automatically. An earlier version of this file
-enumerated only the three options that existed when it was written, which meant
-adding a fourth option to the ecosystem file left the suite green -- the exact
-drift it exists to catch.
+`./setup.sh services` starts pm2 from `ecosystem.config.js` and EXPORTS the knobs
+to it, so both paths describe the same two apps from two independent
+declarations -- setup.sh's `${VAR:-default}` and the file's own fallbacks. They
+can drift in two ways: an option no exported knob drives, so `./setup.sh services`
+cannot influence it and a hand-run start applies a value nobody chose, and a knob
+whose setup.sh default differs from the ecosystem fallback. Both are compared
+option by option, with the option set read from `ecosystem.config.js` itself so an
+option added there later is covered automatically.
 """
 from __future__ import annotations
 
@@ -71,13 +54,11 @@ def _resolve(value: str, defaults: dict[str, str], where: str) -> str:
 
 
 def _setup_sh_exports() -> dict[str, str]:
-    """The env vars `run_services` exports into `pm2 start ecosystem.config.js`.
+    """The env vars `run_services` exports into `pm2 start ecosystem.config.js`,
+    each resolved through setup.sh's own `${VAR:-default}` declaration.
 
-    `{VAR: value}` for every `VAR="$VAR"` on that one invocation, with the value
-    resolved through setup.sh's own `${VAR:-default}` declaration. Scoped to the
-    invocation so an unrelated `VAR="$VAR"` elsewhere in the script cannot be
-    mistaken for a knob the ecosystem file is meant to receive.
-    """
+    Scoped to that one invocation so an unrelated `VAR="$VAR"` elsewhere in
+    setup.sh cannot be mistaken for an exported knob."""
     text = SETUP_SH.read_text()
     start = re.search(
         r'\(\s*cd\s+"\$SCRIPT_DIR"\s*&&(?P<exports>.*?)pm2 start\s+ecosystem\.config\.js',
@@ -113,12 +94,9 @@ def _ecosystem_knobs() -> dict[str, str]:
 def _ecosystem_fallbacks() -> dict[str, str]:
     """{env var: the literal ecosystem.config.js falls back to when it is unset}.
 
-    Only literals are recorded. A fallback that is a path expression
-    (`path.resolve(__dirname)`) has no value to compare against a setup.sh
-    default, and VCCIRCLE_ROOT is the one knob where that is correct: the
-    file's own location IS the answer, which is the whole reason the services
-    are started from the file.
-    """
+    Only literals are recorded: a fallback that is a path expression has no
+    value to compare against a setup.sh default, and for VCCIRCLE_ROOT the file's
+    own location IS the answer."""
     text = ECOSYSTEM_JS.read_text()
     fallbacks: dict[str, str] = {}
     for var, rhs in re.findall(r"process\.env\.(\w+)\s*\|\|\s*([^\n;]+)", text):
@@ -131,16 +109,10 @@ def _ecosystem_fallbacks() -> dict[str, str]:
 def _setup_sh_start_options(app_name: str) -> dict[str, str | None]:
     """The value `./setup.sh services` actually starts `app_name` with.
 
-    setup.sh starts from `ecosystem.config.js`, so an option's value on that
-    path is the one its EXPORTED knob carries, resolved through setup.sh's own
-    `${VAR:-default}` declaration so a `5G` here compares equal to the literal
-    `"5G"` the ecosystem file falls back to. An option no exported knob drives
-    is absent, which is the drift `_missing_options` reports.
-
-    Read from the RAW declaration, not from `_ecosystem_options`: that one
-    resolves each `const` to its fallback, and the NAME of the const is exactly
-    what has to be looked up in the export list.
-    """
+    Resolved through setup.sh's own `${VAR:-default}` declaration, so a `5G` here
+    compares equal to the literal `"5G"` the ecosystem file falls back to. Read
+    from the RAW declaration rather than `_ecosystem_options`, because the NAME of
+    the const is what has to be looked up in the export list."""
     knobs = _ecosystem_knobs()
     exports = _setup_sh_exports()
     options: dict[str, str | None] = {}
@@ -155,10 +127,7 @@ def _ecosystem_declared(app_name: str) -> dict[str, str]:
     """Every non-structural option `ecosystem.config.js` declares, verbatim.
 
     App-level keys sit at six spaces of indentation; nested blocks (`env: {...}`)
-    are indented further and are skipped. Values are unquoted and stripped so
-    that trailing whitespace or an alternate quoting style in the JS file is not
-    mistaken for a real difference.
-    """
+    are indented further and are skipped."""
     block = re.search(
         r'\{\s*\n\s*name:\s*"'
         + re.escape(app_name)
@@ -181,15 +150,12 @@ def _ecosystem_declared(app_name: str) -> dict[str, str]:
 
 
 def _ecosystem_options(app_name: str) -> dict[str, str]:
-    """`_ecosystem_declared`, with each knob resolved to the value it falls back to.
+    """`_ecosystem_declared`, with each knob resolved to its FALLBACK -- the value a
+    hand-run `pm2 start ecosystem.config.js` gets when the knob is unset.
 
-    An option declared as a `const` resolves to that const's FALLBACK, i.e. the
-    value a hand-run `pm2 start ecosystem.config.js` gets when the knob is unset.
-    That is the value this guard compares against setup.sh's own default, so a
-    `const` is never compared as the name of a variable. A const with no literal
-    fallback (VCCIRCLE_ROOT, whose fallback is the file's own location) is left
-    as the name, so it cannot be silently compared equal to an unrelated value.
-    """
+    A const with no literal fallback (VCCIRCLE_ROOT, whose fallback is the file's
+    own location) is left as the name, so it cannot be silently compared equal to
+    an unrelated value."""
     knobs = _ecosystem_knobs()
     fallbacks = _ecosystem_fallbacks()
     resolved: dict[str, str] = {}
@@ -201,7 +167,6 @@ def _ecosystem_options(app_name: str) -> dict[str, str]:
 def _missing_options(
     declared: dict[str, str], passed: dict[str, str | None]
 ) -> list[str]:
-    """Options `ecosystem.config.js` declares that setup.sh does not pass."""
     return sorted(set(declared) - set(passed))
 
 
@@ -210,9 +175,7 @@ def _mismatched_values(
 ) -> dict[str, tuple[str, str | None]]:
     """Declared options setup.sh passes, but with a different value.
 
-    A valueless flag (value None on the setup.sh side) is not a mismatch: it
-    carries no value to disagree about, so presence alone is the check.
-    """
+    A valueless flag is not a mismatch: it carries no value to disagree about."""
     return {
         flag: (declared[flag], passed[flag])
         for flag in declared
@@ -226,14 +189,9 @@ def test_every_ecosystem_process_option_is_driven_by_a_knob_setup_sh_exports(
 ) -> None:
     """Every process option must be reachable from `./setup.sh services`.
 
-    An option the ecosystem file declares that no exported knob drives is one
-    `./setup.sh services` cannot influence, while a hand-run
-    `pm2 start ecosystem.config.js` applies with whatever the file's fallback
-    says. That is the same silent divergence this guard has always existed for,
-    in the mechanism the startup path actually uses: a knob an operator sets and
-    setup.sh exports is accepted and then ignored, which is worse than not
-    offering it at all.
-    """
+    An option no exported knob drives is one that path cannot influence, while a
+    hand-run start applies the file's fallback -- so an operator's override is
+    accepted and then ignored, which is worse than not offering it at all."""
     declared = _ecosystem_options(app_name)
     assert declared, f"no process options parsed for {app_name} in ecosystem.config.js"
 
@@ -252,11 +210,7 @@ def test_setup_sh_process_options_match_ecosystem_values(app_name: str) -> None:
     """The option values must be equal, not merely both present.
 
     Comparing values is what makes this a real guard rather than a key-name
-    grep: a renamed knob does not fail, but a drifted limit does. setup.sh's
-    `${VAR:-default}` and the ecosystem file's own fallback are two independent
-    declarations of the same default, and a hand-run ecosystem start is exactly
-    where the mismatch would show up.
-    """
+    grep: a renamed knob does not fail, but a drifted limit does."""
     declared = _ecosystem_options(app_name)
     passed = _setup_sh_start_options(app_name)
 
@@ -336,12 +290,9 @@ def test_agreeing_options_are_not_reported_as_drift(
 def test_a_knob_declared_but_not_exported_is_still_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An option no exported knob drives is reported, not skipped.
-
-    setup.sh would start the app with the ecosystem file's fallback while
-    believing it had applied its own value, and an operator's override would be
-    accepted and discarded.
-    """
+    """An option no exported knob drives is reported, not skipped: setup.sh would
+    start the app with the ecosystem file's fallback while believing it had
+    applied its own value, so an operator's override is accepted and discarded."""
     _write_deploy_files(
         tmp_path, monkeypatch, defaults=_DEFAULTS, exports="", declared=_DECLARED
     )
@@ -354,11 +305,9 @@ def test_a_knob_declared_but_not_exported_is_still_drift(
 def test_a_default_that_drifted_is_reported_with_both_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stale default must fail as loudly as a missing option.
-
-    The option is present on both sides and only the numbers disagree, which is
-    exactly the drift a presence-only check would pass.
-    """
+    """A stale default must fail as loudly as a missing option: the option is
+    present on both sides and only the numbers disagree, which is exactly the
+    drift a presence-only check would pass."""
     _write_deploy_files(
         tmp_path,
         monkeypatch,
@@ -377,13 +326,10 @@ def test_a_default_that_drifted_is_reported_with_both_values(
 def test_both_startup_paths_bind_the_api_to_loopback() -> None:
     """The API must be bound to loopback, and nginx must be the only way in.
 
-    `./setup.sh services` and a hand-run `pm2 start ecosystem.config.js` are
-    the two ways to start the API, and they now read the SAME line in
-    `ecosystem.config.js`, so a wildcard bind cannot survive in one of them --
-    but it can survive in the file itself, which is what this asserts. The port
-    is resolved through the knob's fallback so a `${API_PORT}` template is
-    compared to setup.sh's own `API_PORT` default rather than string-matched.
-    """
+    Both startup paths now read the SAME line in `ecosystem.config.js`, so what
+    this asserts is a wildcard bind surviving in the file itself. The port is
+    resolved through the knob's fallback, so a `${API_PORT}` template is compared
+    to setup.sh's own `API_PORT` default rather than string-matched."""
     defaults = _setup_sh_defaults()
     ecosystem_bind = re.search(
         r"--bind\s+([0-9.]+|\$\{\w+\}):(\$\{\w+\}|\d+)", ECOSYSTEM_JS.read_text()
@@ -403,9 +349,7 @@ def test_both_startup_paths_bind_the_api_to_loopback() -> None:
         "is listening on"
     )
 
-    # The bind is only safe because nginx proxies over loopback to that same
-    # port; asserting it here is what stops the loopback bind from becoming the
-    # reason the site is unreachable.
+    # The bind is only safe because nginx proxies over loopback to that same port.
     proxies = re.findall(
         r"proxy_pass\s+http://([0-9.]+|\$\w+):\$\{?API_PORT\}?;", SETUP_SH.read_text()
     )
@@ -424,15 +368,10 @@ FRONTEND_PKG_JSON = REPO_ROOT / "frontend" / "package.json"
 def _ecosystem_frontend_argv() -> list[str]:
     """The argv `next start` is given, from the pm2 app definition.
 
-    `./setup.sh services` and a hand-run `pm2 start ecosystem.config.js` both
-    start the frontend from this one `args` string, so there is a single
-    definition to assert on and a second path (the `npm start` script) to
-    compare it against.
-
-    Every token is returned, not just the subcommand: the host is carried by a
-    `-H` flag later in the argv, so dropping the tail would make the caller read
-    an absent flag as Next's wildcard default.
-    """
+    Both startup paths read this one `args` string, so it is the single definition
+    to assert on and the `npm start` script the second path to compare against.
+    Every token is returned: the host is carried by a `-H` flag later in the argv,
+    so dropping the tail would read an absent flag as Next's wildcard default."""
     # `args` is a template literal in the ecosystem file (it interpolates
     # ${NEXT_PORT}), so the quoting is matched rather than assumed: a `"`-only
     # pattern silently finds nothing there, which reads as "declares no args".
@@ -447,10 +386,8 @@ def _ecosystem_frontend_argv() -> list[str]:
 def _next_start_flag(tokens: list[str], flag: str, default: str) -> str:
     """The value of `-H`/`--hostname` or `-p`/`--port`, or `default` if absent.
 
-    A `$VAR` value is resolved through setup.sh's own `${VAR:-default}`
-    declaration, so a correct config that factors the address out into a
-    variable is recognised rather than reported as a regression.
-    """
+    A `$VAR` value is resolved through setup.sh's own default, so a correct config
+    that factors the address out into a variable is not a regression."""
     for name in (flag, {"-H": "--hostname", "-p": "--port"}[flag]):
         if name in tokens:
             return _resolve(tokens[tokens.index(name) + 1], _setup_sh_defaults(), flag)
@@ -458,28 +395,20 @@ def _next_start_flag(tokens: list[str], flag: str, default: str) -> str:
 
 
 def _next_start_host(tokens: list[str]) -> str:
-    """The address `next start` binds.
-
-    `next start` binds all interfaces when no hostname is given, so an absent
-    flag is the wildcard bind this issue is about, not an unspecified value.
-    """
+    """The address `next start` binds: all interfaces when no hostname is given, so
+    an absent flag is the wildcard bind, not an unspecified value."""
     return _next_start_flag(tokens, "-H", "0.0.0.0")
 
 
 def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
     """`next start` must be told 127.0.0.1 in every path that starts the frontend.
 
-    The frontend is a production service behind nginx, so listening on the
-    wildcard publishes the app shell, `/login`, `/signup` and `middleware.ts`
-    on every interface of the host, bypassing TLS termination, the header and
-    request-size limits, rate limiting and access logging. Next.js binds
-    0.0.0.0 by default, so this is only true when the flag is actually passed.
+    The frontend is a production service behind nginx, so a wildcard bind
+    publishes the app shell, `/login`, `/signup` and `middleware.ts` on every
+    interface, bypassing TLS termination, rate limiting and access logging.
 
-    There are two such paths and each one is effective on its own: the pm2 app
-    definition in `ecosystem.config.js` (which is what `./setup.sh services`
-    starts from as well as what an operator starts by hand), and the `npm start`
-    script a manual deploy runs.
-    """
+    Two such paths are effective on their own: the pm2 app definition in
+    `ecosystem.config.js`, and the `npm start` script a manual deploy runs."""
     tokens = _ecosystem_frontend_argv()
     host = _next_start_host(tokens)
     assert host == "127.0.0.1", (
@@ -489,9 +418,8 @@ def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
     )
 
     # A loopback bind on the wrong port is as broken as a wildcard bind on the
-    # right one: nginx proxies to $NEXT_PORT, so a frontend on any other port is
-    # unreachable through the site. `args` is a structural key, so the option
-    # drift guard never sees it and this is the only check on the port.
+    # right one. `args` is a structural key, so the drift guard never sees the
+    # port and this is the only check on it.
     defaults = _setup_sh_defaults()
     port = _next_start_flag(tokens, "-p", "3000")
     assert port == defaults["NEXT_PORT"], (
@@ -512,12 +440,9 @@ def test_both_startup_paths_bind_the_frontend_to_loopback() -> None:
 
 
 def test_nginx_proxies_the_frontend_over_loopback() -> None:
-    """The loopback bind is only safe because nginx already proxies to it.
-
-    Binding Next.js to 127.0.0.1 while nginx proxies anywhere else takes the
-    site down, so the precondition the bind change depends on is asserted here
-    rather than left to whoever next edits the nginx template.
-    """
+    """The loopback bind is only safe because nginx already proxies to it: binding
+    Next.js to 127.0.0.1 while nginx proxies elsewhere takes the site down, so the
+    precondition the bind depends on is asserted here."""
     template = SETUP_SH.read_text()
     proxy_hosts = re.findall(r"proxy_pass\s+http://([0-9.]+|\$\w+):\$\{?(NEXT_PORT)\}?;", template)
     assert proxy_hosts, "the nginx template has no proxy_pass to the frontend port"

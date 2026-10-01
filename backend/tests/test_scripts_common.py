@@ -1,9 +1,8 @@
 """The shared ops-script helpers: one payload builder, one pool factory.
 
-These tests pin the exact payload produced by ``_common.make_point``. That is
-the regression this file exists for: the payload used to be built by three
-separate copies (one per write path), so a key could be silently dropped from
-one path and not another without any test noticing. Asserting the full dict
+These tests pin the exact payload produced by ``_common.make_point``. The
+payload used to be built by three separate copies (one per write path), so a key
+could be silently dropped from one path and not another. Asserting the full dict
 rather than a subset means a dropped or added key now fails loudly, and the
 expected dict in the test is the single source of truth for the key set.
 """
@@ -104,13 +103,11 @@ def test_make_point_normalises_missing_optional_fields():
 def test_content_type_is_in_the_payload():
     """The record carries content_type and so must the stored payload.
 
-    This assertion used to be the reverse — it pinned the key as absent, which
-    was precisely what kept the content_type feature dead end to end: the read
-    path (``main._PAYLOAD_FIELDS`` -> ``SourceArticle.content_type``) and the
-    facet vocabulary both read a field that no write path ever stored. Now that
-    ``make_point`` stores it, this test is the guard that a future refactor
-    cannot silently drop the key again: removing it from the payload fails here
-    and in the exact-dict test above.
+    This assertion used to pin the key as absent, which is what kept the
+    content_type feature dead end to end: the read path
+    (``main._PAYLOAD_FIELDS`` -> ``SourceArticle.content_type``) and the facet
+    vocabulary both read a field no write path ever stored. Now it is the guard
+    that a future refactor cannot silently drop the key again.
     """
     assert "content_type" in _record()  # record_from_row does supply it
 
@@ -147,9 +144,9 @@ def test_payload_keys_cover_what_the_read_path_requests():
     """Every field the search read path asks Qdrant for is one we actually store.
 
     hybrid_search passes _PAYLOAD_FIELDS as `with_payload`, so a field listed
-    there but never written is exactly the dead end this issue is about:
+    there but never written is a read path that always yields the default --
     `content_type` was requested on every read and produced by no write path.
-    This asserts the two sides agree, in both directions, so the next field
+    Asserting the two sides agree, in both directions, means the next field
     added to one without the other fails here.
     """
     from app import main

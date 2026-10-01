@@ -1,20 +1,19 @@
 """
 Helpers shared by the index scripts (fetch/build/update) and the API.
 
-* compose_dense_text(): input for the DENSE embedder. Title + facets
-  (authors, industry, dealtype, tags) + summary — metadata first so the facet
-  values survive the embedder's 512-token truncation. NO body: the dense
-  transformer is token-bound, so keeping this short keeps builds fast, and
-  semantic matching keys on the headline + facets + summary.
-* compose_sparse_text(): input for the SPARSE (BM25/lexical) embedder. The same
+* compose_dense_text(): DENSE embedder input. Title + facets (authors,
+  industry, dealtype, tags) + summary -- metadata first so facet values
+  survive the embedder's 512-token truncation. NO body: the dense transformer
+  is token-bound, and matching keys on headline + facets + summary.
+* compose_sparse_text(): SPARSE (BM25/lexical) embedder input. The same
   metadata lead (so a tag is a lexical term too) + summary + FULL body, so
-  keyword matches inside the article body stay searchable at cheap lexical cost.
-* split_names(): normalizes the comma/delimiter-separated *_names columns into
-  a clean, de-duplicated list (used for the payload facet fields).
-* normalize_date(): converts MySQL datetime values into RFC 3339 so Qdrant's
-  DATETIME payload index, range filters and recency blending all parse them.
+  in-body keyword matches stay searchable at cheap lexical cost.
+* split_names(): normalizes the delimiter-separated *_names columns into a
+  de-duplicated list (used for the payload facet fields).
+* normalize_date(): MySQL datetime -> RFC 3339, which Qdrant's DATETIME index,
+  range filters and recency blending all parse.
 * record_from_row(): builds the canonical indexed record from a MySQL row, so
-  fetch_data.py and update_index.py build identical payloads.
+  the index scripts build identical payloads.
 """
 import html
 import json
@@ -100,9 +99,8 @@ def record_from_row(row: dict) -> dict:
         "author_names": split_names(row["author_names"]),
         "industry_names": split_names(row["industry_names"]),
         "dealtype_names": split_names(row["dealtype_names"]),
-        # row.get(), not row[...]: backfill_body.py and backfill_missing.py
-        # reuse this builder with a narrower SELECT that has no tag_names
-        # column, and a KeyError there would fail an unrelated payload repair.
+        # row.get(), not row[...]: backfill_body.py and backfill_missing.py reuse
+        # this builder with a narrower SELECT lacking tag_names.
         "tag_names": split_names(row.get("tag_names")),
     }
 
@@ -111,24 +109,18 @@ def normalize_date(value):
     """MySQL datetime -> RFC 3339 string (or None), safe for Qdrant/parsing.
 
     The MySQL `publish` column is a naive wall-clock value in the database's
-    local timezone (no offset is stored). We deliberately do NOT attach a
-    hardcoded UTC offset here: assuming UTC would shift every date/year filter
-    by the DB's tz offset (e.g. +5:30 for IST) versus what users expect.
-
-    Naive datetimes are kept naive. Qdrant interprets a tz-less RFC 3339
-    timestamp as UTC, which matches how the filter side (`_parse_date` in
-    main.py) treats naive user input, so stored values and range filters
-    compare on a consistent wall-clock basis. If a configured timezone ever
-    becomes available, attach that tz here instead of assuming UTC.
+    local timezone. No offset is attached on purpose: assuming UTC would shift
+    every date/year filter by the DB's offset. Qdrant reads a tz-less RFC 3339
+    timestamp as UTC, which matches how the filter side (``_parse_date`` in
+    main.py) treats naive user input, so both compare on the same wall clock.
     """
     if value is None:
         return None
     if isinstance(value, datetime):
         dt = value
-        # Normalize any tz-aware input to UTC (keeping the +00:00 suffix) so the
-        # stored string is consistent for the tiebreaker in main.py, which strips
-        # the +00:00/Z suffix. Naive inputs (local wall-clock from MySQL) are left
-        # untouched — attaching a UTC offset here would shift every date filter.
+        # Tz-aware input goes to UTC, keeping the +00:00 suffix main.py's
+        # tiebreaker strips. Naive input is left alone -- attaching an offset
+        # would shift every date filter.
         if dt.tzinfo is not None:
             dt = dt.astimezone(UTC)
     else:

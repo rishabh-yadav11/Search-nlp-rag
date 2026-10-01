@@ -15,8 +15,6 @@
   --card-bg: #fafafa;
   --card-border: #ededed;
   --sans: var(--font-montserrat), 'Montserrat', 'IBM Plex Sans', -apple-system, sans-serif;
-  /* Shared top bar height. The chat layout is sized against it so the
-     composer is never pushed below the fold by the bar above it. */
   --topbar-h: 68px;
 }
 
@@ -46,8 +44,6 @@ body {
   flex: 1;
   min-height: 100vh;
 }
-
-/* ---- Header: dark navy→black gradient bar with white wordmark, mirroring vccircle.com ---- */
 
 header.topbar {
   background: linear-gradient(90deg, var(--navy) 0%, #000 100%);
@@ -211,8 +207,6 @@ main {
   width: 100%;
 }
 
-/* ---- Search hero ---- */
-
 .search-hero {
   max-width: 860px;
   margin: 0 auto 6px;
@@ -336,8 +330,6 @@ input[type='text']:focus-visible,
   }
 }
 
-/* ---- Suggestions ---- */
-
 .suggestions {
   max-width: 860px;
   margin: 2px auto 26px;
@@ -377,8 +369,6 @@ input[type='text']:focus-visible,
   outline: 2px solid var(--blue);
   outline-offset: 2px;
 }
-
-/* ---- Meta / results header ---- */
 
 .meta-row {
   font-size: 11px;
@@ -422,8 +412,6 @@ input[type='text']:focus-visible,
   color: var(--blue-deep);
   word-break: break-word;
 }
-
-/* ---- Sort / hide-low row ---- */
 
 .sort-row {
   display: flex;
@@ -474,8 +462,6 @@ input[type='text']:focus-visible,
   outline-offset: 2px;
 }
 
-/* ---- Weak-result note ---- */
-
 .weak-note {
   background: #fff7ea;
   border-left: 3px solid var(--orange-from);
@@ -485,8 +471,6 @@ input[type='text']:focus-visible,
   font-size: 13px;
   line-height: 1.5;
 }
-
-/* ---- Answer block ---- */
 
 .answer-block {
   background: white;
@@ -533,11 +517,9 @@ input[type='text']:focus-visible,
   font-weight: 700;
 }
 
-/* Wide markdown tables scroll horizontally within this wrapper instead of
- * stretching the bubble. The table itself stays display:table so
- * border-collapse works; this .markdown-body block is the overflow-x:auto
- * scroll container (replaces the old display:block/overflow-x on the table,
- * which cancelled border-collapse and produced nested scrollbars). */
+/* Wide tables scroll here rather than in the bubble: the table stays
+ * display:table for border-collapse, and overflow-x on the table itself
+ * cancels that and nests scrollbars. */
 .markdown-body {
   overflow-x: auto;
 }
@@ -570,9 +552,6 @@ input[type='text']:focus-visible,
 .markdown-body td {
   font-variant-numeric: tabular-nums;
 }
-
-
-/* ---- Result cards (VCCircle style: title 16-18px #222, meta 12px #484848) ---- */
 
 .result {
   display: flex;
@@ -679,8 +658,6 @@ input[type='text']:focus-visible,
   overflow: hidden;
 }
 
-/* ---- Empty / error / loading / hint ---- */
-
 .empty,
 .error,
 .hint {
@@ -718,8 +695,6 @@ input[type='text']:focus-visible,
     opacity: 1;
   }
 }
-
-/* ---- Filters ---- */
 
 .filters {
   margin: 0 0 22px;
@@ -826,8 +801,6 @@ input[type='text']:focus-visible,
   }
 }
 
-/* ---- Footer ---- */
-
 .site-footer {
   background: #000;
   margin-top: 64px;
@@ -860,8 +833,6 @@ input[type='text']:focus-visible,
   color: rgba(255, 255, 255, 0.7);
 }
 
-/* ---- Chat UI (ChatGPT-style) ---- */
-
 .chat-thread::-webkit-scrollbar,
 .chat-session-list::-webkit-scrollbar {
   width: 0;
@@ -875,11 +846,10 @@ input[type='text']:focus-visible,
   -ms-overflow-style: none;
 }
 
-/* The page is a viewport-locked column: the shared top bar takes its natural
-   height and the shell below absorbs whatever is left. Sizing the shell with
-   `calc(100vh - <bar height>)` instead would clip the composer the moment the
-   bar grew past its nominal height — a long account email, or a nav that wraps
-   on a narrow viewport. */
+/* Viewport-locked column: the top bar takes its natural height and the shell
+ * absorbs the rest. Do NOT size the shell with calc(100vh - <bar height>) —
+ * the bar grows past its nominal height (long account email, wrapping nav)
+ * and a calc shell then clips the composer. */
 .chat-page {
   display: flex;
   flex-direction: column;
@@ -987,7 +957,6 @@ input[type='text']:focus-visible,
   background: #f0f0f2;
 }
 
-/* Auth pages (login/signup) */
 .auth-wrap {
   min-height: 100vh;
   display: flex;
@@ -1373,8 +1342,6 @@ input[type='text']:focus-visible,
   margin-bottom: 10px;
 }
 
-/* ---- DataViz (table / bar / pie rendered from assistant dataviz blocks) ---- */
-
 .chat-viz {
   margin: 12px 0;
   border: 1px solid rgba(0, 0, 0, 0.1);
@@ -1553,8 +1520,6 @@ input[type='text']:focus-visible,
   text-align: center;
 }
 
-
-
 @media (max-width: 720px) {
   .chat-app {
     flex-direction: column;
@@ -1572,7 +1537,6 @@ input[type='text']:focus-visible,
   }
 }
 
-/* Analytics dashboard (frontend page, fetches admin-gated JSON APIs) */
 .dash-wrap {
   display: flex;
   flex-direction: column;

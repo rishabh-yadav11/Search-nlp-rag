@@ -5,9 +5,8 @@ at query time fastembed's ONNX (INT8) variant of the same model runs roughly
 3-5x faster on CPU while producing L2-normalized vectors with the same
 direction, so cosine search against the existing index stays correct.
 
-If fastembed cannot load the model (e.g. model not downloaded yet or no
-network), we fall back to the torch sentence-transformers model so startup
-never fails.
+If fastembed cannot load the model (not downloaded, or no network), we fall back
+to the torch sentence-transformers model so startup never fails.
 """
 
 import logging
@@ -17,8 +16,6 @@ logger = logging.getLogger("encoders")
 
 
 class DenseEncoder:
-    """Dense embedder with a fastembed/ONNX fast path and a torch fallback."""
-
     def __init__(self, model_name: str, device: str, threads: int):
         self._fallback: Any = None
         self._model: Any = None

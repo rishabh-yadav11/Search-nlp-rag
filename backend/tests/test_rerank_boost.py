@@ -104,9 +104,8 @@ def test_boost_constants():
 
 
 def test_multiword_entity_kept_distinct_not_bare_headword():
-    # "Banyan Netfaqs Pvt Ltd" must resolve to the single entity "banyan
-    # netfaqs", never the bare token "banyan" that would conflate it with
-    # "Banyan Tree Finance" / "Banyan Green".
+    # Must resolve to the single entity "banyan netfaqs", never the bare token
+    # "banyan" that would conflate it with "Banyan Tree Finance".
     ents = extract_entities("What is the latest news about Banyan Netfaqs Pvt Ltd?")
     assert "banyan netfaqs" in ents
     assert "banyan" not in ents
@@ -124,10 +123,9 @@ def test_sector_noun_not_over_expanded():
 
 
 def test_capitalized_sector_phrase_not_over_expanded():
-    # Realistic capitalized input hits the multi-word run path. A leading generic
-    # noun ("Consumer") and trailing generic noun ("Sector") must be stripped, and
-    # the surviving bare "internet" must not be emitted as a spurious entity that
-    # over-boosts every internet-sector article.
+    # A leading generic noun ("Consumer") and trailing generic noun ("Sector")
+    # must be stripped, and the surviving bare "internet" must not be emitted
+    # as a spurious entity that over-boosts every internet-sector article.
     ents = extract_entities("What is the outlook for the Consumer Internet Sector?")
     assert "consumer" not in ents
     assert "internet" not in ents

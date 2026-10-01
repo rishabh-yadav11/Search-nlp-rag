@@ -1,19 +1,17 @@
-"""#387: bcrypt is handed a SHA-256 pre-image, so nothing truncates at 72 bytes.
+"""bcrypt is handed a SHA-256 pre-image, so nothing truncates at 72 bytes.
 
-Two things have to hold at once, and this file is the proof of both:
+Two things have to hold at once:
 
-1. The credential is the WHOLE password. A value differing only after byte 72 is
-   a different password, and the prefix does not authenticate it.
-2. Every credential stored before the change still authenticates, because a
-   pre-migration hash is ``bcrypt(raw[:72])`` and the new scheme is
-   ``bcrypt(sha256(raw))``. Changing what a stored hash MEANS would otherwise
-   lock out every existing account, including the only admin on a fresh deploy.
+1. The credential is the WHOLE password: a value differing only after byte 72
+   is a different password, and the prefix does not authenticate it.
+2. Every pre-migration credential still authenticates, because a legacy hash is
+   ``bcrypt(raw[:72])`` while the current scheme is ``bcrypt(sha256(raw))``.
+   Changing what a stored hash MEANS would otherwise lock out every existing
+   account, including the only admin on a fresh deploy.
 
-The pre-migration hash is built by ``_legacy_hash`` below, which is byte-for-byte
-what the pre-#387 code produced. That is the whole migration surface: no schema
-change, no bulk rewrite, no reset mail.
+``_legacy_hash`` below builds the pre-migration form byte-for-byte. That is the
+whole migration surface: no schema change, no bulk rewrite, no reset mail.
 """
-
 import asyncio
 import inspect
 import logging
@@ -26,11 +24,10 @@ from conftest import auth_cookie, session_cookie_value
 from app import auth
 from app.auth import AuthStore
 
-# 103 bytes, every one of them past the window bcrypt used to truncate at.
+# 103 bytes, every one past the 72-byte window bcrypt truncated at.
 LONG_PW = "Passphrase1234" + "a" * 89
 LONG_PREFIX = LONG_PW[: auth._LEGACY_BCRYPT_MAX_BYTES]
-# Same first 72 bytes as LONG_PW, different after. This pair IS the collision
-# bcrypt truncation permitted: pre-#387 they hashed identically.
+# Same first 72 bytes as LONG_PW, different after -- the collision truncation permitted.
 LONG_TWINS = LONG_PREFIX + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 SHORT_PW = "secret12"
@@ -38,7 +35,7 @@ ROTATED_PW = "rotated99"
 
 
 def _legacy_hash(password: str) -> str:
-    """A pre-migration stored hash, exactly as the code before #387 built it."""
+    """A pre-migration stored hash: ``bcrypt(password[:72])``."""
     return bcrypt.hashpw(
         password.encode("utf-8")[: auth._LEGACY_BCRYPT_MAX_BYTES], bcrypt.gensalt()
     ).decode("utf-8")
@@ -65,11 +62,7 @@ def _auth_app(tmp_path):
 
 
 def _downgrade_to_legacy(db_path, email, password):
-    """Rewrite an existing account's hash into the pre-migration form.
-
-    This is what the same deploy looked like the day before the change: the row
-    is there, under the same id, holding ``bcrypt(raw[:72])``.
-    """
+    """Rewrite an existing account's hash into the pre-migration form."""
     s = AuthStore(str(db_path))
     asyncio.run(s.connect())
 
@@ -88,12 +81,8 @@ def _downgrade_to_legacy(db_path, email, password):
 
 
 def test_a_72_byte_prefix_does_not_authenticate_the_longer_password():
-    """The bug this issue exists to remove.
-
-    ``_legacy_hash(LONG_PW)`` is what the pre-#387 code stored, and the prefix
-    genuinely does open it -- that is the pinned defect. The current scheme
-    stores neither as the other's credential.
-    """
+    """``_legacy_hash(LONG_PW)`` is what the pre-migration code stored and the
+    prefix genuinely does open it; the current scheme opens neither value."""
     legacy = _legacy_hash(LONG_PW)
     assert auth.verify_password(LONG_PREFIX, legacy), (
         "the fixture must reproduce the pre-migration defect, or this test proves nothing"
@@ -103,36 +92,23 @@ def test_a_72_byte_prefix_does_not_authenticate_the_longer_password():
     assert not auth.verify_password(LONG_PREFIX, current), (
         "the 72-byte prefix authenticated a longer password: the truncation is back"
     )
-    # and the other way round: the longer value is not a super-credential for
-    # an account whose real password is the short one
     assert not auth.verify_password(LONG_PW, auth.hash_password(LONG_PREFIX))
 
 
 def test_two_passwords_differing_only_past_byte_72_are_distinct_credentials():
-    """Acceptance: "a password differing only after byte 72 is a distinct
-    credential", and "length beyond 72 bytes increases effective entropy".
-
-    Under truncation these two hashed to the same thing and either one logged
-    the other in. Now neither does, which is the whole point: everything after
-    byte 72 is part of the credential again.
-    """
+    """Under truncation these two hashed to the same thing and either one
+    logged the other in; now everything past byte 72 is part of the credential."""
     a, b = auth.hash_password(LONG_PW), auth.hash_password(LONG_TWINS)
     assert not auth.verify_password(LONG_TWINS, a)
     assert not auth.verify_password(LONG_PW, b)
-    # the difference is entirely past the window, and each authenticates itself
     assert LONG_PW[: auth._LEGACY_BCRYPT_MAX_BYTES] == LONG_TWINS[: auth._LEGACY_BCRYPT_MAX_BYTES]
     assert auth.verify_password(LONG_PW, a) and auth.verify_password(LONG_TWINS, b)
 
 
 def test_a_long_password_registered_today_still_authenticates_tomorrow(tmp_path):
-    """Acceptance: the stored form is self-describing, so it survives a restart.
-
-    A >72-byte password registered now is written as the scheme marker plus a
-    bcrypt string. Reopening the database from scratch -- a fresh process, a
-    fresh store, tomorrow -- reads that marker back and verifies against the
-    pre-image, so the account still logs in. Nothing about the upgrade is
-    in-memory state a restart would lose.
-    """
+    """The stored form is self-describing, so a fresh process reading the
+    database from scratch verifies against the pre-image and the account still
+    logs in -- nothing here is in-memory state a restart would lose."""
     db = str(tmp_path / "auth.db")
     client, s = _auth_app(tmp_path)
     try:
@@ -140,14 +116,12 @@ def test_a_long_password_registered_today_still_authenticates_tomorrow(tmp_path)
         assert r.status_code == 200
         stored = asyncio.run(s.get_user_by_email("long@x.co")).password_hash
         assert stored.startswith(auth._PASSWORD_SCHEME)
-        # the whole password is the credential now, not its first 72 bytes
         assert not auth.verify_password(LONG_PREFIX, stored)
     finally:
         auth.store = None
         asyncio.run(s.close())
 
-    # "Tomorrow": a brand new store over the same file, as a restarted worker
-    # would open it.
+    # A brand new store over the same file, as a restarted worker would open it.
     reopened = AuthStore(db)
     asyncio.run(reopened.connect())
     try:
@@ -164,8 +138,7 @@ def test_a_long_password_registered_today_still_authenticates_tomorrow(tmp_path)
 
 
 def test_a_credential_stored_before_the_change_still_authenticates(tmp_path):
-    """Acceptance: "every credential stored before the change still
-    authenticates". A row written by the pre-#387 code logs in unchanged."""
+    """A row written in the pre-migration form logs in unchanged."""
     client, s = _auth_app(tmp_path)
     try:
         asyncio.run(s.create_user("old@x.co", SHORT_PW, "Old", "user"))
@@ -184,13 +157,9 @@ def test_a_credential_stored_before_the_change_still_authenticates(tmp_path):
 
 
 def test_a_legacy_credential_is_rehashed_on_its_next_successful_login(tmp_path):
-    """Acceptance: legacy hashes are migrated by the login itself.
-
-    No bulk rewrite, no operator action, no reset mail: the plaintext exists in
+    """Legacy hashes are migrated by the login itself: the plaintext exists in
     exactly one request, so that request is the only place the old hash can be
-    re-expressed. Afterwards the row is in the current scheme and the same
-    password still opens it.
-    """
+    re-expressed."""
     client, s = _auth_app(tmp_path)
     try:
         user = asyncio.run(s.create_user("old@x.co", SHORT_PW, "Old", "user"))
@@ -207,7 +176,6 @@ def test_a_legacy_credential_is_rehashed_on_its_next_successful_login(tmp_path):
         assert after != legacy
         assert not auth.needs_rehash(after)
         assert asyncio.run(s.count_legacy_passwords()) == 0
-        # the same password, unchanged, still authenticates after the rewrite
         assert auth.verify_password(SHORT_PW, after)
         # and a second login is a no-op rather than another rewrite
         assert client.post(
@@ -220,25 +188,19 @@ def test_a_legacy_credential_is_rehashed_on_its_next_successful_login(tmp_path):
 
 
 def test_migrating_a_long_legacy_credential_closes_its_prefix_collision(tmp_path):
-    """The point of the whole change, end to end on one account.
-
-    A long passphrase stored before #387 is a credential its own 72-byte
-    prefix opens. The login that migrates it is the moment that stops being
-    true: the same row, the same id, the same password the owner types -- and
-    the prefix is refused from then on. The account was never locked out; it
-    stopped being open to a shorter credential.
-    """
+    """A long passphrase stored in the legacy form is a credential its own
+    72-byte prefix opens; the login that migrates it is the moment that stops
+    being true -- same row, same password, prefix refused from then on."""
     client, s = _auth_app(tmp_path)
     try:
         user = asyncio.run(s.create_user("long@x.co", LONG_PW, "Long", "user"))
         asyncio.run(s.set_password(user.id, _legacy_hash(LONG_PW)))
-        # before: the prefix really does open it
         assert client.post(
             "/api/auth/login", json={"email": "long@x.co", "password": LONG_PREFIX}
         ).status_code == 200
         assert asyncio.run(s.count_legacy_passwords()) == 0, "the prefix login already migrated it"
 
-        # reset to the pre-migration state, then migrate with the real password
+        # Reset to the pre-migration state, then migrate with the real password.
         asyncio.run(s.set_password(user.id, _legacy_hash(LONG_PW)))
         assert client.post(
             "/api/auth/login", json={"email": "long@x.co", "password": LONG_PW}
@@ -246,7 +208,6 @@ def test_migrating_a_long_legacy_credential_closes_its_prefix_collision(tmp_path
         migrated = asyncio.run(s.get_user_by_email("long@x.co")).password_hash
         assert migrated.startswith(auth._PASSWORD_SCHEME)
         assert auth.verify_password(LONG_PW, migrated)
-        # same account, same row, same password -- and the prefix is now refused
         assert client.post(
             "/api/auth/login", json={"email": "long@x.co", "password": LONG_PREFIX}
         ).status_code == 401
@@ -259,13 +220,8 @@ def test_migrating_a_long_legacy_credential_closes_its_prefix_collision(tmp_path
 
 
 def test_an_upgraded_account_no_longer_accepts_its_72_byte_prefix(tmp_path):
-    """The fallback must not survive the upgrade.
-
-    The tempting shortcut is "verify the pre-image, and if that fails try the
-    legacy form too". That would keep the collision alive for exactly the
-    accounts that were fixed, so this pins the direction: after the upgrade the
-    value that used to open the account is refused.
-    """
+    """A "verify the pre-image, else try the legacy form too" fallback would keep
+    the collision alive for exactly the accounts that were fixed."""
     client, s = _auth_app(tmp_path)
     try:
         assert client.post(
@@ -286,13 +242,9 @@ def test_an_upgraded_account_no_longer_accepts_its_72_byte_prefix(tmp_path):
 
 
 def test_a_failed_login_never_upgrades_the_stored_hash(tmp_path):
-    """Only a verified password may rewrite the row.
-
-    The upgrade is a credential rewrite, so it must not be reachable by anyone
-    who cannot already authenticate -- otherwise the write is a free way to
-    churn rows at no cost, since a guess that fails the verify must not be
-    allowed to reach the write.
-    """
+    """The upgrade is a credential rewrite, so it must not be reachable by
+    anyone who cannot already authenticate -- otherwise a failed guess is a
+    free way to churn rows."""
     client, s = _auth_app(tmp_path)
     try:
         user = asyncio.run(s.create_user("old@x.co", SHORT_PW, "Old", "user"))
@@ -309,12 +261,8 @@ def test_a_failed_login_never_upgrades_the_stored_hash(tmp_path):
 
 
 def test_the_upgrade_is_a_compare_and_swap_on_the_hash_that_was_verified(store):
-    """The upgrade's transactional half, at the statement that does the write.
-
-    It must land only while the row still holds the hash that was just checked.
-    Anything else is a lost update: a credential the owner has since replaced
-    would be overwritten with one derived from a secret they no longer use.
-    """
+    """The write must land only while the row still holds the hash that was just
+    checked; anything else overwrites a credential the owner has replaced."""
     user = asyncio.run(store.create_user("a@x.co", SHORT_PW, "A", "user"))
     legacy = _legacy_hash(SHORT_PW)
     asyncio.run(store.set_password(user.id, legacy))
@@ -327,21 +275,15 @@ def test_the_upgrade_is_a_compare_and_swap_on_the_hash_that_was_verified(store):
     assert auth.verify_password(ROTATED_PW, newer)
     assert not auth.verify_password(SHORT_PW, newer)
 
-    # the write still lands when the observation really is the live value
     fresh = auth.hash_password(ROTATED_PW + "x")
     assert asyncio.run(store.upgrade_password_hash(user.id, newer, fresh)) == 1
     assert asyncio.run(store.get_user(user.id)).password_hash == fresh
 
 
 def test_a_concurrent_password_change_is_not_clobbered_by_a_login_upgrade(tmp_path, monkeypatch):
-    """The same race, end to end through ``login``.
-
-    Another writer commits a new credential in the window between this request
-    reading the row and its upgrade landing. The login has by then verified the
-    OLD password against the OLD hash, so its ``new_hash`` is derived from a
-    secret the owner has already moved on from -- writing it would resurrect a
-    password the owner believes is gone. The compare-and-swap has to lose.
-    """
+    """A concurrent writer's credential is derived from a secret the owner has
+    moved on from, so writing it would resurrect a password they believe is
+    gone: the compare-and-swap has to lose."""
     client, s = _auth_app(tmp_path)
     try:
         user = asyncio.run(s.create_user("old@x.co", SHORT_PW, "Old", "user"))
@@ -352,7 +294,7 @@ def test_a_concurrent_password_change_is_not_clobbered_by_a_login_upgrade(tmp_pa
         async def racing_get(email):
             row = await real_get(email)
             if row is not None and email == "old@x.co":
-                # another worker finishes a password change after we read the row
+                # Another worker finishes a password change after we read the row.
                 await s.set_password(row.id, auth.hash_password(ROTATED_PW))
             return row
 
@@ -371,12 +313,9 @@ def test_a_concurrent_password_change_is_not_clobbered_by_a_login_upgrade(tmp_pa
 
 
 def test_a_failed_upgrade_write_does_not_fail_the_login(tmp_path, monkeypatch, caplog):
-    """The migration is housekeeping and must never become an outage.
-
-    If the rewrite cannot be written, the row keeps a pre-migration hash that
-    still authenticates and the user still gets their session. The upgrade is
-    retried on the next login.
-    """
+    """The migration is housekeeping and must never become an outage: if the
+    rewrite cannot be written, the legacy hash still authenticates and the
+    upgrade is retried on the next login."""
     client, s = _auth_app(tmp_path)
     try:
         user = asyncio.run(s.create_user("old@x.co", SHORT_PW, "Old", "user"))
@@ -404,14 +343,9 @@ def test_a_failed_upgrade_write_does_not_fail_the_login(tmp_path, monkeypatch, c
 
 @pytest.mark.parametrize("scheme", ["current", "legacy"])
 def test_verification_runs_exactly_one_bcrypt_on_either_scheme(monkeypatch, scheme):
-    """Neither scheme is ever tried twice, and the caller cannot ask for both.
-
-    Exactly one ``checkpw`` per verify, whatever the row holds. Two would mean
-    the legacy pre-image is still being offered as an alternative to a migrated
-    row -- the collision, for exactly the accounts that were fixed -- and two
-    would also double the cost of a login against a not-yet-migrated account,
-    making those rows distinguishable by timing from migrated ones.
-    """
+    """Exactly one ``checkpw`` per verify, whatever the row holds: two would
+    re-offer the legacy pre-image for migrated rows and make not-yet-migrated
+    rows distinguishable by timing."""
     hashed = auth.hash_password(SHORT_PW) if scheme == "current" else _legacy_hash(SHORT_PW)
     calls = []
     real = auth.bcrypt.checkpw
@@ -423,7 +357,6 @@ def test_verification_runs_exactly_one_bcrypt_on_either_scheme(monkeypatch, sche
     monkeypatch.setattr(auth.bcrypt, "checkpw", recording)
     assert auth.verify_password(SHORT_PW, hashed)
     assert len(calls) == 1, f"{scheme}: verify tried {len(calls)} candidates"
-    # whatever the row declares is the only credential that is ever built
     if scheme == "current":
         assert calls[0] == auth._prehash(SHORT_PW)
     else:
@@ -431,25 +364,18 @@ def test_verification_runs_exactly_one_bcrypt_on_either_scheme(monkeypatch, sche
 
 
 def test_the_scheme_is_decided_by_the_stored_hash_not_by_the_caller():
-    """No input can steer a row onto the other scheme.
-
-    The dispatch reads the stored marker and nothing else, so there is no
-    request field, header or value shape that makes a migrated row check itself
-    against a raw 72-byte prefix, or a pre-migration row check itself against a
-    pre-image it was never created from.
-    """
+    """The dispatch reads the stored marker and nothing else, so no request
+    field, header or value shape can steer a row onto the other scheme."""
     src = inspect.getsource(auth.verify_password)
     assert "hashed.startswith(_PASSWORD_SCHEME)" in src
-    # one comparison against the supplied password: a second checkpw would be a
-    # second candidate scheme, which is the property above
+    # A second checkpw would be a second candidate scheme, which is the property above.
     assert src.count("bcrypt.checkpw(") == 1
 
 
 def test_needs_rehash_reads_the_stored_marker_only():
     assert auth.needs_rehash(auth.hash_password(SHORT_PW)) is False
     assert auth.needs_rehash(_legacy_hash(SHORT_PW)) is True
-    # a row that is not a hash at all is reported as needing one; it can never
-    # verify, so the upgrade is never reached for it
+    # A row that is not a hash at all can never verify, so the upgrade is never reached.
     assert auth.needs_rehash("") is True
     assert auth.verify_password(SHORT_PW, "") is False
 
@@ -464,18 +390,12 @@ def test_a_corrupt_stored_hash_is_refused_rather_than_raised():
 
 
 def test_startup_reports_the_accounts_still_on_a_pre_migration_hash(store, monkeypatch, caplog):
-    """Accounts that never log in again cannot be migrated for the operator, so
-    the operator has to be able to see that they still exist.
-
-    A hash that means "the first 72 bytes" can only become a pre-image hash by
-    someone supplying the plaintext. This service has no password-reset path to
-    revoke one with instead, so forcing the issue would not migrate anything --
-    it would lock out every dormant account permanently. Reporting the
-    remainder is what the operator actually has to act on.
-    """
+    """Dormant accounts can never be migrated, because a hash that means "the
+    first 72 bytes" only becomes a pre-image hash if someone supplies the
+    plaintext, and this service has no password-reset path. The operator has to
+    be able to see the remainder."""
     monkeypatch.setattr(auth, "store", store)
-    # deliberately uneven: more rows on the old scheme than on the current one,
-    # so counting the wrong side of the marker cannot produce the same number
+    # Deliberately uneven, so counting the wrong side of the marker cannot give the same number.
     for email in ("old1@x.co", "old2@x.co", "old3@x.co"):
         u = asyncio.run(store.create_user(email, SHORT_PW, "Old", "user"))
         asyncio.run(store.set_password(u.id, _legacy_hash(SHORT_PW)))
@@ -486,17 +406,15 @@ def test_startup_reports_the_accounts_still_on_a_pre_migration_hash(store, monke
     assert remaining == 3
     line = "\n".join(x.getMessage() for x in caplog.records)
     assert "3 account(s) still hold a pre-migration password hash" in line
-    # the report says how the remainder gets finished, and that it is not forced
     assert "next successful login" in line
     assert "never logs in again" in line
-    # it counts rows; it never reveals which account, let alone any credential
+    # It counts rows; it never reveals which account, let alone any credential.
     assert "old1@x.co" not in line and SHORT_PW not in line
 
 
 def test_the_report_says_so_when_there_is_nothing_left_to_migrate(store, monkeypatch, caplog):
-    """The other half of the operator's view: a deploy with nothing pending says
-    so, rather than staying silent and leaving the line unreadable as "the
-    migration must not have started"."""
+    """A deploy with nothing pending says so, rather than leaving the line
+    unreadable as "the migration must not have started"."""
     monkeypatch.setattr(auth, "store", store)
     asyncio.run(store.create_user("new@x.co", SHORT_PW, "New", "user"))
 
@@ -528,19 +446,13 @@ def test_the_report_never_fails_startup(store, monkeypatch, caplog):
 
 
 def test_a_fresh_deploy_is_administrable_through_the_migration(tmp_path, monkeypatch):
-    """Acceptance: a fresh deploy is administrable throughout the migration.
-
-    Two deploys, both administrable, on either side of the change. A new one
-    seeds its admin in the current scheme. One that has been running since
-    before it keeps its pre-migration admin credential -- the only account
-    there is -- and logs in with what the operator always used, and that login
-    is what migrates it.
-    """
+    """Both deploys are administrable: a fresh one seeds its admin in the current
+    scheme, and one carrying a pre-migration admin credential -- the only account
+    there is -- migrates on the operator's ordinary login."""
     db = str(tmp_path / "auth.db")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", LONG_PW)
 
-    # (a) fresh deploy
     s = AuthStore(db)
     asyncio.run(s.connect())
     monkeypatch.setattr(auth, "store", s)
@@ -552,8 +464,7 @@ def test_a_fresh_deploy_is_administrable_through_the_migration(tmp_path, monkeyp
     assert asyncio.run(s.count_legacy_passwords()) == 0
     asyncio.run(s.close())
 
-    # (b) the same deploy as it looked before the change: the admin row carries
-    # a pre-migration hash, and the operator logs in with what they always did.
+    # (b) the same deploy as it looked before the change: a pre-migration hash.
     _downgrade_to_legacy(db, "admin@x.co", LONG_PW)
 
     client, s2 = _auth_app(tmp_path)
@@ -563,7 +474,6 @@ def test_a_fresh_deploy_is_administrable_through_the_migration(tmp_path, monkeyp
         migrated = asyncio.run(s2.get_user_by_email("admin@x.co")).password_hash
         assert migrated.startswith(auth._PASSWORD_SCHEME)
         assert auth.verify_password(LONG_PW, migrated)
-        # and the prefix that used to open it does not any more
         assert not auth.verify_password(LONG_PREFIX, migrated)
     finally:
         auth.store = None
@@ -572,17 +482,13 @@ def test_a_fresh_deploy_is_administrable_through_the_migration(tmp_path, monkeyp
 
 
 def test_a_long_password_is_stored_as_the_full_credential(store):
-    """The stored hash is a marker plus a bcrypt string over a 32-byte pre-image.
-
-    Asserted rather than assumed: if the pre-image ever went back to being the
+    """Asserted rather than assumed: if the pre-image ever went back to being the
     password itself, the 72-byte cut would return silently and every other
-    behavioural test in this file would still pass on short passwords.
-    """
+    behavioural test here would still pass on short passwords."""
     stored = auth.hash_password(LONG_PW)
     assert re.match(r"^\$bcrypt-sha256\$\$2[aby]\$", stored)
     assert len(auth._prehash(LONG_PW)) == 32
     assert len(auth._prehash(LONG_PW)) < auth._LEGACY_BCRYPT_MAX_BYTES
     user = asyncio.run(store.create_user("a@x.co", LONG_PW, "A", "user"))
     assert user.password_hash.startswith(auth._PASSWORD_SCHEME)
-    # the password itself is nowhere in what is stored
     assert LONG_PW not in user.password_hash

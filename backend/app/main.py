@@ -94,9 +94,9 @@ from app.user_profile import (
 )
 
 # Uvicorn's worker leaves the root logger at WARNING with no handlers, so every
-# module logger inherits WARNING and drops its INFO records (#293). Done at
-# import -- before the lifespan and before any request is served -- so boot
-# events and the background purge loops are emitted under the real startup path.
+# module logger inherits WARNING and drops its INFO records. Done at import --
+# before the lifespan and before any request is served -- so boot events and the
+# background purge loops are emitted under the real startup path.
 configure_logging()
 
 state = {}
@@ -312,7 +312,7 @@ async def lifespan(app: FastAPI):
     state["qdrant"] = AsyncQdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=30)
     await _load_facet_maps()
     # Names the real cause (missing / placeholder / malformed GEMINI_API_KEY) in
-    # the log at boot, without taking the process down with it (#279).
+    # the log at boot, without taking the process down with it.
     warn_if_llm_key_unusable()
     state["llm"] = AsyncOpenAI(api_key=config.GEMINI_API_KEY, base_url=config.GEMINI_BASE_URL) if config.GEMINI_API_KEY else None
 
@@ -347,8 +347,7 @@ async def lifespan(app: FastAPI):
     # Qdrant client and five Redis pools leak for the rest of the process' life.
     # Each step therefore goes through close_guard: bounded by
     # _TEARDOWN_CLOSE_TIMEOUT, failures logged with the resource named, and the
-    # next step always attempted. Cancellation still propagates, so a cancelled
-    # shutdown unwinds.
+    # next step always attempted.
     teardown_steps = (
         ("chat retention task", lambda: _cancel_and_wait("chat retention task", state["chat_retention"])),
         ("chat store", chat_store.close),
@@ -383,20 +382,10 @@ async def _cancel_and_wait(resource_name: str, task: asyncio.Task) -> None:
     one step and every later resource is still released.
 
     The inner budget is strictly shorter than the ``_TEARDOWN_CLOSE_TIMEOUT``
-    the caller wraps this in, and that ordering is load-bearing rather than
-    cosmetic. Both timers start within microseconds of each other, so with the
-    two equal the outer ``wait_for`` always wins: it cancels this coroutine
-    before the inner wait can report anything, and ``wait_for`` surfaces that
-    as ``TimeoutError``, which ``close_quietly`` catches and logs as a generic
-    close timeout. Teardown still continues to the later steps in that case --
-    but the step is misreported, and the "ignored cancellation" line an
-    operator needs never appears. Halving the inner budget keeps this
-    coroutine's own decision the one that happens, so a task that refuses to
-    die is named as such. Verified by mutation: setting this budget to 10x the
-    outer one fails the two task-step hang tests in tests/test_main_pipeline.py,
-    which assert that abandon message. Do not "simplify" the ratio. The
-    abandoned task is left to the loop's own cancellation.
-
+    the caller wraps this in, and that ordering is load-bearing: with the two
+    equal the outer ``wait_for`` always wins and ``close_quietly`` logs a
+    generic close timeout, so a task that refuses to die is never named as
+    such. Do not "simplify" the ratio.
     """
     task.cancel()
     done, _pending = await asyncio.wait({task}, timeout=_TEARDOWN_CLOSE_TIMEOUT / 2)
@@ -429,12 +418,10 @@ app.add_middleware(
     allow_origins=config.CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-    # Required now that the auth credential is a cookie: without it the
-    # browser drops the cross-origin response and the frontend never sees the
-    # session. Safe because allow_origins is an explicit list, never "*" (a
-    # wildcard with credentials is rejected by the browser anyway, and would
-    # hand any site a readable authenticated response). Moot in production,
-    # where nginx serves the frontend and the API from one origin.
+    # Required now that the auth credential is a cookie: without it the browser
+    # drops the cross-origin response and the frontend never sees the session.
+    # Safe because allow_origins is an explicit list, never "*". Moot in
+    # production, where nginx serves the frontend and the API from one origin.
     allow_credentials=True,
 )
 app.add_middleware(
@@ -450,10 +437,9 @@ app.add_middleware(
 app.add_middleware(RequestIdMiddleware)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
-# #293's configure_logging() above owns the app's single root handler; this only
-# adds the per-request id filter to that handler, so a record it renders carries
-# the id. Installing a second handler here would write every app line twice, and
-# it must stay after that call -- installed_handler() is None until then.
+# configure_logging() above owns the app's single root handler; this only adds
+# the per-request id filter to that handler, so a record it renders carries the
+# id. Installing a second handler here would write every app line twice.
 attach_request_id_filter()
 
 # A host that is missing from ALLOWED_HOSTS answers 400 to every request, which
@@ -557,9 +543,8 @@ def build_facet_filter(
 
     Facet values are normalised and bounded here (see app.input_hygiene) so the
     MatchAny and the cache key derived from this filter are both built from the
-    same bounded spelling. Every facet path -- /search, the auto-facet fallback
-    and the date-window retrieval -- funnels through this one function, so the
-    caps cannot be sidestepped by arriving through a different caller.
+    same bounded spelling. Every facet path funnels through this one function,
+    so the caps cannot be sidestepped by arriving through a different caller.
     """
     conditions = []
     for key, field, raw in (
@@ -602,14 +587,11 @@ def facet_cache_token(
     """Cache-key fragment for the faceted search params.
 
     Values are normalised the same way ``build_facet_filter`` normalises them,
-    so the token and the filter it stands for cannot drift apart, and the
-    components are length-prefixed rather than joined with a delimiter: the
-    pipe-join this replaces was ambiguous, and ``industry='a', dealtype='b|c'``
-    and ``industry='a|b', dealtype='c'`` produced one token for two different
-    filters -- a request was then served the other one's cached results. That
-    prefixing is also what makes adding a field safe: a new component cannot
-    be made to collide with the fields around it by shifting a delimiter
-    across a boundary, so the tuple grows without re-opening the hole.
+    so the token and the filter it stands for cannot drift apart. Components are
+    length-prefixed rather than joined with a delimiter: the pipe-join this
+    replaces was ambiguous, so ``industry='a', dealtype='b|c'`` and
+    ``industry='a|b', dealtype='c'`` produced one token for two different filters
+    -- a request was then served the other one's cached results.
     """
     return build_cache_key(
         *(normalize_text(value or "") for value in
@@ -633,13 +615,10 @@ def _effective_intent(
 
     Returns (retrieval_q, eff_from, eff_to, dealtype, industry). The dealtype/
     industry are looked up against the live facet vocabulary and are None when the
-    query implies no category (or the facet maps are empty). Date words (months,
-    years, quarters) are stripped from the retrieval query because the date filter
-    already scopes the window; the natural phrasing (e.g. 'funding news') is kept
-    so the embedding/rerank match stays strong, while the facet filter (when one
-    resolves) still scopes results. The content-type modifier (interviews/
-    founders/etc.) is derived separately by extract_content_type so the facet maps
-    can stay cold-start-safe and the call sites control its fallback."""
+    query implies no category (or the facet maps are empty). Date words are stripped
+    from the retrieval query because the date filter already scopes the window,
+    while the natural phrasing is kept so the embedding/rerank match stays
+    strong."""
     q = normalize_word_numbers(q)
     retrieval_q, _ = rewrite_year_in_review(q)
     dealtype = extract_dealtype(q)
@@ -714,9 +693,8 @@ def _retrieval_queries(q: str) -> list[str]:
     """Queries to run for a user query. For year-in-review intents this is the
     Flashback-rewritten query PLUS the bare topic (year-filtered) so niche
     topics that have no dedicated Flashback article still surface their specific
-    articles (e.g. 'venture debt providers', 'unicorns created'). For
-    month-scoped queries the bare topic is used directly (date filter scopes the
-    month). Otherwise a single query."""
+    articles. For month-scoped queries the bare topic is used directly (date
+    filter scopes the month). Otherwise a single query."""
     flashback, changed = rewrite_year_in_review(q)
     if changed:
         topic = extract_list_topic(q) or q
@@ -776,27 +754,23 @@ async def hybrid_search(
     # independent of the qfilter, so it is cached in Redis keyed by the
     # embedding models (a model change invalidates it). Repeated queries with
     # different facet/date filters skip encoding entirely.
-    # Bound the text that reaches the encoders, for EVERY caller. /search is
-    # already refused at the edge beyond SEARCH_QUERY_MAX_CHARS, so this never
-    # binds for it; the bound that matters here is RETRIEVAL_QUERY_MAX_CHARS,
-    # which is chat's own accepted message length (chat.MAX_CONTENT_LEN) so
-    # that the LLM prompt and this retrieval always see the same question.
-    # expand_query only ever grows the string, so even an in-limit input can be
-    # over the limit again by the time it gets here. The clamp happens before
-    # the cache key is built so the key and the embedded text always describe
-    # the same string.
+    # Bound the text that reaches the encoders, for EVERY caller. The bound that
+    # matters here is RETRIEVAL_QUERY_MAX_CHARS, which is chat's own accepted
+    # message length (chat.MAX_CONTENT_LEN) so that the LLM prompt and this
+    # retrieval always see the same question. expand_query only ever grows the
+    # string, so even an in-limit input can be over the limit again by the time
+    # it gets here. The clamp happens before the cache key is built so the key
+    # and the embedded text always describe the same string.
     query = query[: config.RETRIEVAL_QUERY_MAX_CHARS]
     # Normalised here, where the embedding is actually computed, so the key and
     # the embedded text cannot drift apart: the cached (dense, sparse) pair
-    # stands for one exact input string. This is the same query the other two
-    # keys see, so a control character or a compatibility variant cannot
-    # fragment the vector cache either. Normalisation only ever shrinks the
+    # stands for one exact input string. Normalisation only ever shrinks the
     # text, so it runs after the clamp above and the encoders still see at most
     # RETRIEVAL_QUERY_MAX_CHARS characters.
     query = normalize_text(query)
     # Same two bounds as the search: and retrieve: keys: the query segment is
-    # digested once past CACHE_KEY_QUERY_MAX_CHARS (#241) and the key is
-    # length-prefixed and bounded as a whole (#252), so the model names stay
+    # digested once past CACHE_KEY_QUERY_MAX_CHARS and the key is
+    # length-prefixed and bounded as a whole, so the model names stay
     # readable in Redis next to a digest rather than spelled-out query text.
     vec_key = build_cache_key(config.EMBED_MODEL, config.SPARSE_MODEL,
                               _cache_key_component(query), namespace="vec")
@@ -902,19 +876,12 @@ def _effective_step(positions: int, step: int, max_windows: int | None) -> int:
     small stride is a legal (and deceptively cheap-looking) setting: step=1
     over a 50K body scores 48,501 windows and costs ~117ms per body, and
     ``body_rescue`` scans every body-bearing article before the candidate cap
-    applies, so 20 articles cost ~2.3s for a single chat turn. Widening the
-    stride bounds the work by window COUNT instead of by the raw value.
+    applies. Widening the stride bounds the work by window COUNT instead of by
+    the raw value.
 
-    ``max_windows=None`` (or <= 0) means no budget, which is what a direct
-    caller that does not opt in gets. ``body_rescue`` always passes the
-    configured ``BODY_RESCUE_MAX_WINDOWS``.
-
-    The trade-off is recall for work: a stride coarse enough to widen can
-    straddle a token-dense region and miss it. That only happens when a budget
-    is configured below what the chosen stride would need, and at the defaults
-    (98 windows against a budget of 200) the stride is never touched, so the
-    scan is unchanged. A budget of 1 degenerates to the single window at
-    start=0 rather than an empty range.
+    ``max_windows=None`` (or <= 0) means no budget. The trade-off is recall for
+    work: at the defaults the stride is never touched, so the scan is unchanged.
+    A budget of 1 degenerates to the single window at start=0.
     """
     step = max(1, step)
     if max_windows and max_windows > 0 and -(-positions // step) > max_windows:
@@ -931,8 +898,7 @@ def _best_body_window(
 
     ``max_windows`` caps how many windows are scored per body, so the work is
     bounded by a window COUNT rather than by the raw stride; it defaults to
-    None (uncapped) so the four-argument calling convention keeps its original
-    behaviour. See ``_effective_step``.
+    None (uncapped). See ``_effective_step``.
     """
     if not tokens or len(body) <= win:
         return body
@@ -964,13 +930,13 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
     The whole feature is gated on ENABLE_BODY_RESCUE here rather than only at
     the call sites: this is the function that pays the cost (a second
     cross-encoder pass under the process-wide inference lock), so the guard
-    belongs where the cost is, not in every future caller that has to remember
-    it. The call-site guards in chat.py stay as a cheap short-circuit.
+    belongs where the cost is. The call-site guards in chat.py stay as a cheap
+    short-circuit.
 
-    The pass runs on at most BODY_RESCUE_MAX_CANDIDATES articles: the body
-    pass costs one cross-encoder prediction per candidate and dominates the
-    window scan by two orders of magnitude, so the candidate count is the only
-    budget that matters."""
+    The pass runs on at most BODY_RESCUE_MAX_CANDIDATES articles: the body pass
+    costs one cross-encoder prediction per candidate and dominates the window
+    scan by two orders of magnitude, so the candidate count is the only budget
+    that matters."""
     if not articles:
         return articles
     if not config.ENABLE_BODY_RESCUE:
@@ -1005,13 +971,12 @@ async def body_rescue(query: str, articles: list[SourceArticle]) -> list[SourceA
     if not candidates:
         return articles
     # Shortlist by body-window overlap, NOT by a.score and NOT by list order.
-    # A weak title+summary score is the very reason the rescue exists: taking
-    # the top-N by score would drop exactly the deep-body matches it exists to
+    # A weak title+summary score is the very reason the rescue exists: taking the
+    # top-N by score would drop exactly the deep-body matches it exists to
     # rescue, and taking the first N by list order would let retrieval ranking
-    # decide the budget. An article whose best window contains none of the
-    # query tokens is one the body pass cannot lift, so it is the correct thing
-    # to drop first when the budget runs out. Ties resolve on the original
-    # index so a run is reproducible.
+    # decide the budget. An article whose best window contains none of the query
+    # tokens is the correct thing to drop first when the budget runs out. Ties
+    # resolve on the original index so a run is reproducible.
     candidates.sort(key=lambda c: (-c[0], c[1]))
     kept = candidates[: config.BODY_RESCUE_MAX_CANDIDATES]
     pairs = [c[2] for c in kept]
@@ -1087,17 +1052,15 @@ def _filter_token(qfilter: Filter | None) -> str:
 def _cache_key_component(value: str) -> str:
     """Bounded, deterministic cache-key fragment for a request-supplied string.
 
-    The retrieval caches (``vec:``, ``retrieve:``, ``search:``) key on the
-    query text and on the facet values, which is fine for a normal request but
-    makes the key as long as the request: a megabyte of ``q`` becomes a
-    megabyte-scale Redis key (multi-KB across the key, plus the memory the
-    server copies on every GET/SET). Rather than truncating the text — which
-    would collide distinct long values onto one key and serve a different
-    query's or a different facet filter's results — a long value is replaced
-    by a truncated sha256 of its UTF-8 bytes, prefixed with ``h:`` so a digest
-    can never be confused with a short literal value that happens to look like
-    hex. Short values keep their exact previous key, so existing cache entries
-    still hit.
+    The retrieval caches (``vec:``, ``retrieve:``, ``search:``) key on the query
+    text and on the facet values, which makes the key as long as the request: a
+    megabyte of ``q`` becomes a megabyte-scale Redis key. Rather than truncating
+    the text — which would collide distinct long values onto one key and serve a
+    different query's or a different facet filter's results — a long value is
+    replaced by a truncated sha256 of its UTF-8 bytes, prefixed with ``h:`` so a
+    digest can never be confused with a short literal value that happens to look
+    like hex. Short values keep their exact previous key, so existing cache
+    entries still hit.
 
     No caller parses a value back out of a key: every one of these keys is
     written and read only through this function's owning call site.
@@ -1158,33 +1121,24 @@ def retrieval_config_fingerprint() -> str:
     """Short, stable digest of every config value that can change what a cached
     retrieval or /search result *contains*.
 
-    A cached entry is only correct for the configuration that produced it. These
-    values are read from the environment at process start, so a redeploy that
-    flips a toggle (query expansion, entity boost, ...) would otherwise keep
+    A cached entry is only correct for the configuration that produced it, and
+    these values are read from the environment at process start, so a redeploy
+    that flips a toggle (query expansion, entity boost, ...) would otherwise keep
     replaying the previous configuration's results for the whole
-    CACHE_TTL_SECONDS window — a stale answer, not just a slow one. Keying on
+    CACHE_TTL_SECONDS window -- a stale answer, not just a slow one. Keying on
     them makes a configuration change invalidate its own entries.
 
-    The digest covers two groups:
-
-    * the retrieval/rerank pipeline (the dense and sparse embedding models,
-      collection, query expansion, candidate depth, rerank model/backend, and
-      the entity boost, and the recency blend that sorts and re-scores the
-      final set) — read by ``retrieve_and_rerank``, ``hybrid_search`` and
-      ``sort_results``, and therefore affecting the ``search:`` entry
-      transitively as well;
-    * the post-retrieval /search shaping (click boost and its thresholds, the
-      click-aggregate key length that decides *which* recorded clicks a long
-      query is matched against, diversity and its parameters, and the
-      ``ASK_MIN_SCORE`` relevance gate that decides whether a lone weak hit is
-      relaxed away) — these run after retrieval, so they change the ``search:``
-      entry but not the ``retrieve:`` one.
+    The digest covers the retrieval/rerank pipeline (read by
+    ``retrieve_and_rerank``, ``hybrid_search`` and ``sort_results``, and therefore
+    affecting the ``search:`` entry transitively as well) and the post-retrieval
+    /search shaping (click boost and its thresholds, diversity and its parameters,
+    and the ``ASK_MIN_SCORE`` relevance gate), which change the ``search:`` entry
+    but not the ``retrieve:`` one.
 
     It is hashed rather than inlined so the key stays bounded however many knobs
-    are listed, and the canonical JSON keeps the value identical across
-    processes and key orderings. Corpus contents and click counters are *not*
-    included: they change continuously and are bounded by the TTL, not by the
-    key.
+    are listed, and the canonical JSON keeps the value identical across processes
+    and key orderings. Corpus contents and click counters are *not* included: they
+    change continuously and are bounded by the TTL, not by the key.
     """
     values = {name: getattr(config, attr) for name, attr in _RETRIEVAL_CONFIG_INPUTS}
     canonical = json.dumps(values, sort_keys=True, default=str, separators=(",", ":"))
@@ -1201,16 +1155,15 @@ def retrieve_cache_key(q: str, top_k: int, qfilter: Filter | None) -> str:
 
     Two bounds compose here and neither replaces the other. ``q`` goes through
     :func:`_cache_key_component` first, so an over-long query contributes a
-    bounded ``h:`` digest rather than its full text (#241); that helper hashes
-    instead of truncating, so two distinct over-long queries still key apart and
-    neither can be served the other's result. ``build_cache_key`` then
-    length-prefixes the parts, so the assembled key is injective and bounded as
-    a whole (#252) -- the first bounds one component, the second the key. The
-    filter JSON is exactly why both are needed: it is long, and it can contain
-    the delimiters the old ``:`` join used.
+    bounded ``h:`` digest rather than its full text; that helper hashes instead of
+    truncating, so two distinct over-long queries still key apart.
+    ``build_cache_key`` then length-prefixes the parts, so the assembled key is
+    injective and bounded as a whole -- the first bounds one component, the second
+    the key. The filter JSON is exactly why both are needed: it is long, and it
+    can contain the delimiters the old ``:`` join used.
 
     The config digest comes last so a configuration change that can change what
-    a cached result *contains* invalidates the entry (#266).
+    a cached result *contains* invalidates the entry.
     """
     return build_cache_key(
         _cache_key_component(q), top_k,
@@ -1222,15 +1175,13 @@ def retrieve_cache_key(q: str, top_k: int, qfilter: Filter | None) -> str:
 def search_cache_key(retrieval_q: str, eff_top_k: int, facets: str) -> str:
     """Cache key for a /search summary page.
 
-    Same composition as :func:`retrieve_cache_key` -- bounded per component by
-    :func:`_cache_key_component` (#241), injective and bounded as a whole by
-    :func:`build_cache_key` (#252), and carrying the config digest (#266) because
+    Same composition as :func:`retrieve_cache_key` -- bounded per component,
+    injective and bounded as a whole, and carrying the config digest because
     click boost, diversity and the relevance gate all run after retrieval and so
     change the ``search:`` entry but not the ``retrieve:`` one.
 
     ``facets`` is already a length-prefixed token from
-    :func:`facet_cache_token`; it is passed through as one opaque part, so its
-    internal framing is not re-derived here.
+    :func:`facet_cache_token`; it is passed through as one opaque part.
     """
     return build_cache_key(
         _cache_key_component(retrieval_q), eff_top_k, facets,
@@ -1286,21 +1237,15 @@ async def retrieve_and_rerank(
     """Run every retrieval leg, merge RRF candidates, cross-encode rerank, and
     apply the entity-mention boost. Returns the recency-sorted articles.
 
-    Shared by /search and /chat so the two pipelines stay consistent. A
-    non-empty reranked article set is cached in Redis (same TTL as /search)
-    because it is deterministic for a (query, filter) pair *under a given
-    configuration* — the key carries a digest of every config value that can
-    change the result (see :func:`retrieval_config_fingerprint`), so a redeploy
-    that flips a toggle cannot replay the previous configuration's entries.
-    Chat follow-ups re-run the same retrieval on every turn, and this cache
-    makes those turns skip embedding + rerank entirely. Empty sets are never
-    cached (see the guard comment by ``cache.set``). Bodies are not cached
-    (they are large); when ``need_body`` is set they are fetched from Qdrant
-    for the returned set.
+    Shared by /search and /chat so the two pipelines stay consistent. A non-empty
+    result set is cached in Redis because it is deterministic for a (query,
+    filter) pair *under a given configuration* — the key carries a digest of every
+    config value that can change the result. Bodies are not cached (they are
+    large); when ``need_body`` is set they are fetched from Qdrant for the
+    returned set.
 
     ``prefetched`` carries the value a caller already read for this exact key
-    (``None`` meaning "already looked up, and it was a miss"). Supplying it
-    saves one Redis round trip; omitting it performs the normal lookup.
+    (``None`` meaning "already looked up, and it was a miss").
     """
     # Typo-corrected, then normalised. This one string flows to the cache key,
     # the retrieval legs and the boosts below, so equivalent spellings of a
@@ -1313,10 +1258,8 @@ async def retrieve_and_rerank(
     recency_boost = is_recency_intent(q)
     # The retrieve: key is assembled in one place, retrieve_cache_key, which
     # composes both bounds: _cache_key_component digests the query segment once
-    # it passes CACHE_KEY_QUERY_MAX_CHARS (issue #241), and build_cache_key
-    # length-prefixes the parts so the assembled key is injective and bounded as
-    # a whole (issue #252) -- the first bounds one component, the second the
-    # key. The filter JSON is exactly why both are needed.
+    # it passes CACHE_KEY_QUERY_MAX_CHARS, and build_cache_key length-prefixes
+    # the parts so the assembled key is injective and bounded as a whole.
     cache_key = retrieve_cache_key(q, top_k, qfilter)
     cached = await cache.get(cache_key) if prefetched is _NO_PREFETCH else prefetched
     if cached is not None:
@@ -1339,13 +1282,10 @@ async def retrieve_and_rerank(
     # Bodies are deliberately excluded from the cache entry: they are large and
     # chat re-fetches them from Qdrant on a cache hit (_attach_bodies).
     #
-    # Empty result sets are never cached: a transient retrieval failure (or a
-    # momentary empty candidate set) would otherwise be replayed as an
-    # authoritative "no results" for the whole CACHE_TTL_SECONDS window, which
-    # is exactly the bug where a date-filtered query returned nothing for
-    # minutes. Skipping the write (rather than caching a short TTL) is the safer
-    # default: it fails toward correctness, and re-running the pipeline costs
-    # far less than serving a wrong answer.
+    # Empty result sets are never cached: a transient retrieval failure would
+    # otherwise be replayed as an authoritative "no results" for the whole
+    # CACHE_TTL_SECONDS window. Skipping the write fails toward correctness, and
+    # re-running the pipeline costs far less than serving a wrong answer.
     if reranked:
         await cache.set(cache_key, [a.model_dump(exclude={"body"}) for a in reranked])
     return reranked
@@ -1374,36 +1314,24 @@ async def retrieve_with_auto_facet_fallback(
     final_content_type)`` where the final facets reflect any fallback, so callers
     can key caches/notes on what was actually retrieved.
 
-    ``industry``/``dealtype``/``content_type`` are the caller-supplied (explicit)
-    facets; when one is None the matching ``auto_*`` value is used instead. An auto
-    facet is a *semantic* guess mapped onto the corpus's tag vocabulary (e.g.
-    'edtech' -> the 'Education' industry facet). When the corpus tags most of those
-    articles differently (VCCircle tags edtech articles 'TMT', not 'Education'),
-    the exact-match industry filter combined with a date window returns nothing and
-    silently kills the query. Only an *empty* result set triggers the retry (the
-    empty attempt is not cached), and only the auto facets are dropped: an
-    explicit user-supplied facet and the date window always stay, so a genuinely
-    empty corpus still reports an honest "no results".
+    An auto facet is a *semantic* guess mapped onto the corpus's tag vocabulary
+    (e.g. 'edtech' -> the 'Education' industry facet). When the corpus tags most of
+    those articles differently, the exact-match filter combined with a date window
+    returns nothing and silently kills the query. Only an *empty* result set
+    triggers the retry (the empty attempt is not cached), and only the auto facets
+    are dropped: an explicit user-supplied facet and the date window always stay,
+    so a genuinely empty corpus still reports an honest "no results". All auto
+    facets are dropped together rather than probing each alone: dropping any one
+    is a relaxation of the same semantic guess, and the broader set is the safer
+    answer for a query that otherwise would have returned nothing.
 
     ``tag`` has no auto counterpart — a tag is an entity or topic name, not a
-    semantic guess — so it is always explicit, and it is carried into the
-    relaxed retry unchanged like every other explicit facet. Dropping it would
-    answer a different question than the one asked, and it is not part of the
-    returned facet triple because it can never be relaxed.
-
-    The fallback is deliberately bounded: it fires only when the first retrieval
-    returned nothing AND an auto facet is present, and the retry itself re-runs
-    retrieval (so a transient miss that then succeeds simply restores the good
-    path). The only cost of a double-transient miss is that the auto facet is
-    relaxed into a broader result — a graceful degradation, never a crash or
-    fabricated data. All auto facets are dropped together (rather than probing
-    each alone): dropping any one of them is a relaxation of the same semantic
-    guess, and the broader set is the safer answer for a query that otherwise
-    would have returned nothing.
+    semantic guess — so it is always explicit and is carried into the relaxed
+    retry unchanged. It is not part of the returned facet triple because it can
+    never be relaxed.
 
     ``prefetched`` is the already-read cache value for the *primary* (effective)
-    facet filter, forwarded to :func:`retrieve_and_rerank` so a caller that
-    already had to read that key does not pay for it twice.
+    facet filter, forwarded to :func:`retrieve_and_rerank`.
     """
 
     eff_industry = industry or auto_industry
@@ -1425,7 +1353,7 @@ async def retrieve_with_auto_facet_fallback(
         )
     # A single below-gate hit (score under the chat relevance gate) left by a
     # mis-applied auto facet is effectively a dead result set, so relax the auto
-    # facet(s) for it too, not only for a fully empty set (#172).
+    # facet(s) for it too, not only for a fully empty set.
     lone_weak_hit = len(results) == 1 and results[0].score < config.ASK_MIN_SCORE
     if (results and not lone_weak_hit) or not (auto_industry or auto_dealtype or auto_content_type):
         results = await _temporal_date_fallback(
@@ -1472,13 +1400,12 @@ async def _temporal_date_fallback(
     need_body: bool,
 ) -> list[SourceArticle]:
     """When a date-scoped query has too few relevance-passing hits, fill the gap
-    with the window's most recent articles (retrieved purely by date, ignoring the
-    weak lexical query).
+    with the window's most recent articles (retrieved purely by date).
 
     A temporal query's date window IS the intent, so recency within that window
-    is a valid relevance signal even when the words carry no lexical match. Returns
-    ``results`` unchanged when no date window is set, when enough hits already
-    pass, or when the date window itself is empty."""
+    is a valid relevance signal even when the words carry no lexical match.
+    Returns ``results`` unchanged when no date window is set, when enough hits
+    already pass, or when the date window itself is empty."""
     if not (from_date or to_date):
         return results
     strong = [r for r in results if r.score >= config.ASK_MIN_SCORE]
@@ -1509,17 +1436,14 @@ async def retrieve_by_date_window(
     most recent articles published in [from_date, to_date], narrowed by the same
     facets the lexical leg was given, so filling a gap cannot widen the caller's
     filter. Used as the temporal fallback when lexical matching is too weak to
-    surface anything — recency within the window becomes the relevance signal.
-    Articles are scored by recency so they clear the chat relevance gate and sort
-    newest-first."""
+    surface anything — recency within the window becomes the relevance signal."""
     qfilter = build_facet_filter(industry, dealtype, author, from_date, to_date, None, tag)
     if qfilter is None:
         return []
     # `published_date` carries a DATETIME payload index, so `order_by` returns the
     # window's most-recent `top_k` articles directly — no full-window
     # materialization (a year-wide window could otherwise page millions of points
-    # into memory). This bounds the work to O(top_k) while still selecting by true
-    # recency rather than an arbitrary ID-ordered slice.
+    # into memory). This bounds the work to O(top_k).
     points, _ = await state["qdrant"].scroll(
         collection_name=config.QDRANT_COLLECTION,
         scroll_filter=qfilter,
@@ -1546,14 +1470,13 @@ async def retrieve_by_date_window(
             # Score on a recency-agnostic base; the recency multiplier is applied
             # exactly once in sort_results so merged results share one scale with
             # lexical (cross-encoder) hits instead of double-counting recency.
-            # Date-only fillers sit at a modest floor: at/below the chat
-            # relevance gate but strictly below the typical lexical
-            # (cross-encoder) band -- real relevant hits sigmoid-score well
-            # above it -- so they surface without outranking a genuine lexical
-            # match (and, via _merge_results' body preference, never drop an
-            # article body). The floor is now independent of the chat gate, so
-            # it clears that gate only while it is kept at or above
-            # config.ASK_MIN_SCORE, which the shipped defaults (both 0.2) do.
+            # Date-only fillers sit at a modest floor: at/below the chat relevance
+            # gate but strictly below the typical lexical (cross-encoder) band --
+            # real relevant hits sigmoid-score well above it -- so they surface
+            # without outranking a genuine lexical match (and, via
+            # _merge_results' body preference, never drop an article body). The
+            # floor is independent of the chat gate, so it clears that gate only
+            # while kept at or above config.ASK_MIN_SCORE.
             score=config.DATE_FILLER_SCORE,
         )
         for p in points
@@ -1591,10 +1514,8 @@ async def search(
     # One normalised spelling of the query drives everything below -- the cache
     # key, the retrieval text, the analytics record and the echoed response --
     # so equivalent spellings share a cache entry and no control character from
-    # the raw input can reach any of them. Query length is validated by FastAPI
-    # (min_length) before this, so a query built only from control characters
-    # can still normalise away to nothing; reject that rather than retrieving
-    # for an empty query.
+    # the raw input can reach any of them. A query built only from control
+    # characters can normalise away to nothing; reject that.
     q = normalize_text(q)
     if not q:
         raise HTTPException(status_code=400, detail="empty query")
@@ -1621,28 +1542,24 @@ async def search(
     # otherwise /search expands twice and diverges from the chat pipeline.
     eff_top_k = min(max(top_k, suggested_top_k(q) or 0), 50)
     # Same composition as the retrieve: key above -- the query segment is
-    # digested per CACHE_KEY_QUERY_MAX_CHARS (#241) and the whole key is
+    # digested per CACHE_KEY_QUERY_MAX_CHARS and the whole key is
     # length-prefixed so no two (query, top_k, facets) triples can share one
-    # entry (#252).
+    # entry.
     cache_key = search_cache_key(
         retrieval_q, eff_top_k,
         facet_cache_token(industry, dealtype, author, eff_from, eff_to, content_type, tag),
     )
     filtered = any((industry, dealtype, author, content_type, tag, from_date, to_date))
     # This request needs two cache entries: its own summary page, and the
-    # retrieval result set underneath it (retrieve_with_auto_facet_fallback ->
-    # retrieve_and_rerank reads the retrieve: key for the same query and the
-    # same effective facet filter). Reading them with one MGET costs a single
-    # round trip instead of two sequential ones on a miss, and the retrieval
-    # value is handed down so the inner lookup is not repeated. The two entries
-    # hold different payloads — the inner one is the full reranked article set
-    # (body excluded), the outer one the post-click-boost/diversity summary
+    # retrieval result set underneath it. Reading them with one MGET costs a
+    # single round trip instead of two sequential ones on a miss, and the
+    # retrieval value is handed down so the inner lookup is not repeated. The two
+    # entries hold different payloads — the inner one is the full reranked article
+    # set (body excluded), the outer one the post-click-boost/diversity summary
     # slice — so they are read together, not merged into one key.
     #
     # The filter and fixed query are derived exactly as the retrieval path
-    # derives them (retrieve_with_auto_facet_fallback applies
-    # build_facet_filter to the same effective facets; retrieve_and_rerank
-    # applies the same fix_query), so the prefetched key is the real one.
+    # derives them, so the prefetched key is the real one.
     prefetch_key = retrieve_cache_key(
         fix_query(retrieval_q)[0], eff_top_k,
         build_facet_filter(industry, dealtype, author, eff_from, eff_to, content_type, tag),
@@ -1684,14 +1601,13 @@ async def search(
     # an explicit-facet request, so the /search cache is skipped for them (the
     # retrieve_and_rerank cache, keyed by the actual filter, still applies).
     # `tag` is absent from this comparison on purpose: it has no auto counterpart
-    # to be relaxed into, so it can never make a result set that was filtered on
-    # it look unfiltered here.
+    # to be relaxed into.
     fell_back = final_industry != industry or final_dealtype != dealtype or final_content_type != content_type
     if results and not fell_back:
         await cache.set(cache_key, [to_summary(r).model_dump() for r in results])
     # `filtered` (computed above from the effective facets) is used unchanged so
-    # the cache-hit and cache-miss paths report the same semantics: the user's
-    # query intent carried the facet even when the fallback relaxed it out.
+    # the cache-hit and cache-miss paths report the same semantics: the query
+    # intent carried the facet even when the fallback relaxed it out.
     await record_search(q, len(results), bool(note), cached=False,
                         latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
     return SearchResponse(query=q, results=[to_summary(r) for r in results], cached=False,
@@ -1704,10 +1620,10 @@ BODY_TRUNCATION_NOTE = "\n[... body truncated ...]"
 
 
 def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) -> str:
-    """Packs an article's metadata + summary + body into a numbered
-    context block for the chat LLM prompt. The body excerpt is capped by
-    CHAT_BODY_CHAR_LIMIT, or by ``body_limit`` when the caller budgets a fixed
-    total across a larger source set (chat scales its source count to 'top N')."""
+    """Packs an article's metadata + summary + body into a numbered context block
+    for the chat LLM prompt. The body excerpt is capped by CHAT_BODY_CHAR_LIMIT, or
+    by ``body_limit`` when the caller budgets a fixed total across a larger source
+    set."""
     meta = s.published_date or "n/a"
     if s.author_names:
         meta += f" | Authors: {', '.join(s.author_names)}"
@@ -1730,8 +1646,9 @@ def source_context(s: SourceArticle, idx: int, body_limit: int | None = None) ->
     return "\n".join(parts)
 
 
-# v2, not v1: a v1 entry has no ``tags`` key, and serving it as if it did would
-# hand every caller an empty tag filter list until the TTL expired on its own.
+# A separate key, not a reused one: an entry written before ``tags`` existed has
+# no ``tags`` key, and serving it as if it did would hand every caller an empty
+# tag filter list until the TTL expired on its own.
 FACETS_CACHE_KEY = "facets:v2"
 FACETS_LIMIT = 200
 # How many of the most frequent tags /facets returns, for the same autocomplete
@@ -1744,34 +1661,30 @@ FACETS_LIMIT = 200
 # the tags a UI actually offers. This cap is applied to a finished frequency
 # ranking instead, so the answer is the true top N by article count and
 # independent of scroll order and page size; a tie is broken alphabetically so
-# the cached payload is stable rather than dependent on insertion order.
+# the cached payload is stable.
 TAGS_FACET_LIMIT = 200
-# How often the FACETS_LIMIT cap is evaluated, counted in POINTS CONSUMED rather
-# than in round trips. A capped scan stops the moment the cap is reached, so where
-# it stops has to be a property of the collection's scroll order: if the check only
-# ran once per page, widening the page would read more points before checking and
-# would change which values a truncated scan returns.
+# How often the FACETS_LIMIT cap is evaluated, counted in POINTS CONSUMED
+# rather than in round trips. A capped scan stops the moment the cap is reached,
+# so where it stops has to be a property of the collection's scroll order: if the
+# check only ran once per page, widening the page would read more points before
+# checking and would change which values a truncated scan returns.
 FACET_CAP_CHECK_EVERY = 256
 # Scroll page size for a facet scan. The walk ends when the collection is
 # exhausted, not when the cap is hit (the vocabulary is tiny), so the page size
 # -- not FACETS_LIMIT -- is what sets the round-trip count: ceil(M / page) calls
-# per key. 1024 rows of a single keyword payload field is a small response, so a
-# big collection is walked in a quarter of the calls, and it cannot move the
-# results: the same offsets are walked, the same points are consumed, and the cap
-# is checked at the same points in the walk.
+# per key. It cannot move the results: the same offsets are walked, the same
+# points are consumed, and the cap is checked at the same points in the walk.
 FACET_SCROLL_PAGE = 1024
 
 # The in-flight /facets miss. /facets is unauthenticated and the frontend fetches
-# it on every page load, so on a cold cache (first boot, Redis flush, expiry)
-# every caller that arrived while the scan was running used to start its own:
-# `cache.get` then `cache.set` is a check-then-act with nothing covering the gap,
-# and each of those scans walks the whole collection. The first caller starts the
-# task and the rest await that same one, so the scans AND the cache write happen
-# once between them. The scope is this process: gunicorn runs several workers, so
-# a cold-cache burst still costs one scan per worker rather than one per caller.
-# The entry is dropped by the task's own done callback, so a failure or a
-# cancelled request releases it instead of wedging the endpoint, and an entry left
-# behind by a dead loop is replaced rather than awaited.
+# it on every page load, so on a cold cache every caller that arrived while the
+# scan was running used to start its own: `cache.get` then `cache.set` is a
+# check-then-act with nothing covering the gap, and each of those scans walks the
+# whole collection. The first caller starts the task and the rest await that same
+# one, so the scans AND the cache write happen once between them. The scope is
+# this process: gunicorn runs several workers, so a cold-cache burst still costs
+# one scan per worker. The entry is dropped by the task's own done callback, so a
+# failure or a cancelled request releases it instead of wedging the endpoint.
 _facet_scan_task: asyncio.Task | None = None
 
 
@@ -1779,8 +1692,7 @@ def _release_facet_scan(task: asyncio.Task) -> None:
     """Drop the in-flight entry once the scan settles.
 
     Identity-checked, so a scan started after this one keeps its own entry, which
-    is what makes a failed scan retryable instead of wedging the key.
-    """
+    is what makes a failed scan retryable instead of wedging the key."""
     global _facet_scan_task
     if _facet_scan_task is task:
         _facet_scan_task = None
@@ -1798,17 +1710,14 @@ async def _facets_uncached() -> dict[str, list[str]]:
     ``tags`` is the exception on two counts. It ranks a free-text vocabulary by
     frequency over the whole collection (_top_facet_values), where the other two
     collect a controlled vocabulary and stop early (_facet_values) -- so it is
-    both the slowest scan and the one most likely to hit a client timeout, while
-    the other two finish in a fraction of it. It is also the only one whose
-    absence is survivable: the tag input is free text, so an empty suggestion
-    list still filters correctly on a typed tag, whereas losing industry or
-    dealtype empties the autocomplete the UI cannot work without.
-
-    So a failed or timed-out tag walk degrades to an empty list and is served
+    both the slowest scan and the one most likely to hit a client timeout. It is
+    also the only one whose absence is survivable: the tag input is free text,
+    so an empty suggestion list still filters correctly on a typed tag, whereas
+    losing industry or dealtype empties the autocomplete the UI cannot work
+    without. So a failed tag walk degrades to an empty list and is served
     alongside the two vocabularies that did answer, rather than turning a slow
     optional scan into a 500 for the whole endpoint. The failure is logged at
-    WARNING: it is a real degradation, and a silently empty tag list would read
-    as "this corpus has no tags".
+    WARNING: a silently empty tag list would read as "this corpus has no tags".
     """
     industry, dealtype, tags = await asyncio.gather(
         _facet_values("industry_names"),
@@ -1839,17 +1748,15 @@ async def _facets_single_flight() -> dict[str, list[str]]:
     away (client disconnect, timeout) does not abort the scan the other waiters
     are still on. The result is shared rather than copied: callers only read it.
 
-    Known consequence of shielding: if every waiter has already gone away and the
-    scan then fails, asyncio logs one "exception in shielded future" at ERROR
-    naming ``_facets_uncached``. It is one line per shared scan however many
-    waiters there were, and it reports a scan that genuinely failed.
-    """
+    Known consequence of shielding: if every waiter has gone and the scan then
+    fails, asyncio logs one "exception in shielded future" at ERROR naming
+    ``_facets_uncached`` -- one line per shared scan, reporting a genuine
+    failure."""
     global _facet_scan_task
     running = _facet_scan_task
     # A task carries its loop and awaiting one from a closed loop raises, so an
-    # entry left over from a dead loop is not reusable. The ASGI app is driven on
-    # a fresh loop per request by the test client, so a scan cut short by a
-    # closed loop is a real shape, not a theoretical one.
+    # entry left over from a dead loop is not reusable. The ASGI app is driven on a
+    # fresh loop per request by the test client, so that is a real shape.
     if running is not None and not running.done() and running.get_loop() is asyncio.get_running_loop():
         return await asyncio.shield(running)
     task = asyncio.create_task(_facets_uncached())
@@ -1861,11 +1768,9 @@ async def _facets_single_flight() -> dict[str, list[str]]:
 def _facet_point_values(payload: dict, key: str) -> list[str]:
     """The non-empty string values one point contributes to ``key``.
 
-    An array-valued keyword field (industry_names, tag_names) contributes each of
-    its elements and a scalar field its own value. Anything that is not a
-    non-empty string is dropped rather than stringified, so a malformed payload
-    cannot put ``'42'`` or ``'None'`` into a vocabulary a user can then select.
-    """
+    Anything that is not a non-empty string is dropped rather than stringified,
+    so a malformed payload cannot put ``'42'`` or ``'None'`` into a vocabulary a
+    user can then select."""
     value = payload.get(key)
     if isinstance(value, str):
         return [value] if value else []
@@ -1881,21 +1786,13 @@ async def _facet_values(key: str) -> list[str]:
     Qdrant-client 1.11 does not expose a stable public facet method, so we page
     through the collection (requesting only ``key``) and collect distinct values
     instead of reaching into the client's private HTTP internals. The result is
-    explicitly capped at FACETS_LIMIT and cached by the caller. Array-valued
-    keyword fields (e.g. industry_names) contribute each element as a distinct
-    value.
+    capped at FACETS_LIMIT and cached by the caller. Array-valued keyword fields
+    (e.g. industry_names) contribute each element as a distinct value.
 
-    The page size is FACET_SCROLL_PAGE rather than a token 256 because the walk
-    runs to the end of the collection, so page size is the only lever on round
-    trips. It is value-neutral because the cap is checked every
-    FACET_CAP_CHECK_EVERY points consumed rather than once per page: a truncated
-    scan stops at the same point in the collection's scroll order at either page
-    size.
-
-    NOTE: the cap is intentional and is NOT silently dropping data — facet
-    vocabularies here are small (well under FACETS_LIMIT); if the cap is ever hit
-    a warning is logged so it can be raised deliberately rather than masking a
-    runaway vocabulary.
+    The cap is checked every FACET_CAP_CHECK_EVERY points consumed rather than
+    once per page, so a truncated scan stops at the same point in the
+    collection's scroll order at either page size. The cap is intentional: these
+    vocabularies are small, and if it is ever hit a warning is logged.
     """
     values: set[str] = set()
     next_offset = None
@@ -1919,8 +1816,8 @@ async def _facet_values(key: str) -> list[str]:
             # returns an empty page without clearing the offset, which would
             # otherwise loop forever.
             break
-    # Explicit cap: if we stopped because the vocabulary hit FACETS_LIMIT (rather
-    # than exhausting the collection), flag it — the data is truncated by design.
+    # Explicit cap: if the walk stopped at FACETS_LIMIT rather than exhausting the
+    # collection, the data is truncated by design.
     if len(values) >= FACETS_LIMIT:
         logger.warning("facet %s hit FACETS_LIMIT=%d; results truncated", key, FACETS_LIMIT)
     return sorted(values)[:FACETS_LIMIT]
@@ -1930,17 +1827,13 @@ async def _top_facet_values(key: str, limit: int) -> list[str]:
     """The ``limit`` most frequent values for ``key``, most frequent first.
 
     The counterpart to :func:`_facet_values` for a vocabulary too large to
-    alphabetise. A tag is a free-text label rather than a controlled one, so the
-    values worth offering are the ones many articles share, and the top N cannot
-    be known without counting every value on every point: hence the full walk
-    with no early exit, and a Counter rather than a set. Memory is one entry per
-    distinct value (tens of thousands of strings), not one list per point —
-    values are tallied and dropped as the pages go by.
-
-    Ordering is by frequency with an alphabetical tie-break, so the result is a
-    property of the corpus rather than of the scroll order or the page size, and
-    the cached payload stays byte-stable across scans.
-    """
+    alphabetise. A tag is a free-text label rather than a controlled one, so
+    the values worth offering are the ones many articles share, and the top N
+    cannot be known without counting every value on every point: hence the full
+    walk with no early exit, and a Counter rather than a set. Ordering is by
+    frequency with an alphabetical tie-break, so the result is a property of
+    the corpus rather than of the scroll order, and the cached payload stays
+    byte-stable across scans."""
     counts: Counter[str] = Counter()
     next_offset = None
     while True:
@@ -1969,12 +1862,10 @@ async def facets():
     """Filter vocabularies for autocomplete, cached in Redis.
 
     ``industry`` and ``dealtype`` are the distinct values of the two controlled
-    vocabularies, alphabetically. ``tags`` is the ``TAGS_FACET_LIMIT`` most
-    frequent tag values, most frequent first, truncated after the ranking rather
-    than during the walk.
-
-    A miss is single-flight: one set of scans and one cache write shared by all
-    the callers that miss together, instead of one full-collection walk each.
+    vocabularies, alphabetically; ``tags`` is the most frequent tag values,
+    truncated after the ranking rather than during the walk. A miss is
+    single-flight: one set of scans and one cache write shared by all the
+    callers that miss together.
     """
     cached = await cache.get(FACETS_CACHE_KEY)
     if cached is not None:
@@ -1995,10 +1886,9 @@ async def _article_in_index(article_id: int | None) -> bool:
     this check an unauthenticated caller mints a click-boost record for any
     integer it likes: the record is inert until that id shows up in someone's
     results, and until then it is pure Redis growth under a key nothing reads.
-    Existence is a single indexed point lookup. Fails CLOSED (Qdrant down,
-    collection missing, or an id of an unusable type) because a click whose
-    article cannot be confirmed must not become a ranking vote; the raw click
-    counters are still recorded by ``record_click``.
+    Existence is a single indexed point lookup, and it fails CLOSED because a
+    click whose article cannot be confirmed must not become a ranking vote; the
+    raw click counters are still recorded.
     """
     if article_id is None:
         return False
@@ -2023,18 +1913,15 @@ async def _article_in_index(article_id: int | None) -> bool:
     dependencies=[Depends(public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN"))],
 )
 async def analytics_click(event: ClickEvent, request: Request):
-    """Anonymous result-click beacon from the public search page (no data
-    returned, so it stays open to keep collecting interaction analytics). The
-    optional ``id`` is the clicked article's feid, used by click-driven learning.
+    """Anonymous result-click beacon from the public search page (no data returned).
 
     Deliberately still unauthenticated: it is a fire-and-forget beacon fired by
     anonymous search traffic, and gating it on a session would drop the clicks
     of every logged-out visitor and add a 401 retry path to the frontend. The
     write amplification it invited is closed from the other side instead -- a
-    per-IP rate limit (the dependency above), a per-client dedupe of the ranking
-    vote in ``record_click``, and the index check below. Only the id is
-    validated; the click itself is always counted.
-    """
+    per-IP rate limit (the dependency above), a per-client dedupe of the
+    ranking vote in ``record_click``, and the index check below. Only the id
+    is validated; the click itself is always counted."""
     article_id = event.id if await _article_in_index(event.id) else None
     if event.id is not None and article_id is None:
         logger.info("click beacon id %s is not in the collection; recorded without a ranking vote", event.id)
@@ -2047,10 +1934,7 @@ def _analytics_unavailable(message: str) -> JSONResponse:
 
     The status line and the body must agree: a 200 carrying
     ``{"error": ...}`` is indistinguishable from a report whose counters are
-    genuinely all zero, which is how a dead analytics store turned into an
-    all-zero dashboard behind a healthy-looking status. The ``error`` key is
-    kept so a client that only inspects the body can still detect this.
-    """
+    genuinely all zero."""
     return JSONResponse(
         status_code=503,
         content={"error": message, "detail": "the analytics store could not be read"},
@@ -2065,18 +1949,16 @@ async def get_analytics_summary(
 ):
     """Aggregated search/click metrics. Admin-only (analytics:read).
 
-    The ``top_queries`` / ``click_top_queries`` lists carry an opaque per-query
-    digest, never the query text: a search query is user-authored content, and
-    aggregating by text made this a cross-user read of everyone's search
-    history. Each read is recorded in the durable admin audit trail, as
-    /analytics/chat is; a failure to record must not break the read.
+    The ``top_queries`` / ``click_top_queries`` lists carry an opaque
+    per-query digest, never the query text: a search query is user-authored
+    content, and aggregating by text made this a cross-user read of
+    everyone's search history. Each read is recorded in the durable admin
+    audit trail; a failure to record must not break the read.
 
     Answers 503 when the analytics Redis is unreachable, so a degraded read is
-    never served as a 200 all-zero report.
-    """
-    # The chat store is only here to hold the audit trail, so resolving it is
-    # part of the best-effort audit, not of the read: a deployment with no chat
-    # store must still serve the (text-free) summary rather than 500 on it.
+    never served as a 200 all-zero report."""
+    # The chat store is only here to hold the audit trail, so resolving it is part
+    # of the best-effort audit, not of the read.
     try:
         store = chat_module._require_store()
         await store.record_admin_audit(request.state.user_id, "analytics.summary.read")
@@ -2094,13 +1976,12 @@ async def get_analytics_chat(
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("analytics:read")),
 ):
-    """Cross-user chat usage (sessions, messages, tokens, cost). Admin-only.
+    """Cross-user chat usage. Admin-only.
 
-    Returns cross-user aggregates and per-session rows (opaque session id,
-    message count, cost/tokens, updated_at) — no user-authored text is ever
-    included. Each read is recorded in the durable admin audit trail; a failure
-    to record must not break the read itself. A chat store that cannot be read
-    answers 503 rather than a 200 body that looks like an empty store.
+    Returns cross-user aggregates and per-session rows — no user-authored
+    text is ever included. Each read is recorded in the audit trail. A chat
+    store that cannot be read answers 503 rather than a 200 body that looks
+    like an empty store.
     """
     store = chat_module._require_store()
     try:
@@ -2113,13 +1994,10 @@ async def get_analytics_chat(
         return _analytics_unavailable(str(exc))
 
 
-# =============================================================================
 # Recommendation API
-# =============================================================================
 
 # Dwell time is stored as a Redis hash VALUE, not a field name or a key, so it
-# does not drive key growth -- it is bounded only to keep a single request from
-# writing an arbitrary-length string.
+# does not drive key growth.
 MAX_DWELL_TIME_MS = 24 * 60 * 60 * 1000
 
 
@@ -2128,15 +2006,13 @@ class InteractionEvent(BaseModel):
 
     ``interaction_type`` is a closed enum, not free-form text: it becomes a
     Redis hash FIELD on ``article:interactions:{id}``, so an unchecked string
-    would mint a new unbounded field per call. ``article_id`` is a positive
-    integer, capped at the signed 64-bit range, and is verified against the
-    article index before any key is written, so a caller cannot mint keys for
-    ids that do not exist.
+    would mint a new unbounded field per call. ``article_id`` is verified
+    against the article index before any key is written.
     """
 
-    # ge=1 rejects 0/negative; le caps at int64 because Qdrant point ids are
-    # uint64/UUID and a larger value raises a client-side error rather than
-    # returning empty, which would turn a reject into a 500.
+    # ge=1 rejects 0/negative; le caps at int64 because a larger value raises a
+    # client-side error rather than returning empty, which would turn a reject into
+    # a 500.
     article_id: int = Field(..., ge=1, le=2**63 - 1, description="Indexed article id")
     interaction_type: InteractionType = InteractionType.CLICK
     dwell_time_ms: int | None = Field(None, ge=0, le=MAX_DWELL_TIME_MS)
@@ -2151,21 +2027,17 @@ class SimilarArticlesResponse(BaseModel):
 
 
 # Bumped when the cached recommendation shape changed. Entries written by the
-# previous shape still carry the full article `body` (up to BODY_CHAR_LIMIT
-# chars per article), and every recommend endpoint returns its cached value
-# verbatim, so a versioned key is what stops those pre-deploy entries from
-# being served for their remaining TTL.
+# previous shape still carry the full article `body`, and every recommend endpoint
+# returns its cached value verbatim, so a versioned key is what stops those
+# pre-deploy entries from being served for their remaining TTL.
 RECOMMEND_CACHE_VERSION = "v2"
-# One search view renders one similar list per result, so this cap is what
-# keeps a single request from asking for a whole page of them over and over:
-# each id costs the one Qdrant point-id query the per-article route would
-# have spent anyway, and the cap bounds how many of those one request can ask
-# for at once.
+# One search view renders one similar list per result, so this cap keeps a single
+# request from asking for a whole page of them over and over: each id costs the one
+# Qdrant point-id query the per-article route would have spent anyway.
 SIMILAR_BATCH_MAX_IDS = 20
 
 
 class SimilarArticlesBatchRequest(BaseModel):
-    """Request body for the batched similar articles endpoint."""
 
     article_ids: list[int] = Field(
         ...,
@@ -2178,7 +2050,6 @@ class SimilarArticlesBatchRequest(BaseModel):
 
 
 class SimilarArticlesGroup(BaseModel):
-    """One article's similar list, as returned inside a batch response."""
 
     article_id: int
     similar_articles: list[dict]
@@ -2186,13 +2057,11 @@ class SimilarArticlesGroup(BaseModel):
 
 
 class SimilarArticlesBatchResponse(BaseModel):
-    """Response for the batched similar articles endpoint."""
 
     results: list[SimilarArticlesGroup]
 
 
 class RecommendationsResponse(BaseModel):
-    """Response for personalized recommendations."""
     user_id: str
     recommendations: list[dict]
     limit: int
@@ -2207,14 +2076,13 @@ class TrendingResponse(BaseModel):
     window_days: int
 
 # /recommend/for-you caches one entry per distinct `limit`, and `limit` is
-# bounded, so a user's entire for-you cache is exactly
-# FOR_YOU_MAX_LIMIT - FOR_YOU_MIN_LIMIT + 1 knowable keys. Deriving that set is
-# what lets an interaction invalidate it with a single DEL; a prefix delete
-# would instead SCAN the whole keyspace, and SCAN ignores MATCH when deciding
-# how much work to do, so its cost tracks every key in the database rather than
-# the ~20 that match. Keep the two bounds below and the `Query` in get_for_you
-# in sync: widening the Query without widening this range would silently leave
-# cached entries behind.
+# bounded, so a user's entire for-you cache is exactly the
+# FOR_YOU_MIN_LIMIT..FOR_YOU_MAX_LIMIT set. Deriving that set is what lets an
+# interaction invalidate it with a single DEL; a prefix delete would instead
+# SCAN the whole keyspace, whose cost tracks every key in the database rather
+# than the ~20 that match. Keep the two bounds below and the `Query` in
+# get_for_you in sync: widening the Query without widening this range would
+# silently leave cached entries behind.
 FOR_YOU_MIN_LIMIT = 1
 FOR_YOU_MAX_LIMIT = 20
 
@@ -2223,11 +2091,7 @@ def _for_you_cache_key(user_id: str, limit: int) -> str:
     """The one place a /recommend/for-you cache key is spelled.
 
     The writer in ``get_for_you`` and the invalidator in
-    ``record_user_interaction`` must agree on this string exactly. They used to
-    be f-strings written out twice, and a change to one silently stopped the
-    other from matching, leaving a user's feed served from a stale entry until
-    its TTL ran out. Both call this instead.
-    """
+    ``record_user_interaction`` must agree on this string exactly."""
     return f"recommend:for-you:{user_id}:{RECOMMEND_CACHE_VERSION}:{limit}"
 
 
@@ -2242,10 +2106,9 @@ def _for_you_cache_keys(user_id: str) -> list[str]:
 @app.post(
     "/recommend/interaction",
     dependencies=[
-        # Both axes are required. One shared NAT address defeats the per-IP
-        # bucket; one account rotating addresses defeats nothing once the
-        # per-account bucket is present. Both go through the same
-        # _consume_counter, so neither can drift into weaker enforcement.
+        # Both axes are required. One shared NAT address defeats the per-IP bucket;
+        # one account rotating addresses defeats nothing once the per-account bucket
+        # is present.
         Depends(public_rate_limit("interaction", "PUBLIC_INTERACTION_RATE_PER_MIN")),
         Depends(user_rate_limit("interaction", "INTERACTION_USER_RATE_PER_MIN")),
     ],
@@ -2257,16 +2120,11 @@ async def record_user_interaction(
 ):
     """Record a user-article interaction for personalization.
 
-    Authenticated users only. Logs clicks, views, and reads to build
-    user preference profiles for personalized recommendations.
-
     Outage posture: the limiter is fail-closed, so a limiter-Redis outage
     answers 503 rather than serving an unbounded write path. This is NOT the
-    /ready exception -- no load balancer probes this endpoint, so there is no
-    health check to protect here. The trade is explicit: a Redis blip stops
-    interaction recording for everyone until it clears, costing personalization
-    signal, whereas failing open re-opens the amplification the limits close.
-    """
+    /ready exception -- no load balancer probes this endpoint. A Redis blip
+    stops interaction recording for everyone until it clears, whereas failing
+    open re-opens the amplification the limits close."""
     user_id = request.state.user_id
     result = await record_interaction(
         user_id=user_id,
@@ -2303,10 +2161,6 @@ async def get_similar(
     same_category: bool = Query(False),
     _auth: None = Depends(require_auth),
 ):
-    """Get articles similar to the specified article.
-
-    Uses dense vector similarity from Qdrant with optional category filtering.
-    """
     cached_key = _similar_cache_key(article_id, limit, same_category)
     cached = await cache.get(cached_key)
     if cached:
@@ -2338,13 +2192,10 @@ def _similar_cache_key(article_id: int, limit: int, same_category: bool) -> str:
 
     The single and the batched route share this so they cannot drift: two
     spellings of the same key would each miss the other's entries and re-run
-    the Qdrant query the cache exists to avoid, which is the exact cost #353
-    set out to remove.
-
-    The version is part of it for the reason RECOMMEND_CACHE_VERSION exists:
-    entries written before the payload narrowed still carry the full article
-    body, and both routes return a cached value verbatim, so a key without the
-    version would serve those pre-deploy entries for the rest of their TTL.
+    the Qdrant query the cache exists to avoid. The version is part of it for
+    the reason RECOMMEND_CACHE_VERSION exists: entries written before the
+    payload narrowed still carry the full article body, and both routes return
+    a cached value verbatim.
     """
     return f"recommend:similar:{RECOMMEND_CACHE_VERSION}:{article_id}:{limit}:{same_category}"
 
@@ -2358,11 +2209,9 @@ async def get_similar_batch(
 
     The same answer ``/recommend/similar/{id}`` gives, for a whole view at
     once: the cached lists are read with a single MGET rather than one GET
-    per article, and the caller spends one round trip per view rather than one
-    per search result. Ids are answered in request order, and an article with
-    no similar rows is reported as an empty list exactly as the per-article
-    route reports it.
-    """
+    per article. Ids are answered in request order, and an article with no
+    similar rows is reported as an empty list exactly as the per-article route
+    reports it."""
     # dict.fromkeys drops a repeated id while keeping the caller's order, so an
     # id listed twice costs one Qdrant query and one response group.
     article_ids = list(dict.fromkeys(body.article_ids))
@@ -2423,18 +2272,13 @@ async def get_for_you(
     _auth: None = Depends(require_auth),
     request: Request = None,
 ):
-    """Get personalized recommendations for the authenticated user.
+    """Personalized recommendations for the authenticated user.
 
-    Uses user interaction history, category affinity, and hybrid scoring
-    to surface relevant articles. A cold-start user -- one who is
-    authenticated but has no interaction history -- is served latest top
-    stories by ``get_personalized_recommendations`` and flagged via
-    ``cold_start`` in the response.
+    A cold-start user -- authenticated but with no interaction history -- is
+    served latest top stories and flagged via ``cold_start`` in the response.
 
-    Every caller reaching this handler has been through ``require_auth``,
-    which sets ``request.state.user_id`` to a real user id or the service
-    token id, so there is no anonymous case here (#303).
-    """
+    Every caller has been through ``require_auth``, which sets
+    ``request.state.user_id`` to a real user id or the service token id."""
     user_id = request.state.user_id
 
     cached_key = _for_you_cache_key(user_id, limit)
@@ -2474,11 +2318,6 @@ async def get_trending(
     limit: int = Query(config.RECOMMEND_DEFAULT_LIMIT, ge=1, le=20),
     _auth: None = Depends(require_auth),
 ):
-    """Get trending/popular articles based on click velocity.
-
-    Queries Redis for recent interaction counts and returns the most
-    engaged-with articles from the configured time window.
-    """
     cached_key = f"recommend:trending:{RECOMMEND_CACHE_VERSION}:{limit}"
     cached = await cache.get(cached_key)
     if cached:

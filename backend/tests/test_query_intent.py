@@ -35,8 +35,7 @@ def test_extract_year_range_span():
 
 
 def test_extract_year_range_span_reversed():
-    """A span written end-first is the same window, not an inverted one:
-    '2025 to 2024' must match '2024 to 2025' rather than from_date > to_date."""
+    """A span written end-first is the same window, not an inverted one."""
     assert extract_year_range("deals 2025 to 2024") == ("2024-01-01", "2025-12-31")
     assert extract_year_range("deals 2025-2024") == ("2024-01-01", "2025-12-31")
     assert extract_year_range("deals 2025 through 2024") == ("2024-01-01", "2025-12-31")
@@ -48,8 +47,6 @@ def test_extract_year_range_span_reversed_matches_ascending():
 
 
 def test_extract_year_range_last_and_this_year():
-    # query_intent derives "this/last year" from _CURRENT_YEAR, so assert relative
-    # to it instead of hardcoding 2025/2026.
     cur = _current_year()
     last = cur - 1
     assert extract_year_range("top articles last year") == (f"{last}-01-01", f"{last}-12-31")
@@ -185,8 +182,8 @@ def test_extract_list_topic_year_span_removed():
 
 
 def test_rewrite_niche_topic_flashback_kept_but_topic_extractable():
-    """The Flashback rewrite still fires, but the bare topic is recoverable for
-    the second (direct) retrieval leg used to surface niche articles."""
+    """The Flashback rewrite still fires, but the bare topic stays recoverable for
+    the second (direct) retrieval leg."""
     new_q, changed = rewrite_year_in_review("top venture debt providers in 2024")
     assert changed is True
     assert new_q == "Flashback 2024 venture debt providers"
@@ -223,13 +220,9 @@ def test_rewrite_skipped_for_month_query():
 
 
 def test_range_query_topic_covers_month_scoped_queries():
-    """Month-scoped topic extraction lives in ``range_query_topic`` (#303).
-
-    The old public ``month_query_topic`` was reachable only from its own
-    tests, so a change made there would silently not affect search. These
-    cases are pinned against the one path the app actually calls, so deleting
-    the duplicate cannot quietly drop month coverage.
-    """
+    """Month-scoped topic extraction is pinned against ``range_query_topic``,
+    the path the app actually calls, so a duplicate implementation cannot
+    quietly drop month coverage."""
     assert range_query_topic("top pharma deals of month january 2025") == "pharma deals"
     assert range_query_topic("deals in feb 2024") == "deals"
     assert range_query_topic("january 2025") is None
@@ -271,7 +264,7 @@ def test_extract_year_range_month_span_crosses_year():
 def test_extract_month_range_span_crosses_year_with_end_year():
     """A single year written after the END month anchors the end: a span that
     crosses the boundary must start the year BEFORE it, not return a future
-    span (issue #172: 'dec to jan 2024' was 2024-12..2025-01)."""
+    span ('dec to jan 2024' was 2024-12..2025-01)."""
     assert extract_month_range("deals in dec to jan 2024") == ("2023-12-01", "2024-01-31")
     assert extract_month_range("deals from december to january 2024") == ("2023-12-01", "2024-01-31")
     assert extract_month_range("deals in dec-jan 2024") == ("2023-12-01", "2024-01-31")
@@ -355,32 +348,27 @@ def test_extract_year_range_fiscal_single_and_consecutive_unchanged():
 
 
 # `_fiscal_range` resolves a date range from the fiscal-year grammar while
-# `_strip_time_tokens` deletes the same tokens from the retrieval query. Both
-# read one compiled regex (`_FY_RE`, whose groups are named); these cases pin
-# the resolved range AND the stripped text, so the two halves of the grammar
-# cannot drift apart again. Expected values are the pre-refactor behaviour.
+# `_strip_time_tokens` deletes the same tokens from the retrieval query; both
+# read one compiled regex. These cases pin the resolved range AND the stripped
+# text so the two halves of the grammar cannot drift apart.
 _FY_CASES = (
-    # span forms
+    # span forms, then a bare fiscal year in all three spellings
     ("fy 2020-2021", ("2020-04-01", "2021-03-31"), " "),
     ("fy 2020 to 2021", ("2020-04-01", "2021-03-31"), " "),
     ("fy 2020 through 2021", ("2020-04-01", "2021-03-31"), " "),
-    # bare fiscal year, all three spellings
     ("fy 2020", ("2019-04-01", "2020-03-31"), " "),
     ("fiscal 2025", ("2024-04-01", "2025-03-31"), " "),
     ("fiscal year 2025", ("2024-04-01", "2025-03-31"), " "),
     ("deals in fiscal year 2025", ("2024-04-01", "2025-03-31"), "deals    "),
-    # no fiscal reference at all
     ("latest startup deals", None, "latest startup deals"),
     ("top 10 companies", None, "top 10 companies"),
     # a span outranks a bare fiscal year even when the bare one comes first,
-    # and a bare 'fy' outranks 'fiscal' — tier order, not leftmost order
+    # and a bare 'fy' outranks 'fiscal': tier order, not leftmost order
     ("fiscal 2025 and fy 2020-2021", ("2020-04-01", "2021-03-31"), "  and  "),
     ("fiscal 2025 plus fy 2020", ("2019-04-01", "2020-03-31"), "  plus  "),
     ("fy 2020-2021 then fy 2022", ("2020-04-01", "2021-03-31"), "  then  "),
-    # the fused 'fiscal2020' spelling: `_fiscal_range` resolved it before the
-    # two grammars were unified, so the shared regex must keep resolving it —
-    # a regression to the stripping-only `\bfiscal\s+` form would drop the
-    # range here. Stripping it too is the deliberate convergence.
+    # the fused 'fiscal2020' spelling must keep resolving the range too; a
+    # regression to the stripping-only `\bfiscal\s+` form would drop it here.
     ("fiscal2020", ("2019-04-01", "2020-03-31"), " "),
     ("deals in fiscal2020", ("2019-04-01", "2020-03-31"), "deals    "),
 )
@@ -433,8 +421,8 @@ def test_range_query_topic():
 
 def test_chart_request_filler_stripped_from_topic():
     """Chart/table request words ('make a table of') describe the output format,
-    not the topic: they must not leak into the retrieval query or embedding
-    match is diluted and retrieval can fail ('make a table deals')."""
+    not the topic: they must not leak into the retrieval query or the embedding
+    match is diluted ('make a table deals')."""
     for q, expected in (
         ("make a table of top 15 deals in 2024-25", "deals"),
         ("show me a bar chart of top 15 deals in 2024-25", "deals"),
@@ -453,8 +441,7 @@ def test_chart_filler_not_stripped_from_real_topic_words():
     """'table' as a real topic word (not part of a chart request) must survive."""
     assert extract_list_topic("top table manufacturing deals in 2025") == "table manufacturing deals"
     assert range_query_topic("top table games funding") is None
-    # The 'table tennis' collocation is a topic, not a view request: the table
-    # noun must survive stripping so retrieval keeps the full topic.
+    # The 'table tennis' collocation is a topic, not a view request.
     assert query_intent._strip_chart_filler("share table tennis news") == "share table tennis news"
     assert not query_intent._is_chart_request("share table tennis news")
 
@@ -463,13 +450,11 @@ def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
     """Pin the module's clock to ``when``, which MUST be tz-aware (the stdlib
     has no ``AwareDatetime`` to annotate that with, so it is enforced here).
 
-    Only the clock is frozen: the module still converts to Asia/Kolkata
-    itself, so the date assertions below fail if that conversion is dropped
-    instead of passing on whatever the implementation happens to return.
-
-    A naive datetime is rejected rather than converted, because
-    ``astimezone`` would silently read it in the *host's* timezone -- the very
-    naive/aware bug this freeze exists to catch.
+    Only the clock is frozen: the module still converts to Asia/Kolkata itself,
+    so the date assertions below fail if that conversion is dropped instead of
+    passing on whatever the implementation happens to return. A naive datetime
+    is rejected rather than converted, because ``astimezone`` would silently
+    read it in the *host's* timezone.
     """
     if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
         raise ValueError(f"_freeze_utc needs an aware datetime, got {when!r}")
@@ -515,11 +500,10 @@ def test_freeze_rejects_naive_datetime(monkeypatch):
         _freeze_utc(monkeypatch, naive)
 
 
-# --- issue #253: the connective-span patterns must stay linear-time ---------
-# The five patterns frozen below are the PRE-FIX versions, copied verbatim
-# from app/query_intent.py. They are the oracle: bounding the gap is a
-# semantic narrowing, so every change to the live patterns has to be shown not
-# to move the result on realistic input.
+# The five patterns frozen below are the PRE-FIX (unbounded-gap) versions,
+# copied verbatim from app/query_intent.py. They are the oracle: bounding the
+# gap is a semantic narrowing, so every change to the live patterns has to be
+# shown not to move the result on realistic input.
 _ORIG_BOTH_AND_RE = re.compile(r"\bboth\b.+?\band\b", re.IGNORECASE)
 _ORIG_ALL_OF_RE = re.compile(r"\ball (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
 _ORIG_ACQUIRED_BY_RE = re.compile(
@@ -537,10 +521,10 @@ _ORIG_BUYER_TRAILING_RE = re.compile(
 )
 
 # `_BOTH_AND_RE`/`_ALL_OF_RE` are applied as SUBSTITUTIONS by
-# `_multi_entity_scaffold` (the whole "both A and B" span is what gets removed
-# to leave the scaffold), so equivalence for those two is compared on
-# `.sub(" ", s)`. The other three are only ever asked as booleans by
-# `acquisition_relation`, so their equivalence is compared as match truthiness.
+# `_multi_entity_scaffold` (the whole "both A and B" span is what gets removed to
+# leave the scaffold), so equivalence for those two is compared on `.sub(" ", s)`.
+# The other three are only ever asked as booleans by `acquisition_relation`, so
+# their equivalence is compared as match truthiness.
 _SUB_PAIRS = (
     (query_intent._BOTH_AND_RE, _ORIG_BOTH_AND_RE),
     (query_intent._ALL_OF_RE, _ORIG_ALL_OF_RE),
@@ -561,14 +545,14 @@ _ORACLES_BY_NAME = {
 # match ordinary English).
 #
 # The corpus below carries inputs chosen to DISCRIMINATE the pre-fix patterns
-# from the bounded ones. The sharpest is a connective with nothing (or almost
-# nothing) between its two ends: `_ALL_OF_RE`'s prefix `\ball ` ends in a
-# literal space, so a zero-width gap would let `\b(?:and|with)\b` match
-# straight after it and the pattern would match "all and" -- which the pre-fix
-# one-or-more gap could not. That widened the matcher, changed the
-# `_multi_entity_scaffold` substitution and flipped `detect_multi_entity` from
-# 'comparison' to 'intersection'. These fixtures are in the corpus so that
-# widening turns the equivalence assertions below red instead of passing.
+# from the bounded ones. The sharpest is a connective with nothing between its
+# two ends: `_ALL_OF_RE`'s prefix `\ball ` ends in a literal space, so a
+# zero-width gap would let `\b(?:and|with)\b` match straight after it and the
+# pattern would match "all and" -- which the pre-fix one-or-more gap could not.
+# That widened the matcher, changed the `_multi_entity_scaffold` substitution
+# and flipped `detect_multi_entity` from 'comparison' to 'intersection'. These
+# fixtures are in the corpus so that widening turns the equivalence assertions
+# below red instead of passing.
 _ZERO_GAP_FIXTURES = (
     "all and",
     "all with",
@@ -580,7 +564,6 @@ _ZERO_GAP_FIXTURES = (
     "both with",
 )
 _INTERSECTION_CORPUS = (
-    # Positives.
     "companies backed by both SoftBank and Tiger Global",
     "funds that have backed both Acme and Beta Capital",
     "deals with all of A, B and C",
@@ -588,8 +571,8 @@ _INTERSECTION_CORPUS = (
     "all of Acme, Beta and Gamma",
     "all of the seed cohort and their angels",
     "what do all of these investors have in common and who led them",
-    # Negatives: a connective with no closing "and"/"with" after it, or with
-    # the closing term only BEFORE it.
+    # Negatives: no closing "and"/"with" after the connective, or the closing
+    # term only BEFORE it.
     "both companies are large",
     "all of the above",
     "startups that SoftBank and Tiger Global have both backed",
@@ -669,8 +652,8 @@ def test_acquisition_corpus_exercises_both_polarities():
 
 # One realistic multi-clause query per pattern, a few hundred characters each
 # with a connective span in the tens of characters -- the shape of query this
-# code is actually asked about. A bound that were set too low, or an escaping
-# mistake in the f-string (`{{0,N}}` -> a literal brace), shows up here.
+# code is actually asked about. A bound set too low, or an escaping mistake in
+# the f-string (`{{0,N}}` -> a literal brace), shows up here.
 _LONG_BOTH_AND = (
     "Among the Series B rounds announced across India and Southeast Asia this quarter, "
     "the two funds that showed up on the most term sheets were the ones backed by both "
@@ -727,8 +710,8 @@ def test_connective_gaps_are_bounded_and_groups_preserved():
     pattern really carries a bound, and that no unbounded gap survived.
 
     The LOWER bound is per-pattern: `_ALL_OF_RE` needs `{1,N}` because its
-    pre-fix gap was one-or-more, and a zero floor there would widen the
-    matcher (see `_ALL_OF_RE`'s comment). The rest take `{0,N}`.
+    pre-fix gap was one-or-more, and a zero floor there would widen the matcher
+    (see `_ALL_OF_RE`'s comment). The rest take `{0,N}`.
     """
     n = query_intent._MAX_CONNECTIVE_SPAN
     for new, orig in _SUB_PAIRS + _SEARCH_PAIRS:
@@ -747,22 +730,20 @@ def test_oracles_reproduce_pre_fix_reachability():
     pin the oracles' own behaviour on inputs that DISCRIMINATE them from the
     live patterns.
 
-    A previous version of this derived the expected oracle source from the
-    live pattern by string substitution. That certified a *transformation*
-    rather than a behaviour, and it was blind to the real defect: the live
-    `_ALL_OF_RE` gap had been changed from one-or-more to zero-or-more, which
-    that substitution happily "undid" back to `+?`, so the test stayed green
-    while the matcher had silently widened to match "all and".
-
-    Checking behaviour means an oracle that drifts -- in either direction, or
-    in the same direction as the live pattern -- fails here instead.
+    Deriving the expected oracle source from the live pattern by string
+    substitution certifies a *transformation* rather than a behaviour, and it is
+    blind to the real defect: the live `_ALL_OF_RE` gap had been changed from
+    one-or-more to zero-or-more, which that substitution happily "undid" back to
+    `+?`, so the test stayed green while the matcher had silently widened to
+    match "all and". Checking behaviour means an oracle that drifts -- in either
+    direction, or in the same direction as the live pattern -- fails here.
     """
     # `_ALL_OF_RE`'s prefix ends in a literal space, so a zero-width gap lets
-    # `\b(?:and|with)\b` match immediately after it. The pre-fix gap was
-    # one-or-more, so neither of these matched before the gap was bounded.
-    # These two are the ONLY discriminating inputs: "all of and" and the
-    # longer fixtures DO match pre-fix, because their gap is at least one
-    # character, so asserting they do not match would fail on correct code.
+    # `\b(?:and|with)\b` match immediately after it, and the pre-fix gap was
+    # one-or-more, so neither of these matched before the gap was bounded. These
+    # two are the ONLY discriminating inputs: "all of and" and the longer
+    # fixtures DO match pre-fix, so asserting they do not would fail on correct
+    # code.
     for text in ("all and", "all with"):
         assert not _ORIG_ALL_OF_RE.search(text), text
         assert not query_intent._ALL_OF_RE.search(text), text
@@ -821,12 +802,11 @@ def test_pathological_query_scales_linearly(name, pat, make):
     cost is linear in the query and the ratio sits near 8.
 
     Per-pattern rather than summed -- summing lets four fixed patterns hide one
-    that is still quadratic, which is the exact regression this guards.
-
-    The small input is repeated so the denominator is a stable multi-call
-    number rather than a single sub-millisecond call, and the absolute ceiling
-    is seconds rather than milliseconds so a loaded CI box cannot fail on
-    scheduling noise. The growth ratio is the assertion that bites.
+    that is still quadratic, which is the exact regression this guards. The
+    small input is repeated so the denominator is a stable multi-call number,
+    and the absolute ceiling is seconds rather than milliseconds so a loaded CI
+    box cannot fail on scheduling noise. The growth ratio is the assertion that
+    bites.
     """
     small, large = 256, 2048
     _time_search(pat, make(8), 1)  # warm up

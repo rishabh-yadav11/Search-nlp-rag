@@ -1,17 +1,10 @@
 /**
- * Issue #287 — a hung `/recommend/similar/batch` response must not pin a
- * SimilarArticles card in "Loading..." forever. The stub holds the request open
- * until its signal aborts, which is what a silent backend looks like to
- * `fetch`: without a deadline the card is stuck on the loading branch forever.
+ * The stub holds the request open until its signal aborts, which is what a silent backend looks like to
+ * `fetch`. The deadline lives in `app/lib/similar.ts` on the shared batch request, so these tests drive
+ * the card but assert on the signal that module handed to `fetch`.
  *
- * The deadline lives in `app/lib/similar.ts`, on the shared batch request
- * (#353 moved the fetch there), so these tests drive the card but assert on the
- * signal that module handed to `fetch`.
- *
- * The component is imported fresh per test because `similar.ts` keeps its cache
- * and in-flight map at module scope: without a reset, a card from an earlier
- * test is served from memory and never issues a request, and every assertion
- * here would pass or fail on the wrong one.
+ * The component is imported fresh per test because `similar.ts` keeps its cache and in-flight map at
+ * module scope: without a reset, a card from an earlier test is served from memory and issues no request.
  */
 import { act, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -97,8 +90,7 @@ describe('SimilarArticles — a hung request does not pin the loading state', ()
     await act(async () => {
       screen.getByRole('button', { name: 'Retry' }).click()
     })
-    // The batch flush is a macrotask (see `similar.ts`), so fake timers have
-    // to be moved for request #2 to actually leave.
+    // The batch flush is a macrotask (see `similar.ts`), so fake timers must move for request #2.
     await advance(0)
     expect(signals).toHaveLength(2)
     expect(signals[1]?.aborted).toBe(false)
@@ -108,16 +100,12 @@ describe('SimilarArticles — a hung request does not pin the loading state', ()
 })
 
 describe('SimilarArticles — a cancelled card is silent while a live one is not', () => {
-  // The observable form of "unmounting does not report a timeout". Unmounting
-  // destroys the DOM, so an assertion after `unmount()` can only ever see a
-  // torn-down tree — it passes whether or not the component misbehaved. This
-  // keeps the card MOUNTED and swaps its articleId instead: the old request is
-  // abandoned and a new one starts, so a stray "did not load in time" from the
-  // abandoned request has a live component to render into and cannot hide.
+  // Unmounting destroys the DOM, so an assertion after `unmount()` sees a torn-down tree and passes
+  // either way. Keeping the card MOUNTED and swapping its articleId abandons the old request and starts
+  // a new one, giving a stray timeout from the abandoned request a live component to render into.
   it('renders no timeout message for a request the card stopped waiting on', async () => {
-    // Request #1 hangs until the deadline; #2 answers. That asymmetry is what
-    // makes the assertion observable: exactly one of the two requests fails,
-    // so if the card painted #1's failure the text would be on screen.
+    // #1 hangs until the deadline and #2 answers: exactly one request fails, so a painted #1 failure
+    // would be on screen.
     vi.stubGlobal(
       'fetch',
       vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
@@ -170,9 +158,8 @@ describe('SimilarArticles — a cancelled card is silent while a live one is not
   })
 
   it('still reports the timeout on the card that is actually waiting', async () => {
-    // The control for the test above: a single mounted card DOES surface the
-    // same elapsed time as an error, so the silence there is the unmount's
-    // doing and not an inert assertion.
+    // The control for the test above: a single mounted card DOES surface the same elapsed time, so the
+    // silence there comes from the abandoned request, not an inert assertion.
     const view = render(<SimilarArticles articleId={1} compact />)
     await advance(0)
     expect(signals).toHaveLength(1)

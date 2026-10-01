@@ -1,12 +1,4 @@
-/**
- * Issue #269 — streaming renders re-parse every settled assistant answer.
- *
- * `AnswerBody` is the only component that pays for markdown parsing, and it
- * parses from the first statement of its body (`splitContent(content)`). The
- * spy below delegates to the real implementation, so the counts below are an
- * exact measure of how many times each answer was re-parsed while the DOM that
- * follows is genuinely rendered — no synthetic replica of the page is involved.
- */
+/** The `splitContent` spy delegates to the real parser, so its counts measure exactly how often each settled answer is re-parsed. */
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as DataVizModule from './DataViz'
@@ -28,10 +20,8 @@ vi.mock('./DataViz', async () => {
 
 const { safeUrlCalls } = vi.hoisted(() => ({ safeUrlCalls: [] as string[] }))
 
-// `SourceList` is the only thing in the chat tree that calls `isSafeUrl`, once
-// per source, so its call count is an exact count of `SourceList` renders for a
-// message whose sources are expanded. The spy delegates to the real guard, so
-// the verdicts the assertions below rely on are the production ones.
+// `SourceList` is the only caller of `isSafeUrl`, one call per source, so the count is an exact count
+// of its renders. The spy delegates to the real guard, so the verdicts asserted below are production.
 vi.mock('../lib/safe-url', async () => {
   const actual = await vi.importActual<typeof SafeUrlModule>('../lib/safe-url')
   return {
@@ -45,14 +35,11 @@ vi.mock('../lib/safe-url', async () => {
 
 const SESSION = { id: 's1', title: 'Budget', created_at: 1_700_000_000, updated_at: 1_700_000_100 }
 
-// The signed-in user the /api/auth/me stub reports. The page decides whether to
-// redirect based on this, and there is no longer any storage-based session to
-// seed.
+// The user /api/auth/me reports; the page's signed-in check reads it, and there is no session in storage.
 const ME_USER = { id: 'u1', email: 'user@example.com', name: 'User', role: 'user', is_active: true }
 
-// Two settled turns. The first assistant message deliberately carries NO
-// `sources`, which is what makes the `sources={m.sources ?? []}` prop literal
-// on the hot render path allocate a fresh array on every tick.
+// The first assistant message carries NO `sources`, making `sources={m.sources ?? []}` allocate a fresh
+// array on every streaming tick.
 const SETTLED = [
   { id: 1, role: 'user', content: 'question one', created_at: 1_700_000_000 },
   { id: 2, role: 'assistant', content: 'SETTLED_ONE answer', created_at: 1_700_000_010 },
@@ -68,21 +55,18 @@ const SETTLED = [
 
 const SETTLED_TEXTS = ['SETTLED_ONE answer', 'SETTLED_TWO answer']
 
-// Six deltas, each spaced past the 50 ms render throttle, so every one of them
-// is a real streaming render — the ~20/s burst the issue describes.
+// Six deltas, each spaced past the 50 ms render throttle, so every one is a real streaming render.
 const DELTAS = ['LIVE a', 'LIVE ab', 'LIVE abc', 'LIVE abcd', 'LIVE abcde', 'LIVE abcdef']
 const STREAM_PREFIX = 'LIVE'
 const FINAL_ANSWER = 'LIVE abcdef done'
 
 let streamCtrl: ReadableStreamDefaultController<Uint8Array> | null = null
 
-// Every RequestInit the streaming fetch was called with, so the tests below can
-// assert on the request the page actually issued.
+// Every RequestInit the streaming fetch was called with.
 let streamInits: RequestInit[] = []
 
-// The fetch stub is used both for JSON endpoints and for the SSE response, so
-// its shape is pinned explicitly: without it TS cannot infer the callbacks
-// and reports them as implicit `any` (TS7023).
+// Explicitly typed: this stub serves both JSON endpoints and the SSE response, and TS cannot infer the
+// callbacks without it (TS7023).
 type StubResponse = {
   ok: boolean
   status: number
@@ -120,9 +104,7 @@ beforeEach(() => {
           }),
         }
       }
-      // The session is an httpOnly cookie now, so the page's "am I signed in?"
-      // check goes through /api/auth/me. Answer it with a user so the guard
-      // passes; the test never fakes a session via storage.
+      // The page's signed-in check goes through /api/auth/me; a user answer lets the guard pass.
       if (url.endsWith('/api/auth/me')) return jsonResponse(ME_USER)
       if (url.endsWith('/api/chat/sessions')) return jsonResponse([SESSION])
       if (url.includes('/api/chat/sessions/')) return jsonResponse({ ...SESSION, messages: SETTLED })
@@ -153,7 +135,7 @@ async function streamABurst() {
   for (const text of DELTAS) {
     await act(async () => {
       streamCtrl!.enqueue(encoder.encode(`event: delta\ndata: ${JSON.stringify({ text })}\n\n`))
-      // Longer than the 50 ms throttle, so each delta is its own render.
+      // Longer than the 50 ms render throttle, so each delta is its own render.
       const { promise, resolve } = Promise.withResolvers<void>()
       setTimeout(resolve, 60)
       await promise
@@ -190,8 +172,7 @@ describe('ChatPage — settled answers are not re-parsed while a new answer stre
     expect(splitCalls.filter((c) => c.startsWith(STREAM_PREFIX)).length).toBe(0)
     await streamABurst()
 
-    // One render per delta that landed outside the throttle window, plus the
-    // final flush and the commit into `messages`.
+    // One render per delta outside the throttle window, plus the final flush and the commit.
     expect(splitCalls.filter((c) => c.startsWith(STREAM_PREFIX)).length).toBeGreaterThanOrEqual(DELTAS.length)
     expect(countFor(FINAL_ANSWER)).toBeGreaterThanOrEqual(1)
   })
@@ -223,17 +204,14 @@ describe('ChatPage — settled answers are not re-parsed while a new answer stre
 })
 
 describe('ChatPage — a server-truncated thread is announced, not silently shortened', () => {
-  // The server returns only the most recent CHAT_SESSION_MESSAGE_LIMIT messages
-  // and flags the rest (issue #258). Dropping older messages without saying so
-  // would look like the user's history vanishing.
+  // The server returns only the most recent CHAT_SESSION_MESSAGE_LIMIT messages and flags the rest;
+  // dropping older messages without saying so would look like the user's history vanishing.
   function stubSessionDetail(detail: Record<string, unknown>) {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL): Promise<StubResponse> => {
         const url = String(input)
-        // The SSE route must be stubbed too, so a turn can be sent against a
-        // truncated thread; `streamABurst` writes into the controller it
-        // captures.
+        // The SSE route must be stubbed too so a turn can be sent against a truncated thread.
         if (url.includes('/messages/stream')) {
           return {
             ok: true,
@@ -298,8 +276,7 @@ describe('ChatPage — a server-truncated thread is announced, not silently shor
 
     await streamABurst()
 
-    // One more turn = one more user message and one more answer stored, and
-    // the loaded window is a fixed-size tail, so 10 hidden becomes 12.
+    // One more turn adds a user message and an answer, and the window is a fixed-size tail.
     expect(screen.getByRole('status').textContent).toContain('12')
   })
 })

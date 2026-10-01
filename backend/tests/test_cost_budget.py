@@ -1,13 +1,10 @@
 """Tests for the daily LLM spend cap (app/cost_budget) and the facet helper.
 
-The cap is enforced by reserving against it BEFORE a billed LLM call and
-settling the real cost afterwards, and it fails closed: an unreachable counter
-store refuses the call instead of reading as "no spend". The store is modelled
-by ``FakeBudgetStore``, which implements the server-side contract of the
-budget script (sweep expired holds, then compare-then-mutate in one atomic
-step) so concurrency and crash behaviour are exercised without a live Redis.
-The facet helper is tested against a fake Qdrant HTTP layer so the endpoint
-logic is exercised without a live server.
+The cap is enforced by reserving against it BEFORE a billed LLM call and settling
+the real cost afterwards, and it fails closed: an unreachable counter store
+refuses the call instead of reading as "no spend". The store is modelled by
+``FakeBudgetStore``, which implements the server-side contract of the budget
+script so concurrency and crash behaviour are exercised without a live Redis.
 """
 
 import ast
@@ -26,10 +23,10 @@ def _declared_env_default(var):
 
     ``Config`` evaluates that call in its class body, so ``config.<VAR>`` is
     whatever the ambient environment says -- a developer's untracked, gitignored
-    ``backend/.env`` included. A developer box that legitimately disables the cap
-    made the shipped default unobservable and turned a source-level guard into
-    an environment assertion. Reading the declaration keeps the guard on the
-    code that ships, and cannot mutate the module 700+ other tests import.
+    ``backend/.env`` included -- which made the shipped default unobservable and
+    turned a source-level guard into an environment assertion. Reading the
+    declaration keeps the guard on the code that ships, and cannot mutate the
+    module 700+ other tests import.
     """
     source = pathlib.Path(_config_module.__file__).read_text(encoding="utf-8")
     for node in ast.walk(ast.parse(source)):
@@ -41,15 +38,15 @@ def _declared_env_default(var):
             if not any(getattr(t, "id", None) == var for t in stmt.targets):
                 continue
             call = stmt.value
-            # The shipped form is float(os.getenv(var, default)); unwrap the
-            # conversion so the guard survives dropping or adding it.
+            # Unwrap the shipped float(...) conversion so the guard survives
+            # dropping or adding it.
             if isinstance(call.func, ast.Name) and len(call.args) == 1:
                 call = call.args[0]
             if not isinstance(call, ast.Call):
                 continue
             if not isinstance(call.func, ast.Attribute) or call.func.attr != "getenv":
                 continue
-            # os.getenv(name, default) -- the default is the second positional arg
+            # os.getenv(name, default): the default is the second positional arg
             args = call.args
             if len(args) < 2 or getattr(args[0], "value", None) != var:
                 continue
@@ -66,19 +63,18 @@ def _declared_env_default(var):
 def test_shipped_default_cap_is_not_disabled():
     """The cap must be ON by default, and nothing else pins it.
 
-    Every other test sets LLM_DAILY_BUDGET_USD through monkeypatch, so the
-    shipped value itself was unconstrained: restoring the fail-open default of
-    0 (= disabled) left the whole suite green. That default is the live-billing
-    decision the issue made deliberately, so it is asserted here rather than
-    left to a code comment (#255)."""
+    Every other test sets LLM_DAILY_BUDGET_USD through monkeypatch, so the shipped
+    value itself was unconstrained: restoring the fail-open default of 0 (= disabled)
+    left the whole suite green. That default is the live-billing decision, so it is
+    asserted here rather than left to a code comment."""
     assert float(_declared_env_default("LLM_DAILY_BUDGET_USD")) > 0.0
 
 
 def test_env_example_agrees_with_the_shipped_budget_default():
-    """``backend/.env.example`` is the template operators copy, so a default
-    that survives review in the code but not in the template still ships a
-    disabled cap to every new deployment. Both sides are read from files, so
-    this stays independent of any local ``.env``."""
+    """``backend/.env.example`` is the template operators copy, so a default that
+    survives review in the code but not in the template still ships a disabled cap
+    to every new deployment. Both sides are read from files, so this stays
+    independent of any local ``.env``."""
     declared = _declared_env_default("LLM_DAILY_BUDGET_USD")
     example = pathlib.Path(_config_module.__file__).resolve().parent.parent / ".env.example"
     values = [
@@ -115,11 +111,11 @@ def test_reserve_holds_then_blocks_and_rejection_creates_no_hold(monkeypatch):
 
 
 def test_concurrent_reserves_cannot_overspend(monkeypatch):
-    """Regression (#255): the old code read the counter, called the LLM, then
-    wrote the cost at the end of the turn, so 8 turns reserving 0.05 against a
-    0.15 cap all saw "under budget" and all 8 were admitted. Holding the
-    estimate before the call means the read-modify-write happens once, on the
-    server, so exactly cap/estimate turns get in."""
+    """The old code read the counter, called the LLM, then wrote the cost at the
+    end of the turn, so 8 turns reserving 0.05 against a 0.15 cap all saw
+    "under budget" and all 8 were admitted. Holding the estimate before the call
+    means the read-modify-write happens once, on the server, so exactly
+    cap/estimate turns get in."""
     store = _wire(monkeypatch, FakeBudgetStore())
     monkeypatch.setattr(cost_budget.config, "LLM_DAILY_BUDGET_USD", 0.15)
     results = _gather(*(cost_budget.reserve(0.05) for _ in range(8)))
@@ -143,15 +139,15 @@ def test_reserve_defaults_to_configured_per_call_hold(monkeypatch):
 
 
 def test_reserve_store_down_fails_closed(monkeypatch):
-    """An unreadable counter says nothing about how much is left, so the only
-    safe answer is to refuse the call. The old fail-open read admitted spend
-    from a down store, which is the case a cap exists to stop."""
+    """An unreadable counter says nothing about how much is left, so the only safe
+    answer is to refuse the call. A fail-open read would admit spend from a down
+    store, which is the case a cap exists to stop."""
     store = _wire(monkeypatch, BrokenStore())
     monkeypatch.setattr(cost_budget.config, "LLM_DAILY_BUDGET_USD", 5.0)
     with pytest.raises(cost_budget.BudgetUnavailable) as exc:
         _run(cost_budget.reserve(0.05))
-    # A distinct, catchable type: callers must be able to tell "out of money"
-    # from "cannot tell".
+    # A distinct, catchable type: callers must be able to tell "out of money" from
+    # "cannot tell".
     assert not isinstance(exc.value, cost_budget.BudgetExceeded)
     assert store.calls  # the store really was tried, then failed
     # The cached script handle is dropped so a restarted server re-registers.
@@ -159,11 +155,11 @@ def test_reserve_store_down_fails_closed(monkeypatch):
 
 
 def test_crashed_turn_stays_charged_when_its_hold_lapses(monkeypatch):
-    """A turn that reserves and then dies never settles, and the call it
-    covered was very likely billed. The sweep therefore CHARGES a lapsed hold
-    to the counter: the hold stops occupying the holds table (so one crash
-    cannot starve the cap until the day key rolls over) without ever making
-    the crashed call free spend, which is what deleting the hold did."""
+    """A turn that reserves and then dies never settles, and the call it covered
+    was very likely billed. The sweep therefore CHARGES a lapsed hold to the
+    counter: the hold stops occupying the holds table (so one crash cannot starve
+    the cap until the day key rolls over) without ever making the crashed call
+    free spend, which is what deleting the hold did."""
     store = _wire(monkeypatch, FakeBudgetStore())
     monkeypatch.setattr(cost_budget.config, "LLM_DAILY_BUDGET_USD", 0.05)
     monkeypatch.setattr(cost_budget.config, "COST_RESERVATION_TTL_SECONDS", 900)
@@ -249,8 +245,8 @@ def test_release_never_refunds_a_charge_the_sweep_already_made(monkeypatch):
 
 
 def test_zero_per_call_reserve_knob_cannot_switch_the_cap_off(monkeypatch):
-    """A non-positive LLM_CALL_RESERVE_USD used to make every hold worth zero,
-    so `total + amount > budget` could never trip and the cap silently admitted
+    """A non-positive LLM_CALL_RESERVE_USD would make every hold worth zero, so
+    `total + amount > budget` could never trip and the cap silently admitted
     unlimited concurrent turns. The hold is floored at one micro-USD, so the
     budget still runs out -- at cap/1micro turns -- and no 0 hold is stored."""
     store = _wire(monkeypatch, FakeBudgetStore())
@@ -408,14 +404,11 @@ def test_to_usd_canonical_unit(monkeypatch):
 
 
 def test_to_usd_falls_back_to_one_rate_and_warns_once(monkeypatch, caplog):
-    """An unconfigured INR_PER_USD must not silently rescale every recorded
-    cost. The module falls back to a 1.0 rate -- so the recorded USD is the raw
-    INR figure rather than a wrong conversion -- and warns, but only ONCE: a
-    misconfigured deploy would otherwise emit a warning on every turn for the
-    life of the process.
-
-    The checked "1.0 fallback rate" claim in TEST_COVERAGE_GAPS.md referred to
-    this branch, and nothing executed it."""
+    """An unconfigured INR_PER_USD must not silently rescale every recorded cost.
+    The module falls back to a 1.0 rate -- so the recorded USD is the raw INR
+    figure rather than a wrong conversion -- and warns, but only ONCE: a
+    misconfigured deploy would otherwise warn on every turn for the life of the
+    process."""
     monkeypatch.setattr(cost_budget.config, "INR_PER_USD", 0.0)
     monkeypatch.setattr(cost_budget, "_inr_fallback_warned", False)
 
@@ -485,20 +478,19 @@ _BASE_TS = 1_700_000_000
 class FakeBudgetStore:
     """In-memory model of the Redis side of ``_BUDGET_LUA``.
 
-    It implements the contract the script relies on rather than echoing the
-    call: one atomic operation that (1) sweeps lapsed holds into real spend,
-    (2) compares the counter plus every live hold against the cap, and
-    (3) mutates -- with no await in the middle. That is what makes the
-    concurrency test mean anything: the store refuses the 4th simultaneous
-    0.05 hold against a 0.15 cap exactly as Redis would, because the whole
-    read-modify-write is one step.
+    It implements the contract the script relies on rather than echoing the call:
+    one atomic operation that (1) sweeps lapsed holds into real spend, (2) compares
+    the counter plus every live hold against the cap, and (3) mutates -- with no
+    await in the middle. That is what makes the concurrency test mean anything:
+    the store refuses the 4th simultaneous 0.05 hold against a 0.15 cap exactly
+    as Redis would.
 
-    ``accounted`` is the fourth key: reservation id -> micros already charged
-    on that id's behalf (0 once settled). The sweep writes a crashed hold's
-    estimate there after charging it, settle reads it back to replace that
-    estimate with the real cost, and its presence is what makes a repeated
-    settle a no-op. The same scenarios run against the real Lua in
-    ``test_budget_lua.py``, so the two cannot drift apart silently.
+    ``accounted`` is the fourth key: reservation id -> micros already charged on
+    that id's behalf (0 once settled). The sweep writes a crashed hold's estimate
+    there after charging it, settle reads it back to replace that estimate with
+    the real cost, and its presence is what makes a repeated settle a no-op. The
+    same scenarios run against the real Lua in ``test_budget_lua.py``, so the two
+    cannot drift apart silently.
     """
 
     def __init__(self):
@@ -530,11 +522,11 @@ class FakeBudgetStore:
             # whatever the sweep already charged for these ids.
             #
             # Three ledger states, and collapsing any two of them loses money:
-            # absent -> a live hold never charged (charge it); value > 0 ->
-            # the sweep charged this id's estimate (refund it and charge the
-            # real cost instead, a replacement not a sum); value == 0 -> an
-            # earlier settle already charged it (charge nothing, which is what
-            # makes settle idempotent).
+            # absent -> a live hold never charged (charge it); value > 0 -> the
+            # sweep charged this id's estimate (refund it and charge the real
+            # cost instead, a replacement not a sum); value == 0 -> an earlier
+            # settle already charged it (charge nothing, which is what makes
+            # settle idempotent).
             promoted = 0
             all_accounted = bool(ids)
             seen = set()

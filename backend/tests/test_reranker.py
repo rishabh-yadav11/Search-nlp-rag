@@ -1,9 +1,5 @@
 """Reranker tests: the torch-only construction and predict path.
 
-The ONNX/optimum fast path and its load/export/lock tests were removed together
-with the code they covered (optimum-onnx is not installable alongside the pinned
-transformers 5.x, so that path could never run — see app/reranker.py).
-
 ``sentence_transformers`` is faked in ``sys.modules`` so nothing downloads a
 model or runs real inference. A working ``optimum`` fake is installed in the
 default-backend test to prove construction does not take an ONNX path even when

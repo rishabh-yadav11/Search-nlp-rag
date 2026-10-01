@@ -2,8 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import SafeArticleLink from './SafeArticleLink'
-// Auth travels via the shared httpOnly session cookie through
-// `fetchSimilarArticles` (lib/similar.ts), which applies `authRequestInit`.
+// Auth rides the shared httpOnly cookie; `fetchSimilarArticles` applies `authRequestInit`.
 import { formatArticleDate } from '../lib/format'
 import { fetchSimilarArticles, peekSimilarArticles } from '../lib/similar'
 import type { SimilarArticle } from '../lib/similar'
@@ -28,20 +27,14 @@ export default function SimilarArticles({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
-  // Bumped by the error state's Retry button and part of the fetch effect's
-  // deps, so a retry re-runs the request with a fresh deadline.
   const [retryCount, setRetryCount] = useState(0)
 
   useEffect(() => {
     if (!articleId) return
 
-    // No AbortController here on purpose. The request is shared with every
-    // other card in this view, so aborting it because THIS card unmounted
-    // would take the rest of the view's data down with it. Unmounting only
-    // means the answer is no longer worth applying. The deadline that bounds
-    // the socket therefore lives in `app/lib/similar.ts`, on the shared
-    // request itself: a backend that accepts the connection and never answers
-    // would otherwise pin every card in the view on "Loading..." forever.
+    // No AbortController on purpose: the request is shared with every other card in
+    // this view, so aborting it on THIS card's unmount would take the rest down.
+    // The deadline lives on the shared request in `app/lib/similar.ts`.
     let active = true
     setLoading(true)
     setError(null)

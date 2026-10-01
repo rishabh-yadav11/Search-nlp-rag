@@ -1,4 +1,4 @@
-"""Cache-key completeness and round-trip cost for /search (#266).
+"""Cache-key completeness and round-trip cost for /search.
 
 The retrieval cache is documented as "deterministic for a (query, filter) pair".
 It is only deterministic for a *(query, filter, configuration)* triple: the
@@ -63,7 +63,7 @@ IRRELEVANT_KNOBS = [
     "PUBLIC_SEARCH_RATE_PER_MIN",
 ]
 
-# Round trips a /search miss cost on one connection before #266, measured
+# Round trips a /search miss cost on one connection before the fix, measured
 # against the real base commit: GET(search:...), GET(retrieve:...) from inside
 # the retrieval leg, GET(vec:...) from inside hybrid_search, then SET(vec:...),
 # SET(retrieve:...) and SET(search:...).
@@ -392,9 +392,9 @@ def test_every_retrieval_knob_invalidates_a_populated_cache(monkeypatch, knob):
 def test_a_search_miss_costs_three_redis_round_trips(monkeypatch):
     """A miss reads both keys in one MGET and writes each entry once.
 
-    Before #266 the same request issued GET(search:...), then GET(retrieve:...)
-    from inside the retrieval leg, then SET(retrieve:...) and SET(search:...) --
-    four sequential round trips for the same work on one connection.
+    Before the fix the same request issued GET(search:...), then
+    GET(retrieve:...) from inside the retrieval leg, then SET(retrieve:...) and
+    SET(search:...) -- four sequential round trips for the same work.
     """
     cache = _wire_search(monkeypatch)
     _search()

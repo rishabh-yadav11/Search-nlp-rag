@@ -1,4 +1,4 @@
-"""Both chat prepare paths share ONE prompt-assembly tail (#265).
+"""Both chat prepare paths share ONE prompt-assembly tail.
 
 ``_prepare_turn`` (single entity) and ``_prepare_multi_entity_turn`` (comparison /
 intersection) each used to end in their own copy of the same code: join the
@@ -11,7 +11,7 @@ These tests pin three things the refactor must not change:
 * the exact prompt bytes each path produces (golden files captured from the
   pre-refactor code),
 * the retrieval-side behaviour deliberately LEFT per path, because it is
-  genuinely different — single-entity gates the merged list then slices
+  genuinely different -- single-entity gates the merged list then slices
   ``[: k]``, multi-entity gates per entity with no such slice,
 * the KeyError hazard a new ``CHAT_PROMPT`` field used to pose: with a format
   call in each path, updating only one copy made that path render and the other

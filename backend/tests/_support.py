@@ -1,10 +1,9 @@
-"""Test helpers that used to be copy-pasted into individual test modules.
+"""Test helpers shared across test modules.
 
 The coroutine runner, the article factory and the ``HybridCache`` stand-in each
 existed in several test files with signatures that had drifted apart. They live
 here once; every difference between the old copies is an explicit argument, so
-a test file states the shape it needs instead of carrying a private version of
-the helper.
+a test file states the shape it needs instead of carrying a private version.
 
 Not named ``_common``: that module is ``backend/scripts/_common.py``, imported as
 a top-level module by several tests, and ``backend/tests`` is on ``sys.path``.

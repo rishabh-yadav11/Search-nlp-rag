@@ -2,18 +2,16 @@
 
 The limiter's safety rests on two arguments to a single ``SET``: ``NX`` so the
 window is not re-armed on every hit, and ``EX`` so the counter is reclaimed when
-the window closes. Both are invisible to a permissive test double that accepts
-``**kwargs``, which is why these cases drive ``app.auth`` through a fake that
-models them and then assert on OBSERVABLE behaviour -- a subject that is
-throttled and later served again, a count that continues rather than restarts,
-and the order of the recorded calls.
+the window closes. Both are invisible to a permissive double that accepts
+``**kwargs``, so these cases drive ``app.auth`` through a fake that models them
+and assert on OBSERVABLE behaviour: a subject throttled and later served again,
+a count that continues rather than restarts, and the order of recorded calls.
 
-Except for the one case that exercises the double itself in isolation, every
-test here installs the fake via ``auth._rate_client``. They also assert
-``fake.violations == []``: ``_consume_counter`` wraps the Redis exchange in
-``except Exception`` and either fails closed with 503 or silently degrades to
-the in-process fallback, so a double that merely raised would keep the suite
-green while proving nothing. A violation is data, and it is asserted on.
+Except for the case that exercises the double itself, every test installs the
+fake via ``auth._rate_client`` and asserts ``fake.violations == []``:
+``_consume_counter`` wraps the Redis exchange in ``except Exception`` and either
+fails closed with 503 or silently degrades to the in-process fallback, so a
+double that merely raised would keep the suite green while proving nothing.
 """
 
 import asyncio

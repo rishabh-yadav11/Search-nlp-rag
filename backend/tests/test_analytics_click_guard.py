@@ -1,4 +1,4 @@
-"""Write-amplification guards on the anonymous /analytics/click beacon (#242).
+"""Write-amplification guards on the anonymous /analytics/click beacon.
 
 The beacon is intentionally unauthenticated (it is fired by anonymous search
 traffic), so these tests pin the controls that keep an unauthenticated caller
@@ -10,11 +10,9 @@ real boosting code, standing in only for Redis and Qdrant.
 Hermeticity: ``app/config.py`` calls ``load_dotenv()`` at import, so the live
 ``config`` object carries whatever a developer's ``backend/.env`` says -- and an
 env file that pins ``CLICK_BOOST_MIN_*`` silently replaces the shipped
-thresholds. These tests pin a security property, so they must not read whatever
-this machine happens to have: the autouse fixture below loads the SHIPPED policy
-and installs it on the live config. Vote counts are then derived FROM that
-policy, so each test states its claim for any valid thresholds rather than
-relying on one particular ratio between them holding.
+thresholds. These tests pin a security property, so the autouse fixture below
+loads the SHIPPED policy and installs it on the live config; vote counts are
+then derived FROM that policy.
 """
 import asyncio
 import importlib.util
@@ -32,10 +30,9 @@ from app.main import SourceArticle
 
 _client = TestClient(main.app, raise_server_exceptions=False)
 
-# The click-boost policy these tests run under. The values themselves are
-# pinned explicitly in test_shipped_click_boost_thresholds_are_the_shipped_ones,
-# so retuning the boost is a deliberate, visible act rather than something an
-# operator's .env can quietly redefine.
+# The click-boost policy these tests run under; the values themselves are pinned
+# in test_shipped_click_boost_thresholds_are_the_shipped_ones, so retuning the
+# boost is a deliberate, visible act rather than something a .env can redefine.
 _CLICK_POLICY_KNOBS = (
     "ENABLE_CLICK_BOOST",
     "CLICK_BOOST_MIN_CLICKS",
@@ -51,15 +48,12 @@ _CLICK_POLICY_KNOBS = (
 def _shipped_config(monkeypatch, **env):
     """Parse ``app/config.py`` in a private module under a controlled environment.
 
-    Two things have to be neutralised for the result to be the SHIPPED policy
-    rather than an echo of this machine: ``load_dotenv()`` runs inside
-    config.py and would repopulate ``os.environ`` from a developer's
-    ``backend/.env`` (and it resolves the file from the CALLING file's
-    location, not the CWD, so chdir alone would not keep it out), and the
-    ambient environment is replaced outright so an unrelated shell export
-    cannot leak in. monkeypatch undoes both. The load is private, so no other
-    module's ``config`` object is touched and the rest of the suite still sees
-    the process-wide config it had before.
+    ``load_dotenv()`` runs inside config.py and would repopulate ``os.environ``
+    from a developer's ``backend/.env`` (it resolves that file from the CALLING
+    file's location, not the CWD, so chdir alone would not keep it out), and the
+    ambient environment is replaced outright so an unrelated shell export cannot
+    leak in; monkeypatch undoes both. The load is private, so no other module's
+    ``config`` object is touched.
     """
     import dotenv
 
@@ -84,7 +78,6 @@ class FakeRedis:
         self.nx_keys: set[str] = set()
         self.queried: list[str] = []
 
-    # -- pipeline (record_click) --
     def pipeline(self):
         return _Pipeline(self)
 
@@ -101,7 +94,6 @@ class FakeRedis:
         self.ttls[key] = seconds
         return self
 
-    # -- direct (dedupe claim) --
     async def set(self, key, value, nx=False, ex=None):
         if nx and key in self.nx_keys:
             return None
@@ -157,9 +149,9 @@ class BrokenDedupeRedis(FakeRedis):
 
 
 class FlakyPipelineRedis(FakeRedis):
-    """Redis that accepts the dedupe claim but can be made to fail the write
-    that was supposed to record it, standing in for a failure between the two.
-    The claim and any release of it hit the same state, as they would in Redis.
+    """Redis that accepts the dedupe claim but can be made to fail the write it
+    was supposed to record, standing in for a failure between the two. The claim
+    and any release of it hit the same state, as they would in Redis.
     """
 
     def __init__(self, fail_pipeline: bool = True):
@@ -182,10 +174,8 @@ def _run(coro):
 
 # The secret every query digest is keyed with in this file. Pinned rather than
 # minted so the expected Redis key is a fixed, checkable value, and so none of
-# the fakes above has to implement the ``analytics:query_digest_key`` read that
-# ``_digest_key`` would otherwise make. The stored key is an opaque digest, not
-# the query text (#348) -- the click-boost signal is addressed the same way,
-# which is what these guards still exercise.
+# the fakes above has to implement the digest-key read. The stored key is an
+# opaque digest, not the query text.
 _TEST_DIGEST_KEY = "click-guard-test-digest-key"
 
 
@@ -194,12 +184,11 @@ def pinned_query_digest_key():
     """Install a fixed query-digest key for every test in this file.
 
     ``_QUERY_DIGEST_KEY`` is cached process-wide by design (it is the secret
-    shared by every gunicorn worker), so it must be seeded and cleared per test
-    or one test's key leaks into the next. Pinning it also keeps these
-    expectations independent of whatever ``ANALYTICS_QUERY_KEY`` this machine's
-    .env names, and -- because the key is resolved without a Redis round trip
-    -- leaves ``nx_keys`` holding only dedupe CLAIMS, which is what the claim
-    assertions below read.
+    shared by every gunicorn worker), so it must be seeded and cleared per test.
+    Pinning it also keeps these expectations independent of whatever
+    ``ANALYTICS_QUERY_KEY`` this machine's .env names, and -- because the key is
+    resolved without a Redis round trip -- leaves ``nx_keys`` holding only dedupe
+    CLAIMS, which is what the claim assertions below read.
     """
     analytics._QUERY_DIGEST_KEY = _TEST_DIGEST_KEY
     yield
@@ -223,14 +212,12 @@ def _qkey(query):
 def shipped_click_policy(monkeypatch):
     """Install the SHIPPED click-boost policy on the live config for every test.
 
-    Without this, these assertions read whatever the developer running them has
-    in ``backend/.env`` -- and #242 proved the cost of that: a .env pinning
-    ``CLICK_BOOST_MIN_*`` redefines the bar these tests claim to pin, so
-    ``_CLICK_POLICY_KNOBS`` are read from a clean parse of config.py and set
-    explicitly. The knobs are read at call time by the code under test, so
-    setting them here is enough to steer the real route, recording and
-    boosting. monkeypatch restores the ambient values afterwards, leaving the
-    rest of the suite exactly as it found them.
+    Otherwise these assertions read whatever the developer running them has in
+    ``backend/.env``, and a .env pinning ``CLICK_BOOST_MIN_*`` redefines the bar
+    these tests claim to pin, so ``_CLICK_POLICY_KNOBS`` are read from a clean
+    parse of config.py and set explicitly. The knobs are read at call time by the
+    code under test, so setting them here steers the real route, recording and
+    boosting; monkeypatch restores the ambient values afterwards.
     """
     shipped = _shipped_config(monkeypatch)
     for knob in _CLICK_POLICY_KNOBS:
@@ -243,25 +230,18 @@ def _votes_short_of_boost(target_votes):
 
     ``apply_click_boost`` boosts an article holding ``c`` clicks only when
     ``c >= CLICK_BOOST_MIN_ARTICLE_CLICKS`` AND ``c >= max(1, round(total *
-    CLICK_BOOST_MIN_SHARE))``. The share gate is the one an attacker's own
-    clicks cannot satisfy on their own: the more total traffic the query has,
-    the more filler is needed. Solving ``round(total * share) > target_votes``
-    for ``total`` gives the padding below, so the target's share sits strictly
-    under the threshold BY CONSTRUCTION -- it does not depend on
-    ``min_article / min_clicks < min_share`` happening to hold for whatever
-    thresholds are in force, which is what broke under a retuned or
-    .env-overridden policy.
+    CLICK_BOOST_MIN_SHARE))``. The share gate is the one an attacker's own clicks
+    cannot satisfy on their own, so the padding is SOLVED for: the target's share
+    sits strictly under the threshold BY CONSTRUCTION, for any valid thresholds,
+    rather than assuming ``min_article / min_clicks < min_share`` happens to hold.
 
     Returns ``(total_clicks, filler_votes)``; the caller is responsible for
     firing the filler from distinct clients so each one really is a vote.
     """
     share = config.CLICK_BOOST_MIN_SHARE
     if not 0 < share < 1:
-        # A share at or above 1 can never be crossed by any article, and a
-        # share of 0 makes every article a majority of the query. Neither is a
-        # threshold this test can demonstrate a minority share against, so the
-        # tests that use this helper say so rather than assert something the
-        # policy has made vacuous.
+        # A share at or above 1 can never be crossed by any article, and 0 makes
+        # every article a majority: neither can demonstrate a minority share.
         raise AssertionError(
             f"CLICK_BOOST_MIN_SHARE={share!r} admits no minority share; the "
             "click-guard thresholds are not a usable policy for this test"
@@ -336,18 +316,14 @@ def _boosted(store, query="ola ipo"):
     return _run(click_boost.apply_click_boost(query, _results()))
 
 
-# --- the attack from the issue: a burst of forged beacons ---
-
-
 def test_forged_beacon_burst_does_not_move_ranking(store, index):
-    """The issue's repro, post-fix: 5 forged beacons from one client for a real
-    article id leave both the scores and the order exactly as they were.
+    """5 forged beacons from one client for a real article id leave both the
+    scores and the order exactly as they were.
 
     The dedupe is the load-bearing part and holds for any policy: five beacons,
-    one vote. The ranking assertion is made independent of the thresholds by
-    giving the query real traffic from uninvolved clients, so the lone forged
-    vote is both under the per-article bar and a minority share. It is not left
-    to the accident that one vote happens to be too few at today's thresholds.
+    one vote. The ranking assertion is made threshold-independent by giving the
+    query real traffic from uninvolved clients, so the lone forged vote is both
+    under the per-article bar and a minority share.
     """
     for _ in range(5):
         assert _beacon("ola ipo", 1, 42).status_code == 200
@@ -368,18 +344,12 @@ def test_forged_beacons_from_distinct_clients_still_cannot_boost_one_article(sto
     the query is busy enough for the signal to be live at all: their votes hold
     too small a share of the query's total to be believed.
 
-    The attacker spends exactly the per-article allowance they are entitled to
-    (``CLICK_BOOST_MIN_ARTICLE_CLICKS`` distinct clients, one vote each -- the
-    most a single forged campaign can buy under the dedupe), and every other
-    click on the query comes from a different, uninvolved client. The filler
-    count is DERIVED so the target's share sits below ``CLICK_BOOST_MIN_SHARE``
-    by construction: the claim is about a minority never being believed, and
-    holds for any valid thresholds. It is not the case that
-    ``min_article / min_clicks < min_share`` happens to be true, which is what
-    the old count arithmetic silently assumed -- under a .env or a retuned
-    policy that ratio inverts, and a handful of clients really would boost the
-    article, so the test would fail for a reason that has nothing to do with the
-    dedupe it is here to pin.
+    The attacker spends exactly the per-article allowance it is entitled to, and
+    every other click on the query comes from a different, uninvolved client. The
+    filler count is DERIVED so the target's share sits below
+    ``CLICK_BOOST_MIN_SHARE`` by construction, which holds for any valid
+    thresholds; it is NOT the case that ``min_article / min_clicks < min_share``
+    happens to be true, a ratio that inverts under a .env or a retuned policy.
     """
     forged = max(1, config.CLICK_BOOST_MIN_ARTICLE_CLICKS)
     total, filler = _votes_short_of_boost(forged)
@@ -424,16 +394,12 @@ def test_one_client_cannot_manufacture_click_share(store, index):
     assert _boosted(store) == _results()
 
 
-# --- the legitimate path still works ---
-
-
 def test_distinct_clients_still_boost_a_genuinely_clicked_article(store, index):
     """The feature is not switched off: once enough distinct users click one
     result, that result is boosted and re-sorted.
 
-    The vote count is derived from the policy (every distinct client that the
-    boost needs at least), and the click is unanimous, so this holds for any
-    thresholds rather than for the particular counts shipped today.
+    The vote count is derived from the policy and the click is unanimous, so this
+    holds for any thresholds rather than for today's particular counts.
     """
     voters = max(
         config.CLICK_BOOST_MIN_CLICKS,
@@ -451,20 +417,16 @@ def test_distinct_clients_still_boost_a_genuinely_clicked_article(store, index):
 def test_shipped_click_boost_thresholds_are_the_shipped_ones(shipped_click_policy):
     """The shipped click-boost thresholds are pinned, deliberately.
 
-    #242 fixes the forged-burst attack with the per-client vote dedupe, which
-    defeats the attack at ANY threshold. It deliberately does NOT raise these
-    values: raising them also makes the boost harder to trigger for genuine
-    signal, which is a ranking-tuning decision that needs measurement, not a
-    side effect of a security fix. This test is where that decision gets made
+    The forged-burst attack is fixed by the per-client vote dedupe, which defeats
+    it at ANY threshold; raising these values is NOT part of that fix, because it
+    also makes the boost harder to trigger for genuine signal -- a ranking-tuning
+    decision that needs measurement. This test is where that decision becomes
     visible if it is ever made.
 
     The values are read from a clean parse of config.py with ``load_dotenv``
-    neutralised (see ``_shipped_config``), so what is asserted is what the code
-    ships -- not what a developer's ``backend/.env`` happens to override it
-    with. That override is exactly how #242's fix could be silently disabled:
-    an env file pinning ``CLICK_BOOST_MIN_*`` wins over the code default, and
-    every threshold-sensitive test here would then be asserting the operator's
-    policy while appearing to assert the repository's.
+    neutralised (see ``_shipped_config``), so an env file pinning
+    ``CLICK_BOOST_MIN_*`` cannot quietly redefine the policy every
+    threshold-sensitive test here claims to pin.
     """
     shipped = shipped_click_policy
     assert (
@@ -507,7 +469,6 @@ def test_raw_click_analytics_are_untouched_by_the_dedupe(store, index):
         f"analytics:click:pos:{i}": 1 for i in range(1, fired + 1)
     }
     assert store.sets["analytics:click_top_queries"] == {_digest("ola ipo"): float(fired)}
-    # ...while the ranking vote is one.
     assert store.sets[_qkey("ola ipo")] == {"42": 1.0}
 
 
@@ -536,20 +497,18 @@ def test_click_without_an_id_is_still_counted(store, index):
 
 
 def test_a_non_numeric_article_id_never_becomes_a_ranking_vote(store, index):
-    """``record_click`` is the module's public entry point, so its id handling
-    is pinned directly as well as through the route. A value that is not an
-    integer must not be written into the per-query sorted set -- a garbage
-    member there is a member the ranking layer can never interpret. The raw
-    click is still counted, exactly as for a beacon with no id at all."""
+    """``record_click`` is the module's public entry point, so its id handling is
+    pinned directly as well as through the route.
+
+    A value that is not an integer must not be written into the per-query sorted
+    set -- a garbage member there is one the ranking layer can never interpret.
+    The raw click is still counted, exactly as for a beacon with no id at all.
+    """
     _run(analytics.record_click("ola ipo", 1, article_id="not-an-int", client_ip="10.9.9.9"))
     _run(analytics.record_click("ola ipo", 1, article_id=None, client_ip="10.9.9.10"))
 
     assert not [k for k in store.sets if k.startswith("analytics:query_click:")]
-    # Both beacons were still counted -- the guard drops the vote, not the click.
     assert store.counters["analytics:click:total"] == 2
-
-
-# --- the client-supplied id must exist in the index ---
 
 
 def test_beacon_for_an_unknown_article_id_records_no_ranking_vote(store, index):
@@ -583,9 +542,6 @@ def test_dedupe_claim_failure_drops_the_ranking_vote(store, index, monkeypatch):
     assert not [k for k in broken.sets if k.startswith("analytics:query_click:")]
 
 
-# --- one logical query must not mint many boost keys ---
-
-
 def test_query_spellings_collapse_to_a_single_boost_key(store, index):
     """Case and whitespace variations are one query, so they share one key
     instead of each minting a boost record nothing reads back."""
@@ -595,9 +551,8 @@ def test_query_spellings_collapse_to_a_single_boost_key(store, index):
     assert [k for k in store.sets if k.startswith("analytics:query_click:")] == [
         _qkey("ola ipo")
     ]
-    # All five came from ONE client, so the canonicalised claim must collapse
-    # them to a single vote -- a per-spelling claim would let one client buy
-    # five votes just by varying its whitespace and case.
+    # All five came from ONE client, so the canonicalised claim must collapse them
+    # to a single vote -- a per-spelling claim would buy one client five votes.
     assert store.sets[_qkey("ola ipo")] == {"42": 1.0}
 
 
@@ -616,12 +571,10 @@ def test_normalisation_is_identical_on_the_read_path(store, index):
 @pytest.mark.parametrize(
     "label,query",
     [
-        # Under the cap: the two orders of collapse-then-bound and
-        # bound-then-collapse happen to agree, so this case proves nothing.
+        # Under the cap both orders of collapse and bound happen to agree.
         ("short", "Ola   IPO"),
-        # Over the cap AND containing a whitespace run: bounding the raw string
-        # first throws the tail away, collapsing first keeps it. These two
-        # orders disagree here, which is what stranded the vote.
+        # Over the cap AND containing a whitespace run, where the two orders
+        # disagree -- this is what stranded the vote.
         ("long with whitespace run", "a" * 100 + " " * 200 + "b" * 100),
         ("long trailing run", "a " * 300),
         ("long unbroken", "x" * 5_000),
@@ -646,9 +599,8 @@ def test_over_long_query_is_stored_bounded_and_expires(store, index):
     _beacon(huge, 1, 42, ip="10.3.3.3")
 
     (key,) = [k for k in store.sets if k.startswith("analytics:query_click:")]
-    # The key is a fixed-width digest, so it no longer grows with the beacon at
-    # all. The length cap still bounds what gets hashed, so a query past the cap
-    # keys identically to its bounded prefix -- the vote is not stranded.
+    # The key is a fixed-width digest, so it does not grow with the beacon; the
+    # length cap still bounds what gets hashed.
     assert len(key) == len(_qkey("x"))
     assert key == _qkey("ola ipo " + "x" * config.CLICK_QUERY_MAX_LEN)
     assert store.ttls[key] == config.CLICK_QUERY_TTL_SECONDS
@@ -666,9 +618,6 @@ def test_dedupe_claim_keys_carry_a_ttl_and_leak_no_ip_or_query(store, index):
     assert store.ttls[claim] == config.CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS
 
 
-# --- the beacon is still a public, per-IP rate-limited endpoint ---
-
-
 def test_beacon_remains_public_and_per_ip_rate_limited(store, index, monkeypatch):
     """No auth header, no cookie, no session: the beacon stays open so anonymous
     traffic is still measured. And the per-IP limit still bites -- one client
@@ -678,7 +627,6 @@ def test_beacon_remains_public_and_per_ip_rate_limited(store, index, monkeypatch
     first = _as("10.7.7.7")
     second = _as("10.7.7.8")
     for _ in range(2):
-        # No Authorization header was sent and none was demanded.
         assert first.post("/analytics/click", json={"query": "q", "position": 1}).status_code == 200
 
     over = first.post("/analytics/click", json={"query": "q", "position": 1})
@@ -696,7 +644,6 @@ def test_a_failed_write_gives_the_click_vote_back(store, index, monkeypatch):
     assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200
     assert not flaky.nx_keys, "the claim must not stay spent when the tally failed"
 
-    # The vote is still castable: the same client clicking again records it.
     healthy = FakeRedis()
     monkeypatch.setattr(analytics, "_client", lambda: healthy)
     assert _beacon("ola ipo", 1, 42, ip="10.4.4.4").status_code == 200

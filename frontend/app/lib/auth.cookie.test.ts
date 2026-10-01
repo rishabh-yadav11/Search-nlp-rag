@@ -1,16 +1,7 @@
-/**
- * Issue #247 — the session is an httpOnly cookie, not a token in localStorage.
- *
- * These tests pin the two properties the migration has to hold:
- *  1. JavaScript can never read the session, so nothing readable is left in
- *     storage and no request carries an `Authorization` header; and
- *  2. the httpOnly cookie only reaches the backend when we ask for it
- *     (`credentials: 'include'`), and only when the API base is trusted.
- */
+/** The session is an httpOnly cookie: JS can never read it, and it only reaches the backend when we send `credentials: 'include'` to a trusted API base. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as AuthTypes from './auth'
 
-/** The parts of the auth module these tests drive. */
 type AuthModule = Pick<
   typeof AuthTypes,
   | 'API_BASE'
@@ -43,12 +34,9 @@ function jsonResponse(data: unknown, status = 200): StubResponse {
 const USER_A = { id: 'a1', email: 'a@example.com', name: 'A', role: 'user', is_active: true }
 const USER_B = { id: 'b1', email: 'b@example.com', name: 'B', role: 'user', is_active: true }
 
-/** Every RequestInit the module handed to fetch, in order. */
 let fetchInits: RequestInit[] = []
-/** Every URL the module fetched, in order. */
 let fetchUrls: string[] = []
 
-/** Route a single URL to a response; anything else 404s. */
 let route: (url: string, init: RequestInit) => StubResponse
 
 beforeEach(() => {
@@ -74,8 +62,7 @@ afterEach(() => {
   vi.resetModules()
 })
 
-// The module keeps a time-keyed `/me` cache at module scope, so every test that
-// asserts on cache behaviour imports a FRESH copy of the module.
+// The `/me` cache is module scope, so cache tests need a FRESH copy of the module.
 async function freshAuth(): Promise<AuthModule> {
   vi.resetModules()
   return import('./auth')
@@ -83,22 +70,19 @@ async function freshAuth(): Promise<AuthModule> {
 
 describe('session cookie replaces the localStorage token', () => {
   it('leaves no usable credential in localStorage after a successful login', async () => {
-    // A pre-cookie build left a readable token behind: the worst case, because
-    // a working session is already sitting in storage when the user signs in.
+    // Worst case: a working session is already sitting in storage when the user signs in.
     localStorage.setItem(LEGACY_KEY, 'stale-jwt-from-old-build')
     const auth = await freshAuth()
 
     route = () =>
       jsonResponse({
-        // The backend returns the user, not a token. The stub deliberately
-        // includes token-looking fields the client must ignore entirely.
+        // Token-looking fields the client must ignore entirely.
         user: USER_A,
         access_token: 'SHOULD-NEVER-BE-STORED',
         token: 'SHOULD-NEVER-BE-STORED',
       })
 
-    // Exactly what the login page does: POST the login, read the body, then
-    // reset the cached identity and drop the legacy key.
+    // Mirrors the login page: POST, then drop the legacy token and reset the cache.
     const res = await fetch('/api/auth/login', auth.authRequestInit({ method: 'POST' }))
     const body = (await res.json()) as Record<string, unknown>
     auth.clearMeCache()
@@ -107,18 +91,14 @@ describe('session cookie replaces the localStorage token', () => {
     await auth.getMe()
 
     expect(body.user).toEqual(USER_A)
-    // The old key is gone...
     expect(localStorage.getItem(LEGACY_KEY)).toBeNull()
-    // ...and nothing replaced it: no key of any name holds a credential, and in
-    // particular no response field was persisted.
     expect(localStorage.length).toBe(0)
     expect(JSON.stringify({ ...localStorage })).not.toContain('SHOULD-NEVER-BE-STORED')
   })
 
   it('exposes no API that can write a credential to storage', async () => {
     const auth = await freshAuth()
-    // The old module exported getToken/setToken/clearToken, which together were
-    // a complete write/read API for the session. None of that may come back.
+    // getToken/setToken/clearToken together were a full write/read API for the session.
     const exported = Object.keys(auth) as Array<keyof typeof auth>
     expect(exported).not.toContain('setToken' as keyof typeof auth)
     expect(exported).not.toContain('getToken' as keyof typeof auth)
@@ -157,10 +137,8 @@ describe('getMe', () => {
 
     expect(fetchInits).toHaveLength(1)
     const init = fetchInits[0]
-    // The cookie rides along only because we asked for it.
     expect(init.credentials).toBe('include')
-    // The backend no longer accepts bearer tokens, and JS cannot read the
-    // cookie, so there must be no Authorization header at all.
+    // The backend takes no bearer tokens and JS cannot read the cookie, so there must be no Authorization header.
     expect(new Headers(init.headers).has('Authorization')).toBe(false)
     expect(fetchUrls[0]).toContain('/api/auth/me')
   })
@@ -179,8 +157,7 @@ describe('getMe', () => {
       throw boom
     }
 
-    // A transient network error is NOT a logout. Resolving null here would make
-    // every page redirect a signed-in user to /login on a flaky connection.
+    // Resolving null would bounce a signed-in user to /login on a flaky connection.
     await expect(getMe()).rejects.toBe(boom)
   })
 
@@ -189,8 +166,7 @@ describe('getMe', () => {
     route = () => jsonResponse(USER_A)
     expect(await getMe()).toEqual(USER_A)
 
-    // Cache warm, backend now unreachable: the cached identity is still valid
-    // and must not be discarded as a logout.
+    // Cache warm, backend unreachable: the cached identity must not be discarded.
     route = () => {
       throw new TypeError('Failed to fetch')
     }
@@ -202,14 +178,12 @@ describe('/me cache isolation between users', () => {
   it('does not serve user A after user B logs in on the same tab', async () => {
     const { getMe, clearMeCache } = await freshAuth()
 
-    // User A is signed in; the cache warms with A's record.
     route = () => jsonResponse(USER_A)
     expect(await getMe()).toEqual(USER_A)
     expect(await getMe()).toEqual(USER_A) // served from cache, no second fetch
     expect(fetchUrls).toHaveLength(1)
 
-    // B signs in on the same tab. The login success path clears the cache, so
-    // the next read must go back to the server instead of replaying A.
+    // B signs in on the same tab: clearing the cache must send the next read back to the server.
     route = () => jsonResponse(USER_B)
     clearMeCache()
 
@@ -225,8 +199,7 @@ describe('/me cache isolation between users', () => {
     route = () => jsonResponse(USER_A)
     expect(await getMe()).toEqual(USER_A)
 
-    // Session expires: a real 401 must invalidate the cache, not just return
-    // null once. `force` is what gets past the warm cache to reach the server.
+    // A real 401 must invalidate the cache, not just return null once; `force` gets past the warm cache.
     route = () => jsonResponse({ detail: 'expired' }, 401)
     expect(await getMe(true)).toBeNull()
 
@@ -265,10 +238,7 @@ describe('authRequestInit', () => {
   })
 
   it('omits credentials entirely when the API base is untrusted', async () => {
-    // A configured cross-origin http base that is neither loopback nor
-    // allow-listed is the one input that yields an untrusted base. It must be
-    // stubbed before the module is imported, since the value is resolved once
-    // at module scope.
+    // The env must be stubbed before the import: the base is resolved once at module scope.
     vi.stubEnv('NEXT_PUBLIC_API_BASE', 'http://api.example.com')
     const { authRequestInit, API_BASE_TRUSTED, API_BASE } = await freshAuth()
 
@@ -276,8 +246,7 @@ describe('authRequestInit', () => {
     // `baseFromUrl` preserves the base's path, hence the trailing slash.
     expect(API_BASE).toBe('http://api.example.com/')
 
-    // Returned unchanged: the caller gets back exactly what it passed in, with
-    // no `credentials` key that would leak the cookie cross-origin.
+    // Returned unchanged, so no `credentials` key can leak the cookie cross-origin.
     const callerInit: RequestInit = { method: 'POST' }
     const init = authRequestInit(callerInit)
     expect(init).toBe(callerInit)
@@ -312,11 +281,8 @@ describe('authRequestInit', () => {
 
 describe('logout', () => {
   it('sends the revocation with keepalive so it survives the redirect', async () => {
-    // The reason this is a test and not a comment: `redirectToLogin` navigates
-    // away on the next line, which tears down an ordinary in-flight fetch. An
-    // httpOnly cookie cannot be cleared by script, so a cancelled POST leaves
-    // the session live on the server and in the browser -- the user returns to
-    // /login still authenticated, and a shared machine stays signed in.
+    // keepalive is load-bearing: the redirect tears down an in-flight fetch, and an httpOnly cookie
+    // cannot be cleared by script, so a cancelled POST leaves the session live.
     const { logout } = await freshAuth()
     const replaced = vi.fn()
     const original = window.location
@@ -336,15 +302,12 @@ describe('logout', () => {
     const logoutCall = fetchInits.find((_, i) => fetchUrls[i].endsWith('/api/auth/logout'))
     expect(logoutCall).toBeDefined()
     expect(logoutCall?.keepalive).toBe(true)
-    // Credentialed, so the cookie rides and the server can revoke the session.
     expect(logoutCall?.credentials).toBe('include')
-    // And still nothing script-readable is attached to it.
     expect(new Headers(logoutCall?.headers).has('Authorization')).toBe(false)
   })
 
   it('still navigates away when the revocation request fails', async () => {
-    // The page must not strand the user on an authenticated page because the
-    // network is down; the session simply dies with the tab.
+    // A network failure must not strand the user on an authenticated page.
     const { logout } = await freshAuth()
     const replaced = vi.fn()
     const original = window.location

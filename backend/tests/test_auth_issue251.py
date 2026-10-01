@@ -1,11 +1,10 @@
-"""Tests for issue #251: the auth rate limiter must not fail open, must bound
-distributed attempts per account, must not reintroduce an account-existence
-oracle, active tokens must be capped and the eviction must be a real revocation,
-and the service token must be scoped, expiring and rotatable.
+"""The auth rate limiter must not fail open, must bound distributed attempts per
+account, must not reintroduce an account-existence oracle, active tokens must be
+capped and the eviction must be a real revocation, and the service token must be
+scoped, expiring and rotatable.
 
-Kept in its own module (rather than appended to test_auth.py) because the
-behaviour under test is entirely about module-level limiter state and the
-service-token table, and these cases each want to drive that state directly.
+Kept in its own module because the behaviour under test is entirely about
+module-level limiter state and the service-token table.
 """
 
 import asyncio
@@ -22,12 +21,9 @@ from app.auth import AuthStore
 
 
 def _req(headers: dict, ip: str | None = "9.9.9.9") -> SimpleNamespace:
-    """A stand-in Request.
-
-    ``cookies`` and ``method`` are real attributes, not conveniences: the
+    """``cookies`` and ``method`` are real attributes, not conveniences: the
     credential is a session cookie and ``require_auth`` runs the same-origin
-    guard, which is scoped to unsafe methods and so reads ``method``.
-    """
+    guard, which is scoped to unsafe methods and so reads ``method``."""
     return SimpleNamespace(
         headers=headers,
         client=SimpleNamespace(host=ip) if ip else None,
@@ -46,14 +42,9 @@ def store(tmp_path) -> AuthStore:
 
 
 def _dead_redis_url() -> str:
-    """A Redis URL that is genuinely unreachable.
-
-    Bind a socket to port 0, read the port the OS gave it, then close it: that
-    port had nothing listening on it a moment ago and, with nothing else on the
-    box racing for it, nothing is listening now. This is a real TCP connect
-    failure, not a stubbed client, so the fallback path is exercised through the
-    actual redis client and its actual exception.
-    """
+    """Bind a socket to port 0, read the OS-assigned port, then close it: nothing
+    is listening there, so this is a real TCP connect failure through the actual
+    redis client and its actual exception, not a stub."""
     s = socket.socket()
     try:
         s.bind(("127.0.0.1", 0))
@@ -68,15 +59,13 @@ def _dead_redis_url() -> str:
 
 def test_redis_down_login_is_still_rate_limited_not_wide_open(store, monkeypatch):
     """With the limiter's Redis genuinely unreachable, login past the limit is
-    REJECTED. Before the fix the same request was admitted: the limiter's
-    except branch logged and returned, so a Redis outage was an unlimited
-    credential-stuffing window."""
+    REJECTED: an except branch that logs and returns would make a Redis outage
+    an unlimited credential-stuffing window."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth, "config", auth.config)
     monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_MIN", 3)
     monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", 0)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
-    # Point the limiter at a port with nothing on it and drop any cached client.
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
 
@@ -119,8 +108,8 @@ def test_redis_down_signup_is_still_rate_limited(store, monkeypatch):
 
 
 def test_redis_down_counter_actually_counts_upwards(monkeypatch):
-    """Unit level: the fallback returns a monotonically rising count, so the
-    comparison in _consume_counter rejects rather than admits."""
+    """The fallback returns a monotonically rising count, so the comparison in
+    _consume_counter rejects rather than admits."""
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
     auth.reset_local_rate_limits()
@@ -131,8 +120,8 @@ def test_redis_down_counter_actually_counts_upwards(monkeypatch):
 
 
 def test_redis_down_check_rate_limit_rejects_past_the_limit(monkeypatch):
-    """The same thing one layer up: _check_rate_limit itself, with a dead Redis,
-    must raise 429 rather than return quietly."""
+    """_check_rate_limit itself, with a dead Redis, must raise 429 rather than
+    return quietly."""
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
 
@@ -146,8 +135,8 @@ def test_redis_down_check_rate_limit_rejects_past_the_limit(monkeypatch):
     assert e.value.status_code == 429
 
 def test_local_fallback_limiter_is_bounded(monkeypatch):
-    """An attacker who can force the fallback can also mint unlimited distinct
-    keys; the dict must not grow with them."""
+    """An attacker who can force the fallback can mint unlimited distinct keys;
+    the dict must not grow with them."""
     monkeypatch.setattr(auth, "_LOCAL_RATE_MAX_KEYS", 100)
     auth.reset_local_rate_limits()
     for i in range(1000):
@@ -157,8 +146,8 @@ def test_local_fallback_limiter_is_bounded(monkeypatch):
 
 
 def test_fail_closed_surfaces_still_answer_503(monkeypatch):
-    """The public surface keeps its 503 posture: this change did not silently
-    downgrade /search to in-process limiting."""
+    """The public surface keeps its 503 posture: /search is not downgraded to
+    in-process limiting."""
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
 
@@ -184,10 +173,9 @@ def test_per_account_limit_bounds_ip_rotation(store, monkeypatch):
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "")
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
-    # TestClient's peer is the string "testclient", not an IP, so the shipped
-    # auto rule (trust X-Forwarded-For only from a loopback peer) DISCARDS the
-    # header. Without this the six requests below would all come from one
-    # bucket and the test would not be rotating anything. This mirrors the
+    # TestClient's peer is "testclient", not an IP, so the shipped auto rule
+    # (trust X-Forwarded-For only from a loopback peer) would discard the header
+    # and every request below would land in one bucket. This mirrors the
     # deployed topology, where nginx forwards from 127.0.0.1.
     monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", True)
 
@@ -195,8 +183,7 @@ def test_per_account_limit_bounds_ip_rotation(store, monkeypatch):
     app.include_router(auth.router)
     client = TestClient(app)
 
-    # Prove the rotation is real before relying on it: each distinct
-    # X-Forwarded-For value must resolve to a distinct client IP.
+    # Prove the rotation is real before relying on it.
     def ip_seen_by_the_limiter(xff: str) -> str:
         return auth._client_ip(
             auth.Request(
@@ -221,13 +208,10 @@ def test_per_account_limit_bounds_ip_rotation(store, monkeypatch):
 
 
 def test_a_correct_password_is_never_rate_limited(store, monkeypatch):
-    """The per-account throttle must not become an account-lockout weapon.
-
-    A bucket fed by every attempt, and consulted BEFORE the credential check,
+    """A bucket fed by every attempt, and consulted BEFORE the credential check,
     lets an anonymous caller deny a known address access indefinitely: send the
-    limit's worth of wrong passwords from rotating source addresses, and the
-    real owner is then refused with 429 no matter what they type. The owner
-    knowing the correct password must get in."""
+    limit's worth of wrong passwords from rotating addresses and the real owner
+    is refused with 429 no matter what they type."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -244,7 +228,6 @@ def test_a_correct_password_is_never_rate_limited(store, monkeypatch):
     client = TestClient(app)
     client.post("/api/auth/signup", json={"email": "owner@corp.example", "password": "secret12", "name": "O"})
 
-    # 10 wrong passwords from 10 different source addresses -- twice the budget.
     for i in range(10):
         r = client.post(
             "/api/auth/login",
@@ -253,7 +236,6 @@ def test_a_correct_password_is_never_rate_limited(store, monkeypatch):
         )
         assert r.status_code in (401, 429)
 
-    # The account is now over budget, and the owner still gets in.
     owner = client.post(
         "/api/auth/login",
         json={"email": "owner@corp.example", "password": "secret12"},
@@ -264,8 +246,8 @@ def test_a_correct_password_is_never_rate_limited(store, monkeypatch):
 
 
 def test_a_correct_password_does_not_consume_the_budget(store, monkeypatch):
-    """Successful logins must not count: a user signing in repeatedly from home
-    and work must never walk themselves into their own 429."""
+    """Successful logins must not count, or a user signing in from home and work
+    walks themselves into their own 429."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -295,27 +277,21 @@ def test_a_correct_password_does_not_consume_the_budget(store, monkeypatch):
 
 
 def test_per_account_bucket_survives_a_key_flood(monkeypatch):
-    """Flooding the fallback with fresh keys must not let an attacker discard
-    the very bucket throttling them.
-
-    The attack as modelled: keep hammering ONE account from a rotating set of
-    source addresses, so every request mints a new per-IP key while the
-    per-account bucket is hit on every single request. Because the dict is kept
-    least-recently-used and a hit re-inserts its key at the tail, the bucket
-    being attacked is the last one eviction would reach. Dropping by insertion
-    order instead would discard it and hand the attacker a fresh count."""
+    """Flooding the fallback with fresh keys must not let an attacker discard the
+    very bucket throttling them. Because the dict is kept least-recently-used
+    and a hit re-inserts its key at the tail, the attacked bucket is the last
+    one eviction would reach; dropping by insertion order instead would discard
+    it and hand the attacker a fresh count."""
     monkeypatch.setattr(auth, "_LOCAL_RATE_MAX_KEYS", 50)
     auth.reset_local_rate_limits()
     victim = "auth:rl:acct:login:victim@example.com"
 
     seen = []
     for i in range(500):
-        # New source address each time; same victim every time.
         auth._local_rate_hit(f"auth:rl:login:10.0.0.{i}", 600)
         seen.append(auth._local_rate_hit(victim, 600))
 
     assert len(auth._local_rate_counters) <= 50
-    # It counted every single one of the 500 attempts, across the flooding.
     assert seen == list(range(1, 501)), "the per-account bucket was reset by the key flood"
     assert auth._local_rate_hit(victim, 600) == 501
     auth.reset_local_rate_limits()
@@ -349,15 +325,14 @@ def test_dead_service_tokens_are_purged_but_the_configured_tombstone_is_kept(sto
         return purged, before, await remaining()
 
     purged, before, after = asyncio.run(scenario())
-    # The two expired minted tokens and the revoked one are all gone...
     assert purged == 3
     assert len(before) == 4
     assert after == {auth.hash_token("svc-configured")}
 
 
 def test_reaping_the_tombstone_would_resurrect_it(store, monkeypatch):
-    """Why the exclusion exists, stated as an executable fact: with the row
-    deleted, the configured value re-seeds with a full fresh lifetime."""
+    """Why the exclusion exists: with the row deleted, the configured value
+    re-seeds with a full fresh lifetime."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-configured")
 
@@ -365,7 +340,6 @@ def test_reaping_the_tombstone_would_resurrect_it(store, monkeypatch):
         await store.ensure_bootstrap_service_token("svc-configured", {"chat:use"}, 3600)
         await store.revoke_service_token("svc-configured")
         assert await store.service_token_for("svc-configured") is None
-        # Reap it, ignoring the exclusion, and present it again.
         await store.purge_dead_service_tokens()
         assert await store.service_token_for("svc-configured") is None
         req = _req({"x-service-token": "svc-configured"})
@@ -378,14 +352,10 @@ def test_reaping_the_tombstone_would_resurrect_it(store, monkeypatch):
 
 
 def test_reaping_keeps_a_dead_configured_token_dead(store, monkeypatch):
-    """The exclusion must hold for a configured token that is ALREADY dead.
-
-    The other test opts out of the exclusion to show what deletion costs; this
-    one passes the configured hash, as the reaper does, and requires that a
-    revoked configured token is still revoked afterwards -- the row survives as
-    a tombstone, and presenting it is still a 401. Without the exclusion in
-    the SQL the row is reaped and INSERT OR IGNORE silently hands the credential
-    a fresh lifetime, permanently."""
+    """The exclusion must hold for a configured token that is ALREADY dead: the
+    row survives as a tombstone and presenting it is still a 401. Without the
+    exclusion in the SQL the row is reaped and INSERT OR IGNORE silently hands
+    the credential a fresh lifetime, permanently."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-configured")
 
@@ -404,7 +374,7 @@ def test_reaping_keeps_a_dead_configured_token_dead(store, monkeypatch):
         assert purged == 0
         assert row is not None and row["revoked_at"] is not None
 
-        # And presenting it is still a 401, not a silently revived credential.
+        # Presenting it is still a 401, not a silently revived credential.
         with pytest.raises(HTTPException) as e:
             await auth.require_auth(_req({"x-service-token": "svc-configured"}))
         assert e.value.status_code == 401
@@ -450,8 +420,8 @@ def test_token_purge_loop_reaps_both_token_tables(store, monkeypatch):
 
 
 def test_per_account_limit_is_per_account(store, monkeypatch):
-    """The account bucket must not become a global one: a second address is
-    unaffected by the first address exhausting its own bucket."""
+    """A second account must be unaffected by the first one exhausting its
+    bucket."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "REDIS_URL", _dead_redis_url())
     monkeypatch.setattr(auth, "_rate_client", None)
@@ -469,7 +439,6 @@ def test_per_account_limit_is_per_account(store, monkeypatch):
                 blocked += 1
             else:
                 allowed += 1
-        # A different account is untouched by the first one's exhausted bucket.
         await attempt("two@b.co")
         return allowed, blocked
 
@@ -493,14 +462,13 @@ def test_per_account_limit_normalises_the_address(store, monkeypatch):
     asyncio.run(scenario())
 
 
-# --- 3. the per-account path must not leak account existence (#276) ---
+# --- 3. the per-account path must not leak account existence ---
 
 
 def test_per_account_limit_is_identical_for_known_and_unknown_addresses(store, monkeypatch):
     """A registered and an unregistered address must be indistinguishable
     through the limiter: same status, same body, same headers, at every attempt
-    including the one that trips the limit. #276 removed the existence oracle
-    from the credential check; the throttle must not put one back."""
+    including the one that trips the limit."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -525,8 +493,7 @@ def test_per_account_limit_is_identical_for_known_and_unknown_addresses(store, m
         return out
 
     unknown_trace = probe("nosuch@b.co")
-    # Reset the shared counter so the registered address starts from the same
-    # state, then probe it identically.
+    # Reset the shared counter so the registered address starts from the same state.
     auth.reset_local_rate_limits()
     known_trace = probe(known.email)
 
@@ -555,7 +522,6 @@ def test_per_account_limit_does_no_account_lookup(store, monkeypatch):
 
     async def scenario():
         with pytest.raises(HTTPException):
-            # Over the limit: rejected before any account is consulted.
             for _ in range(4):
                 await auth._check_account_rate_limit(_req({}), "login", 2, "a@b.co")
 
@@ -568,7 +534,7 @@ def test_per_account_limit_does_no_account_lookup(store, monkeypatch):
 
 def test_active_token_cap_revokes_the_oldest_token(store, monkeypatch):
     """Passing the cap must make the oldest token genuinely unusable, not merely
-    absent from a listing: the check is a 401 from an authenticated route."""
+    absent from a listing."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -590,11 +556,10 @@ def test_active_token_cap_revokes_the_oldest_token(store, monkeypatch):
     def usable(token: str) -> int:
         return client.get("/api/auth/me", cookies=auth_cookie(token)).status_code
 
-    # The three oldest were revoked; the newest three still work.
     assert [usable(t) for t in tokens[:3]] == [401, 401, 401]
     assert [usable(t) for t in tokens[3:]] == [200, 200, 200]
 
-    # And a revoked token stays dead in the store itself, not just on the route.
+    # A revoked token stays dead in the store itself, not just on the route.
     assert asyncio.run(store.user_for_token(tokens[0])) is None
 
 
@@ -611,25 +576,20 @@ def test_token_cap_does_not_evict_other_users(store, monkeypatch):
 
 
 def test_token_cap_does_not_evict_expired_rows(store, monkeypatch):
-    """The cap must only ever count and revoke UNEXPIRED rows.
-
-    Set up so the cap genuinely has to evict something -- two live tokens
-    against a cap of one -- otherwise "nothing was evicted" and "the wrong row
-    was evicted" look identical from the outside. The oldest live token is the
-    victim, and the already-dead row is left exactly where it was."""
+    """The cap must only ever count and revoke UNEXPIRED rows. Two live tokens
+    against a cap of one, so "nothing was evicted" and "the wrong row was
+    evicted" cannot look identical from the outside."""
     monkeypatch.setattr(auth.config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 1)
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     dead = asyncio.run(store.issue_token(user.id, 0))  # expires immediately
     oldest_live = asyncio.run(store.issue_token(user.id, 7))
     newest_live = asyncio.run(store.issue_token(user.id, 7))
 
-    # An eviction really did happen...
     assert asyncio.run(store.user_for_token(oldest_live)) is None
     assert asyncio.run(store.user_for_token(newest_live)) is not None
 
-    # ...and it took the oldest LIVE token with it, not the dead row. Asserted
-    # against the table, because user_for_token returns None for any expired
-    # row whether or not the cap touched it.
+    # The oldest LIVE token went, not the dead row: asserted against the table,
+    # because user_for_token returns None for any expired row.
     async def stored_hashes():
         rows = await store._fetchall("SELECT token_hash FROM auth_tokens WHERE user_id = ?", (user.id,))
         return {r["token_hash"] for r in rows}
@@ -690,7 +650,6 @@ def test_service_token_honours_its_expiry(store, monkeypatch):
 
     assert asyncio.run(fresh()) == auth.SERVICE_USER_ID
 
-    # Let the seeded record's expiry pass; the env value is unchanged.
     async def expire():
         row = await store._fetchone("SELECT token_hash FROM auth_service_tokens")
         await store._db.execute("UPDATE auth_service_tokens SET expires_at = ?", (time.time() - 1,))
@@ -708,13 +667,8 @@ def test_service_token_honours_its_expiry(store, monkeypatch):
 
 
 def _chat_route_permissions() -> set[str]:
-    """The permissions app/chat.py actually installs on its router.
-
-    Read from the router rather than hardcoded, so this test tracks the real
-    dependency. A literal here would keep passing if chat.py's permission
-    changed -- at which point it would be asserting a fiction and every chat
-    turn from eval_runner.py would be getting a 403.
-    """
+    """Read from the router rather than hardcoded, so this test tracks the real
+    dependency: a literal would keep passing if chat.py's permission changed."""
     from app.chat import router
 
     found = set()
@@ -729,19 +683,12 @@ def _chat_route_permissions() -> set[str]:
 
 def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch):
     """The one in-repo consumer, backend/scripts/eval_runner.py, sends the raw
-    AUTH_SERVICE_TOKEN and only ever calls /api/chat. The property that keeps it
-    working is that the shipped default scope COVERS what app/chat.py's router
-    requires -- so assert that, reading the requirement off the router rather
-    than restating a literal on both sides, which would only compare a constant
-    with itself.
-
-    Fails if either side drifts: if chat.py starts requiring a permission the
-    default scope lacks, or if the default scope stops covering chat.
-    """
+    AUTH_SERVICE_TOKEN and only ever calls /api/chat, so the shipped default
+    scope must COVER what app/chat.py's router requires. Fails if either side
+    drifts."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-from-env")
-    # Pin the shipped default explicitly rather than reading whatever
-    # load_dotenv() put in the ambient config.
+    # Pin the shipped default explicitly, not whatever load_dotenv() loaded.
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
 
     required = _chat_route_permissions()
@@ -756,7 +703,6 @@ def test_service_token_default_scope_covers_the_eval_scripts(store, monkeypatch)
     async def scenario():
         req = _req({"x-service-token": "svc-from-env"})
         await auth.require_auth(req)
-        # Run the real checker the router installs, for the real permission.
         for permission in required:
             await auth.require_permission(permission)(req)
         return req.state.user_id
@@ -786,12 +732,8 @@ def test_default_scope_would_not_cover_a_permission_chat_now_requires(store, mon
 
 
 def test_rate_limiter_pins_its_redis_db(monkeypatch):
-    """The limiter must not inherit the db index from REDIS_URL.
-
-    The shipped REDIS_URL points at DB 0, which this repo documents as the
-    query cache and flushes during deploys. An unpinned limiter therefore kept
-    its security counters in the database a deploy empties, and a flush reset
-    every bucket. Pin it, as analytics.py and cost_budget.py already do."""
+    """The shipped REDIS_URL points at DB 0, which deploys flush; an unpinned
+    limiter kept its security counters there and a flush reset every bucket."""
     captured = {}
 
     def fake_from_url(url, **kwargs):
@@ -799,7 +741,6 @@ def test_rate_limiter_pins_its_redis_db(monkeypatch):
         captured.update(kwargs)
         return "client"
 
-    # A URL that points somewhere else entirely: the pin must win anyway.
     monkeypatch.setattr(auth.config, "REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setattr(auth.config, "AUTH_RATE_LIMIT_REDIS_DB", 3)
     monkeypatch.setattr(auth, "_rate_client", None)
@@ -811,8 +752,7 @@ def test_rate_limiter_pins_its_redis_db(monkeypatch):
 
 def test_rate_limiter_db_default_is_not_the_flushed_cache_db():
     """The shipped default must not be DB 0, or pinning it would be pointless."""
-    # Read the getenv default from the source, not the ambient config, which
-    # load_dotenv() may have overridden.
+    # Read the getenv default from the source, not the ambient config.
     import inspect
     import re as _re
 
@@ -826,12 +766,9 @@ def test_rate_limiter_db_default_is_not_the_flushed_cache_db():
 
 def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypatch):
     """Revocation must stick even though the value is still in the environment.
-
-    The env value seeds the record on a store miss, and that seed is INSERT OR
-    IGNORE -- so it cannot overwrite the tombstone of a revoked row. If it ever
-    could, every revoked configured token would silently come back to life
-    with a full fresh lifetime on the next request, which would make the expiry
-    theatre."""
+    The seed on a store miss is INSERT OR IGNORE, so it cannot overwrite a
+    revoked row's tombstone; if it ever could, every revoked configured token
+    would come back to life with a full fresh lifetime."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-abc")
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_SCOPE", ("chat:use",))
@@ -850,7 +787,6 @@ def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypat
                 assert e.status_code == 401
             else:
                 raise AssertionError("a revoked service token came back to life")
-        # And its row is still there as a tombstone, not silently re-created.
         row = await store._fetchone("SELECT revoked_at FROM auth_service_tokens")
         return row is not None and row["revoked_at"] is not None
 
@@ -858,15 +794,9 @@ def test_revoked_service_token_is_not_resurrected_by_re_seeding(store, monkeypat
 
 
 def test_cold_start_tombstone_survives_the_reaper(store, monkeypatch):
-    """The reaper must not collect the tombstone written by a cold-start kill.
-
-    The tombstone is a dead row, so the reaper's predicate selects it -- and if
-    it were deleted, the next request would seed the configured value live
-    again with a full fresh lifetime, and the kill switch would quietly stop
-    working the first time the background reaper next runs. The reaper
-    already excludes the configured value's hash; this pins that it keeps
-    doing so for a tombstone that was never presented.
-    """
+    """The reaper must not collect the tombstone written by a cold-start kill:
+    it is a dead row, so the reaper's predicate selects it, and deleting it
+    would let the next request re-seed the configured value live again."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -889,8 +819,8 @@ def test_cold_start_tombstone_survives_the_reaper(store, monkeypatch):
     )
     assert killed.json()["revoked"] == 1
 
-    # Drive the REAL reaper, not a re-implementation of its keep_hash: a copy
-    # here would keep passing even if the loop stopped passing the exclusion.
+    # Drive the REAL reaper: a re-implementation of its keep_hash here would
+    # keep passing even if the loop stopped passing the exclusion.
     class StopLoop(Exception):
         pass
 
@@ -916,8 +846,8 @@ def test_cold_start_tombstone_survives_the_reaper(store, monkeypatch):
 
 
 def test_service_token_restart_does_not_extend_its_life(store, monkeypatch):
-    """Seeding is INSERT OR IGNORE, so a worker restart must not push the
-    expiry out -- otherwise the expiry would be theatre."""
+    """Seeding is INSERT OR IGNORE, so a worker restart must not push the expiry
+    out -- otherwise the expiry would be theatre."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-abc")
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 100)
@@ -949,16 +879,13 @@ def test_service_token_is_scoped(store, monkeypatch):
     client = TestClient(app)
 
     assert client.get("/api/auth/users", headers={"X-Service-Token": "svc-abc"}).status_code == 403
-    # Minting is a users:manage action, so a scoped machine credential cannot
-    # mint itself a successor.
     assert client.post("/api/auth/service-tokens", headers={"X-Service-Token": "svc-abc"}).status_code == 403
 
 
 def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
     """Rotation must work in the order an operator actually reaches for: mint
-    the replacement, move consumers onto it, then retire the old one -- without
-    a window in which no credential works and without the fresh token being
-    swept up by the retirement."""
+    the replacement, move consumers onto it, then retire the old one -- with no
+    window in which no credential works."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -979,7 +906,7 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
     asyncio.run(store.ensure_bootstrap_service_token("old-svc", {"chat:use"}, 3600))
     assert client.get("/api/auth/me", headers={"X-Service-Token": "old-svc"}).status_code == 200
 
-    # 1. Mint the replacement. Both work, so nothing has an outage.
+    # 1. Mint the replacement; both work, so nothing has an outage.
     minted = client.post("/api/auth/service-tokens", cookies=hdr)
     assert minted.status_code == 200, minted.text
     new_token = minted.json()["token"]
@@ -988,7 +915,7 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
     assert new_token != "old-svc", "rotation mints a fresh value, not the old one"
     assert client.get("/api/auth/me", headers={"X-Service-Token": new_token}).status_code == 200
 
-    # 2. Retire the old one BY VALUE. This must not take the new one with it.
+    # 2. Retire the old one BY VALUE, which must not take the new one with it.
     retired = client.post("/api/auth/service-tokens/revoke", json={"token": "old-svc"}, cookies=hdr)
     assert retired.status_code == 200, retired.text
     assert retired.json()["revoked"] == 1
@@ -998,13 +925,10 @@ def test_service_token_rotation_in_the_safe_order(store, monkeypatch):
 
 
 def test_kill_switch_works_before_the_configured_token_is_ever_used(store, monkeypatch):
-    """Revoking the env-configured value from a COLD start must actually kill it.
-
-    Seeding is lazy, so a configured value that has never been presented has no
-    row to UPDATE. A plain revoke then reports 0 rows, changes nothing, and the
-    next request seeds the credential live with a full fresh lifetime -- so the
-    one kill switch that matters for a suspected leak of the configured value
-    silently does nothing. Both revoke forms must tombstone it instead."""
+    """Seeding is lazy, so a configured value that has never been presented has
+    no row to UPDATE: a plain revoke reports 0 rows and the next request seeds
+    the credential live with a full fresh lifetime. Both forms must tombstone
+    it instead."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -1032,7 +956,6 @@ def test_kill_switch_works_before_the_configured_token_is_ever_used(store, monke
     assert killed.json()["revoked"] == 1, "a cold configured token must be killable, not a silent no-op"
     assert asyncio.run(row_count()) == 1, "a revoked tombstone must exist to block re-seeding"
 
-    # And it stays dead however many times it is presented afterwards.
     for _ in range(3):
         assert client.get("/api/auth/me", headers={"X-Service-Token": "cold-svc"}).status_code == 401
     assert asyncio.run(store.service_token_for("cold-svc")) is None
@@ -1084,8 +1007,7 @@ def test_revoke_all_service_tokens_kills_every_one(store, monkeypatch):
     asyncio.run(store.ensure_bootstrap_service_token("old-svc", {"chat:use"}, 3600))
     new_token = client.post("/api/auth/service-tokens", cookies=hdr).json()["token"]
 
-    # A POST with NO body at all must mean revoke-everything -- that is the
-    # form the docs give -- so it must not be a 422 for a missing body.
+    # A POST with NO body must mean revoke-everything, not a 422 for a missing body.
     revoked = client.post("/api/auth/service-tokens/revoke", cookies=hdr)
     assert revoked.status_code == 200, revoked.text
     assert revoked.json()["revoked"] == 2
@@ -1117,7 +1039,7 @@ def test_revoke_reports_what_it_actually_revoked(store, monkeypatch):
     minted = client.post("/api/auth/service-tokens", cookies=hdr).json()["token"]
     first = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, cookies=hdr)
     assert first.json()["revoked"] == 1
-    # Same token again, and a token that never existed: nothing changed.
+    # Same token again, and one that never existed: nothing changed.
     again = client.post("/api/auth/service-tokens/revoke", json={"token": minted}, cookies=hdr)
     assert again.json()["revoked"] == 0
     never = client.post("/api/auth/service-tokens/revoke", json={"token": "never-existed"}, cookies=hdr)
@@ -1125,7 +1047,6 @@ def test_revoke_reports_what_it_actually_revoked(store, monkeypatch):
 
 
 def test_service_token_logout_actually_revokes(store, monkeypatch):
-    """Logout used to answer ok and leave the machine credential working."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -1137,9 +1058,8 @@ def test_service_token_logout_actually_revokes(store, monkeypatch):
     app = FastAPI()
     app.include_router(auth.router)
     client = TestClient(app)
-    # A machine credential is a HEADER, and deliberately still one: the cookie
-    # migration is about the browser credential, and a browser cannot be made
-    # to attach this.
+    # A machine credential is a HEADER, and deliberately still one: a browser
+    # cannot be made to attach this.
     hdr = {"X-Service-Token": "svc-abc"}
 
     assert client.get("/api/auth/me", headers=hdr).status_code == 200
@@ -1169,15 +1089,11 @@ def test_service_token_unknown_scope_names_are_dropped(monkeypatch):
 
 
 def test_service_token_ttl_comes_from_config_and_never_from_nowhere(monkeypatch):
-    """The seeded lifetime must be the configured one, and a non-positive
-    configuration must fall back to the default rather than meaning 'never
-    expires'. Otherwise an operator setting 0 -- or a regression that hardcodes
-    a long life -- quietly reinstates the permanent admin credential this issue
-    is about, and nothing in the suite would notice."""
-    # No assertion on the ambient config value: it is populated by
-    # load_dotenv(), so it reads whatever backend/.env on the host says. The
-    # monkeypatched 60 and the non-positive loop below pin the honoured value
-    # and the fallback env-independently.
+    """A non-positive configuration must fall back to the default rather than
+    meaning 'never expires', or an operator setting 0 quietly reinstates a
+    permanent admin credential."""
+    # No assertion on the ambient config value: load_dotenv() populates it from
+    # whatever backend/.env on the host says.
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 60)
     assert auth._service_token_ttl_seconds() == 60
     for non_positive in (0, -1, -86400):

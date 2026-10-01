@@ -1,37 +1,32 @@
-"""Make the app's own log records actually reach stderr (#293).
+"""Make the app's own log records actually reach stderr.
 
-The app used to configure logging nowhere. Uvicorn's worker applies
-``uvicorn.config.LOGGING_CONFIG`` before the app is imported, and that config
-leaves the ROOT logger at WARNING with no handlers, hanging a single
-``DefaultHandler`` off the ``uvicorn`` logger with ``propagate: False``. Every
-app module logger is a child of root, so it inherited WARNING, owned no handler,
-and fell through to ``logging.lastResort``: a ``logger.info(...)`` call was
-silently discarded while WARNING survived via lastResort. That is why the app
-looked healthy and its INFO lines never appeared.
+Uvicorn's worker applies ``uvicorn.config.LOGGING_CONFIG`` before the app is
+imported, and that config leaves the ROOT logger at WARNING with no handlers,
+hanging a single ``DefaultHandler`` off the ``uvicorn`` logger with
+``propagate: False``. Every app module logger is a child of root, so it inherits
+WARNING, owns no handler, and falls through to ``logging.lastResort``: an INFO
+call is silently discarded while WARNING survives.
 
 ``configure_logging`` is called once from ``app.main`` at import, which happens
-before FastAPI's lifespan runs, so operator-visible events from boot
-("bootstrapped admin account", "purged N expired conversation(s)") and from the
+before FastAPI's lifespan runs, so operator-visible events from boot and from the
 background loops are emitted under the real startup path.
 
 What is deliberately NOT done, and why:
 
 * **The root LOGGER's level is never changed.** The handler carries the app's
-  level; the root logger keeps the WARNING it inherits from uvicorn. Raising the
-  root level to INFO is the obvious fix and the wrong one: every third-party
-  logger (httpx, openai, ...) is a child of root too, so it would switch on
-  their per-request "HTTP Request: ..." output in production as well.
+  level; raising the root level to INFO would switch on every third-party logger
+  (httpx, openai, ...) and their per-request output in production too.
 * **Only the app's own loggers get the app's level**, so third-party loggers
-  keep the root level they have today. ``APP_LOGGERS`` is the list; a module
-  that grows a new bare-named module-level ``logger`` must be added there or it
-  goes quiet again -- ``tests/test_logging_config.py`` fails when one is missed.
+  keep the root level they have today. ``APP_LOGGERS`` is the list; a module that
+  grows a new bare-named module-level ``logger`` must be added there or it goes
+  quiet again -- ``tests/test_logging_config.py`` fails when one is missed.
 * **Existing handlers are left alone.** ``logging.config.dictConfig`` in its
-  default (non-incremental) mode removes every handler already installed on
-  root and calls ``logging.shutdown`` on the process-wide handler list, i.e. it
-  clobbers handlers this process did not ask us to touch (a test harness's
-  capture handler, an embedding application's). The ``uvicorn`` logger is never
-  named or reconfigured, so its handler and ``propagate: False`` survive: its
-  output is written once by uvicorn and never duplicated by the app's handler.
+  default (non-incremental) mode removes every handler already installed on root
+  and calls ``logging.shutdown`` on the process-wide handler list, clobbering
+  handlers this process never asked to touch (a test harness's capture handler,
+  an embedding application's). The ``uvicorn`` logger is never named or
+  reconfigured, so its handler and ``propagate: False`` survive and its output is
+  written once, never duplicated by the app's handler.
 """
 
 import logging
@@ -42,15 +37,13 @@ from app.config import config
 logger = logging.getLogger(__name__)
 
 # The levels an operator may set through LOG_LEVEL. NOTSET is deliberately not
-# offered: it means "inherit", which would hand these loggers the root level
-# (WARNING under uvicorn) and silently drop the records this module exists to
-# emit.
+# offered: it means "inherit", handing these loggers the root level (WARNING
+# under uvicorn) and silently dropping the records this module exists to emit.
 VALID_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
 
-# Every logger the app package creates. "app" covers the modules that log under
-# their own dotted name via ``logging.getLogger(__name__)`` (app.main,
-# app.config, app.recommender, app.user_profile, app.index_text); the rest are
-# bare names, which is why they need naming one by one.
+# Every logger the app package creates. "app" covers the modules logging under
+# their own dotted name via ``getLogger(__name__)``; the rest are bare names,
+# which is why they need naming one by one.
 APP_LOGGERS = (
     "app",
     "analytics",

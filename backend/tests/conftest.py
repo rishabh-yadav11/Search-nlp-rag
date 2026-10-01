@@ -19,8 +19,7 @@ def fake_cache():
     Yields the shared ``FakeCache`` class rather than an instance: a test calls
     ``fake_cache()`` for a bare cache, or ``fake_cache(get_result=...)`` /
     ``fake_cache(get_error=...)`` when ``get()`` has to return or raise
-    something specific. Every call builds a fresh store, so no state is shared
-    between tests.
+    something specific. Every call builds a fresh store.
     """
     from _support import FakeCache
 
@@ -56,11 +55,9 @@ def parse_config(monkeypatch):
 
     * ``load_dotenv()`` runs inside config.py and would re-populate
       ``os.environ`` from a developer's ``backend/.env`` while the copy loads;
-    * the ambient environment is replaced outright by the caller's mapping, so
-      a shell export of an unrelated knob cannot leak into the result.
+    * the ambient environment is replaced outright by the caller's mapping.
 
-    The load is private: no other module's ``config`` object is touched, so
-    the rest of the suite still sees the process-wide config it had before.
+    The load is private: no other module's ``config`` object is touched.
     """
 
     def _parse(**env):

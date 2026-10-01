@@ -1,5 +1,4 @@
-"""Unit tests for the internal (non-HTTP) pipeline functions in app.main:
-embedding, intent rewrite, retrieval, body rescue/attach, and facet values."""
+"""Unit tests for the internal (non-HTTP) pipeline functions in app.main."""
 
 import asyncio
 import logging
@@ -279,9 +278,8 @@ def test_hybrid_search_cache_miss(monkeypatch, fake_cache):
     assert sparse.calls == 1
     assert len(cache.sets) == 1
     key, value, ttl = cache.sets[0]
-    # The key must name both models, so swapping either invalidates the cache.
-    # (The exact encoding is covered in app.input_hygiene; what matters here is
-    # that the model names are actually part of the key.)
+    # The key must name both models, so swapping either invalidates the cache;
+    # the exact encoding is covered in app.input_hygiene.
     assert key.startswith("vec:")
     assert "dense-model" in key and "sparse-model" in key
     assert "query" in key
@@ -324,10 +322,9 @@ def _vector_key_setup(monkeypatch, fake_cache):
 
 def test_vector_cache_key_is_keyed_on_the_text_that_was_embedded(monkeypatch, fake_cache):
     """The cached (dense, sparse) pair stands for one exact input string, so the
-    key has to be built from the same normalised text that gets encoded. If the
-    key normalised but the encoder did not, a full-width query and its ASCII
-    equivalent would share one cached vector -- a wrong hit of exactly the kind
-    this is meant to prevent."""
+    key must be built from the same normalised text that gets encoded; a key that
+    normalised where the encoder did not would let a full-width query and its
+    ASCII equivalent share one vector."""
     cache, dense = _vector_key_setup(monkeypatch, fake_cache)
 
     _run(main.hybrid_search("ＴＥＳＴ deals", 8))
@@ -348,9 +345,9 @@ def test_vector_cache_key_is_bounded_for_a_long_query(monkeypatch, fake_cache):
     key, _value, _ttl = cache.sets[0]
     assert key.startswith("vec:")
     assert len(key) <= 256, f"vec key grew to {len(key)} chars: {key[:80]!r}"
-    # The query itself is digested per CACHE_KEY_QUERY_MAX_CHARS (#241) and the
-    # key is length-prefixed (#252), so a 1000-char query costs 34 characters
-    # of digest plus a length prefix, not 1000 characters of query text.
+    # The query is digested per CACHE_KEY_QUERY_MAX_CHARS and the key is
+    # length-prefixed, so a 1000-char query costs 34 characters of digest plus a
+    # length prefix, not 1000 characters of query text.
     assert main._cache_key_component("q" * 1000) in key
     assert "q" * 200 not in key, "the raw query reached the key"
 
@@ -438,14 +435,11 @@ def test_hybrid_search_skips_null_and_empty_payload_points(monkeypatch, fake_cac
 
 
 def test_hybrid_search_surfaces_the_stored_content_type(monkeypatch, fake_cache):
-    """A payload written by the real writer reaches SourceArticle.content_type.
-
-    This is the read half of the feature that was dead end to end: the write
-    side (make_point) and the read side (hybrid_search -> SourceArticle) are
-    joined here through a real payload, so a break on either side is caught by
-    one test. An empty stored value must read back as None, matching the
-    `or None` mapping, so articles with no content type stay indistinguishable
-    from articles that were never backfilled.
+    """A payload written by the real writer reaches SourceArticle.content_type:
+    the write side (make_point) and the read side (hybrid_search ->
+    SourceArticle) are joined through a real payload, so a break on either side
+    is caught by one test. An empty stored value must read back as None, so
+    articles with no content type stay indistinguishable from un-backfilled ones.
     """
     monkeypatch.setattr(main, "cache", fake_cache())
     monkeypatch.setitem(main.state, "model", _FakeDense([0.1, 0.2]))
@@ -512,10 +506,9 @@ def _date_window_articles():
 
 def test_date_fillers_take_their_own_knob(monkeypatch):
     """The relevance floor handed to date-only fillers is its own knob, read
-    where the articles are built: retuning it must move the fillers, and
-    nothing else. Pinned to the shipped 0.2 first so a developer .env cannot
-    decide the starting expectation (the default itself is asserted against a
-    clean parse below)."""
+    where the articles are built: retuning it must move the fillers, and nothing
+    else. Pinned to the shipped 0.2 first so a developer .env cannot decide the
+    starting expectation."""
     _date_window_qdrant(monkeypatch)
     monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.2)
     assert [a.score for a in _date_window_articles()] == [0.2, 0.2]
@@ -525,12 +518,10 @@ def test_date_fillers_take_their_own_knob(monkeypatch):
 
 
 def test_date_fillers_do_not_follow_the_inclusion_gate_at_the_call_site(monkeypatch):
-    """Regression (issue #300), call-site half: the floor must not be
-    re-derived from config.ASK_MIN_SCORE where the articles are built, which
-    would drag every date-only filler up the moment an operator retuned the
-    gate. The import-time capture the issue found is what
-    test_date_fillers_take_their_own_knob pins (a module-level constant bound
-    before the test runs cannot follow a monkeypatched knob at all)."""
+    """The floor must not be re-derived from config.ASK_MIN_SCORE where the
+    articles are built, which would drag every date-only filler up the moment an
+    operator retuned the gate. An import-time capture cannot follow a
+    monkeypatched knob at all."""
     _date_window_qdrant(monkeypatch)
     monkeypatch.setattr(main.config, "DATE_FILLER_SCORE", 0.2)
     monkeypatch.setattr(main.config, "ASK_MIN_SCORE", 0.9)
@@ -538,17 +529,17 @@ def test_date_fillers_do_not_follow_the_inclusion_gate_at_the_call_site(monkeypa
 
 
 def test_date_filler_knob_ships_the_value_the_alias_resolved_to(parse_config):
-    """Default configuration must be byte-identical to the pre-#300 behaviour:
-    _DATE_FILLER_SCORE = config.ASK_MIN_SCORE resolved to ASK_MIN_SCORE's own
-    0.2 default out of the box, and the two shipped defaults stay equal.
+    """Default configuration must be byte-identical to the behaviour from when
+    _DATE_FILLER_SCORE was an alias of config.ASK_MIN_SCORE: it resolved to
+    ASK_MIN_SCORE's own 0.2 default out of the box, and the two shipped
+    defaults stay equal.
 
-    The ordering assertion is about the shipped PAIR, not about a coupling
-    between the knobs: chat filters sources with `score >= ASK_MIN_SCORE`, so a
-    filler floor below the gate would be dropped before the model ever saw it
-    and the temporal fallback would silently stop working. The two are
-    independent now, which means raising one in a deployment's .env without
-    raising the other is a real (documented) way to break that -- but the
-    defaults this branch ships must not start out broken.
+    The ordering assertion is about the shipped PAIR, not a coupling between the
+    knobs: chat filters sources with `score >= ASK_MIN_SCORE`, so a filler floor
+    below the gate would be dropped before the model ever saw it and the temporal
+    fallback would silently stop working. The two are independent now, so
+    raising one in a deployment's .env without the other is a real way to break
+    that -- but the shipped defaults must not start out broken.
     """
     shipped = parse_config()
     assert shipped.ASK_MIN_SCORE == 0.2
@@ -557,11 +548,10 @@ def test_date_filler_knob_ships_the_value_the_alias_resolved_to(parse_config):
 
 
 def test_retuning_the_inclusion_gate_does_not_move_the_date_filler_floor(parse_config):
-    """The deployment-level half of the #300 regression. A shipped .env that
-    raises ASK_MIN_SCORE to 0.9 must not drag the date-only fillers up with
-    it: with the old import-time alias the filler floor followed the gate into
-    every window query. Parsed from `ASK_MIN_SCORE=0.9` and nothing else, so
-    the result cannot be an echo of this machine's own .env."""
+    """A shipped .env that raises ASK_MIN_SCORE to 0.9 must not drag the date-only
+    fillers up with it: with an import-time alias the filler floor followed the
+    gate into every window query. Parsed from `ASK_MIN_SCORE=0.9` and nothing
+    else, so the result cannot echo this machine's own .env."""
     parsed = parse_config(ASK_MIN_SCORE="0.9")
     assert parsed.ASK_MIN_SCORE == 0.9
     assert parsed.DATE_FILLER_SCORE == 0.2
@@ -582,7 +572,7 @@ def test_a_filler_floor_below_the_chat_gate_is_logged_at_startup(parse_config, c
     reachable from a deployment's .env — and it fails silently: every date-only
     filler is dropped by the chat gate, the temporal fallback contributes
     nothing, and the turn answers "no relevant articles" with no other trace.
-    config.py warns about it, the way it warns about clamped knobs, instead of
+    config.py warns about it the way it warns about clamped knobs, instead of
     raising: the service still serves, but the misconfiguration is named."""
     caplog.clear()
     with caplog.at_level(logging.WARNING):
@@ -943,10 +933,10 @@ def test_facet_values_match_a_full_scan_of_a_multi_page_collection(monkeypatch):
     """The scroll page size went up to cut round trips; the values must not move.
 
     5001 articles over 5 pages at the shipped page size, with a value that only
-    exists at the very end of the collection, so a walk that stopped early, or
-    repeated or skipped a page, would silently drop it. The same collection is
-    then re-walked at the old 256 page size: the vocabulary has to be identical
-    both ways, which is the only thing a page size is allowed to change.
+    exists at the very end, so a walk that stopped early, or repeated or skipped
+    a page, would silently drop it. The same collection is then re-walked at the
+    old 256 page size: the vocabulary has to be identical both ways, which is
+    the only thing a page size is allowed to change.
     """
     points = [_Point(i, {"industry_names": [f"Industry {i % 40}"]}) for i in range(5000)]
     points.append(_Point(5000, {"industry_names": ["Tail Only"]}))
@@ -981,12 +971,10 @@ def test_facet_values_are_the_same_at_both_page_sizes_when_the_cap_trips(monkeyp
 
     The cap is checked every FACET_CAP_CHECK_EVERY points CONSUMED, not once per
     page, so a truncated walk stops at the same place in the collection's scroll
-    order at either page size. If the check were per page, the 1024-point page
-    would read four times as many points before checking and would return a
-    different 200 values -- a silent change to what /facets serves.
-
-    Every point here carries a distinct value and the values are not in point
-    order, so any shift in where the walk stops changes the answer.
+    order at either page size; a per-page check would read four times as many
+    points first and return a different 200 values. Every point here carries a
+    distinct value and the values are not in point order, so any shift in where
+    the walk stops changes the answer.
     """
     points = [_Point(i, {"industry_names": [f"V{(i * 7) % 1024:04d}"]}) for i in range(1024)]
 
@@ -1028,23 +1016,18 @@ def test_best_body_window_tail_wins_on_tie():
 
 
 def test_effective_step_leaves_the_default_scan_alone():
-    """The default scan must be bit-for-bit unchanged by the budget.
-
-    A full 50,000-char body at win=1500/step=500 is 98 window starts,
-    comfortably inside the default budget of 200, so no operator upgrading
-    this branch sees a different body scan.
-    """
+    """The default scan must be bit-for-bit unchanged by the budget: a full
+    50,000-char body at win=1500/step=500 is 98 window starts, comfortably inside
+    the default budget of 200."""
     positions = 50_000 - 1500 + 1
     assert main._effective_step(positions, 500, 200) == 500
     assert -(-positions // main._effective_step(positions, 500, 200)) == 98
 
 
 def test_effective_step_widens_a_legal_but_expensive_stride():
-    """Clamping BODY_RESCUE_STEP alone does not bound the work: step=1 is
-    inside the clamp and still scores 48,501 windows of a 50K body (~117ms,
-    and body_rescue scans every body-bearing article before the candidate cap
-    applies, so 20 articles cost ~2.3s for one chat turn).
-    """
+    """Clamping BODY_RESCUE_STEP alone does not bound the work: step=1 is inside
+    the clamp and still scores 48,501 windows of a 50K body, and body_rescue
+    scans every body-bearing article before the candidate cap applies."""
     positions = 49_700 - 1500 + 1
     widened = main._effective_step(positions, 1, 200)
     assert widened > 1
@@ -1067,12 +1050,9 @@ def test_effective_step_never_returns_a_zero_stride():
 
 
 def test_best_body_window_finds_dense_region_at_the_default_budget():
-    """The budget must be free at any value that does not force a widening.
-
-    This is the case operators actually run: win=1500/step=500 over this body
-    is 98 windows against a budget of 200, so the stride never moves and the
-    dense region is still found.
-    """
+    """The budget must be free at any value that does not force a widening:
+    win=1500/step=500 over this body is 98 windows against a budget of 200, so
+    the stride never moves and the dense region is still found."""
     body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
     out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 500, max_windows=200)
     low = out.lower()
@@ -1080,13 +1060,10 @@ def test_best_body_window_finds_dense_region_at_the_default_budget():
 
 
 def test_best_body_window_a_tight_budget_can_straddle_the_dense_region():
-    """The trade-off, stated rather than papered over: a stride coarse enough
-    to widen can skip a token-dense region. That is the cost of capping the
-    work, and it is only reachable when a budget tighter than the chosen
-    stride needs is configured -- the default budget never widens.
-
-    A budget of 1 forces the single window at start=0, so the result is
-    deterministically `body[:1500]` and cannot depend on window arithmetic.
+    """The trade-off, stated rather than papered over: a stride coarse enough to
+    widen can skip a token-dense region, and that is the cost of capping the
+    work. A budget of 1 forces the single window at start=0, so the result is
+    deterministically `body[:1500]`.
     """
     body = ("filler " * 4000) + ("alpha beta gamma " * 40) + ("filler " * 2000)
     out = main._best_body_window(body, {"alpha", "beta", "gamma"}, 1500, 1, max_windows=1)
@@ -1100,11 +1077,9 @@ def test_best_body_window_a_tight_budget_can_straddle_the_dense_region():
 class _IterationCountingTokens(set):
     """A token set that records how many times the scan loop iterated it.
 
-    `_best_body_window` scores each window with `sum(1 for t in tokens ...)`,
-    so the number of times the set is iterated is the number of windows scored
-    (plus the single tail comparison the helper always makes). This observes
-    the real loop through `_best_body_window` itself, which is the only place
-    the budget is actually applied.
+    `_best_body_window` scores each window with `sum(1 for t in tokens ...)`, so
+    the iteration count is the number of windows scored (plus the single tail
+    comparison). This observes the real loop, the only place the budget applies.
     """
 
     def __init__(self, items):
@@ -1120,13 +1095,10 @@ class _IterationCountingTokens(set):
 
 
 def test_best_body_window_applies_the_window_budget():
-    """The budget must be enforced by `_best_body_window`, not merely be
-    available on `_effective_step`.
-
-    Asserting only the helper leaves the single line that applies it
-    (`step = _effective_step(...)`) uncovered: deleting that line leaves the
-    whole suite green while the DoS bound silently disappears.
-    """
+    """The budget must be enforced by `_best_body_window`, not merely available
+    on `_effective_step`: asserting only the helper leaves the single line that
+    applies it uncovered, so deleting it keeps the suite green while the DoS
+    bound silently disappears."""
     body = "filler " * 7100  # 49,700 chars
     tokens = _IterationCountingTokens({"alpha", "beta", "gamma"})
     main._best_body_window(body, tokens, 1500, 1, max_windows=200)
@@ -1280,7 +1252,7 @@ def test_lifespan_startup_and_teardown(monkeypatch):
             assert deps["fixer_calls"][0][1]["max_edit"] == main.config.QUERY_FIX_MAX_EDIT
             assert "chat_retention" in main.state
             # the pre-migration password-hash count is reported at startup, so
-            # the operator can see the credential migration draining (#387)
+            # the operator can see the credential migration draining
             assert deps["reported"] == [True]
 
     try:
@@ -1314,9 +1286,8 @@ def test_lifespan_llm_none_without_api_key(monkeypatch):
 
 def test_lifespan_logs_a_placeholder_gemini_key_by_name(monkeypatch, caplog):
     """The startup log is the whole point of not crashing on a bad key: an
-    operator reading a chat-broken deploy finds the cause in one line instead
-    of a per-turn 401, and the process stays up to serve /health and /ready.
-    So the lifespan must actually emit it -- which is what this test holds."""
+    operator reading a chat-broken deploy finds the cause in one line, and the
+    process stays up to serve /health and /ready."""
     orig = dict(main.state)
     monkeypatch.setattr(main.config, "GEMINI_API_KEY", "your_key_here")
     _stub_lifespan_deps(monkeypatch)
@@ -1378,7 +1349,7 @@ def test_lifespan_startup_failure_propagates(monkeypatch):
     assert deps["chat_store"].closed is False
 
 
-# --- lifespan teardown resilience (#284) ---
+# --- lifespan teardown resilience ---
 #
 # The teardown releases ten unrelated resources. As a bare statement chain, one
 # step raising or hanging strands every resource after it -- the Qdrant client
@@ -1420,10 +1391,9 @@ class _IgnoresCancellation:
     running: the in-process shape of a teardown step stuck on a socket that
     never answers.
 
-    This is the one hang ``asyncio.wait_for`` does not save you from -- it
-    waits for the cancellation to land before returning, so a task that refuses
-    to unwind makes it block forever. Hence ``asyncio.wait`` in
-    _cancel_and_wait. Self-terminating, so it can never outlive its test.
+    This is the one hang ``asyncio.wait_for`` does not save you from -- it waits
+    for the cancellation to land before returning, so a task that refuses to
+    unwind makes it block forever. Hence ``asyncio.wait`` in _cancel_and_wait.
     """
 
     def __init__(self):
@@ -1433,15 +1403,14 @@ class _IgnoresCancellation:
         """Return the Task itself -- the one placed in main.state.
 
         A wrapper object would not do: ``_cancel_and_wait`` hands the value
-        straight to ``asyncio.wait``, which needs a real Task/Future and
-        raises AttributeError on anything else. That raise is swallowed by the
-        step guard, so a wrapper silently turned the hang case into a copy of
-        the raise case while still going green.
+        straight to ``asyncio.wait``, which needs a real Task/Future and raises
+        AttributeError on anything else, and that raise is swallowed by the step
+        guard.
         """
         self._task = asyncio.get_running_loop().create_task(self._run())
-        # Yielded to, so the coroutine is genuinely inside its sleep loop
-        # before teardown cancels it. A task cancelled before its first step
-        # never runs at all, which would make this fixture a no-op.
+        # Yielded to, so the coroutine is genuinely inside its sleep loop before
+        # teardown cancels it. A task cancelled before its first step never runs
+        # at all, which would make this fixture a no-op.
         await asyncio.sleep(0)
         return self._task
 
@@ -1481,8 +1450,7 @@ def _record_teardown(monkeypatch, deps, released, faults):
 
     A step appends its name to ``released`` only after it has actually
     completed, so a name missing from the list means the resource was NOT
-    released -- not merely that the step was entered. That distinction is what
-    makes the ordering assertions below meaningful.
+    released -- not merely that the step was entered.
     """
     holdouts = []
     exploding = []
@@ -1569,9 +1537,8 @@ def test_lifespan_teardown_releases_every_resource_in_order(monkeypatch):
     """The complete, ordered release list on a clean shutdown.
 
     This is what makes the fault tests below trustworthy: a teardown step
-    missing from the lifespan, or released out of order, fails here first -- so
-    the subsets the fault tests assert are known to be real subsets of a
-    working shutdown.
+    missing from the lifespan, or released out of order, fails here first, so
+    the subsets they assert are known to be real subsets of a working shutdown.
     """
     orig = dict(main.state)
     monkeypatch.setattr(main.config, "GEMINI_API_KEY", "sk-test")
@@ -1600,10 +1567,9 @@ def test_lifespan_teardown_survives_a_broken_step(monkeypatch, caplog, faulty, k
     after it must still be released.
 
     The broken step is the only expected loss -- a close that raises is by
-    definition not a close that released anything. What is under test is the
-    tail: without per-step guarding, `cache client` (say) and the four Redis
-    pools after it are skipped outright, and without a bound the hanging case
-    never reaches them at all.
+    definition not a close that released anything. Without per-step guarding,
+    `cache client` and the four Redis pools after it are skipped outright, and
+    without a bound the hanging case never reaches them at all.
     """
     orig = dict(main.state)
     monkeypatch.setattr(main.config, "GEMINI_API_KEY", "sk-test")
@@ -1648,10 +1614,9 @@ def test_lifespan_teardown_survives_a_broken_step(monkeypatch, caplog, faulty, k
     # The operator can tell which resource leaked, without a debugger.
     assert faulty in caplog.text
     if kind == "hang" and faulty in _TASK_STEPS:
-        # A hanging background task is abandoned by the inner asyncio.wait
-        # budget inside _cancel_and_wait. Loosening that budget past the outer
-        # one makes the outer wait_for fire first, so the step is reported as a
-        # generic close timeout and this line never appears -- which is how the
-        # halving stays pinned. Teardown would still reach the later steps;
-        # what changes is that the refusal goes unreported.
+        # A hanging background task is abandoned by the inner asyncio.wait budget
+        # inside _cancel_and_wait. Loosening that budget past the outer one makes
+        # the outer wait_for fire first, so the step is reported as a generic
+        # close timeout and this line never appears -- which is how the halving
+        # stays pinned. The later steps would still run; only the reporting changes.
         assert "ignored cancellation" in caplog.text

@@ -1,32 +1,20 @@
 """Unified chat eval runner over prompts_with_variations_flat.json.
 
 For every prompt: create a chat session, POST one message, capture the answer,
-sources, token usage and cost, fetch the cited articles' full bodies from
-Qdrant, then delete the session. Results are appended one-per-line to a JSONL
-log after every prompt so an interrupted run keeps partial data; pass
---start/--limit to resume. A companion markdown report aggregates
-success/latency/cost, cross-variation consistency (prompts are grouped by
-normalized text similarity) and anomalies.
+sources, token usage and cost, fetch the cited articles' bodies from Qdrant,
+then delete the session. Results are appended one-per-line to a JSONL log after
+every prompt, so an interrupted run keeps partial data; --start/--limit resume.
 
-Prerequisites: backend on localhost:8001 with AUTH_SERVICE_TOKEN in
-backend/.env, plus Qdrant reachable at QDRANT_URL. Chat turns make real (billed)
-LLM calls against the daily budget — use --dry-run to validate loading only.
+Chat turns make real (billed) LLM calls against the daily budget; use
+``--dry-run`` to validate loading only.
 
-    ./venv/bin/python scripts/eval_runner.py --dry-run
-    ./venv/bin/python scripts/eval_runner.py --start 1 --limit 5
-    ./venv/bin/python scripts/eval_runner.py --input /path/to/prompts.json
-
-Results land in eval_results/<timestamp>_<pid>.json and <timestamp>_<pid>_report.md,
-relative to the working directory (override with EVAL_RESULTS_DIR). Each
-invocation writes its own file covering the slice it ran; a resumed slice's
-report aggregates only that slice. The pid suffix makes filename collisions
-impossible, even when two runs start in the same second. During the run,
-results are appended one-per-line to <timestamp>_<pid>.jsonl (crash-safe,
-cheap) under an exclusive advisory lock; after the report is written the
-.jsonl is removed. If a run dies before that (SIGKILL, power loss), the OS
-releases the lock and the next invocation consolidates the orphaned .jsonl
-— including a report — before starting fresh. Recovery never touches a live
-run's log: the lock attempt blocks it.
+Results land in eval_results/<timestamp>_<pid>.json plus a _report.md, relative
+to the working directory (override with EVAL_RESULTS_DIR). The pid suffix makes
+collisions impossible even when two runs start in the same second. During the
+run the .jsonl is written under an exclusive advisory lock and removed once the
+report exists; if a run dies before that, the OS releases the lock and the next
+invocation consolidates the orphaned .jsonl first. Recovery never touches a live
+run's log -- the lock attempt blocks it.
 """
 
 import argparse
@@ -53,8 +41,7 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"))
 
 
-# Mirrors the bootstrap in ``_common.py`` so ``app`` (one directory up) imports
-# when this script is run directly from any working directory.
+# Mirrors the bootstrap in _common.py so ``app`` (one directory up) imports from any cwd.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.lexical import jaccard
@@ -62,8 +49,8 @@ from app.lexical import jaccard
 CHAT_BASE = os.getenv("EVAL_CHAT_BASE", "http://localhost:8001/api/chat")
 SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-# None when the store runs unauthenticated; the same rule config.py applies, so
-# an empty env var does not turn into an empty api-key header.
+# None when the store runs unauthenticated; same rule as config.py, so an empty
+# env var does not become an empty api-key header.
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "vccircle_articles")
 RESULTS_DIR = os.getenv("EVAL_RESULTS_DIR", "eval_results")
@@ -210,13 +197,15 @@ class _UnionFind:
 
 
 def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
-    """Map group label -> 1-based prompt indices. The flat input lists the
-    variations of each base prompt in consecutive runs of VARIATION_RUN, and a
-    run's members restate identical content behind interchangeable scaffolding
-    ("Tell me X" / "Hey, tell me X" / "List the most recent X"). So merging is
-    confined to a run — pairwise, on filler-stripped normalized prompts whose
-    content-word Jaccard similarity reaches SIMILARITY_THRESHOLD — which keeps
-    neighboring runs about related topics (funding deals vs M&A deals) apart."""
+    """Map group label -> 1-based prompt indices.
+
+    The flat input lists each base prompt's variations in consecutive runs of
+    VARIATION_RUN, and a run's members restate identical content behind
+    interchangeable scaffolding ("Tell me X" / "List the most recent X"). So
+    merging is confined to a run, pairwise, on filler-stripped normalized
+    prompts whose content-word Jaccard similarity reaches SIMILARITY_THRESHOLD
+    -- which keeps neighboring runs about related topics apart.
+    """
     keys = [normalize_prompt(p) for p in prompts]
     tokens = [_content_tokens(k) for k in keys]
     uf = _UnionFind(len(prompts))
@@ -241,13 +230,14 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
 
 
 class ResultStore:
-    """Appends one JSON line per prompt so a long run can be interrupted at any
-    point without losing earlier results, and never re-serializes the growing
-    document. An exclusive advisory lock is held on the log for the store's
-    lifetime: recovery uses lock acquisition to tell a dead run's log from a
-    live one. finish() consolidates the log into the single <ts>.json document
-    the report and downstream tooling expect; cleanup_log() releases the lock
-    and removes the log once the report is safely on disk."""
+    """Appends one JSON line per prompt, so a long run can be interrupted without
+    losing earlier results and the growing document is never re-serialized.
+
+    An exclusive advisory lock is held on the log for the store's lifetime:
+    recovery uses lock acquisition to tell a dead run's log from a live one.
+    finish() consolidates the log into the <ts>.json document; cleanup_log()
+    releases the lock and removes the log once the report is safely on disk.
+    """
 
     def __init__(self, json_path: str, meta: dict):
         self.json_path = json_path
@@ -318,7 +308,8 @@ def _failure_entry(index: int, group: str | None, prompt: str, error: str, sessi
 
 def _fsync_dir(path: str) -> None:
     """Make a create/rename/remove in `path` durable across power loss; without
-    this the .jsonl can vanish while the renamed .json never materializes."""
+    this the .jsonl can vanish while the renamed .json never materializes.
+    """
     fd = os.open(path or ".", os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -386,11 +377,10 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
 
 
 def _recover_orphan_logs(results_dir: str) -> None:
-    """Consolidate any <ts>.jsonl left behind by a run that died before its
-    report was written (SIGKILL, power loss, hard crash) so its completed
-    prompts are not stranded in a log nothing reads. A log still held by a
-    live run is skipped: the advisory lock attempt fails. Tolerates a torn
-    final line."""
+    """Consolidate a <ts>.jsonl left behind by a run that died before its report
+    was written, so its completed prompts are not stranded in a log nothing
+    reads. A log held by a live run is skipped: the advisory lock attempt fails.
+    """
     if not os.path.isdir(results_dir):
         return
     for log_name in sorted(os.listdir(results_dir)):
@@ -528,7 +518,7 @@ def run_eval(
                 entry = _failure_entry(index, group, prompt, f"session create failed: {exc!r}")
             except Exception as exc:
                 # A timeout/reset may have created the session server-side even
-                # though no id came back — the orphan can never be deleted.
+                # though no id came back; the orphan can never be deleted.
                 meta["orphan_session_risk"] += 1
                 store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
                 entry = _failure_entry(index, group, prompt, f"session create failed (possible orphan): {exc!r}")

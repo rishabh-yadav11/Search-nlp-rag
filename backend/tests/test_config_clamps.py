@@ -1,11 +1,10 @@
-"""Regression tests for the clamped env knobs in `app.config` (#253).
+"""Regression tests for the clamped env knobs in `app.config`.
 
-The knobs guarded here are all *throughput* caps, and the interesting
-assertion is never "the helper returned N" -- it is "the pipeline actually
-observes N". A clamp that is applied in `config.py` but bypassed at a call
-site is still a DoS, so the call-site tests drive the real
-`_retrieval_leg` -> `hybrid_search` path with a hostile value in the
-environment and assert on the number that actually reaches retrieval.
+The knobs guarded here are all *throughput* caps, and the interesting assertion
+is never "the helper returned N" -- it is "the pipeline actually observes N". A
+clamp applied in `config.py` but bypassed at a call site is still a DoS, so the
+call-site tests drive the real `_retrieval_leg` -> `hybrid_search` path with a
+hostile value in the environment.
 """
 
 import asyncio
@@ -25,11 +24,10 @@ def effective_config():
     """Rebind `app.config` under a temporary environment.
 
     `app.config` computes its knobs at import time and every consumer did
-    `from app.config import config`, so a plain `monkeypatch.setattr` would
-    only prove the attribute is settable. Reloading the module under a patched
-    environment re-runs the real parsing/clamping code. The original class
-    object is put back on both the module and `app.main` afterwards so the
-    rest of the suite sees exactly what it saw before.
+    `from app.config import config`, so a plain `monkeypatch.setattr` would only
+    prove the attribute is settable. Reloading under a patched environment
+    re-runs the real parsing/clamping code, and the original class object is put
+    back on both the module and `app.main` afterwards.
     """
     saved_module_config = config_module.config
     saved_main_config = main.config
@@ -111,16 +109,14 @@ def test_clamped_int_rejects_a_default_outside_the_bounds():
     # A default outside the bounds would make the effective value depend on
     # whether the operator set the variable at all. `ValueError` rather than
     # `AssertionError` on purpose: pytest runs with assertions enabled but the
-    # shipped interpreter may be `python -O`, where an `assert` is stripped and
-    # this guarantee would silently evaporate. See the `-O` test below.
+    # shipped interpreter may be `python -O`, where an `assert` is stripped.
     with pytest.raises(ValueError):
         _clamped_int("PROBE_CANDIDATES", 500, 5, 50)
 
 
 def test_clamped_int_default_range_guard_survives_python_O():
     """The guard must not be an `assert`: `python -O` strips those, so the
-    guarantee would hold under pytest and not in production. Subprocess both
-    ways and require the ValueError in each."""
+    guarantee would hold under pytest and not in production."""
     import pathlib
     import subprocess
     import sys

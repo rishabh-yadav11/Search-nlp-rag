@@ -34,10 +34,9 @@ class _FakeClock:
 def _outage_lines(caplog, logger_name="analytics"):
     """The latch's own lines, excluding the independent digest-key warning.
 
-    A dead store fails the digest-key read as well as the write, and #348 gave
-    that its own message and its own flag on purpose. Counting every WARNING
-    would make these assertions depend on a different feature's warning, so
-    the outage under test is selected by its own text.
+    A dead store fails the digest-key read as well as the write, and that has its
+    own message on purpose, so the outage under test is selected by its own text
+    rather than by level.
     """
     return [
         r
@@ -51,10 +50,9 @@ class _FakeRedis:
     def __init__(self):
         self.store: dict = {}
         self.last_pipe = []
-        # Every sorted-set member ever written, as (key, member). The store
-        # itself collapses a zset to a running total, so this is the only way a
-        # test can assert on WHAT was stored -- which is the whole question
-        # #348 turns on.
+        # Every sorted-set member ever written, as (key, member): the store
+        # collapses a zset to a running total, so this is the only way a test can
+        # assert on WHAT was stored.
         self.zsets: list = []
 
     def zincrby_members(self, key):
@@ -93,9 +91,7 @@ class _FakeRedis:
 
     async def mget(self, keys, *_rest):
 
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls this both ways, `mget(keys)` and `mget(*keys)`.
 
         if isinstance(keys, str):
 
@@ -110,8 +106,8 @@ class _FakeRedis:
         return self.store.get(key)
 
     async def set(self, key, value, nx=False):
-        # ``nx`` is how the digest key is seeded without two workers minting
-        # two different keys for one deployment.
+        # ``nx`` is how the digest key is seeded without two workers minting two
+        # different keys for one deployment.
         if nx and key in self.store:
             return None
         self.store[key] = value
@@ -125,12 +121,10 @@ class _FakeRedis:
 def _reset_digest_key():
     """Clear the process-wide digest key, warning latch and scrub flag.
 
-    ``_QUERY_DIGEST_KEY`` is deliberately cached for the life of the process
-    (it is the secret shared by all workers), so without this a key seeded
-    through one test's fake Redis would still be in force for the next test.
-    ``_digest_warned`` and ``_legacy_scrubbed`` are reset alongside it so a test
-    cannot inherit another's already-emitted warning, or skip the one-time
-    legacy scrub because an earlier test already ran it.
+    ``_QUERY_DIGEST_KEY`` is deliberately cached for the life of the process (it
+    is the secret shared by all workers), and ``_digest_warned`` /
+    ``_legacy_scrubbed`` are process-global, so a test must not inherit
+    another's already-emitted warning or already-run scrub.
     """
     analytics._QUERY_DIGEST_KEY = None
     analytics._digest_warned = False
@@ -237,9 +231,6 @@ def test_summary_reads_aggregates(monkeypatch):
     assert s["clicks_total"] == 7
 
 
-# --- summary() read-path ranges are derived, not hardcoded ---
-
-
 class _SummaryRedis:
     """Redis stand-in with real sorted sets, so summary()'s top-N windows and
     click-position buckets are exercised for real (zrevrange end index is
@@ -252,9 +243,7 @@ class _SummaryRedis:
 
     async def mget(self, keys, *_rest):
 
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls this both ways, `mget(keys)` and `mget(*keys)`.
 
         if isinstance(keys, str):
 
@@ -340,9 +329,9 @@ def test_summary_top_lists_window_sizes_are_exact(monkeypatch):
     """Named top-N limits must yield exactly N members, not N or N+1, which is
     what a mis-transcribed inclusive zrevrange end index would cause."""
     fake = _SummaryRedis()
-    # Members are digests now, so seed the store with members the read path
-    # will actually keep -- a non-digest member is dropped, which would make
-    # this test measure the filter instead of the window size.
+    # Members are digests now, so seed with members the read path will keep: a
+    # non-digest member is dropped, which would make this test measure the
+    # filter instead of the window size.
     fake.zsets["analytics:top_queries"] = {f"q1:{i:032x}": 100 - i for i in range(1, 31)}
     fake.zsets["analytics:click_top_queries"] = {f"q1:{i:032x}": 100 - i for i in range(1, 21)}
     monkeypatch.setattr(analytics, "_client", lambda: fake)
@@ -374,32 +363,28 @@ def test_recording_never_raises_when_redis_down(monkeypatch, caplog, clock):
             raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
-    # Rebind a fresh latch, on the injected clock, so this test owns both the
-    # transition state and the re-announce window regardless of what earlier
-    # tests left behind in the process-global.
+    # Rebind a fresh latch on the injected clock, so this test owns both the
+    # transition state and the re-announce window.
     monkeypatch.setattr(
         analytics,
         "_latch",
         DegradedLatch(analytics.logger, "analytics Redis", now=clock),
     )
 
-    # Both lines of the policy are WARNING, so caplog's default level captures
-    # them; no override is needed here.
+    # Both lines of the policy are WARNING, so caplog's default level captures them.
     _run(analytics.record_search("anything", 1, weak=False, cached=False, latency_ms=10, filtered=False))
     _run(analytics.record_click("anything", 1))
-    # Two failures, one outage: the latch holds the second one silent.
     assert [r.levelname for r in _outage_lines(caplog)] == ["WARNING"]
 
 
 def test_summary_raises_when_redis_is_down(monkeypatch):
-    """A failed analytics read must be a failure, not a payload the caller
-    cannot tell from a report whose counters are legitimately all zero
-    (#281). The HTTP layer turns this into 503."""
+    """A failed analytics read must be a failure, not a payload the caller cannot
+    tell from a report whose counters are legitimately all zero. The HTTP layer
+    turns this into 503."""
 
     class _BrokenRedis:
         async def mget(self, keys, *_rest):
-            # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-            # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+            # Production calls this both ways, `mget(keys)` and `mget(*keys)`.
             if isinstance(keys, str):
                 keys = [keys, *_rest]
             else:
@@ -450,8 +435,7 @@ def analytics_client(tmp_path):
 
 class _UnreachableRedis:
     async def mget(self, keys, *_rest):
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls this both ways, `mget(keys)` and `mget(*keys)`.
         if isinstance(keys, str):
             keys = [keys, *_rest]
         else:
@@ -466,9 +450,9 @@ class _UnreachableRedis:
 
 
 def test_analytics_summary_endpoint_is_503_when_redis_is_down(analytics_client, monkeypatch):
-    """/analytics/summary must not answer 200 while the analytics store is
-    down: the status has to agree with the body, or the dashboard renders an
-    all-zero report during an outage (#281)."""
+    """/analytics/summary must not answer 200 while the analytics store is down:
+    the status has to agree with the body, or the dashboard renders an all-zero
+    report during an outage."""
     client, cookie, _ = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _UnreachableRedis())
 
@@ -477,13 +461,12 @@ def test_analytics_summary_endpoint_is_503_when_redis_is_down(analytics_client, 
     assert res.status_code == 503
     body = res.json()
     assert body["error"]
-    # A degraded body must not be mistakable for a report.
     assert "searches_total" not in body
 
 
 def test_analytics_chat_endpoint_is_503_when_chat_store_is_down(analytics_client, monkeypatch):
     """/analytics/chat must answer 503 when the chat store cannot be read, for
-    the same reason as /analytics/summary (#281)."""
+    the same reason as /analytics/summary."""
     client, cookie, chat_store = analytics_client
 
     async def boom(*args, **kwargs):
@@ -512,14 +495,12 @@ def test_analytics_endpoints_still_serve_200_when_stores_are_up(analytics_client
     assert summary_res.status_code == 200
     assert "searches_total" in summary_res.json()
     assert chat_res.status_code == 200
-    # A real (empty) report: zero sessions is genuine data, not a degraded body.
     assert chat_res.json()["sessions"] == 0
 
 
 def test_summary_read_is_recorded_in_the_admin_audit_trail(analytics_client, monkeypatch):
-    """The cross-user read leaves a trail, as #273 established for
-    /analytics/chat. Without one, an admin reading these aggregates is
-    indistinguishable from nobody having looked."""
+    """The cross-user read leaves a trail. Without one, an admin reading these
+    aggregates is indistinguishable from nobody having looked."""
     client, cookie, chat_store = analytics_client
     monkeypatch.setattr(analytics, "_client", lambda: _FakeRedis())
 
@@ -566,9 +547,6 @@ def test_summary_still_serves_when_the_audit_write_fails(analytics_client, monke
     assert "searches_total" in res.json()
 
 
-# --- _client / _degraded / close ---
-
-
 def test_client_lazy_init_replaces_redis_db(monkeypatch):
     """_client builds REDIS_URL pointing at ANALYTICS_REDIS_DB and reuses the
     connection across calls."""
@@ -586,7 +564,7 @@ def test_client_lazy_init_replaces_redis_db(monkeypatch):
     monkeypatch.setattr(analytics.config, "REDIS_URL", "redis://localhost:6379/0")
     monkeypatch.setattr(analytics.config, "ANALYTICS_REDIS_DB", 1)
     client = analytics._client()
-    assert analytics._client() is client  # cached, not recreated
+    assert analytics._client() is client
     assert len(created) == 1
     assert created[0][0] == "redis://localhost:6379/0"
     assert created[0][1]["db"] == 1
@@ -647,14 +625,11 @@ def test_close_noop_when_no_redis(monkeypatch):
     _run(analytics.close())  # must not raise
 
 
-# --- record_click with article_id ---
-
-
 def test_record_click_with_article_id_tallies_query_click(monkeypatch):
     fake = _FakeRedis()
     monkeypatch.setattr(analytics, "_client", lambda: fake)
     _run(analytics.record_click("fintech funding", 3, article_id=42))
-    _run(analytics.record_click("fintech funding", 1, article_id=42))  # repeat click
+    _run(analytics.record_click("fintech funding", 1, article_id=42))
     # Keyed by the query's digest, not the query: click_signals can still reach
     # the set, without the text ever becoming a Redis key.
     assert fake.store["analytics:click:total"] == 2
@@ -672,9 +647,6 @@ def test_record_click_without_article_id_skips_query_key(monkeypatch):
     assert not any(k.startswith("analytics:query_click:") for k in fake.store)
 
 
-# --- click_signals ---
-
-
 def test_click_signals_no_raw_returns_none(monkeypatch):
     fake = _SignalsRedis([])
     monkeypatch.setattr(analytics, "_client", lambda: fake)
@@ -686,7 +658,7 @@ def test_click_signals_no_raw_returns_none(monkeypatch):
 
 def test_click_signals_below_min_clicks_returns_none(monkeypatch):
     monkeypatch.setattr(analytics.config, "CLICK_BOOST_MIN_CLICKS", 5)
-    fake = _SignalsRedis([("12", 2.0), ("7", 2.0)])  # total 4 < 5
+    fake = _SignalsRedis([("12", 2.0), ("7", 2.0)])
     monkeypatch.setattr(analytics, "_client", lambda: fake)
     assert _run(analytics.click_signals("q")) is None
 
@@ -703,8 +675,8 @@ def test_click_signals_redis_down_returns_none(monkeypatch, caplog, clock):
 
     The digest-key read happens first, so a dead store is reported there and
     the query-keyed lookup is abandoned rather than attempted against raw text.
-    That is the digest latch, not the store-outage latch, and this asserts the
-    behaviour main owns -- so the outage latch is asserted to stay silent.
+    That is the digest latch, not the store-outage latch, so the outage latch is
+    asserted to stay silent.
     """
 
     class _BrokenRedis:
@@ -725,15 +697,12 @@ def test_click_signals_redis_down_returns_none(monkeypatch, caplog, clock):
     )
     monkeypatch.setattr(analytics, "_client", lambda: _BrokenRedis())
     with caplog.at_level(logging.WARNING, logger="analytics"):
-        assert _run(analytics.click_signals("q")) is None  # degraded -> None
+        assert _run(analytics.click_signals("q")) is None
     assert analytics._digest_warned is True
     # The outage latch never sees a failure here, so it must not claim one: a
-    # digest hiccup is not a store outage (#348) and must not consume it.
+    # digest hiccup is not a store outage and must not consume it.
     assert _outage_lines(caplog) == []
     assert "analytics digest key unavailable" in caplog.records[0].getMessage()
-
-
-# --- _i / _f malformed-value branches ---
 
 
 @pytest.mark.parametrize("value", ["abc", [1], {"a": 1}])
@@ -755,15 +724,12 @@ def test_i_and_f_parse_values():
     assert analytics._f(None) == 0.0
 
 
-# --- #348: cross-user search text must not be stored or reported ---
-
-
 def test_recorded_search_never_stores_the_query_text(monkeypatch):
     """The store must not hold user-authored search text at all.
 
-    Load-bearing for #348: redacting the response alone would leave the corpus
-    in Redis for the next reader to return, so this asserts on what was
-    WRITTEN, not on how the response looks.
+    Redacting the response alone would leave the corpus in Redis for the next
+    reader to return, so this asserts on what was WRITTEN, not on how the
+    response looks.
     """
     fake = _FakeRedis()
     monkeypatch.setattr(analytics, "_client", lambda: fake)
@@ -772,7 +738,6 @@ def test_recorded_search_never_stores_the_query_text(monkeypatch):
     _run(analytics.record_search(secret, 5, weak=False, cached=False, latency_ms=10, filtered=False))
 
     assert secret not in repr(fake.store)
-    # The only member written to top_queries is the digest, not the query.
     assert fake.zincrby_members("analytics:top_queries") == [
         analytics.query_digest(secret, analytics._QUERY_DIGEST_KEY)
     ]
@@ -812,12 +777,10 @@ def test_summary_drops_legacy_verbatim_members(monkeypatch):
 def test_summary_still_reports_a_full_list_when_legacy_rows_dominate(monkeypatch):
     """Dropping legacy rows must not silently shrink the report.
 
-    An upgraded deployment's store is full of pre-change verbatim members
-    ranked above the new digests. Reading exactly TOP_QUERIES_N and filtering
-    afterwards would let those rows swallow the whole window and report a short
-    or empty list even though real digest rows sit just below the cut -- so the
-    read over-fetches. A short list while a full one of digests is available is
-    the failure this pins.
+    An upgraded deployment's store is full of pre-change verbatim members ranked
+    above the new digests, so reading exactly TOP_QUERIES_N and filtering
+    afterwards would let those rows swallow the whole window even though real
+    digest rows sit just below the cut. The read over-fetches instead.
     """
     fake = _SummaryRedis()
     rows = {f"legacy verbatim query {i}": 1000 - i for i in range(40)}
@@ -830,7 +793,6 @@ def test_summary_still_reports_a_full_list_when_legacy_rows_dominate(monkeypatch
 
     assert "legacy verbatim" not in repr(s)
     assert len(s["top_queries"]) == analytics.TOP_QUERIES_N
-    # Every row is a digest, and they are the highest-scoring ones available.
     assert all(analytics._is_digest(q) for q, _ in s["top_queries"])
     assert [q for q, _ in s["top_queries"]] == digests[: analytics.TOP_QUERIES_N]
 
@@ -857,7 +819,6 @@ def test_summary_deletes_legacy_verbatim_members_from_the_store(monkeypatch):
 
     _run(analytics.summary())
 
-    # Gone from the store, not just from the response.
     assert secret not in repr(fake.zsets)
     assert "another pre-upgrade query" not in repr(fake.zsets)
     assert list(fake.zsets["analytics:top_queries"]) == [analytics.query_digest("live", "k")]
@@ -887,7 +848,7 @@ def test_legacy_scrub_runs_once_not_on_every_read(monkeypatch):
     _run(analytics.summary())
 
     assert first > 0
-    assert len(scans) == first  # no second pass
+    assert len(scans) == first
 
 
 def test_summary_still_reads_when_the_scrub_fails(monkeypatch):
@@ -922,12 +883,11 @@ def test_click_beacon_never_stores_the_query_text(monkeypatch):
 
 def test_click_signals_still_finds_its_own_signal_after_hashing(monkeypatch):
     """Hashing the key must not break the click-boost layer: the signal recorded
-    for a query must still be found by looking that same query up. This is the
-    regression the hashing could have caused, and why the digest is a stable
-    function of the query rather than a random id.
+    for a query must still be found by looking that same query up. That is why
+    the digest is a stable function of the query rather than a random id.
 
-    The fake needs real sorted sets: the point is that the write and the read
-    agree on the key, which a stub that ignores keys cannot demonstrate.
+    The fake needs real sorted sets, because a stub that ignores keys cannot
+    show the write and the read agreeing.
     """
 
     class _RoundTripRedis(_SummaryRedis):
@@ -1073,7 +1033,6 @@ def test_digest_width_is_bounded_regardless_of_query_length(monkeypatch):
     monkeypatch.setattr(analytics.config, "CLICK_QUERY_MAX_LEN", 256)
     digest = analytics.query_digest("x" * 10_000, "k")
     assert len(digest) == len(analytics.QUERY_DIGEST_PREFIX) + analytics.QUERY_DIGEST_HEX_LEN
-# --- degraded latch transitions ---
 
 
 class _SwitchableRedis:
@@ -1108,8 +1067,8 @@ def _record_search():
 def latch(monkeypatch, clock):
     """A fresh analytics latch on the injected clock.
 
-    Rebinding it means each test owns both the transition state and the
-    re-announce window instead of inheriting either from a previous test.
+    Rebinding it means each test owns the transition state and the re-announce
+    window instead of inheriting either from a previous test.
     """
     fresh = DegradedLatch(analytics.logger, "analytics Redis", now=clock)
     monkeypatch.setattr(analytics, "_latch", fresh)
@@ -1126,11 +1085,11 @@ def test_degraded_latch_logs_warn_warn_warn_across_flap(
 ):
     """failure -> success -> failure is exactly 3 events: W, W, W.
 
-    Both lines are WARNING, so the levels alone cannot identify which is
-    which; the rendered messages carry the ordering proof. The clock jumps
-    past the re-announce window between the two outages, so these are two
-    separate incidents; inside the window the second outage is deliberately
-    swallowed as a flap (see app/degraded.py).
+    Both lines are WARNING, so the levels alone cannot identify which is which;
+    the rendered messages carry the ordering proof. The clock jumps past the
+    re-announce window between the two outages, so these are two separate
+    incidents; inside the window the second outage is deliberately swallowed as
+    a flap (see app/degraded.py).
     """
     fake = _SwitchableRedis()
     monkeypatch.setattr(analytics, "_client", lambda: fake)
@@ -1139,7 +1098,7 @@ def test_degraded_latch_logs_warn_warn_warn_across_flap(
     _run(_record_search())
     fake.broken = False
     _run(_record_search())
-    # Two incidents minutes apart, not one flap: the window has to pass.
+    # Two incidents, not one flap: the re-announce window has to pass.
     clock.advance(REANNOUNCE_SECONDS + 1)
     fake.broken = True
     _run(_record_search())

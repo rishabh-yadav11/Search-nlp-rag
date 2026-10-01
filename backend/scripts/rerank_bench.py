@@ -1,23 +1,13 @@
 """Cross-encoder reranker benchmark: bge-reranker-base (torch / ONNX fp32 /
-ONNX int8) vs the current ms-marco-MiniLM-L-6-v2 (torch).
+ONNX int8) vs ms-marco-MiniLM-L-6-v2 (torch).
 
-Run on the deployment box from `backend/` with the venv python:
-
-    ./venv/bin/python scripts/rerank_bench.py
-
-Prerequisites: Qdrant reachable (config from backend/.env), the
-`vccircle_articles` collection populated. Deterministic: candidates are built
-from a fixed query list with a fixed seed, so re-runs are comparable.
-
-Measures, per backend:
-  * latency (median ms) for a realistic batch of RERANK_CANDIDATES pairs and
-    for single pairs, under the same thread budget as production (TORCH_THREADS)
-  * ranking agreement (Spearman rho) and top-8 overlap against every other
-    backend, computed on the exact same candidate pairs
-  * on-disk model size
-
-The point: decide whether INT8 dynamic quantization of bge-reranker-base is
-fast enough without meaningfully changing top-8 ordering.
+Measures, per backend: latency (median ms) for a full batch of
+RERANK_CANDIDATES pairs and for single pairs under the production thread budget
+(TORCH_THREADS); ranking agreement (Spearman rho) and top-8 overlap against
+every other backend on the identical candidate pairs; and on-disk model size.
+Candidates come from a fixed query list, so re-runs are comparable. The point is
+to decide whether INT8 dynamic quantization is fast enough without meaningfully
+changing top-8 ordering.
 """
 import asyncio
 import math
@@ -57,10 +47,6 @@ QUERIES = [
 
 THREADS = config.TORCH_THREADS
 
-
-# ---------------------------------------------------------------------------
-# backend factories
-# ---------------------------------------------------------------------------
 
 def _session(path: str, threads: int):
     import onnxruntime as ort
@@ -117,8 +103,8 @@ def quantize_onnx(fp32_dir: str, tag: str):
         quantizer = ORTQuantizer.from_pretrained(fp32_dir, file_name="model.onnx")
         dqconfig = AutoQuantizationConfig.avx512(is_static=False)
         quantizer.quantize(save_dir=out, quantization_config=dqconfig)
-        # ORTQuantizer writes model_quantized.onnx; normalize the filename so
-        # the same loader works for fp32 and int8 exports.
+        # ORTQuantizer writes model_quantized.onnx; normalize the filename so the
+        # same loader works for fp32 and int8 exports.
         src = os.path.join(out, "model_quantized.onnx")
         if os.path.isfile(src):
             os.replace(src, os.path.join(out, "model.onnx"))
@@ -158,10 +144,6 @@ def dir_mb(path: str) -> float:
     return round(total / 1e6, 1)
 
 
-# ---------------------------------------------------------------------------
-# metrics
-# ---------------------------------------------------------------------------
-
 def _ranks(vals: list[float]) -> list[float]:
     """Standard competition ranking."""
     order = sorted(range(len(vals)), key=lambda i: vals[i], reverse=True)
@@ -196,17 +178,13 @@ def topk_overlap(a: list[float], b: list[float], k: int = 8) -> float:
     return len(sa & sb) / k
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     print(f"threads={THREADS} queries={len(QUERIES)} candidates={config.RERANK_CANDIDATES}")
     print(f"torch threads env: OMP={os.environ.get('OMP_NUM_THREADS')} MKL={os.environ.get('MKL_NUM_THREADS')}")
 
-    # -- build deterministic candidate sets from the live collection ----------
-    # The app state isn't running here, so drive retrieval with a local
-    # client + encoders instead of importing app.state.
+    # Deterministic candidate sets from the live collection. The app state isn't
+    # running here, so retrieval is driven with a local client + encoders rather
+    # than importing app.state.
     from qdrant_client import AsyncQdrantClient
 
     from app.main import inference_lock

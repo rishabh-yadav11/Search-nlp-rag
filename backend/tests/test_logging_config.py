@@ -1,12 +1,11 @@
-"""The app's log records must actually be emitted (#293).
+"""The app's log records must actually be emitted.
 
 Before the fix, nothing in the app configured logging. Uvicorn's worker applies
 ``uvicorn.config.LOGGING_CONFIG``, which leaves the ROOT logger at WARNING with
 no handlers and hangs a single handler off the ``uvicorn`` logger with
 ``propagate: False``. Every app module logger is a child of root, so it inherited
 WARNING, owned no handler, and ``logger.info(...)`` was discarded: the boot
-lines an operator actually needs ("bootstrapped admin account", "purged N
-expired conversation(s)") never appeared, with no signal that they were lost.
+lines an operator actually needs never appeared, with no signal they were lost.
 
 The tests here pin the three properties the fix delivers, and the one cost it
 must not pay:
@@ -79,11 +78,9 @@ def restore_logging_state():
 
 @pytest.fixture
 def unconfigured_logging():
-    """The logging state the app booted in before #293.
-
-    No handler of the app's own, the app loggers at their inherited level and
-    root at WARNING -- what uvicorn leaves behind.
-    """
+    """The logging state the app booted in before the fix: no handler of the
+    app's own, the app loggers at their inherited level and root at WARNING --
+    what uvicorn leaves behind."""
     handler = logging_config.installed_handler()
     if handler is not None:
         logging.getLogger().removeHandler(handler)
@@ -109,7 +106,6 @@ def _startup_in_a_fresh_process(body: str, env_extra: dict[str, str] | None = No
     ``app.main`` is imported once per process, so an in-process check would
     report whatever an earlier test left behind. ``LOG_LEVEL`` is controlled here
     and ``.env`` loading is switched off, so no ambient file decides the level.
-    Only stderr comes back: that is where the app's log records go.
     """
     env = dict(os.environ)
     env.pop("LOG_LEVEL", None)

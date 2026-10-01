@@ -1,4 +1,4 @@
-"""Issue #285: a password change must not be able to half-happen.
+"""A password change must not be able to half-happen.
 
 ``change_password`` used to run three writes that only mean anything together
 -- store the new hash, revoke the old tokens, mint a replacement -- each
@@ -161,17 +161,12 @@ def _seeded(tmp_path):
 def _assert_no_partial_change(db_path: str, user_id: str, old_tokens: list[str], new_password: str) -> None:
     """Assert the committed state, read through an independent connection.
 
-    Two things have to hold.
-
-    The harm #285 describes must be impossible: a password that has already
-    changed must never sit behind a token minted before the change. And the
-    user must not be locked out -- at least one of the two passwords they know
-    still authenticates.
-
-    And because every test that calls this kills the worker *before* the
-    commit, the state must be exactly the pre-change one: an uncommitted
-    transaction is invisible to everyone, so none of the three writes may have
-    landed.
+    Two things have to hold. A password that has already changed must never sit
+    behind a token minted before the change, and the user must not be locked out
+    -- at least one of the two passwords they know still authenticates. Because
+    every caller kills the worker *before* the commit, the state must be
+    exactly the pre-change one: an uncommitted transaction is invisible to
+    everyone, so none of the three writes may have landed.
     """
     reader = AuthStore(db_path)
     asyncio.run(reader.connect())
@@ -266,10 +261,9 @@ def test_killed_change_does_not_lock_out_other_connections(tmp_path, monkeypatch
 
     If the writes ran on the shared connection and it was abandoned mid
     transaction, that connection still holds SQLite's write lock, and every
-    other connection -- each later request in this worker, and every other
-    gunicorn worker -- waits out the 5 s busy timeout and then fails. A
-    connection never blocks on a lock it holds itself, so this has to be
-    probed from a *second* connection: create a user on one and see it through.
+    other connection waits out the 5 s busy timeout and then fails. A connection
+    never blocks on a lock it holds itself, so this has to be probed from a
+    *second* connection.
     """
     store, db_path, user, _tokens = _seeded(tmp_path)
     _arm(monkeypatch, store, kill_at=3)
@@ -347,11 +341,10 @@ def test_a_concurrent_login_cannot_publish_a_half_finished_change(tmp_path, monk
     The change runs on its own connection precisely so ordinary traffic cannot
     land inside it. This store's shared connection serves every request in the
     worker, so on a shared-connection design a login committing between the
-    hash write and the revocation publishes a half-finished change -- measured
-    by hand: a separate connection then saw a new password next to two
-    still-live old tokens, which is the harm #285 describes, produced by
-    normal traffic rather than a crash. The docstring claims the dedicated
-    connection prevents that; this is what holds it to the claim.
+    hash write and the revocation publishes a half-finished change: a separate
+    connection then sees a new password next to two still-live old tokens.
+    The docstring claims the dedicated connection prevents that; this holds it
+    to the claim.
     """
 
     async def main():

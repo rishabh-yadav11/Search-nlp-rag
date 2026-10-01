@@ -24,9 +24,8 @@ def _headers(*pairs) -> dict:
 
 
 def _req(headers: dict | None = None, state=None, cookies: dict | None = None, method: str = "GET") -> SimpleNamespace:
-    """A stand-in Request. ``cookies``/``method`` are attributes because
-    require_auth reads the session cookie and runs the same-origin guard,
-    which is scoped to unsafe methods."""
+    """A stand-in Request: require_auth reads the session cookie and runs the
+    same-origin guard, which is scoped to unsafe methods."""
     return SimpleNamespace(
         headers=headers or {}, client=None, state=state or SimpleNamespace(), cookies=cookies or {}, method=method
     )
@@ -43,11 +42,11 @@ def store(tmp_path) -> AuthStore:
 def test_password_hashes_never_plaintext(store):
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     assert user.password_hash != "secret12"
-    # the current scheme: the marker plus a plain bcrypt string (#387)
+    # scheme marker followed by a plain bcrypt string
     assert re.match(r"^\$bcrypt-sha256\$\$2[aby]\$", user.password_hash)
     assert auth.verify_password("secret12", user.password_hash)
     assert not auth.verify_password("wrong12", user.password_hash)
-    # hash-only on disk: raw password must not appear in the db or its WAL
+    # hash-only on disk: the raw password never appears in the db or its WAL
     for path in (store._path, store._path + "-wal"):
         try:
             with open(path, "rb") as f:
@@ -67,13 +66,9 @@ def test_validate_email_rejects_and_normalizes():
 
 def test_validate_password_rules():
     auth.validate_password("password1")  # ok
-    # No "too long" case here: the policy deliberately has no maximum, since
-    # refusing longer values is what left an admin unable to re-apply its own
-    # bootstrap passphrase (#334). bcrypt now hashes a fixed-width SHA-256
-    # pre-image rather than the password (#387), so an unbounded input costs no
-    # extra hashing work and none of it is discarded. Over-length values are
-    # covered in test_signup_accepts_long_password_without_revealing_it and
-    # test_change_password_accepts_the_long_passphrase_bootstrap_accepted.
+    # No "too long" case: the policy has no maximum, since an unbounded input
+    # costs no extra hashing work once a fixed-width SHA-256 pre-image is
+    # hashed in place of the password.
     for bad in ("", "short1", "nodigits", "12345678"):
         with pytest.raises(HTTPException) as e:
             auth.validate_password(bad)
@@ -101,7 +96,6 @@ def test_tokens_hashed_stored_revoked_expire(store):
         except FileNotFoundError:
             continue
         assert raw.encode() not in blob
-    # the stored token is the SHA-256 hash
     row = asyncio.run(store._fetchone(
         "SELECT token_hash FROM auth_tokens WHERE user_id = ?", (user.id,)))
     assert row is not None and row["token_hash"] == auth.hash_token(raw)
@@ -109,7 +103,6 @@ def test_tokens_hashed_stored_revoked_expire(store):
     resolved = asyncio.run(store.user_for_token(raw))
     assert resolved is not None and resolved.id == user.id
 
-    # expiry: back-date the token
     asyncio.run(store._db.execute(
         "UPDATE auth_tokens SET expires_at = ? WHERE token_hash = ?",
         (auth._now() - 1, auth.hash_token(raw)),
@@ -117,7 +110,6 @@ def test_tokens_hashed_stored_revoked_expire(store):
     asyncio.run(store._db.commit())
     assert asyncio.run(store.user_for_token(raw)) is None
 
-    # revoke
     raw2 = asyncio.run(store.issue_token(user.id, 7))
     asyncio.run(store.revoke_token(raw2))
     assert asyncio.run(store.user_for_token(raw2)) is None
@@ -153,7 +145,6 @@ def test_bootstrap_admin_created_once(store, monkeypatch):
     asyncio.run(bootstrap_admin())
     admin = asyncio.run(store.get_user_by_email("admin@x.co"))
     assert admin is not None and admin.role == "admin" and admin.is_active
-    # never overwrites an existing account (password stays verifiable)
     asyncio.run(store.set_password(admin.id, auth.hash_password("newpass1")))
     asyncio.run(bootstrap_admin())
     again = asyncio.run(store.get_user_by_email("admin@x.co"))
@@ -169,9 +160,8 @@ def test_bootstrap_admin_disabled_without_env(store, monkeypatch):
 
 
 def test_bootstrap_admin_refuses_weak_password_and_names_the_reason(store, monkeypatch, caplog):
-    """AUTH_ADMIN_PASSWORD=x must not provision a full-admin account with a
-    1-character password -- the signup path would reject that same value, and
-    the bootstrap path is the one that skipped the validators (#290)."""
+    """A bootstrap password the signup path would reject must not provision a
+    full-admin account."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
     monkeypatch.setattr(auth, "store", store)
@@ -179,30 +169,23 @@ def test_bootstrap_admin_refuses_weak_password_and_names_the_reason(store, monke
     with caplog.at_level(logging.ERROR, logger="auth"):
         asyncio.run(bootstrap_admin())  # must not raise: the worker still starts
 
-    # nothing was created
     assert asyncio.run(store.list_users()) == []
     assert asyncio.run(store.get_user_by_email("admin@x.co")) is None
 
-    # and the operator learns WHICH variable, WHICH validator, and WHY
     errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     assert errors, "a refused bootstrap admin must be logged, not silently skipped"
     joined = "\n".join(errors)
     assert "AUTH_ADMIN_PASSWORD" in joined
     assert "validate_password" in joined
-    # Pin the validator's OWN reason verbatim. Asserting only the min-length
-    # number is not enough: the remediation hint also contains "8", so the test
-    # would still pass if the logged reason were an unrelated string. Deriving
-    # the expectation from validate_password itself would be worse (tautological:
-    # changing the validator would change both sides). This literal is what
-    # validate_password emits for "x" and cannot come from the hint.
+    # Pin the validator's OWN reason verbatim: the remediation hint also
+    # contains "8", so a numeric check would pass on an unrelated string.
     assert "password must be at least" in joined
     assert "NOT created" in joined
 
 
 def test_bootstrap_admin_refuses_malformed_email_and_names_the_reason(store, monkeypatch, caplog):
-    """A malformed AUTH_ADMIN_EMAIL creates an account that can never be
-    validated or repaired through the normal flows, so nothing is created and
-    validate_email is named in the log (#290)."""
+    """A malformed AUTH_ADMIN_EMAIL must create nothing and name validate_email
+    in the log."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "not-an-email")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "adminpass1")
     monkeypatch.setattr(auth, "store", store)
@@ -219,9 +202,8 @@ def test_bootstrap_admin_refuses_malformed_email_and_names_the_reason(store, mon
 
 
 def test_bootstrap_admin_rejection_is_not_retried_five_times(store, monkeypatch, caplog):
-    """A config value the validators reject is a permanent fault: retrying it
-    inside the 5-attempt write-lock loop would re-log the identical error five
-    times. Transient SQLite faults must still retry, so both are checked."""
+    """A rejected config value is a permanent fault: it must not enter the
+    write-lock retry loop, while a transient write lock still retries."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
     monkeypatch.setattr(auth, "store", store)
@@ -262,19 +244,17 @@ def test_bootstrap_admin_rejection_is_not_retried_five_times(store, monkeypatch,
 
 
 def test_bootstrap_admin_keeps_existing_weak_admin_but_warns(store, monkeypatch, caplog):
-    """An admin created by an earlier run with weak credentials must survive --
-    deleting the only admin at startup is an unauthenticated lockout -- but it
-    must be reported loudly for out-of-band rotation (#290)."""
+    """A weak existing admin must survive startup -- deleting the only admin is
+    an unauthenticated lockout -- but be reported for out-of-band rotation."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
     monkeypatch.setattr(auth, "store", store)
-    # simulate the pre-fix world: a weak admin already exists
+    # a weak admin already exists
     asyncio.run(store.create_user("admin@x.co", "x", "Administrator", role="admin"))
 
     with caplog.at_level(logging.ERROR, logger="auth"):
         asyncio.run(bootstrap_admin())
 
-    # left in place, and NOT overwritten
     existing = asyncio.run(store.get_user_by_email("admin@x.co"))
     assert existing is not None and existing.role == "admin"
     assert auth.verify_password("x", existing.password_hash)
@@ -289,12 +269,10 @@ def test_bootstrap_admin_keeps_existing_weak_admin_but_warns(store, monkeypatch,
 
 
 def test_bootstrap_admin_accepts_long_passphrase_and_creates_loggable_admin(store, monkeypatch):
-    """REGRESSION: a passphrase longer than bcrypt's old 72-byte window is fully
-    serviceable. Rejecting it would be worse than the bug it guards:
-    bootstrap_admin is the ONLY path that can ever create an admin (signup
-    hardcodes SIGNUP_ROLE, and PATCH /users needs an admin token that cannot
-    exist yet), so refusing it leaves a fresh deploy permanently
-    unadministrable while /health still reports green."""
+    """A passphrase longer than bcrypt's old 72-byte window is serviceable.
+    bootstrap_admin is the ONLY path that can create an admin (signup hardcodes
+    SIGNUP_ROLE, and PATCH /users needs an admin token that cannot exist yet),
+    so refusing it leaves a fresh deploy unadministrable while /health is green."""
     long_pw = "Passphrase1234" + "a" * 89  # 103 chars
     assert len(long_pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
@@ -306,17 +284,13 @@ def test_bootstrap_admin_accepts_long_passphrase_and_creates_loggable_admin(stor
     admin = asyncio.run(store.get_user_by_email("admin@x.co"))
     assert admin is not None, "a long passphrase must still bootstrap an admin"
     assert admin.role == "admin" and admin.is_active
-    # and the account is actually usable
     assert auth.verify_password(long_pw, admin.password_hash)
     assert len(asyncio.run(store.list_users())) == 1
 
 
 def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeypatch):
-    """A multi-byte passphrase used to straddle bcrypt's 72-byte cut, and
-    decoding the truncated bytes strictly raised UnicodeDecodeError inside
-    bootstrap -- a restart-looping worker, the fail-dead outcome the old check
-    existed to avoid. Nothing is decoded from a cut buffer any more: the whole
-    value is encoded and digested, so the straddle has nowhere to happen."""
+    """A multi-byte passphrase must not crash bootstrap: the whole value is
+    encoded and digested, so nothing is decoded from a cut buffer."""
     pw = "Passphrase1234" + "a" * 57 + "é" * 20
     assert len(pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
@@ -340,14 +314,8 @@ def test_bootstrap_admin_long_multibyte_passphrase_does_not_crash(store, monkeyp
     ],
 )
 def test_bootstrap_admin_accepts_digit_past_the_bcrypt_cut(store, monkeypatch, password):
-    """REGRESSION: the letter+digit rule is about the secret the operator
-    configured, not any prefix of it. A passphrase whose only digit sits past
-    byte 72 used to have that digit discarded before the rule was applied, so
-    judging composition on what survived would refuse a long, usable value --
-    and since bootstrap_admin is the only path that can create an admin, that
-    refusal leaves a fresh deploy unadministrable. The rule is judged on the
-    whole configured value, and every byte of it is now part of the
-    credential."""
+    """The letter+digit rule is judged on the whole configured value, not on any
+    byte prefix of it, so every byte of it is part of the credential."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
     monkeypatch.setattr(auth, "store", store)
@@ -361,9 +329,8 @@ def test_bootstrap_admin_accepts_digit_past_the_bcrypt_cut(store, monkeypatch, p
 
 
 def test_bootstrap_admin_refuses_genuinely_composition_free_password(store, monkeypatch, caplog):
-    """The documented residual: composition is still enforced on the whole
-    value, so a password with no letter and no digit at all is refused even
-    though it is long. Judging it on the prefix would only have admitted it."""
+    """Composition is still enforced on the whole value, so a long password with
+    no letter and no digit is refused."""
     password = "\U0001F600" * 100
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
@@ -378,11 +345,8 @@ def test_bootstrap_admin_refuses_genuinely_composition_free_password(store, monk
 
 
 def test_bootstrap_does_not_demand_rotation_for_an_email_rejection(store, monkeypatch, caplog):
-    """A dotless address can never validate, so a rejection on the email axis
-    fires on every worker start forever. Demanding a PASSWORD rotation there
-    would be an unresolvable instruction for a perfectly healthy account: the
-    only real fault is the configured address, which is what the fix must name.
-    """
+    """A dotless address can never validate, so an email-axis rejection fires on
+    every worker start; demanding a PASSWORD rotation there is unresolvable."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@localhost")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "healthy-pass1")
     monkeypatch.setattr(auth, "store", store)
@@ -393,20 +357,18 @@ def test_bootstrap_does_not_demand_rotation_for_an_email_rejection(store, monkey
             asyncio.run(bootstrap_admin())
 
     existing = asyncio.run(store.get_user_by_email("admin@localhost"))
-    assert auth.verify_password("healthy-pass1", existing.password_hash)  # untouched
+    assert auth.verify_password("healthy-pass1", existing.password_hash)
     joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
     assert "Rotate" not in joined, "an email rejection must never demand a password rotation"
     assert "REJECTED" not in joined
-    # and the remedy must name the address, which is the actual fault
     assert "AUTH_ADMIN_EMAIL" in joined
     assert "address" in joined
     assert len(asyncio.run(store.list_users())) == 1
 
 
 def test_bootstrap_admin_still_blocks_a_sub_floor_password_however_long_it_is(store, monkeypatch):
-    """Length is judged on the whole password, so a long one can no longer be
-    admitted by a short prefix: a 201-character value under a raised floor is
-    refused, and refusing it does not take startup down with it (#290)."""
+    """Length is judged on the whole password, and refusing an under-floor one
+    must not take startup down with it."""
     password = "a" * 200 + "1"
     monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", len(password) + 1)
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
@@ -426,10 +388,8 @@ def test_bootstrap_admin_still_blocks_a_sub_floor_password_however_long_it_is(st
     ],
 )
 def test_bootstrap_rejection_hint_matches_the_reason(store, monkeypatch, caplog, password):
-    """The remediation must never contradict the reason it accompanies: telling
-    an operator to lengthen a password that was rejected for having no digit
-    sends them the wrong way (#290). The reason is read back off the policy
-    itself, so this fails if the two drift rather than restating them."""
+    """The remediation must never contradict the reason it accompanies; the
+    reason is read back off the policy itself, so drift fails the test."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", password)
     monkeypatch.setattr(auth, "store", store)
@@ -451,18 +411,9 @@ def test_bootstrap_rejection_hint_matches_the_reason(store, monkeypatch, caplog,
 
 
 def test_all_three_set_paths_agree_on_one_policy():
-    """#334: ``signup``, ``change_password`` and ``bootstrap_admin`` must reach
-    the SAME policy function. They used to state the same two rules against
-    different values -- length on the raw string for the API paths but on the
-    72-byte effective prefix for bootstrap, and a raw 72-byte cap the bootstrap
-    path did not have at all -- so each admitted passwords the others refused.
-
-    Asserted structurally (one function backs all three) rather than by
-    re-listing the rules, because a second copy of the rules is exactly the bug.
-    The check is that each endpoint DELEGATES and adds no bound of its own: an
-    endpoint that calls ``validate_password`` and then also compares a length
-    has reintroduced exactly the drift this issue removed.
-    """
+    """``signup``, ``change_password`` and ``bootstrap_admin`` must all delegate
+    to one policy function: a second copy of the rules is the bug. The check is
+    that each endpoint adds no bound of its own."""
     for name in ("signup", "change_password"):
         src = inspect.getsource(getattr(auth, name))
         assert "validate_password(" in src, f"{name} must go through validate_password"
@@ -478,15 +429,8 @@ def test_all_three_set_paths_agree_on_one_policy():
 
 
 def test_a_truncated_passwords_prefix_no_longer_authenticates_it():
-    """The consequence #334 documented and pinned is gone (#387).
-
-    With no maximum on the policy, a user could choose a password whose tail was
-    silently dropped, and two passwords sharing a 72-byte prefix were the same
-    credential -- so the prefix alone opened the longer account. That is the
-    collision bcrypt's truncation permits, and it is exactly why the value has
-    to be pre-hashed rather than truncated. Pinned here so a change that puts
-    the truncation back has to confront it.
-    """
+    """Two passwords sharing a 72-byte prefix are the same credential under
+    bcrypt truncation -- which is why the value is pre-hashed, not truncated."""
     long_pw = "Passphrase1234" + "a" * 89
     prefix = long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES]
     assert len(long_pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
@@ -499,15 +443,8 @@ def test_a_truncated_passwords_prefix_no_longer_authenticates_it():
 
 
 def test_minimum_is_judged_on_the_whole_password(monkeypatch):
-    """The floor applies to the credential, whatever the credential is made of.
-
-    #334 had to judge length on a 72-byte prefix because bcrypt hashed one, and
-    that made a floor on the raw string the weaker bound: a 30-character
-    password of 3-byte characters cleared a 30-character floor while only 24
-    characters of it became the credential. Pre-hashing removed the shortening
-    that made the raw bound weaker, so the floor is judged on the whole value
-    and a password is neither silently cut nor admitted by a short prefix.
-    """
+    """The length floor is judged on the whole value: a 30-character password of
+    3-byte characters is 30 characters of credential, not 24."""
     pw = "a" + "１" * 29  # 30 chars, 88 bytes
     assert len(pw) == 30 and len(pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", 30)
@@ -522,14 +459,9 @@ def test_minimum_is_judged_on_the_whole_password(monkeypatch):
 
 
 def test_a_sub_floor_password_is_refused_by_every_set_path(tmp_path, monkeypatch, store):
-    """The minimum rule must hold at the ENDPOINTS, not just in the helper: a
-    caller must not reach the user table with a sub-floor credential by any of
-    the three routes.
-
-    Every leg asserts the rejection REASON, not merely a 422. A bare status
-    check would pass on any refusal, so it could not tell "refused because the
-    credential is under the floor" from "refused for an unrelated reason".
-    """
+    """The minimum rule must hold at the ENDPOINTS, not just in the helper, and
+    every leg asserts the rejection REASON: a bare status check could not tell
+    "under the floor" from an unrelated refusal."""
     pw = "a" + "１" * 28  # 29 characters
     monkeypatch.setattr(auth.config, "AUTH_PASSWORD_MIN_LEN", 30)
     reason = "password must be at least 30 characters"
@@ -541,9 +473,8 @@ def test_a_sub_floor_password_is_refused_by_every_set_path(tmp_path, monkeypatch
         assert r.status_code == 422, "signup admitted a sub-floor effective credential"
         assert r.json()["detail"] == reason
 
-        # the third route, which this test previously never exercised at all.
-        # The seeded account needs a password that CLEARS the raised floor, so
-        # the 422 below can only be about the sub-floor one.
+        # The seeded account's password CLEARS the raised floor, so the 422
+        # below can only be about the sub-floor one.
         seeded = "Goodpassword9-abcdefghijklmnop"
         cookie = _session(client, "user@x.co", seeded)
         cr = client.post(
@@ -561,9 +492,8 @@ def test_a_sub_floor_password_is_refused_by_every_set_path(tmp_path, monkeypatch
         auth.store = None
         asyncio.run(s.close())
 
-    # The `store` fixture and _auth_app share one tmp_path database, so the
-    # signup leg's account is in it too: assert on the ADMIN specifically
-    # rather than on the table being empty.
+    # The `store` fixture and _auth_app share one tmp_path database, so assert
+    # on the ADMIN specifically rather than on the table being empty.
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", pw)
     monkeypatch.setattr(auth, "store", store)
@@ -574,14 +504,8 @@ def test_a_sub_floor_password_is_refused_by_every_set_path(tmp_path, monkeypatch
 
 
 def test_change_password_accepts_the_long_passphrase_bootstrap_accepted(tmp_path):
-    """The correctness/DoS half of #334: an admin bootstrapped with a
-    passphrase longer than bcrypt's window could log in with it, but was 422'd
-    out of re-applying or rotating *to* it. The operator's own working
-    credential was unsettable through the API.
-
-    The two paths now share one policy, so the same value is settable here too,
-    and it really authenticates afterwards.
-    """
+    """An admin's own working passphrase must stay settable through
+    change_password, and must authenticate afterwards."""
     long_pw = "Passphrase1234" + "a" * 89  # 103 bytes
     assert len(long_pw.encode()) > auth._LEGACY_BCRYPT_MAX_BYTES
     client, s = _auth_app(tmp_path)
@@ -608,11 +532,9 @@ def test_change_password_accepts_the_long_passphrase_bootstrap_accepted(tmp_path
 
 
 def test_signup_accepts_long_password_without_revealing_it(tmp_path):
-    """#334: ``signup`` refused any password over 72 bytes outright, so the
-    ordinary user path carried the same ceiling. It is now aligned with
-    bootstrap and change_password -- and nothing about the password may leak
-    into the response, which is the one fixed message that makes the endpoint
-    non-enumerable (#276)."""
+    """``signup`` shares bootstrap's unbounded policy, and nothing about the
+    password may leak into the fixed message that makes the endpoint
+    non-enumerable."""
     long_pw = "Passphrase1234" + "a" * 89
     client, s = _auth_app(tmp_path)
     try:
@@ -626,17 +548,8 @@ def test_signup_accepts_long_password_without_revealing_it(tmp_path):
 
 
 def test_no_set_path_still_drops_a_passwords_tail(tmp_path, store, monkeypatch, caplog):
-    """#334 warned on every set path that the bytes past byte 72 were being
-    discarded. Nothing is discarded now, so what each path stores is the whole
-    password: the tail is part of the credential rather than a warning about
-    what was lost.
-
-    The three paths are also driven under ``caplog`` to pin the property #334's
-    warning test carried as a side assertion: none of them ever writes the
-    password to the log. That matters more here than it did, because the
-    migration adds logging to the login path, and a line that named the secret
-    would put a credential in the log exactly when the login is rewriting it.
-    """
+    """What each set path stores is the whole password, and none of the three
+    ever writes the password to the auth log."""
     long_pw = "Passphrase1234" + "a" * 89
     caplog.set_level(logging.DEBUG, logger="auth")
     client, s = _auth_app(tmp_path)
@@ -646,10 +559,8 @@ def test_no_set_path_still_drops_a_passwords_tail(tmp_path, store, monkeypatch, 
         assert auth.verify_password(long_pw, signed_up)
         assert not auth.verify_password(long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES], signed_up)
 
-        # The one line the auth logger writes on a set path is the
-        # already-registered notice, so the second signup is what puts a log
-        # record on the path at all -- two fresh addresses would log nothing
-        # here and the assertion at the end would pass on an empty capture.
+        # The auth logger's only record on a set path is the already-registered
+        # notice, so the second signup is what makes the log check non-vacuous.
         assert _signup(client, "tail@x.co", long_pw) == {
             "message": auth.SIGNUP_ACCEPTED_MESSAGE
         }
@@ -676,9 +587,8 @@ def test_no_set_path_still_drops_a_passwords_tail(tmp_path, store, monkeypatch, 
     assert auth.verify_password(long_pw, seeded.password_hash)
     assert not auth.verify_password(long_pw[: auth._LEGACY_BCRYPT_MAX_BYTES], seeded.password_hash)
 
-    # Guard first: without a captured auth record the assertion below would pass
-    # on an empty capture and prove nothing. Then the property #334 carried as a
-    # side assertion, now that the truncation warning it rode along with is gone.
+    # Guard first: without a captured auth record the check below would pass on
+    # an empty capture and prove nothing.
     assert any(r.name == "auth" for r in caplog.records), (
         "nothing was captured from the auth logger, so the check below is vacuous"
     )
@@ -686,21 +596,20 @@ def test_no_set_path_still_drops_a_passwords_tail(tmp_path, store, monkeypatch, 
 
 
 def test_bootstrap_no_rotate_alarm_for_unrelated_healthy_admin(store, monkeypatch, caplog):
-    """A config value that merely fails validation says nothing about a healthy
-    admin's password. Demanding rotation of an unrelated account on every
-    worker restart is a false alarm, so 'Rotate' must appear only when the
-    configured value really is that account's current password."""
+    """'Rotate' must appear only when the configured value really is that
+    account's current password; a config value that merely fails validation says
+    nothing about a healthy admin's password."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
-    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")  # invalid config
+    monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
     monkeypatch.setattr(auth, "store", store)
-    # ... but the existing admin is on a strong, valid password
+    # but the existing admin is on a strong, valid password
     asyncio.run(store.create_user("admin@x.co", "healthy-pass1", "Administrator", role="admin"))
 
     with caplog.at_level(logging.ERROR, logger="auth"):
         asyncio.run(bootstrap_admin())
 
     existing = asyncio.run(store.get_user_by_email("admin@x.co"))
-    assert auth.verify_password("healthy-pass1", existing.password_hash)  # untouched
+    assert auth.verify_password("healthy-pass1", existing.password_hash)
     joined = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
     assert "REJECTED" not in joined
     assert "Rotate" not in joined
@@ -708,9 +617,8 @@ def test_bootstrap_no_rotate_alarm_for_unrelated_healthy_admin(store, monkeypatc
 
 
 def test_bootstrap_probe_failure_is_logged_not_swallowed(store, monkeypatch, caplog):
-    """If the existence probe itself fails, the operator must still see that,
-    rather than getting only the generic 'no admin account' line with the weak
-    -admin warning silently missing."""
+    """A failed existence probe must be logged, not replaced by the generic
+    'no admin account' line with the weak-admin warning silently missing."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
     monkeypatch.setattr(auth, "store", store)
@@ -784,9 +692,8 @@ def test_require_auth_accepts_session_cookie_and_rejects_missing(store, monkeypa
     async def expect_401(**kwargs):
         await auth.require_auth(_req(**kwargs))
 
-    # No credential, a garbage cookie, and a genuinely valid token sent in the
-    # old Authorization header are all refused: the header is no longer a
-    # transport, so the header path is gone rather than merely shadowed.
+    # The old Authorization header is no longer a transport: a genuinely valid
+    # token sent in it is refused, not merely shadowed.
     for bad_kwargs in ({}, {"cookies": auth_cookie("garbage")}, {"headers": {"authorization": f"Bearer {raw}"}}):
         with pytest.raises(HTTPException) as e:
             asyncio.run(expect_401(**bad_kwargs))
@@ -794,8 +701,8 @@ def test_require_auth_accepts_session_cookie_and_rejects_missing(store, monkeypa
 
 
 def test_service_token_acts_as_admin(store, monkeypatch):
-    # A service token is a stored, scoped, expiring credential now (#251), so
-    # unlike the old compare-only bypass it needs the auth store to resolve.
+    # A service token is a stored, scoped, expiring credential, so it needs the
+    # auth store to resolve.
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-tok-123")
     req = _req({"x-service-token": "svc-tok-123"})
@@ -811,19 +718,10 @@ def test_service_token_acts_as_admin(store, monkeypatch):
 
 
 def test_service_token_non_ascii_header_is_401_not_500(store, monkeypatch):
-    """A header carrying bytes above 0x7F must be a mismatch, not a crash.
-
-    ``secrets.compare_digest`` raises ``TypeError`` on non-ASCII ``str`` input,
-    and nothing on this path caught it, so a raw request with a non-ASCII
-    X-Service-Token turned an authentication failure into a 500. The token is
-    therefore compared as bytes.
-
-    Driven through a raw ASGI scope rather than a test client, so the header
-    is the exact bytes chosen here: an httpx/TestClient call cannot send a
-    non-ASCII header ``str`` at all (it raises on the ASCII encode), and a
-    client handed raw bytes re-encodes them, so neither reproduces what a
-    server actually receives off the wire.
-    """
+    """``secrets.compare_digest`` raises ``TypeError`` on non-ASCII ``str`` input,
+    so the token is compared as bytes and a mismatched header is a 401, not a
+    500. Driven through a raw ASGI scope because an httpx/TestClient call
+    cannot send a non-ASCII header ``str`` at all."""
     from fastapi import FastAPI
 
     monkeypatch.setattr(auth, "store", store)
@@ -862,27 +760,21 @@ def test_service_token_non_ascii_header_is_401_not_500(store, monkeypatch):
         return next(m for m in sent if m["type"] == "http.response.start")["status"]
 
     async def scenario():
-        # The configured token still authenticates, and a wrong ASCII one is
-        # still a plain 401: the fix is not "reject more".
+        # The fix is not "reject more": a wrong ASCII token is still a plain 401.
         assert await drive(b"svc-tok-123") == 200
         assert await drive(b"nope") == 401
         # latin-1 (what a server decodes a raw 0xE9 byte into) and utf-8 both
         # reach the comparison as non-ASCII, and both are ordinary 401s.
         assert await drive(b"svc-tok-\xe9") == 401
         assert await drive("svc-tok-é".encode()) == 401
-        # Nothing was seeded for a value that did not match.
         assert await store.service_token_for("svc-tok-\xe9") is None
 
     asyncio.run(scenario())
 
 
 def test_revoke_service_token_non_ascii_is_not_a_crash(store, monkeypatch):
-    """The same non-ASCII comparison, on the other credential that has one.
-
-    Revoking names a token in the request body, which is equally
-    attacker-controlled, so a non-ASCII value must be a plain "revoked 0"
-    rather than raise out of the endpoint.
-    """
+    """The revoke body is equally attacker-controlled, so a non-ASCII token must
+    be a plain "revoked 0" rather than raise out of the endpoint."""
     monkeypatch.setattr(auth, "store", store)
     monkeypatch.setattr(auth.config, "AUTH_SERVICE_TOKEN", "svc-tok-123")
     body = auth.ServiceTokenRevokeIn(token="svc-tok-é")
@@ -890,8 +782,7 @@ def test_revoke_service_token_non_ascii_is_not_a_crash(store, monkeypatch):
     async def scenario():
         result = await auth.revoke_service_tokens(SimpleNamespace(), body, None, None)
         assert result == {"revoked": 0}
-        # Not the configured token, so the ordinary path ran and the
-        # configured credential was left alone.
+        # Not the configured token, so the ordinary path ran and left it alone.
         assert await store.service_token_for(body.token) is None
         assert await store.service_token_for("svc-tok-123") is None
 
@@ -919,7 +810,6 @@ def test_rate_limit_429_and_reset(monkeypatch):
     key = "auth:rl:login:1.2.3.4"
     assert fake.ttl(key) is not None, "a counter with no TTL would lock this IP out forever"
 
-    # And the counter is reclaimed once the window closes.
     fake.advance(auth.config.AUTH_RATE_WINDOW_SECONDS + 1)
     asyncio.run(attempt())
     assert fake.counters[key] == 1
@@ -937,7 +827,6 @@ def test_last_admin_protected(store, monkeypatch):
     with pytest.raises(HTTPException) as e:
         asyncio.run(_patch_guard(admin.id, "user"))
     assert e.value.status_code == 400
-    # adding a second admin then demoting the first is fine
     second = asyncio.run(store.create_user("a2@x.co", "adminpass1", "A2", "admin"))
     asyncio.run(store.update_user(admin.id, None, "user", None))
     assert asyncio.run(store.get_user(admin.id)).role == "user"
@@ -969,11 +858,9 @@ def _auth_app(tmp_path):
 
 
 def _signup(client, email, password="secret12", name=""):
-    """POST /signup and return the parsed body, asserting the 200.
-
-    Signup deliberately returns the same tokenless ``{"message": ...}`` for a
-    fresh address and an already-registered one, so tests that need a session
-    must log in afterwards (see ``_session``)."""
+    """POST /signup and return the parsed body, asserting the 200. Signup is
+    tokenless for a fresh address and an already-registered one alike, so a test
+    needing a session must log in afterwards."""
     r = client.post("/api/auth/signup", json={"email": email, "password": password, "name": name})
     assert r.status_code == 200, r.text
     return r.json()
@@ -992,8 +879,8 @@ def test_signup_login_me_flow(tmp_path):
     client, s = _auth_app(tmp_path)
     try:
         data = _signup(client, "  New@Example.com ", name="Alice")
-        # Signup is tokenless by design (#276): a token here would tell an
-        # anonymous caller that the address was free.
+        # Signup is tokenless by design: a token here would tell an anonymous
+        # caller that the address was free.
         assert set(data) == {"message"}
         assert data["message"] == auth.SIGNUP_ACCEPTED_MESSAGE
 
@@ -1006,7 +893,6 @@ def test_signup_login_me_flow(tmp_path):
         assert "token" not in login.json()
         cookie = auth_cookie(session_cookie_value(login))
 
-        # me with the issued cookie
         assert client.get("/api/auth/me", cookies=cookie).json()["email"] == "new@example.com"
     finally:
         auth.store = None
@@ -1014,10 +900,9 @@ def test_signup_login_me_flow(tmp_path):
 
 
 def test_signup_validation_errors(tmp_path, monkeypatch):
-    # This case hammers signup more times than AUTH_SIGNUP_RATE_PER_MIN allows.
-    # The limit is real and now enforced even with the limiter's Redis down
-    # (see test_auth_issue251.py), so the limit -- not the validation rules --
-    # is what the loop below would otherwise be measuring.
+    # The case list exceeds AUTH_SIGNUP_RATE_PER_MIN, and the limit is enforced
+    # even with the limiter's Redis down, so it is raised to leave the loop
+    # measuring the validation rules.
     monkeypatch.setattr(auth.config, "AUTH_SIGNUP_RATE_PER_MIN", 100)
     client, s = _auth_app(tmp_path)
     try:
@@ -1037,13 +922,8 @@ def test_signup_validation_errors(tmp_path, monkeypatch):
 
 
 def test_signup_duplicate_email_indistinguishable(tmp_path):
-    """A duplicate signup must be indistinguishable from a fresh one (#276).
-
-    It used to answer 409 "an account with this email already exists", a
-    single unauthenticated request that confirmed which addresses are
-    registered here. Now both cases get the same 200 and the same body --
-    including when the attacker varies the case of the address, which the
-    store treats as the same account."""
+    """A duplicate signup must be indistinguishable from a fresh one: the same
+    status and the same body, including when the address case varies."""
     client, s = _auth_app(tmp_path)
     try:
         first = _signup(client, "dup@x.co")
@@ -1057,17 +937,14 @@ def test_signup_duplicate_email_indistinguishable(tmp_path):
 
 def test_signup_duplicate_leaves_existing_account_untouched(tmp_path):
     """The generic duplicate answer must not touch, replace or take over the
-    account (#276): the stored row is byte-identical afterwards, no second row
-    appears, and the password the duplicate signup offered never becomes
-    valid -- otherwise a re-registration attempt would be an account takeover
-    wearing a success message."""
+    account: the stored row is byte-identical afterwards, no second row appears,
+    and the password the duplicate signup offered never becomes valid."""
     client, s = _auth_app(tmp_path)
     try:
         _signup(client, "dup@x.co", password="secret12", name="Owner")
         before = asyncio.run(s.get_user_by_email("dup@x.co"))
         assert before is not None
 
-        # different case, different password, different name
         dup = client.post(
             "/api/auth/signup",
             json={"email": "DUP@x.co", "password": "attacker9", "name": "Attacker"},
@@ -1078,7 +955,6 @@ def test_signup_duplicate_leaves_existing_account_untouched(tmp_path):
         assert after == before  # no re-hash, rename, re-activation or id change
         assert asyncio.run(s.list_users()) == [auth.UserOut.from_user(before)]
 
-        # the owner's password still works; the offered one never did
         assert client.post("/api/auth/login", json={"email": "dup@x.co", "password": "secret12"}).status_code == 200
         assert client.post("/api/auth/login", json={"email": "dup@x.co", "password": "attacker9"}).status_code == 401
     finally:
@@ -1088,25 +964,19 @@ def test_signup_duplicate_leaves_existing_account_untouched(tmp_path):
 
 def test_signup_role_ignores_env_default_role(tmp_path, monkeypatch):
     """A hostile AUTH_DEFAULT_ROLE=admin env must not escalate a public signup.
-
-    Asserts every observable surface that still exists after #276 made signup
-    tokenless: the row PERSISTED in the auth store, and what a real session
-    for that account reports via /me. A response-only fix would pass a check
-    on the signup body and still be a full compromise, so both are checked.
-    """
+    Both observable surfaces are checked -- the persisted row and what a real
+    session reports via /me -- because a response-only fix is still a full
+    compromise."""
     monkeypatch.setattr(auth.config, "AUTH_DEFAULT_ROLE", "admin", raising=False)
     client, s = _auth_app(tmp_path)
     try:
         body = _signup(client, "env@x.co", name="E")
-        # the response commits to no role at all (it is a fixed string)
         assert "role" not in body["message"]
 
-        # persisted record, read straight back out of the store
         stored = asyncio.run(s.get_user_by_email("env@x.co"))
         assert stored is not None
         assert stored.role == "user"
 
-        # a real session for that account reports no privilege either
         login = client.post("/api/auth/login", json={"email": "env@x.co", "password": "secret12"})
         me = client.get("/api/auth/me", cookies=auth_cookie(session_cookie_value(login)))
         assert me.status_code == 200
@@ -1118,13 +988,10 @@ def test_signup_role_ignores_env_default_role(tmp_path, monkeypatch):
 
 
 def test_signup_ignores_role_in_request_payload(tmp_path):
-    """A self-declared role in the signup body is not honoured."""
     client, s = _auth_app(tmp_path)
     try:
-        # One signup carrying role=admin. The account must NOT pre-exist: a
-        # duplicate POST short-circuits into the swallowed DuplicateEmailError
-        # branch and never reaches create_user, so the payload-role guard this
-        # test exists for would go unexercised.
+        # The account must NOT pre-exist: a duplicate POST short-circuits into
+        # the swallowed DuplicateEmailError branch and never reaches create_user.
         r = client.post(
             "/api/auth/signup",
             json={"email": "sneaky@x.co", "password": "secret12", "name": "S", "role": "admin"},
@@ -1152,15 +1019,11 @@ def test_login_invalid_credentials_identical_401(tmp_path):
 
 
 def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
-    """An unknown address must still pay a full bcrypt verify (#276).
-
-    ``user is not None and await verify_password(...)`` short-circuits, so the
-    unknown-address path skipped the ~100ms bcrypt entirely and answered far
-    faster than a wrong password: a remote account-existence oracle behind an
-    otherwise identical 401. The mechanism is asserted, not a stopwatch --
-    exactly one verify must run, and against the dummy hash, which carries the
-    same cost factor as a stored one (a cheaper dummy would be the same
-    oracle)."""
+    """``user is not None and await verify_password(...)`` short-circuits, so the
+    unknown-address path skipped the bcrypt entirely and answered faster than a
+    wrong password: a remote account-existence oracle behind an identical 401.
+    Exactly one verify must run, against the dummy hash, which carries the same
+    cost factor as a stored one."""
     client, s = _auth_app(tmp_path)
     try:
         _signup(client, "known@x.co")
@@ -1180,7 +1043,7 @@ def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
         assert not real_verify("secret12", auth._DUMMY_PASSWORD_HASH)  # the dummy is not a back door
 
         # the dummy hash costs what a real one costs, and is in the same scheme
-        # so it takes the same verify path (#387)
+        # so it takes the same verify path
         def cost_of(hashed: str) -> str:
             body = hashed.removeprefix(auth._PASSWORD_SCHEME)
             return body.split("$")[2]  # "$2b$<rounds>$..."
@@ -1191,7 +1054,6 @@ def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
         verified.clear()
         wrong = client.post("/api/auth/login", json={"email": "known@x.co", "password": "wrong12"})
         assert wrong.status_code == 401
-        # the real path verifies against the stored hash, not the dummy
         assert len(verified) == 1
         assert verified[0] != auth._DUMMY_PASSWORD_HASH
         assert asyncio.run(s.get_user_by_email("known@x.co")).password_hash == verified[0]
@@ -1201,19 +1063,10 @@ def test_login_unknown_email_verifies_against_dummy_hash(tmp_path, monkeypatch):
 
 
 def test_login_unknown_vs_wrong_password_timing_comparable(tmp_path, monkeypatch):
-    """Loose statistical guard on the wall-clock side of #276.
-
-    The mechanism is asserted in the test above; this one samples real bcrypt
-    cost so a future "optimisation" that skips the dummy verify is caught even
-    if the mechanism changes shape. Medians over several iterations, and only
-    one-sided: the bug made the unknown address *faster*, so requiring the
-    unknown path to cost at least half of a real verify fails on the old code
-    (a few ms vs ~100ms) while tolerating a loaded CI box.
-
-    The per-IP limiter is switched off: this fires 14 logins against a default
-    AUTH_LOGIN_RATE_PER_MIN of 10, so wherever Redis is reachable the tail of
-    the samples would be fast 429s and both the medians and the 401 assertion
-    would be wrong. A rate limiter has no bearing on the oracle under test."""
+    """Loose wall-clock guard on the dummy verify: the bug made the unknown
+    address faster, so one-sided medians fail on the old code (a few ms vs
+    ~100ms) while tolerating a loaded CI box. The per-IP limiter is off because
+    the 14 logins here exceed the default AUTH_LOGIN_RATE_PER_MIN."""
     monkeypatch.setattr(auth.config, "AUTH_LOGIN_RATE_PER_MIN", 0)
     client, s = _auth_app(tmp_path)
     try:
@@ -1240,9 +1093,8 @@ def test_login_unknown_vs_wrong_password_timing_comparable(tmp_path, monkeypatch
 
 
 def test_login_deactivated_account_pays_a_real_verify(tmp_path, monkeypatch):
-    """A deactivated account must be indistinguishable too (#276): the
-    is_active check comes after the verify, so it cannot become a third,
-    cheaper branch that separates 'exists but disabled' from 'no account'."""
+    """The is_active check runs after the verify, so a deactivated account cannot
+    become a third, cheaper branch separating it from 'no account'."""
     client, s = _auth_app(tmp_path)
     try:
         _signup(client, "off@x.co")
@@ -1297,10 +1149,8 @@ def test_change_password_invalidates_other_tokens(tmp_path):
         # the rotated session is re-issued as a cookie, never in the body
         assert "token" not in ok.json()
         new_cookie = auth_cookie(session_cookie_value(ok))
-        # old token was revoked, the new one works
         assert client.get("/api/auth/me", cookies=cookie).status_code == 401
         assert client.get("/api/auth/me", cookies=new_cookie).status_code == 200
-        # and the new password logs in
         assert client.post("/api/auth/login", json={"email": "a@x.co", "password": "secret21"}).status_code == 200
     finally:
         auth.store = None
@@ -1308,10 +1158,10 @@ def test_change_password_invalidates_other_tokens(tmp_path):
 
 
 def test_concurrent_create_duplicate_race_no_poison(tmp_path):
-    """Two separate connections racing to INSERT the same UNIQUE email must yield
-    exactly one success and one DuplicateEmailError. Each attempt gets its own
-    AuthStore/connection: a single SQLite connection must never be shared across
-    concurrent coroutines (that was the source of the flakiness)."""
+    """Two connections racing the same UNIQUE email must yield exactly one
+    success and one DuplicateEmailError. Each attempt gets its own
+    AuthStore/connection: one SQLite connection must never be shared across
+    concurrent coroutines."""
     db_path = str(tmp_path / "auth.db")
 
     async def attempt(name: str):
@@ -1323,7 +1173,7 @@ def test_concurrent_create_duplicate_race_no_poison(tmp_path):
             await s.close()
 
     async def main():
-        # Prime the schema once on a throwaway connection.
+        # prime the schema once on a throwaway connection
         prime = AuthStore(db_path)
         await prime.connect()
         await prime.close()
@@ -1348,18 +1198,9 @@ def test_concurrent_create_duplicate_race_no_poison(tmp_path):
 
 def test_signup_duplicate_race_is_indistinguishable(tmp_path):
     """Two concurrent signups for one address must both look like a plain
-    success (#276). This is the ``DuplicateEmailError`` site -- the second of
-    the two 409s the old endpoint could emit, and the one a plain second
-    request would never reach -- so a fix applied only to the pre-flight
-    existence check would still fail here.
-
-    The race is exercised as two coroutines on a single event loop (via an
-    ASGI transport) rather than two OS threads sharing one TestClient — the
-    latter is flaky because the store's SQLite connection is bound to the
-    thread it was opened on, so a cross-thread request can error out
-    intermittently. Coroutines keep the connection on one loop while still
-    racing the INSERTs. The store is opened/closed inside the same coroutine so
-    its aiosqlite connection stays bound to the loop that runs the requests."""
+    success. Raced as two coroutines on one event loop: the store's SQLite
+    connection is bound to the thread it was opened on, so a cross-thread
+    TestClient is flaky."""
     import asyncio
 
     import httpx
@@ -1438,20 +1279,15 @@ def test_admin_user_management_rbac(tmp_path):
         
         
 
-        # regular users cannot read or manage users
         assert client.get("/api/auth/users", cookies=uh).status_code == 403
         assert client.patch("/api/auth/users/some-id", cookies=uh, json={"role": "user"}).status_code == 403
-        # admins can list; non-existent id -> 404
         listing = client.get("/api/auth/users", cookies=ah)
         assert listing.status_code == 200 and len(listing.json()) == 2
         assert client.get("/api/auth/users/nope", cookies=ah).status_code == 404
-        # invalid role -> 422
         uid = listing.json()[0]["id"]
         assert client.patch(f"/api/auth/users/{uid}", cookies=ah, json={"role": "superuser"}).status_code == 422
-        # promote the user
         user_id = asyncio.run(s.get_user_by_email("user@x.co")).id
         assert client.patch(f"/api/auth/users/{user_id}", cookies=ah, json={"role": "admin"}).status_code == 200
-        # revoke all tokens
         assert client.post(f"/api/auth/users/{user_id}/tokens/revoke", cookies=ah).json() == {"ok": True}
         assert client.get("/api/auth/me", cookies=uh).status_code == 401
     finally:
@@ -1461,16 +1297,14 @@ def test_admin_user_management_rbac(tmp_path):
 
 def test_verify_password_malformed_hash_returns_false():
     """A malformed stored password hash raises ValueError inside bcrypt, which
-    verify_password must swallow as a plain False (ERROR PATH — malformed stored
-    password hash)."""
+    verify_password must swallow as a plain False."""
     assert auth.verify_password("secret12", "not-a-bcrypt-hash") is False
     assert auth.verify_password("secret12", "") is False
 
 
 def test_create_user_generic_error_rolls_back_and_raises(store, monkeypatch):
-    """A non-integrity INSERT failure must roll back so the connection never
-    holds an open write transaction, then re-raise (ERROR PATH — SQLite write
-    failure)."""
+    """A non-integrity INSERT failure must roll back so the connection never holds
+    an open write transaction, then re-raise."""
     calls = {"rollback": 0}
     orig_execute = store._db.execute
 
@@ -1491,8 +1325,6 @@ def test_create_user_generic_error_rolls_back_and_raises(store, monkeypatch):
 
 
 def test_update_user_no_op_and_name_update(store, monkeypatch):
-    """update_user with no fields issues no SQL; a name update persists (lines
-    284-285, 293)."""
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     execs = []
     orig_execute = store._db.execute
@@ -1511,7 +1343,6 @@ def test_update_user_no_op_and_name_update(store, monkeypatch):
 
 
 def test_delete_user_removes_tokens_and_user(store):
-    """delete_user removes the user and cascades its tokens (lines 299-301)."""
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
     token = asyncio.run(store.issue_token(user.id, 7))
     assert asyncio.run(store.user_for_token(token)) is not None
@@ -1521,8 +1352,7 @@ def test_delete_user_removes_tokens_and_user(store):
 
 
 def test_issue_token_error_rolls_back_and_raises(store, monkeypatch):
-    """A token INSERT failure must roll back before re-raising (ERROR PATH —
-    SQLite write failure)."""
+    """A token INSERT failure must roll back before re-raising."""
     calls = {"rollback": 0}
     orig_execute = store._db.execute
 
@@ -1552,15 +1382,15 @@ def test_require_auth_store_uninitialized_503(monkeypatch):
 def test_client_ip_x_forwarded_for_and_fallback():
     """_client_ip honors X-Forwarded-For only behind a trusted proxy, else the
     real socket peer, then 'unknown'."""
-    # Auto (the shipped default) with a client that is not behind a local
-    # proxy: the header is ignored and the socket peer stays authoritative,
-    # so a direct caller cannot forge an IP to escape its own rate-limit bucket.
+    # Auto (the shipped default) with a client that is not behind a local proxy:
+    # the socket peer stays authoritative, so a direct caller cannot forge an IP
+    # to escape its own rate-limit bucket.
     req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"
-    # Auto with a loopback peer -- the reference deploy, where nginx on this
-    # host forwards to 127.0.0.1. The rightmost (nginx-appended) XFF hop wins,
-    # so a client cannot spoof its IP by prepending a forged address.
+    # Auto with a loopback peer -- the reference deploy, where nginx on this host
+    # forwards to 127.0.0.1. The rightmost (nginx-appended) XFF hop wins, so a
+    # client cannot spoof its IP by prepending a forged address.
     req = _req({"x-forwarded-for": "203.0.113.9, 10.0.0.1"})
     req.client = SimpleNamespace(host="127.0.0.1")
     assert auth._client_ip(req) == "10.0.0.1"
@@ -1572,12 +1402,10 @@ def test_client_ip_x_forwarded_for_and_fallback():
     req = _req({})
     req.client = SimpleNamespace(host="1.2.3.4")
     assert auth._client_ip(req) == "1.2.3.4"
-    # no peer at all -> "unknown"
     assert auth._client_ip(_req({})) == "unknown"
 
 
 def test_client_ip_trust_setting_overrides_the_auto_peer_check(monkeypatch):
-    """An explicit true/false forces the behaviour whatever the peer is."""
     req = _req({"x-forwarded-for": "10.0.0.1"})
     req.client = SimpleNamespace(host="127.0.0.1")
     monkeypatch.setattr(auth.config, "AUTH_TRUST_X_FORWARDED_FOR", False)
@@ -1590,9 +1418,8 @@ def test_client_ip_trust_setting_overrides_the_auto_peer_check(monkeypatch):
 
 
 def test_xff_trust_env_parsing_is_three_state(monkeypatch):
-    """'auto' (and an unset var) must resolve to the auto behaviour, so the
-    .env shipped by setup.sh does not force a decision. A forced true/false is
-    honoured, and an unrecognised value falls back to auto rather than
+    """'auto' (and an unset var, as in the .env shipped by setup.sh) resolves to
+    the auto behaviour; an unrecognised value falls back to auto rather than
     silently picking a side."""
     monkeypatch.delenv("PROBE_FLAG", raising=False)
     assert config_module._env_tristate("PROBE_FLAG") is None
@@ -1617,7 +1444,6 @@ def _promote_to_admin(client, s, email):
 
 
 def test_get_user_endpoint(tmp_path):
-    """GET /api/auth/users/{id} returns the requested user (line 548)."""
     client, s = _auth_app(tmp_path)
     try:
         ah = _session(client, "boss@x.co")
@@ -1634,8 +1460,8 @@ def test_get_user_endpoint(tmp_path):
 
 
 def test_patch_user_last_admin_guard_endpoint(tmp_path):
-    """PATCH cannot demote or deactivate the last active admin (line 566) —
-    ERROR PATH — self-lockout protection."""
+    """PATCH cannot demote or deactivate the last active admin -- self-lockout
+    protection."""
     client, s = _auth_app(tmp_path)
     try:
         ah = _session(client, "boss@x.co")
@@ -1653,8 +1479,7 @@ def test_patch_user_last_admin_guard_endpoint(tmp_path):
 
 
 def test_delete_user_last_admin_guard_endpoint(tmp_path):
-    """DELETE cannot remove the last active admin (lines 580-585) — ERROR PATH —
-    self-lockout protection."""
+    """DELETE cannot remove the last active admin -- self-lockout protection."""
     client, s = _auth_app(tmp_path)
     try:
         ah = _session(client, "boss@x.co")
@@ -1671,8 +1496,8 @@ def test_delete_user_last_admin_guard_endpoint(tmp_path):
 
 
 def test_bootstrap_admin_gives_up_after_write_lock_retries(store, monkeypatch):
-    """bootstrap_admin retries 5 times on a write lock, sleeping between attempts,
-    then gives up gracefully instead of failing startup (lines 620-624)."""
+    """bootstrap_admin retries 5 times on a write lock, sleeping between
+    attempts, then gives up gracefully instead of failing startup."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@x.co")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "adminpass1")
     monkeypatch.setattr(auth, "store", store)
@@ -1695,16 +1520,14 @@ def test_bootstrap_admin_gives_up_after_write_lock_retries(store, monkeypatch):
 
 
 def test_bootstrap_still_flags_a_weak_admin_behind_an_email_fault(store, monkeypatch, caplog):
-    """REGRESSION: a deploy that ran pre-validator main with BOTH a dotless
-    address and a 1-character password, then upgraded. The email rejection must
-    not swallow the weak-admin warning, because the account's stored password
-    really IS the rejected config value, so rotation is the right advice.
-    Deciding rotation by which variable failed -- rather than by what the
-    account is actually on -- would hide a live 1-character admin password."""
+    """The email rejection must not swallow the weak-admin warning: the account's
+    stored password really IS the rejected config value, so rotation is the
+    right advice. Deciding by which variable failed would hide a live
+    1-character admin password."""
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_EMAIL", "admin@localhost")
     monkeypatch.setattr(auth.config, "AUTH_ADMIN_PASSWORD", "x")
     monkeypatch.setattr(auth, "store", store)
-    # pre-fix world: main provisioned this admin with the 1-character password
+    # this admin was provisioned with the 1-character password
     asyncio.run(store.create_user("admin@localhost", "x", "Administrator", role="admin"))
 
     with caplog.at_level(logging.ERROR, logger="auth"):
@@ -1723,11 +1546,9 @@ def test_bootstrap_still_flags_a_weak_admin_behind_an_email_fault(store, monkeyp
     ],
 )
 def test_bootstrap_enforces_the_minimum_length_boundary(store, monkeypatch, password):
-    """The headline guarantee of #290: an admin password shorter than
-    AUTH_PASSWORD_MIN_LEN is refused rather than provisioned. This pins the
-    boundary exactly, and every case has a letter AND a digit so that the
-    length rule is the only thing under test -- the pre-existing 15-character
-    case fails on composition, so it would still pass if length were wrong."""
+    """An admin password shorter than AUTH_PASSWORD_MIN_LEN is refused rather
+    than provisioned. Every case has a letter AND a digit, so the length rule is
+    the only thing under test."""
     assert len(password) in (
         auth.config.AUTH_PASSWORD_MIN_LEN - 1,
         auth.config.AUTH_PASSWORD_MIN_LEN,

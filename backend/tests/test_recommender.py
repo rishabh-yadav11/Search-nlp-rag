@@ -1,9 +1,4 @@
-"""Tests for the recommendation engine (app/recommender.py).
-
-These are unit tests that test the pure logic functions without requiring
-Qdrant or Redis to be running. Integration tests that require the full stack
-should be added separately.
-"""
+"""Unit tests for the recommendation engine's pure logic functions."""
 import json
 import logging
 import math
@@ -17,8 +12,6 @@ from qdrant_client.models import ScoredPoint
 
 
 class TestCalculateRecencyScore:
-    """Tests for _calculate_recency_score helper."""
-
     def test_recent_article(self):
         from app.recommender import _calculate_recency_score
         now = datetime.now(UTC)
@@ -55,8 +48,6 @@ class TestCalculateRecencyScore:
 
 
 class TestFormatArticles:
-    """Tests for _format_articles helper."""
-
     def test_empty_points(self):
         from app.recommender import _format_articles
         result = _format_articles([])
@@ -118,8 +109,6 @@ class TestFormatArticles:
 
 
 class TestRecommenderConfig:
-    """Tests that config values are respected."""
-
     def test_enabled_by_default(self):
         from app.config import config
         assert config.ENABLE_RECOMMENDATIONS is True
@@ -133,11 +122,9 @@ class TestRecommenderConfig:
 
     def test_disable_recommendations(self):
         from app.config import Config
-        # Simulate disabled via env var
         original = Config.ENABLE_RECOMMENDATIONS
         try:
             with patch.dict('os.environ', {'ENABLE_RECOMMENDATIONS': 'false'}):
-                # Re-import to pick up new env
                 import importlib
 
                 import app.config as config_module
@@ -148,8 +135,6 @@ class TestRecommenderConfig:
 
 
 class TestGetSimilarArticlesDisabled:
-    """Test similar articles when recommendations are disabled."""
-
     @pytest.mark.asyncio
     async def test_returns_empty_when_disabled(self):
         from app.recommender import get_similar_articles
@@ -161,18 +146,13 @@ class TestGetSimilarArticlesDisabled:
 
 
 class TestUserProfileIntegration:
-    """Integration tests for user profile interactions with Redis."""
-
     @pytest.mark.asyncio
     async def test_record_interaction_reports_recorded(self):
         """A successful record reports RECORDED, and the guards run first.
 
-        Replaces a mock-echo test that asserted the function returned None and
-        that a MagicMock's pipeline was called once. The contract is now an
-        explicit InteractionResult, and an article_id must clear the index
-        check before any pipeline exists -- so this drives the real code with a
-        fake that would raise on an unlisted command, and asserts both the
-        result and that the counter was actually written.
+        The contract is an explicit InteractionResult, and an article_id must
+        clear the index check before any pipeline exists -- so this drives the
+        real code with a fake that would raise on an unlisted command.
         """
         from app.user_profile import InteractionResult, record_interaction
 
@@ -187,8 +167,7 @@ class TestUserProfileIntegration:
                 return True
 
             def pipeline(self):
-                # redis-py's pipeline() is SYNC-returning; the commands are then
-                # executed with await. A coroutine here would never be awaited.
+                # redis-py's pipeline() is SYNC-returning; the commands are awaited after.
                 class _Pipe:
                     def zcard(self, key):
                         return 0
@@ -209,8 +188,8 @@ class TestUserProfileIntegration:
                         written[f"{key}:{field}"] = str(amount)
 
                     def zincrby(self, *a, **k):
-                        # Advances the trending index (#261) in the same
-                        # transaction; this double only asserts the counter.
+                        # Advances the trending index in the same transaction;
+                        # this double only asserts the counter.
                         pass
 
                     def delete(self, *a, **k):
@@ -232,12 +211,10 @@ class TestUserProfileIntegration:
             result = await record_interaction("user1", 42, "click")
 
         assert result is InteractionResult.RECORDED
-        # The article counter was genuinely written, by the legal field name.
         assert written["article:interactions:42:click"] == "1"
 
     @pytest.mark.asyncio
     async def test_get_user_interactions_returns_empty_on_error(self):
-        """Test graceful degradation when Redis is unavailable."""
         from app.user_profile import get_user_interactions
         with patch('app.user_profile._redis_client') as mock_redis:
             mock_redis.side_effect = Exception("Redis down")
@@ -246,7 +223,6 @@ class TestUserProfileIntegration:
 
     @pytest.mark.asyncio
     async def test_get_trending_articles_returns_empty_on_error(self):
-        """Test graceful degradation for trending."""
         from app.user_profile import get_trending_articles
         with patch('app.user_profile._redis_client') as mock_redis:
             mock_redis.side_effect = Exception("Redis down")
@@ -255,7 +231,6 @@ class TestUserProfileIntegration:
 
     @pytest.mark.asyncio
     async def test_invalidate_user_profile_returns_none(self):
-        """Test that invalidating profile works."""
         from app.user_profile import invalidate_user_profile
         with patch('app.user_profile._redis_client') as mock_redis:
             mock_client = AsyncMock()
@@ -326,9 +301,9 @@ def _scored_point(pid: int, title: str) -> ScoredPoint:
 class _FakeQdrant:
     """Qdrant double whose vector, category and trending legs fail on demand.
 
-    The vector leg queries with a point id (`query=...`); the category leg
-    queries with only a filter. That is what lets a single fake fail one leg
-    while the others keep working.
+    The vector leg queries with a point id (``query=...``) and the category leg
+    with only a filter, which is what lets one fake fail one leg while the
+    others keep working.
     """
 
     OUTAGE = "qdrant unreachable"
@@ -365,8 +340,7 @@ async def _personalized(qdrant, *, interactions=(901,)):
             recommender, "get_user_interactions",
             AsyncMock(return_value=[(pid, now) for pid in interactions]),
         ),
-        # A category containing "industry" is required for a category filter
-        # to be built at all, otherwise the category leg short-circuits.
+        # A category containing "industry" is required for a category filter to be built.
         patch.object(
             recommender, "get_user_profile_categories",
             AsyncMock(return_value=[("software industry", 1.0)]),
@@ -382,8 +356,8 @@ async def _personalized(qdrant, *, interactions=(901,)):
 def _leg_warnings(caplog, leg, exc_message):
     """Warnings from ONE named leg that carry the exception text.
 
-    Matching on the leg name matters: a warning from any other leg would
-    otherwise satisfy the assertion, since they share the same exception.
+    Matching on the leg name matters: a warning from another leg would satisfy
+    the assertion, since they share the same exception.
     """
     return [
         record for record in caplog.records
@@ -421,7 +395,6 @@ class TestCandidateLegObservability:
             result = await _personalized(_FakeQdrant(fail_vector=True))
 
         assert _leg_warnings(caplog, _VECTOR_LEG, _FakeQdrant.OUTAGE), caplog.records
-        # The other two legs still supply the feed.
         assert _titles(result) == {"category hit", "trending hit"}
 
     @pytest.mark.asyncio
@@ -444,8 +417,8 @@ class TestCandidateLegObservability:
     async def test_total_outage_logs_every_leg_once(self, caplog):
         """All three legs down: empty feed, and each leg warns exactly once.
 
-        Once per leg because this user has a single interaction, and the
-        vector handler logs per failing interaction rather than per request.
+        Once per leg because this user has a single interaction, and the vector
+        handler logs per failing interaction rather than per request.
         """
         qdrant = _FakeQdrant(fail_vector=True, fail_category=True, fail_trending=True)
         with caplog.at_level(logging.WARNING):
@@ -462,9 +435,7 @@ class TestCandidateLegObservability:
         with caplog.at_level(logging.WARNING):
             result = await _personalized(qdrant, interactions=(901, 902))
 
-        # The surviving interaction still contributed, alongside the other legs.
         assert _titles(result) == {"vector hit", "category hit", "trending hit"}
-        # Exactly one vector warning, naming only the interaction that failed.
         vector_warnings = _leg_warnings(caplog, _VECTOR_LEG, _FakeQdrant.OUTAGE)
         assert len(vector_warnings) == 1, caplog.records
         assert "article 901" in vector_warnings[0].getMessage()
@@ -490,11 +461,9 @@ class _PoolQdrant:
     """Qdrant double that serves each leg a pool exactly as wide as it is asked for.
 
     The leg named by ``fresh_leg`` hands out ids from its own base range with an
-    age that *shrinks* down the pool, so its deepest candidates are the
-    freshest; the other leg is STALE_DAYS old. Disjoint id ranges per leg plus
-    recency in the hybrid score mean the page is filled from whichever
-    candidates the pool actually reached, which is what makes the pool width
-    visible in the response instead of being an internal fetch detail.
+    age that *shrinks* down the pool, so its deepest candidates are the freshest;
+    the other leg is STALE_DAYS old. Disjoint ranges plus recency in the hybrid
+    score make the pool width visible in the response.
     """
 
     VECTOR_BASE = 100
@@ -529,8 +498,8 @@ class _PoolQdrant:
 class _ScrollQdrant:
     """Qdrant double for the cold-start path, which only calls ``scroll``.
 
-    Like the vector leg above, the deepest rows of the scroll are the freshest,
-    so scrolling deeper is the only way to reach a fresher article.
+    Like the vector leg above, the deepest rows are the freshest, so scrolling
+    deeper is the only way to reach a fresher article.
     """
 
     BASE = 400
@@ -560,8 +529,7 @@ async def _pooled_page(candidates_limit, *, limit=5, fresh_leg="vector"):
             recommender, "get_user_interactions",
             AsyncMock(return_value=[(901, now)]),
         ),
-        # A category containing "industry" is required for a category filter
-        # to be built at all, otherwise the category leg short-circuits.
+        # A category containing "industry" is required for a category filter to be built.
         patch.object(
             recommender, "get_user_profile_categories",
             AsyncMock(return_value=[("software industry", 1.0)]),
@@ -587,9 +555,8 @@ class TestCandidatePoolWidth:
         """The knob is not cosmetic: a deeper pool changes which articles ship.
 
         With a pool of 5 the freshest reachable vector candidate is 5 days old
-        and the page also carries the 90-day-old category hits; with a pool of
-        25 the page can reach candidates a day old and the stale ones are
-        outranked. Same user, same request, different pool.
+        and the page also carries the 90-day-old category hits; a pool of 25
+        reaches candidates a day old and outranks the stale ones.
         """
         narrow = await _pooled_page(2)
         wide = await _pooled_page(25)
@@ -612,9 +579,8 @@ class TestCandidatePoolWidth:
     async def test_page_stays_full_when_the_knob_is_below_the_requested_limit(self):
         """A pool narrower than the request is raised to the request, not honoured.
 
-        limit=8 asks for 8 candidates per leg, so a knob of 2 must not starve
-        the page of candidates to choose from: the fetch is clamped up to 8 and
-        nothing deeper than that is ever requested.
+        limit=8 asks for 8 candidates per leg, so a knob of 2 must not starve the
+        page: the fetch is clamped up to 8 and nothing deeper is ever requested.
         """
         result = await _pooled_page(2, limit=8)
 
@@ -626,10 +592,9 @@ class TestCandidatePoolWidth:
     async def test_category_leg_pool_width_reaches_the_page(self):
         """The category leg is wired too, not just the vector one.
 
-        Here the category leg is the fresh one, so the slots it can fill are
-        bounded by its pool. At limit=5 the narrowest reachable pool is 5 (the
-        clamp raises a knob of 3 to the page size) and fills 5 of the 10
-        slots; a 20-wide pool fills all ten.
+        Here the category leg is the fresh one, so the slots it can fill are bounded
+        by its pool: at limit=5 the narrowest reachable pool is 5 (the clamp raises a
+        knob of 3 to the page size); a 20-wide pool fills all ten slots.
         """
         narrow = await _pooled_page(3, fresh_leg="category")
         wide = await _pooled_page(20, fresh_leg="category")
@@ -643,10 +608,9 @@ class TestCandidatePoolWidth:
     async def test_cold_start_knob_deepens_the_scroll_below_the_3x_floor(self):
         """The cold-start scroll honours the knob, on top of its own 3x.
 
-        The scroll is called with ``over=3`` because the page is ``limit * 2``,
-        and the knob is a floor on that rather than a cap: at limit=5 the floor
-        is 15, so a knob of 3 cannot shrink it, while a knob of 20 deepens the
-        scroll to 20 rows and the page is drawn from fresher rows instead.
+        The scroll is called with ``over=3`` because the page is ``limit * 2``, and
+        the knob is a floor on that rather than a cap: at limit=5 the floor is 15, so
+        a knob of 3 cannot shrink it, while a knob of 20 deepens the scroll.
         """
         from app import recommender
 
@@ -662,8 +626,7 @@ class TestCandidatePoolWidth:
 
         assert len(floor) == len(deepened) == 10
         assert _ids(floor) != _ids(deepened), "a deeper scroll must change which rows the page comes from"
-        # The 15-row floor builds the page out to row 14; a 20-row scroll
-        # reaches ten rows further down.
+        # The 15-row floor builds the page out to row 14; 20 rows reaches ten further.
         assert max(_ids(floor)) - _ScrollQdrant.BASE == 14
         assert max(_ids(deepened)) - _ScrollQdrant.BASE == 19
 
@@ -671,11 +634,9 @@ class TestCandidatePoolWidth:
     async def test_cold_start_pool_never_narrows_below_the_page_headroom(self):
         """A knob below 3x must not shrink the cold-start scroll.
 
-        The API accepts limit up to 20 and this path returns ``limit * 2``
-        articles after dropping already-seen ids, so a scroll capped at the
-        knob (50) instead of floored at it would fetch fewer rows than it did
-        before this knob existed, and a page that comes up short once enough
-        ids are excluded.
+        The API accepts limit up to 20 and this path returns ``limit * 2`` articles
+        after dropping already-seen ids, so a scroll capped at the knob instead of
+        floored at it would fetch fewer rows than before the knob existed.
         """
         from app import recommender
 

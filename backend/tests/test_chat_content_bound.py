@@ -1,13 +1,12 @@
-"""The ``MessageIn.content`` length bound (#350).
+"""The ``MessageIn.content`` length bound.
 
 The bound is declared on the request model rather than in one route's helper, so
 every route that accepts chat text is covered by a single declaration: the two
-message routes, the SSE stream, and the session rename, plus any route added
-later. A bound that lives in a helper is a bound the next route forgets to call.
+message routes, the SSE stream, the session rename, and any route added later.
+A bound that lives in a helper is a bound the next route forgets to call.
 
 Oversized content is REJECTED, never truncated. A silently shortened question is
-answered as though it were the whole one, which is worse than a refusal: the
-user gets a confident answer to something they never asked.
+answered as though it were the whole one, which is worse than a refusal.
 """
 
 import pytest
@@ -71,8 +70,7 @@ def _at_the_bound():
 
 def test_bound_is_enforced_by_the_model_itself():
     """The guarantee is a property of ``MessageIn``, so it holds for every route
-    that takes the model -- including one that has no validation helper at all,
-    and one written after this fix."""
+    that takes the model, including one with no validation helper at all."""
     assert MessageIn(content=_at_the_bound()).content == _at_the_bound()
     with pytest.raises(ValidationError):
         MessageIn(content=_too_long())
@@ -140,14 +138,11 @@ def test_oversized_stream_is_rejected_before_the_stream_opens(tmp_path):
 
 
 def test_oversized_rename_is_rejected_and_leaves_the_title_alone(tmp_path):
-    """The rename route writes client text through the same model and used to
-    have no length check of its own, so an oversized title came back 200 with
-    the store's clip already applied to it. Above MAX_CONTENT_LEN it is now
-    refused outright, and the stored title is left exactly as it was.
+    """The rename route writes client text through the same model, so an
+    oversized title is refused outright and the stored title is left as it was.
 
-    The 200-char clip the store applies to titles that are SHORTER than the
-    bound is pre-existing and untouched by this fix; only the over-the-bound
-    window changes here."""
+    The 200-char clip the store applies to titles SHORTER than the bound is
+    pre-existing; only the over-the-bound window changes."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)

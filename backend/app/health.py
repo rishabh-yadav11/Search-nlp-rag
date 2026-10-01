@@ -46,16 +46,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# Created eagerly at import rather than lazily inside _redis_status. The lazy
-# form this replaces was not actually racy: `if lock is None: lock =
-# asyncio.Lock()` has no await between the check and the assignment, so no
-# other task can be scheduled in between and every caller shares the first
-# lock built. The block it guards awaits nothing either, so that lock could
-# never be contended -- the #183 race is unreachable. Eager creation is still
-# worth it as a simplification: the lock is never None, so there is no
-# optional state to check, and close_redis() no longer has a path that resets
-# it. "One lock shared by every caller" becomes structural instead of a
-# property of an atomic check. Python 3.10+ no longer binds an asyncio.Lock to
+# Created eagerly at import rather than lazily inside _redis_status. A lazy
+# `if lock is None: lock = asyncio.Lock()` has no await between the check and the
+# assignment, so every caller already shares the first lock built; eager creation
+# just makes that structural, with no optional state to check and no path in
+# close_redis() that resets it. Python 3.10+ no longer binds an asyncio.Lock to
 # an event loop at construction, so a module-level instance is safe.
 _redis_init_lock: asyncio.Lock = asyncio.Lock()
 
@@ -64,19 +59,17 @@ async def _close_quietly(client: aioredis.Redis) -> None:
     """Best-effort release of a client we are about to discard.
 
     ``aioredis.Redis`` owns a connection pool, so dropping a reference without
-    closing leaves the socket to the GC. A client that just failed its ping can
-    also fail to close due to a Redis or operating-system network failure, and
-    ``asyncio.wait_for`` raises ``TimeoutError`` when it exceeds
-    ``_REDIS_CLOSE_TIMEOUT``. Those expected teardown failures are swallowed:
-    the caller only cares that readiness is degraded, not about teardown.
+    closing leaves the socket to the GC, and a client that just failed its ping
+    can also fail to close. The expected teardown failures -- including the
+    ``TimeoutError`` ``asyncio.wait_for`` raises past ``_REDIS_CLOSE_TIMEOUT`` --
+    are swallowed: the caller only cares that readiness is degraded.
 
     Cancellation and unexpected programming errors deliberately propagate: a
-    cancelled probe (client disconnect, server shutdown) must still unwind,
-    and a broken close implementation must not be mistaken for a network
-    failure.
+    cancelled probe (client disconnect, server shutdown) must still unwind, and
+    a broken close implementation must not be mistaken for a network failure.
 
-    The mechanics live in ``app.close_guard``, shared with the lifespan
-    teardown so both release a client under the same bound.
+    The mechanics live in ``app.close_guard``, shared with the lifespan teardown
+    so both release a client under the same bound.
     """
     await close_quietly(
         "readiness Redis client",
@@ -87,8 +80,8 @@ async def _close_quietly(client: aioredis.Redis) -> None:
 
 
 async def _drop_redis_client(client: aioredis.Redis) -> None:
-    """Invalidate the cached client under the init lock, and only if it is
-    still the client that failed.
+    """Invalidate the cached client under the init lock, and only if it is still
+    the client that failed.
 
     The ping runs outside the lock (holding it across a 2s network call would
     serialize every readiness probe), so by the time a ping fails another
@@ -96,11 +89,10 @@ async def _drop_redis_client(client: aioredis.Redis) -> None:
     ``_redis_client = None`` would discard that replacement - and leak its
     connection - forcing yet another reconnect for no reason.
 
-    The lock is held only for the identity check and the swap: the failing
-    client is closed afterwards, outside the critical section, so no I/O (and
-    no re-entry into this non-reentrant lock) happens under it. A client that
-    is still cached - i.e. one installed by another caller - is never closed;
-    only the client actually dropped here is released."""
+    The lock is held only for the identity check and the swap: the failing client
+    is closed afterwards, outside the critical section, so no I/O (and no
+    re-entry into this non-reentrant lock) happens under it.
+    """
     global _redis_client
     async with _redis_init_lock:
         if _redis_client is not client:
@@ -111,10 +103,8 @@ async def _drop_redis_client(client: aioredis.Redis) -> None:
 
 async def close_redis() -> None:
     """Close the lazily-created readiness-check Redis client. Registered as a
-    shutdown hook so the connection isn't leaked on worker exit. The init lock
-    is deliberately left untouched: it is built once at import and never reset,
-    so callers that arrive after a close await the same lock as any caller
-    still in flight instead of a second, freshly built one."""
+    shutdown hook so the connection isn't leaked on worker exit. The init lock is
+    deliberately left untouched: it is built once at import and never reset."""
     global _redis_client
     if _redis_client is not None:
         await _redis_client.aclose()
@@ -131,9 +121,9 @@ async def _qdrant_ok(state: dict) -> bool:
 
     Every client/driver failure -- the expected ``TimeoutError`` and
     ``ApiException`` as much as an unexpected transport or driver error -- is a
-    readiness failure, not a crash. Letting one escape turned a Qdrant problem
-    into a bodiless 500, which a probe cannot distinguish from a server bug.
-    Only ``Exception`` is caught, so a cancellation still propagates.
+    readiness failure, not a crash: letting one escape turned a Qdrant problem
+    into a bodiless 500, which a probe cannot distinguish from a server bug. Only
+    ``Exception`` is caught, so a cancellation still propagates.
     """
     client = state.get("qdrant")
     if client is None:
@@ -153,11 +143,11 @@ def _models_ok(state: dict) -> bool:
 def _llm_status() -> tuple[bool, str]:
     """(usable, reason) for the configured Gemini key.
 
-    Delegates to config.classify_gemini_api_key so readiness and the startup
-    log can never disagree about the key. The old ``bool(config.GEMINI_API_KEY)``
+    Delegates to config.classify_gemini_api_key so readiness and the startup log
+    can never disagree about the key. A bare ``bool(config.GEMINI_API_KEY)``
     answered "true" for any non-empty string, and the value shipped in
-    .env.example is the literal placeholder "your_key_here" -- so a backend
-    whose every chat answer is the canned fallback reported itself healthy.
+    .env.example is the literal placeholder "your_key_here" -- so a backend whose
+    every chat answer is the canned fallback reported itself healthy.
     """
     reason = classify_gemini_api_key(config.GEMINI_API_KEY)
     return reason == "ok", reason
@@ -195,24 +185,19 @@ async def _redis_status() -> tuple[bool, str]:
 # report) with a time.monotonic() deadline -- never an event-loop-bound object,
 # so it stays valid across the per-test event loops the endpoint tests run in.
 _readiness_cache: tuple[float, bool, dict] | None = None
-# Single-flight for the cache MISS. The entry above bounds the SERIAL probe
-# rate, but the moment it expires every request arriving in the same instant
-# misses together, and each would otherwise fan out its own Qdrant + Redis
-# probe round. The rate limiter does not prevent that herd either: it bounds
-# arrival rate, not concurrency.
+# Single-flight for the cache MISS. The entry above bounds the SERIAL probe rate,
+# but the moment it expires every request arriving in the same instant misses
+# together and each would fan out its own Qdrant + Redis round; the rate limiter
+# does not prevent that herd either, since it bounds arrival rate, not
+# concurrency.
 #
 # Built LAZILY and per event loop, unlike _redis_init_lock, and both parts are
-# load-bearing. _redis_init_lock guards a block that awaits nothing, so it is
-# never contended and acquire() always takes the fast path, which never binds
-# the lock to a loop. This one IS contended, and a contended acquire binds the
-# lock to its running loop for good: reusing that lock from another loop raises
-# "is bound to a different event loop". The tests here run a fresh event loop
-# each, so a lock carried across them is a live hazard, and lazy creation alone
-# only papers over it -- it has to be rebuilt when the loop changes. The check
-# and the assignment sit together with no await between them, so two callers
-# in one loop cannot each build a lock and defeat the single-flight, and the
-# lock is held in a local so a concurrent reset cannot swap the object out from
-# under the `async with`.
+# load-bearing: this lock IS contended, and a contended acquire binds an
+# asyncio.Lock to its running loop for good, so reusing it from another loop
+# raises "is bound to a different event loop". The check and the assignment sit
+# together with no await between them, so two callers in one loop cannot each
+# build a lock and defeat the single-flight, and the lock is held in a local so a
+# concurrent reset cannot swap the object out from under the `async with`.
 _readiness_probe_lock: asyncio.Lock | None = None
 _readiness_probe_loop: asyncio.AbstractEventLoop | None = None
 
@@ -237,10 +222,9 @@ async def _cached_readiness_report(state: dict) -> tuple[bool, dict]:
     cached = _readiness_cache
     if cached is not None and cached[0] > time.monotonic():
         return cached[1], cached[2]
-    # Rebuild when the loop changes: a lock bound to a dead loop would refuse
-    # this acquire. Callers within one loop all see the same object, so the
-    # single-flight still holds; the check and the assignment are adjacent with
-    # no await between them, so they cannot both build one.
+    # Rebuild when the loop changes: a lock bound to a dead loop would refuse this
+    # acquire. Callers within one loop all see the same object, so the
+    # single-flight still holds.
     loop = asyncio.get_running_loop()
     lock = _readiness_probe_lock
     if lock is None or _readiness_probe_loop is not loop:
@@ -290,12 +274,10 @@ async def _readiness_report(state: dict) -> tuple[bool, dict]:
     qdrant_ok, (redis_ok, cache_mode) = qdrant_result, redis_result
     models_ok = _models_ok(state)
     llm_ok, llm_reason = _llm_status()
-    # The LLM key gates readiness, not just the report. Without a usable key
-    # every chat answer is the canned fallback: search and indexing still serve,
-    # but the deployment cannot do the one thing it is deployed to do, and
-    # reporting that as ready is what let a placeholder key ship unnoticed.
-    # Redis stays out of this sum on purpose (see _redis_status): it degrades to
-    # an in-process cache rather than to a wrong answer.
+    # The LLM key gates readiness, not just the report: without a usable key every
+    # chat answer is the canned fallback, so the deployment cannot do the one
+    # thing it is deployed to do. Redis stays out of this sum on purpose (see
+    # _redis_status): it degrades to an in-process cache, not to a wrong answer.
     ready = qdrant_ok and models_ok and llm_ok
     report = {
         "ready": ready,
@@ -327,9 +309,8 @@ async def ready() -> JSONResponse:
     This is the real answer -- Qdrant reachable, models loaded, and a usable
     Gemini key configured -- and it is the endpoint a load balancer or an
     orchestrator polls. The result is cached for READY_CACHE_TTL_SECONDS and the
-    probe is rate-limited, both of which are right for a 1 Hz prober and both of
-    which are wrong for a watchdog that must see an outage the moment it starts:
-    use /ready/deep for that.
+    probe is rate-limited, both right for a 1 Hz prober and both wrong for a
+    watchdog that must see an outage the moment it starts: use /ready/deep.
 
     Unlike /health, this endpoint CAN fail, and its answer is allowed to flip
     from 200 to 503 while the process itself is perfectly healthy.
@@ -350,10 +331,9 @@ async def ready() -> JSONResponse:
 
 @router.get(
     "/readyz",
-    # The same limiter, and deliberately the same "ready" action, as /ready:
-    # this alias runs the identical readiness probe, so it shares one budget
-    # rather than handing a caller a second allowance by changing one path
-    # segment. Same fail-open deviation, same reason.
+    # The same limiter, and deliberately the same "ready" action, as /ready: this
+    # alias runs the identical readiness probe, so it shares one budget rather
+    # than handing a caller a second allowance by changing one path segment.
     dependencies=[Depends(public_rate_limit("ready", "PUBLIC_READY_RATE_PER_MIN", fail_closed=False))],
 )
 async def readyz() -> Response:
@@ -398,21 +378,20 @@ def _is_host_local_probe(request: Request) -> bool:
 
 @router.get("/ready/deep")
 async def ready_deep(request: Request) -> Response:
-    """Uncached, unrated readiness for host-local monitoring (#279).
+    """Uncached, unrated readiness for host-local monitoring.
 
     The same readiness contract as /ready -- same report, same 200/503 -- with
     the two things a *watchdog* must not inherit deliberately removed:
 
     * no cache. /ready may answer from an entry written up to
-      READY_CACHE_TTL_SECONDS ago, so a poll landing just after a dependency
-      died gets the pre-outage verdict. A watchdog acts on that answer, so this
-      one re-probes every time; it neither reads nor writes the shared entry.
+      READY_CACHE_TTL_SECONDS ago, so a poll landing just after a dependency died
+      gets the pre-outage verdict. A watchdog acts on that answer, so this one
+      re-probes every time; it neither reads nor writes the shared entry.
     * no rate limit. Its callers act on the status code, and a 429 is
       indistinguishable from an outage to all of them: setup.sh's `wait_http`
-      uses `curl -fsS`, so a throttled probe fails the deploy outright, and the
-      watchdog would alert on a backend that is serving perfectly well. Such
-      callers also run on a timer or a single pass, far below the 600/60s
-      budget /ready needs for a load balancer polling once a second.
+      uses `curl -fsS`, so a throttled probe fails the deploy outright. Such
+      callers also run on a timer or a single pass, far below the budget /ready
+      needs for a load balancer polling once a second.
 
     Neither property is safe to hand to the internet, so the route is refused
     for any caller that is not a direct loopback request on this host
@@ -435,7 +414,7 @@ async def ready_deep(request: Request) -> Response:
 
 
 def warn_if_llm_key_unusable() -> None:
-    """Log the LLM key's usability once at startup (#279).
+    """Log the LLM key's usability once at startup.
 
     Deliberately a log line, not a raised error. Crashing would take /health
     with it, leaving the watchdog nothing to probe and turning a diagnosable

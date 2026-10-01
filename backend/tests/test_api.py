@@ -33,14 +33,13 @@ def _only(conds: list[FieldCondition]) -> FieldCondition:
 def _route_paths(routes) -> set[str]:
     """Every path the app actually serves, however the routers are nested.
 
-    Since fastapi 0.141 (issue #331), ``include_router`` no longer copies each
-    route into the top-level list: it stores a single ``_IncludedRouter``
-    wrapper, and the real routes live under its ``original_router``. So a flat
+    Since fastapi 0.141, ``include_router`` no longer copies each route into
+    the top-level list: it stores a single ``_IncludedRouter`` wrapper, and the
+    real routes live under its ``original_router``. So a flat
     ``{r.path for r in app.routes}`` both misses the included routes entirely
     and raises on the wrapper. Descending into any child that carries its own
-    ``routes`` list keeps this version-agnostic and, more importantly, keeps the
-    assertions below honest -- a path counts as absent only if it is absent
-    from the whole tree, not merely from the top level.
+    ``routes`` list keeps this version-agnostic and keeps the assertions below
+    honest: a path counts as absent only if it is absent from the whole tree.
     """
     paths: set[str] = set()
     for route in routes:
@@ -249,7 +248,7 @@ def test_sort_results_full_ordering(monkeypatch):
 
 def _blend_key(article: SourceArticle, strength: float, decay: float) -> tuple[float, str]:
     """The blended-score half of the key sort_results ranks on, recomputed
-    from the pre-#300 literals. Limited to the shapes below: dated, naive,
+    from the pre-knob literals. Limited to the shapes below: dated, naive,
     already-past articles, where the tz-stripped tiebreak and the future-date
     clamp in _recency_multiplier cannot differ from this."""
     dt = _dt.fromisoformat(article.published_date).replace(tzinfo=UTC)
@@ -270,9 +269,9 @@ def _pin_shipped_recency_boost(monkeypatch):
 
 
 def test_recency_boost_knobs_ship_the_values_the_pre_knob_constants_had(parse_config):
-    """Issue #300 moved the recency-boost weights out of app/main.py's module
-    scope into config. Parsed from a clean environment they must still be the
-    literals that lived there."""
+    """The recency-boost weights moved out of app/main.py's module scope into
+    config. Parsed from a clean environment they must still be the literals
+    that lived there."""
     shipped = parse_config()
     assert shipped.RECENCY_BOOST_STRENGTH == 0.85
     assert shipped.RECENCY_BOOST_DECAY_DAYS == 30.0
@@ -481,13 +480,10 @@ def test_route_paths_walks_routes_nested_in_included_routers():
     top level.
 
     Every path asserted by ``test_analytics_dashboard_is_frontend_owned`` is a
-    top-level route, so those three assertions stay green even if the descent
-    is deleted -- which would silently blind the negative assertion to a
-    dashboard route mounted on an included router. This pins the descent
-    itself using paths that are reachable ONLY through it: since fastapi 0.141
-    (issue #331) the health, auth and chat routers are stored as
-    ``_IncludedRouter`` wrappers, so none of these appear in a flat
-    ``app.routes`` walk.
+    top-level route, so those assertions stay green even if the descent is
+    deleted. This pins the descent itself using paths reachable ONLY through
+    it: since fastapi 0.141 the health, auth and chat routers are stored as
+    ``_IncludedRouter`` wrappers, so none of these appear in a flat walk.
     """
     paths = _route_paths(main.app.routes)
     flat = {r.path for r in main.app.routes if getattr(r, "path", None) is not None}

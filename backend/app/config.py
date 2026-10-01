@@ -62,16 +62,13 @@ _DEFAULT_ALLOWED_HOSTS = ("localhost", "127.0.0.1", "testserver")
 def _normalize_host(entry: str) -> str:
     """Lowercase a host/origin and drop any scheme and :port suffix.
 
-    Only IPv4 and names. Starlette compares the Host authority as
-    ``headers.get("host", "").split(":")[0]`` — everything before the FIRST
-    colon — so an IPv6 literal cannot be expressed in this allow-list at all: a
-    bracketed ``[::1]`` arrives already split to ``[``, and an unbracketed
-    ``2001:db8::5`` arrives as ``2001``. Keeping the brackets would silently
-    admit an entry that can never match, and truncating to the first hextet
-    would be worse: ``2001`` matches ANY ``2001:*`` Host, turning the check
-    into a fail-open on a guessable header. So IPv6 is excluded by
-    ``_is_ipv6_literal`` at every source instead, and serving an IPv6-only
-    deployment needs a middleware that parses the authority properly.
+    Starlette compares the Host authority as
+    ``headers.get("host", "").split(":")[0]`` -- everything before the FIRST
+    colon -- so an IPv6 literal cannot be expressed in this allow-list at all,
+    and truncating to the first hextet would be worse: ``2001`` matches ANY
+    ``2001:*`` Host, turning the check into a fail-open on a guessable header.
+    IPv6 is excluded by `_is_ipv6_literal` at every source instead, and serving
+    an IPv6-only deployment needs a middleware that parses the authority.
     """
     host = entry.strip().lower().split("://", 1)[-1]
     return host.partition(":")[0]
@@ -80,9 +77,8 @@ def _normalize_host(entry: str) -> str:
 def _is_ipv6_literal(entry: str) -> bool:
     """True for an address that a split-on-first-colon Host can never match.
 
-    Both spellings occur in the wild: ``getaddrinfo`` and ``getsockname`` hand
-    back unbracketed literals, while an operator writing ``CORS_ORIGINS`` is
-    likely to bracket them.
+    Both spellings occur: `getaddrinfo` and `getsockname` hand back unbracketed
+    literals, while an operator writing `CORS_ORIGINS` is likely to bracket them.
     """
     host = entry.strip().lower().split("://", 1)[-1]
     if host.startswith("["):
@@ -94,15 +90,14 @@ def _machine_hosts() -> tuple[str, ...]:
     """Hostnames and addresses this box itself answers to.
 
     Production is same-origin through nginx behind a `server_name _` catch-all
-    vhost that forwards whatever `Host` the client used, and the documented
-    posture leaves CORS_ORIGINS at its localhost default — so neither CORS nor
-    a hardcoded domain covers a site reached by IP or by the box's own name.
-    These are the box's name, the addresses bound to it and its default-route
-    address; without them, every public request 400s. A separately registered
-    public domain still has to be added to ALLOWED_HOSTS by the operator.
+    that forwards whatever `Host` the client used, and the documented posture
+    leaves CORS_ORIGINS at its localhost default -- so neither CORS nor a
+    hardcoded domain covers a site reached by IP or by the box's own name.
+    Without them, every public request 400s. A separately registered public
+    domain still has to be added to ALLOWED_HOSTS by the operator.
 
-    Best effort by design: this runs at import, so a name-resolution failure
-    must degrade to "fewer allowed hosts", never take the whole API down.
+    Best effort by design: this runs at import, so a name-resolution failure must
+    degrade to "fewer allowed hosts", never take the whole API down.
     """
     hosts: list[str] = []
     for getter in (socket.gethostname, socket.getfqdn):
@@ -130,22 +125,19 @@ def _machine_hosts() -> tuple[str, ...]:
 def _default_route_addresses() -> tuple[str, ...]:
     """The address this box would source outbound traffic from.
 
-    `getaddrinfo(gethostname())` only yields the addresses bound to the box's
-    own name, which on a NAT'd cloud host is the private one — but the site is
+    `getaddrinfo(gethostname())` only yields the addresses bound to the box's own
+    name, which on a NAT'd cloud host is the private one -- but the site is
     reached at the public address, and nginx forwards the client's `Host`
-    through (`server_name _;` plus `proxy_set_header Host $host`). Without the
-    public address in the allow-list, every public request answers 400.
+    through. Without the public address in the allow-list, every public request
+    answers 400.
 
-    A connected UDP socket sends no packets: it only asks the routing table
-    which source address it would pick. Any failure (no route, a sandboxed
-    import, a missing address family) just means one fewer allowed host, so
-    every step is guarded: this runs at import, and an exception escaping here
-    would take the whole API down, which is strictly worse than a narrower
-    allow-list.
+    A connected UDP socket sends no packets: it only asks the routing table which
+    source address it would pick. Any failure just means one fewer allowed host,
+    so every step is guarded: this runs at import, and an exception escaping here
+    would take the whole API down, which is worse than a narrower allow-list.
 
     IPv4 only. An IPv6 source address cannot be put in the allow-list at all
-    (see _normalize_host), so probing for one would only add an entry that
-    could never match.
+    (see _normalize_host).
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
@@ -154,13 +146,10 @@ def _default_route_addresses() -> tuple[str, ...]:
     except Exception:
         # Broad on purpose, and asserted by test so it cannot be narrowed
         # back: the only contract that matters here is "never raise at
-        # import". No route, a sandboxed socket module and an unusable
-        # address family all cost the same one allowed host.
-        # DEBUG, not WARNING: a box with no default route is unremarkable, so
-        # this would fire once per worker on an ordinary boot and a warning
-        # traceback would be noise. The operator signal that matters is the
-        # effective allow-list main.py logs at startup, which already shows a
-        # public address missing from it.
+        # import". DEBUG, not WARNING: a box with no default route is
+        # unremarkable, so this would fire once per worker on an ordinary boot
+        # and a warning traceback would be noise. The operator signal that
+        # matters is the effective allow-list main.py logs at startup.
         logger.debug("default-route probe failed", exc_info=True)
         return ()
 
@@ -171,7 +160,7 @@ def _clamped_int(name: str, default: int, low: int, high: int) -> int:
 
     Clamp-and-warn, not raise. This module is imported at process start, so
     raising here would turn a mistyped deployment value into a boot failure of
-    the whole API — and the knobs guarded by this helper are throughput caps
+    the whole API -- and the knobs guarded by this helper are throughput caps
     whose *failure* mode is expensive CPU, not a wrong answer. Clamping keeps
     the service up and bounds the cost; the WARNING naming the key, the
     rejected value and the bound keeps the misconfiguration visible in the
@@ -179,15 +168,13 @@ def _clamped_int(name: str, default: int, low: int, high: int) -> int:
 
     A non-integer value falls back to ``default`` for the same reason: an
     unparseable knob is an operator typo, not a client input, and the safest
-    reading of it is "not configured", which is what an absent variable means.
-    ``default`` itself is required to sit inside ``[low, high]``; violating
-    that raises ``ValueError``, and deliberately not via ``assert`` so the
-    guarantee survives ``python -O``.
+    reading of it is "not configured". ``default`` itself must sit inside
+    ``[low, high]``; violating that raises ``ValueError``, and deliberately not
+    via ``assert`` so the guarantee survives ``python -O``.
     """
-    # An explicit raise, not an `assert`: this is a programming-error guard on
-    # our own call sites, and CPython strips asserts under `python -O`, which
-    # would silently turn a stated guarantee into no guarantee at all. The
-    # assert stays only as a readable marker, never as the enforcement.
+    # An explicit raise, not an `assert`: CPython strips asserts under
+    # `python -O`, which would turn a stated guarantee into no guarantee.
+    # The assert stays only as a readable marker, never as the enforcement.
     if not low <= default <= high:
         raise ValueError(f"{name} default {default} outside [{low}, {high}]")
     raw = os.getenv(name)
@@ -217,16 +204,14 @@ def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> 
     replaces that default wholesale: a bare "*" is rejected outright (it would
     silently disable the check, which is the exact opposite of the knob's
     purpose) and a value that contains no usable hostname is rejected too,
-    because it would otherwise match nothing and 400 every request with no clue
-    why.
+    because it would otherwise match nothing and 400 every request.
 
     A wildcard is only accepted in the one shape TrustedHostMiddleware itself
     supports, a leading ``*.``. Any other placement is rejected HERE rather
     than left to the middleware, because ``add_middleware`` defers building the
     middleware stack to the first request: a malformed pattern such as
-    ``a.*.com`` would otherwise boot cleanly, log a healthy-looking allow-list
-    and then turn every single request into a 500 from the middleware's own
-    ``assert``. Failing at config load turns that into a clear message.
+    ``a.*.com`` would otherwise boot cleanly and then turn every single request
+    into a 500 from the middleware's own ``assert``.
     """
     if raw is None or not raw.strip():
         # IPv6 literals are dropped for the same reason as in _machine_hosts: a
@@ -274,17 +259,14 @@ def _parse_allowed_hosts(raw: str | None, extra_hosts: tuple[str, ...] = ()) -> 
 # The spellings that mean "on" and "off" for a boolean env knob, for every knob
 # in this file. One set, two readers: _env_tristate (three-state) and _env_bool
 # (two-state). A second convention here is how ENABLE_DIVERSITY=" true " came
-# to read as OFF while AUTH_TRUST_X_FORWARDED_FOR understood it, so the
-# question is answered once.
+# to read as OFF while AUTH_TRUST_X_FORWARDED_FOR understood it.
 #
-# The truthy set is load-bearing OUTSIDE this file. setup.sh's forced-true
-# warning greps exactly these four spellings, and it has to: a forced True
-# trusts X-Forwarded-For from ANY peer, so a client reaching the API port
-# directly can forge it to dodge a per-IP rate limit (#245), and that warning
-# is the only signal the operator gets. Add a spelling here and setup.sh's
-# regex must add it in the same commit, or AUTH_TRUST_X_FORWARDED_FOR=<new>
-# forces header trust with no warning anywhere. The two are tied together by
-# test, not by comment.
+# The truthy set is load-bearing OUTSIDE this file: setup.sh's forced-true
+# warning greps exactly these four spellings, because a forced True trusts
+# X-Forwarded-For from ANY peer, so a client reaching the API port directly can
+# forge it to dodge a per-IP rate limit, and that warning is the only signal
+# the operator gets. Add a spelling here and setup.sh's regex must add it in
+# the same commit. The two are tied together by test, not by comment.
 _TRUE_SPELLINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_SPELLINGS = frozenset({"0", "false", "no", "off"})
 
@@ -307,36 +289,24 @@ def _env_tristate(name: str) -> bool | None:
 def _env_bool(name: str, default: bool) -> bool:
     """Read a two-state boolean knob, normalising case and surrounding space.
 
-    The ENABLE_* feature toggles each used to be parsed inline as
-    ``os.getenv(name, "true").lower() in ("1", "true", "yes")``. That already
-    lowercased, so case was never the problem -- but it did not strip, and it
-    had no "on" in the set, so ``on``, " true " and "1 " all read as OFF. A
-    whole retrieval feature then sits disabled with nothing wrong visible
-    anywhere -- the knob looks configured, the template says true, and the
-    service answers as if the operator had asked for off.
+    The old inline parse lowercased but did not strip and had no "on" in its
+    set, so ``on``, " true " and "1 " all read as OFF: a whole retrieval feature
+    sat disabled with nothing wrong visible anywhere.
 
     Three input classes, and the differences between them are deliberate:
 
-    - unset -> ``default``. The shipped value applies, as it always did.
-    - a known spelling -> that side, after strip/lower. This is the fix.
+    - unset -> ``default``.
+    - a known spelling -> that side, after strip/lower.
     - set but BLANK -> False, with a warning. Blank keeps meaning exactly what
       it means today, which is off, because ``KEY=`` in a .env is how an
-      operator clears a knob and python-dotenv writes it as an empty string.
-      Falling back to ``default`` here would be the worst possible bug in this
-      function: .env.example ships all eight toggles as ``true``, so a
-      deployment that blanked one to turn it off would silently get the
-      feature switched back ON by an edit that changes no behaviour the
-      operator asked for. The warning is there because the value alone is
-      indistinguishable from an intentional off, and .env.example shipping
-      ``=true`` means a blank line is far more likely to be a mistake.
+      operator clears a knob. Falling back to ``default`` here would be the
+      worst possible bug in this function: .env.example ships all eight
+      toggles as ``true``, so a deployment that blanked one to turn it off
+      would silently get the feature switched back ON.
     - anything else -> ``default``, with a warning. Warn-and-default, agreeing
-      with _clamped_int rather than the strictest available option: raising
-      ValueError here would turn a mistyped deployment value into a boot
-      failure of the whole API, because this module is imported at process
-      start, and a knob that only picks a feature is a bad trade for an
-      outage. The WARNING names the key, the rejected value and the spellings
-      that would have worked, so the misconfiguration stays visible instead of
-      being papered over.
+      with _clamped_int: raising ValueError would turn a mistyped deployment
+      value into a boot failure of the whole API, and a knob that only picks a
+      feature is a bad trade for an outage.
     """
     raw = os.getenv(name)
     if raw is None:
@@ -371,16 +341,10 @@ def _env_bool(name: str, default: bool) -> bool:
 def _ensure_data_dir(path: str, env_var: str) -> None:
     """Create ``path``'s parent directory, or fail with an actionable message.
 
-    The two failure modes this refuses to swallow:
-
-    - the parent cannot be created at all (a path component is a regular file,
-      or the volume is read-only). `os.makedirs` in the store would raise, but
-      deep inside `ChatStore.connect`, with the exception buried in a
-      traceback that names no knob and no path.
-    - the parent exists but is not writable. Here `os.makedirs(exist_ok=True)`
-      SUCCEEDS and `sqlite3.connect` then succeeds too, creating a fresh EMPTY
-      database that the app serves as if it simply had no history. That is the
-      silent-data-loss failure this function exists for.
+    The failure mode this refuses to swallow: the parent exists but is not
+    writable. Here `os.makedirs(exist_ok=True)` SUCCEEDS and `sqlite3.connect`
+    then succeeds too, creating a fresh EMPTY database that the app serves as
+    if it simply had no history.
 
     Raises RuntimeError naming the env var, the absolute path and the reason, so
     the operator sees the fix in the first lines of the startup log instead of
@@ -415,10 +379,9 @@ def ensure_data_paths_ready(cfg: "Config") -> None:
 
     Only the paths the app WRITES are checked. A missing
     ``QUERY_FIX_VOCAB_PATH`` file is a legitimate no-op (typo correction
-    degrades by design, see QUERY_FIX_VOCAB_PATH), so only its directory has
-    to be usable. ``RERANK_ONNX_DIR`` is inert and is deliberately not
-    validated: nothing reads it, so requiring the directory would fail a
-    perfectly healthy deploy.
+    degrades by design), so only its directory has to be usable.
+    ``RERANK_ONNX_DIR`` is inert and is deliberately not validated: nothing
+    reads it, so requiring the directory would fail a perfectly healthy deploy.
     """
     for env_var, path in (
         ("CHAT_DB_PATH", cfg.CHAT_DB_PATH),
@@ -429,7 +392,6 @@ def ensure_data_paths_ready(cfg: "Config") -> None:
 
 
 class Config:
-    # MySQL
     MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
     MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
@@ -437,66 +399,55 @@ class Config:
     MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "vccircle")
     MYSQL_TABLE = os.getenv("MYSQL_TABLE", "articles")
 
-    # Qdrant
     QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
     # The API key qdrant itself is started with (setup.sh sets
     # QDRANT__SERVICE__API_KEY on the container). None when the store runs
-    # unauthenticated -- a dev box, or a localhost-only instance -- and the
-    # client is then built without the kwarg rather than with an empty string,
-    # because qdrant-client sends whatever it is given as the api-key header.
+    # unauthenticated, and the client is then built without the kwarg rather
+    # than with an empty string, because qdrant-client sends whatever it is
+    # given as the api-key header.
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
     QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "vccircle_articles")
 
-    # Cache
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-    # Embeddings
     EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-base-en-v1.5")
     EMBED_DIM = 768  # matches bge-base; change if you swap models
     EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "256"))
     EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
-    # CPU threads each worker's inference libs may use (torch + onnxruntime).
     # Kept small so GUNICORN_WORKERS processes don't oversubscribe the box.
     TORCH_THREADS = _TORCH_THREADS
 
     # Indexed text limits. The dense embedder gets title+facets+summary only
     # (kept short so CPU builds stay fast); the sparse/lexical embedder gets the
-    # full text including body so body keywords stay searchable. Body-related
-    # caps default to 50000 chars, which covers every article currently in the
-    # corpus (longest clean body ~44K) with headroom for growth.
+    # full text including body so body keywords stay searchable.
     EMBED_DENSE_CHAR_LIMIT = int(os.getenv("EMBED_DENSE_CHAR_LIMIT", "1500"))
     EMBED_CHAR_LIMIT = int(os.getenv("EMBED_CHAR_LIMIT", "50000"))
     BODY_CHAR_LIMIT = int(os.getenv("BODY_CHAR_LIMIT", "50000"))
     # Per-source body excerpt sent to the chat LLM (the whole stored body when
     # this matches BODY_CHAR_LIMIT; lower it to cut prompt tokens/cost).
     CHAT_BODY_CHAR_LIMIT = int(os.getenv("CHAT_BODY_CHAR_LIMIT", "50000"))
-    # Chat dynamically scales the source count to the query's requested 'top N'
-    # (capped here so the LLM context stays bounded) and trims each source's
-    # body excerpt to fit the total budget below, so asking for more deals never
-    # balloons the prompt size. 400000 matches today's 8 sources x 50K bodies.
+    # Chat scales the source count to the query's requested 'top N' (capped here
+    # so the LLM context stays bounded) and trims each source's body excerpt to
+    # fit the total budget below.
     CHAT_MAX_SOURCES = int(os.getenv("CHAT_MAX_SOURCES", "20"))
     CHAT_TOTAL_BODY_CHARS = int(os.getenv("CHAT_TOTAL_BODY_CHARS", "400000"))
     # A comparison/intersection chat turn runs one full retrieval leg PER
-    # entity, so the entity count is the turn's fan-out. A question can name
-    # an unbounded number of proper nouns (MAX_CONTENT_LEN is 8000 chars,
-    # which an attacker fills with 150+ of them), so "compare A and B and ..."
-    # could otherwise fan out that many pipelines -- each of which can run the
-    # pipeline twice -- inside one turn. Above this cap the multi-entity
-    # expansion is skipped and the question is answered as a single query,
-    # which is what a 150-way comparison deserves anyway.
+    # entity, so the entity count is the turn's fan-out. A question can name an
+    # unbounded number of proper nouns (MAX_CONTENT_LEN is 8000 chars, which an
+    # attacker fills with 150+ of them), so "compare A and B and ..." could
+    # otherwise fan out that many pipelines inside one turn. Above this cap the
+    # multi-entity expansion is skipped and the question is answered as a single
+    # query, which is what a 150-way comparison deserves anyway.
     CHAT_MAX_MULTI_ENTITIES = int(os.getenv("CHAT_MAX_MULTI_ENTITIES", "6"))
     # How many of those legs may be in flight at once. Every leg takes the
-    # shared module-global inference_lock for its CPU rerank, so gathering
-    # them all would only queue them on that lock; a small depth is what
-    # actually overlaps the Qdrant I/O between legs without piling waiters
-    # onto the encoder pool.
+    # shared module-global inference_lock for its CPU rerank, so gathering them
+    # all would only queue them on that lock.
     CHAT_MULTI_ENTITY_CONCURRENCY = int(os.getenv("CHAT_MULTI_ENTITY_CONCURRENCY", "4"))
 
     # Total characters of prior conversation replayed into the chat prompt.
     # CHAT_MAX_HISTORY_TURNS bounds the turn COUNT but not their SIZE, and every
     # replayed turn is untrusted text the model must read as data rather than
-    # instructions (#248), so the replay is also bounded by character budget,
-    # newest turns first. 12000 fits several full question/answer turns.
+    # instructions, so the replay is also bounded by character budget.
     CHAT_HISTORY_CHAR_LIMIT = int(os.getenv("CHAT_HISTORY_CHAR_LIMIT", "12000"))
 
     # Ceiling on the raw query embedded in a Redis cache key. A query longer
@@ -504,73 +455,52 @@ class Config:
     # main._cache_key_component) so the key stays short and bounded while
     # remaining deterministic — a long query must not silently share a key
     # with a different long query, which is why the digest replaces the text
-    # rather than the text being cut.
-    # Clamped like every other operator-tunable bound (_clamped_int): a value
-    # of 0 here would digest EVERY key, and a huge one would hand the raw text
-    # back to Redis. The default, 128, leaves a normal query spelled out and
-    # only digests the genuinely long ones.
+    # rather than the text being cut. Clamped because 0 here would digest EVERY
+    # key and a huge one would hand the raw text back to Redis.
     CACHE_KEY_QUERY_MAX_CHARS = _clamped_int("CACHE_KEY_QUERY_MAX_CHARS", 128, 8, 4096)
 
     # Ceiling on the query text the SHARED retrieval path hands to the
     # transformers (hybrid_search's dense/sparse encode, rerank's
-    # cross-encoder pairs, body_rescue's second pass). This is deliberately a
-    # different knob from SEARCH_QUERY_MAX_CHARS, and deliberately not equal
-    # to it: /search and chat do not agree on how long a question may be.
-    # /search refuses anything longer than SEARCH_QUERY_MAX_CHARS at the HTTP
-    # edge, so this bound never binds for it. Chat ACCEPTS up to
-    # chat.MAX_CONTENT_LEN (8000) and puts the whole message in the LLM prompt,
-    # so clamping its retrieval to 512 would silently drop the caller's own
-    # words from the search while the model still read them -- a relevance bug,
-    # not a performance trade. The default therefore matches what chat already
-    # accepts, which keeps the prompt and the retrieval query in agreement, and
-    # still bounds every tokenizer against the megabyte input #241 reported.
+    # cross-encoder pairs, body_rescue's second pass). Deliberately NOT equal
+    # to SEARCH_QUERY_MAX_CHARS: /search refuses anything longer than that at
+    # the HTTP edge, so this bound never binds for it, while chat accepts up to
+    # chat.MAX_CONTENT_LEN (8000) and puts the whole message in the LLM prompt
+    # — clamping its retrieval lower would silently drop the caller's own words
+    # from the search while the model still read them, a relevance bug and not a
+    # performance trade.
     # Clamped, not read raw: this is the one knob whose misconfiguration fails
     # as a WRONG ANSWER rather than as wasted CPU. A 0 would slice every query
-    # to "" at all three clamp sites and silently empty every result set --
-    # clamped-and-warned to 64 instead, with the bad value named in the log.
+    # to "" at all three clamp sites and silently empty every result set.
     RETRIEVAL_QUERY_MAX_CHARS = _clamped_int("RETRIEVAL_QUERY_MAX_CHARS", 8000, 64, 65536)
 
     # In-flight encode batches during indexing. Keep this small: CPU dense
     # encoding of a batch near max-token length uses ~1-2GB, so depth * batch
-    # must fit in RAM (the pipeline's value is overlapping encode with upsert,
-    # not running many encodes in parallel).
+    # must fit in RAM.
     INDEXER_WORKERS = int(os.getenv("INDEXER_WORKERS", "2"))
 
     # Sparse (BM25) embeddings — must match the model used at index time
     SPARSE_MODEL = os.getenv("SPARSE_MODEL", "Qdrant/bm25")
 
-    # Reranker (cross-encoder) applied to RRF candidates before the top_k is kept.
-    # Fewer candidates = faster CPU rerank; 12 keeps top-8 quality vs 16 while
-    # trimming latency (measured 8/8 overlap on representative queries).
+    # Reranker (cross-encoder) applied to RRF candidates before the top_k is
+    # kept. Fewer candidates = faster CPU rerank.
     RERANK_MODEL = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    # Clamped to [5, 50] — see _clamped_int for clamp-and-warn rationale. Both
-    # ends are real hazards, not defensive padding:
+    # Clamped to [5, 50] — see _clamped_int. Both ends are real hazards:
     #   * High end: every candidate is one cross-encoder pair, and the whole
     #     batch runs under the process-wide `inference_lock` on TORCH_THREADS
-    #     (2) cores, so a large value serialises every other inference in the
+    #     cores, so a large value serialises every other inference in the
     #     process behind one request. 50 already exceeds what any caller can
     #     consume — /search caps top_k at 50 and CHAT_MAX_SOURCES is 20.
-    #     The batch that actually reaches the cross-encoder is NOT this value:
-    #     `_retrieval_leg` fetches `max(top_k, RERANK_CANDIDATES)` PER LEG,
-    #     `_retrieval_queries` returns at most TWO legs (Flashback + bare topic
-    #     for a year-in-review intent), and `_merge_results` unions them, so the
-    #     bound is `2 * max(top_k, RERANK_CANDIDATES)` — at most 100 pairs at
-    #     the ceiling. `rerank()` is deliberately not truncated further: dropping
-    #     merged candidates there would change reranked ordering for
-    #     year-in-review queries, which is a relevance change, not a DoS fix.
-    #   * Low end: below 5 there is no ranking left to do. `main.py` does
-    #     `max(top_k, RERANK_CANDIDATES)`, so a small value degrades quietly
-    #     there, but `scripts/rerank_bench.py` passes this straight through as
-    #     a Qdrant `limit`, where 0 returns nothing and a negative is invalid.
-    #     A silently dead rerank is worse than a clamped one.
+    #   * Low end: below 5 there is no ranking left to do. `scripts/rerank_bench.py`
+    #     passes this straight through as a Qdrant `limit`, where 0 returns
+    #     nothing and a negative is invalid. A silently dead rerank is worse
+    #     than a clamped one.
     RERANK_CANDIDATES = _clamped_int("RERANK_CANDIDATES", 12, 5, 50)
     # Reranker execution backend. 'torch' (sentence-transformers CrossEncoder)
-    # is the only backend: the ONNX backend ('onnx', via optimum/onnxruntime)
-    # is not installable — optimum-onnx requires transformers<4.58, which
-    # conflicts with the pinned transformers 5.x (CVE-fix) version — so its
-    # code path was removed from app/reranker.py. This knob is kept so existing
-    # deployments that set RERANK_BACKEND keep working; any value other than
-    # 'torch' logs a warning and uses torch.
+    # is the only backend: the ONNX backend is not installable alongside the
+    # pinned transformers version, so its code path was removed from
+    # app/reranker.py. This knob is kept so existing deployments that set
+    # RERANK_BACKEND keep working; any value other than 'torch' logs a warning
+    # and uses torch.
     RERANK_BACKEND = os.getenv("RERANK_BACKEND", "torch")
     # Inert: local dir that held the exported ONNX cross-encoder cache when the
     # ONNX backend existed. Nothing reads it now; kept as a documented
@@ -584,8 +514,7 @@ class Config:
     # are not the same fault and must be told apart: a placeholder makes 100% of
     # answers the canned fallback while the process still looks healthy, so
     # classify_gemini_api_key below is the single place that decides whether the
-    # configured value can actually reach the LLM, and both the readiness report
-    # and the startup log report through it.
+    # configured value can actually reach the LLM.
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
     # Answer model. Kept separate from GEMINI_MODEL so the eval judge can be held
@@ -601,7 +530,6 @@ class Config:
     LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
     LLM_RETRY_BACKOFF = float(os.getenv("LLM_RETRY_BACKOFF", "1.0"))
     # Pricing in USD per 1M tokens, used by LLMResult.cost() for cost tracking.
-    # Defaults approximate Google Gemini 3.1 Flash Lite rates.
     LLM_PRICE_INPUT_PER_1M = float(os.getenv("LLM_PRICE_INPUT_PER_1M", "0.25"))
     LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "1.50"))
     # Conversion for displaying cost in Indian Rupees (INR). Approx market rate.
@@ -615,66 +543,48 @@ class Config:
     # concurrent turns contend for the same budget instead of each reading a
     # stale counter (see reserve() in app/cost_budget.py).
     LLM_CALL_RESERVE_USD = float(os.getenv("LLM_CALL_RESERVE_USD", "0.05"))
-    # Lifetime of an unsettled hold. Bounds the damage a crashed or cancelled
-    # turn does to the budget: after this long the hold is swept and CHARGED to
-    # the spend counter at its reserved amount, so a crashed billed call stays
-    # charged for the rest of the day instead of becoming free spend.
+    # Lifetime of an unsettled hold. After this long the hold is swept and
+    # CHARGED to the spend counter at its reserved amount, so a crashed billed
+    # call stays charged for the rest of the day instead of becoming free spend.
     COST_RESERVATION_TTL_SECONDS = int(os.getenv("COST_RESERVATION_TTL_SECONDS", "900"))
     # Total-character cap on conversation history sent to the LLM. Turns the
     # cap is needed most (long histories) into the turns that cost the most.
     CHAT_MAX_HISTORY_CHARS = int(os.getenv("CHAT_MAX_HISTORY_CHARS", "24000"))
 
-    # Search
     TOP_K = int(os.getenv("TOP_K", "8"))
     # Minimum reranked relevance score for chat sources; weaker results are
     # dropped before the LLM sees them.
     ASK_MIN_SCORE = float(os.getenv("ASK_MIN_SCORE", "0.2"))
     # When the query itself resolves a category facet (dealtype/industry), that
     # facet filter IS the relevance signal, so the cross-encoder score only ranks
-    # within an already on-topic set. Drop the gate to 0 so month/year-scoped
-    # category queries (e.g. 'funding news in jun 2025') surface their matches
-    # instead of being rejected as "weakly related".
+    # within an already on-topic set, and the gate drops to 0.
     ASK_MIN_SCORE_FACETED = float(os.getenv("ASK_MIN_SCORE_FACETED", "0.0"))
     # Answerability gates (app/answer_fallback.py). WEAK_RESULT_SCORE is the
     # score a reranked hit must exceed to count as "strong", and
     # WEAK_RESULT_MIN_STRONG is how many strong hits a result list must hold
-    # before it is reported as weakly answered. These are deliberately separate
-    # from ASK_MIN_SCORE above because they answer different questions: that
-    # gate is chat's inclusion filter (it drops a source before anything else
-    # looks at it), while this pair judges the whole list the caller hands over
-    # and decides whether the answer is reported as weakly supported. /search
-    # applies no inclusion gate at all, so the pair is the only relevance bar
-    # its weak note sees.
-    #
+    # before it is reported as weakly answered. Deliberately separate from
+    # ASK_MIN_SCORE above: that gate is chat's inclusion filter, while this pair
+    # judges the whole list the caller hands over. /search applies no inclusion
+    # gate at all, so the pair is the only relevance bar its weak note sees.
     # The count is capped at the length of the list and floored at 1
-    # (app/answer_fallback.py:results_are_weak), so a deployment that raises
-    # this above the number of results a caller passes sees no change -- the
-    # /search weak note passes the whole result list and is the caller this
-    # knob actually moves; chat's fallback passes at most one source, where
-    # the count is always 1. A value of 0 or less behaves as 1.
+    # (app/answer_fallback.py:results_are_weak), so a value of 0 or less
+    # behaves as 1.
     WEAK_RESULT_SCORE = float(os.getenv("WEAK_RESULT_SCORE", "0.3"))
     WEAK_RESULT_MIN_STRONG = int(os.getenv("WEAK_RESULT_MIN_STRONG", "3"))
     # Score handed to every date-only fallback filler
     # (app/main.py:retrieve_by_date_window) when a temporal query's lexical
     # signal is too weak to fill the window. Its own knob rather than a shared
-    # one with the inclusion gate above: it used to be an import-time alias of
-    # ASK_MIN_SCORE, so retuning the gate silently moved the filler floor too.
-    # The default reproduces the value the alias resolved to out of the box
-    # (ASK_MIN_SCORE's own 0.2 default), so the shipped ranking is unchanged.
-    # The two are now independent, which means this floor has to be kept at or
-    # above ASK_MIN_SCORE for fillers to survive the chat gate that filters
-    # sources by score. Raise the gate without raising this and the temporal
-    # fallback stops reaching the model.
+    # one with the inclusion gate above, so retuning the gate cannot silently
+    # move the filler floor. The two are independent, which means this floor
+    # has to be kept at or above ASK_MIN_SCORE for fillers to survive the chat
+    # gate that filters sources by score: raise the gate without raising this
+    # and the temporal fallback stops reaching the model.
     #
-    # A warning, not a ValueError, and deliberately so: the two are separate
-    # operator knobs, and refusing to boot over a mis-ordered pair of scoring
-    # thresholds would be a worse failure than serving degraded answers that
-    # are at least named in the logs. (_parse_allowed_hosts does raise for
+    # A warning, not a ValueError: refusing to boot over a mis-ordered pair of
+    # scoring thresholds would be a worse failure than serving degraded answers
+    # that are at least named in the logs. (_parse_allowed_hosts does raise for
     # ALLOWED_HOSTS=*, where the misconfiguration disables a security check
-    # outright and there is no safe degraded mode to serve.) Deriving one knob
-    # from the other is not an option either: that is the import-time alias #300
-    # removed, and it would put a knob the operator chose back under another's
-    # control.
+    # outright and there is no safe degraded mode to serve.)
     DATE_FILLER_SCORE = float(os.getenv("DATE_FILLER_SCORE", "0.2"))
     if DATE_FILLER_SCORE < ASK_MIN_SCORE:
         logger.warning(
@@ -691,10 +601,8 @@ class Config:
     # Byte budget for the in-process fallback cache (the HybridCache degrades to
     # a per-worker LRU when Redis is unreachable). The entry cap alone cannot
     # bound memory because the shared cache mixes small search-result payloads
-    # with large embedding vectors (768 floats as JSON, ~15KB each): a handful
-    # of vectors would otherwise consume the whole entry budget and thrash out
-    # the many small entries. Eviction therefore drops the largest entries first
-    # until the total is back under this budget.
+    # with large embedding vectors (~15KB each), so eviction drops the largest
+    # entries first until the total is back under this budget.
     CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", "33554432"))
     # TTL for cached query (dense+sparse) vectors, keyed by the embedding model
     # so a model change invalidates them automatically. Long is safe: the pair
@@ -716,10 +624,7 @@ class Config:
     # Stronger recency weighting applied when the query itself expresses a
     # recency intent ('latest', 'recent', 'fresh'), so old evergreen articles
     # drop below newer ones instead of surfacing on relevance alone. Hard-window
-    # phrases ('this week') are filtered separately and get no boost. This is
-    # the branch that decides whether a "latest" query surfaces new news, so it
-    # is a tuning knob beside the baseline pair above rather than a literal in
-    # app/main.py. The defaults are the values that were hardcoded there.
+    # phrases ('this week') are filtered separately and get no boost.
     RECENCY_BOOST_STRENGTH = float(os.getenv("RECENCY_BOOST_STRENGTH", "0.85"))
     RECENCY_BOOST_DECAY_DAYS = float(os.getenv("RECENCY_BOOST_DECAY_DAYS", "30.0"))
 
@@ -765,11 +670,10 @@ class Config:
     # and short enough that genuine later interest still registers. 0 disables
     # the dedupe.
     #
-    # This is the control #242 actually relies on. The click-boost THRESHOLDS
-    # above are deliberately left at their shipped 5/3/0.3: raising them would
-    # also blunt a forged burst, but it would blunt legitimate signal just as
-    # hard, and that is a ranking-tuning decision to be made on measurement
-    # rather than shipped inside a security fix.
+    # This is the control click-boost forgery actually relies on. The
+    # THRESHOLDS above are deliberately left at their shipped 5/3/0.3: raising
+    # them would blunt a forged burst, but blunt legitimate signal just as hard,
+    # and that is a ranking-tuning decision to make on measurement.
     CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS = int(os.getenv("CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS", "3600"))
 
     # Bounds on stored query strings so a hostile client can't grow Redis
@@ -780,12 +684,11 @@ class Config:
     CLICK_QUERY_TTL_SECONDS = int(os.getenv("CLICK_QUERY_TTL_SECONDS", str(7 * 24 * 3600)))
 
     # Secret mixed into the per-query digest that stands in for a search query
-    # in the analytics aggregates (#348). Left empty, the app generates a random
-    # key on first use and persists it in the analytics Redis, so every gunicorn
-    # worker and every restart shares one key and no operator action is needed.
-    # Set it only to pin the digest namespace across an analytics-Redis rebuild;
-    # changing it makes previously stored digests unreachable, which resets the
-    # top-query lists (their counters are per-digest) but leaks nothing.
+    # in the analytics aggregates. Left empty, the app generates a random key on
+    # first use and persists it in the analytics Redis, so every gunicorn worker
+    # and every restart shares one key. Set it only to pin the digest namespace
+    # across an analytics-Redis rebuild; changing it makes previously stored
+    # digests unreachable, which resets the top-query lists but leaks nothing.
     ANALYTICS_QUERY_KEY = os.getenv("ANALYTICS_QUERY_KEY", "")
 
     # Daily LLM cost counter TTL: kept well past the day it tracks so the budget
@@ -799,12 +702,10 @@ class Config:
     # facts live mid-article) pass the chat relevance gate; costs one extra
     # cross-encoder pass per candidate and only runs on weak-top results.
     #
-    # The rescue is left ON by default: it exists because deep-body matches
-    # were being dropped by the relevance gate, and turning it off is a
-    # relevance regression, not a performance fix. Its cost is bounded by the
-    # three clamped knobs below instead — the expensive part is the second
-    # cross-encoder pass, not the body scan (a 50K body scans in ~0.25ms at
-    # these defaults), so that is what BODY_RESCUE_MAX_CANDIDATES bounds.
+    # Left ON by default: turning it off is a relevance regression, not a
+    # performance fix. Its cost is bounded by the three clamped knobs below
+    # instead -- the expensive part is the second cross-encoder pass, which is
+    # what BODY_RESCUE_MAX_CANDIDATES bounds.
     ENABLE_BODY_RESCUE = _env_bool("ENABLE_BODY_RESCUE", True)
     BODY_RESCUE_THRESHOLD = float(os.getenv("BODY_RESCUE_THRESHOLD", "0.3"))
     # WINDOW is the size of the excerpt handed to the cross-encoder. Below 200
@@ -813,47 +714,36 @@ class Config:
     # while still paying for the pass); above 8000 it inflates the model's
     # input for every candidate in the rescue batch.
     BODY_RESCUE_WINDOW = _clamped_int("BODY_RESCUE_WINDOW", 1500, 200, 8000)
-    # STEP is the sliding-window stride over the body. A 0 is a hard crash —
-    # `range(0, n, 0)` raises ValueError and 500s the chat turn — and a small
-    # step re-scans the whole body: step=1 costs ~117ms per 50K body versus
-    # ~0.26ms at the default 500, a 450x amplification of a knob whose value
-    # is supposed to be a cost saving.
+    # STEP is the sliding-window stride over the body. A 0 is a hard crash
+    # (`range(0, n, 0)` raises ValueError and 500s the chat turn) and a small
+    # step re-scans the whole body.
     BODY_RESCUE_STEP = _clamped_int("BODY_RESCUE_STEP", 500, 1, 1500)
     # Hard budget on how many windows are scored per body, independent of the
     # stride. Clamping STEP alone does NOT bound the work, because a small
     # stride is legal: step=1 still scans 48,501 windows of a 50K body, and
     # body_rescue scans every body-bearing article before the candidate cap
-    # applies, so 20 articles cost ~2.3s. `_best_body_window` widens the
-    # stride to fit this budget. 200 is above the 98 windows the defaults
-    # already scan, so the default scan is bit-for-bit unchanged and the budget
-    # only engages for a deliberately expensive stride.
+    # applies, so 20 articles cost ~2.3s. `_best_body_window` widens the stride
+    # to fit this budget, and 200 is above the 98 windows the defaults scan.
     # Recall trade-off, stated rather than implied: a budget tighter than the
     # configured stride needs widens the stride, and a stride coarse enough to
-    # widen can straddle a token-dense region and miss it. That is the price of
-    # capping the work. It is free at any budget >= 98 (the default scan), so
-    # the default rescue is unchanged; only a deliberately tight budget trades
-    # recall, and tightening it is an explicit operator choice.
+    # widen can straddle a token-dense region and miss it. Free at any budget
+    # >= 98 (the default scan), so only a deliberately tight budget trades
+    # recall.
     BODY_RESCUE_MAX_WINDOWS = _clamped_int("BODY_RESCUE_MAX_WINDOWS", 200, 1, 5000)
-    # Most candidates that may enter the second cross-encoder pass. The pass is
-    # the dominant cost (one pair per candidate, under `inference_lock`) and
-    # chat hands body_rescue up to CHAT_MAX_SOURCES (20) articles. 10 keeps the
-    # rescue available on the candidates it is designed for while halving the
-    # worst case; see body_rescue() in main.py for how the shortlist is picked.
+    # Most candidates that may enter the second cross-encoder pass, the dominant
+    # cost (one pair per candidate, under `inference_lock`), while chat hands
+    # body_rescue up to CHAT_MAX_SOURCES (20) articles.
     BODY_RESCUE_MAX_CANDIDATES = _clamped_int("BODY_RESCUE_MAX_CANDIDATES", 10, 1, 50)
 
-    # Upper bound on the /search `q` parameter, in characters. This overlaps
-    # issue #241 (still open) and is deliberately the minimal version of it:
-    # q reaches the embedding encoders, the cache key and every query_intent
-    # regex, so an unbounded value costs CPU and Redis memory per request. It
-    # is set well above CLICK_QUERY_MAX_LEN (256) because a rejected search is
-    # user-visible whereas a truncated stored query string is not.
+    # Upper bound on the /search `q` parameter, in characters: q reaches the
+    # embedding encoders, the cache key and every query_intent regex, so an
+    # unbounded value costs CPU and Redis memory per request. Set well above
+    # CLICK_QUERY_MAX_LEN (256) because a rejected search is user-visible whereas
+    # a truncated stored query string is not.
     SEARCH_QUERY_MAX_CHARS = _clamped_int("SEARCH_QUERY_MAX_CHARS", 512, 32, 4000)
 
-    # Chat history (SQLite on the host; survives restarts, unlike Redis without AOF)
-    # Resolved to an absolute path against the backend root, never the process
-    # working directory (see _data_path): a CWD-relative path made a wrong CWD
-    # open a brand-new empty chat DB with no error anywhere.
-    # Retention purges conversations idle for CHAT_RETENTION_DAYS.
+    # Chat history (SQLite on the host; survives restarts, unlike Redis without
+    # AOF). Retention purges conversations idle for CHAT_RETENTION_DAYS.
     CHAT_DB_PATH = _data_path("CHAT_DB_PATH", "data/chat.db")
     CHAT_RETENTION_DAYS = int(os.getenv("CHAT_RETENTION_DAYS", "180"))
     CHAT_MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "10"))
@@ -861,21 +751,18 @@ class Config:
     # Messages returned by GET /api/chat/sessions/{id}. A session lives for
     # CHAT_RETENTION_DAYS and each message deserialises its sources JSON, so an
     # unbounded read of a long thread serialises the entire history into one
-    # response (#258). The read returns the MOST RECENT CHAT_SESSION_MESSAGE_LIMIT
-    # messages in chronological order, so the thread still renders as its tail,
-    # and flags the truncation in the response so the client can say so. This is
-    # deliberately looser than CHAT_MAX_HISTORY_TURNS/CHAT_MAX_HISTORY_CHARS
-    # (#255), which bound the *prompt*: the user can read further back in a
-    # thread than the model is given context for, and that is expected.
+    # response. The read returns the MOST RECENT CHAT_SESSION_MESSAGE_LIMIT
+    # messages in chronological order and flags the truncation in the response.
+    # Deliberately looser than CHAT_MAX_HISTORY_TURNS/CHAT_MAX_HISTORY_CHARS,
+    # which bound the *prompt*: the user can read further back in a thread than
+    # the model is given context for, and that is expected.
     CHAT_SESSION_MESSAGE_LIMIT = int(os.getenv("CHAT_SESSION_MESSAGE_LIMIT", "200"))
     # Sources returned per message on the same read. CHAT_MAX_SOURCES (20) caps
     # what is *generated*; this caps what is *serialized back* per message, so a
     # message stored with more sources than the cap cannot multiply the response.
     CHAT_MESSAGE_SOURCE_LIMIT = int(os.getenv("CHAT_MESSAGE_SOURCE_LIMIT", "20"))
 
-    # Recommendation engine
     ENABLE_RECOMMENDATIONS = _env_bool("ENABLE_RECOMMENDATIONS", True)
-    # Hybrid scoring weights
     RECOMMEND_SIMILARITY_WEIGHT = float(os.getenv("RECOMMEND_SIMILARITY_WEIGHT", "0.4"))
     RECOMMEND_CATEGORY_WEIGHT = float(os.getenv("RECOMMEND_CATEGORY_WEIGHT", "0.3"))
     RECOMMEND_RECENCY_WEIGHT = float(os.getenv("RECOMMEND_RECENCY_WEIGHT", "0.2"))
@@ -891,18 +778,11 @@ class Config:
     # Width of the candidate pool the personalized recommendation legs and the
     # cold-start fallback fetch, deliberately wider than the result page so
     # scoring and exclusion post-processing have something to choose from (see
-    # _candidate_pool in app/recommender.py). The vector leg runs one query per
-    # recent interaction, so a request reads up to five of these pools. A
-    # request asking for more than this still gets at least `limit` candidates.
-    # /recommend/similar, the trending feed and the personalized trending leg
-    # keep their own fixed widths -- each has a comment saying why.
+    # _candidate_pool in app/recommender.py).
     RECOMMEND_CANDIDATES_LIMIT = int(os.getenv("RECOMMEND_CANDIDATES_LIMIT", "50"))
-    # Redis keys for user profiles and interactions
     USER_PROFILE_REDIS_DB = int(os.getenv("USER_PROFILE_REDIS_DB", "2"))
-    # Trending/viral signal TTL
     TRENDING_VELOCITY_WINDOW_DAYS = int(os.getenv("TRENDING_VELOCITY_WINDOW_DAYS", "7"))
 
-    # Analytics
     # Aggregates live in Redis DB 1 (the query cache uses DB 0 and is flushed
     # during deploys). Read endpoints are gated by the auth layer (admin role).
     ANALYTICS_REDIS_DB = int(os.getenv("ANALYTICS_REDIS_DB", "1"))
@@ -914,13 +794,12 @@ class Config:
     AUTH_DB_PATH = _data_path("AUTH_DB_PATH", "data/auth.db")
     # Redis DB holding the auth rate-limit counters. Pinned explicitly, like
     # ANALYTICS_REDIS_DB and USER_PROFILE_REDIS_DB, rather than inherited from
-    # any db segment in REDIS_URL. The inherited value was DB 0, which this
-    # repo documents as the query cache and flushes during deploys -- so the
-    # limiter's counters were living in the database a deploy empties, and a
-    # flush silently reset every bucket. These counters are a security
-    # control, so they get their own database: cache 0, analytics 1, profiles
-    # 2, rate limiting 3. The `db` kwarg on from_url overrides whatever the URL
-    # carries, so this is correct regardless of the URL's db segment.
+    # any db segment in REDIS_URL: the inherited value was DB 0, which this repo
+    # documents as the query cache and flushes during deploys, so the limiter's
+    # counters were living in the database a deploy empties and a flush
+    # silently reset every bucket. These counters are a security control, so
+    # they get their own database: cache 0, analytics 1, profiles 2, rate
+    # limiting 3. The `db` kwarg on from_url overrides whatever the URL carries.
     AUTH_RATE_LIMIT_REDIS_DB = int(os.getenv("AUTH_RATE_LIMIT_REDIS_DB", "3"))
     AUTH_TOKEN_TTL_DAYS = int(os.getenv("AUTH_TOKEN_TTL_DAYS", "7"))
     # Optional machine-to-machine credential: the value carried in an
@@ -929,17 +808,13 @@ class Config:
     #
     # This is a SEED, not a standing grant. The first request presenting it
     # creates a row in auth_service_tokens with the scope and expiry below;
-    # from then on that row is the only authority on the token's life, so the
-    # credential stops working once it expires or is revoked.
+    # from then on that row is the only authority on the token's life.
     #
-    # OPERATIONAL CONSEQUENCE, and it is deliberate: the seeded token expires
-    # AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS after it is first seeded (24h by
-    # default) and a restart does NOT revive it, because a credential that
-    # silently came back would be the permanent grant this replaced. Recovery
-    # is rotation -- change the value here and restart (a different value
-    # hashes to a different row, so it seeds a fresh one), or mint one with
-    # POST /api/auth/service-tokens. A machine client that runs longer than
-    # that must be given a freshly rotated value, not the original.
+    # OPERATIONAL CONSEQUENCE, deliberate: the seeded token expires
+    # AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS after it is first seeded and a restart
+    # does NOT revive it, because a credential that silently came back would be
+    # the permanent grant this replaced. Recovery is rotation -- change the
+    # value here and restart, or mint one with POST /api/auth/service-tokens.
     # Session cookie. The credential is no longer read from an
     # `Authorization: Bearer` header: a header the app writes into a JSON body is
     # reachable by any script that runs on the page, so an XSS bug exfiltrates a
@@ -947,8 +822,8 @@ class Config:
     # cookie, which script cannot read. See app/auth.py for the contract.
     #
     # No Domain attribute is ever set on the cookie: host-only is deliberate so
-    # the same image works on a bare-IP deployment (`http://10.0.0.7`) where a
-    # Domain would have to encode an address the operator may not control.
+    # the same image works on a bare-IP deployment where a Domain would have to
+    # encode an address the operator may not control.
     AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "vccircle_session")
     # Defaulted off from the old localStorage key name on purpose: keeping the
     # old name would let a stale credential silently authenticate through a
@@ -966,8 +841,7 @@ class Config:
     # NGINX_TLS=off) MUST set AUTH_COOKIE_SECURE=false or login will silently
     # not persist. That is a deployment dependency, not something to auto-
     # detect: the app sits behind TLS termination and cannot trust
-    # request.url.scheme or X-Forwarded-Proto to work it out, so a guess here
-    # could go either way silently.
+    # request.url.scheme or X-Forwarded-Proto to work it out.
     AUTH_COOKIE_SECURE = _env_tristate("AUTH_COOKIE_SECURE") is not False
     # Not configurable. It must stay "/": the API serves /api/... , and a
     # narrower path would silently stop the cookie from ever reaching it.
@@ -992,7 +866,6 @@ class Config:
     # this email exists. An existing account is never overwritten.
     AUTH_ADMIN_EMAIL = os.getenv("AUTH_ADMIN_EMAIL", "")
     AUTH_ADMIN_PASSWORD = os.getenv("AUTH_ADMIN_PASSWORD", "")
-    # Input-validation limits for the auth endpoints.
     AUTH_PASSWORD_MIN_LEN = int(os.getenv("AUTH_PASSWORD_MIN_LEN", "8"))
     AUTH_MAX_EMAIL_LEN = int(os.getenv("AUTH_MAX_EMAIL_LEN", "254"))
     AUTH_MAX_NAME_LEN = int(os.getenv("AUTH_MAX_NAME_LEN", "60"))
@@ -1012,25 +885,18 @@ class Config:
     # check, turned the throttle into an account-lockout weapon -- an anonymous
     # caller could deny a known address access indefinitely by sending the
     # limit's worth of wrong passwords from rotating source addresses, never
-    # guessing anything. A correct password is never counted, never gated and
-    # never rate-limited.
+    # guessing anything.
     #
-    # WHAT IT BUYS YOU: it caps the RATE of attempts aimed at a single account
-    # and gives a per-account signal the per-IP limit cannot. What it does NOT
-    # buy you is attacker cost -- the check runs after the bcrypt verify, so
-    # being refused is free to the caller (measured: an over-budget request
-    # costs within ~1% of an under-budget one). AUTH_LOGIN_RATE_PER_MIN is the
-    # control that bounds attacker cost. Sizing this knob as a DoS control
-    # would be a mistake; see the login docstring for why the check cannot
-    # simply move before the verify. 0 disables.
+    # What it does NOT buy is attacker cost: the check runs after the bcrypt
+    # verify, so being refused is free to the caller. AUTH_LOGIN_RATE_PER_MIN is
+    # the control that bounds attacker cost. 0 disables.
     AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN = int(os.getenv("AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN", "20"))
-    # Cap on simultaneously ACTIVE (unexpired) tokens per user. Every login
-    # mints one, and the periodic purge only removes EXPIRED rows, so the
-    # table grew with the number of logins rather than with the number of
-    # users -- an unbounded-growth / DoS vector on the auth store. Logging in
-    # past the cap REVOKES (deletes) the user's oldest active tokens, so the
-    # evicted credential stops working immediately rather than merely
-    # disappearing from a listing. 0 disables the cap.
+    # Cap on simultaneously ACTIVE (unexpired) tokens per user. Every login mints
+    # one, and the periodic purge only removes EXPIRED rows, so the table grew
+    # with the number of logins rather than with the number of users -- an
+    # unbounded-growth / DoS vector on the auth store. Logging in past the cap
+    # REVOKES (deletes) the user's oldest active tokens, so the evicted
+    # credential stops working immediately. 0 disables the cap.
     AUTH_MAX_ACTIVE_TOKENS_PER_USER = int(os.getenv("AUTH_MAX_ACTIVE_TOKENS_PER_USER", "10"))
     # Redis-backed per-IP rate limits on the public search surface: /search,
     # /facets, /analytics/click and /ready were unauthenticated and unrated,
@@ -1038,8 +904,7 @@ class Config:
     # poisoning. 0 disables an individual limit. Unlike the auth limits these
     # FAIL CLOSED (503) when Redis is unreachable: these endpoints are the
     # abuse surface, so an unrated request is not an acceptable fallback.
-    # /ready is the one deliberate exception and fails open instead -- see
-    # health.py and auth.public_rate_limit.
+    # /ready is the one deliberate exception and fails open instead.
     PUBLIC_SEARCH_RATE_PER_MIN = int(os.getenv("PUBLIC_SEARCH_RATE_PER_MIN", "60"))
     PUBLIC_FACETS_RATE_PER_MIN = int(os.getenv("PUBLIC_FACETS_RATE_PER_MIN", "60"))
     PUBLIC_CLICK_RATE_PER_MIN = int(os.getenv("PUBLIC_CLICK_RATE_PER_MIN", "120"))
@@ -1065,13 +930,8 @@ class Config:
     # Unset (the shipped default) means AUTO, resolved in auth._client_ip
     # against the actual socket peer: X-Forwarded-For is honoured only when
     # the immediate peer is loopback, i.e. a proxy on this same host (the
-    # nginx config in setup.sh forwards from 127.0.0.1). That gives the
-    # deployed topology per-client-IP rate limits with no .env edit, while a
-    # client hitting the API directly still sees its own routable address as
-    # the peer and cannot forge a header to escape its bucket.
-    #
-    # Set the variable to true/false to force one behaviour regardless of peer
-    # (true when the proxy runs on another host, false for local/direct-only).
+    # nginx config in setup.sh forwards from 127.0.0.1). Set the variable to
+    # true/false to force one behaviour regardless of peer.
     AUTH_TRUST_X_FORWARDED_FOR: bool | None = _env_tristate("AUTH_TRUST_X_FORWARDED_FOR")
     # Background purge interval for expired auth_tokens rows (0 disables the loop).
     AUTH_TOKEN_PURGE_INTERVAL_SECONDS = int(os.getenv("AUTH_TOKEN_PURGE_INTERVAL_SECONDS", "3600"))
@@ -1089,34 +949,28 @@ class Config:
 
     # Hostnames this API answers to, enforced by TrustedHostMiddleware. The
     # default is derived from CORS_ORIGINS, this box's own name and addresses
-    # (bound ones plus its default-route address), and the local dev/test
-    # hosts, so a site reached by IP or by the box's own name keeps working
-    # with no configuration at all. Set
-    # ALLOWED_HOSTS explicitly (comma separated hostnames) when the API is
-    # reachable under a name none of those cover — a separately registered
-    # public domain, for instance. A wrong value here answers 400 to every
-    # request; the effective list is logged at startup.
-    # Immutable (tuple), like CORS_ORIGINS, so the allow-list can't be mutated
-    # at runtime.
+    # (bound ones plus its default-route address), and the local dev/test hosts,
+    # so a site reached by IP or by the box's own name keeps working with no
+    # configuration at all. Set ALLOWED_HOSTS explicitly (comma separated) when
+    # the API is reachable under a name none of those cover. A wrong value here
+    # answers 400 to every request; the effective list is logged at startup.
     ALLOWED_HOSTS: ClassVar[tuple[str, ...]] = _parse_allowed_hosts(
         os.getenv("ALLOWED_HOSTS"), CORS_ORIGINS + _machine_hosts()
     )
 
     # Level for the app's own loggers, read by app/logging_config.py at startup.
     # It exists because uvicorn's worker leaves the root logger at WARNING with
-    # no handlers, so every logger.info in the app was dropped (#293). Only the
-    # app's loggers take this level; the root logger's level is left alone, so a
-    # third-party logger's INFO output stays off at every setting. CRITICAL,
-    # ERROR, WARNING, INFO or DEBUG (case-insensitive); an unrecognised value
-    # falls back to INFO and says so in the log.
+    # no handlers, so every logger.info in the app was dropped. Only the app's
+    # loggers take this level; the root logger's level is left alone, so a
+    # third-party logger's INFO output stays off at every setting. An
+    # unrecognised value falls back to INFO and says so in the log.
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
 
 # A real Google API key is "AIza" followed by 35 URL-safe characters. That shape
 # is only required against Google's own endpoint: GEMINI_BASE_URL is
 # configurable, so a deployment pointing at an OpenAI-compatible gateway
-# legitimately holds a differently shaped key, and rejecting that would report a
-# working configuration as broken.
+# legitimately holds a differently shaped key.
 _GOOGLE_KEY_RE = re.compile(r"^AIza[0-9A-Za-z_-]{35}$")
 _GOOGLE_API_HOST = "generativelanguage.googleapis.com"
 _GOOGLE_KEY_PREFIX = "AIza"
@@ -1164,13 +1018,11 @@ _REPEATED_FILLER_RE = re.compile(r"(.)\1{3,}")
 
 # ...but that check cannot see inside a correctly shaped key: a MASKED key keeps
 # its real prefix and its real length and fills the rest with filler, which is
-# how documentation writes an example ("AIza" + "Sy" + a run of X's) and how an
-# operator redacts a key they are not sure about. That is precisely a key whose
-# shape is right and whose content is filler. So the tail after the prefix is
-# also required to look random: a real 35-character tail drawn from a 64-symbol
-# alphabet has ~27 distinct characters, and the chance of a genuine key having
-# fewer than _MIN_DISTINCT_KEY_CHARS of them is vanishingly small, while every
-# masking style (all X, all digits, all dashes, a padded word) lands far below.
+# how documentation writes an example and how an operator redacts a key they are
+# not sure about. So the tail after the prefix is also required to look random:
+# a real 35-character tail drawn from a 64-symbol alphabet has ~27 distinct
+# characters, while every masking style (all X, all digits, all dashes, a padded
+# word) lands far below.
 # NB: the example above is described, never written out -- a contiguous
 # 39-character "AIza..." string anywhere in this repository, comment included,
 # is indistinguishable from a leaked credential to a secrets scanner.
@@ -1192,8 +1044,7 @@ def classify_gemini_api_key(value: str | None) -> str:
     A truthiness test cannot do this job: every non-empty string is truthy and
     the value shipped in .env.example is the literal "your_key_here", so
     ``bool(key)`` reported a chat-broken deployment as a healthy one. The value
-    itself is never returned or logged, only its classification, so a readiness
-    report or a log line can name the fault without leaking the secret.
+    itself is never returned or logged, only its classification.
     """
     if value is None or not value.strip():
         return "missing"

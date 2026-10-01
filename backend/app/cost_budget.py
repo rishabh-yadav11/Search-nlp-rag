@@ -8,46 +8,42 @@ racking up unbilled spend.
 
 The cap is enforced as RESERVE / SETTLE around every billed LLM call:
 
-* ``reserve(estimate_usd)`` holds the estimate against today's cap *before*
-  the call runs and returns an opaque reservation id.
+* ``reserve(estimate_usd)`` holds the estimate against today's cap *before* the
+  call runs and returns an opaque reservation id.
 * ``settle(ids, actual_usd)`` drops those holds and writes the ACTUAL cost --
   the one and only counter write for the turn.
 * ``release(ids)`` drops holds for a turn that made no billed call.
 
-Holding before the call is what closes the check-then-act window behind #255.
-The old shape was "read the counter, call the LLM, write the counter at the
-end of the turn": N concurrent turns all read "under budget", all proceed, and
-the cap is overshot by N times the per-call cost, every time. Here the whole
-read-modify-write happens once, inside a single Lua script on the server, so
-at most ``cap / per-call reserve`` turns can be in flight at once and the
-limit holds under concurrency.
+Holding before the call closes the check-then-act window: "read the counter, call
+the LLM, write the counter at the end" lets N concurrent turns all read "under
+budget" and overshoot by N times the per-call cost. Here the whole
+read-modify-write happens once, inside a single Lua script, so at most
+``cap / per-call reserve`` turns can be in flight at once.
 
 Everything about the store fails CLOSED. An unreachable Redis raises
-``BudgetUnavailable`` instead of quietly reading "no spend": the old fail-open
-read meant a down, flushed or misconfigured counter admitted unbounded spend,
-which is precisely the case a cap exists to stop. A ``settle`` that cannot
-reach the store raises too and leaves the holds in place, so nothing the turn
-did is written off.
+``BudgetUnavailable`` instead of quietly reading "no spend": a fail-open read
+means a down, flushed or misconfigured counter admits unbounded spend, which is
+precisely the case a cap exists to stop. A ``settle`` that cannot reach the
+store raises too and leaves the holds in place, so nothing the turn did is
+written off.
 
 A hold that is never settled -- the worker crashed, the container was killed
 mid-stream, the client disconnected -- expires after
 COST_RESERVATION_TTL_SECONDS. Every script call sweeps expired holds before
-doing anything else, and the sweep CHARGES a lapsed hold to the counter
-instead of handing the budget back: a crashed turn's reserved estimate stays
-billed for the rest of the UTC day. Deleting the hold instead would make
-every crash free spend, and keeping it forever would let one crash starve the
-cap until the day key rolls over; promoting it to spend is the only outcome
-that is both honest and self-healing.
+doing anything else, and the sweep CHARGES a lapsed hold to the counter instead
+of handing the budget back: a crashed turn's reserved estimate stays billed for
+the rest of the UTC day. Deleting the hold instead would make every crash free
+spend, and keeping it forever would let one crash starve the cap until the day
+key rolls over.
 
 Two consequences worth stating plainly:
 
 * A hold that lapses while its turn is still running is charged its estimate,
-  and the turn's later ``settle`` replaces that estimate with the real cost.
-  The day total is therefore never under-counted; it can briefly over-count
-  the estimate while the slow call is in flight.
-* ``settle`` is idempotent. The first settle of a reservation id charges it;
-  a repeat of the same ids charges nothing, so a retried or duplicated
-  settle cannot inflate the counter.
+  and the turn's later ``settle`` replaces that estimate with the real cost. The
+  day total is therefore never under-counted; it can briefly over-count the
+  estimate while the slow call is in flight.
+* ``settle`` is idempotent: the first settle of a reservation id charges it, and
+  a repeat charges nothing, so a retried settle cannot inflate the counter.
 """
 import logging
 import secrets
@@ -69,17 +65,16 @@ _redis = None
 # the same units.
 #
 # The counter uses a DISTINCT key namespace (`llm:cost:micro:...`) from the
-# legacy USD-valued `llm:cost:day:...` key. A pre-existing USD-valued key at
-# deploy time would otherwise be misread (divided by _COST_SCALE) and have
-# micro-USD added to a USD value, corrupting that day's total until the key
-# rolls. The separate key never collides with any legacy USD key.
+# legacy USD-valued `llm:cost:day:...` key: a pre-existing USD-valued key would
+# otherwise be misread (divided by _COST_SCALE) and have micro-USD added to a
+# USD value, corrupting that day's total until the key rolls.
 _COST_SCALE = 1_000_000
 _COST_KEY_PREFIX = "llm:cost:micro"
 
 # ONE script serves all three operations. Doing the cap check and the mutation
-# in a single server-side script is the whole point: any read from Python and
-# a later write from Python is a TOCTOU window, which is exactly how the
-# previous implementation let concurrent turns overspend.
+# in a single server-side script is the whole point: any read from Python and a
+# later write from Python is a TOCTOU window that lets concurrent turns
+# overspend.
 #
 # KEYS[1] today's spent counter (integer micro-USD)
 # KEYS[2] live holds hash: reservation id -> held micro-USD
@@ -113,24 +108,22 @@ local new_id = ARGV[7]
 if hold_ttl < 1 then hold_ttl = 1 end
 if counter_ttl < 1 then counter_ttl = 1 end
 
--- The holds hash and the holds-expiry zset must OUTLIVE the instant a hold
--- first becomes sweepable. A hold's zset score is `now + hold_ttl` and the
--- sweep predicate is `score <= now`, so the earliest moment the promotion of a
--- crashed call is POSSIBLE is exactly hold_ttl after the reserve -- which is
--- precisely when containers expired at hold_ttl are gone. Redis expires
--- lazily, on the first command issued after the deadline, and that command is
--- the sweep itself: the containers would be deleted in the same breath in
--- which the promotion became observable, and a crashed billed call's spend
--- would be silently lost. Two TTLs of slack leaves a full further hold_ttl
--- window in which ANY budget call promotes the lapsed hold.
+-- The holds hash and the holds-expiry zset must OUTLIVE the instant a hold first
+-- becomes sweepable. A hold's zset score is `now + hold_ttl` and the sweep
+-- predicate is `score <= now`, so the earliest moment a crashed call's promotion
+-- is possible is exactly hold_ttl after the reserve -- precisely when containers
+-- expired at hold_ttl are gone, and Redis expires them lazily on the first
+-- command after the deadline, which is the sweep itself. Two TTLs of slack
+-- leaves a full further hold_ttl window in which ANY budget call promotes the
+-- lapsed hold.
 local container_ttl = hold_ttl * 2
 
--- Sweep lapsed holds first, in every mode. A turn that reserved and then
--- crashed never settles, and an un-swept hold would keep eating budget until
--- the day key rolled over. A lapsed hold is PROMOTED, not freed: the call it
--- covered was very likely made and billed, so its estimate is charged to the
--- counter and recorded in KEYS[4] as already-accounted. Dropping the hold
--- instead would hand out the budget and make a crashed call free spend.
+-- Sweep lapsed holds first, in every mode. A turn that reserved and then crashed
+-- never settles, and an un-swept hold would keep eating budget until the day key
+-- rolled over. A lapsed hold is PROMOTED, not freed: the call it covered was
+-- very likely made and billed, so its estimate is charged to the counter and
+-- recorded in KEYS[4] as already-accounted. Dropping the hold instead would hand
+-- out the budget and make a crashed call free spend.
 local lapsed = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now)
 for i = 1, #lapsed do
   local v = redis.call('HGET', KEYS[2], lapsed[i])
@@ -147,14 +140,13 @@ end
 local counter = tonumber(redis.call('GET', KEYS[1]) or '0')
 
 if mode == 'reserve' then
-  -- Spend already incurred (counter) plus every live hold plus this estimate
-  -- is what the cap is measured against. Reading the holds here, in the same
-  -- script run that creates the hold, is what makes concurrent reserves safe.
+  -- Spend already incurred (counter) plus every live hold plus this estimate is
+  -- what the cap is measured against. Reading the holds here, in the same script
+  -- run that creates the hold, is what makes concurrent reserves safe.
   -- A zero (or negative) hold is floored at one micro-USD: `total + amount >
   -- budget` would otherwise be untrippable and a misconfigured
-  -- LLM_CALL_RESERVE_USD would silently turn the cap into a no-op. This floor
-  -- is deliberately reserve-only -- a zero-cost settle must still be a
-  -- no-op -- and mirrors the TTL floors above.
+  -- LLM_CALL_RESERVE_USD would silently turn the cap into a no-op. This floor is
+  -- deliberately reserve-only -- a zero-cost settle must still be a no-op.
   if amount < 1 then amount = 1 end
   local total = counter
   local held = redis.call('HVALS', KEYS[2])
@@ -206,24 +198,24 @@ if mode == 'settle' then
   end
   -- A hold is NOT spend and was never added to the counter -- reserve only
   -- HSET/ZADDs it -- so the real cost is added whole here. Subtracting the
-  -- released hold here would double-discount it and quietly lose the
-  -- difference every time a call costs less than its estimate.
+  -- released hold would double-discount it and quietly lose the difference every
+  -- time a call costs less than its estimate.
   --
-  -- `amount` is what the call really cost and is deliberately allowed to
-  -- exceed the held estimate: spend that already happened is recorded, not
-  -- refused, and the resulting over-cap total blocks the NEXT call.
+  -- `amount` is what the call really cost and is deliberately allowed to exceed
+  -- the held estimate: spend that already happened is recorded, not refused, and
+  -- the resulting over-cap total blocks the NEXT call.
   --
   -- An EMPTY id list is never idempotent: nothing identifies what is being
-  -- charged, so `amount` is written whole or spend incurred outside a hold
-  -- would be lost.
+  -- charged, so `amount` is written whole or spend incurred outside a hold would
+  -- be lost.
   local new_charge = amount
   if all_accounted then new_charge = 0 end
   local next_counter = counter + new_charge - promoted
   if next_counter < 0 then next_counter = 0 end
   redis.call('SET', KEYS[1], next_counter, 'EX', counter_ttl)
-  -- Tombstones: accounted, with nothing outstanding. A later settle of the
-  -- same ids sees them and charges nothing. No TTL here on purpose: they must
-  -- survive past hold_ttl so a late settle cannot double charge.
+  -- Tombstones: accounted, with nothing outstanding, so a later settle of the
+  -- same ids charges nothing. No TTL here on purpose: they must survive past
+  -- hold_ttl so a late settle cannot double charge.
   for i = 8, #ARGV do
     redis.call('HSET', KEYS[4], ARGV[i], 0)
   end
@@ -237,9 +229,9 @@ end
 
 if mode == 'release' then
   -- Drops live holds and records nothing: no billed call was made. It
-  -- deliberately does NOT refund KEYS[4] -- a promoted id was already
-  -- charged to the counter by the sweep, and refunding it here would make a
-  -- crashed turn's cost free again.
+  -- deliberately does NOT refund KEYS[4] -- a promoted id was already charged to
+  -- the counter by the sweep, and refunding it here would make a crashed turn's
+  -- cost free again.
   for i = 8, #ARGV do
     redis.call('HDEL', KEYS[2], ARGV[i])
     redis.call('ZREM', KEYS[3], ARGV[i])
@@ -277,8 +269,8 @@ def _client() -> aioredis.Redis:
     global _redis
     if _redis is None:
         # Pin the DB explicitly so the daily cost counter never silently lands in
-        # DB 0 (which a deploy FLUSHDB would wipe), disabling the budget guardrail.
-        # The ``db`` kwarg overrides any db segment in REDIS_URL.
+        # DB 0 (which a deploy FLUSHDB would wipe), disabling the budget
+        # guardrail. The ``db`` kwarg overrides any db segment in REDIS_URL.
         _redis = aioredis.from_url(
             config.REDIS_URL,
             db=config.ANALYTICS_REDIS_DB,
@@ -309,16 +301,15 @@ def _holds_expiry_key() -> str:
 
 
 def _holds_done_key() -> str:
-    """Hash of reservation ids already charged to the counter (value 0 once
-    settled) -- the ledger that makes a repeated settle idempotent."""
+    """Hash of reservation ids already charged to the counter (value 0 once settled)
+    -- the ledger that makes a repeated settle idempotent."""
     return f"{_day_key()}:holds:done"
 
 
 def _now_ts() -> int:
-    """Current epoch seconds, as the script's clock.
-
-    A module function (not an inline ``time.time()``) so the expiry sweep is
-    testable: tests move the clock forward instead of sleeping."""
+    """Current epoch seconds, as the script's clock. A module function (not an
+    inline ``time.time()``) so the expiry sweep is testable: tests move the clock
+    forward instead of sleeping."""
     return int(time.time())
 
 
@@ -326,7 +317,8 @@ def _to_micros(usd: float) -> int:
     """Convert a USD amount to integer micro-USD for exact counter storage.
 
     This is the single rounding point: the USD value is rounded to the nearest
-    micro-USD here, so callers must not round again before this conversion."""
+    micro-USD here, so callers must not round again before this conversion.
+    """
     return round(usd * _COST_SCALE)
 
 
@@ -365,19 +357,19 @@ async def _run_script(mode: str, amount_micros: int, ids: Sequence[str], new_id:
 async def reserve(estimate_usd: float = 0.0) -> str:
     """Hold ``estimate_usd`` against today's cap and return a reservation id.
 
-    Call this immediately BEFORE a billed LLM call and keep the id until the
-    turn ends: ``settle`` turns the hold into the real cost, ``release`` drops
-    it when the call never happened. A non-positive ``estimate_usd`` falls back
-    to the configured LLM_CALL_RESERVE_USD per-call hold. A hold is floored at
-    one micro-USD: a zero hold would leave the cap's arithmetic unable to trip
-    and silently admit every turn.
+    Call this immediately BEFORE a billed LLM call and keep the id until the turn
+    ends: ``settle`` turns the hold into the real cost, ``release`` drops it when
+    the call never happened. A non-positive ``estimate_usd`` falls back to the
+    configured LLM_CALL_RESERVE_USD per-call hold. A hold is floored at one
+    micro-USD: a zero hold would leave the cap's arithmetic unable to trip and
+    silently admit every turn.
 
-    Returns ``""`` (and touches the store not at all) when the cap is disabled
-    with LLM_DAILY_BUDGET_USD <= 0.
-
-    Raises BudgetExceeded when the hold would pass the cap -- counting today's
-    spend *and* every live hold, so concurrent turns contend for the same
-    budget -- and BudgetUnavailable when the store cannot be reached."""
+    Returns ``""`` (touching the store not at all) when the cap is disabled with
+    LLM_DAILY_BUDGET_USD <= 0. Raises BudgetExceeded when the hold would pass the
+    cap -- counting today's spend *and* every live hold, so concurrent turns
+    contend for the same budget -- and BudgetUnavailable when the store cannot be
+    reached.
+    """
     if config.LLM_DAILY_BUDGET_USD <= 0:
         return ""
     amount = _to_micros(estimate_usd if estimate_usd > 0 else config.LLM_CALL_RESERVE_USD)
@@ -398,20 +390,20 @@ async def settle(reservation_ids: Sequence[str], actual_usd: float) -> None:
     """Drop the given holds and record ``actual_usd`` as today's spend.
 
     This is the only counter write for a turn, and it happens once. ``actual_usd``
-    is the real cost and may exceed what was reserved: already-incurred spend is
-    recorded rather than dropped, which can put the counter over the cap and
-    block the next call -- the correct outcome. A non-positive ``actual_usd``
-    releases the holds without incrementing anything.
+    may exceed what was reserved: already-incurred spend is recorded rather than
+    dropped, which can put the counter over the cap and block the next call --
+    the correct outcome. A non-positive ``actual_usd`` releases the holds without
+    incrementing anything.
 
-    Raises BudgetUnavailable if the store cannot be reached. The holds are then
+    Raises BudgetUnavailable if the store cannot be reached; the holds are then
     left in place (the script never ran), so the turn's cost is neither written
     off nor double counted once Redis returns.
 
-    Settling the same ids again is a no-op: a reservation id is charged once,
-    so a retried or duplicated settle cannot inflate the counter. A hold that
-    lapsed while the turn was still running was already charged its estimate by
-    the sweep, and this call replaces that estimate with the real cost rather
-    than adding to it."""
+    Settling the same ids again is a no-op: a reservation id is charged once, so
+    a retried or duplicated settle cannot inflate the counter. A hold that lapsed
+    while the turn was still running was already charged its estimate by the
+    sweep, and this call replaces that estimate rather than adding to it.
+    """
     ids = [rid for rid in reservation_ids if rid]
     amount = max(0, _to_micros(actual_usd))
     if not ids and amount == 0:
@@ -433,8 +425,9 @@ def to_usd(cost_inr: float) -> float:
     All cost accounting in this project is canonical in USD (the daily budget
     counter, analytics, and stored message costs), so callers convert at the
     recording boundary instead of mixing units. Falls back to a 1.0 rate if
-    INR_PER_USD is unset (and warns once, since that misconfiguration yields
-    wrong costs)."""
+    INR_PER_USD is unset (warning once, since that misconfiguration yields wrong
+    costs).
+    """
     global _inr_fallback_warned
     rate = config.INR_PER_USD
     if not rate:
