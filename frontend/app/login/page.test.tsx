@@ -1,5 +1,5 @@
 /**
- * Issue #247 — the login page must not persist a credential.
+ * The login page must not persist a credential.
  *
  * The backend answers a successful login with an httpOnly cookie and a user
  * object. This pins the client half of that contract: nothing readable is

@@ -125,7 +125,7 @@ module.exports = {
       cwd: path.join(APP_ROOT, "backend"),
       script: "venv/bin/python",
       // 127.0.0.1, not 0.0.0.0: nginx is the only thing that should reach the
-      // API, so the bind must not publish it to every interface (#243).
+      // API, so the bind must not publish it to every interface.
       args: `-m gunicorn -k uvicorn.workers.UvicornWorker --workers ${WORKERS} --bind 127.0.0.1:${API_PORT} --timeout 120 app.main:app`,
       env: {
         NODE_ENV: "production",
@@ -140,7 +140,7 @@ module.exports = {
       cwd: path.join(APP_ROOT, "frontend"),
       script: "node_modules/.bin/next",
       // -H 127.0.0.1 for the same reason: both listeners are reached through
-      // nginx and neither is meant to be reachable off-box (#318).
+      // nginx and neither is meant to be reachable off-box.
       args: `start -H 127.0.0.1 -p ${NEXT_PORT}`,
       env: {
         NODE_ENV: "production",

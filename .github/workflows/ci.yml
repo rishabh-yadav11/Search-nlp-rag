@@ -119,11 +119,8 @@ jobs:
           python -m pip install -r backend/requirements-dev.txt
 
       # Policy: fail the build on ANY advisory. There is no ignore list and no
-      # --ignore-vuln flag. The seven starlette advisories this gate used to
-      # suppress (PYSEC-2026-1943/1941/161/2281/2280/249/248) were reachable
-      # only through the old fastapi==0.115.0 pin, which capped starlette below
-      # 0.39; issue #331 raised fastapi to 0.141.1 and pinned starlette 1.7.0
-      # directly, so every fixed release is reachable and nothing is waived.
+      # --ignore-vuln flag: fastapi and starlette are both pinned exactly in
+      # backend/requirements.txt, so every fixed release is reachable.
       - name: pip-audit (runtime dependencies)
         run: python -m pip_audit -r backend/requirements.txt
       - name: pip-audit (dev dependencies)

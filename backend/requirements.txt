@@ -1,10 +1,8 @@
-# fastapi is pinned together with starlette, and both are exact. starlette was
-# previously an unpinned transitive of fastapi==0.115.0, which capped it below
-# 0.39 and made 7 advisories (PYSEC-2026-1943/1941/161/2281/2280/249/248)
-# unreachable without raising fastapi -- see issue #331. An unpinned transitive
-# would make the fix depend on whatever the resolver happens to pick, so the
-# patched version is pinned here explicitly; the pip-audit gate in
-# .github/workflows/ci.yml now runs with no --ignore-vuln suppressions.
+# fastapi is pinned together with starlette, and both are exact: starlette is
+# not a transitive to be resolved, because an unpinned one would make the fix
+# for its advisories depend on whatever the resolver happens to pick. Pinning
+# it here explicitly is what makes every fixed release reachable, so the
+# pip-audit gate runs with no --ignore-vuln suppressions.
 fastapi==0.141.1
 starlette==1.7.0
 # Pinned directly, not just inherited from starlette: app/chat.py uses a
