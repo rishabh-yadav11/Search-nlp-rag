@@ -1,23 +1,18 @@
 """Cross-encoder reranker benchmark: bge-reranker-base (torch / ONNX fp32 /
 ONNX int8) vs the current ms-marco-MiniLM-L-6-v2 (torch).
 
-Run on the deployment box from `backend/` with the venv python:
+Per backend it measures median latency for a realistic batch of
+RERANK_CANDIDATES pairs and for single pairs under the production thread
+budget (TORCH_THREADS), Spearman rho and top-8 agreement against every other
+backend on the same candidate pairs, and on-disk model size. The question it
+answers: is INT8 dynamic quantization of bge-reranker-base fast enough without
+meaningfully changing top-8 ordering?
+
+Deterministic -- candidates come from a fixed query list, so re-runs are
+comparable. Needs Qdrant reachable (config from backend/.env) and the collection
+populated. Run from `backend/` with the venv python:
 
     ./venv/bin/python scripts/rerank_bench.py
-
-Prerequisites: Qdrant reachable (config from backend/.env), the
-`vccircle_articles` collection populated. Deterministic: candidates are built
-from a fixed query list with a fixed seed, so re-runs are comparable.
-
-Measures, per backend:
-  * latency (median ms) for a realistic batch of RERANK_CANDIDATES pairs and
-    for single pairs, under the same thread budget as production (TORCH_THREADS)
-  * ranking agreement (Spearman rho) and top-8 overlap against every other
-    backend, computed on the exact same candidate pairs
-  * on-disk model size
-
-The point: decide whether INT8 dynamic quantization of bge-reranker-base is
-fast enough without meaningfully changing top-8 ordering.
 """
 import asyncio
 import math
@@ -58,9 +53,7 @@ QUERIES = [
 THREADS = config.TORCH_THREADS
 
 
-# ---------------------------------------------------------------------------
-# backend factories
-# ---------------------------------------------------------------------------
+# --- backend factories ---
 
 def _session(path: str, threads: int):
     import onnxruntime as ort
@@ -117,8 +110,8 @@ def quantize_onnx(fp32_dir: str, tag: str):
         quantizer = ORTQuantizer.from_pretrained(fp32_dir, file_name="model.onnx")
         dqconfig = AutoQuantizationConfig.avx512(is_static=False)
         quantizer.quantize(save_dir=out, quantization_config=dqconfig)
-        # ORTQuantizer writes model_quantized.onnx; normalize the filename so
-        # the same loader works for fp32 and int8 exports.
+        # ORTQuantizer writes model_quantized.onnx; normalize the name so one
+        # loader serves both the fp32 and the int8 export.
         src = os.path.join(out, "model_quantized.onnx")
         if os.path.isfile(src):
             os.replace(src, os.path.join(out, "model.onnx"))
@@ -158,9 +151,7 @@ def dir_mb(path: str) -> float:
     return round(total / 1e6, 1)
 
 
-# ---------------------------------------------------------------------------
-# metrics
-# ---------------------------------------------------------------------------
+# --- metrics ---
 
 def _ranks(vals: list[float]) -> list[float]:
     """Standard competition ranking."""
@@ -196,17 +187,15 @@ def topk_overlap(a: list[float], b: list[float], k: int = 8) -> float:
     return len(sa & sb) / k
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+# --- main ---
 
 def main() -> None:
     print(f"threads={THREADS} queries={len(QUERIES)} candidates={config.RERANK_CANDIDATES}")
     print(f"torch threads env: OMP={os.environ.get('OMP_NUM_THREADS')} MKL={os.environ.get('MKL_NUM_THREADS')}")
 
     # -- build deterministic candidate sets from the live collection ----------
-    # The app state isn't running here, so drive retrieval with a local
-    # client + encoders instead of importing app.state.
+    # app.state is not running here, so retrieval is driven by a local client
+    # and local encoders instead.
     from qdrant_client import AsyncQdrantClient
 
     from app.main import inference_lock
@@ -248,7 +237,7 @@ def main() -> None:
     assert all(len(s) == config.RERANK_CANDIDATES for s in pair_sets), "candidate sets incomplete"
     print(f"candidate sets: {len(pair_sets)} x {config.RERANK_CANDIDATES} pairs")
 
-    # -- build backends --------------------------------------------------------
+    # -- build backends -------------------------------------------------------
     bge_fp32_dir = export_onnx(BGE, "bge_reranker_base_fp32")
     bge_int8_dir = quantize_onnx(bge_fp32_dir, "bge_reranker_base_int8")
     backends = [
@@ -258,7 +247,7 @@ def main() -> None:
         Backend("MiniLM torch", make_torch(MINILM, THREADS), size_mb=0.0),
     ]
 
-    # -- score + latency --------------------------------------------------------
+    # -- score + latency ------------------------------------------------------
     scores = {b.name: [] for b in backends}
     lat_batch: dict[str, list[float]] = {b.name: [] for b in backends}
     lat_single: dict[str, list[float]] = {b.name: [] for b in backends}
@@ -274,7 +263,7 @@ def main() -> None:
                 b.score([p])
             lat_single[b.name].append((time.perf_counter() - t0) * 1000 / len(pairs))
 
-    # -- per-query agreement -----------------------------------------------------
+    # -- per-query agreement --------------------------------------------------
     names = [b.name for b in backends]
     rho = {n: {m: [] for m in names} for n in names}
     ovl = {n: {m: [] for m in names} for n in names}

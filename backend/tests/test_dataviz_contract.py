@@ -1,24 +1,15 @@
-"""The ONE dataviz validator contract, checked across both sides of the wire (#267).
+"""The ONE dataviz validator contract, checked across both sides of the wire.
 
-The server and the browser each decide whether a ``dataviz`` block is valid, and
-the two verdicts must be the same: the server strips a block it calls malformed
-and bills a nudge retry for it, while the browser renders whatever it accepted.
-When they disagreed, a streamed chart vanished on reload, and a value-less or
-half-numeric block was billed a retry that could never help.
+The server and the browser each decide whether a ``dataviz`` block is valid, so
+one fixture corpus runs through BOTH implementations -- the backend's
+``parse_dataviz`` in-process, and the frontend's ``parseDataViz`` executed under
+node -- and they must agree on the verdict, the value column, every coerced
+cell, and the matched fence span.
 
-So this test runs ONE fixture corpus (fixtures/dataviz_corpus.json) through
-BOTH implementations — the backend's ``parse_dataviz`` in-process, and the
-frontend's real ``parseDataViz`` executed under node by importing
-frontend/app/chat/datavizContract.ts — and fails if they accept different
-fixtures, pick a different value column, coerce a cell to a different number, or
-match a different span of the answer.
-
-Running the frontend half needs a node that can import a ``.ts`` file, which is
-node 22.6+ (the built-in TypeScript support, unflagged from 22.18). The
-frontend itself still builds on node 18+, so that remains the documented
-requirement for the app; only this one test needs the newer node. Because this
-module is the only coverage of the browser-side validator, a node that cannot
-run it is a FAILURE under CI and a skip locally, never a silent pass.
+Running the frontend half needs a node that can import a ``.ts`` file (built-in
+TypeScript support, unflagged from 22.18). Because this module is the only
+coverage of the browser-side validator, a node that cannot run it is a FAILURE
+under CI and a skip locally, never a silent pass.
 """
 
 import json
@@ -61,9 +52,9 @@ def _node_version(executable: str) -> tuple[int, ...] | None:
 
 
 def _plotted_values(data):
-    """The numbers a chart would plot, in row order: every non-missing cell of
-    the value column, coerced. Mirrors the harness so the two sides are compared
-    on the values they would actually draw, not merely on accept/reject."""
+    """Every non-missing cell of the value column, coerced, in row order --
+    mirroring the harness so the sides are compared on the values they would
+    draw, not merely on accept/reject."""
     vc = data.get("value_column")
     if vc is None:
         return []
@@ -95,11 +86,9 @@ def _utf16_units(text: str, index: int) -> int:
     """``index`` (a Python codepoint offset) as a UTF-16 code-unit offset.
 
     JavaScript string indices count UTF-16 code units, so a character outside
-    the BMP -- an emoji, say -- counts as TWO there and as ONE here. Comparing
-    the two spans without this conversion fabricates a divergence on any text
-    carrying a supplementary character, even though both sides captured the same
-    payload and agreed on the verdict. surrogatepass so a stray surrogate in a
-    fixture cannot make this helper raise."""
+    the BMP -- an emoji, say -- counts as TWO there and as ONE here; without this
+    conversion any text carrying one fabricates a span divergence. surrogatepass
+    so a stray surrogate in a fixture cannot make this helper raise."""
     return len(text[:index].encode("utf-16-le", "surrogatepass")) // 2
 
 
@@ -113,9 +102,8 @@ def frontend(corpus):
     """The shipped frontend validator's verdicts, by actually running it.
 
     A node too old to import a .ts module is treated exactly like a missing one:
-    a failure under CI, a skip locally. A developer on node 18 should not be
-    told their backend is broken, but CI must not quietly lose the only coverage
-    of the browser-side validator."""
+    a failure under CI, a skip locally, so a developer on node 18 is not told
+    their backend is broken while CI still keeps the only browser-side coverage."""
     node = shutil.which("node")
     unusable = None
     if node is None:
@@ -134,8 +122,8 @@ def frontend(corpus):
         if os.environ.get("CI"):
             pytest.fail(message + " Install a new enough node in CI rather than letting the suite pass without it.")
         pytest.skip(message)
-    # The flag is what opts 22.6-22.17 into type stripping; newer node accepts it
-    # as a no-op, so it is always safe to pass and avoids a second version branch.
+    # --experimental-strip-types opts 22.6-22.17 into type stripping; newer node
+    # takes it as a no-op, so it is always safe to pass.
     proc = subprocess.run(
         [node, "--experimental-strip-types", str(HARNESS_PATH), str(CONTRACT_TS_PATH), str(CORPUS_PATH)],
         capture_output=True,
@@ -152,21 +140,16 @@ def frontend(corpus):
 def test_node_probe_rejects_versions_that_cannot_import_typescript():
     """The gate is the version, not merely `which node`.
 
-    The repo documents node 18+ for the app, and a node 18 or 20 box WOULD pass a
-    `shutil.which` check and then die inside the harness on an unknown .ts
-    extension — turning the whole backend suite red with a raw subprocess error
-    instead of a clean, explanatory skip. Pinning the minimum here keeps that
-    path honest, and is the reason the harness also passes
-    --experimental-strip-types: node 22.6-22.17 needs the flag to strip types,
-    while 22.18+ and every 23.x/24.x accept it as a no-op."""
+    A node 18 or 20 box passes a `shutil.which` check and then dies inside the
+    harness on an unknown .ts extension — turning the whole backend suite red
+    with a raw subprocess error instead of a clean, explanatory skip."""
     assert MIN_NODE == (22, 6)
     assert _node_version("definitely-not-a-real-node-binary") is None
 
 
 def test_frontend_and_backend_agree_on_every_fixture(corpus, frontend):
-    """The acceptance item: one corpus, both implementations, no fixture where
-    they disagree. Each side's verdict, chosen value column and coerced plot
-    values must match the other's."""
+    """One corpus, both implementations, no fixture where the verdict, the
+    chosen value column or the coerced plot values differ."""
     disagreements = []
     for fixture in corpus["fixtures"]:
         py = _python_verdict(fixture["text"])
@@ -203,9 +186,9 @@ def test_every_fixture_has_the_verdict_both_sides_agree_on(corpus, frontend):
 
 
 def test_fixture_names_are_unique(corpus):
-    """The harness keys its results by fixture name, so two fixtures sharing one
-    would leave the first shadowed -- its verdict compared against the second's --
-    and a real disagreement on it would never be looked at."""
+    """The harness keys its results by fixture name, so a shared name leaves the
+    first shadowed -- its verdict compared against the second's -- and a real
+    disagreement on it would never be looked at."""
     seen, duplicates = set(), []
     for fixture in corpus["fixtures"]:
         if fixture["name"] in seen:
@@ -256,15 +239,13 @@ def test_deeply_nested_payload_is_dropped_not_raised():
 
 
 def test_view_pinning_applies_the_same_load_rules():
-    """The view-pinning path re-loads the block itself, and that second load used
-    to be laxer than parse_dataviz's: it let a block through that the
-    re-validation below then rejected, so _apply_requested_view returned it
-    unpinned and a user who asked for a bar chart quietly lost the chart."""
+    """The view-pinning path re-loads the block itself, and that second load must
+    apply the same rules as parse_dataviz: laxer, it returns a block unpinned and
+    a user who asked for a bar chart quietly loses the chart."""
     payload = '{"columns": ["A", "B"], "rows": [["x", 1e999]], "value_column": 1}'
     assert chat_module._parse_dataviz_with_view(f"```dataviz\n{payload}\n```", "bar") is None
     bare = '{"columns": ["A", "B"], "rows": [["x", 1]], "value_column": 1, "note": Infinity}'
     assert chat_module._parse_dataviz_with_view(f"```dataviz\n{bare}\n```", "table") is None
-    # and a well-formed block is still pinned
     good = '{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}'
     pinned = chat_module._parse_dataviz_with_view(f"```dataviz\n{good}\n```", "bar")
     assert pinned is not None and pinned["view"] == "bar"
@@ -278,14 +259,14 @@ def test_fence_grammar_is_one_string_on_both_sides(frontend):
 
 def test_numeric_literal_grammar_is_one_string_on_both_sides(frontend):
     """A cell is a stated number only when the WHOLE cell is a plain numeric
-    literal. The pattern is shared as a string so the frontend's Number() and
-    the backend's float() cannot drift into accepting different spellings."""
+    literal; the pattern is shared as a string so the frontend's Number() and the
+    backend's float() cannot drift into accepting different spellings."""
     assert frontend["numeric_literal_src"] == chat_module._NUMERIC_LITERAL_SRC
 
 
 def test_trim_grammar_is_one_string_on_both_sides(frontend):
     """The trim set is shared as a string, so the character class behind the
-    per-codepoint probe above can only be changed in both places at once."""
+    per-codepoint probe below can only be changed in both places at once."""
     assert frontend["trim_src"] == chat_module._TRIM_SRC
 
 
@@ -300,11 +281,10 @@ def test_both_sides_trim_the_same_whitespace(frontend):
     """Which characters get trimmed off a cell, checked one codepoint at a time.
 
     The two languages disagree here and a string comparison cannot see it:
-    JavaScript's trim() removes U+FEFF and Python's str.strip() does not, so a
-    cell carrying a BOM read as "missing" in the browser and as a real value on
-    the server. Both sides now name ASCII whitespace explicitly, and this pins
-    every character either side might have an opinion about -- including the
-    ones that must NOT be trimmed."""
+    JavaScript's trim() removes U+FEFF and Python's str.strip() does not, so both
+    sides name ASCII whitespace explicitly, and this pins every character either
+    side might have an opinion about -- including the ones that must NOT be
+    trimmed."""
     mismatched = [
         f"U+{cp.upper()}: backend trims={backend_trims} frontend trims={frontend['trim_probes'].get(cp)}"
         for cp, backend_trims in sorted(chat_module._TRIM_PROBES.items())
@@ -323,11 +303,12 @@ def test_missing_value_tokens_are_identical_on_both_sides(corpus, frontend):
 
 def test_corpus_exercises_every_missing_value_token(corpus):
     """Each token gets a fixture whose ROWS ACTUALLY CONTAIN IT, and both sides
-    read that fixture. A fixture merely *named* after a token would let a token
-    be declared in all three lists while nothing tested it, which is the silent
-    drift this whole corpus exists to prevent; so the token is looked for in the
-    parsed cells, and dropping the token from either list flips the verdict of
-    its own fixture."""
+    read that fixture.
+
+    A fixture merely *named* after a token would let a token be declared in all
+    three lists while nothing tested it, which is the silent drift this whole
+    corpus exists to prevent; so the token is looked for in the parsed cells, and
+    dropping the token from either list flips the verdict of its own fixture."""
     by_name = {f["name"]: f["text"] for f in corpus["fixtures"]}
     problems = []
     for tok in chat_module._MISSING_VALUE_TOKENS:

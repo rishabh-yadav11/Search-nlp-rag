@@ -1,18 +1,13 @@
 """Log-volume policy for the Redis-backed user profile helpers.
 
-Every helper in :mod:`app.user_profile` keeps serving (cold start, empty list)
-when its backing store is unreachable, so the log line is the only signal an
-operator gets. The policy is one WARNING for an outage, one WARNING
+Every helper keeps serving when its backing store is unreachable, so the log
+line is the only signal an operator gets: one WARNING per outage, one WARNING
 "recovered" when it ends, and a re-armed latch so a later outage is announced
-again -- rate-limited against the clock, because transitions alone are not a
-volume bound: a helper that fails every other call would otherwise turn one
-Redis outage into two lines per request. So an outage arriving inside
+again. Those lines are rate-limited against the clock -- an outage within
 :data:`app.degraded.REANNOUNCE_SECONDS` of the previous line is suppressed by
-design, and a test that wants a second outage announced has to move the
-injected clock past that window, which is what the transitions below do.
-Both lines are WARNING, not INFO: the root logger keeps Python's default
-level under gunicorn/uvicorn, so a quieter record would never reach PM2. They
-assert only on emitted records, never on the latch's internal state.
+design -- so a second outage has to move the injected clock past that window.
+Both lines are WARNING because the root logger keeps Python's default level
+under gunicorn/uvicorn, so a quieter record would never reach PM2.
 """
 import logging
 from datetime import UTC, datetime
@@ -27,9 +22,8 @@ from app.degraded import REANNOUNCE_SECONDS, DegradedLatch
 class _LatchClock:
     """Callable stand-in for ``time.monotonic`` that moves only when told.
 
-    The latches rate-limit their lines against the clock, so a test driving two
-    outages has to decide whether they are seconds or minutes apart.
-    Injecting the clock makes that explicit and keeps the tests from sleeping.
+    Injecting the clock keeps the tests from sleeping and makes it explicit
+    whether two outages are seconds or minutes apart.
     """
 
     def __init__(self, now: float = 0.0) -> None:
@@ -88,8 +82,7 @@ class _WorkingPipe:
         return 1
 
     def zscore(self, *_args, **_kwargs):
-        # None == this article has not been interacted with, so a write mints a
-        # new key rather than rewriting an existing one.
+        # None means no prior interaction, so a write mints a new key.
         return None
 
     async def execute(self):
@@ -105,9 +98,7 @@ class _WorkingRedis:
     async def delete(self, *_args, **_kwargs):
         return 1
 
-    # ``_ensure_trending_index`` asks whether the index is already seeded.
-    # Without this the "working" fake raises AttributeError, the caller takes
-    # its degraded path, and a healthy call is misreported as an outage.
+    # ``_ensure_trending_index`` probes with ``exists``; without it a healthy call reads as an outage.
     async def exists(self, *_args, **_kwargs):
         return False
 
@@ -130,10 +121,9 @@ class _WorkingRedis:
 class _StoredVectorRedis(_WorkingRedis):
     """Working Redis that also serves a cached profile vector.
 
-    ``get_user_profile_vector`` only treats a value as a success if one is
-    stored: a missing key delegates to ``build_user_profile``, which returns
-    None and logs on a *different* latch. Serving a real vector is what makes
-    the recovery land on the reader's own latch.
+    Only a stored value counts as a success for ``get_user_profile_vector``: a
+    missing key delegates to ``build_user_profile``, which logs on its own
+    latch and would leave this one unrecovered.
     """
 
     async def get(self, *_args, **_kwargs):
@@ -143,10 +133,9 @@ class _StoredVectorRedis(_WorkingRedis):
 class _KnownArticleRedis(_WorkingRedis):
     """Working Redis that also confirms the article exists.
 
-    ``record_interaction`` confirms the article is indexed before writing (#271),
-    and a missing confirmation falls through to Qdrant. Serving the cached
-    confirmation keeps the write path -- the path these tests exercise -- the
-    one that runs.
+    ``record_interaction`` confirms the article is indexed before writing, and a
+    missing confirmation falls through to Qdrant; serving the cached
+    confirmation keeps the write path the one these tests exercise.
     """
 
     async def get(self, *_args, **_kwargs):
@@ -157,9 +146,9 @@ class _RecordingPipe(_WorkingPipe):
     """Pipeline reporting a slot available and a fresh article counter.
 
     ``_has_interaction_slot`` unpacks two results and ``record_interaction``
-    reads ``results[0]`` as the HINCRBY post-value, so a bare empty list
-    cannot walk the write path at all. ``(1, None)`` means "under the cap, no
-    prior interaction" for the first and a brand-new counter for the second.
+    reads ``results[0]`` as the HINCRBY post-value, so a bare empty list cannot
+    walk the write path at all; ``(1, None)`` means "under the cap, no prior
+    interaction" plus a brand-new counter.
     """
 
     async def execute(self):
@@ -176,10 +165,9 @@ class _RecordableRedis(_KnownArticleRedis):
 class _BrokenWriteRedis(_RecordableRedis):
     """Lets the interaction be *attempted*, then fails the write itself.
 
-    Both the article confirmation and the slot check have to succeed for the
-    write to be reached, and both are Redis round trips. Failing the shared
-    pipeline instead would fail the slot check too and report a different
-    failure than the one under test.
+    The article confirmation and the slot check must both succeed to reach the
+    write, and both are Redis round trips: failing the shared pipeline instead
+    would fail the slot check too and report a different failure.
     """
 
     def __init__(self):
@@ -205,8 +193,7 @@ class _BrokenWriteRedis(_RecordableRedis):
         return 1
 
     async def execute(self):
-        # First pipeline is the slot check, which must pass; the second is the
-        # interaction write, which is what is down.
+        # The first pipeline is the slot check, which must pass; the second is the write, which is down.
         if self.queued == 1:
             return [1, None]
         raise ConnectionError("profile redis unavailable")
@@ -215,9 +202,9 @@ class _BrokenWriteRedis(_RecordableRedis):
 class _InteractingRedis(_WorkingRedis):
     """Working Redis that reports one stored interaction.
 
-    ``build_user_profile`` returns early -- logging a recovery, never a
-    failure -- when there are no interactions, so its own failure path is
-    only reachable once there is something to build a profile from.
+    ``build_user_profile`` returns early -- logging a recovery, never a failure
+    -- when there are no interactions, so its failure path is only reachable
+    once there is a profile to build.
     """
 
     async def zrevrange(self, *_args, **_kwargs):
@@ -294,7 +281,7 @@ def _levels(caplog):
 async def test_outage_recovers_then_fails_again_logs_both_outages(
     monkeypatch, profile_logs, clock
 ):
-    """A recovered outage must not silence the next one. Acceptance case."""
+    """A recovered outage must not silence the next one."""
     _fresh_latches(monkeypatch, clock)
     user_id = "user-acceptance"
 
@@ -304,8 +291,7 @@ async def test_outage_recovers_then_fails_again_logs_both_outages(
     _use_redis(monkeypatch, _WorkingRedis())
     assert await user_profile.get_user_interactions(user_id) == []
 
-    # Two incidents minutes apart, not one flap: the window has to pass, or the
-    # second outage is suppressed and only two lines are correct.
+    # Two incidents minutes apart, not one flap: the window has to pass.
     clock.advance(REANNOUNCE_SECONDS + 1)
     _use_redis(monkeypatch, _BrokenRedis())
     assert await user_profile.get_user_interactions(user_id) == []
@@ -406,9 +392,8 @@ async def test_profile_vector_reader_rearms_after_recovery(
 ):
     """get_user_profile_vector's own latch announces both outages.
 
-    A stored vector is what counts as a success here; a missing key delegates
-    to build_user_profile, which logs on its own latch and would leave this
-    one unrecovered.
+    Only a stored vector counts as a success here; a missing key delegates to
+    build_user_profile, which logs on its own latch.
     """
     _fresh_latches(monkeypatch, clock)
     user_id = "user-profile-vector"
@@ -435,10 +420,9 @@ async def test_profile_vector_reader_rearms_after_recovery(
 async def test_profile_builder_rearms_after_recovery(monkeypatch, profile_logs, clock):
     """build_user_profile's own latch announces both outages.
 
-    A Redis outage cannot reach this latch: it is absorbed by
-    get_user_interactions, which has one of its own. The failure this helper
-    can actually see is the article lookup it makes after the interactions, so
-    that is what is driven up and down here.
+    A Redis outage cannot reach this latch -- it is absorbed by
+    get_user_interactions, which has one of its own -- so what is driven up and
+    down here is the article lookup the helper makes afterwards.
     """
     _fresh_latches(monkeypatch, clock)
     qdrant = _BrokenQdrant()
@@ -496,8 +480,7 @@ async def test_trending_reader_rearms_after_recovery(monkeypatch, profile_logs, 
     _use_redis(monkeypatch, _BrokenRedis())
     assert await user_profile.get_trending_articles() == []
 
-    # A scan that returns no keys is a clean, successful window with nothing
-    # trending, which is what lets the recovery land on this latch.
+    # An empty scan is a clean window, which is what lets the recovery land here.
     _use_redis(monkeypatch, _WorkingRedis())
     assert await user_profile.get_trending_articles() == []
 

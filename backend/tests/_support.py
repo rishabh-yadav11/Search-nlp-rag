@@ -1,10 +1,4 @@
-"""Test helpers that used to be copy-pasted into individual test modules.
-
-The coroutine runner, the article factory and the ``HybridCache`` stand-in each
-existed in several test files with signatures that had drifted apart. They live
-here once; every difference between the old copies is an explicit argument, so
-a test file states the shape it needs instead of carrying a private version of
-the helper.
+"""Shared test helpers: the coroutine runner, article factory and cache stand-in.
 
 Not named ``_common``: that module is ``backend/scripts/_common.py``, imported as
 a top-level module by several tests, and ``backend/tests`` is on ``sys.path``.
@@ -27,7 +21,7 @@ __all__ = [
 #: "No value configured" -- distinct from ``None``, which is a legitimate value.
 MISSING = object()
 
-#: "Build this field from the article id" (the per-file default of most copies).
+#: "Build this field from the article id" -- ``make_article``'s default.
 DERIVE = object()
 
 #: "Leave this field out of the constructor" so the model's own default applies.
@@ -51,10 +45,10 @@ def make_article(
 ) -> SourceArticle:
     """Build a ``SourceArticle`` for a test.
 
-    ``title``, ``url`` and ``summary`` are built from ``id_`` when they are left
-    at :data:`DERIVE`; pass :data:`OMIT` to keep the field out of the
-    constructor so the model default applies, or a value to use it verbatim.
-    Every other keyword is passed straight through to ``SourceArticle``.
+    ``title``, ``url`` and ``summary`` derive from ``id_`` at the default
+    :data:`DERIVE`; pass :data:`OMIT` to keep the field out of the constructor
+    so the model default applies, or a value to use it verbatim. Every other
+    keyword is passed straight through to ``SourceArticle``.
     """
     if title is DERIVE:
         title = f"Title {id_}"
@@ -74,10 +68,9 @@ def make_article(
 class FakeCache:
     """In-memory stand-in for the ``HybridCache`` the pipeline retrieves through.
 
-    ``get()`` raises ``get_error`` when one is set, otherwise returns
-    ``get_result`` when one is configured, otherwise the value in ``store``.
-    Every key read is appended to ``gets``; every write to ``sets`` as a
-    ``(key, value, ttl)`` triple, so a test can assert the TTL a write carried.
+    ``get()`` raises ``get_error`` when set, else returns ``get_result`` when
+    configured, else the value in ``store``. Reads append to ``gets``, writes to
+    ``sets`` as a ``(key, value, ttl)`` triple.
     """
 
     def __init__(self, get_result: Any = MISSING, get_error: Exception | None = None) -> None:
@@ -96,9 +89,8 @@ class FakeCache:
         return self.store.get(key)
 
     async def get_many(self, keys):
-        """Mirrors ``HybridCache.get_many``: positional results, one per key,
-        each read through ``get()`` so ``gets`` and the fixed ``get_result``
-        still apply to every key in the batch."""
+        """As ``HybridCache.get_many``, reading through ``get()`` so ``gets`` and
+        ``get_result`` apply to every key in the batch."""
         return [await self.get(key) for key in keys]
 
     async def set(self, key, value, ttl=None):

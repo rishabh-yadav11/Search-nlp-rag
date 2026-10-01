@@ -14,20 +14,16 @@ from app.config import config
 def _shipped_weak_gate(monkeypatch):
     """Pin the two answerability knobs for this module.
 
-    They are deployment settings now (#300), so on a machine whose .env
-    retunes them every assertion below would be deciding something other than
-    what it looks like it is deciding. Pinned here rather than read from
-    `config` so the constants in the assertions mean what they say.
+    They are deployment settings, so a machine whose .env retunes them would
+    make every assertion below decide something other than what it looks like.
     """
     monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.3)
     monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", 3)
 
 
 def test_weak_result_knobs_ship_the_values_the_pre_knob_constants_had(parse_config):
-    """Issue #300 moved the answerability gate out of answer_fallback.py's
-    module scope into config. Parsed from a clean environment, the knobs must
-    still be exactly the literals that lived there (0.3 and 3), or every
-    answerability decision moves the moment the change lands."""
+    """The answerability gate is a config knob; parsed from a clean environment
+    it must still default to the values the module used to hardcode (0.3 and 3)."""
     shipped = parse_config()
     assert shipped.WEAK_RESULT_SCORE == 0.3
     assert shipped.WEAK_RESULT_MIN_STRONG == 3
@@ -57,17 +53,14 @@ def test_weak_result_min_strong_knob_moves_the_answerability_decision(monkeypatc
     assert results_are_weak(scores) is True
     monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", 2)
     assert results_are_weak(scores) is False
-    # An explicit limit still wins over the knob. No production caller passes
-    # one (chat and the /search note both take the default), so this only
-    # pins that the parameter still overrides.
+    # No production caller passes an explicit limit, so this only pins that the
+    # parameter still overrides the knob.
     assert results_are_weak(scores, limit=3) is True
 
 
 def test_weak_result_min_strong_cannot_open_the_gate(monkeypatch):
-    """The count is floored at 1: a knob of 0 or less must not turn
-    "is this list weak?" into a permanent no. An unclamped env value reaching
-    `min(0, len(scores))` would silence every weak-result note and every chat
-    refusal."""
+    """The count is floored at 1: an unclamped env value reaching
+    ``min(0, len(scores))`` would silence every weak-result note and chat refusal."""
     for nonsense in (0, -1):
         monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", nonsense)
         assert results_are_weak([0.01, 0.01]) is True
@@ -93,8 +86,7 @@ def test_results_are_weak_empty_list():
 
 def test_results_are_weak_few_strong_matches_not_weak():
     """A topic with only 1-2 strong matches must not be suppressed: the corpus
-    may simply have few articles on it (regression: niche queries were refused
-    even when retrieval found a solid match)."""
+    may simply have few articles on it."""
     assert results_are_weak([0.5, 0.9]) is False
     assert results_are_weak([0.761, 0.457]) is False
     assert results_are_weak([0.5]) is False
@@ -182,20 +174,16 @@ def test_date_label_month_and_year():
 
 def test_date_label_impossible_month_returns_none_instead_of_raising():
     """An out-of-range month must fall back to None like any other window that
-    isn't a plain month/year. Regression: the except clause named
-    calendar.IllegalYearError, which does not exist, so evaluating the except
-    tuple itself raised AttributeError (issue #169)."""
+    isn't a plain month/year."""
     assert date_label("2025-13-01", "2025-12-31") is None
     assert date_label("2025-00-01", "2025-12-31") is None
     assert date_label("2025-99-01", "2025-99-31") is None
 
 
 def test_date_label_out_of_range_year_is_normalized_not_raised():
-    """An out-of-range year (0000) is normalized by calendar, not rejected:
-    calendar.monthrange(0, 1) succeeds, so date_label never raises here. The
-    zero-padded window still yields None because to_date is compared against
-    the int year ('0-01-31'); the matching unpadded window labels as
-    'January 0'. Regression guard for issue #169: no IllegalYearError exists."""
+    """An out-of-range year is normalized by calendar, not rejected:
+    ``calendar.monthrange(0, 1)`` succeeds. The zero-padded window still yields
+    None because ``to_date`` is compared against the int year."""
     assert date_label("0000-01-01", "0000-01-31") is None
     assert date_label("0000-01-01", "0-01-31") == "January 0"
 

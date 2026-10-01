@@ -60,7 +60,7 @@ def test_expand_returns_query_unchanged_when_no_term_fits_token_budget(monkeypat
 
 def test_expand_does_not_trigger_on_substring_inside_words():
     """Short triggers ('ai'/'ml'/'ev') must match on word boundaries, not as
-    substrings of unrelated words like email/small/every."""
+    substrings of unrelated words."""
     assert expand_query("send me an email") == "send me an email"
     assert expand_query("a small business") == "a small business"
     assert expand_query("every weekend deal") == "every weekend deal"

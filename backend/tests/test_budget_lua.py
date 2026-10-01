@@ -1,18 +1,13 @@
 """Runs the REAL ``_BUDGET_LUA`` source under lua5.1.
 
-``test_cost_budget.py`` exercises the Python side of the spend cap against
-``FakeBudgetStore``, which is only a *model* of what the server executes. If
-the shipped Lua drifted from that model -- a renamed key, an inverted
-condition, a missing write -- every Python test would still pass and the cap
-would quietly stop capping. So the actual script text is written to disk, a
-small harness binds ``KEYS``/``ARGV`` as Redis binds them over an in-memory
-stub of the primitives the script uses, and the same scenarios are asserted
-against the real thing.
+``test_cost_budget.py`` exercises the Python side against ``FakeBudgetStore``,
+which is only a *model* of what the server runs, so a drift between the two
+would leave every Python test green while the cap quietly stopped capping. The
+real script text is therefore written to disk and bound to an in-memory stub of
+the Redis primitives it calls, and the same scenarios are asserted against it.
 
-One scenario per invocation (``lua5.1 harness.lua <name>``) so a failure names
-itself, and every check prints the scenario it belongs to. Skipped, loudly,
-where lua5.1 is unavailable (CI without it must not fail; it must also not
-pretend to have covered the script).
+One scenario per invocation so a failure names itself. Skipped, loudly, where
+lua5.1 is unavailable.
 """
 
 import re
@@ -30,10 +25,8 @@ pytestmark = pytest.mark.skipif(
     LUA is None, reason="lua5.1 not available; the shipped Lua script is not executed"
 )
 
-# The stub implements only what _BUDGET_LUA calls, and fails loudly on
-# anything else so an unexpected new command shows up as an error rather than
-# as a silently missing write. GET/HGET return a number-as-string and `false`
-# for a missing hash field, exactly as a Redis reply reaches Lua.
+# The stub implements only what _BUDGET_LUA calls and fails loudly on anything
+# else, so an unexpected new command shows up as an error, not a missing write.
 HARNESS = """
 local SCENARIO = arg[1]
 local SCRIPT = assert(loadfile('budget.lua'))
@@ -396,8 +389,8 @@ SCENARIOS = [
 
 @pytest.fixture(scope="module")
 def harness(tmp_path_factory):
-    """The shipped Lua text plus the harness, written next to each other so the
-    harness can loadfile() the script exactly as Redis would receive it."""
+    """The shipped Lua text plus the harness, side by side so the harness can
+    loadfile() the script exactly as Redis would receive it."""
     workdir = tmp_path_factory.mktemp("budget_lua")
     (workdir / "budget.lua").write_text(cost_budget._BUDGET_LUA, encoding="utf-8")
     (workdir / "harness.lua").write_text(textwrap.dedent(HARNESS).lstrip(), encoding="utf-8")
@@ -406,8 +399,7 @@ def harness(tmp_path_factory):
 
 @pytest.mark.parametrize("scenario", SCENARIOS)
 def test_budget_lua_scenario(harness, scenario):
-    """One scenario against the real script; the harness prints the name of any
-    individual check that failed."""
+    """One scenario against the real script; the harness prints the failing check."""
     proc = subprocess.run(
         [LUA, "harness.lua", scenario],
         cwd=harness,
@@ -420,7 +412,6 @@ def test_budget_lua_scenario(harness, scenario):
 
 
 def test_harness_defines_every_scenario_pytest_runs():
-    """Guard the two lists against drifting apart: a scenario in SCENARIOS but
-    missing from the Lua would fail on a Lua assert, and one defined in the Lua
-    but missing from SCENARIOS would never run at all -- silently."""
+    """Guard the two lists against drifting apart: a scenario defined in the Lua
+    but missing from SCENARIOS would never run at all, silently."""
     assert set(re.findall(r"^function S\.(\w+)\(\)", HARNESS, re.MULTILINE)) == set(SCENARIOS)

@@ -18,12 +18,10 @@ def build_messages(prompt: str, system_prompt: str | None = None) -> list[dict]:
     """Chat messages for one turn, with the system prompt in its own role.
 
     The system prompt must travel as a real ``system`` message: the OpenAI chat
-    completions API (openai==1.68.2 ``ChatCompletionSystemMessageParam``) treats
-    it as the instruction channel, whereas sending it as a ``user`` message
-    leaves it indistinguishable from the untrusted article and conversation text
-    sharing that role, so attacker-supplied text can read as an instruction
-    (#248). ``system_prompt`` is optional, so a caller with no system text still
-    sends a single user message.
+    completions API treats it as the instruction channel, whereas sending it as a
+    ``user`` message leaves it indistinguishable from the untrusted article and
+    conversation text sharing that role, so attacker-supplied text can read as an
+    instruction.
     """
     messages: list[dict] = []
     if system_prompt:
@@ -35,12 +33,11 @@ def build_messages(prompt: str, system_prompt: str | None = None) -> list[dict]:
 class LLMUnavailableError(Exception):
     """Raised when the LLM cannot be reached, after retries are exhausted.
 
-    ``attempts`` is how many requests were actually sent to the provider. The
-    provider bills the prompt of every attempt, retry or not, so a caller that
-    charges for a failed call needs the count and not just the fact of failure:
-    an outage that burned every retry cost several times a single failed
-    request, while zero attempts means the request was never sent and cost
-    nothing at all (#280).
+    ``attempts`` is how many requests were actually sent. The provider bills the
+    prompt of every attempt, retry or not, so a caller charging for a failed call
+    needs the count and not just the fact of failure: an outage that burned every
+    retry cost several times a single failed request, while zero attempts means the
+    request was never sent and cost nothing.
     """
 
     def __init__(self, message: str = "LLM temporarily unavailable", attempts: int = 1):
@@ -97,9 +94,9 @@ def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
     if isinstance(exc, openai.APIStatusError):
-        # Retry only transient failures: 5xx server errors and rate-limit (429).
-        # Do NOT retry 4xx client errors (e.g. 400 invalid request) — they won't
-        # succeed on retry and would just burn attempts/budget.
+        # Retry only transient failures: 5xx server errors and rate limits (429). A 4xx
+        # client error (e.g. 400 invalid request) will not succeed on retry and would
+        # only burn attempts and budget.
         return exc.status_code is not None and (exc.status_code >= 500 or exc.status_code == 429)
     return False
 
@@ -107,10 +104,9 @@ def _is_retryable(exc: Exception) -> bool:
 async def generate_answer(llm_client, prompt: str, model: str, system_prompt: str | None = None) -> LLMResult:
     """Call the LLM with a timeout and retries on transient errors.
 
-    Retries exponential backoff (LLM_RETRY_BACKOFF * 2^attempt) up to
-    LLM_MAX_RETRIES. Raises LLMUnavailableError (wrapping the last error)
-    after retries are exhausted, so callers never surface raw SDK errors.
-    Returns an LLMResult with the answer text and token usage.
+    Retries exponential backoff (LLM_RETRY_BACKOFF * 2^attempt) up to LLM_MAX_RETRIES,
+    then raises LLMUnavailableError wrapping the last error, so callers never surface
+    raw SDK errors. Returns an LLMResult with the answer text and token usage.
     """
     last_error = None
     for attempt in range(config.LLM_MAX_RETRIES + 1):
@@ -149,8 +145,8 @@ async def generate_answer(llm_client, prompt: str, model: str, system_prompt: st
                 delay,
             )
             await asyncio.sleep(delay)
-    # The loop ran zero times (LLM_MAX_RETRIES < 0), so no request was ever
-    # sent and nothing was billed (#280).
+    # The loop ran zero times (LLM_MAX_RETRIES < 0): no request was sent, so nothing
+    # was billed.
     raise LLMUnavailableError(attempts=0) from last_error
 
 
@@ -163,12 +159,10 @@ async def stream_answer(
 ):
     """Yield answer text chunks as they arrive from the LLM.
 
-    Same retry policy as generate_answer, but only retries when the stream
-    fails before yielding any content (a mid-stream failure would otherwise
-    duplicate already-sent text). Each item yielded is a string chunk; the
-    caller reassembles the full answer. When usage_holder is provided (a
-    single-element list), it is filled with the final LLMResult after the
-    stream completes. Raises LLMUnavailableError after retries are exhausted.
+    Same retry policy as generate_answer, but only retries when the stream fails before
+    yielding any content (a mid-stream failure would duplicate already-sent text).
+    ``usage_holder``, when given a single-element list, receives the final LLMResult
+    after the stream completes. Raises LLMUnavailableError after retries are exhausted.
     """
     last_error = None
     for attempt in range(config.LLM_MAX_RETRIES + 1):
@@ -220,6 +214,6 @@ async def stream_answer(
                 delay,
             )
             await asyncio.sleep(delay)
-    # The loop ran zero times (LLM_MAX_RETRIES < 0): no request was sent, so
-    # nothing was billed (#280).
+    # The loop ran zero times (LLM_MAX_RETRIES < 0): no request was sent, so nothing
+    # was billed.
     raise LLMUnavailableError(attempts=0) from last_error

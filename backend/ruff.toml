@@ -2,11 +2,11 @@ line-length = 120
 target-version = "py311"
 
 [lint.per-file-ignores]
-# Pragmatic baseline for this codebase:
-#   BLE001  - broad except in resilient boundary code (cache/health/analytics/indexers) is intentional
-#   ASYNC230- blocking file IO in async CLI scripts is fine (single-threaded, non-server)
+# Pragmatic baseline; each ignore is a deliberate choice, not a leftover:
+#   BLE001  - broad except is intentional in resilient boundary code (cache/health/analytics/indexers)
+#   ASYNC230- blocking file IO is fine in single-threaded async CLI scripts
 #   SIM115  - flock lock files are deliberately not context-managed
-#   FURB162 - explicit timezone normalization is clearer than relying on fromisoformat
+#   FURB162 - explicit timezone normalization is clearer than fromisoformat
 "app/health.py" = ["BLE001"]
 "app/redis_cache.py" = ["BLE001"]
 "app/analytics.py" = ["BLE001"]

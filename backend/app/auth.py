@@ -1,38 +1,16 @@
 """Session-cookie + RBAC authentication for the API.
 
-Signup issues no cookie and always answers the same thing (see the endpoint);
-login issues an opaque token (hashed with SHA-256 in storage, expiring after
-AUTH_TOKEN_TTL_DAYS, individually revocable, multiple per user) and delivers it
-ONLY as an HttpOnly cookie named ``config.AUTH_COOKIE_NAME``. The token is
-never in a response body and is never read from a header: a token a browser
-has to hold in script-readable storage is one XSS bug away from a durable
-account takeover, and a header path stays reachable from ``fetch()``, so
-keeping one alongside the cookie would leave the exfiltration surface open.
+The session token is never returned in a body nor read from a header: a
+script-readable token is one XSS bug from a durable account takeover, and a
+header path stays reachable from ``fetch()``.
 
-Because the cookie is attached by the browser automatically, every
-cookie-authenticated unsafe request is forgeable by a page the user visits, so
-``enforce_same_origin`` guards them (see its docstring). It runs inside
-``require_auth``, which means coverage cannot be forgotten on a new route.
+Because the browser attaches that cookie automatically, every unsafe
+cookie-authenticated request is forgeable by a page the user visits, so
+``enforce_same_origin`` guards them from inside ``require_auth`` -- coverage
+cannot be forgotten on a new route.
 
-Signup issues no token and always answers the same thing (see the endpoint);
-login issues opaque session tokens (hashed with SHA-256 in storage, expiring
-after AUTH_TOKEN_TTL_DAYS, individually revocable, several per user but capped
-at AUTH_MAX_ACTIVE_TOKENS_PER_USER active ones, oldest revoked past the cap) and
-delivers them ONLY as the HttpOnly cookie described above.
-A role-based access-control layer maps roles to permissions; endpoints assert
-the permission they need via ``require_permission``. A bootstrap admin account
-is seeded from AUTH_ADMIN_EMAIL / AUTH_ADMIN_PASSWORD at startup.
-
-Roles:
-- ``admin`` — everything (chat, analytics, user management)
-- ``user``  — chat only (the public-signup default)
-
-Machine clients (eval scripts) may authenticate with the AUTH_SERVICE_TOKEN
-header, which is a SCOPED, EXPIRING credential rather than an unconditional
-admin bypass: it carries an explicit permission set, stops working after
-AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS, and can be revoked or rotated. That header
-path is unchanged by the cookie migration: it is not a browser credential, and
-browsers cannot be made to attach it. All inputs are validated server-side.
+``AUTH_SERVICE_TOKEN`` is a scoped, expiring machine credential rather than an
+unconditional admin bypass.
 """
 
 import asyncio
@@ -63,52 +41,27 @@ logger = logging.getLogger("auth")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-# Module-level store; set by main.lifespan (and by tests).
 store: "AuthStore | None" = None
 
 VALID_ROLES = ("admin", "user")
 
-# The only role public self-service signup can ever grant. Not configurable:
-# see the signup docstring.
 SIGNUP_ROLE = "user"
 
-# Role -> permissions. Single source of truth for access control; add a
-# resource-scoped permission here and assert it on the route that needs it.
 ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
     "admin": {"chat:use", "analytics:read", "users:read", "users:manage"},
     "user": {"chat:use"},
 }
 
-# Id used as the user_id for service-token requests (eval scripts, ops).
 SERVICE_USER_ID = "service-token"
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
-# How a password reaches bcrypt.
-#
-# bcrypt hashes AT MOST the first 72 bytes of its input and silently discards
-# the rest. Handed the password itself, that makes every long password a prefix
-# of itself: a 103-byte passphrase authenticates from its first 72 bytes, any
-# two values sharing a 72-byte prefix are the same credential, and bytes past
-# the cut add no entropy at all. No application-level maximum can fix that,
-# because the cut happens inside bcrypt rather than in validation -- which is
-# why the policy deliberately has no maximum (#290, #334).
-#
-# So bcrypt is handed a fixed-width SHA-256 pre-image instead. The digest is
-# always 32 bytes, so nothing is ever truncated, the prefix collision is gone,
-# and a 200-byte passphrase is worth 200 bytes. This is the standard remedy for
-# bcrypt's limit.
-#
-# It changes what a stored hash MEANS, so the two schemes must be tellable
-# apart. A current hash is this marker followed by a plain bcrypt string;
-# anything without the marker is a pre-migration ``bcrypt(raw[:72])``, which
-# ``verify_password`` still accepts until its owner next logs in and it is
-# rewritten in place (see ``login`` and ``_upgrade_password_hash``).
+# Prefixed onto every current hash to mark it as bcrypt over the SHA-256 pre-image;
+# an unmarked hash is pre-migration ``bcrypt(raw[:72])``, which ``verify_password``
+# still accepts.
 _PASSWORD_SCHEME = "$bcrypt-sha256$"
 
-# The width of the credential a pre-migration hash represents. Kept ONLY so
-# those hashes can still be verified: no password is handed to bcrypt raw any
-# more, so nothing truncates and this bounds nothing.
+# Only the width a pre-migration hash was built from; nothing is truncated any more.
 _LEGACY_BCRYPT_MAX_BYTES = 72
 
 
@@ -155,36 +108,21 @@ class UserOut(BaseModel):
 
 
 class AuthOut(BaseModel):
-    """The body of a successful ``POST /api/auth/login`` / ``/change-password``.
-
-    Carries the user record and deliberately NOT the session token. The token
-    is delivered only in an HttpOnly ``Set-Cookie``, never in a field script
-    can read: publishing it in the body would hand every XSS on the site a
-    durable account takeover, which is the exact exposure the cookie moves the
-    credential out of.
-    """
+    """Carries the user record and deliberately NOT the session token: publishing
+    it in the body would hand every XSS on the site a durable account takeover."""
 
     user: UserOut
 
 
 class SignupOut(BaseModel):
-    """Response of a successful-looking ``POST /api/auth/signup``.
-
-    Deliberately carries neither a token nor a user record: whether the
-    address was free or already registered, the response is this one fixed
-    message, so the endpoint cannot be used to confirm that an address has
-    an account here. Callers follow up with ``POST /api/auth/login``.
-    """
+    """Carries neither a token nor a user record, so the fixed answer cannot be used
+    to confirm that an address already has an account here."""
 
     message: str
 
 
-# The single response body every accepted signup gets. It must state the two
-# possible outcomes without favouring one: this app has no confirmation-email
-# flow, so a returning user who re-submits a registered address gets no mail
-# and no error -- the message is their recovery route ("just sign in with
-# your existing password"), and it is deliberately the same string a brand new
-# address receives.
+# Must state both possible outcomes without favouring one: there is no
+# confirmation-email flow, so for a returning user this message is the recovery route.
 SIGNUP_ACCEPTED_MESSAGE = (
     "If this email is not already registered, your account is ready. "
     "Sign in with your email and password to continue; if you already have "
@@ -205,13 +143,8 @@ class StoredUser:
 
 @dataclass
 class StoredServiceToken:
-    """A machine credential (X-Service-Token) as stored.
-
-    ``scope`` is the explicit set of permissions the token may exercise --
-    it is NOT the full admin permission set, and it is enforced per route by
-    ``require_permission``. ``expires_at`` bounds the credential's life, so a
-    leaked service token stops working on its own instead of forever.
-    """
+    """``scope`` is the explicit set of permissions this token may exercise, NOT the
+    full admin set, and ``expires_at`` bounds its life so a leak stops working."""
 
     token_hash: str
     scope: frozenset[str]
@@ -220,8 +153,7 @@ class StoredServiceToken:
 
 
 class ServiceTokenOut(BaseModel):
-    """Response of a service-token mint. The plaintext value is returned
-    exactly once, at mint time; only its SHA-256 is ever stored."""
+    """The plaintext value is returned exactly once, at mint time; only its SHA-256 is stored."""
 
     token: str
     scope: list[str]
@@ -229,13 +161,10 @@ class ServiceTokenOut(BaseModel):
 
 
 class ServiceTokenRevokeIn(BaseModel):
-    """Which service token to retire. Omit ``token`` to revoke all of them."""
-
     token: str = ""
 
 
 def validate_email(email: str) -> str:
-    """Normalize + validate an email address, raising 422 on any violation."""
     email = (email or "").strip().lower()
     if not email or len(email) > config.AUTH_MAX_EMAIL_LEN or not _EMAIL_RE.match(email):
         raise HTTPException(status_code=422, detail="invalid email address")
@@ -243,44 +172,18 @@ def validate_email(email: str) -> str:
 
 
 def _has_letter_and_digit(password: str) -> bool:
-    """The composition rule, in one place so ``validate_password`` and the
-    bootstrap guard cannot drift into disagreeing about what counts."""
     return bool(re.search(r"[A-Za-z]", password)) and bool(re.search(r"\d", password))
 
 
 def _password_rejection(password: str) -> str | None:
-    """Why this password is refused, or None when it is accepted.
+    """Why this password is refused, or None when it is accepted: the single source of
+    truth every path that can set a password must reach.
 
-    THE SINGLE SOURCE OF TRUTH for the password policy. Every path that can set
-    a password -- ``signup``, ``change_password`` and ``bootstrap_admin`` -- must
-    reach this function. The three of them used to state the same two rules
-    against different values, so they admitted different passwords (#334).
+    Both rules are judged on the WHOLE value, because that is what authenticates:
+    ``hash_password`` hands bcrypt a fixed-width SHA-256 pre-image, so no byte is dropped.
 
-    Both rules are judged on the WHOLE value, because the whole value is what
-    authenticates: ``hash_password`` hands bcrypt a fixed-width SHA-256
-    pre-image, so no byte of the password is ever dropped. That is the second
-    half of the argument #334 made. It had to judge the length floor on
-    ``_effective_password()`` -- the 72-byte prefix bcrypt could actually see --
-    because a floor judged on the raw string was then the weaker bound: a
-    30-character password of 3-byte characters cleared a 30-character floor
-    while only 24 characters of it became the credential. That weaker bound was
-    safe only because the raw 72-byte maximum refused every value long enough to
-    have a shortened effective form, so the two bounds masked each other.
-    Pre-hashing removes the shortening that made the raw bound weaker, and with
-    it the reason the two bounds had to differ at all.
-
-    **Letter+digit** is a composition rule, not an entropy rule, and has always
-    been judged on the configured secret. It stays that way: judging it on a
-    truncated prefix used to refuse credentials ``login`` already accepted (a
-    passphrase whose only digit sat past byte 72), and with nothing truncated
-    there is no second value to judge it on.
-
-    There is deliberately NO maximum. The 72-byte cut was a property of bcrypt,
-    not a policy the application could enforce, and refusing over-long values is
-    what stopped ``bootstrap_admin`` -- the only path that can ever create an
-    admin -- from seeding one, while leaving the very same working passphrase
-    unsettable through ``change_password`` (#290, #334). All three set paths
-    accept a value of any length, and every byte of it now counts.
+    There is deliberately NO maximum: bcrypt's 72-byte cut stopped ``bootstrap_admin``
+    from seeding an admin whose own passphrase ``change_password`` then refused.
     """
     if len(password) < config.AUTH_PASSWORD_MIN_LEN:
         return f"password must be at least {config.AUTH_PASSWORD_MIN_LEN} characters"
@@ -290,12 +193,8 @@ def _password_rejection(password: str) -> str | None:
 
 
 def validate_password(password: str) -> str:
-    """Validate a password (length + letter/digit), raising 422 on violation.
-
-    The raising form the signup and change-password endpoints call. It returns
-    the password unchanged rather than a normalised variant, so a caller can
-    never store something other than the exact value that was validated.
-    """
+    """Raise 422 unless the policy accepts the value; returns it unchanged, so a caller
+    can never store something other than the exact value that was validated."""
     reason = _password_rejection(password)
     if reason:
         raise HTTPException(status_code=422, detail=reason)
@@ -303,12 +202,8 @@ def validate_password(password: str) -> str:
 
 
 def _validator_rejection(validator, value: str) -> str | None:
-    """Return why ``validator`` rejects ``value``, or None when it accepts it.
-
-    ``validate_email`` / ``validate_password`` are written for the signup
-    endpoints and signal failure by raising ``HTTPException``. Callers that
-    need the reason as text (rather than as a 422 response) use this.
-    """
+    """``validate_*`` signal failure by raising; the bootstrap path needs the reason as
+    text, so it uses this instead."""
     try:
         validator(value)
     except HTTPException as exc:
@@ -317,7 +212,6 @@ def _validator_rejection(validator, value: str) -> str | None:
 
 
 def validate_name(name: str) -> str:
-    """Trim + validate an optional display name, raising 422 on violation."""
     name = (name or "").strip()
     if len(name) > config.AUTH_MAX_NAME_LEN:
         raise HTTPException(status_code=422, detail=f"name too long (max {config.AUTH_MAX_NAME_LEN} chars)")
@@ -327,59 +221,26 @@ def validate_name(name: str) -> str:
 
 
 def _prehash(password: str) -> bytes:
-    """The fixed-width pre-image bcrypt is actually handed.
-
-    SHA-256 rather than a second bcrypt: a second bcrypt would only move the
-    truncation window somewhere else, and a plain digest removes it outright.
-    32 bytes whatever the password's length, so the 72-byte cut can never bite.
-    """
+    """The fixed-width pre-image bcrypt is handed: SHA-256 rather than a second bcrypt,
+    which would only move the truncation window somewhere else."""
     return hashlib.sha256(password.encode("utf-8")).digest()
 
 
 def hash_password(password: str) -> str:
-    """Hash a password in the current scheme: the scheme marker followed by a
-    plain bcrypt string over ``_prehash(password)``."""
     digest = bcrypt.hashpw(_prehash(password), bcrypt.gensalt()).decode("utf-8")
     return _PASSWORD_SCHEME + digest
 
 
 def needs_rehash(hashed: str) -> bool:
-    """Whether ``hashed`` is a pre-migration hash a verified password should be
-    rewritten into the current scheme.
-
-    A pure test of the stored marker: no bcrypt, no secret, no user input. It
-    reads the same string ``verify_password`` dispatches on, so the two can
-    never disagree about which scheme a row is in. Callers only ask after a
-    successful verify, and a row whose hash is unreadable or empty (a
-    non-account's placeholder, a corrupt value) can never reach that point,
-    because a hash that verifies is a hash bcrypt produced.
-    """
     return not hashed.startswith(_PASSWORD_SCHEME)
 
 
 def verify_password(password: str, hashed: str) -> bool:
     """Check a password against a stored hash of EITHER scheme.
 
-    The scheme is read from the STORED hash and only from the stored hash; the
-    two schemes are never both tried and the caller cannot choose between them.
-    That is what makes the migration safe in both directions:
-
-    - A current-scheme row is only ever checked against the pre-image, so
-      nobody can authenticate it with a raw 72-byte prefix. The collision
-      cannot survive the upgrade for exactly the accounts that were upgraded.
-    - A pre-migration row is only ever checked against ``raw[:72]`` -- the
-      credential it was created to represent -- so an account that predates the
-      change keeps logging in unchanged.
-
-    Trying both, or picking the scheme by what the caller submitted, would leave
-    the shorter of the two as a working alternative for whichever row an
-    attacker targeted: a current row would still fall back to the prefix, which
-    is the whole bug, and a legacy row would accept a value the owner never set.
-
-    Dispatching on the row also keeps the cost at exactly one bcrypt either way,
-    so a pre-migration account is not distinguishable by timing from a current
-    one, and the unknown-address path keeps paying the same
-    ``_DUMMY_PASSWORD_HASH`` cost it always did.
+    The scheme is read from the STORED hash and only from it: trying both, or
+    dispatching on what the caller submitted, would leave the shorter of the two as
+    a working alternative for whichever row an attacker targeted.
     """
     if hashed.startswith(_PASSWORD_SCHEME):
         stored, preimage = hashed[len(_PASSWORD_SCHEME):], _prehash(password)
@@ -389,21 +250,14 @@ def verify_password(password: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(preimage, stored.encode("utf-8"))
     except ValueError:
-        # Not a bcrypt string at all: a corrupt row, an empty placeholder, a
-        # truncated write. Same answer as a wrong password, and never an
-        # exception out of an auth path.
+        # A corrupt row, an empty placeholder or a truncated write: the same answer as a
+        # wrong password, and never an exception out of an auth path.
         return False
 
 
-# A bcrypt hash of a per-process random secret, computed once at import by the
-# same ``hash_password`` -- and therefore the same ``gensalt()`` cost factor --
-# that produced every stored hash. Logging in against an address that has no
-# account verifies the supplied password against this constant, so that path
-# costs the same wall-clock time as a wrong-password login. Without it the
-# missing short-circuit is a remote account-existence oracle even though both
-# paths return the identical 401 body. It must never be a cheaper hash: the
-# cost factor is the whole point, so it is derived rather than hard-coded. The
-# secret is discarded immediately and is never a valid password for anyone.
+# A per-process random secret hashed once at import, so a login against an address with
+# no account costs the same wall-clock time as a wrong-password login; without it the
+# missing short-circuit is a remote account-existence oracle behind the identical 401.
 _DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(32))
 
 
@@ -414,19 +268,9 @@ def hash_token(token: str) -> str:
 def tokens_match(presented: str, expected: str) -> bool:
     """Constant-time equality of two credential strings.
 
-    ``secrets.compare_digest`` raises ``TypeError`` when a ``str`` argument
-    holds a non-ASCII character, and an ``X-Service-Token`` header is
-    attacker-controlled bytes: a raw request carrying one would turn the
-    comparison into an unhandled ``TypeError`` and the route into a 500.
-    Comparing the UTF-8 encodings keeps the content-comparison property
-    that matters: both sides still go through one ``compare_digest`` call
-    over bytes, so the comparison walks the content without an early exit on
-    a differing byte. (``compare_digest`` itself does return early when the
-    two lengths differ; the configured token's length is not a secret, and
-    that is unchanged from the ``str`` comparison.) A non-ASCII value simply
-    is not the expected token, and ``surrogateescape`` makes the encode
-    total, so no byte sequence a server can decode into the header raises
-    here either.
+    ``secrets.compare_digest`` raises ``TypeError`` on a non-ASCII ``str`` and an
+    ``X-Service-Token`` header is attacker-controlled bytes; ``surrogateescape`` keeps the
+    encode total, so nothing a server can decode into the header raises here.
     """
     return secrets.compare_digest(
         presented.encode("utf-8", "surrogateescape"), expected.encode("utf-8", "surrogateescape")
@@ -438,13 +282,12 @@ def _now() -> float:
 
 
 class DuplicateEmailError(Exception):
-    """Raised when an INSERT hits the users.email UNIQUE constraint (e.g. two
-    gunicorn workers bootstrapping the same admin concurrently)."""
+    """Raised when an INSERT hits the users.email UNIQUE constraint, e.g. two gunicorn
+    workers bootstrapping the same admin concurrently."""
 
 
 class AuthStore:
-    """SQLite-backed user + token store (WAL mode, same concurrency discipline
-    as the chat store). Token values are never stored plaintext."""
+    """SQLite-backed user + token store (WAL mode). Token values are never stored plaintext."""
 
     def __init__(self, path: str):
         self._path = path
@@ -540,10 +383,9 @@ class AuthStore:
             )
             await self._db.commit()
         except sqlite3.IntegrityError:
-            # Duplicate email under concurrency (e.g. concurrent worker
-            # bootstrap). Roll back so the failed statement never leaves this
-            # connection holding an open write transaction (which would poison
-            # the whole DB with "database is locked").
+            # Duplicate email under concurrency (e.g. concurrent worker bootstrap).
+            # Roll back so the failed statement never leaves this connection holding
+            # an open write transaction, which would poison the DB with "database is locked".
             await self._db.rollback()
             raise DuplicateEmailError(email) from None
         except Exception:
@@ -571,8 +413,8 @@ class AuthStore:
         is_active: bool | None,
         guard_last_admin: bool = False,
     ) -> int:
-        # Whitelist the columns that may be set so a future caller can never inject
-        # a user-controlled column name into the SQL via f-string interpolation.
+        # Whitelisted so a caller can never inject a user-controlled column name into the
+        # f-string SQL.
         allowed: dict[str, object] = {"name": name, "role": role, "is_active": is_active}
         sets, params = [], []
         for col, val in allowed.items():
@@ -588,9 +430,7 @@ class AuthStore:
         params.append(user_id)
         where = "id = ?"
         if guard_last_admin:
-            # Atomic guard: block only when this update would remove the last
-            # remaining admin (demote to user or deactivate). A single statement
-            # keeps the check and the write free of a count-then-set race.
+            # One statement, so the check and the write are free of a count-then-set race.
             where += (
                 " AND NOT (role = 'admin'"
                 " AND (SELECT COUNT(*) FROM users WHERE role = 'admin') <= 1"
@@ -620,34 +460,21 @@ class AuthStore:
         return n
 
     async def set_password(self, user_id: str, password_hash: str) -> None:
-        """Overwrite one user's stored hash on its own.
-
-        A caller that also has to invalidate credentials must not use this: a
-        password write that commits without the matching revocation leaves
-        every previously issued token alive behind a password the owner has
-        just changed. ``change_password`` is the atomic form.
-        """
+        """Overwrite one user's stored hash on its own. A caller that also has to invalidate
+        credentials must not use this: a password write that commits without the matching
+        revocation leaves every previously issued token alive. ``change_password`` is atomic."""
         await self._db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
         await self._db.commit()
 
     async def upgrade_password_hash(self, user_id: str, observed_hash: str, new_hash: str) -> int:
-        """Replace a pre-migration hash with a current one, but only while the
-        row still holds the hash that was just verified. Returns rows changed.
+        """Replace a pre-migration hash, but only while the row still holds the hash just
+        verified. Returns rows changed.
 
-        The compare-and-swap on ``observed_hash`` is what makes the
-        opportunistic upgrade safe to run from a login. A concurrent
-        ``change_password``, or a second worker upgrading the same account,
-        that committed after this request read the row must not be clobbered
-        with a hash derived from a credential its owner has already replaced.
-        Losing that race is the correct outcome -- the winning writer's hash is
-        the newer one -- so the rowcount is returned for the caller to log, not
-        retried: a retry would reopen the same race.
-
-        One statement, so it is atomic on its own and needs no transaction
-        around it: the row is on the old hash or the new one, never anything in
-        between, and a worker killed mid-write leaves the pre-migration hash in
-        place -- which still authenticates, so a crash here cannot lock anyone
-        out.
+        That compare-and-swap is what makes the opportunistic upgrade safe from a login: a
+        concurrent ``change_password``, or a second worker upgrading the same account, must
+        not be clobbered with a hash derived from a credential its owner already replaced.
+        Losing that race is the correct outcome, so the rowcount is returned for the caller
+        to log rather than retried -- a retry reopens the same race.
         """
         cur = await self._db.execute(
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
@@ -659,15 +486,9 @@ class AuthStore:
     async def count_legacy_passwords(self) -> int:
         """How many accounts still hold a pre-migration hash.
 
-        An upper bound on the at-risk set, not an exact one: a row records
-        nothing about how long the original password was, so a pre-migration
-        account whose password fitted inside bcrypt's window -- and which
-        therefore carries no prefix-collision exposure at all -- is counted
-        here too. Nothing in the row can tell those apart.
-
-        ``substr`` with a bound parameter rather than ``NOT LIKE``: ``%`` and
-        ``_`` are LIKE wildcards, so a scheme marker containing one would
-        silently match the wrong rows.
+        An upper bound, not an exact one: a row records nothing about the original length, so
+        an account whose password fitted inside bcrypt's window is counted too. ``substr``
+        with a bound parameter, not ``NOT LIKE``, whose ``%`` and ``_`` are wildcards.
         """
         row = await self._fetchone(
             "SELECT COUNT(*) AS n FROM users WHERE substr(password_hash, 1, ?) <> ?",
@@ -680,10 +501,7 @@ class AuthStore:
         return int(row["n"]) if row else 0
 
     async def issue_token(self, user_id: str, ttl_days: int) -> str:
-        """Mint a bearer token and return it in plaintext (only its SHA-256 is
-        stored). Enforces the per-user active-token cap, so a caller cannot
-        grow the table by logging in repeatedly -- see ``_enforce_token_cap``.
-        """
+        """Mint a bearer token, returned in plaintext; only its SHA-256 is stored."""
         raw = secrets.token_urlsafe(32)
         created = _now()
         expires = created + ttl_days * 86400
@@ -700,27 +518,19 @@ class AuthStore:
         return raw
 
     async def _enforce_token_cap(self, user_id: str) -> int:
-        """Keep at most ``config.AUTH_MAX_ACTIVE_TOKENS_PER_USER`` unexpired
-        tokens per user, revoking the oldest surplus. Returns how many were
-        revoked.
+        """Keep at most ``config.AUTH_MAX_ACTIVE_TOKENS_PER_USER`` unexpired tokens per user,
+        revoking the oldest surplus. Returns how many were revoked.
 
-        The surplus rows are DELETED, not just hidden: ``user_for_token``
-        resolves a token by looking its hash up in this very table, so a
-        deleted row means the credential no longer authenticates (401) the
-        moment it is evicted. Leaving the row in place and merely not listing
-        it would keep a live credential alive, which is the opposite of what a
-        cap is for.
-
-        Only unexpired rows count toward the cap and are candidates for
-        eviction, so already-dead rows (the purge loop's job) neither occupy a
-        slot nor get churned by this.
+        The surplus rows are DELETED, not just hidden: ``user_for_token`` resolves a token by
+        looking its hash up in this very table, so leaving the row would keep a live
+        credential alive, which is the opposite of what a cap is for.
         """
         cap = int(getattr(config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 0))
         if cap <= 0:
             return 0
         now = _now()
-        # rowid breaks ties between rows minted in the same clock tick so the
-        # eviction order is deterministic rather than storage-dependent.
+        # rowid breaks ties between rows minted in the same clock tick, making the
+        # eviction order deterministic rather than storage-dependent.
         rows = await self._fetchall(
             "SELECT token_hash FROM auth_tokens"
             " WHERE user_id = ? AND expires_at >= ?"
@@ -738,20 +548,17 @@ class AuthStore:
         return len(victims)
 
     async def active_token_count(self, user_id: str) -> int:
-        """Number of the user's unexpired tokens. Exposed for the admin surface
-        and for tests; not used to make an access decision."""
+        """Number of the user's unexpired tokens; not used to make an access decision."""
         row = await self._fetchone(
             "SELECT COUNT(*) AS n FROM auth_tokens WHERE user_id = ? AND expires_at >= ?",
             (user_id, _now()),
         )
         return int(row["n"]) if row else 0
 
-    # --- service tokens (machine credentials, X-Service-Token) ---
 
     async def issue_service_token(self, scope: set[str], ttl_seconds: float) -> tuple[str, StoredServiceToken]:
-        """Mint a scoped, expiring machine credential. Returns the plaintext
-        alongside its stored record; only the hash is persisted, so the caller
-        gets exactly one chance to keep it."""
+        """Mint a scoped, expiring machine credential. Only the hash is persisted, so the
+        caller gets exactly one chance to keep the plaintext."""
         raw = secrets.token_urlsafe(32)
         created = _now()
         record = StoredServiceToken(
@@ -771,15 +578,12 @@ class AuthStore:
     async def ensure_bootstrap_service_token(self, raw: str, scope: set[str], ttl_seconds: float) -> None:
         """Seed the record for the env-configured ``AUTH_SERVICE_TOKEN``.
 
-        INSERT OR IGNORE, and deliberately so: re-running this on every worker
-        restart must NOT push the expiry out, or the credential would be
-        eternal in practice and the expiry would be theatre. Rotating means
-        revoking the row (or changing the env value, which hashes differently
-        and seeds a new row) so the next call seeds a fresh lifetime.
+        INSERT OR IGNORE, and deliberately so: re-running this on every worker restart
+        must NOT push the expiry out, or the credential would be eternal in practice.
+        Rotating means revoking the row (or changing the env value, which hashes
+        differently) so the next call seeds a fresh lifetime.
         """
-        # One timestamp for both columns: reading the clock twice would make
-        # created_at and expires_at disagree by however long the two calls
-        # straddle, which is not a lifetime anyone can reason about.
+        # One clock read for both columns, so created_at and expires_at cannot disagree.
         created = _now()
         await self._db.execute(
             "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
@@ -789,9 +593,9 @@ class AuthStore:
         await self._db.commit()
 
     async def service_token_for(self, raw: str) -> StoredServiceToken | None:
-        """Resolve a machine credential, or None when it is unknown, revoked or
-        expired. A revoked or expired token is a hard no: there is no
-        'but the env still says so' path back in."""
+        """Resolve a machine credential, or None when it is unknown, revoked or expired.
+        A revoked or expired token is a hard no: there is no 'but the env still says so'
+        path back in."""
         row = await self._fetchone(
             "SELECT token_hash, scope, created_at, expires_at FROM auth_service_tokens"
             " WHERE token_hash = ? AND revoked_at IS NULL",
@@ -807,12 +611,9 @@ class AuthStore:
         )
 
     async def revoke_service_token(self, raw: str) -> int:
-        """Soft-revoke one machine credential. Marks the row rather than
-        deleting it: the row is the tombstone that stops a revoked configured
-        value being re-seeded with a fresh lifetime (see
-        ``ensure_bootstrap_service_token``). Returns how many rows it actually
-        revoked -- 0 for an unknown or already-revoked token, which the caller
-        must be able to see rather than assume.
+        """Soft-revoke one machine credential. Marks the row rather than deleting it: the
+        row is the tombstone that stops a revoked configured value being re-seeded with a
+        fresh lifetime. Returns how many rows it actually revoked.
         """
         cur = await self._db.execute(
             "UPDATE auth_service_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
@@ -822,23 +623,15 @@ class AuthStore:
         return cur.rowcount
 
     async def revoke_configured_service_token(self, raw: str, scope: set[str]) -> int:
-        """Kill the env-configured value, including from a cold start.
+        """Kill the env-configured value, including from a cold start. Returns the rows changed.
 
-        Seeding is lazy, so a configured value that has never been presented has
-        no row at all. The plain UPDATE in ``revoke_service_token`` then matches
-        nothing, reports 0, and the very next request seeds the value live with
-        a full fresh ``AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS`` -- so "revoke this
-        now" silently does nothing precisely when an operator is trying to
-        contain a leak of a credential that is not yet in use.
-
-        So when the value has no row, INSERT a tombstone: a row that exists and
-        is already revoked. Seeding is INSERT OR IGNORE, so a later request
-        cannot overwrite it and cannot revive the credential. INSERT OR IGNORE
-        also means a value that already has a row is left exactly as it is, so
-        this can only ever make a credential deader, never younger.
-
-        Returns the number of rows this call changed (1 for a fresh tombstone,
-        1 for revoking a live row, 0 if it was already dead).
+        Seeding is lazy, so a configured value that has never been presented has no row:
+        the plain UPDATE then matches nothing, reports 0, and the next request seeds the
+        value live with a fresh full lifetime -- "revoke this now" would silently do
+        nothing exactly when an operator is containing a leak of a credential not yet in
+        use. So when the value has no row, INSERT a tombstone: a row that exists and is
+        already revoked. Seeding is INSERT OR IGNORE, so this can only ever make a
+        credential deader, never younger.
         """
         now = _now()
         cur = await self._db.execute(
@@ -858,17 +651,11 @@ class AuthStore:
         return cur.rowcount
 
     async def purge_dead_service_tokens(self, keep_hash: str = "") -> int:
-        """Delete service-token rows that can no longer authenticate anything --
-        revoked, or past their expiry -- so a long rotation history cannot grow
-        the table without bound the way an unrotated one would.
+        """Delete service-token rows that can no longer authenticate anything.
 
-        ``keep_hash`` is excluded, and it must be: that row is the tombstone
-        which stops a revoked or expired configured ``AUTH_SERVICE_TOKEN`` from
-        being re-seeded with a fresh lifetime on the next request. Delete it and
-        the reaper would hand the credential straight back, which is the
-        permanent-grant failure this table exists to prevent. Once the operator
-        points the env var at a different value the old row is no longer
-        excluded and is collected like any other dead row.
+        ``keep_hash`` is excluded, and it must be: that row is the tombstone which stops a
+        revoked or expired configured ``AUTH_SERVICE_TOKEN`` from being re-seeded with a
+        fresh lifetime, and delete it and the reaper would hand the credential straight back.
         """
         now = _now()
         cur = await self._db.execute(
@@ -881,9 +668,6 @@ class AuthStore:
         return cur.rowcount
 
     async def user_for_token(self, raw_token: str) -> StoredUser | None:
-        """Resolve a raw session token (the auth cookie's value) to an active
-        user, or None when the token is unknown, expired, or the account is
-        disabled."""
         row = await self._fetchone(
             "SELECT * FROM auth_tokens WHERE token_hash = ?", (hash_token(raw_token),)
         )
@@ -903,47 +687,18 @@ class AuthStore:
         await self._db.commit()
 
     async def change_password(self, user_id: str, new_password_hash: str, ttl_days: int) -> str:
-        """Store a new password, revoke every existing token and mint a
-        replacement as ONE durable unit. Returns the replacement token.
+        """Store a new password, revoke every existing token and mint a replacement as ONE
+        durable unit. Returns the replacement token.
 
-        These three writes only mean anything together, so they are applied
-        inside a single ``BEGIN IMMEDIATE`` .. ``COMMIT``: SQLite keeps an
-        uncommitted transaction invisible to every other connection and
-        discards it outright if the process dies, so the database is always on
-        one side of the change or the other and never inside it.
+        These three writes only mean anything together, so they run inside a single
+        ``BEGIN IMMEDIATE`` .. ``COMMIT`` on a short-lived dedicated connection: it cannot
+        be held on the shared one, where another coroutine's ``commit()`` landing mid-way
+        would publish a half-finished change early and its ``rollback()`` would throw this
+        one away. WAL lets it work alongside the shared connection, and ``isolation_level
+        =None`` keeps this ``BEGIN`` as the connection's only transaction.
 
-        The shared connection would in fact hold these three writes in a single
-        implicit transaction -- sqlite3 opens one at the first DML and keeps it
-        until ``commit()``, and the three separate commits this replaced were
-        exactly what cut it into three. What it cannot do is hold one open
-        safely for the length of this change: that connection serialises every
-        request in the worker, so another coroutine's ``commit()`` landing
-        between two of these statements would publish a half-finished password
-        change early, and its ``rollback()`` would throw this one away -- the
-        very "one connection is never shared across concurrent coroutines"
-        hazard ``create_user`` already rolls back on. Hence a short-lived
-        dedicated connection to the same file: WAL lets it read and write
-        alongside the shared one, SQLite's own write lock serialises it against
-        other writers, and ``BEGIN IMMEDIATE`` takes that lock up front so this
-        waits out the same 5 s busy timeout rather than failing on a
-        mid-transaction lock upgrade. It is opened with
-        ``isolation_level=None`` so this ``BEGIN`` is the connection's only
-        transaction, not a nested one sqlite3 would refuse.
-
-        The statements are ALSO ordered revoke -> set hash -> mint. That is
-        defence in depth, not the guarantee: it is what keeps the change safe
-        if this ever runs somewhere the transaction does not hold. An
-        interruption after the revoke leaves the old password and no live
-        tokens; one after the hash write leaves the new password and no live
-        tokens. Either way the user logs back in, and no interruption point
-        leaves a changed password standing next to a token minted before it.
-        The transaction above is what the tests pin, and on its own it holds
-        whatever order the statements are written in.
-
-        The per-user token cap is not re-applied here: every other token was
-        deleted in this same transaction, so the user can hold at most the one
-        row inserted below. Measured rather than assumed -- with the cap set to
-        0, 1, 2 and 10 the user holds exactly one live row after the change.
+        The statements are ALSO ordered revoke -> set hash -> mint: defence in depth, not
+        the guarantee. An interruption after either write leaves no live tokens either way.
         """
         if self._db is None:
             raise RuntimeError("auth store is not connected")
@@ -961,10 +716,9 @@ class AuthStore:
             )
             await db.commit()
         except BaseException:
-            # BaseException, not Exception: a request cancelled out from under
-            # this coroutine (client gone, worker shutting down) must not
-            # abandon an open write transaction, which is what leaves the file
-            # locked against every other connection.
+            # BaseException, not Exception: a request cancelled out from under this
+            # coroutine must not abandon an open write transaction, which is what leaves
+            # the file locked against every other connection.
             await db.rollback()
             raise
         finally:
@@ -972,9 +726,7 @@ class AuthStore:
         return raw
 
     async def purge_expired_tokens(self) -> int:
-        """Delete rows whose expiry has passed. Parameterized to avoid SQL
-        injection; returns the number of rows removed. Run periodically so the
-        table can't grow without bound as tokens expire."""
+        """Delete rows whose expiry has passed, so the table cannot grow without bound."""
         now = _now()
         cur = await self._db.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (now,))
         await self._db.commit()
@@ -987,22 +739,14 @@ def _require_auth_store() -> AuthStore:
     return store
 
 
-# --- rate limiting (Redis-backed, per-IP) ---
-
 _rate_client = None
 
 
 def _rate_redis() -> aioredis.Redis:
     global _rate_client
     if _rate_client is None:
-        # Pin the DB explicitly so the rate-limit counters never silently land
-        # in DB 0, which is the query cache and is flushed during deploys --
-        # a flush there would reset every bucket and briefly disable the
-        # throttle. The ``db`` kwarg overrides any db segment in REDIS_URL, so
-        # this is safe whether or not the URL carries a db index. Matches the
-        # convention in analytics.py and cost_budget.py. This client is
-        # module-local to the limiter (closed by close_rate_redis), so pinning
-        # it cannot move anyone else's data.
+        # Pinned so the counters never land in DB 0, which is the query cache and is
+        # flushed during deploys -- a flush there would reset every bucket.
         _rate_client = aioredis.from_url(
             config.REDIS_URL,
             db=config.AUTH_RATE_LIMIT_REDIS_DB,
@@ -1014,8 +758,8 @@ def _rate_redis() -> aioredis.Redis:
 
 
 async def close_rate_redis() -> None:
-    """Close the lazily-created auth rate-limit Redis client. Registered as a
-    shutdown hook so the connection isn't leaked on worker exit."""
+    """Close the lazily-created rate-limit Redis client; a shutdown hook, so the connection
+    isn't leaked on worker exit."""
     global _rate_client
     if _rate_client is not None:
         await _rate_client.aclose()
@@ -1023,8 +767,7 @@ async def close_rate_redis() -> None:
 
 
 async def token_purge_loop() -> None:
-    """Background task: purge dead token rows -- expired user tokens, and
-    service tokens that are revoked or expired. Never raises. Disabled when
+    """Background task purging dead token rows. Never raises. Disabled when
     AUTH_TOKEN_PURGE_INTERVAL_SECONDS is 0 (e.g. tests)."""
     interval = config.AUTH_TOKEN_PURGE_INTERVAL_SECONDS
     while interval > 0:
@@ -1045,9 +788,8 @@ async def token_purge_loop() -> None:
 
 
 def _peer_is_local_proxy(peer: str | None) -> bool:
-    """True when the socket peer is a reverse proxy on this same host, i.e. a
-    loopback address. A peer that is not a real IP (a test ASGI transport, for
-    instance) is not loopback, so it never widens the trust."""
+    """True when the socket peer is a loopback reverse proxy on this same host. A peer
+    that is not a real IP (a test ASGI transport) is not loopback, so never widens trust."""
     if not peer:
         return False
     try:
@@ -1059,13 +801,11 @@ def _peer_is_local_proxy(peer: str | None) -> bool:
 def _trust_forwarded_for(peer: str | None) -> bool:
     """Whether X-Forwarded-For may be trusted for this request's peer.
 
-    ``config.AUTH_TRUST_X_FORWARDED_FOR`` forces the answer when set to true or
-    false. The shipped default is None ("auto"), which trusts the header only
-    for a loopback peer: the reference deployment (setup.sh) always runs behind
-    nginx forwarding from 127.0.0.1, so its clients get correct per-IP rate
-    limiting out of the box, while a client connecting straight to the API
-    port is its own non-loopback peer and cannot forge a header to escape its
-    own bucket.
+    ``config.AUTH_TRUST_X_FORWARDED_FOR`` forces the answer; the shipped default is None
+    ("auto"), trusting the header only for a loopback peer. The reference deployment
+    always runs behind nginx forwarding from 127.0.0.1, while a client connecting
+    straight to the API port is its own non-loopback peer and cannot forge a header to
+    escape its own bucket.
     """
     configured = config.AUTH_TRUST_X_FORWARDED_FOR
     if configured is not None:
@@ -1074,14 +814,11 @@ def _trust_forwarded_for(peer: str | None) -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    """Client IP. The X-Forwarded-For header is only honored when the request
-    came through a trusted reverse proxy (see ``_trust_forwarded_for``), so a
-    raw client cannot spoof its IP (e.g. for bypassing rate limits). Otherwise
-    the socket peer wins.
+    """Client IP, from X-Forwarded-For only when the request came through a trusted
+    reverse proxy, so a raw client cannot spoof its IP to escape a rate-limit bucket.
 
-    nginx ``$proxy_add_x_forwarded_for`` APPENDS ``$remote_addr`` (the real
-    peer) to any client-supplied X-Forwarded-For list, so the *rightmost* hop
-    is the one added by the trusted proxy while the leftmost is attacker
+    nginx ``$proxy_add_x_forwarded_for`` APPENDS the real peer to any client-supplied
+    list, so the *rightmost* hop is the trusted one while the leftmost is attacker
     controlled; take the rightmost."""
     peer = request.client.host if request.client else None
     if _trust_forwarded_for(peer):
@@ -1103,24 +840,16 @@ async def _check_rate_limit(
 ) -> None:
     """Enforce a rate limit with Redis INCR+EXPIRE.
 
-    ``fail_closed`` selects what happens when the limiter's Redis is
-    unreachable. The auth endpoints keep the default (False) and fall back to
-    a bounded in-process limiter -- see ``_consume_counter``; the public search
-    surface passes ``fail_closed=True`` and is answered 503 instead, because an
-    unrated request against ``/search`` or ``/analytics/click`` is precisely
-    the full-corpus scraping and analytics-poisoning vector these limits exist
-    to close -- there, no answer is not an acceptable fallback.
+    ``fail_closed`` selects what happens when the limiter's Redis is unreachable. The auth
+    endpoints keep the default (False) and fall back to a bounded in-process limiter; the
+    public search surface passes ``fail_closed=True`` and is answered 503 instead, because
+    an unrated request against ``/search`` or ``/analytics/click`` is precisely the
+    scraping and analytics-poisoning vector these limits close.
 
-    ``window_seconds`` defaults to the auth window so the existing auth call
-    sites keep their current 60s window; the public limits pass their own.
-
-    ``subject`` overrides the bucket identity from the client IP to a caller
-    supplied one, typically an authenticated user id. A per-IP bucket cannot
-    bound one account sitting behind a shared NAT or proxy address, which is
-    the shape a deliberate flood takes, so an endpoint that mints per-account
-    state is limited on both axes. It changes ONLY which string is counted --
-    the counter, window, Redis path and in-process fallback are identical, so
-    the two axes cannot drift apart in enforcement.
+    ``subject`` overrides the bucket identity from the client IP to a caller supplied one,
+    typically an authenticated user id: a per-IP bucket cannot bound one account behind a
+    shared NAT or proxy address, so an endpoint that mints per-account state is limited on
+    both axes. It changes ONLY which string is counted, so the two axes cannot drift.
     """
     if limit_per_min <= 0:
         return
@@ -1135,27 +864,16 @@ async def _check_account_rate_limit(
     limit_per_min: int,
     account: str,
 ) -> None:
-    """Enforce a rate limit keyed on the submitted account rather than the
-    source address, so rotating IPs cannot buy an attacker a fresh bucket.
+    """Enforce a rate limit keyed on the submitted account rather than the source address,
+    so rotating IPs cannot buy an attacker a fresh bucket. The key is the address folded
+    to lower case and stripped, so one account cannot be handed a second bucket by
+    changing case or padding.
 
-    The key is the address folded to lower case and stripped, so one account
-    cannot be handed a second bucket by changing case or padding -- the
-    invariant is enforced here rather than left to the caller.
-
-    THIS HELPER PERFORMS NO LOOKUP: given the same submitted string it computes
-    the same key, the same counter update and the same answer whether or not
-    the address has an account, which is what keeps it from being an
-    account-existence oracle. Its caller decides WHETHER to call it, and that
-    is where existence enters -- login only counts a failed credential check.
-    That is not an enumeration channel: the only thing that skips the increment
-    is supplying the correct password, which is exactly what the attacker does
-    not have. A registered address and an unregistered address both pay a
-    bcrypt verify, both increment on failure, and both return the identical
-    401 or 429.
-
-    Keep it that way. A version of this that consulted the users table, or one
-    the caller invoked before the credential check, would reintroduce the
-    account-existence oracle the dummy-hash login path exists to close.
+    THIS HELPER PERFORMS NO LOOKUP, and must not: it computes the same key and the same
+    counter update whether or not the address has an account, which is what keeps it from
+    being an account-existence oracle. Existence enters only in the caller's decision to
+    call it -- login counts failed credential checks, and the only thing that skips the
+    increment is supplying the correct password.
     """
     key_account = (account or "").strip().lower()
     if limit_per_min <= 0 or not key_account:
@@ -1179,39 +897,23 @@ async def _consume_counter(
 ) -> None:
     """Count one hit against ``key`` and reject past ``limit``.
 
-    Redis is the shared counter, so the limit is global across every worker
-    process. When it is unreachable the choice is between three behaviours and
-    the two obvious ones are both wrong on their own:
+    Redis is the shared counter, so the limit is global across every worker process. When
+    it is unreachable both obvious behaviours are wrong: admitting the request turns an
+    attacker-inducible Redis outage into an unlimited credential-stuffing window, while
+    rejecting everything hands a DoS to whoever can disturb Redis without helping anyone
+    guess a password.
 
-    * admit the request (the historical behaviour here) makes a Redis outage
-      -- which an attacker can often induce, and which lasts exactly as long
-      as they want -- into an unlimited credential-stuffing window on the
-      login and signup endpoints. That is the hole this function exists to
-      close.
-    * reject every request turns the same outage into a total login outage.
-      Credential stuffing is an attacker's problem; a Redis blip locking every
-      legitimate user out of their own account is the defender's, and it hands
-      a denial-of-service to whoever can disturb Redis without helping anyone
-      guess a password.
-
-    So the fallback is a third option: a bounded in-process limiter with the
-    SAME limit. The degraded posture is "single-process limiting" rather than
-    "no limiting" or "no service". It stays bounded under an unbounded key
-    flood (see ``_local_rate_hit``), and it is not a hidden fail-open: past the
-    limit the caller still gets 429, exactly as it would from Redis.
-
-    The per-worker weakening is inherent to an in-process fallback and is
-    accepted deliberately: a gunicorn deployment multiplies the effective limit
-    by its worker count during a Redis outage, which is still a finite bound
-    rather than none.
+    So the fallback is a third option: a bounded in-process limiter with the SAME limit.
+    The degraded posture is "single-process limiting" rather than "no limiting" or "no
+    service"; the per-worker weakening is inherent to it and a gunicorn deployment
+    multiplies the effective limit by its worker count, which is still a finite bound.
     """
     try:
         rc = _rate_redis()
-        # Establish the sliding window atomically on the first hit: SET NX EX sets
-        # the value to 0 with the window TTL only if the key did not already
-        # exist, so the key always has a TTL. A later crash can never leave a
-        # counter with no expiry (which would block the IP forever under the old
-        # INCR + separate EXPIRE). Subsequent hits just increment.
+        # Establish the sliding window atomically on the first hit: SET NX EX sets the
+        # value to 0 with the window TTL only if the key did not already exist, so the key
+        # always has a TTL. A later crash can never leave a counter with no expiry, which
+        # under the old INCR + separate EXPIRE would block the IP forever.
         await rc.set(key, 0, nx=True, ex=window)
         n = await rc.incr(key)
     except Exception:
@@ -1234,43 +936,34 @@ async def _consume_counter(
 
 # --- in-process fallback limiter ---
 
-# Guarded by a plain lock rather than asyncio primitives: the critical section
-# is a dict lookup and two integer comparisons, it must also be safe against
-# the shutdown-time calls that may arrive off-loop, and it never awaits.
+# A plain lock rather than an asyncio primitive: the critical section never awaits, and
+# it must also be safe against shutdown-time calls that may arrive off-loop.
 _local_rate_lock = threading.Lock()
 # key -> (count, window_expiry)
 _local_rate_counters: dict[str, tuple[int, float]] = {}
 
-# Hard bound on the fallback's memory. An attacker who can make us fail over to
-# the fallback can also mint unlimited distinct keys (one per source address,
-# one per submitted address), so an unbounded dict would be a memory-exhaustion
-# DoS in place of the rate-limit DoS it replaced.
+# Hard bound on the fallback's memory: an attacker who can force the fallback can also
+# mint unlimited distinct keys, so an unbounded dict would be a memory-exhaustion DoS in
+# place of the rate-limit DoS it replaced.
 #
-# What is dropped when the cap is hit matters, because the buckets this dict
-# holds are not all equal. An attacker flooding it with fresh source addresses
-# must not be able to use the pressure to discard the per-ACCOUNT bucket they
-# are actually being throttled by. So the dict is kept in least-recently-used
-# order (every hit re-inserts its key at the tail) and eviction drops from the
-# head, which makes an actively-attacked bucket the last thing to go rather
-# than the first. Windows that have already closed are reclaimed first,
-# before any live bucket is touched -- they are worth nothing to anyone.
+# What is dropped when the cap is hit matters: a flood of fresh source addresses must not
+# be able to use the pressure to discard the per-ACCOUNT bucket being throttled. So the
+# dict stays in least-recently-used order (every hit re-inserts at the tail) and eviction
+# drops from the head. Closed windows are reclaimed before any live bucket.
 _LOCAL_RATE_MAX_KEYS = 20_000
 
 
 def _local_rate_hit(key: str, window: int) -> int:
-    """Count one hit against ``key`` in memory and return the running count.
-
-    Fixed window, matching the Redis path: the first hit opens a window of
-    ``window`` seconds and the count resets when it closes.
-    """
+    """Count one hit against ``key`` in memory and return the running count. Fixed window,
+    matching the Redis path."""
     now = time.monotonic()
     with _local_rate_lock:
         count, expiry = _local_rate_counters.get(key, (0, now + window))
         if now >= expiry:
             count, expiry = 0, now + window
         count += 1
-        # Re-insert rather than update: deleting first moves the key to the
-        # tail, which is what makes this least-recently-used ordered.
+        # Re-insert rather than update: deleting first moves the key to the tail, which is
+        # what makes this least-recently-used ordered.
         _local_rate_counters.pop(key, None)
         _local_rate_counters[key] = (count, expiry)
         if len(_local_rate_counters) > _LOCAL_RATE_MAX_KEYS:
@@ -1279,24 +972,19 @@ def _local_rate_hit(key: str, window: int) -> int:
 
 
 def _prune_local_rate_counters(now: float) -> None:
-    """Bring the fallback dict back under ``_LOCAL_RATE_MAX_KEYS``. Call with
-    the lock held."""
+    """Bring the fallback dict back under ``_LOCAL_RATE_MAX_KEYS``. Call with the lock held."""
     for key in [k for k, (_, expiry) in _local_rate_counters.items() if expiry <= now]:
         del _local_rate_counters[key]
     over = len(_local_rate_counters) - _LOCAL_RATE_MAX_KEYS
     if over <= 0:
         return
-    # Head first == least recently used first. A live bucket is only ever
-    # dropped when the attacker is generating keys faster than the windows
-    # close, and then only in recency order.
     for stale in list(_local_rate_counters)[:over]:
         del _local_rate_counters[stale]
 
 
 def reset_local_rate_limits() -> None:
-    """Forget every in-process counter. Used by tests, which share one process
-    (and therefore one fallback limiter) across every case; nothing in the
-    service calls it."""
+    """Forget every in-process counter. Used by tests, which share one process (and
+    therefore one fallback limiter) across every case."""
     with _local_rate_lock:
         _local_rate_counters.clear()
 
@@ -1309,19 +997,14 @@ def public_rate_limit(
 ) -> Callable[[Request], Awaitable[None]]:
     """Build the FastAPI dependency that rate-limits one public endpoint.
 
-    ``limit_attr`` names a ``config`` attribute (e.g.
-    ``"PUBLIC_SEARCH_RATE_PER_MIN"``) and is resolved per request rather than
-    captured at import time, so the limit stays tunable -- and overridable in a
-    test -- without rebuilding the app.
+    ``limit_attr`` names a ``config`` attribute (e.g. ``"PUBLIC_SEARCH_RATE_PER_MIN"``)
+    resolved per request rather than captured at import, so the limit stays tunable --
+    and overridable in a test -- without rebuilding the app.
 
-    ``fail_closed`` defaults to True because every current caller is on the
-    public search surface. ``/ready`` is the one deliberate exception: it is
-    polled by load balancers and orchestrators, and this service treats a Redis
-    outage as a degraded-but-serving state (the HybridCache falls back to an
-    in-process cache), so failing its limiter closed would pull healthy nodes
-    out of rotation for a dependency the service does not require to be ready.
-    It still counts and still answers 429 -- only a broken limiter store is
-    tolerated there.
+    ``fail_closed`` defaults to True. ``/ready`` is the one deliberate exception: it is
+    polled by load balancers, and this service treats a Redis outage as
+    degraded-but-serving, so failing its limiter closed would pull healthy nodes out of
+    rotation. It still counts and still answers 429 -- only a broken store is tolerated.
     """
 
     async def dependency(request: Request) -> None:
@@ -1345,22 +1028,13 @@ def user_rate_limit(
 ) -> Callable[[Request], Awaitable[None]]:
     """Build the FastAPI dependency that rate-limits one endpoint per ACCOUNT.
 
-    Same counter, window, Redis path and in-process fallback as
-    ``public_rate_limit`` -- both go through ``_check_rate_limit`` and
-    ``_consume_counter``, so neither axis can drift into weaker enforcement
-    than the other. Only the bucket identity and the key prefix differ: this
-    one counts the authenticated user id, under ``user:rl`` so it can never
-    collide with the per-IP bucket even when the action name matches.
+    Same counter, window, Redis path and in-process fallback as ``public_rate_limit``, so
+    neither axis can drift into weaker enforcement; only the bucket identity and key
+    prefix differ, and ``user:rl`` cannot collide with the per-IP bucket.
 
-    Compose this WITH ``public_rate_limit`` on an endpoint that mints
-    per-account persistent state: a per-IP bucket alone cannot bound one
-    account behind a shared address, and a per-account bucket alone cannot
-    bound one account rotating addresses.
-
-    Depends on ``require_auth`` rather than reading ``request.state`` blindly,
-    so the user id is guaranteed resolved before the counter is keyed. It is
-    declared in the signature so FastAPI resolves it in dependency order even
-    though the endpoint body has its own ``Depends(require_auth)``.
+    Compose this WITH ``public_rate_limit`` on an endpoint that mints per-account
+    persistent state: a per-IP bucket alone cannot bound one account behind a shared
+    address, and a per-account bucket alone cannot bound one rotating addresses.
     """
 
     async def dependency(request: Request, _auth: None = Depends(require_auth)) -> None:
@@ -1377,16 +1051,11 @@ def user_rate_limit(
     return dependency
 
 
-# --- dependencies ---
-
-
 def _token_from_request(request: Request) -> str | None:
-    """The session token on this request, read from the auth cookie alone.
+    """The session token on this request, from the auth cookie alone.
 
-    There is deliberately no ``Authorization: Bearer`` branch. A header
-    credential is one the app must hand to script, and that path stays
-    reachable from ``fetch()``; keeping it alongside the cookie would leave
-    the very exfiltration surface this migration closes.
+    There is deliberately no ``Authorization: Bearer`` branch: a header credential is one
+    the app must hand to script, and that path stays reachable from ``fetch()``.
     """
     return request.cookies.get(config.AUTH_COOKIE_NAME) or None
 
@@ -1394,17 +1063,11 @@ def _token_from_request(request: Request) -> str | None:
 def _host_only(authority: str) -> str:
     """Lowercase an authority and drop its port, IPv6 literals included.
 
-    ``host``, ``host:port``, ``[::1]:8001`` and a bare ``::1`` all reduce to
-    their host. A split on the FIRST colon would turn ``[::1]:8001`` into
-    ``[`` and let any bracketed address match any other, so brackets are peeled
-    before the port. The bare form matters too: ``urlsplit(...).hostname``
-    returns an IPv6 address with its brackets already removed, and that value
-    is fed straight back through here for the comparison — without this the
-    two sides of an IPv6 comparison reduce differently (``::1`` vs ``''``) and
-    a legitimate same-origin request is refused.
-    Port is not part of the comparison because a port is not a security
-    boundary for a cookie or for CSRF: the dev stack legitimately serves the
-    frontend on :3000 and the API on :8001 under one host.
+    ``host``, ``host:port``, ``[::1]:8001`` and a bare ``::1`` all reduce to their host. A
+    split on the FIRST colon would turn ``[::1]:8001`` into ``[`` and let any bracketed
+    address match any other, so brackets are peeled before the port. The bare form matters
+    too: ``urlsplit(...).hostname`` returns an IPv6 address with its brackets already
+    removed and feeds it back through here.
     """
     host = authority.strip().lower()
     if host.startswith("["):
@@ -1413,9 +1076,8 @@ def _host_only(authority: str) -> str:
             return host[1:end]
         return host
     if host.count(":") > 1:
-        # More than one colon and no brackets: a bare IPv6 literal. It cannot
-        # carry a port (RFC 3986 requires brackets for that), so there is
-        # nothing to drop and splitting would leave the empty string.
+        # More than one colon and no brackets: a bare IPv6 literal. It cannot carry a port
+        # (RFC 3986 requires brackets), so splitting would leave the empty string.
         return host
     return host.partition(":")[0]
 
@@ -1423,10 +1085,9 @@ def _host_only(authority: str) -> str:
 def _origin_host(origin: str) -> str | None:
     """The host an ``Origin`` header names, or None when it names none.
 
-    ``urlsplit(...).hostname`` already lowercases and drops the port and is
-    IPv6-safe. It returns None for the literal ``Origin: null`` that a
-    sandboxed iframe or a privacy browser sends; that is reported as None so
-    the caller rejects it rather than treating "no host" as "same host".
+    ``urlsplit(...).hostname`` already lowercases, drops the port and is IPv6-safe, but it
+    returns None for the literal ``Origin: null`` a sandboxed iframe sends, so the caller
+    rejects that rather than treating "no host" as "same host".
     """
     try:
         return urlsplit(origin.strip()).hostname
@@ -1437,17 +1098,10 @@ def _origin_host(origin: str) -> str | None:
 def _request_host(request: Request) -> str | None:
     """The host this request was addressed to, from the ``Host`` header alone.
 
-    ``X-Forwarded-Host`` is deliberately NOT consulted. It is not one of the
-    Fetch spec's forbidden header names, so a page can set it, and the shipped
-    nginx config neither overwrites nor strips it — it arrives verbatim. A
-    host the client chooses cannot be the basis of the CSRF comparison, since
-    the client chooses ``Origin`` too: naming the same value in both would
-    defeat the check completely. ``Host`` is the right basis because
-    ``TrustedHostMiddleware`` already constrains it to this deployment's own
-    allow-list, and a cross-site page cannot pick it — the browser sets it to
-    the victim's own domain. Nothing is lost by ignoring the forwarded
-    variant: every location in ``nginx_locations`` (setup.sh) now sets
-    ``proxy_set_header Host $host``, so the backend sees the public host.
+    ``X-Forwarded-Host`` is deliberately NOT consulted: it is not a Fetch-spec forbidden
+    header name, so a page can set it, and the shipped nginx config neither overwrites nor
+    strips it. ``Host`` is the right basis because ``TrustedHostMiddleware`` already
+    constrains it to this deployment's allow-list.
     """
     host = request.headers.get("host")
     return host.strip() if host and host.strip() else None
@@ -1457,56 +1111,30 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
 async def enforce_same_origin(request: Request) -> None:
-    """Reject a cross-site unsafe request: 403 when the browser says it is
-    cross-site, or when the request's own headers disagree about the host.
+    """Reject a cross-site unsafe request: 403 when the browser says it is cross-site, or
+    when the request's own headers disagree about the host.
 
-    The auth cookie is attached by the browser whether or not the page means
-    to send it, so a hostile page can make an authenticated state-changing
-    request that rides the user's session. Two signals are checked, and they
-    are not redundant with one another — neither covers the other's gap:
+    The browser attaches the auth cookie whether or not the page means to send it, so a
+    hostile page can make an authenticated state-changing request that rides the user's
+    session. Two signals are checked, and neither covers the other's gap:
 
-    - ``Sec-Fetch-Site: cross-site`` is set by the browser and cannot be set
-      by script, so on its own it is decisive for every current browser: the
-      browser sends it on any cross-site unsafe request, whatever the page's
-      origin. It says nothing at all about a client that omits it (curl, an
-      eval script, a non-browser agent, a pre-2021 browser), and that is the
-      gap the second signal closes. It is checked first because it needs no
-      host comparison and stays correct behind any proxy.
+    - ``Sec-Fetch-Site: cross-site`` is set by the browser and cannot be set by script,
+      so on its own it is decisive for every current browser. It says nothing about a
+      client that omits it (curl, an eval script), which is the gap the second closes.
     - ``Origin`` is compared against the request's own ``Host``. This is a
-      self-consistency check, not an allow-list, and it is the signal that
-      still stands when ``Sec-Fetch-Site`` is absent or has been tampered
-      with: a foreign ``Origin`` is refused on its own. In turn it catches
-      nothing when the client omits ``Origin`` as well, and it is only as
-      trustworthy as the ``Host`` it is compared to — which is why
-      ``_request_host`` refuses to let a client-settable
-      ``X-Forwarded-Host`` pick that answer. Hosts are compared with ports
-      stripped because the app sits behind TLS termination and cannot trust
-      ``request.url.scheme``, and because the dev stack serves :3000 and
-      :8001 under one host.
+      self-consistency check, not an allow-list, and it catches nothing when the client
+      omits ``Origin`` too. It is only as trustworthy as the ``Host`` it is compared to,
+      which is why ``_request_host`` refuses to let a client-settable
+      ``X-Forwarded-Host`` pick that answer. Ports are stripped because the app sits
+      behind TLS termination and cannot trust ``request.url.scheme``.
 
-    ``CORS_ORIGINS`` is deliberately NOT used here: it is a localhost-only dev
-    default that does not contain the production host, so an allow-list built
-    from it would 403 every real request.
+    ``CORS_ORIGINS`` is deliberately NOT used here: it is a localhost-only dev default
+    that does not contain the production host, so an allow-list built from it would 403
+    every real request.
 
-    The honest limitation: a request with NEITHER header is allowed through.
-    Every browser sends both on an unsafe method, so their absence means a
-    non-browser client (curl, an eval script) which has no ambient cookie to
-    ride in the first place. This is therefore not fail-closed — a
-    hypothetical client able to suppress both headers while still holding the
-    cookie would pass — but the browser is the only thing that attaches
-    cookies unasked, and demanding these headers outright would break every
-    non-browser caller for no added protection.
-
-    Scope: applied to every cookie-authenticated request via ``require_auth``
-    and to ``POST /api/auth/login``. The routes with neither ``require_auth``
-    nor a direct ``enforce_same_origin`` are: the public ``GET /search`` and
-    ``GET /facets``; the health probes ``/health``, ``/live``, ``/ready`` and
-    ``/readyz``; and the two public unsafe routes ``POST /analytics/click``
-    and ``POST /api/auth/signup``. Every other route — including
-    ``POST /recommend/interaction`` and the whole ``/api/chat`` router —
-    carries ``require_auth`` and is therefore guarded. The unguarded ones
-    are all either safe methods, which the guard ignores anyway, or
-    unauthenticated endpoints that have no session to ride.
+    The honest limitation: a request with NEITHER header is allowed through. Every browser
+    sends both on an unsafe method, so their absence means a non-browser client, which has
+    no ambient cookie to ride in the first place.
     """
     if request.method.upper() not in _UNSAFE_METHODS:
         return
@@ -1517,8 +1145,8 @@ async def enforce_same_origin(request: Request) -> None:
         return
     origin_host = _origin_host(origin)
     if not origin_host:
-        # Covers the literal "null" from a sandboxed iframe or privacy
-        # browser: it names no host, so it can never be shown to be ours.
+        # The literal "null" from a sandboxed iframe or privacy browser names no host, so
+        # it can never be shown to be ours.
         raise HTTPException(status_code=403, detail="cross-site request rejected")
     expected = _request_host(request)
     if expected is None or _host_only(origin_host) != _host_only(expected):
@@ -1526,9 +1154,8 @@ async def enforce_same_origin(request: Request) -> None:
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
-    """Attach the session cookie. No ``domain``: host-only keeps it working
-    on a bare-IP deployment, where any Domain would have to name an address
-    the operator may not control."""
+    """Attach the session cookie. No ``domain``: host-only keeps it working on a bare-IP
+    deployment, where any Domain would have to name an address the operator may not control."""
     response.set_cookie(
         config.AUTH_COOKIE_NAME,
         token,
@@ -1541,12 +1168,9 @@ def _set_session_cookie(response: Response, token: str) -> None:
 
 
 def _clear_session_cookie(response: Response) -> None:
-    """Expire the session cookie.
-
-    Every attribute must match ``_set_session_cookie`` exactly: a browser
-    treats a deletion whose name or path differs from the original as a
-    different cookie, and the live one would then be left in place.
-    """
+    """Expire the session cookie. Every attribute must match ``_set_session_cookie``
+    exactly: a browser treats a deletion whose name or path differs from the original as a
+    different cookie, and the live one would then be left in place."""
     response.delete_cookie(
         config.AUTH_COOKIE_NAME,
         path=config.AUTH_COOKIE_PATH,
@@ -1569,10 +1193,9 @@ def _service_user() -> StoredUser:
 
 
 def _service_token_ttl_seconds() -> float:
-    """Lifetime of a freshly minted service token. A non-positive configured
-    value falls back to the shipped default instead of meaning 'never
-    expires' -- an immortal machine admin credential is the hole, so there is
-    deliberately no way to configure one back into existence."""
+    """Lifetime of a freshly minted service token. A non-positive configured value falls
+    back to the shipped default instead of meaning 'never expires' -- an immortal machine
+    admin credential is the hole, so there is no way to configure one back into existence."""
     configured = int(getattr(config, "AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS", 0) or 0)
     return float(configured if configured > 0 else 86400)
 
@@ -1580,10 +1203,9 @@ def _service_token_ttl_seconds() -> float:
 def _service_token_scope() -> frozenset[str]:
     """Permissions a service token gets, from ``config.AUTH_SERVICE_TOKEN_SCOPE``.
 
-    Unknown permission names are dropped with a warning rather than passed
-    through: a typo in the operator's .env then yields a token that can do
-    less than intended and is logged, instead of a token whose scope silently
-    does not match what anyone reading the .env believes.
+    Unknown names are dropped with a warning rather than passed through: a typo in the
+    operator's .env then yields a token that can do less than intended and is logged,
+    instead of a scope that silently does not match the .env.
     """
     known = {p for role in ROLE_PERMISSIONS.values() for p in role}
     requested = tuple(getattr(config, "AUTH_SERVICE_TOKEN_SCOPE", ()) or ())
@@ -1594,14 +1216,12 @@ def _service_token_scope() -> frozenset[str]:
 
 
 async def _resolve_service_token(raw: str) -> StoredServiceToken | None:
-    """Resolve a machine credential, seeding the env-configured one on first
-    use. Returns None when the credential is unknown, revoked or expired.
+    """Resolve a machine credential, seeding the env-configured one on first use. Returns
+    None when it is unknown, revoked or expired.
 
-    Every service token -- the one in the environment and any minted through
-    the admin surface -- is resolved from the table by its hash. The
-    environment value is only the SEED: it creates the record once, and from
-    then on the stored row is the sole authority on the token's life, so
-    revoking or expiring it actually takes effect.
+    The environment value is only the SEED: every service token, minted or configured, is
+    resolved from the table by its hash, so the stored row is the sole authority on the
+    token's life and revoking or expiring it actually takes effect.
     """
     s = _require_auth_store()
     record = await s.service_token_for(raw)
@@ -1615,16 +1235,14 @@ async def _resolve_service_token(raw: str) -> StoredServiceToken | None:
 
 async def require_auth(request: Request) -> None:
     """Validate the request's credentials and stash the user on request.state.
-    Accepts the auth cookie (user tokens) or ``X-Service-Token`` (a scoped,
-    expiring machine credential).
 
-    A service token that is revoked or past its expiry is NOT honoured: it
-    falls through to the cookie path and ends as a 401, rather than being
-    granted admin because the environment still mentions it.
+    A service token that is revoked or past its expiry is NOT honoured: it falls through to
+    the cookie path and ends as a 401, rather than being granted admin because the
+    environment still mentions it.
     """
-    # Guard FIRST, so a cross-site request is refused whichever credential it
-    # presents. Inside this dependency rather than on each route: a new
-    # cookie-authenticated endpoint then cannot forget the guard.
+    # Guard FIRST, so a cross-site request is refused whichever credential it presents.
+    # Inside this dependency rather than on each route: a new cookie-authenticated
+    # endpoint then cannot forget the guard.
     await enforce_same_origin(request)
     service = request.headers.get("x-service-token")
     if service:
@@ -1632,16 +1250,13 @@ async def require_auth(request: Request) -> None:
         if record is not None:
             request.state.user = _service_user()
             request.state.user_id = SERVICE_USER_ID
-            # The scope narrows this below the role's full permission set; a
-            # token minted with an empty scope can authenticate but reach
-            # nothing.
+            # The scope narrows this below the role's full permission set; a token minted
+            # with an empty scope can authenticate but reach nothing.
             request.state.scope = record.scope
             request.state.service_token = service
             return
-        # Debug, not warning: this sits on an unauthenticated, attacker-
-        # controlled path, so at warning level any anonymous request with a
-        # junk header writes a log line -- a log-flood amplifier, and a steady
-        # stream of noise from a machine client that has outlived its token.
+        # Debug, not warning: this sits on an unauthenticated, attacker-controlled path,
+        # so at warning level any anonymous request with a junk header writes a log line.
         logger.debug("auth: a presented service token did not resolve")
     token = _token_from_request(request)
     if token is None:
@@ -1656,10 +1271,9 @@ async def require_auth(request: Request) -> None:
 def require_permission(permission: str):
     """Dependency factory: require ``permission`` (see ROLE_PERMISSIONS).
 
-    A service-token request is additionally checked against that token's own
-    scope: its role is admin so it can reach admin routes at all, but the scope
-    is what decides which of them. Human users carry no scope and are decided
-    by their role alone, as before.
+    A service-token request is additionally checked against that token's own scope: its
+    role is admin so it can reach admin routes at all, but the scope is what decides which
+    of them. Human users carry no scope and are decided by their role alone.
     """
 
     async def checker(request: Request) -> None:
@@ -1675,48 +1289,38 @@ def require_permission(permission: str):
     return checker
 
 
-# --- endpoints ---
-
-
 @router.post("/signup", response_model=SignupOut)
 async def signup(body: SignupIn, request: Request):
-    """Register an account (public). Validated server-side: email format,
-    password strength, name limits.
+    """Register an account (public). Validated server-side: email format, password
+    strength, name limits.
 
-    The response is one fixed 200 ``{"message": ...}`` whether or not the
-    address was already registered, so an unauthenticated caller cannot use
-    this endpoint to learn which addresses have accounts here. It therefore
-    sets no cookie: a session present only for fresh addresses would be the
-    oracle all over again, and minting one for an existing account would hand
-    an anonymous caller someone else's session. Callers follow up with
-    ``POST /api/auth/login``.
+    The response is one fixed 200 ``{"message": ...}`` whether or not the address was
+    already registered, and sets no cookie: a session present only for fresh addresses
+    would be the oracle all over again, and minting one for an existing account would hand
+    an anonymous caller someone else's session.
 
-    The role is hardcoded to 'user': public signups always land with the least
-    privilege. There is deliberately no configuration knob here — a role that
-    can be flipped by an env var (or a request field) turns a config mistake
-    into a full account compromise. Privilege is granted only by an
-    authenticated admin via PATCH /api/auth/users/{id}."""
+    The role is hardcoded to 'user'. There is deliberately no configuration knob here -- a
+    role flippable by an env var (or a request field) turns a config mistake into a full
+    account compromise. Privilege is granted only by an authenticated admin.
+    """
     await _check_rate_limit(request, "signup", config.AUTH_SIGNUP_RATE_PER_MIN)
     email = validate_email(body.email)
     password = validate_password(body.password)
     name = validate_name(body.name)
     s = _require_auth_store()
-    # No pre-flight "does this address exist" lookup: create_user hashes the
-    # password and attempts the INSERT either way, so a duplicate costs the
-    # same wall-clock time as a fresh registration. A pre-check would skip
-    # that bcrypt work and leak existence through timing, exactly as login
-    # did. The users.email UNIQUE constraint is the single source of truth.
+    # No pre-flight "does this address exist" lookup: create_user hashes the password and
+    # attempts the INSERT either way, so a duplicate costs the same wall-clock time as a
+    # fresh registration. A pre-check would skip that bcrypt work and leak existence
+    # through timing, exactly as login did.
     try:
         await s.create_user(email, password, name, role=SIGNUP_ROLE)
     except DuplicateEmailError:
-        # Already registered (including losing a concurrent-creation race).
-        # Swallow it into the same success-shaped answer a fresh address gets
-        # and leave the stored row untouched: no re-hash, no rename, no
-        # re-activation, no duplicate, no session.
+        # Already registered (including losing a concurrent-creation race): swallowed into
+        # the same success-shaped answer a fresh address gets, leaving the stored row
+        # untouched -- no re-hash, no rename, no re-activation, no session.
         logger.info("signup for an already-registered address: reported as accepted")
-    # No cookie is set here on purpose (see the docstring): minting a session
-    # on signup is what the anti-enumeration rule forbids. Login-CSRF is
-    # covered by running the same-origin guard on /login instead.
+    # No cookie on purpose (see the docstring). Login-CSRF is covered by the same-origin
+    # guard on /login instead.
     return SignupOut(message=SIGNUP_ACCEPTED_MESSAGE)
 
 
@@ -1729,89 +1333,59 @@ async def login(
 ):
     """Exchange email+password for a session cookie.
 
-    The opaque token is issued, stored hashed, and handed to the browser only
-    as an HttpOnly cookie; it is deliberately absent from the response body.
+    Guarded by ``enforce_same_origin`` even though it is unauthenticated: without it a
+    hostile page could force a login with the *attacker's* credentials, so the victim's
+    subsequent authenticated actions would post into the attacker's account ("login CSRF").
 
-    Guarded by ``enforce_same_origin`` even though it is unauthenticated:
-    without it a hostile page could force a login with the *attacker's*
-    credentials, so the victim's subsequent authenticated actions would post
-    into the attacker's account ("login CSRF").
+    An unknown address, a known address with a wrong password and a deactivated account are
+    all indistinguishable: the identical 401 body and the identical full bcrypt verify cost,
+    because the unknown-address path verifies against a fixed dummy hash rather than
+    skipping the check.
 
-    An unknown address and a known address with a wrong password are
-    indistinguishable to the caller: the identical 401 status and body, and
-    the identical full bcrypt verify cost, because the unknown-address path
-    verifies the supplied password against a fixed dummy hash at the same
-    cost factor instead of skipping the check. A deactivated account is
-    verified the same way, so it is not distinguishable either.
-    The per-account rate limit is held to the same rule: it is keyed on the
-    submitted address alone, so a registered and an unregistered address reach
-    the same counter, the same 429 and the same amount of work.
+    The per-account rate limit holds to the same rule -- keyed on the submitted address
+    alone -- and counts FAILED attempts only, applied after the credential check. Counting
+    every attempt and gating first made the throttle an account-lockout weapon: twenty
+    anonymous wrong-password requests from twenty source addresses would lock the real owner
+    out indefinitely without ever guessing a password.
 
-    That per-account limit counts FAILED attempts only, and is applied after
-    the credential check rather than before it. Counting every attempt, and
-    gating on the counter first, made the throttle an account-lockout weapon:
-    twenty anonymous wrong-password requests against a known address, from
-    twenty source addresses, would lock the real owner out of their own
-    account indefinitely without ever guessing a password -- an unauthenticated
-    DoS aimed at anyone whose address the attacker already had. A correct
-    password must never be rate-limited, so it never touches the counter.
+    It deliberately does NOT bound attacker COST: the check runs after the bcrypt verify,
+    so being refused is free. The per-IP limiter is the control that bounds attacker cost;
+    anything making this counter do that job has to consult it BEFORE the verify, which
+    reinstates both the lockout primitive and the existence timing oracle.
 
-    WHAT THIS COUNTER IS AND IS NOT. It bounds the RATE of attempts directed at
-    one account, and gives a per-account signal that a per-IP limit cannot:
-    twenty addresses all failing against the same victim is visible here and
-    invisible per-IP. It does NOT bound an attacker's COST. Because the check
-    runs after the bcrypt verify, being refused is free -- the verify has
-    already been paid. Measured, an over-budget request costs within ~1% of an
-    under-budget one, so the attacker gains nothing from tripping the limit.
-
-    The per-IP limiter is the control that bounds attacker cost. Anything that
-    wants to make this counter do that job has to consult it BEFORE the
-    verify, and that is precisely the change already made and rejected: it
-    reinstates the account-lockout primitive, and it reinstates the existence
-    timing oracle, because a cheap 429 for a known address and an expensive
-    verify for an unknown one is a perfect enumeration signal. The counter is
-    deliberately second-line.
-
-    A successful login also REWRITES the stored hash if it predates the
-    pre-image scheme (#387). That is a write on the read-looking path, and it
-    is deliberate: the plaintext exists in this request and nowhere else, so
-    this is the only moment a pre-migration credential can be re-expressed
-    without the account owner doing anything but logging in as they already do.
-    It never revokes anything -- the credential is unchanged, only how it is
-    stored -- and it can never fail the login (see ``_upgrade_password_hash``).
+    A successful login also REWRITES the stored hash if it predates the pre-image scheme.
+    That is a write on the read-looking path, and it is deliberate: the plaintext exists in
+    this request and nowhere else, so this is the only moment a pre-migration credential can
+    be re-expressed without the account owner doing anything but logging in as they already
+    do. It revokes nothing and can never fail the login (see ``_upgrade_password_hash``).
     """
     await _check_rate_limit(request, "login", config.AUTH_LOGIN_RATE_PER_MIN)
     email = validate_email(body.email)
     s = _require_auth_store()
     user = await s.get_user_by_email(email)
-    # Always pay the bcrypt cost, even with no account to compare against:
-    # `user is not None and await ... verify_password(...)` short-circuits, and
-    # that skipped ~100ms was a remote account-existence oracle.
+    # Always pay the bcrypt cost, even with no account to compare against: short-circuiting
+    # the verify skipped ~100ms and was a remote account-existence oracle.
     password_ok = await asyncio.to_thread(
         verify_password,
         body.password,
         user.password_hash if user is not None else _DUMMY_PASSWORD_HASH,
     )
     if password_ok and user is not None and user.is_active:
-        # A real user with a real password is never counted, never gated, and
-        # never rate-limited. Only failures consume the account's budget.
+        # A real user with a real password is never counted, never gated, never
+        # rate-limited. Only failures consume the account's budget.
         if needs_rehash(user.password_hash):
-            # Opportunistic migration. The plaintext exists only in this
-            # request, and this is the one moment the pre-migration hash can be
-            # re-expressed in the current scheme -- so the migration completes
-            # without a bulk reset, an operator action, or the account owner
-            # doing anything but logging in as they already do.
+            # Opportunistic migration: the plaintext exists only in this request, so this
+            # is the one moment the pre-migration hash can be re-expressed.
             await _upgrade_password_hash(s, user, body.password)
         token = await s.issue_token(user.id, config.AUTH_TOKEN_TTL_DAYS)
-        # The session is delivered ONLY as the HttpOnly cookie. It is never put
-        # in the response body, so there is nothing for script on the page --
-        # including script injected by an XSS -- to read and exfiltrate.
+        # Delivered ONLY as the HttpOnly cookie, never in the body, so there is nothing for
+        # script on the page -- including XSS-injected script -- to read and exfiltrate.
         _set_session_cookie(response, token)
         return AuthOut(user=UserOut.from_user(user))
 
-    # Failed. Count it against the address, keyed on the submitted string alone
-    # (no lookup feeds this), so a registered and an unregistered address are
-    # indistinguishable here too. Raises 429 past the limit.
+    # Failed. Counted against the address, keyed on the submitted string alone (no lookup
+    # feeds this), so a registered and an unregistered address are indistinguishable here
+    # too. Raises 429 past the limit.
     await _check_account_rate_limit(
         request, "login", config.AUTH_LOGIN_RATE_PER_ACCOUNT_PER_MIN, email
     )
@@ -1821,19 +1395,15 @@ async def login(
 async def _upgrade_password_hash(s: AuthStore, user: StoredUser, password: str) -> None:
     """Re-store ``user``'s just-verified password in the current scheme.
 
-    Only ever called after ``verify_password`` accepted ``password`` against
-    ``user.password_hash``, so the credential cannot change meaning here: the
-    owner keeps logging in with the same value and every token already issued
-    stays valid. Nothing is revoked, because this rewrites how one secret is
-    stored, not which secret it is -- the opposite of ``change_password``, which
-    is why that path is deliberately not reused.
+    Only ever called after ``verify_password`` accepted ``password``, so the credential
+    cannot change meaning here: the owner keeps logging in with the same value and every
+    token already issued stays valid. Nothing is revoked, because this rewrites how one
+    secret is stored, not which secret it is -- the opposite of ``change_password``.
 
-    Never raises. A failure here is logged and dropped: the row is untouched
-    and its pre-migration hash still authenticates, so the user is logged in,
-    the upgrade is retried on their next login, and a housekeeping write can
-    never turn into an authentication outage. The user id is logged rather than
-    the address so this line cannot be read back as a record of who has
-    successfully authenticated.
+    Never raises. A failure here is logged and dropped: the row is untouched and its
+    pre-migration hash still authenticates, so a housekeeping write can never turn into an
+    authentication outage. The user id is logged rather than the address so this line is not
+    a record of who has successfully authenticated.
     """
     try:
         new_hash = await asyncio.to_thread(hash_password, password)
@@ -1859,14 +1429,9 @@ async def me(request: Request, _: None = Depends(require_auth)):
 async def logout(request: Request, response: Response, _: None = Depends(require_auth)):
     """Revoke the credential this request authenticated with, and expire the cookie.
 
-    For a service token that revocation is real: the token is marked revoked,
-    so it stops working immediately. It used to be a no-op here -- logout only
-    ever looked at a bearer token, so a machine credential answered ``ok`` and
-    then went on working for as long as the process did.
-
-    For a user session the token is read from the cookie, which is the only
-    place it can now be: re-parsing a header here would leave the stored token
-    live and turn logout into a silent no-op that still answers ``{"ok": true}``.
+    For a user session the token is read from the cookie, which is the only place it can now
+    be -- re-parsing a header here would leave the stored token live and turn logout into a
+    silent no-op.
     """
     service = getattr(request.state, "service_token", None)
     if service is not None:
@@ -1886,18 +1451,17 @@ async def change_password(
     response: Response,
     _: None = Depends(require_auth),
 ):
-    """Change the current user's password after verifying the old one. Revokes
-    every other token the user holds and re-issues the session cookie with a
-    fresh token, so this session stays signed in and no other one does.
+    """Change the current user's password after verifying the old one. Revokes every other
+    token the user holds and re-issues the session cookie with a fresh token, so this
+    session stays signed in and no other one does.
 
-    The new password is judged by the same policy ``signup`` and
-    ``bootstrap_admin`` use (see ``_password_rejection``), and stored the same
-    way, so an admin seeded with a passphrase of any length can re-apply that
-    very passphrase here instead of being 422'd out of its own credential.
+    The new password is judged by the same policy ``signup`` and ``bootstrap_admin`` use
+    (see ``_password_rejection``), and stored the same way, so an admin seeded with a
+    passphrase of any length can re-apply that very passphrase here.
 
-    "Invalidates" holds even if the worker is killed mid-request: the hash
-    write, the revocation and the replacement token commit together or not at
-    all -- see ``AuthStore.change_password``.
+    "Invalidates" holds even if the worker is killed mid-request: the hash write, the
+    revocation and the replacement token commit together or not at all (see
+    ``AuthStore.change_password``).
     """
     user = request.state.user
     s = _require_auth_store()
@@ -1907,23 +1471,18 @@ async def change_password(
     ):
         raise HTTPException(status_code=400, detail="current password is incorrect")
     new_password = validate_password(body.new_password)
-    # Hash first, then take the write lock: bcrypt is the slow part and has no
-    # business being spent holding it.
+    # Hash first, then take the write lock: bcrypt is the slow part and has no business
+    # being spent holding it.
     new_hash = await asyncio.to_thread(hash_password, new_password)
-    # ONE transaction for the hash write, the revocation and the replacement
-    # token. Do not split this back into set_password / revoke_all_tokens /
-    # issue_token: that is the three-transaction shape #285 closed, and it
-    # leaves a durable new password valid alongside still-authenticating
-    # pre-existing tokens whenever the worker dies between them.
+    # ONE transaction for the hash write, the revocation and the replacement token. Do not
+    # split this back into set_password / revoke_all_tokens / issue_token: that shape leaves
+    # a durable new password valid alongside still-authenticating pre-existing tokens
+    # whenever the worker dies between them.
     token = await s.change_password(user.id, new_hash, config.AUTH_TOKEN_TTL_DAYS)
-    # Revocation above killed every token this user held, including the one in
-    # the cookie, so the cookie has to be re-issued with the new token or the
-    # session dies on the user's very next request.
+    # Revocation killed every token this user held, including the one in the cookie, so the
+    # cookie has to be re-issued or the session dies on the very next request.
     _set_session_cookie(response, token)
     return AuthOut(user=UserOut.from_user(stored))
-
-
-# --- admin user management (users:manage) ---
 
 
 async def _get_user_or_404(s: AuthStore, user_id: str) -> StoredUser:
@@ -1961,8 +1520,8 @@ async def patch_user(
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("users:manage")),
 ):
-    """Update a user's name/role/is_active. Protects the last active admin from
-    demotion or deactivation."""
+    """Update a user's name/role/is_active. Protects the last active admin from demotion or
+    deactivation."""
     s = _require_auth_store()
     target = await _get_user_or_404(s, user_id)
     if body.role is not None and body.role not in VALID_ROLES:
@@ -1982,7 +1541,6 @@ async def delete_user(
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("users:manage")),
 ):
-    """Permanently remove a user and revoke all their tokens."""
     s = _require_auth_store()
     target = await _get_user_or_404(s, user_id)
     n = await s.delete_user(user_id, guard_last_admin=(target.role == "admin"))
@@ -1998,7 +1556,6 @@ async def revoke_user_tokens(
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("users:manage")),
 ):
-    """Revoke every token a user holds (forces re-login)."""
     await _require_auth_store().revoke_all_tokens(user_id)
     return {"ok": True}
 
@@ -2009,16 +1566,12 @@ async def mint_service_token(
     _auth: None = Depends(require_auth),
     _perm: None = Depends(require_permission("users:manage")),
 ):
-    """Mint a scoped, expiring machine credential (rotation).
+    """Mint a scoped, expiring machine credential (rotation). Neither the scope nor the
+    lifetime can be widened per request.
 
-    The plaintext value is in the response and nowhere else -- only its
-    SHA-256 is stored -- so this is the only chance to record it. It is scoped
-    to ``config.AUTH_SERVICE_TOKEN_SCOPE`` and expires after
-    ``AUTH_SERVICE_TOKEN_MAX_AGE_SECONDS``; neither can be widened per request.
-
-    Requires ``users:manage``, which a service token scoped to the shipped
-    default (``chat:use``) does not hold, so a leaked machine credential cannot
-    mint itself a successor.
+    Requires ``users:manage``, which a service token scoped to the shipped default
+    (``chat:use``) does not hold, so a leaked machine credential cannot mint itself a
+    successor.
     """
     raw, record = await _require_auth_store().issue_service_token(
         set(_service_token_scope()), _service_token_ttl_seconds()
@@ -2035,24 +1588,19 @@ async def revoke_service_tokens(
 ):
     """Revoke a service token: the other half of rotation.
 
-    Pass the token to retire and only that one dies, which is what makes
-    rotation safe to perform in the order an operator naturally reaches for --
-    mint the replacement, move consumers onto it, *then* kill the old one,
-    without a window in which no credential works. Posting no body at all (or an
-    empty one) revokes every live service token at once; that is the right move
-    for a suspected leak, and the wrong one for a planned rotation because it
-    would take down the replacement minted moments earlier.
+    Pass the token to retire and only that one dies, which is what makes rotation safe in
+    the order an operator naturally reaches for -- mint the replacement, move consumers
+    onto it, *then* kill the old one, without a window in which no credential works. Posting
+    no body at all revokes every live service token at once: right for a suspected leak,
+    wrong for a planned rotation because it takes down the replacement minted moments
+    earlier.
 
-    ``revoked`` is the number of rows actually changed, so revoking an unknown
-    or already-revoked token reports 0 rather than a reassuring 1.
+    ``revoked`` is the number of rows actually changed, so revoking an unknown or
+    already-revoked token reports 0 rather than a reassuring 1.
 
-    The value in ``AUTH_SERVICE_TOKEN`` is handled specially in both forms. It
-    is the one credential whose seeding is lazy, so before it has ever been
-    presented there is no row to UPDATE and a plain revoke would report 0 while
-    leaving it live -- the next request would seed it with a fresh full
-    lifetime. Revoking it writes a revoked tombstone instead, so "kill this
-    now" works from a cold start, which is exactly the case an operator
-    containing a leak needs.
+    The value in ``AUTH_SERVICE_TOKEN`` is handled specially in both forms, writing a
+    revoked tombstone instead of a plain UPDATE, so "kill this now" works from a cold start
+    (see ``revoke_configured_service_token``).
     """
     s = _require_auth_store()
     configured = config.AUTH_SERVICE_TOKEN or ""
@@ -2066,29 +1614,14 @@ async def revoke_service_tokens(
     return {"revoked": revoked}
 
 
-
 async def report_legacy_password_hashes() -> int | None:
-    """Log how many accounts still hold a pre-migration password hash, and
-    return that count (None when it could not be determined).
+    """Log how many accounts still hold a pre-migration password hash, and return that
+    count (None when it could not be determined). Never raises and never blocks startup.
 
-    The migration is completed by each account owner logging in, and nothing
-    here can finish it for them: a hash that means "the first 72 bytes" can
-    only become a pre-image hash by someone supplying the plaintext. What the
-    operator can do is SEE whether it is draining, which is the difference
-    between "three dormant accounts still authenticate on a 72-byte prefix" and
-    "the migration completed on day one".
-
-    There is deliberately no force option alongside this. Revoking a
-    pre-migration hash is the only way to finish one without the plaintext, and
-    this codebase has no password-reset path to revoke one with: a force switch
-    would not migrate anything, it would permanently lock out every account
-    that has not logged in since the upgrade, including on a fresh deploy an
-    operator has flipped the switch on to be thorough. Reporting the remainder
-    costs nothing and locks nobody out; a forced cutoff would have to wait for
-    a reset flow to exist (#387).
-
-    Never raises and never blocks startup. A count that fails is not worth
-    failing a boot over, and the next restart tries again.
+    There is deliberately no force option. Revoking a pre-migration hash is the only way to
+    finish one without the plaintext, and this codebase has no password-reset path to
+    revoke one with: a force switch would not migrate anything, it would permanently lock
+    out every account that has not logged in since the upgrade.
     """
     s = store
     if s is None:
@@ -2114,46 +1647,35 @@ async def report_legacy_password_hashes() -> int | None:
 
 
 async def bootstrap_admin() -> None:
-    """Seed the bootstrap admin from config (once, at startup). Never overwrites
-    an existing account's password. Safe under concurrent worker startups: the
-    duplicate / write-lock races are handled instead of failing startup (which
-    would restart-loop the worker).
+    """Seed the bootstrap admin from config (once, at startup). Never overwrites an existing
+    account's password. Safe under concurrent worker startups: the duplicate / write-lock
+    races are handled instead of failing startup.
 
-    The configured credentials go through the same ``validate_email`` /
-    ``validate_password`` guards as every other path into the user table. A
-    config value the validators reject is refused, loudly, and no account is
-    created -- but the process still starts, so a typo in one env var cannot take
-    the whole API (and /health) down and leave nobody able to reach the service
-    to fix it. An operator must correct the config and restart.
+    A value the validators reject is refused, loudly, and no account is created -- but the
+    process still starts, so a typo in one env var cannot take the whole API (and /health)
+    down and leave nobody able to reach the service to fix it.
 
-    An admin account left behind by an earlier run with weak credentials is
-    deliberately NOT deleted: this runs at startup, unauthenticated, and
-    removing the only admin account would lock every operator out of their own
-    deployment. Such an account is reported instead, so it gets rotated.
+    An admin account left behind by an earlier run with weak credentials is deliberately NOT
+    deleted: this runs at startup, unauthenticated, and removing the only admin account
+    would lock every operator out of their own deployment.
     """
     email = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
     password = config.AUTH_ADMIN_PASSWORD or ""
     if not email or not password:
         return
-    # The config values are the one remaining path into the user table that does
-    # not go through the validators, so a typo like AUTH_ADMIN_PASSWORD=x used to
-    # provision a full-admin account with a 1-character password that the signup
-    # endpoint would itself have rejected. Run both through those validators.
+    # The config values are the one remaining path into the user table that does not go
+    # through the validators, so a typo like AUTH_ADMIN_PASSWORD=x used to provision a
+    # full-admin account with a 1-character password the signup endpoint would itself have
+    # rejected.
     #
-    # The rejection is a permanent, config-level fault: retrying it five times
-    # inside the write-lock loop below would re-log the identical error five
-    # times and change nothing, so it returns before reaching that loop. The loop
-    # still retries genuine transient faults (SQLite write locks) as before.
-    # The password is validated first, and unconditionally, so that the advice
-    # given for an EMAIL fault can still say whether the account sitting behind
-    # it is on a weak password. A deploy that ran pre-validator main can have
-    # both faults at once, and reporting only the address would hide a live
-    # 1-character admin password.
+    # The rejection is a permanent, config-level fault: retrying it inside the write-lock
+    # loop below would re-log the identical error and change nothing, so it returns before
+    # reaching that loop. The loop still retries genuine transient faults (SQLite write
+    # locks).
     #
-    # Length is judged on the whole configured value, and so is everything else
-    # about it: hash_password hands bcrypt a fixed-width pre-image, so every
-    # byte of this passphrase becomes part of the credential and none of it is
-    # dropped. See _password_rejection for why there is still no maximum.
+    # The password is validated first, and unconditionally, so the advice given for an EMAIL
+    # fault can still say whether the account behind it is on a weak password: a deploy that
+    # ran pre-validator main can have both faults at once.
     password_error = _password_rejection(password)
 
     email_error = _validator_rejection(validate_email, email)
@@ -2194,24 +1716,18 @@ async def bootstrap_admin() -> None:
 async def _reject_bootstrap(
     variable: str, reason: str, *, hint: str, password_rejected: str | None
 ) -> None:
-    """Log that the configured bootstrap admin credentials were refused, and
-    report (never delete) an account a previous run already created from the
-    same bad value.
+    """Log that the configured bootstrap admin credentials were refused, and report (never
+    delete) an account a previous run already created from the same bad value.
 
-    Must stay loud and specific: the operator reading the log has to learn that
-    AUTH_ADMIN_PASSWORD -- not the login endpoint -- is the thing to fix, so the
-    message names the variable, the validator that rejected it, the validator's
-    own reason, and the fix.
+    Must stay loud and specific: the operator has to learn that AUTH_ADMIN_PASSWORD -- not
+    the login endpoint -- is the thing to fix.
     """
-    # A weak admin may already exist from a run that predates the validators.
-    # Removing it here would be an unauthenticated, startup-time way to delete
-    # the only admin account and lock every operator out, so the row is left
-    # alone and surfaced loudly for out-of-band rotation instead.
+    # A weak admin may already exist from a run that predates the validators. Removing it
+    # here would be an unauthenticated, startup-time way to delete the only admin account
+    # and lock every operator out, so the row is left alone and surfaced loudly instead.
     #
-    # "Rotate" is demanded only when the configured value is genuinely the
-    # account's current password. A config value that merely fails validation
-    # says nothing about a healthy admin's password, so demanding rotation of an
-    # unrelated account on every worker restart would be a false alarm.
+    # "Rotate" is demanded only when the configured value is genuinely the account's current
+    # password; a value that merely fails validation says nothing about a healthy admin's.
     if store is not None:
         probe = (config.AUTH_ADMIN_EMAIL or "").strip().lower()
         existing = None
@@ -2225,22 +1741,15 @@ async def _reject_bootstrap(
             )
             existing = None
         if existing is not None and existing.role == "admin":
-            # Rotation is warranted by a conjunction of two facts about the
-            # ACCOUNT, neither of which is "which variable failed": the stored
-            # password must actually be the configured one (proving this account
-            # was provisioned from the bad config), AND the password must itself
-            # have failed validation. Requiring both means an email fault on a
-            # healthy admin never nags, while a pre-validator deploy carrying
-            # both faults is still told to rotate -- a live 1-character admin
-            # password is exactly what an operator must hear about.
+            # Rotation needs BOTH facts about the ACCOUNT, neither being "which variable
+            # failed": the stored password must be the configured one (proving this account
+            # came from the bad config), AND the password must itself have failed
+            # validation. Requiring both means an email fault on a healthy admin never nags.
             if password_rejected and verify_password(
                 config.AUTH_ADMIN_PASSWORD or "", existing.password_hash
             ):
-                # The remedy here is a PASSWORD rotation, so the hint must be the
-                # password one. Passing through `hint` unchanged would pair
-                # "Rotate that account's password" with an email remedy
-                # ("set it to a valid address") on the email axis, sending the
-                # operator to fix the wrong variable.
+                # The remedy here is a PASSWORD rotation, so the hint must be the password
+                # one; passing `hint` through would send the operator to the wrong variable.
                 logger.error(
                     "bootstrap admin %s is REJECTED by validation: %s rejected the configured %s: %s. "
                     "No account was created, and the pre-existing admin account (id %s) -- whose "
@@ -2252,9 +1761,6 @@ async def _reject_bootstrap(
                     hint, _password_hint("password must contain a letter and a digit"),
                 )
             elif _validator_name_for(variable) != "validate_password":
-                # The account is on a different, valid password, so the fault is
-                # purely the configured address: say that, and do not send the
-                # operator to rotate a password that is not the problem.
                 logger.error(
                     "bootstrap admin NOT created: %s rejected the configured %s: %s. The "
                     "pre-existing admin account (id %s) was left untouched and keeps its current "
@@ -2279,14 +1785,9 @@ async def _reject_bootstrap(
 
 
 def _password_hint(reason: str) -> str:
-    """The remediation hint for a ``validate_password`` reason.
-
-    Keyed on the reason so the advice can never contradict it -- one fixed hint
-    would tell an operator to lengthen a password that was rejected for having
-    no digit. It enumerates every reason ``_password_rejection`` can return; the
-    too-long case is gone entirely now that the policy has no maximum, so a
-    "lengthen it" branch here would have nothing left to describe.
-    """
+    """The remediation hint for a ``validate_password`` reason, keyed on the reason so the
+    advice can never contradict it -- one fixed hint would tell an operator to lengthen a
+    password that was rejected for having no digit."""
     if "at least" in reason:
         return (
             f"set it to a password of at least {config.AUTH_PASSWORD_MIN_LEN} characters "
@@ -2294,8 +1795,6 @@ def _password_hint(reason: str) -> str:
         )
     if "letter and a digit" in reason:
         return "set it to a password containing both a letter and a digit, then restart"
-    # A future reason must not fall through to advice that could be wrong, so
-    # the fallback stays reason-agnostic.
     return "set AUTH_ADMIN_PASSWORD to a password that satisfies the password policy, then restart"
 
 

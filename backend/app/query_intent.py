@@ -3,54 +3,34 @@ import re
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# The app serves Indian news, so 'today' follows the Indian calendar, not the
-# host's: between 00:00 and 05:30 IST the UTC date is still the previous day,
-# which would resolve the wrong year around New Year on a UTC server.
-# `tzdata` is pinned in requirements.txt: stdlib zoneinfo falls back to that
-# package when the host has no system tz database. That pin -- not the stdlib
-# alone -- is what makes this zone resolvable on a slim container. If it is not
-# installed (an image built from older requirements, or a deploy that skips
-# `pip install -r requirements.txt`), this import raises ZoneInfoNotFoundError
-# and the app dies at boot; there is deliberately no degraded UTC-offset
-# fallback, because deployments always install requirements.txt.
+# 'Today' follows the Indian calendar, not the host's: between 00:00 and 05:30 IST the UTC date is
+# still the previous day, which would resolve the wrong year around New Year on a UTC server.
 _IST = ZoneInfo("Asia/Kolkata")
 
 
 def _now() -> datetime:
-    """The current instant, as an aware UTC datetime. This is the module's
-    single clock seam: tests freeze time by patching this helper
-    (``monkeypatch.setattr(query_intent, "_now", lambda: frozen)``) rather than
-    the imported ``datetime`` class, so they keep working if this changes."""
     return datetime.now(UTC)
 
 
 def _today() -> date:
-    """Today's date in Asia/Kolkata (UTC+05:30). Single source of 'now' for
-    this module; the conversion from UTC happens here so freezing ``_now``
-    still exercises the Indian-calendar resolution."""
     return _now().astimezone(_IST).date()
 
 
 def _current_year() -> int:
-    """The current Indian year, computed at call time so resolution stays
-    correct across a calendar-year boundary in a long-running process."""
     return _today().year
 
 _YEAR_RE = re.compile(r"\b(20\d{2}|19\d{2})\b")
-# Full year span: '2024 to 2025', '2023-2025', '2023 through 2025'.
 _YEAR_SPAN_RE = re.compile(
     r"\b(20\d{2}|19\d{2})\s*(?:-|to|through|and)\s*(20\d{2}|19\d{2})\b", re.IGNORECASE
 )
-# Short year span: '2024-25' -> years 2024 and 2025 (same century). The trailing
-# \b on the 2-digit year keeps it from matching inside a 4-digit year.
+# Short year span: '2024-25' -> 2024 and 2025; the trailing \b keeps it out of a 4-digit year.
 _YEAR_SPAN_SHORT_RE = re.compile(
     r"\b(20\d{2}|19\d{2})\s*(?:-|to|through)\s*(\d{2})\b", re.IGNORECASE
 )
 _LAST_YEAR_RE = re.compile(r"\b(?:the\s+)?last\s+year\b|\bprevious\s+year\b", re.IGNORECASE)
 _THIS_YEAR_RE = re.compile(r"\b(?:this|current)\s+year\b", re.IGNORECASE)
 _FLASHBACK_RE = re.compile(r"\bflashback\s+(20\d{2}|19\d{2})\b", re.IGNORECASE)
-# Word-form counts for 'top ten deals' (mirrors the digit form). Built
-# longest-first so 'fourteen' matches before 'four'.
+# Word-form counts, built longest-first so 'fourteen' wins over 'four'.
 _UNITS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
     "eight": 8, "nine": 9,
@@ -64,8 +44,6 @@ _TENS = {
     "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
 }
 _NUMBER_WORDS = dict(_UNITS, **_TEENS, **_TENS)
-# Concatenated tens+unit compounds ('fortyfive', 'twentyone') plus the plain
-# tens ('forty') for standalone use.
 for _tens_word, tens_val in _TENS.items():
     _NUMBER_WORDS[_tens_word] = tens_val
     for _unit_word, unit_val in _UNITS.items():
@@ -73,8 +51,6 @@ for _tens_word, tens_val in _TENS.items():
 _NUMBER_WORDS["hundred"] = 100
 _NUM_WORD_ALT = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
 _WORD_SEP = r"(?:\s+|-|\s+-\s+)"
-# 'top 10' or 'top ten', 'top twenty five', 'top twenty-five', 'best ten'.
-# Any list-hint word (top/best/leading/biggest/largest) may precede the count.
 _TOP_HINT_ALT = r"top|best|leading|biggest|largest"
 _TOP_N_RE = re.compile(
     rf"\b({_TOP_HINT_ALT})\s+((?:\d{{1,4}})|(?:(?:{_NUM_WORD_ALT})(?:{_WORD_SEP}(?:{_NUM_WORD_ALT}))*))\b",
@@ -82,13 +58,9 @@ _TOP_N_RE = re.compile(
 )
 _TOP_HINT_RE = re.compile(r"\b(best|leading|biggest|largest|top)\b", re.IGNORECASE)
 _DEFAULT_LIST_K = 10
-# Superlative/aggregation hints beyond the plain list words. These signal the
-# user wants a ranked/aggregated answer over many items ("biggest funding
-# rounds", "highest valued startups", "most active investors") rather than a
-# single fact. "most" only counts when it precedes an aggregation noun
-# (active/funded/valued/...): bare "most" is far too common ("most of the time").
-# "least" is a genuine superlative ("least funded"), but the common threshold
-# phrase "at least" must NOT be treated as one, so we negative-lookbehind "at ".
+# Superlatives that mean a ranked answer over many items. "most" counts only before an aggregation
+# noun ("most of the time" is not one), and "least" is excluded after "at " so the threshold phrase
+# "at least" does not read as a superlative.
 _SUPERLATIVE_ALT = r"biggest|largest|highest|greatest|maximum|smallest|lowest|(?<!at\s)least"
 _AGG_NOUN_ALT = (
     r"active|funded|funding|invested|investing|investments?|valuable|valued|"
@@ -98,7 +70,6 @@ _AGG_NOUN_ALT = (
 _SUPERLATIVE_RE = re.compile(
     rf"\b({_SUPERLATIVE_ALT})\b|\bmost\s+({_AGG_NOUN_ALT})\b", re.IGNORECASE
 )
-# Filler/time words dropped when extracting a bare topic from a query
 _NOISE_WORDS_RE = re.compile(
     r"\bof\b|\bin\b|\bfor\b|\bto\b|\bmonth\b|\bmonths\b|\byear\b|\byears\b|\bflashback\b",
     re.IGNORECASE,
@@ -135,20 +106,18 @@ _MONTH_ALT = (
     r"november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
 )
 _MONTH_RE = re.compile(rf"\b({_MONTH_ALT})\b", re.IGNORECASE)
-# A span of months: 'jan-march', 'january to march 2025', 'january 2025 to march
-# 2025', 'between january and march'. Each month may carry its own year.
+# A span of months; each side may carry its own year.
 _MONTH_SPAN_RE = re.compile(
     rf"\b({_MONTH_ALT})\b(?:\s+(?:of\s+)?((?:19|20)\d{{2}}))?\s*(?:-|to|through|and)\s*"
     rf"\b({_MONTH_ALT})\b(?:\s+(?:of\s+)?((?:19|20)\d{{2}}))?",
     re.IGNORECASE,
 )
-# month(+optional year) with optional filler words: "january 2025", "of month january 2025", "in jan"
+# month (+optional year), tolerating filler words between the two ("of month january 2025").
 _MONTH_YEAR_RE = re.compile(
     rf"\b({_MONTH_ALT})\b[^.\d]*(?:\b(20\d{{2}}|19\d{{2}})\b)?",
     re.IGNORECASE,
 )
 
-# Quarter references: 'Q1 2025', 'Q1-2025', "Q1'25", 'first quarter of 2025'.
 _QUARTER_MONTHS = {1: (1, 3), 2: (4, 6), 3: (7, 9), 4: (10, 12)}
 _QUARTER_WORD_ORDER = {
     "first": 1, "1st": 1,
@@ -165,18 +134,9 @@ _QUARTER_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Fiscal-year references: 'FY25', 'FY 25', "FY'25", 'FY2024-25', 'FY 2024 to 2025',
-# 'fiscal year 2025'. An Indian FY ending in year N spans Apr (N-1) to Mar N.
-# The groups are NAMED so `_fiscal_range` can pick whichever alternative
-# matched by name; this one grammar is shared with `_strip_time_tokens`, so a
-# syntax change cannot drift between resolving a range and stripping the token.
-# The last branch takes `\s*`, so the fused 'fiscal2020' spelling is a fiscal
-# year here too. That spelling used to be recognised ONLY by `_fiscal_range`
-# (whose private copy read `\bfiscal(?:\s+year)?\s*`) while this regex required
-# whitespace, so the date filter fired while the token survived into the
-# retrieval query. Resolving and stripping now share the permissive form, so
-# the token is removed like every other fiscal spelling; the alternative
-# (`\s+`) would instead have silently dropped the resolved range.
+# Fiscal-year references, in three named-group tiers (span / bare 'fy N' / 'fiscal year N' or
+# 'fiscal N'); the grammar is shared with `_strip_time_tokens` so resolving a range and stripping
+# its token cannot drift apart. An Indian FY ending in year N spans Apr (N-1) to Mar N.
 _FY_RE = re.compile(
     r"\bfy\s*(?P<fy_range_start>(?:19|20)?\d{2})\s*(?:-|to|through)\s*(?P<fy_range_end>(?:19|20)?\d{2})\b"
     r"|\bfy\s*'?(?P<fy_single>(?:19|20)?\d{2})\b"
@@ -185,9 +145,8 @@ _FY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# A year that names a historical event is a topic reference, not a
-# publication-date filter: 'the 2008 crisis' should surface retrospectives
-# written later, so the auto date filter is suppressed for such phrases.
+# An event-naming year ('the 2008 crisis') is a topic reference, not a publication-date filter:
+# such a query wants retrospectives written later.
 _EVENT_NOUNS = (
     "crisis", "crash", "bubble", "meltdown", "recession", "slowdown", "downturn",
     "pandemic", "epidemic", "outbreak", "war", "invasion", "battle", "conflict",
@@ -198,23 +157,16 @@ _EVENT_NOUNS = (
     "independence",
 )
 _EVENT_NOUN_ALT = "|".join(sorted(_EVENT_NOUNS, key=len, reverse=True))
-# '2008 (financial) crisis', 'the 2008 global financial crisis'
 _EVENT_YEAR_RE = re.compile(
     rf"\b((?:19|20)\d{{2}})\s+(?:\w+\s+){{0,2}}({_EVENT_NOUN_ALT})s?\b", re.IGNORECASE
 )
-# 'financial crisis of 2008', 'the crisis in 2008'
 _REV_EVENT_YEAR_RE = re.compile(
     rf"\b(?:\w+\s+){{0,2}}({_EVENT_NOUN_ALT})s?\s+(?:of|in)\s+((?:19|20)\d{{2}})\b", re.IGNORECASE
 )
 
-# Chart/table request filler: 'make a table of', 'show me a bar chart of',
-# 'create a pie chart for', 'top deals as a table'. These words describe the
-# requested OUTPUT format, not the topic, so they must be stripped from the
-# retrieval/rerank query or the embedding match is diluted ('make a table of
-# top 15 deals' would otherwise retrieve on 'make a table' instead of 'deals').
-# Table nouns exclude the 'table tennis' collocation (a topic, not a view
-# request) and need an article or format/form/view suffix in trailing position:
-# bare 'in table' is a common-noun phrase, not a view request.
+# Chart/table request filler: it names the requested OUTPUT format, not the topic, so leaving it
+# in dilutes the embedding match ('make a table of top 15 deals' retrieves on 'make a table').
+# Bare 'in table' is an ordinary noun phrase, so table views need a form/format/view suffix.
 _CHART_VERB = r"(?:show|draw|make|create|give|build|plot|display|present|share|convert)"
 _CHART_TYPE = r"(?:bar|line|pie|column|area|pictogram|pictograph)?\s*"
 _CHART_NOUN = r"(?:chart|graph|plot|diagram|pictogram|pictograph)"
@@ -234,14 +186,9 @@ _CHART_TRAIL_RE = re.compile(
 )
 
 
-# Content-type intent modifiers: 'interviews with X', 'founders of Y',
-# 'competitors of Z', 'appointments'. These name the kind of article the user
-# wants, distinct from its dealtype/industry. The bare modifier maps to a
-# canonical content-type keyword; main.resolve_content_type then promotes it to a
-# real facet value from the live `content_type` vocabulary (exact, then substring),
-# so an unknown corpus degrades to no filter (current behavior) rather than a
-# bogus value. Aliases are matched whole-word, longest-first, so 'competitors'
-# beats 'compete' and 'founder' beats 'found'.
+# Content-type modifiers name the kind of article wanted, distinct from its dealtype/industry; the
+# bare modifier becomes a keyword that main.resolve_content_type promotes from the live
+# `content_type` vocabulary, so an unknown corpus degrades to no filter rather than a bogus value.
 _CONTENT_TYPE_ALIASES: dict[str, str] = {
     "interview": "interview",
     "interviews": "interview",
@@ -259,10 +206,6 @@ _CONTENT_TYPE_ALIASES: dict[str, str] = {
 
 
 def extract_content_type(query: str) -> str | None:
-    """The canonical content-type keyword implied by ``query`` (e.g. 'interviews
-    with X' -> 'interview', 'founders of Y' -> 'founder'), or None when the query
-    carries no content-type modifier. Resolution to a real facet value happens in
-    main.resolve_content_type against the live vocabulary."""
     q = query.lower()
     for alias, kw in sorted(_CONTENT_TYPE_ALIASES.items(), key=lambda kv: -len(kv[0])):
         if re.search(r"\b" + re.escape(alias) + r"\b", q):
@@ -271,22 +214,16 @@ def extract_content_type(query: str) -> str | None:
 
 
 def _is_chart_request(text: str) -> bool:
-    """True when the query contains a chart/table request phrase, so its filler
-    words can be stripped from the retrieval topic."""
     return bool(_CHART_LEAD_RE.search(text) or _CHART_TRAIL_RE.search(text))
 
 
 def _strip_chart_filler(text: str) -> str:
-    """Remove chart/table request filler words, leaving the bare topic text."""
     s = _CHART_LEAD_RE.sub(" ", text)
     s = _CHART_TRAIL_RE.sub(" ", s)
     return s
 
 
 def _year_is_event_reference(query: str, year: int) -> bool:
-    """True when ``year`` appears in the query inside a historical-event phrase
-    (e.g. '2008 crisis' or 'financial crisis of 2008'), meaning it is a topic
-    reference rather than a publication-date filter."""
     for pattern, year_group in ((_EVENT_YEAR_RE, 1), (_REV_EVENT_YEAR_RE, 2)):
         for m in pattern.finditer(query):
             if int(m.group(year_group)) == year:
@@ -295,13 +232,8 @@ def _year_is_event_reference(query: str, year: int) -> bool:
 
 
 def _full_year(y: int, near: int) -> int:
-    """Expand a 2-digit year to 4 digits near ``near`` (e.g. '25' near 2024 ->
-    2025), handling century rollover ('99' near 2024 -> 1999).
-
-    A 50-year pivot is used: the 2-digit year is placed in ``near``'s century,
-    then rolled back a century if it falls more than 50 years ahead of ``near``
-    (e.g. '99' -> 2099 -> 1999) or forward a century if it falls more than 50
-    years behind (e.g. '20' near 2071 -> 1920 -> 2020)."""
+    """Expand a 2-digit year to 4 digits in ``near``'s century, rolling a century when that lands
+    more than 50 years away ('99' near 2024 -> 1999)."""
     if y >= 100:
         return y
     base = (near // 100) * 100
@@ -314,10 +246,8 @@ def _full_year(y: int, near: int) -> int:
 
 
 def extract_month_range(query: str) -> tuple[str, str] | None:
-    """Return (from_date, to_date) ISO strings for a month or span of months in
-    the query, e.g. 'january 2025' -> ('2025-01-01', '2025-01-31') and
-    'january to march 2025' -> ('2025-01-01', '2025-03-31'). Year defaults to
-    the current year when not given. None when no month is mentioned."""
+    """(from_date, to_date) ISO strings for a month or month span ('january to march 2025'); year
+    defaults to the current year, None when no month is mentioned."""
     q = query.lower()
     span = _extract_month_span(q)
     if span is not None:
@@ -333,11 +263,8 @@ def extract_month_range(query: str) -> tuple[str, str] | None:
 
 
 def _extract_month_span(query: str) -> tuple[str, str] | None:
-    """A span of months as (from_date, to_date), or None. Handles 'jan-march',
-    'january to march 2025', 'january 2025 to march 2025', and 'january and
-    february'. A reverse span (e.g. 'may to march') crosses a year boundary; a
-    single year anchors the month it is written next to ('dec to jan 2024' ->
-    2023-12..2024-01, 'dec 2023 to jan' -> 2023-12..2024-01)."""
+    """A span of months as (from_date, to_date), or None. A lone written year anchors the month it
+    sits beside ('dec to jan 2024' -> 2023-12..2024-01)."""
     m = _MONTH_SPAN_RE.search(query)
     if not m:
         return None
@@ -345,19 +272,11 @@ def _extract_month_span(query: str) -> tuple[str, str] | None:
     m2 = _MONTHS[m.group(3)]
     crosses_year = m1 > m2
     if y1 and y2:
-        # Two explicit years: honor each side's year exactly (e.g. 'dec 2023 to
-        # jan 2024' -> start 2023-12, end 2024-01).
         start_year, end_year = int(y1), int(y2)
     elif y2:
-        # One explicit year attached to the END month (e.g. 'dec to jan 2024'):
-        # it anchors the end, so a boundary-crossing span starts the year BEFORE
-        # it, not a year after (2023-12 to 2024-01).
         end_year = int(y2)
         start_year = end_year - 1 if crosses_year else end_year
     elif y1:
-        # One explicit year attached to the START month (e.g. 'dec 2023 to
-        # jan'): it anchors the start, so a boundary-crossing span ends the year
-        # after it (2023-12 to 2024-01).
         start_year = int(y1)
         end_year = start_year + 1 if crosses_year else start_year
     else:
@@ -370,8 +289,8 @@ def _extract_month_span(query: str) -> tuple[str, str] | None:
 
 
 def _quarter_range(query: str) -> tuple[str, str] | None:
-    """(from_date, to_date) for a quarter reference ('Q1 2025', 'first quarter
-    of 2025'), or None. Year defaults to the current year when not given."""
+    """(from_date, to_date) for a quarter reference ('Q1 2025', 'first quarter of 2025'), or None;
+    year defaults to the current year."""
     q = query.lower()
     m = _Q_YEAR_RE.search(q)
     if m:
@@ -391,34 +310,21 @@ def _quarter_range(query: str) -> tuple[str, str] | None:
 
 
 def _fiscal_range(query: str) -> tuple[str, str] | None:
-    """(from_date, to_date) for a fiscal-year reference ('FY25', 'FY 2024-25',
-    'fiscal year 2025'), or None. FY ending in year N spans Apr (N-1) to Mar N."""
+    """(from_date, to_date) for a fiscal-year reference ('FY25', 'FY 2024-25'), or None."""
     q = query.lower()
-    # One grammar (`_FY_RE`, also used by `_strip_time_tokens`) in three
-    # priority tiers: an explicit span, then a bare 'fy N', then
-    # 'fiscal year N'/'fiscal N'. A tier wins wherever it appears, so the
-    # matches are scanned in full rather than taking the leftmost one --
-    # otherwise 'fiscal 2025 and fy 2020-2021' would resolve 2025.
+    # A tier wins wherever it appears, so all matches are scanned instead of taking the leftmost
+    # ('fiscal 2025 and fy 2020-2021').
     matches = list(_FY_RE.finditer(q))
     span = next((m for m in matches if m.group("fy_range_start")), None)
     if span:
         y1 = _full_year(int(span.group("fy_range_start")), _current_year())
         y2 = _full_year(int(span.group("fy_range_end")), y1)
-        # An FY span lists the start and end years (e.g. 'FY 2024-25' ->
-        # FY2024-2025). When written end-first ('fy 2025-24') the larger
-        # number is still the ending year, so take min/max rather than a
-        # wrong century rollover. `start` is the first fiscal year of the
-        # span and `end` the year the last one closes, so a multi-year span
-        # ('fy 2020-2025') spans the whole range: Apr (start) to Mar (end);
-        # that window starts on f"{start}-04-01" and closes on
-        # f"{end}-03-31", so it is only valid while start < end.
+        # 'FY 2024-25' lists the first and last fiscal year, and an end-first spelling ('fy 2025-24')
+        # still ends on the larger number, so min/max rather than let _full_year roll the century.
         start = min(y1, y2)
         end = max(y1, y2)
-        # min/max guarantees start <= end, so start == end is the sole
-        # inverted-window case. It means the span names one year twice
-        # ('fy 25-25', 'fy 2025-25', 'fy 2025 to 2025'), which is a single
-        # fiscal year, not a span: fall back to end - 1 as the start so the
-        # window stays valid instead of matching zero rows.
+        # min/max guarantees start <= end, so start == end is the sole inverted-window case ('fy 25-25'
+        # names one year twice): widen backwards instead of matching zero rows.
         if start == end:
             start = end - 1
         return (f"{start}-04-01", f"{end}-03-31")
@@ -434,11 +340,8 @@ def _fiscal_range(query: str) -> tuple[str, str] | None:
     return None
 
 
-# Rolling-window recency phrases ("this week", "today", "past 3 days") resolve to a
-# concrete recent date range so the filter excludes old evergreen articles. Softer
-# recency signals ("latest", "recent") have no fixed window and are handled by
-# ``is_recency_intent`` (a ranking weight) instead. Number-bearing forms capture
-# (count, unit) in groups 1-2 ("past 3 days") or 3-4 ("2 weeks ago").
+# Hard rolling windows resolve to a date range so the filter excludes old evergreen articles.
+# Number-bearing forms capture (count, unit) in groups 1-2 ("past 3 days") or 3-4 ("2 weeks ago").
 _RECENCY_WINDOW_RE = re.compile(
     r"\b(?:today|"
     r"this\s+week|past\s+week|last\s+week|"
@@ -447,43 +350,33 @@ _RECENCY_WINDOW_RE = re.compile(
     r"(\d+)\s*(day|days|week|weeks|month|months)\s*ago)\b",
     re.IGNORECASE,
 )
-# Soft recency/freshness signals express a preference for recent articles without
-# naming a fixed window: they weight recency in ranking rather than filtering.
-# 'current'/'upcoming' are excluded: 'current account' is a finance topic, and
-# 'upcoming' points at future events the corpus may not yet cover.
+# Soft recency signals weight ranking rather than filtering. 'current'/'upcoming' are excluded:
+# 'current account' is a finance topic, and 'upcoming' points past the corpus.
 _RECENCY_INTENT_RE = re.compile(
     r"\b(latest|recent|newest|freshest|fresh|lately|breaking|of\s+late)\b",
     re.IGNORECASE,
 )
 
+# Months are fixed at 30 days, which widens a 'past month' window by up to 2 days; a multiplier that
+# disagreed with `timedelta`'s month length would silently move the window boundary.
 _UNIT_DAYS = {"day": 1, "days": 1, "week": 7, "weeks": 7, "month": 30, "months": 30}
 
 
 def _days_ago_iso(days: int) -> str:
-    """ISO date ``days`` before today (Asia/Kolkata). Used for rolling recency
-    windows so the resolution matches the module's Indian-calendar 'now'."""
     return (_today() - timedelta(days=days)).isoformat()
 
 
 def _month_start_iso() -> str:
-    """ISO date of the first day of the current (Indian) month. Used to anchor
-    'this month' to the calendar boundary so prior-month articles are excluded."""
     return _today().replace(day=1).isoformat()
 
 
 def _week_start_iso() -> str:
-    """ISO date of Monday of the current week (Indian 'now'). Used to anchor
-    'this week' to the calendar boundary so last week's articles are excluded."""
     t = _today()
     return (t - timedelta(days=t.weekday())).isoformat()
 
 
 def extract_recency_range(query: str) -> tuple[str, str] | None:
-    """(from_date, to_date) ISO strings for a rolling recency window in the
-    query ('this week', 'this month', 'today', 'past 3 days', '2 weeks ago'), or
-    None. A hard window is applied so old evergreen articles are filtered out;
-    soft recency signals ('latest', 'recent') have no fixed window and are left
-    to ``is_recency_intent`` (ranking weight) instead."""
+    """(from_date, to_date) ISO strings for a hard rolling recency window ('this week', 'past 3 days'), or None."""
     m = _RECENCY_WINDOW_RE.search(query)
     if not m:
         return None
@@ -494,9 +387,8 @@ def extract_recency_range(query: str) -> tuple[str, str] | None:
     text = m.group(0).lower()
     if "today" in text:
         return (_days_ago_iso(0), _today().isoformat())
-    # 'this week'/'this month' anchor to the calendar boundary of the current
-    # week/month so prior-period articles are excluded; other week/month forms
-    # ('past week', 'last month') keep their rolling window semantics.
+    # 'this week'/'this month' anchor to the calendar boundary so prior-period articles are excluded;
+    # other forms ('past week', 'last month') keep their rolling window.
     if "this week" in text:
         return (_week_start_iso(), _today().isoformat())
     if "this month" in text:
@@ -509,38 +401,25 @@ def extract_recency_range(query: str) -> tuple[str, str] | None:
 
 
 def strip_recency_window(query: str) -> str:
-    """Remove rolling-window recency phrases ('this week', 'today', 'past 3 days')
-    from a query, leaving the bare topic text for retrieval."""
+    """Remove rolling-window recency phrases ('this week', 'past 3 days'); only after
+    ``extract_recency_range``, since stripping first discards the window the date filter is built
+    from."""
     return _RECENCY_WINDOW_RE.sub(" ", query).strip()
 
 
 def strip_recency_intent(query: str) -> str:
-    """Remove soft recency/freshness signals ('latest', 'recent', 'fresh') from a
-    query, leaving the bare topic text for retrieval. The recency intent for
-    ranking (``is_recency_intent``) must be detected on the original query, so
-    this only affects retrieval text, never intent detection."""
+    """Remove soft recency signals ('latest', 'recent') from the retrieval text only;
+    ``is_recency_intent`` reads the original query."""
     return _RECENCY_INTENT_RE.sub(" ", query).strip()
 
 
 def is_recency_intent(query: str) -> bool:
-    """True when the query expresses a soft recency/freshness preference ('latest
-    news', 'recent funding', 'fresh updates') with no fixed window. Such queries
-    should weight recency in ranking so recent articles outrank old evergreen
-    ones. Hard-window phrases ('this week') are filtered separately and are not
-    flagged here."""
     return bool(_RECENCY_INTENT_RE.search(query))
 
 
 def extract_year_range(query: str) -> tuple[str, str] | None:
-    """Return (from_date, to_date) ISO strings for a time window mentioned in the
-    query: a specific month or month span ('january 2025', 'jan-march'), a fiscal
-    year ('FY25'), a quarter ('Q1 2025'), a year span ('2024-25', '2023 to
-    2025'), an explicit year, or 'last year'/'this year'. Month spans take
-    precedence, then fiscal, then quarter, then year span.
-
-    An explicit year that names a historical event ('2008 crisis', 'financial
-    crisis of 2008') is NOT treated as a publication-date filter: such queries
-    want retrospectives written later, not only articles published that year."""
+    """(from_date, to_date) ISO strings for a time window in the query -- month, month span, fiscal
+    year, quarter, year span, explicit year, 'last/this year' -- tried in that precedence order."""
     q = query.lower()
     month_range = extract_month_range(q)
     if month_range is not None:
@@ -554,17 +433,14 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
     m = _YEAR_SPAN_RE.search(q)
     if m:
         y1, y2 = int(m.group(1)), int(m.group(2))
-        # A descending span ('2025 to 2024') is the same window written
-        # end-first; normalize to the ascending range instead of emitting an
-        # inverted (from > to) date window that matches nothing.
+        # A descending span ('2025 to 2024') is the same window end-first; emitting it inverted
+        # (from > to) would match nothing.
         start, end = min(y1, y2), max(y1, y2)
         return (f"{start}-01-01", f"{end}-12-31")
     m = _YEAR_SPAN_SHORT_RE.search(q)
     if m:
         start = int(m.group(1))
         end = _full_year(int(m.group(2)), start)
-        # A descending short span ('2024-23') is just a reversed year span;
-        # normalize to the ascending range instead of a century rollover.
         start, end = min(start, end), max(start, end)
         return (f"{start}-01-01", f"{end}-12-31")
     if _LAST_YEAR_RE.search(q):
@@ -584,8 +460,6 @@ def extract_year_range(query: str) -> tuple[str, str] | None:
 
 
 def _top_n_to_int(phrase: str) -> int | None:
-    """Convert a 'top N' count phrase ('10', 'ten', 'twenty five') to an int,
-    or None when the phrase is not a recognizable count."""
     if phrase.isdigit():
         return int(phrase)
     total = 0
@@ -598,10 +472,8 @@ def _top_n_to_int(phrase: str) -> int | None:
 
 
 def normalize_word_numbers(query: str) -> str:
-    """Rewrite word-form counts after a list hint to digits so the retrieval
-    query matches the numeric form exactly: 'top ten ipo' -> 'top 10 ipo'.
-    Without this the literal word 'ten' pollutes the embedding/rerank match
-    (it can match titles like 'Ten Sports'), while the digit form does not."""
+    """Rewrite word-form counts after a list hint to digits ('top ten ipo' -> 'top 10 ipo'): the
+    literal word matches titles ('Ten Sports') where the digit form does not."""
     def _replace(m: re.Match) -> str:
         n = _top_n_to_int(m.group(2))
         return f"{m.group(1)} {n}" if n is not None else m.group(0)
@@ -610,11 +482,8 @@ def normalize_word_numbers(query: str) -> str:
 
 
 def suggested_top_k(query: str) -> int | None:
-    """Suggested top_k from a 'top N' in the query (digit or word form, e.g.
-    'top ten'), or a small default for a generic top/best intent without a
-    number. Also defaults for a superlative/aggregation intent ('biggest
-    funding rounds', 'most active investors') so chat fetches enough articles
-    to aggregate into a ranked list. None when no list intent."""
+    """Suggested top_k from a 'top N' in the query, else ``_DEFAULT_LIST_K`` for a bare list or
+    superlative intent so chat fetches enough articles to rank; None when no list intent."""
     m = _TOP_N_RE.search(query)
     if m:
         n = _top_n_to_int(m.group(2))
@@ -626,27 +495,16 @@ def suggested_top_k(query: str) -> int | None:
 
 
 def _is_superlative(query: str) -> bool:
-    """True when the query uses a superlative/aggregation phrase ('biggest',
-    'highest', 'most active'), independent of any explicit 'top N' count."""
     return bool(_SUPERLATIVE_RE.search(query))
 
 
 def is_aggregation_intent(query: str) -> bool:
-    """True when the query asks for a ranked/aggregated answer over many items
-    (a 'top N' count, a top/best/leading hint, or a superlative like 'biggest
-    funding rounds' / 'most active investors'), so chat must present a ranked
-    top-N with the metric that justifies the ordering rather than isolated
-    single items. Used to widen the retrieved source set and to trigger the
-    ranked-list prompt and refusal nudge."""
     return suggested_top_k(query) is not None
 
 
 def _strip_time_tokens(text: str) -> str:
-    """Remove fiscal/quarter/month/year/time filler tokens from a query, leaving
-    the bare topical text. Time-word regexes are applied longest-first so a
-    compound token ('FY 2024-25', 'jan to march') is removed before its parts.
-    Chart/table request filler ('make a table of') is stripped first when the
-    query is a chart request, so the output-format words never reach retrieval."""
+    """Remove fiscal/quarter/month/year filler tokens, longest-first so a compound token
+    ('FY 2024-25', 'jan to march') goes before its parts; chart/table filler goes first."""
     if _is_chart_request(text):
         text = _strip_chart_filler(text)
     s = _FY_RE.sub(" ", text)
@@ -666,13 +524,8 @@ def _strip_time_tokens(text: str) -> str:
 
 
 def rewrite_year_in_review(query: str) -> tuple[str, bool]:
-    """For 'top/best <topic> in <year>' style queries, rewrite to surface the
-    year-in-review ('Flashback <year>') articles. Returns (query, changed).
-
-    Queries that mention a specific MONTH are NOT rewritten: Flashback articles
-    are annual roundups, so a month-scoped query should match the month's actual
-    articles instead. Range/fiscal/quarter queries are not rewritten either —
-    they want the span's own data, not a single annual roundup."""
+    """Rewrite 'top/best <topic> in <year>' to surface 'Flashback <year>' articles; returns (query,
+    changed). Month-scoped and range/fiscal/quarter queries want their own span, not a roundup."""
     if extract_month_range(query) is not None:
         return query, False
     topic = extract_list_topic(query)
@@ -684,10 +537,8 @@ def rewrite_year_in_review(query: str) -> tuple[str, bool]:
 
 
 def _referenced_year(query: str) -> int | None:
-    """The year referenced by the query (explicit, last/this year, or an
-    explicit 'Flashback <year>' prefix), else None. Range, fiscal-year, and
-    quarter queries return None: they span more than a single calendar year (or
-    a sub-year period) and must not collapse into one annual roundup."""
+    """The single year referenced, or None when the query spans more than one (range, fiscal year,
+    quarter) and must not collapse into a roundup."""
     m = _FLASHBACK_RE.search(query)
     if m:
         return int(m.group(1))
@@ -704,13 +555,9 @@ def _referenced_year(query: str) -> int | None:
 
 
 def range_query_topic(query: str) -> str | None:
-    """Cleaned retrieval/rerank query for a query scoped by an auto date range
-    that is NOT a plain single year — a month, month span, quarter, fiscal year,
-    or year span — e.g. 'top 15 deals in Q1 2025' -> 'deals'. The date filter
-    already scopes the period, so dropping the 'top/quarter/fiscal/of/month/year'
-    words lets the embeddings and cross-encoder focus on the actual topic. None
-    for plain single-year queries (they keep their Flashback rewrite) or for
-    queries with no auto date range."""
+    """Bare topic for a query scoped by an auto date range that is not a plain single year ('top 15
+    deals in Q1 2025' -> 'deals'); the date filter already scopes the period. None for single-year
+    queries (which keep their Flashback rewrite) or unfiltered queries."""
     if extract_month_range(query) is not None:
         return extract_list_topic(query) or _strip_noise_words(query)
     if _quarter_range(query) is not None or _fiscal_range(query) is not None:
@@ -721,9 +568,6 @@ def range_query_topic(query: str) -> str | None:
 
 
 def extract_list_topic(query: str) -> str | None:
-    """The bare topic of a top-N query with year/time words removed, e.g.
-    'top 3 unicorns created in 2025' -> 'unicorns created'. None when the
-    query is not a top/best/list intent."""
     if _TOP_HINT_RE.search(query) is None and _TOP_N_RE.search(query) is None:
         return None
     stripped = _strip_time_tokens(query)
@@ -734,52 +578,34 @@ def extract_list_topic(query: str) -> str | None:
 
 
 def _strip_noise_words(query: str) -> str | None:
-    """Remove month/year/time filler words, leaving the bare query text."""
     q = _strip_time_tokens(query)
     q = re.sub(r"[\s-]+", " ", q).strip()
     return q or None
 
 
-# Acquisition relation direction. "who acquired X?" names X as the company that
-# WAS acquired (the target), whereas "what did X acquire?" names X as the company
-# that DID the acquiring (the buyer). Retrieval must honor this direction so it
-# surfaces the right counterpart instead of inverting the relation.
+# Acquisition relation direction. "who acquired X?" names X as the acquired company (the target),
+# "what did X acquire?" names X as the acquirer (the buyer); retrieval must honor the direction or
+# it inverts the relation.
 _ACQUIRE_VERB_RE = re.compile(
     r"\b(acquir\w+|bought|buyout|take\s*over|took\s*over|takeover)\b", re.IGNORECASE
 )
-# An active acquisition predicate: the grammatical subject in front of it is the
-# buyer, so "<interrogative> <predicate> X" makes X the target.
 _ACTIVE_ACQ_PREDICATE = (
     r"(?:has|have|had)\s+(?:acquired|bought|purchased|taken\s*over)"
     r"|(?:is|are|was|were)\s+(?:acquiring|buying|taking\s*over|(?:the\s+)?acquirers?)"
     r"|acquired|acquires|bought|buys|purchased|purchases|took\s*over|takes?\s*over"
 )
-# "who acquired X?" / "which company bought X?": the interrogative is the SUBJECT
-# of an active acquisition predicate, so the named company X is the target. The
-# predicate has to follow the interrogative directly, which keeps "who did X
-# acquire?" and "who was acquired by X?" -- where X is the buyer -- from matching.
+# "who acquired X?": the interrogative is the SUBJECT of the predicate, so X is the target. The
+# predicate must follow it directly, which is what separates it from "who did X acquire?" (X = buyer).
 _WHO_ACQUIRED_RE = re.compile(
     rf"\b(?:who|which\s+(?:compan(?:y|ies)|firms?|business(?:es)?))\s+(?:{_ACTIVE_ACQ_PREDICATE})\b",
     re.IGNORECASE,
 )
-# Longest connective span the relation patterns below will scan between their
-# two fixed ends ("both" ... "and", an acquire verb ... "by" ... "who"). Each
-# of them only ever asks whether a connective spans a SHORT clause, and real
-# multi-clause queries put one in the tens of characters -- "companies backed
-# by both SoftBank and Tiger Global" spans 14 from "both" to "and" -- so the
-# bound is invisible on real input. 200 is several times the longest span any
-# sensible query needs and a large slice of the 512 characters /search accepts
-# for `q`, so a query whose connective really did span 200+ characters is
-# itself pathological. The gap has to be bounded because the input is the
-# caller's query: an unbounded `.*?` gap is rescanned from each of the k
-# literal start positions, so one search costs O(n^2) in query length and a
-# long /search query becomes a CPU burn (the /search endpoint bounds `q` to a
-# few hundred characters, which is what makes that blow-up reachable at all).
-# The LOWER bound is per-pattern and is not always 0: it must reproduce what
-# the pre-fix gap required. A gap that was `.+?` (one-or-more) must stay
-# one-or-more, because a zero floor widens the matcher whenever the prefix
-# ends in a consumable character rather than a zero-width `\b`. See
-# `_ALL_OF_RE` for the one pattern that needs `{1,N}?`; the rest take `{0,N}?`.
+# Longest connective span the relation patterns scan between their two fixed ends; real multi-clause
+# queries put one in the tens of characters, so the bound is invisible on real input. It must be
+# bounded because the input is the caller's query and an unbounded `.*?` gap is rescanned from each
+# literal start position, making one search O(n^2) in query length. A gap that was `.+?` must stay
+# one-or-more (see `_ALL_OF_RE`): a zero floor widens a matcher whose prefix ends in a consumable
+# character rather than a zero-width `\b`.
 _MAX_CONNECTIVE_SPAN = 200
 
 
@@ -788,8 +614,6 @@ _ACQUIRED_BY_RE = re.compile(
     rf"\bby\b[^.?!]{{0,{_MAX_CONNECTIVE_SPAN}}}?\b(who|whom)\b",
     re.IGNORECASE,
 )
-# "who did X acquire?" / "which company was acquired by X?": the interrogative
-# stands for the counterpart, so the named company X is the buyer.
 _BUYER_AUX_RE = re.compile(
     rf"\b(?:who|whom|what|which\s+\w+)\b[^.?!]{{0,{_MAX_CONNECTIVE_SPAN}}}?"
     rf"\b(?:did|does|do|has|have|had|is|are|was|were)\b"
@@ -805,18 +629,12 @@ _BUYER_TRAILING_RE = re.compile(
 
 
 def acquisition_relation(query: str) -> str | None:
-    """Infer the acquisition relation direction implied by ``query``.
-
-    Returns ``'target'`` when the named company is the one that WAS acquired
-    (e.g. "who acquired X?" -> X is the target), ``'buyer'`` when the named
-    company is the one doing the acquiring (e.g. "what did X acquire?" -> X is
-    the buyer), or ``None`` when the query has no acquisition-relation intent.
-    """
+    """``'target'`` when the named company was acquired ("who acquired X?"), ``'buyer'`` when it did
+    the acquiring ("what did X acquire?"), or ``None`` when the query carries no such intent."""
     if not _ACQUIRE_VERB_RE.search(query):
         return None
-    # Target patterns are the stricter ones, so they are tested first: "who has
-    # acquired X?" is a target query even though the looser buyer pattern would
-    # also match its "who ... has ... acquired" shape.
+    # Target patterns are the stricter ones, so they run first: "who has acquired X?" is a target
+    # query even though the looser buyer pattern matches its shape too.
     if _WHO_ACQUIRED_RE.search(query) or _ACQUIRED_BY_RE.search(query):
         return "target"
     if _BUYER_AUX_RE.search(query) or _BUYER_TRAILING_RE.search(query):
@@ -824,36 +642,25 @@ def acquisition_relation(query: str) -> str | None:
     return None
 
 
-# Comparison cues: a question that names two entities and asks to weigh them
-# against each other ("X vs Y", "compare A and B", "difference between A and B").
 _COMPARE_RE = re.compile(
     r"\b(versus|vs\.?|compare|compared to|compared with|"
     r"differences? between|contrast|how do(?:es)? .* compare)\b",
     re.IGNORECASE,
 )
-# Intersection cues: a question that wants what is shared across entities
-# ("companies backed by both A and B", "deals with all of A, B and C").
 _BOTH_AND_RE = re.compile(
     rf"\bboth\b.{{0,{_MAX_CONNECTIVE_SPAN}}}?\band\b", re.IGNORECASE
 )
 _ALL_OF_RE = re.compile(
-    # Lower bound 1, not 0: the pre-fix gap here was `.+?` (one-or-more), so
-    # `{0,N}?` would WIDEN the matcher. `\ball ` ends in a literal space, so a
-    # zero-length gap lets `\b(?:and|with)\b` match immediately after it --
-    # `search("all and")` flipped False -> True. That is not cosmetic: it
-    # changes the `_multi_entity_scaffold` output and flips
-    # `detect_multi_entity` from 'comparison' to 'intersection', which changes
-    # per-entity retrieval. The other four patterns here are unaffected by a
-    # zero floor because their prefixes end in a zero-width `\b` (so a word
-    # character cannot follow), or because their pre-fix gap was already
-    # `*?`/`.*` -- both zero-or-more, so `{0,N}?` is a faithful narrowing.
+    # Lower bound 1, not 0: this gap must stay one-or-more. `\ball ` ends in a literal space, so a
+    # zero-length gap lets `\b(?:and|with)\b` match right after it, flipping search("all and") to
+    # True -- which flips detect_multi_entity from 'comparison' to 'intersection'. The other four
+    # relation patterns end in a zero-width `\b`, so a zero floor cannot widen them.
     rf"\ball (?:of )?.{{1,{_MAX_CONNECTIVE_SPAN}}}?\b(?:and|with)\b",
     re.IGNORECASE,
 )
 
 
 def _strip_entities(text: str, entities: list[str]) -> str:
-    """Remove each entity mention (word-bounded, case-insensitive) from ``text``."""
     s = text
     for e in entities:
         if not e:
@@ -863,10 +670,9 @@ def _strip_entities(text: str, entities: list[str]) -> str:
 
 
 def _multi_entity_scaffold(query: str, entities: list[str]) -> str:
-    """The topical remainder of a multi-entity query once the entity names and the
-    comparison/intersection connectives are removed, e.g. 'compare funding of
-    SoftBank and Tiger Global' -> 'funding'. Used to build a per-entity retrieval
-    query that keeps the     topic while swapping in a single entity."""
+    """Topical remainder of a multi-entity query once entity names and connectives are removed
+    ('compare funding of SoftBank and Tiger Global' -> 'funding'); used to build a per-entity
+    retrieval query."""
     s = _strip_entities(query.lower(), entities)
     s = _COMPARE_RE.sub(" ", s)
     s = _BOTH_AND_RE.sub(" ", s)
@@ -877,11 +683,8 @@ def _multi_entity_scaffold(query: str, entities: list[str]) -> str:
 
 
 class MultiEntityQuery:
-    """A query that spans two or more entities, either as a comparison (weigh
-    entities against each other) or an intersection (what is shared across all of
-    them). ``entities`` are the extracted proper nouns; ``scaffold`` is the topic
-    left after stripping the entities and connectives, used to build a per-entity
-    retrieval query."""
+    """A query spanning two or more entities, as a comparison or an intersection. ``scaffold`` is
+    the topic left after stripping entities and connectives."""
 
     def __init__(self, mode: str, entities: list[str], scaffold: str):
         self.mode = mode
@@ -892,9 +695,8 @@ class MultiEntityQuery:
 def detect_multi_entity(query: str) -> "MultiEntityQuery | None":
     """Detect a comparison or intersection query over two or more entities.
 
-    Returns a :class:`MultiEntityQuery` when the query both names at least two
-    entities AND carries a comparison or intersection cue, else None. Single-entity
-    queries (the default path) return None so the caller's normal retrieval runs."""
+    Needs BOTH a cue and two or more named entities; a single-entity query returns None so the
+    caller's normal path runs, and an intersection cue wins over a comparison cue."""
     from app.rerank_boost import extract_entities
 
     entities = extract_entities(query)

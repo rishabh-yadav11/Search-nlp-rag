@@ -1,19 +1,15 @@
 """LLM-as-judge scorer for eval_runner.py output.
 
 Reads the JSON produced by eval_runner.py and scores each result on
-faithfulness, relevance, context precision, citation accuracy, recency,
-and refusal correctness using a Gemini judge model. Results are appended
-one-per-line to a JSONL log (crash-safe) and consolidated into a summary
-JSON + markdown report after the run completes.
-
-Prerequisites:
-  - GEMINI_API_KEY set in backend/.env
-  - eval_runner.py output JSON in eval_results/
+faithfulness, relevance, context precision, citation accuracy, recency and
+refusal correctness with a Gemini judge model. Results are appended one per line
+to a crash-safe JSONL log and consolidated into a summary JSON + markdown report
+once the run completes. Needs GEMINI_API_KEY in backend/.env and an
+eval_runner.py output JSON in eval_results/; scores land in
+eval_results/<timestamp>_scores.json and _scores_report.md.
 
     ./venv/bin/python scripts/eval_scorer.py eval_results/20260901T120000Z.json
     ./venv/bin/python scripts/eval_scorer.py eval_results/20260901T120000Z.json --start 1 --limit 5
-
-Results land in eval_results/<timestamp>_scores.json and <timestamp>_scores_report.md.
 """
 
 import argparse

@@ -1,6 +1,5 @@
-"""Click boost tests: disabled/empty short-circuit, no-signal pass-through
-(including the Redis-down degraded path), the min-article-clicks + min-share
-gating, score multiply + re-sort, and the no-change ordering guarantee.
+"""Click boost: short-circuits, no-signal pass-through (incl. the Redis-down
+degraded path), min-article-clicks + min-share gating, multiply + re-sort.
 click_signals is faked on the module so no Redis client is needed."""
 
 from types import SimpleNamespace
@@ -37,7 +36,7 @@ def _enable(monkeypatch, min_article=3, min_share=0.3, mult=1.3):
     monkeypatch.setattr(config, "CLICK_BOOST_MULT", mult)
 
 
-# --- short-circuits (line 17) ---
+# --- short-circuits ---
 
 
 def test_disabled_short_circuit_skips_signals(monkeypatch):
@@ -69,7 +68,7 @@ def test_empty_results_short_circuit_skips_signals(monkeypatch):
     assert called == []
 
 
-# --- no click signals (lines 20-21) ---
+# --- no click signals ---
 
 
 def test_no_click_signals_passthrough_unchanged(monkeypatch):
@@ -84,8 +83,7 @@ def test_no_click_signals_passthrough_unchanged(monkeypatch):
 
 
 def test_redis_down_degraded_signals_passthrough(monkeypatch):
-    # click_signals degrades to None when Redis is down -> apply_click_boost is
-    # a silent pass-through (no mutation, no re-sort). ERROR PATH — Redis down.
+    # ERROR PATH: Redis down makes click_signals return None, a silent pass-through.
     _enable(monkeypatch)
     monkeypatch.setattr(click_boost, "click_signals", _no_signals())
     results = [_res(1, 0.4), _res(2, 0.9)]
@@ -96,7 +94,7 @@ def test_redis_down_degraded_signals_passthrough(monkeypatch):
     assert [r.score for r in out] == [0.4, 0.9]
 
 
-# --- boost loop: gating + multiply + re-sort (lines 24-32) ---
+# --- boost loop: gating + multiply + re-sort ---
 
 
 def test_boost_applies_gating_multiplies_and_resorts(monkeypatch):
@@ -107,8 +105,7 @@ def test_boost_applies_gating_multiplies_and_resorts(monkeypatch):
     results = [_res(1, 0.5), _res(2, 0.9), _res(3, 0.8)]
     out = _run(click_boost.apply_click_boost("q", results))
 
-    # id 1 (5 clicks) and id 3 (8 clicks) qualify -> boosted; id 2 (2 clicks)
-    # below MIN_ARTICLE_CLICKS -> untouched.
+    # Ids 1 and 3 clear MIN_ARTICLE_CLICKS; id 2 does not.
     assert {r.id: r.score for r in out} == {
         1: pytest.approx(0.75),
         2: 0.9,
@@ -132,8 +129,7 @@ def test_boost_min_share_gate(monkeypatch):
 
 def test_boost_min_share_floor_at_one(monkeypatch):
     _enable(monkeypatch, min_article=1, min_share=0.3, mult=2.0)
-    # total = 1 (defaults to sum of by_id) -> int(1*0.3) = 0 -> max(1, 0) = 1,
-    # so a single click qualifies.
+    # max(1, int(1*0.3)) = 1, so a single click qualifies.
     monkeypatch.setattr(click_boost, "click_signals", _signals({1: 1}))
 
     out = _run(click_boost.apply_click_boost("q", [_res(1, 0.5)]))
@@ -158,6 +154,5 @@ def test_no_boost_change_keeps_original_order(monkeypatch):
 
     out = _run(click_boost.apply_click_boost("q", results))
 
-    # Nothing qualified -> changed stays False -> no re-sort (1 stays first even
-    # though it has the lower score).
+    # Nothing qualified -> no re-sort, so the lower score stays first.
     assert [r.id for r in out] == [1, 2]

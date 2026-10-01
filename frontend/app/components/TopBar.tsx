@@ -5,22 +5,18 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { AuthUser, getMe, logout } from '../lib/auth'
 
-// The nav is a literal move of the header that used to live inline on the
-// search page. The active item used to be hardcoded onto "Search"; it is now
-// derived from the route so every page that mounts this bar highlights itself.
+// The active item is derived from the route so every page that mounts this bar
+// highlights itself.
 const NAV: { href: string; label: string }[] = [
   { href: '/', label: 'Search' },
   { href: '/for-you', label: 'For You' },
   { href: '/chat', label: 'Chat' },
 ]
 
-// Admin-only route, so it is not part of the always-on nav list.
+// Admin-only route, excluded from the always-on nav list.
 const ANALYTICS_HREF = '/analytics/dashboard'
 
 /**
- * The app's single top bar: wordmark (+ optional page subtitle), primary nav,
- * the ASK VCCircle call to action and the account control.
- *
  * `me` is tri-state: `undefined` renders nothing in the account slot, `null` is
  * signed out. Whether the bar resolves the session ITSELF is decided by the
  * PRESENCE of the prop, not its value, so a page that already owns the request

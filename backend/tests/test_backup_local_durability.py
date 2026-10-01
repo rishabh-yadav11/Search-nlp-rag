@@ -426,8 +426,7 @@ class _FakeQdrant:
         return type("R", (), {"collections": [type("C", (), {"name": n})() for n in self._collections]})()
 
     def create_snapshot(self, collection_name, wait=False):
-        # A real server-side snapshot, so a test using the real make_backup gets
-        # as far as the download instead of failing at the create step.
+        # A real server-side snapshot, so the test gets as far as the download.
         return _FakeSnapshot()
 
     def delete_collection(self, collection_name):
@@ -591,12 +590,12 @@ def test_backup_cli_exits_nonzero_when_no_snapshot_landed_on_disk(
 
 
 def test_backup_cli_exits_nonzero_when_nothing_at_all_was_written(backups_dir, monkeypatch, capsys):
-    """The other half of the CLI contract: no snapshot and no local artifacts,
-    so make_backup removes the directory and returns dest=None. Nothing was
-    written, so the exit status must not read as success either.
+    """The other half of the CLI contract: no snapshot and no local artifacts, so
+    make_backup removes the directory and returns dest=None, and the exit status
+    must not read as success either.
 
     The sibling test above writes an articles.jsonl, so it takes the
-    `not backup.snapshot_ok` branch; this one deliberately reaches the earlier
+    `not backup.snapshot_ok` branch; this one reaches the earlier
     `backup.dest is None` branch instead."""
     import backup_qdrant
 

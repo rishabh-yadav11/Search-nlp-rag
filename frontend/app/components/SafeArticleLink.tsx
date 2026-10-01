@@ -12,16 +12,12 @@ interface SafeArticleLinkProps {
 }
 
 /**
- * Renders a backend-supplied article `url` as a link only when `isSafeUrl`
- * approves both the scheme and the origin. Otherwise the same children are
- * rendered as an inert element, so a poisoned `url` (`javascript:`, `data:`,
- * `//evil/phish`) is never clickable — the same fallback `app/page.tsx` already
- * uses for search results.
+ * Renders a backend-supplied `url` as a link only when `isSafeUrl` approves
+ * scheme and origin; otherwise the same children render inert, so a poisoned
+ * `url` (`javascript:`, `data:`, `//evil/phish`) is never clickable.
  *
- * The fallback is a `div`, not a `span`: every caller passes block content
- * (`div`/`h2`/`p`), and a `span` may only contain phrasing content, so a `span`
- * wrapper would emit malformed server HTML. All three call sites style the
- * wrapper with an explicit `display`, so the element change is visually inert.
+ * The fallback is a `div`, not a `span`: callers pass block content, which a
+ * `span` may not contain.
  */
 export default function SafeArticleLink({ url, className, children }: SafeArticleLinkProps) {
   if (!isSafeUrl(url)) {

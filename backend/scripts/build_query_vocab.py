@@ -2,15 +2,12 @@
 
 Writes a gzip JSON list of [token, doc_count] for the word tokens present in
 the published article title + summary + body, to QUERY_FIX_VOCAB_PATH
-(default data/query_vocab.json.gz). Also adds curated entity names with a huge
-count so SymSpell prefers them over equally-close corpus words.
+(default data/query_vocab.json.gz). Curated entity names are added with a huge
+count so SymSpell prefers them over equally-close corpus words. app/query_fix.py
+loads the artifact at API startup; rebuild it after the corpus changes a lot.
 
-Run from `backend/` with the venv python (needs MySQL reachable per backend/.env):
-
-    ./venv/bin/python scripts/build_query_vocab.py
-
-The artifact is consumed by app/query_fix.py at API startup. Rebuild it after
-the corpus changes substantially.
+Run from `backend/` with the venv python (needs MySQL reachable per
+backend/.env):  ./venv/bin/python scripts/build_query_vocab.py
 """
 import gzip
 import json
@@ -39,9 +36,9 @@ def fetch_rows():
         pool = await make_pool(maxsize=10)
         try:
             async with pool.acquire() as conn, conn.cursor(aiomysql.DictCursor) as cur:
-                # config.MYSQL_TABLE is a trusted config identifier, not user
-                # input; it must never be derived from or concatenated with any
-                # request-supplied value.
+                # config.MYSQL_TABLE is a trusted config identifier, never a
+                # request-supplied value; interpolating user input here would
+                # be an injection.
                 await cur.execute(
                     f"SELECT title, summary, body FROM {config.MYSQL_TABLE} WHERE status=1")
                 rows = await cur.fetchall()

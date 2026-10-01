@@ -1,7 +1,5 @@
-"""QueryFixer tests: vocab loading (missing/corrupt artifacts), _build with
-curated-entity counts, empty-vocab disable, _allowed_distance, the full fix()
-pipeline (disabled/short/digit/known/no-suggestion/equal-input/low-count/
-capitalization/fix-list branches), and init_fixer/fix_query no-ops.
+"""QueryFixer: vocab loading, _build, _allowed_distance, the fix() pipeline, and
+init_fixer/fix_query no-ops.
 
 symspellpy is faked in sys.modules so tests never build a real dictionary; the
 fix() branches use a fake SymSpell-like object injected via __new__."""
@@ -75,7 +73,7 @@ def test_normalize_entity_lowercases_strips_apostrophes_and_collapses_space():
     assert _normalize_entity("  ABC  Corp 'n' ") == "abc corp n"
 
 
-# --- _load_vocab (lines 80-90) ---
+# --- _load_vocab ---
 
 
 def test_load_vocab_missing_path_returns_empty(tmp_path):
@@ -105,14 +103,14 @@ def test_load_vocab_filters_non_conforming_rows(tmp_path):
             ["", 5],
             [3, 5],
             ["bad-count", "x"],
-            ["fractional", 7.5],  # fractional float -> dropped (not a whole count)
-            ["whole", 8.0],  # whole-number float -> admitted as int
+            ["fractional", 7.5],  # dropped: not a whole count
+            ["whole", 8.0],  # whole-number float is admitted as int
         ],
     )
     assert QueryFixer._load_vocab(vocab) == {"good": 5, "whole": 8}
 
 
-# --- _build (lines 92-111) ---
+# --- _build ---
 
 
 def test_build_with_vocab_and_curated_entities(monkeypatch, tmp_path):
@@ -138,8 +136,7 @@ def test_build_empty_vocab_disables_fixer(monkeypatch, tmp_path):
     vocab = _write_vocab(tmp_path, [])
 
     # __init__ always injects _NORMALIZED_ENTITIES when entities is empty, so
-    # _build is called directly with an empty entity list to reach the
-    # no-entries disabled branch.
+    # _build is called directly to reach the no-entries disabled branch.
     f = QueryFixer.__new__(QueryFixer)
     f.max_edit = 2
     f._sym = None
@@ -161,7 +158,7 @@ def test_build_missing_vocab_without_entities_disables_fixer(monkeypatch, tmp_pa
     assert f._sym is None
 
 
-# --- _allowed_distance (line 113-115) ---
+# --- _allowed_distance ---
 
 
 def test_allowed_distance_short_token_capped_at_one():
@@ -171,7 +168,7 @@ def test_allowed_distance_short_token_capped_at_one():
     assert f._allowed_distance("abcde") == 2
 
 
-# --- fix pipeline (lines 117-147) ---
+# --- fix pipeline ---
 
 
 def test_fix_disabled_or_empty_text_noop():
@@ -232,7 +229,7 @@ def test_fix_full_pipeline_multiple_fixes():
     ]
 
 
-# --- init_fixer / fix_query (lines 150-173) ---
+# --- init_fixer / fix_query ---
 
 
 def test_init_fixer_disabled_sets_none():

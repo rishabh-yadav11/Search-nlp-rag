@@ -63,8 +63,7 @@ def test_fingerprint_sensitive_to_a_content_type_only_change():
     ``category`` does not cover this: record_from_row sets category to
     dealtype_names when those exist, so on any row that HAS dealtype_names a
     content_type-only change leaves the fingerprint identical and the indexed
-    payload goes stale forever with nothing logged.
-    """
+    payload goes stale forever with nothing logged."""
     before = _payload_rec(content_type="Interview")
     after = _payload_rec(content_type="Video")
 
@@ -78,8 +77,7 @@ def test_fingerprint_covers_every_field_the_payload_stores():
     The payload key set and the fingerprint field list are two halves of one
     contract: a field stored in the payload but absent from the fingerprint is
     silently frozen at whatever value it had when it was first indexed. The
-    keys are read from make_point itself so the two cannot drift apart.
-    """
+    keys are read from make_point itself so the two cannot drift apart."""
     from _common import make_point
 
     class _Arr:
@@ -159,8 +157,7 @@ def _legacy_fingerprint(rec: dict) -> str:
 
     Spelled out field by field rather than derived from ``fingerprint`` so this
     stays a genuine reconstruction of the old state file: deriving it from the
-    current function would make the test pass no matter what the code does.
-    """
+    current function would make the test pass no matter what the code does."""
     raw = "|".join(
         [
             rec.get("title") or "",
@@ -178,14 +175,11 @@ def _legacy_fingerprint(rec: dict) -> str:
 
 
 def test_adding_content_type_to_the_fingerprint_requeues_the_whole_corpus():
-    """Pin the one-time consequence instead of leaving it to a comment.
-
-    Adding a term to fingerprint() re-hashes every record, so a state file
+    """Adding a term to fingerprint() re-hashes every record, so a state file
     written by the previous version matches NOTHING and the first sync after
-    this ships re-embeds the entire corpus. This is the behaviour the operator
-    note and the start-up WARNING describe; asserting it here is what stops the
-    note from quietly becoming false.
-    """
+    this ships re-embeds the entire corpus -- the behaviour the operator note
+    and the start-up WARNING describe, asserted so the note cannot go quietly
+    false."""
     records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 6)}
     legacy_state = {
         "updated_at": "2026-08-13T00:00:00+00:00",
@@ -211,15 +205,13 @@ def test_init_reseed_clears_the_requeue():
 
     --init stores fingerprints computed by the CURRENT function, so after it the
     corpus is no longer re-queued. This is the whole reason the operator remedy
-    works, so it is asserted rather than assumed.
-    """
+    works, so it is asserted rather than assumed."""
     records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 6)}
     legacy_state = {
         "updated_at": None,
         "fingerprints": {str(i): _legacy_fingerprint(r) for i, r in records.items()},
     }
 
-    # What --init writes.
     reseeded = {"updated_at": None, "fingerprints": {str(i): fingerprint(r) for i, r in records.items()}}
 
     # Contrast: the legacy state re-queues, the re-seeded one does not. That
@@ -263,8 +255,7 @@ def test_main_warns_and_names_init_when_every_row_reads_as_changed(monkeypatch, 
     A fingerprint-scheme change is indistinguishable from "every row really was
     edited", and the cost is a full re-embed. Without a log line the operator
     only finds out from a bill, so main() must name --init when it sees this
-    signature.
-    """
+    signature."""
     records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 4)}
     legacy = {
         "updated_at": None,
@@ -283,8 +274,7 @@ def test_main_does_not_warn_on_a_normal_partial_delta(monkeypatch, tmp_path, cap
     """The warning must not fire on ordinary incremental work.
 
     A scheduled run where a few rows changed is the normal case; warning there
-    would train operators to ignore the line that matters.
-    """
+    would train operators to ignore the line that matters."""
     records = {i: _payload_rec(id=i, title=f"Article {i}") for i in range(1, 4)}
     state = {"updated_at": None, "fingerprints": {str(i): fingerprint(r) for i, r in records.items()}}
     records[2] = _payload_rec(id=2, title="Article 2 EDITED")

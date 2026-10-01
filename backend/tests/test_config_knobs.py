@@ -1,25 +1,15 @@
 """Every knob in app/config.py must be read by something, or not exist at all.
 
-A setting that nothing reads is a false promise to whoever deploys this app:
-it is defined in config.py, it is listed in .env.example, an operator sets it,
-and no behaviour moves. Issue #263 shipped two such knobs -- a profile-decay
-lambda that was never wired to the hardcoded 30-day decay, and a candidate-pool
-limit the recommender never consulted.
+A setting nothing reads is a false promise: it is defined, it is listed in
+.env.example, an operator sets it, and no behaviour moves. A knob counts as
+read when it is accessed as ``config.NAME`` / ``Config.NAME`` or when its name
+appears as a string literal, which is how the rate-limit knobs are resolved
+(``public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN")`` reads the attribute
+name out of a string and passes it to ``getattr``).
 
-So this module makes the class of defect fail the suite instead. A knob counts
-as read when it is accessed as ``config.NAME`` / ``Config.NAME``, or when its
-name appears as a string literal, which is how the rate-limit knobs are
-resolved (``public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN")`` reads the
-attribute name out of a string and passes it to ``getattr``).
-
-To keep a knob that is deliberately inert, add it to INTENTIONALLY_INERT with a
-reason. The reason is required: an allowlist entry with no explanation is just
-the bug again, one level up.
-
-What it does NOT check, deliberately: a knob's *value* (a getenv whose name
-drifted from the attribute, or a hardcoded literal replacing it, is invisible
-here) and the effect a knob has. Proving "changing this changes behaviour" is
-the job of a behavioural test beside the code that reads the knob.
+Deliberately NOT checked: a knob's *value*, and the effect it has. Proving
+"changing this changes behaviour" is the job of a behavioural test beside the
+code that reads the knob.
 """
 import ast
 import re
@@ -31,8 +21,7 @@ THIS_FILE = Path(__file__).resolve()
 
 _SKIP_DIRS = {"venv", ".git", "node_modules", "__pycache__", "build", "dist", "data"}
 
-# Config knobs that nothing reads on purpose. Keep the list empty if you can:
-# every entry here is an operator-visible setting with no effect.
+# Deliberately unread knobs; each entry is an operator-visible setting with no effect.
 INTENTIONALLY_INERT: dict[str, str] = {
     "RERANK_ONNX_DIR": (
         "Inert on purpose: the ONNX reranker backend was removed, so the exported "
@@ -65,20 +54,17 @@ def _config_knobs() -> dict[str, int]:
 def _source_files() -> list[Path]:
     """Every shipped runtime file: the app package and the CLI scripts.
 
-    Deliberately NOT ``BACKEND.rglob("*.py")``. A test is not a reader: a knob
-    that only a test mentions is still inert in production, and including tests/
-    would let ``patch.object(config, "SOME_KNOB", ...)`` in a test vouch for a
-    knob the app ignores -- exactly the failure this guard exists to catch.
-    config.py itself is excluded because every knob appears in its own
-    ``os.getenv`` call, and this test because its allowlist spells knob names
-    out in plain text.
+    Deliberately NOT ``BACKEND.rglob("*.py")``: a test is not a reader, and
+    including tests/ would let ``patch.object(config, "SOME_KNOB", ...)`` vouch
+    for a knob the app ignores. config.py and this file are excluded because
+    both spell every knob name out in plain text.
     """
     files = [
         path
         for root in ("app", "scripts")
         for path in (BACKEND / root).rglob("*.py")
-        # Relative parts only: a checkout that happens to live under a
-        # ~/build or /srv/data ancestor must still be scanned.
+        # Relative parts only: a checkout under a ~/build or /srv/data ancestor
+        # must still be scanned.
         if not _SKIP_DIRS.intersection(path.relative_to(BACKEND).parts)
         and path.resolve() not in (CONFIG_PY.resolve(), THIS_FILE)
     ]
@@ -91,17 +77,13 @@ def _is_referenced(knob: str, corpus: str) -> bool:
     """Whether anything outside config.py reads ``knob``."""
     if re.search(rf"\b(?:config|Config)\.{knob}\b", corpus):
         return True
-    # Attribute access through a string, e.g. getattr(config, name) where the
-    # caller was handed the knob name as a literal.
+    # Attribute access through a string, e.g. getattr(config, name).
     #
     # Deliberately loose: any standalone string literal counts, not only one
     # passed to getattr/public_rate_limit. Narrowing it to those two call shapes
-    # would make the guard fail the moment the rate-limit helpers change how
-    # they receive the attribute name, and a false positive on a real knob is
-    # worse than the narrow false negative this leaves open (a knob name quoted
-    # only in a log message). The knobs that rely on this rule today are
-    # PUBLIC_SEARCH/FACETS/CLICK_RATE_PER_MIN, all resolved by
-    # int(getattr(config, limit_attr)) in app/auth.py.
+    # would break whenever the rate-limit helpers change how they receive the
+    # name, and a false positive on a real knob is worse than the false negative
+    # left open (a knob name quoted only in a log message).
     return bool(re.search(rf"""(['"]){re.escape(knob)}\1""", corpus))
 
 
@@ -123,11 +105,8 @@ def test_every_config_knob_is_read_somewhere():
 def test_inert_allowlist_is_still_accurate():
     """An allowlist entry must name a real, genuinely unread knob, with a reason.
 
-    Three ways an entry goes stale, all of them hiding a live knob from the
-    guard: deleting the knob leaves the entry behind, wiring the knob later
-    leaves the entry behind, and an entry with no reason is just the bug again.
-    An entry therefore has to PROVE it is inert, not merely claim to be -- a
-    wired knob parked here would otherwise silence this test forever.
+    An entry has to PROVE it is inert, not merely claim to be -- a wired knob
+    parked here would otherwise silence this test forever.
     """
     knobs = _config_knobs()
     missing = sorted(set(INTENTIONALLY_INERT) - set(knobs))
@@ -145,12 +124,7 @@ def test_inert_allowlist_is_still_accurate():
 
 
 def test_scan_actually_sees_knob_references():
-    """Guard on the guard: a corpus that found nothing would pass vacuously.
-
-    A scanner that silently stopped matching (renamed module, typo in the
-    pattern, backend moved) would make the test above pass with every knob
-    unreadable.
-    """
+    """Guard on the guard: a corpus that found nothing would pass vacuously."""
     corpus = "\n".join(path.read_text() for path in _source_files())
     known_reader = "RECOMMEND_DEFAULT_LIMIT"
     assert known_reader in _config_knobs(), f"{known_reader} should still be a knob"
@@ -165,17 +139,11 @@ def test_ranking_tuning_knobs_agree_with_the_shipped_env_template(parse_config):
     """A knob the template quotes at a value the code does not default to is a
     promise to the operator that does not hold on a fresh deploy: copying
     .env.example sets the knob to something other than the shipped default,
-    silently. Same convention as the cost-budget default in
-    test_cost_budget.py.
-
-    The five knobs below are the ones issue #300 moved out of module scope;
-    the module-level recency weights and the weak-result threshold had no
-    template entry at all before, so there was nothing to disagree with.
+    silently. Same convention as the cost-budget default in test_cost_budget.py.
     """
     shipped = parse_config()
-    # Exact `NAME=value` assignments, compared as whole entries: a substring
-    # match would accept WEAK_RESULT_SCORE=0.35 as the shipped 0.3, which is
-    # the decimal drift this is here to catch.
+    # Exact `NAME=value` entries only: a substring match would accept
+    # WEAK_RESULT_SCORE=0.35 as the shipped 0.3, the decimal drift being caught.
     template = {}
     for line in (BACKEND / ".env.example").read_text().splitlines():
         stripped = line.strip()

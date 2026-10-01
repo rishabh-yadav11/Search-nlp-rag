@@ -12,8 +12,7 @@ from qdrant_client.models import DatetimeRange, FieldCondition, Filter, MatchAny
 from app import main
 from app.main import SourceArticle, build_facet_filter, sort_results
 
-# The shape this file's copy of the helper had: no summary, and a title that
-# is empty unless the test sets one.
+# No summary, and a title that stays empty unless a test sets one.
 _article = partial(make_article, title="", summary=OMIT)
 
 
@@ -31,16 +30,10 @@ def _only(conds: list[FieldCondition]) -> FieldCondition:
 
 
 def _route_paths(routes) -> set[str]:
-    """Every path the app actually serves, however the routers are nested.
+    """Every path the app serves, descending into ``include_router`` wrappers.
 
-    Since fastapi 0.141 (issue #331), ``include_router`` no longer copies each
-    route into the top-level list: it stores a single ``_IncludedRouter``
-    wrapper, and the real routes live under its ``original_router``. So a flat
-    ``{r.path for r in app.routes}`` both misses the included routes entirely
-    and raises on the wrapper. Descending into any child that carries its own
-    ``routes`` list keeps this version-agnostic and, more importantly, keeps the
-    assertions below honest -- a path counts as absent only if it is absent
-    from the whole tree, not merely from the top level.
+    fastapi 0.141 keeps included routes under the wrapper rather than the
+    top-level list, so a flat walk both misses them and raises on the wrapper.
     """
     paths: set[str] = set()
     for route in routes:
@@ -80,9 +73,8 @@ def test_build_facet_filter_dates():
     assert all(isinstance(c.range, DatetimeRange) for c in date_conds)
     gtes = [c.range.gte for c in date_conds]
     ltes = [c.range.lte for c in date_conds]
-    # DatetimeRange parses the ISO string back into datetime objects, so compare
-    # against the isoformat of the expected datetimes (not the datetimes directly,
-    # to avoid tzinfo-identity mismatches between Qdrant's tz class and timezone.utc).
+    # DatetimeRange re-parses the ISO strings into datetimes of its own tz class,
+    # so compare isoformat rather than the datetimes.
     assert _dt(2025, 1, 1, tzinfo=UTC).isoformat() in [g.isoformat() for g in gtes if g is not None]
     assert _dt(2025, 12, 31, 23, 59, 59, 999999, tzinfo=UTC).isoformat() in [l.isoformat() for l in ltes if l is not None]
 
@@ -101,12 +93,7 @@ def test_build_facet_filter_tag():
 
 
 def test_the_auto_facet_retry_never_drops_an_explicit_tag(monkeypatch):
-    """A tag survives the relaxation retry, because it is never relaxed.
-
-    Only the three auto-guessed facets are recomputed for the retry, so a tag
-    forgotten there would silently widen a tagged query precisely when an auto
-    facet zeroed the set — the one path the user did not choose.
-    """
+    """A tag survives the relaxation retry, which recomputes only the auto facets."""
     filters = []
 
     async def fake_retrieve_and_rerank(q, top_k, qfilter, **kwargs):
@@ -135,9 +122,8 @@ class _ScoredPoint:
 def _tag_scroll_qdrant():
     """A scroll source over three pages, re-served from the start per instance.
 
-    Sensex is seen first and IPO last, so a scan that returned values in the
-    order it met them (or stopped once it had enough) would answer differently
-    from one that counts.
+    Sensex is seen first and IPO last, so a scan that stopped once it had
+    enough would rank differently from one that counts every point.
     """
     pages = [
         ([_ScoredPoint(["Sensex"]), _ScoredPoint(["Sensex"])], 2),
@@ -161,9 +147,7 @@ def test_the_tag_vocabulary_is_ranked_by_frequency_over_every_point(monkeypatch)
     """The cap truncates a finished ranking, it does not end the walk.
 
     The top N by frequency is unknowable until every value on every point has
-    been counted, so this has to read all three pages and then drop the tail —
-    an early exit (the shape the other two vocabularies use) would return
-    Sensex and Flipkart here, the two least useful values a filter can offer.
+    been counted, so all three pages are read and the tail dropped.
     """
     qdrant = _tag_scroll_qdrant()
     monkeypatch.setitem(main.state, "qdrant", qdrant)
@@ -173,15 +157,13 @@ def test_the_tag_vocabulary_is_ranked_by_frequency_over_every_point(monkeypatch)
     assert out == ["IPO", "Sensex"]
     assert [c["offset"] for c in qdrant.calls] == [None, 2, 5], \
         "the walk stopped before the collection was exhausted"
-    # Requesting one keyword field per page, not the whole payload: ~6KB of body
-    # per point would make this scan the most expensive thing the app does.
+    # One keyword field per page: the whole payload is ~6KB of body per point.
     assert all(c["with_payload"] == ["tag_names"] for c in qdrant.calls)
 
 
 def test_equal_tag_counts_break_alphabetically(monkeypatch):
-    """Two tags used by the same number of articles have no frequency order
-    between them, so the tie is broken by name — otherwise the cached payload
-    would depend on the order the pages happened to arrive in."""
+    """Equal counts have no frequency order, so ties break by name; otherwise
+    the cached payload would depend on the order the pages arrived in."""
     qdrant = _tag_scroll_qdrant()
     monkeypatch.setitem(main.state, "qdrant", qdrant)
 
@@ -230,7 +212,6 @@ def test_sort_results_recency_ordering(monkeypatch):
 
 def test_sort_results_missing_date_last_on_tie(monkeypatch):
     monkeypatch.setattr(main, "datetime", _FrozenNow)
-    # Dated article is 12 days old on the frozen 'now' (2026-08-13).
     mult = 1.0 - main.config.RECENCY_STRENGTH * (1.0 - math.exp(-12.0 / main.config.RECENCY_DECAY_DAYS))
     dated = _article(1, 1.0, "2026-08-01")
     missing = _article(2, mult, None)
@@ -248,10 +229,11 @@ def test_sort_results_full_ordering(monkeypatch):
 
 
 def _blend_key(article: SourceArticle, strength: float, decay: float) -> tuple[float, str]:
-    """The blended-score half of the key sort_results ranks on, recomputed
-    from the pre-#300 literals. Limited to the shapes below: dated, naive,
-    already-past articles, where the tz-stripped tiebreak and the future-date
-    clamp in _recency_multiplier cannot differ from this."""
+    """The blended-score half of the key sort_results ranks on, recomputed here.
+
+    Limited to dated, naive, already-past articles, where the tz-stripped
+    tiebreak and the future-date clamp in _recency_multiplier cannot differ.
+    """
     dt = _dt.fromisoformat(article.published_date).replace(tzinfo=UTC)
     age_days = (_dt(2026, 8, 13, tzinfo=UTC) - dt).total_seconds() / 86400.0
     return (
@@ -261,27 +243,22 @@ def _blend_key(article: SourceArticle, strength: float, decay: float) -> tuple[f
 
 
 def _pin_shipped_recency_boost(monkeypatch):
-    """Pin the boost knobs to the values config ships (asserted against a
-    clean parse in the test below). They are deployment settings now, so
-    reading them off `config` here would let a developer .env decide them."""
+    """Pin the boost knobs to the shipped values, not to whatever .env holds."""
     monkeypatch.setattr(main.config, "RECENCY_BOOST_STRENGTH", 0.85)
     monkeypatch.setattr(main.config, "RECENCY_BOOST_DECAY_DAYS", 30.0)
     monkeypatch.setattr(main, "datetime", _FrozenNow)
 
 
 def test_recency_boost_knobs_ship_the_values_the_pre_knob_constants_had(parse_config):
-    """Issue #300 moved the recency-boost weights out of app/main.py's module
-    scope into config. Parsed from a clean environment they must still be the
-    literals that lived there."""
+    """The shipped defaults must stay the weights the ranking tests pin."""
     shipped = parse_config()
     assert shipped.RECENCY_BOOST_STRENGTH == 0.85
     assert shipped.RECENCY_BOOST_DECAY_DAYS == 30.0
 
 
 def test_shipped_recency_boost_reproduces_the_pre_knob_ranking(monkeypatch):
-    """Default configuration must be unchanged: with the shipped boost
-    weights, sort_results must produce exactly the order the hardcoded
-    RECENCY_BOOST_STRENGTH=0.85 / RECENCY_BOOST_DECAY_DAYS=30.0 produced."""
+    """The shipped boost weights must reproduce the ranking sort_results gave
+    while they were hardcoded in app/main.py."""
     _pin_shipped_recency_boost(monkeypatch)
 
     articles = [
@@ -293,16 +270,14 @@ def test_shipped_recency_boost_reproduces_the_pre_knob_ranking(monkeypatch):
     expected = sorted(articles, key=lambda a: _blend_key(a, 0.85, 30.0), reverse=True)
     out = sort_results(articles, recency_boost=True)
     assert [a.id for a in out] == [a.id for a in expected]
-    # A boost that only ever produced relevance order would pass the same
-    # comparison, so pin that it really is re-ordering relative to no boost.
+    # A no-op boost would satisfy the comparison above, so pin that it reorders.
     assert [a.id for a in out] != [
         a.id for a in sorted(articles, key=lambda a: (a.score, a.published_date), reverse=True)
     ]
 
 
 def test_recency_boost_strength_knob_moves_the_ranking(monkeypatch):
-    """Strength is what decides whether a 'latest' query surfaces new news, so
-    turning it off must hand ranking back to raw relevance."""
+    """Turning strength off must hand ranking back to raw relevance."""
     _pin_shipped_recency_boost(monkeypatch)
     recent = _article(1, 0.25, "2026-08-01")
     old = _article(2, 1.0, "2025-01-01")
@@ -313,9 +288,8 @@ def test_recency_boost_strength_knob_moves_the_ranking(monkeypatch):
 
 
 def test_recency_boost_decay_knob_moves_the_ranking(monkeypatch):
-    """Decay sets how fast the boost ages an article out. A longer decay keeps
-    a moderately old hit competitive with a much older, higher-scoring one;
-    the default decay does not. Both knobs must reach sort_results."""
+    """A longer decay keeps a moderately old hit competitive; both knobs must
+    reach sort_results."""
     _pin_shipped_recency_boost(monkeypatch)
     recent = _article(1, 0.2, "2026-08-01")
     old = _article(2, 1.0, "2025-01-01")
@@ -392,14 +366,12 @@ def test_retrieval_queries_single_for_non_year_top():
 def test_retrieval_queries_no_dup_when_topic_equals_rewrite():
     from app.main import _retrieval_queries
 
-    # A query that's already a bare 'top <topic>' with no year: no rewrite -> single
     qs = _retrieval_queries("top deals")
     assert qs == ["top deals"]
 
 
 def test_filter_token_deterministic_and_json_serializable():
-    """The retrieve-cache key from a Qdrant filter must be a stable string
-    (regression: model_dump_json(sort_keys=...) is unsupported in pydantic)."""
+    """Stable string cache key: pydantic Filter has no model_dump_json(sort_keys=...)."""
     f = Filter(must=[FieldCondition(key="industry_names", match=MatchAny(any=["Fintech"]))])
     assert main._filter_token(None) == ""
     t1 = main._filter_token(f)
@@ -452,7 +424,7 @@ def test_retrieve_and_rerank_caches_without_body(monkeypatch, fake_cache):
     monkeypatch.setattr(main, "_attach_bodies", refetch_bodies)
     out2 = asyncio.run(main.retrieve_and_rerank("q", 8, None, need_body=True))
     assert out2[0].body == "refetched"
-    assert len(cache.store) == 1  # still a single cache entry
+    assert len(cache.store) == 1
 
 
 def test_source_context_includes_whole_body():
@@ -468,8 +440,8 @@ def test_source_context_includes_whole_body():
 
 
 def test_analytics_dashboard_is_frontend_owned():
-    """The dashboard UI is a Next.js page now (frontend/app/analytics/dashboard);
-    the backend only serves the JSON data endpoints, both admin-gated."""
+    """The dashboard UI is a Next.js page; the backend serves only the JSON data
+    endpoints."""
     paths = _route_paths(main.app.routes)
     assert "/analytics/dashboard" not in paths
     assert "/analytics/summary" in paths
@@ -482,12 +454,8 @@ def test_route_paths_walks_routes_nested_in_included_routers():
 
     Every path asserted by ``test_analytics_dashboard_is_frontend_owned`` is a
     top-level route, so those three assertions stay green even if the descent
-    is deleted -- which would silently blind the negative assertion to a
-    dashboard route mounted on an included router. This pins the descent
-    itself using paths that are reachable ONLY through it: since fastapi 0.141
-    (issue #331) the health, auth and chat routers are stored as
-    ``_IncludedRouter`` wrappers, so none of these appear in a flat
-    ``app.routes`` walk.
+    is deleted. The paths used here are reachable only through it: fastapi
+    0.141 keeps the health, auth and chat routes under their wrappers.
     """
     paths = _route_paths(main.app.routes)
     flat = {r.path for r in main.app.routes if getattr(r, "path", None) is not None}
@@ -508,7 +476,7 @@ def test_best_body_window_finds_query_token_dense_region():
     win = _best_body_window(body, tokens, 1500, 500)
     low = win.lower()
     assert "2008" in low and "subbarao" in low
-    assert low.find("2008") < 1500  # picked the dense region, not the filler intro
+    assert low.find("2008") < 1500
 
 
 def test_body_rescue_lifts_deep_body_match_and_reorders(monkeypatch):

@@ -1,15 +1,8 @@
-"""Tests for the API attack surface being closed (#291).
+"""Guards the two attack-surface decisions: the schema is not served, and the Host
+allow-list rejects strangers without rejecting this project's own hosts.
 
-Two things are asserted here:
-
-* the interactive docs and the generated schema are not served at all, because
-  they publish the complete route list and request/response models (including
-  the mass-assignable ``UserPatchIn``) to any unauthenticated caller;
-* the ``Host`` header is validated, and — just as important — the allow-list the
-  app actually ships with still accepts every host this project legitimately uses.
-  A ``TrustedHostMiddleware`` with a wrong allow-list answers 400 to *every*
-  request, which is a worse outage than the one it prevents, so the defaults are
-  pinned here explicitly.
+The second is the risky half: a wrong default allow-list 400s *every* request,
+a worse outage than the one it prevents.
 """
 
 import os
@@ -26,13 +19,11 @@ from app import config as config_module
 from app import main as main_module
 from app.config import _default_route_addresses, _machine_hosts, _parse_allowed_hosts, config
 
-# raise_server_exceptions=False so a 400/404 from middleware surfaces as a
-# response instead of propagating.
+# raise_server_exceptions=False so a 400 from middleware surfaces as a response.
 _client = TestClient(main_module.app, raise_server_exceptions=False)
 
-# Every host a real client of this project may legitimately present: the
-# Starlette TestClient default, the loopback dev stack, and whatever the
-# deployment derives from CORS_ORIGINS.
+# Hosts a real client may present: the TestClient default, the loopback dev
+# stack, and whatever the deployment derives from CORS_ORIGINS.
 _LOCAL_HOSTS = ("testserver", "localhost", "127.0.0.1", "localhost:3000", "localhost:8001")
 
 
@@ -45,11 +36,8 @@ def test_docs_and_schema_are_not_served(path):
 
 
 def test_schema_still_generable_in_process():
-    """The schema is only hidden from HTTP; `app.openapi()` still works locally.
-
-    This is what docs/API.md tells developers to run to regenerate the schema,
-    so the doc stays true now that the route is gone.
-    """
+    """The schema is only hidden from HTTP; `app.openapi()` still works locally,
+    which is what docs/API.md tells developers to run to regenerate it."""
     schema = main_module.app.openapi()
     assert len(schema["paths"]) > 10
     assert "UserPatchIn" in schema["components"]["schemas"]
@@ -73,11 +61,8 @@ def test_dev_and_test_hosts_still_work(host):
 
 @pytest.mark.parametrize("host", config.ALLOWED_HOSTS)
 def test_every_shipped_allowed_host_is_accepted(host):
-    """Each entry of the default allow-list must actually work.
-
-    Parametrised over the parsed config rather than a hardcoded copy, so the
-    test follows the default instead of drifting from it.
-    """
+    """Each entry of the default allow-list must actually work; parametrised over
+    the parsed config so the test follows the default instead of drifting."""
     r = _client.get("/live", headers={"Host": f"{host}:8001"})
     assert r.status_code == 200, f"allow-list entry {host!r} does not match its own Host header"
 
@@ -99,14 +84,10 @@ def test_default_allow_list_derives_hosts_from_cors_origins():
 
 
 def test_default_allow_list_covers_this_boxes_own_identity():
-    """The box's own name and IPs must be in the default allow-list.
-
-    Production is same-origin through nginx behind a `server_name _` catch-all
-    vhost, which forwards whatever Host the client used, and the deployed
-    CORS_ORIGINS is left at its localhost default. So for a site reached by IP
-    or by the box's own name, the CORS-derived list covers nothing and every
-    public request would 400.
-    """
+    """The box's own name and IPs must be in the default allow-list: production is
+    same-origin through a `server_name _` catch-all that forwards whatever Host
+    the client used, and the deployed CORS_ORIGINS is left at its localhost
+    default, so the CORS-derived list covers nothing for a site reached by IP."""
     assert set(_machine_hosts()) <= set(config.ALLOWED_HOSTS)
 
 
@@ -120,9 +101,8 @@ def test_default_allow_list_covers_the_default_route_address(monkeypatch):
     """A NAT'd box is reached at its public address, not the bound private one.
 
     nginx forwards the client's `Host` through (`server_name _;` plus
-    `proxy_set_header Host $host`), so on a cloud host the `Host` a real browser
-    sends is the public address — which `getaddrinfo(gethostname())` does not
-    report. Without it in the default allow-list the whole site answers 400.
+    `proxy_set_header Host $host`), so the `Host` a real browser sends is the
+    public address — which `getaddrinfo(gethostname())` does not report.
     """
     monkeypatch.setattr(config_module, "_default_route_addresses", lambda: ("203.0.113.7",))
     assert "203.0.113.7" in _parse_allowed_hosts(None, _machine_hosts())
@@ -131,9 +111,8 @@ def test_default_allow_list_covers_the_default_route_address(monkeypatch):
 def test_default_route_address_is_read_from_the_routing_table(monkeypatch):
     """The probe is a real socket, not a guess: it reports what the kernel picks.
 
-    IPv4 only, and deliberately so. An IPv6 source address cannot be
-    expressed in this allow-list (Starlette compares ``host.split(":")[0]``),
-    so probing for one would only ever yield an entry that can never match.
+    IPv4 only, and deliberately so: Starlette compares ``host.split(":")[0]``, so
+    an IPv6 source address could only ever yield an entry that can never match.
     """
     seen: list[tuple] = []
 
@@ -157,7 +136,6 @@ def test_default_route_address_is_read_from_the_routing_table(monkeypatch):
     assert _default_route_addresses() == ("203.0.113.7",)
     assert (socket.AF_INET, socket.SOCK_DGRAM) in seen
     assert ("8.8.8.8", 53) in seen
-    # No IPv6 leg: an IPv6 address could not be matched by the middleware.
     assert socket.AF_INET6 not in [family for family, _ in seen]
 
 
@@ -179,10 +157,9 @@ def test_default_route_probe_failure_degrades_instead_of_raising(monkeypatch):
 def test_default_route_probe_never_raises_at_import(monkeypatch):
     """No probe failure may escape: this runs while the module is imported.
 
-    The route probe is a best-effort nicety, so *any* failure has to cost one
-    allowed host and nothing more. An unusable address family raises TypeError
-    from ``socket.socket()``, which a narrow ``except OSError`` would miss, and
-    the API would then refuse to boot over a cosmetic detail.
+    The probe is a best-effort nicety, so *any* failure may cost one allowed host
+    and nothing more. ``socket.socket()`` raises TypeError for an unusable
+    address family, which a narrow ``except OSError`` would miss.
     """
 
     def boom(*args, **kwargs):
@@ -190,7 +167,6 @@ def test_default_route_probe_never_raises_at_import(monkeypatch):
 
     monkeypatch.setattr(config_module.socket, "socket", boom)
     assert _default_route_addresses() == ()
-    # Still a closed, usable allow-list rather than a raised import.
     assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
         "localhost",
         "127.0.0.1",
@@ -201,12 +177,10 @@ def test_default_route_probe_never_raises_at_import(monkeypatch):
 def test_ipv6_literals_never_enter_the_allow_list(monkeypatch):
     """A dual-stack box must not widen the Host check with a truncated IPv6.
 
-    Starlette compares the authority as ``host.split(":")[0]``, so an IPv6
-    literal cannot be matched: ``[::1]`` arrives as ``[``, and an unbracketed
-    ``2001:db8::5`` arrives as ``2001``. Normalising the latter and keeping the
-    result would admit ``2001``, which matches ANY ``2001:*`` Host header --
-    the check failing open on a guessable value, plus a real IPv6 client being
-    400'd. So the literals are dropped at the source instead.
+    Starlette compares the authority as ``host.split(":")[0]``, so ``[::1]``
+    arrives as ``[`` and a bare ``2001:db8::5`` arrives as ``2001``. Keeping
+    the normalised form would admit ``2001``, which matches ANY ``2001:*`` Host
+    header — a guessable fail-open, plus a real IPv6 client being 400'd.
     """
 
     class DualStack:
@@ -239,7 +213,6 @@ def test_ipv6_literals_never_enter_the_allow_list(monkeypatch):
     assert not any(":" in h for h in hosts), f"no IPv6 literal survives: {hosts}"
     derived = _parse_allowed_hosts(None, config.CORS_ORIGINS + hosts)
     assert not any(":" in h for h in derived), f"no IPv6 reaches the allow-list: {derived}"
-    # The fail-open itself: a hextet entry would match any 2001:* Host.
     assert "2001" not in derived
 
 
@@ -296,11 +269,8 @@ def test_machine_hosts_degrade_instead_of_raising(monkeypatch):
     ids=["oserror", "unicode", "valueerror"],
 )
 def test_machine_hosts_survive_any_probe_failure(monkeypatch, make_exc):
-    """A hostname probe that fails in any way must not stop the app importing.
-
-    A non-decodable hostname raises UnicodeDecodeError, not OSError; missing it
-    would mean the API refuses to boot over a cosmetic detail.
-    """
+    """A hostname probe that fails in any way must not stop the app importing: a
+    non-decodable hostname raises UnicodeDecodeError, not OSError."""
 
     def boom(*args, **kwargs):
         raise make_exc()
@@ -308,7 +278,6 @@ def test_machine_hosts_survive_any_probe_failure(monkeypatch, make_exc):
     monkeypatch.setattr(config_module.socket, "getaddrinfo", boom)
     monkeypatch.setattr(config_module.socket, "gethostname", boom)
     monkeypatch.setattr(config_module.socket, "getfqdn", boom)
-    # Still produces a closed, usable allow-list rather than raising.
     assert _parse_allowed_hosts(None, _machine_hosts())[:3] == (
         "localhost",
         "127.0.0.1",
@@ -343,9 +312,8 @@ def test_malformed_wildcard_is_rejected_at_config_load(raw):
     """A bad wildcard shape must fail at import, not 500 every request.
 
     TrustedHostMiddleware asserts on the pattern's shape, but add_middleware
-    only builds the stack on the FIRST REQUEST. So an unvalidated `a.*.com`
-    boots cleanly, logs a healthy-looking allow-list and then turns every
-    request into a 500. The parser is the only place that can catch it.
+    only builds the stack on the FIRST REQUEST, so an unvalidated `a.*.com`
+    boots cleanly and then turns every request into a 500.
     """
     with pytest.raises(ValueError, match="not a valid wildcard pattern"):
         _parse_allowed_hosts(raw)
@@ -368,22 +336,15 @@ def test_leading_wildcard_actually_admits_its_subdomain(monkeypatch):
 
 @pytest.mark.parametrize("entry", ["[::1]", "2001:db8::5", "::1", "[2001:db8::5]:8001"])
 def test_ipv6_entry_is_rejected_loudly(entry):
-    """An explicit IPv6 entry is refused, not quietly truncated.
-
-    A bracketed literal would sit in the list as dead weight and a bare one
-    would truncate to its first hextet, matching any Host under that prefix --
-    a silent fail-open. Failing at config load says so plainly instead.
-    """
+    """An explicit IPv6 entry is refused, not quietly truncated: a bare one
+    truncates to its first hextet, matching any Host under that prefix."""
     with pytest.raises(ValueError, match="IPv6 literal"):
         _parse_allowed_hosts(entry)
 
 
 def test_ipv6_origin_in_cors_is_filtered_from_the_derived_default():
-    """The self-inflicted edge: a bracketed origin must not become an entry.
-
-    An operator listing an IPv6 origin in CORS_ORIGINS is plausible, and the
-    derived default must not turn that into a dead or fail-open entry.
-    """
+    """The self-inflicted edge: a bracketed origin in CORS_ORIGINS must not
+    become a dead or fail-open entry."""
     hosts = _parse_allowed_hosts(None, ("[::1]", "http://localhost:3000"))
     assert not any(":" in h or h == "[" for h in hosts), f"IPv6 leaked in: {hosts}"
     assert "localhost" in hosts
@@ -401,8 +362,8 @@ def test_wildcard_env_fails_at_config_load():
     """End to end: ALLOWED_HOSTS=* must not import into a disabled check.
 
     Run in a subprocess: the value is read at import time, and reloading
-    app.config in-process would rebind the `config` object that app.health,
-    app.auth and others hold a reference to, corrupting unrelated tests.
+    app.config in-process would rebind the `config` object that app.health and
+    app.auth hold a reference to.
     """
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     proc = subprocess.run(
@@ -421,10 +382,9 @@ def test_allow_list_is_logged_without_logging_config():
     """The effective allow-list must actually reach stderr in a worker.
 
     This is the only clue an operator gets when ALLOWED_HOSTS is wrong and every
-    request answers 400, so it has to survive the process manager's logging
-    setup: gunicorn and uvicorn configure only their own loggers, leaving the
-    root logger without a handler, where anything below WARNING is dropped.
-    A bare subprocess import is exactly that environment.
+    request answers 400, so it has to survive gunicorn's and uvicorn's logging
+    setup: they configure only their own loggers, leaving the root logger
+    without a handler, where anything below WARNING is dropped.
     """
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     proc = subprocess.run(

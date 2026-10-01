@@ -1,12 +1,12 @@
 """Maximal Marginal Relevance (MMR) diversity for search results.
 
-News coverage repeats itself: one deal is covered by several near-identical
-articles. Greedy MMR selects a diverse top-n while keeping relevance dominant:
+News coverage repeats itself: one deal is covered by several near-identical articles. Greedy MMR
+selects a diverse top-n while keeping relevance dominant:
 
-    score(candidate) = LAMBDA * relevance - (1 - LAMBDA) * max sim(candidate, chosen)
+   score(candidate) = LAMBDA * relevance - (1 - LAMBDA) * max sim(candidate, chosen)
 
-where sim is Jaccard similarity of title word-tokens. Lambda near 1 favours
-pure relevance; lower values trade a little relevance for headline diversity.
+where sim is Jaccard similarity of title word-tokens. Lambda near 1 favours pure relevance; lower
+values trade a little relevance for headline diversity.
 """
 import logging
 import math
@@ -57,23 +57,14 @@ def diversify(
             if s >= sim_thresh and s > best:
                 best = s
         return best
-    # Complexity, with m = len(results) and n the requested count: ``order`` is
-    # never mutated -- each round scans it once and skips indices already in
-    # ``chosen_set``. That removes the per-round O(m) ``list.remove``, i.e. an
-    # O(m*n) term across the n rounds, which is the pattern #193 flagged.
-    # It is not a measurable latency win: the number of ``max_sim``/Jaccard
-    # computations is identical to the mutating version, and every candidate
-    # visit still calls ``max_sim``, which is O(len(chosen_idx)) and therefore
-    # O(m*n^2) summed over the rounds -- that remains the dominant cost, with
-    # the removed list-mutation work only a lower-order term. So the change
-    # removes the flagged quadratic list-mutation pattern rather than buying a
-    # better asymptotic bound or a measured constant-factor speedup.
+    # ``order`` is never mutated -- each round scans it once and skips indices already in
+    # ``chosen_set``, which removes the per-round O(m) ``list.remove``. That is an O(m*n) term
+    # across the n rounds, not a change to the dominant cost: every candidate visit still calls
+    # ``max_sim``, which is O(len(chosen_idx)) and therefore O(m*n^2) summed over the rounds.
     #
-    # Termination: every round either appends to ``chosen_idx`` (capped at n)
-    # or breaks below, so the loop cannot spin. No ``len(chosen_set) <
-    # len(order)`` guard is needed: the two collections grow in lockstep and
-    # the early return above guarantees n < len(order), so ``len(chosen_idx) <
-    # n`` already implies it.
+    # Termination: every round either appends to ``chosen_idx`` (capped at n) or breaks below,
+    # so the loop cannot spin. No ``len(chosen_set) < len(order)`` guard is needed -- the two
+    # grow in lockstep and the early return above guarantees n < len(order).
     order = list(range(len(results)))
     chosen_idx: list[int] = []
     chosen_set: set[int] = set()

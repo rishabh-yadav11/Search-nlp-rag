@@ -1,28 +1,19 @@
 """Shared helpers for the ops/ETL scripts.
 
-Every script in this directory used to carry its own copy of the same three
-helpers: a UTC ``log()``, a Qdrant ``PointStruct`` builder, and an
-``aiomysql.create_pool`` call. Six copies of the first and three of the second
-meant an ops run of one script could write a *different* payload for the same
-article than another script — silent index divergence, expensive to detect
-after the fact. This module is the single definition of all three.
-
-Follows the same convention as ``qdrant_backup.py``: a plain importable helper
-module with no ``__main__`` block, resolved by the caller through the
-``sys.path`` bootstrap below (so ``python scripts/<name>.py`` keeps working
-from any working directory).
-
-Used by: build_index.py, update_index.py, backfill_body.py,
-backfill_missing.py, backfill_summary.py, fetch_data.py, build_query_vocab.py,
-qdrant_backup.py.
+One definition of the UTC ``log()``, the redacting URL printer, the Qdrant
+point builder, the payload index set and the MySQL pool, so two scripts cannot
+write a *different* payload for the same article -- divergence that is silent
+and expensive to detect afterwards. Resolved by callers through the
+``sys.path`` bootstrap below, so ``python scripts/<name>.py`` keeps working
+from any working directory.
 """
 import os
 import sys
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 
-# Mirrors the bootstrap every script in this directory already performs, so this
-# module is importable on its own (``app`` lives one directory up).
+# Mirrors the bootstrap every script in this directory performs, so this module
+# is importable on its own (``app`` lives one directory up).
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qdrant_client.models import PayloadSchemaType, PointStruct, SparseVector
@@ -38,14 +29,10 @@ def log(msg: str):
 def redact_url(url: str) -> str:
     """Return the URL with userinfo and query-param secrets stripped.
 
-    Ops output gets pasted into tickets and chat, and a service URL can carry a
+    Ops output is pasted into tickets and chat, and a service URL can carry a
     password in its userinfo or a token in its query string, so no script may
-    print one raw. It lives here rather than in the one script that first needed
-    it for the same reason ``log`` does: two copies of a redactor is a redactor
-    that gets fixed in only one of them.
-
-    On any parse failure, returns a safe placeholder rather than the original
-    URL, so a malformed (and potentially secret-bearing) value cannot leak.
+    print one raw. Any parse failure returns a placeholder rather than the
+    original, so a malformed, possibly secret-bearing value cannot leak.
     """
     try:
         parsed = urlparse(url)
@@ -60,22 +47,13 @@ def redact_url(url: str) -> str:
 def make_point(rec: dict, dvec, svec) -> PointStruct:
     """Build the Qdrant point for one indexed record.
 
-    ``rec`` is the canonical record produced by ``app.index_text.record_from_row``
-    (or the same dict as read back from ``data/articles.jsonl``); ``dvec`` and
-    ``svec`` are the dense and sparse embeddings for it.
+    ``rec`` is the canonical record from ``app.index_text.record_from_row``;
+    ``dvec`` and ``svec`` are its dense and sparse embeddings. The key set is
+    fixed here, so a field not stored by this function is stored by no script.
 
-    This is the single definition of the indexed payload, shared by every write
-    path, so two scripts can no longer store a different set of keys for the
-    same article. The key set is deliberately fixed at the eleven fields the
-    search read path uses; a field that is not stored here is not stored by any
-    script.
-
-    Every value is normalised to ``str`` (never ``None``) where it carries a
-    KEYWORD index, and a field that is ``str`` on some points and ``None`` on
-    others is a mixed-type field that Qdrant indexes inconsistently. The read
-    side maps a falsy value back to ``None`` (``payload.get("content_type") or
-    None``), so an article with no content type in MySQL round-trips as absent
-    exactly as before.
+    Values on a KEYWORD-indexed field are normalised to ``str``, never ``None``:
+    a field that is ``str`` on some points and ``None`` on others is indexed
+    inconsistently. The read side maps a falsy value back to ``None``.
     """
     payload = {
         "title": rec["title"],
@@ -105,16 +83,10 @@ def create_payload_indexes(client):
 
     A stored field is not filterable until its payload index exists, so this
     list must cover every field ``main.build_facet_filter`` builds a condition
-    on. It lives beside ``make_point`` on purpose: the payload key set and the
-    index set are two halves of one contract, and keeping them in one module is
-    what stops a field being stored but left unfilterable — the exact state
-    ``content_type`` was in, requested on every read and written by nobody.
-
-    Safe to call on a collection that already exists (re-creating an existing
-    field's index is a no-op in Qdrant), which is why ``build_index.py`` calls
-    it on a resumed build and not only on collection creation: otherwise a field
-    added after the collection was built stays unfilterable until a full
-    destructive rebuild.
+    on. It lives beside ``make_point`` on purpose: the key set and the index set
+    are two halves of one contract. Re-creating an existing index is a no-op in
+    Qdrant, so ``build_index.py`` calls this on a resumed build too -- otherwise
+    a field added after the collection was built stays unfilterable.
     """
     for field, schema in (
         ("category", PayloadSchemaType.KEYWORD),
@@ -133,16 +105,10 @@ def create_payload_indexes(client):
 async def make_pool(*, maxsize: int = 3, connect_timeout: int | None = None):
     """Open an autocommit MySQL pool from the app's configured credentials.
 
-    Every script that talks to MySQL reads the same ``config.MYSQL_*`` settings
-    (MYSQL_HOST/PORT/USER/PASSWORD/DATABASE), so the connection parameters are
-    taken from one place here rather than being restated per script.
-
-    ``maxsize`` (pool ceiling; ``minsize`` is always 1) and ``connect_timeout``
-    are passed through because the call sites legitimately differ. Note that
-    ``read_timeout``/``write_timeout`` are deliberately absent: the installed
-    aiomysql does not accept them, and any call passing them raises
-    ``TypeError: connect() got an unexpected keyword argument`` before a
-    connection is ever attempted.
+    ``maxsize`` and ``connect_timeout`` are passed through because call sites
+    legitimately differ. ``read_timeout``/``write_timeout`` are deliberately
+    absent: the installed aiomysql rejects them with a TypeError before any
+    connection is attempted, and exposes no equivalent.
     """
     import aiomysql
 

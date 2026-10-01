@@ -1,26 +1,14 @@
-"""Tests for the /recommend/for-you cold-start contract (#303).
+"""Tests for the /recommend/for-you cold-start contract.
 
-The handler used to open with::
-
-    if user_id == "unknown":
-        articles = await get_latest_top_stories(limit)
-        return RecommendationsResponse(user_id="anonymous", ..., cold_start=True)
-
-That branch could never run. The route depends on ``require_auth``, which
-either raises 401 or sets ``request.state.user_id`` to a real user id or to
-``SERVICE_USER_ID``; the literal ``"unknown"`` is only ever produced by
-``auth._client_ip`` for rate limiting. The branch therefore advertised an
-anonymous response no client could receive, while the real cold-start case --
-authenticated but with no history -- is served by
-``recommender.get_personalized_recommendations``.
-
-These tests pin the contract that actually holds:
+``/recommend/for-you`` is auth-gated: ``require_auth`` either raises 401 or
+installs a real user id or ``SERVICE_USER_ID``, so there is no anonymous
+response to return. The contract these tests pin:
 
 * an authenticated user with no interactions still gets a populated
   ``cold_start=True`` response, so removing the recommender's cold-start
-  fallback (the real path, not the dead branch) makes this go red;
+  fallback goes red;
 * a request with no credentials is rejected at the auth gate, before any
-  handler logic -- the behaviour the dead branch implied but never provided;
+  handler logic;
 * for every id the auth layer can install, the response is attributed to that
   id and never to ``"anonymous"``.
 """
@@ -69,11 +57,9 @@ class _StubRedis:
 def env(monkeypatch):
     """Route the real recommender at a controlled Redis/Qdrant boundary.
 
-    ``get_personalized_recommendations`` is deliberately NOT stubbed: it is the
-    code that owns cold-start, so stubbing it would make these tests assert
-    their own fixture. Only the I/O it reaches through is replaced -- a stub
-    Redis for the profile/interaction lookups and for the cache, and a stub
-    ``_get_latest_top_stories`` for the cold-start fallback itself.
+    ``get_personalized_recommendations`` is deliberately NOT stubbed: it owns
+    cold-start, so stubbing it would make these tests assert their own fixture.
+    Only the I/O it reaches through is replaced.
     """
     redis_stub = _StubRedis()
     cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=1000, max_bytes=1 << 24)
@@ -94,9 +80,7 @@ def env(monkeypatch):
     monkeypatch.setattr(recommender, "get_user_profile_categories", _no_categories)
     monkeypatch.setattr(recommender, "_get_latest_top_stories", _latest_top_stories)
     monkeypatch.setattr(recommender.config, "ENABLE_RECOMMENDATIONS", True)
-    # The recommender reads the shared Qdrant handle before it checks for a cold
-    # start, and a missing handle is swallowed into an empty result. Seed it so
-    # a genuine cold-start regression cannot hide behind that error.
+    # A missing Qdrant handle is swallowed into an empty result before the cold-start check, so seed it.
     monkeypatch.setitem(recommender.state, "qdrant", object())
 
     return redis_stub
@@ -106,8 +90,7 @@ def env(monkeypatch):
 def client(monkeypatch):
     """TestClient with ``require_auth`` bypassed, so the handler is reachable.
 
-    Bypassing the gate is what lets these tests drive the cold-start path; the
-    gate's own behaviour is asserted separately in
+    The gate's own behaviour is asserted in
     ``test_no_credentials_is_rejected_before_the_handler_runs``.
     """
 
@@ -121,10 +104,8 @@ def client(monkeypatch):
 def test_authenticated_user_with_no_history_gets_cold_start_recommendations(client, env):
     """The real cold-start path: authenticated, zero interactions, latest stories.
 
-    This is the behaviour the deleted ``user_id == "unknown"`` branch claimed
-    to provide. It is served by the recommender's ``if not interactions``
-    branch, so if that fallback were removed or made to return nothing, this
-    goes red -- which is exactly the regression the dead branch was hiding.
+    Served by the recommender's ``if not interactions`` branch, so removing or
+    emptying that fallback turns this red.
     """
     response = client.get("/recommend/for-you", params={"limit": 5})
 
@@ -141,9 +122,9 @@ def test_authenticated_user_with_no_history_gets_cold_start_recommendations(clie
 def test_cold_start_response_is_cached_under_the_authenticated_user_id(client, env):
     """A warm second call is served from cache, still attributed to that user.
 
-    With the anonymous branch gone, the cache key is the only place the user id
-    reaches the cached entry, so a response cached under one id and replayed
-    for another would be a real cross-user leak.
+    The cache key is the only place the user id reaches the cached entry, so a
+    response cached under one id and replayed for another would be a real
+    cross-user leak.
     """
     assert client.get("/recommend/for-you", params={"limit": 5}).json()["cached"] is False
 
@@ -153,19 +134,15 @@ def test_cold_start_response_is_cached_under_the_authenticated_user_id(client, e
     body = second.json()
     assert body["cached"] is True
     assert body["user_id"] == USER
-    # Built by the endpoint's own helper, not re-spelled here: the key carries a
-    # cache-version segment (#257), and repeating the format string is how the
-    # writer and the reader of this key drift apart while both stay green.
+    # Built by the endpoint's helper: re-spelling the versioned key format is how writer and reader drift.
     assert main._for_you_cache_key(USER, 5) in env.store, "precondition: the entry is cached"
 
 
 def test_response_is_never_attributed_to_anonymous(monkeypatch, client, env):
     """No id the auth layer can install produces an ``"anonymous"`` response.
 
-    ``require_auth`` sets one of exactly two things: ``SERVICE_USER_ID`` or a
-    real user's id. Both are driven here. A handler that grew an anonymous
-    response for either would be handing a service or user client another
-    identity's data shape, so this pins attribution per id.
+    ``require_auth`` sets one of exactly two things, ``SERVICE_USER_ID`` or a
+    real user's id, and both are driven here.
     """
     for user_id in (USER, auth.SERVICE_USER_ID):
         async def _authed(request: Request, uid=user_id) -> None:
@@ -182,12 +159,10 @@ def test_response_is_never_attributed_to_anonymous(monkeypatch, client, env):
 
 
 def test_no_credentials_is_rejected_before_the_handler_runs(monkeypatch, env):
-    """The behaviour the deleted branch implied: an anonymous caller gets a 401.
+    """An anonymous caller gets a 401 before the handler runs.
 
-    ``/recommend/for-you`` is auth-gated, so there is no anonymous response to
-    return and no cold-start state to compute for one. Asserting it here means
-    "reopen this route to anonymous users" is a deliberate, visible change
-    rather than a stray ``user_id`` sentinel.
+    The route is auth-gated, so there is no anonymous response to return and no
+    cold-start state to compute for one.
     """
     monkeypatch.delitem(main.app.dependency_overrides, main.require_auth, raising=False)
     client = TestClient(main.app)

@@ -1,27 +1,23 @@
-"""
-Removes the entire index so the next run starts from zero.
+"""Remove the entire index so the next run starts from zero.
 
 Drops the Qdrant collection and deletes the local data artifacts
 (articles.jsonl, build checkpoint, incremental index state). The embedding
-model cache, venv, and .env are left untouched.
+model cache, venv and .env are left untouched.
 
-Safety: before deleting anything, a snapshot backup is taken
-via qdrant_backup.make_backup() (Qdrant collection snapshot downloaded to
-backend/backups/ + copies of articles.jsonl/index_state.json). Deletion only
-proceeds when a *verified local* snapshot archive exists on disk, unless the
-explicit --skip-backup flag is passed (dangerous). A snapshot that exists only
-inside the Qdrant container does not count: it is destroyed by a container
-recreate or `docker rm`. Run scripts/backup_qdrant.py to back up without
+Safety: a snapshot backup is taken via qdrant_backup.make_backup() before
+anything is deleted, and deletion only proceeds once a *verified local* snapshot
+archive exists on disk. A snapshot that exists only inside the Qdrant container
+does not count -- a container recreate destroys it. ``--skip-backup`` deletes
+with no backup at all; run scripts/backup_qdrant.py to back up without
 resetting.
 
-Exit status: 0 only when the reset ran to completion; 1 on any abort
-(declined confirmation, Qdrant unreachable, or no usable backup).
+Exit status: 0 only when the reset ran to completion; 1 on any abort.
 
 Usage:
-    python scripts/reset_index.py            # interactive confirmation
-    python scripts/reset_index.py --yes      # skip confirmation
-    python scripts/reset_index.py --keep-data  # drop collection only
-    python scripts/reset_index.py --skip-backup  # delete WITHOUT a backup (dangerous)
+    python scripts/reset_index.py                # interactive confirmation
+    python scripts/reset_index.py --yes          # skip confirmation
+    python scripts/reset_index.py --keep-data    # drop collection only
+    python scripts/reset_index.py --skip-backup  # delete WITHOUT a backup
 """
 import os
 import socket
@@ -120,8 +116,8 @@ def main() -> int:
                     return 1
                 log(f"backup before reset: {backup.dest}")
             else:
-                # Collection is missing: still attempt a backup of any local artifacts
-                # so the reset leaves a recoverable record instead of silently doing nothing.
+                # Collection missing: still back up local artifacts, so the
+                # reset leaves a recoverable record instead of doing nothing.
                 backup = make_backup(client, config.QDRANT_COLLECTION)
                 if backup.dest is None:
                     log(

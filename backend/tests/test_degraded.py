@@ -4,8 +4,7 @@ import pytest
 
 from app.degraded import REANNOUNCE_SECONDS, DegradedLatch
 
-# A dedicated logger name keeps these assertions off every other module's
-# records, so a test can only see the latch under test.
+# A dedicated logger name keeps these assertions off every other module's records.
 LOGGER_NAME = "test_degraded_latch"
 
 OUTAGE = "widget Redis unavailable (%s)"
@@ -14,10 +13,8 @@ OUTAGE = "widget Redis unavailable (%s)"
 class _FakeClock:
     """Callable stand-in for ``time.monotonic`` that moves only when told.
 
-    The latch rate-limits its lines against the clock, so a test driving
-    several outages in a row has to decide whether they are minutes or
-    microseconds apart. Injecting the clock makes that decision explicit and
-    keeps the tests from sleeping.
+    The latch rate-limits its lines against the clock, so injecting it makes the
+    elapsed time between outages explicit and keeps the tests from sleeping.
     """
 
     def __init__(self, now: float = 0.0) -> None:
@@ -67,8 +64,7 @@ def test_outage_then_recovery_then_outage_announces_both_outages(
     latch.warn_degraded(OUTAGE, ConnectionError("down"))
     latch.log_recovered()
     # Two incidents minutes apart are two incidents, not one: the window has to
-    # pass before the second outage is announced again. Without the jump the
-    # third event would still be inside the window and correctly suppressed.
+    # pass before the second outage is announced again.
     clock.advance(REANNOUNCE_SECONDS + 1)
     latch.warn_degraded(OUTAGE, ConnectionError("down"))
 
@@ -81,8 +77,7 @@ def test_outage_then_recovery_then_outage_announces_both_outages(
 
 
 def test_sustained_outage_logs_once_regardless_of_how_many_failures(latch, latch_logs):
-    # The clock never moves, so no re-announce window can open: 50 failures are
-    # one line, not 50.
+    # The clock never moves, so no re-announce window can open.
     for _ in range(50):
         latch.warn_degraded(OUTAGE, ConnectionError("down"))
 
@@ -173,8 +168,7 @@ def test_sustained_outage_is_reannounced_once_per_elapsed_window(
 
     Silence after the first line is the other half of the anti-spam failure --
     an incident that outlives its first warning. The count has to follow the
-    elapsed windows, so 100 failing requests spread over 5 windows cost 5
-    lines and not 100.
+    elapsed windows, so 100 failing requests spread over 5 windows cost 5 lines.
     """
     windows, requests_per_window = 5, 20
 
@@ -198,10 +192,9 @@ def test_outage_arriving_inside_the_window_produces_no_recovery_line(
 
     The first incident is reported and closed, then a second outage starts
     while that recovery line is still inside the window. Nothing is logged for
-    it, so nothing may be logged for its recovery either: the log already says
-    the dependency is down, and pairing every flap is the spam again. If the
-    suppressed outage claimed a line that was never emitted, the following
-    success would close an outage the log never opened.
+    it, so nothing may be logged for its recovery either: pairing every flap is
+    the spam again, and a recovery for an outage that was never announced would
+    close an incident the log never opened.
     """
     latch.warn_degraded(OUTAGE, ConnectionError("down"))
     latch.log_recovered()  # the first incident is over, and is the recent line
@@ -209,7 +202,6 @@ def test_outage_arriving_inside_the_window_produces_no_recovery_line(
     latch.warn_degraded(OUTAGE, ConnectionError("down"))  # suppressed
     latch.log_recovered()  # closes the suppressed outage
 
-    # Only the first incident's pair; the suppressed outage added nothing.
     assert _messages(latch_logs.records) == [
         "widget Redis unavailable (down)",
         "widget Redis recovered",
@@ -223,8 +215,7 @@ def test_a_dependency_that_fails_again_long_after_the_first_outage_is_announced(
 
     A helper that is not called for hours and then fails has nobody to call
     ``log_recovered()`` in between, so only elapsed time can distinguish the
-    two episodes. Without the jump the second failure would be swallowed as a
-    flap of an outage the log has not been told about since the first line.
+    two episodes.
     """
     latch.warn_degraded(OUTAGE, ConnectionError("down"))
     clock.advance(REANNOUNCE_SECONDS * 10)  # ten re-announce windows of silence
@@ -265,12 +256,10 @@ def test_a_flapping_dependency_cannot_renew_its_own_silence_indefinitely(
 ):
     """A flapping dependency is bounded by elapsed windows, not by flaps.
 
-    Flapping with a real recovery on every cycle: a latch that simply reset on
-    recovery would emit a pair per cycle, and a hot path that flaps per request
-    would emit a pair per request. Here the run covers three windows, so the
-    cost is three pairs however many cycles the operator sees -- the recovery
-    lines never move the window, which is what stops the latch renewing its
-    own silence indefinitely.
+    A latch that simply reset on recovery would emit a pair per cycle, and a hot
+    path that flaps per request would emit a pair per request. Here the run
+    covers three windows, so the cost is three pairs however many cycles the
+    operator sees -- the recovery lines never move the window.
     """
     cycles, windows = 12, 3
 

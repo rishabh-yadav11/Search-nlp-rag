@@ -14,13 +14,10 @@ for _path in (BACKEND_DIR, SCRIPTS_DIR, TESTS_DIR):
 
 @pytest.fixture
 def fake_cache():
-    """Factory for the in-memory ``HybridCache`` stand-in.
+    """Factory returning the ``FakeCache`` class; each call builds a fresh store.
 
-    Yields the shared ``FakeCache`` class rather than an instance: a test calls
-    ``fake_cache()`` for a bare cache, or ``fake_cache(get_result=...)`` /
-    ``fake_cache(get_error=...)`` when ``get()`` has to return or raise
-    something specific. Every call builds a fresh store, so no state is shared
-    between tests.
+    A test passes ``get_result=``/``get_error=`` to make ``get()`` return or
+    raise something specific.
     """
     from _support import FakeCache
 
@@ -31,11 +28,9 @@ def fake_cache():
 def _reset_auth_rate_limits():
     """Clear the auth rate limiter's in-process counters around every test.
 
-    When the limiter's Redis is unreachable the limiter falls back to a
-    bounded in-process counter, and no Redis runs in the test environment --
-    so that fallback is the live limiter here. Its state lives on the module
-    and the whole session shares one process, without this reset the logins of
-    one test would 429 an unrelated test later in the run.
+    No Redis runs in the test environment, so the limiter's bounded
+    in-process fallback is the live limiter here, and its state lives on the
+    module -- without this reset one test's logins 429 another's.
     """
     from app import auth
 
@@ -51,16 +46,11 @@ def parse_config(monkeypatch):
 
     ``app.config`` reads its knobs with ``os.getenv`` at import time, so the
     only way to ask "what does the app parse when the environment says X?" is
-    to execute config.py again. Two things have to be neutralised for that to
-    be a controlled measurement rather than an echo of the machine:
+    to execute config.py again. ``load_dotenv()`` runs inside it and would
+    re-populate ``os.environ`` from a developer's ``backend/.env``, and the
+    ambient environment is replaced outright by the caller's mapping.
 
-    * ``load_dotenv()`` runs inside config.py and would re-populate
-      ``os.environ`` from a developer's ``backend/.env`` while the copy loads;
-    * the ambient environment is replaced outright by the caller's mapping, so
-      a shell export of an unrelated knob cannot leak into the result.
-
-    The load is private: no other module's ``config`` object is touched, so
-    the rest of the suite still sees the process-wide config it had before.
+    The load is private: no other module's ``config`` object is touched.
     """
 
     def _parse(**env):
@@ -81,10 +71,10 @@ def parse_config(monkeypatch):
     return _parse
 
 def auth_cookie(token: str) -> dict:
-    """The cookie a real browser attaches for this session token.
+    """The cookie a browser attaches for this session token.
 
-    The auth credential is an HttpOnly cookie, so tests authenticate the way the
-    app does in production: by cookie, never by an ``Authorization`` header.
+    The credential is HttpOnly, so tests authenticate by cookie, never by an
+    ``Authorization`` header.
     """
     from app.config import config
 

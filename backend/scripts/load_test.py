@@ -1,18 +1,12 @@
-"""Simple concurrent load test for /search.
+"""Concurrent load test for /search against a running backend.
 
-Measures throughput and latency under concurrency against a running backend.
-Two modes:
-
-  cold  - N DISTINCT queries so every request hits the full pipeline
-          (encode + rerank + Qdrant); stresses inference/CPU.
-  hot   - every request uses the SAME query (cache hits); stresses I/O.
-
-Run from anywhere (the backend must be up):
+``--mode cold`` sends N distinct queries so every request runs the full pipeline
+(encode + rerank + Qdrant), stressing inference/CPU; ``--mode hot`` sends the
+same query every time, stressing I/O through the caches. Prints total time,
+requests/sec and p50/p95/p99 latency in ms.
 
     python3 scripts/load_test.py --base http://localhost:8001 \
         --concurrency 32 --total 64 --mode cold --workers 8
-
-Prints total time, requests/sec, and p50/p95/p99 latency (ms).
 """
 import argparse
 import concurrent.futures as cf
@@ -27,16 +21,12 @@ import urllib.request
 class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
     """Per-thread HTTP/1.1 keep-alive handler.
 
-    urllib's default opener opens (and closes) a fresh socket for every
-    request and even forces ``Connection: close``. The loader runs every task
-    through a fixed-size ThreadPoolExecutor, so each worker thread serves many
-    requests; this handler keeps one live connection per thread and reuses it,
-    avoiding connect latency and socket churn.
-
-    It subclasses ``HTTPHandler``/``HTTPSHandler`` and is the ONLY protocol
-    opener registered (we build the ``OpenerDirector`` by hand rather than via
-    ``build_opener``), so our ``http_open``/``https_open`` actually win instead
-    of being shadowed by the default handlers.
+    urllib's default opener opens a fresh socket per request and forces
+    ``Connection: close``. The loader runs every task through a fixed-size
+    ThreadPoolExecutor, so one live connection per worker thread avoids connect
+    latency and socket churn. This is the ONLY protocol opener registered (the
+    OpenerDirector is built by hand, not via ``build_opener``), so its
+    ``http_open``/``https_open`` are not shadowed by the default handlers.
     """
 
     _local = threading.local()
@@ -52,9 +42,8 @@ class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
         timeout = req.timeout or 120
         conn = self._conn(scheme, netloc, timeout)
         headers = dict(req.header_items())
-        # Preserve the caller's header names verbatim; do NOT .title()/mangle
-        # multi-word header names (e.g. "Content-Type" -> "Content-Type" must
-        # stay intact).
+        # Preserve the caller's header names verbatim; .title()-casing them would
+        # mangle multi-word names like "Content-Type".
         headers["Connection"] = "keep-alive"
         try:
             return self._exchange(conn, req, headers)
@@ -92,17 +81,15 @@ class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
             encode_chunked=req.has_header("Transfer-encoding"),
         )
         r = conn.getresponse()
-        # Keep the socket open for the next request on this thread; neuter the
-        # context-manager close() so the caller's `with` block doesn't tear the
-        # connection down.
+        # Keep the socket open for this thread's next request: neuter the
+        # context-manager close() so the caller's `with` cannot tear it down.
         r.close = lambda: None
         return r
 
 
-# Build the opener by hand so the default HTTPHandler/HTTPSHandler are NOT also
-# registered (build_opener would add them and let their http_open win over
-# ours). We register our keep-alive handler plus the standard error/redirect
-# processors so 3xx and 4xx/5xx are handled like the normal opener.
+# Built by hand so the default HTTPHandler/HTTPSHandler are NOT also registered
+# (build_opener would add them and let their http_open win over ours); the
+# redirect/error processors keep 3xx and 4xx/5xx behaving like the normal opener.
 _opener = urllib.request.OpenerDirector()
 _opener.add_handler(_KeepAliveHandler())
 _opener.add_handler(urllib.request.HTTPRedirectHandler())
@@ -111,10 +98,9 @@ _opener.add_handler(urllib.request.HTTPErrorProcessor())
 _opener.add_handler(urllib.request.UnknownHandler())
 
 
-# Cold queries: each request gets a UNIQUE query so every one triggers a full
-# retrieval pass (distinct queries can't hit the search/retrieve cache). A
-# per-run offset makes queries differ across invocations so the per-worker
-# in-process TTLCache (not cleared by redis FLUSHDB) can't serve them.
+# Cold queries are unique per request so every one triggers a full retrieval
+# pass, and the run id keeps them distinct across invocations so a per-worker
+# in-process TTLCache cannot serve them.
 def cold_query(i: int, run_id: int) -> str:
     topics = [
         "venture debt providers", "fintech funding round", "AI startups raising capital",
@@ -128,10 +114,9 @@ def cold_query(i: int, run_id: int) -> str:
 def hit(url: str, q: str, hot: bool, run_id: int):
     """Return (latency_ms, error).
 
-    On a successful request ``error`` is None and ``latency_ms`` holds the
-    measured round-trip time. On any failure (timeout, HTTP 429/500, connection
-    reset, ...) ``latency_ms`` is None and ``error`` carries a short status
-    string so the caller can record the failure and keep the run alive.
+    `latency_ms` is the round-trip time on success and None on any failure, in
+    which case `error` carries a short status string so the caller can record it
+    and keep the run alive.
     """
     query = "top startup funding deals of 2024" if hot else cold_query(int(q), run_id)
     u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)

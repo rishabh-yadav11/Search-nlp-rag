@@ -1,12 +1,10 @@
-"""
-Pulls ALL published rows from the source MySQL vcc_frontend table using cursor
-(id-based) pagination so we never hold the full table in memory and can resume
-if interrupted. Writes newline-delimited JSON to data/articles.jsonl with the
-canonical payload schema consumed by build_index.py:
+"""Pull all published rows from the source MySQL table into data/articles.jsonl.
 
-    id, title, summary, url, published_date, category
+Cursor (id-based) pagination, so the full table is never held in memory and an
+interrupted run can resume. The output is newline-delimited JSON in the payload
+schema build_index.py consumes: id, title, summary, url, published_date,
+category.
 
-Usage:
     python scripts/fetch_data.py
 """
 import asyncio
@@ -31,21 +29,17 @@ PAGE_SIZE = 5000
 async def fetch_all():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     tmp_path = OUTPUT_PATH + ".tmp"
-    # Remove any stale temp file unconditionally so a previous crash (which left
-    # a .tmp but never ran os.replace) can't have its rows re-fetched and
-    # appended again, producing duplicates in OUTPUT on the next run.
+    # Drop any stale temp file unconditionally: a crashed run leaves one behind
+    # (os.replace never ran) and its rows would be re-appended, duplicating them.
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
     last_id = 0
     total_written = 0
 
-    # Resume support: if the output file already exists, find the max id already
-    # written. A previous run may have been interrupted mid-write, leaving a
-    # truncated trailing jsonl line; detect it and drop it so downstream
-    # build_index.py never reads corrupt records. We scan streaming (constant
-    # memory) and stop at the first non-empty invalid record; blank lines are
-    # skipped, never treated as a truncation point.
+    # Resume: find the max id already written, scanning in constant memory and
+    # stopping at the first invalid record, which marks a truncated trailing line
+    # from an interrupted run. Blank lines are skipped, not a truncation point.
     if os.path.exists(OUTPUT_PATH):
         with open(OUTPUT_PATH, "rb") as f:
             last_valid_offset = 0
@@ -67,19 +61,16 @@ async def fetch_all():
                 f"Resuming: dropping {file_size - last_valid_offset} byte(s) of "
                 f"incomplete trailing line from a previous interrupted run.",
             )
-        # Copy the valid prefix into a temp file. New rows are appended there and
-        # only atomically renamed over OUTPUT_PATH on full success, so an errored
-        # run never appends partial rows to the real file (no row duplication on
-        # re-run). The stale temp was already removed unconditionally above.
+        # Append to a temp file renamed over OUTPUT_PATH only on success, so an
+        # errored run never leaves partial rows for the next run to duplicate.
         with open(OUTPUT_PATH, "rb") as src, open(tmp_path, "wb") as dst:
             dst.write(src.read(last_valid_offset))
         print(f"Resuming from id > {last_id} ({total_written} rows already written)")
 
     pool = None
     pool = await make_pool(maxsize=5, connect_timeout=10)
-    # Previously also passed read_timeout/write_timeout; aiomysql 0.3.0 rejects
-    # them (TypeError before any socket opens) and exposes no equivalent. Do not
-    # restore them — see make_pool in _common.py.
+    # Do not restore the old read_timeout/write_timeout args: aiomysql rejects
+    # them (TypeError before any socket opens) and exposes no equivalent.
 
     # Only published content ('article'/'interview'/'video'); the table pk is `feid`.
     query = f"""
@@ -134,8 +125,7 @@ async def fetch_all():
 
         print(f"Done. {total_written} total articles written to {OUTPUT_PATH}")
     except Exception:
-        # Discard the temp file so a failed run never leaves partial rows
-        # behind to be duplicated on the next run.
+        # A failed run must not leave partial rows behind to be duplicated.
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise

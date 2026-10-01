@@ -1,19 +1,15 @@
 """Behavioural contract for the Redis-backed rate limiter's window bookkeeping.
 
 The limiter's safety rests on two arguments to a single ``SET``: ``NX`` so the
-window is not re-armed on every hit, and ``EX`` so the counter is reclaimed when
-the window closes. Both are invisible to a permissive test double that accepts
-``**kwargs``, which is why these cases drive ``app.auth`` through a fake that
-models them and then assert on OBSERVABLE behaviour -- a subject that is
-throttled and later served again, a count that continues rather than restarts,
-and the order of the recorded calls.
+window is not re-armed on every hit, and ``EX`` so the counter is reclaimed.
+Both are invisible to a permissive double that accepts ``**kwargs``, so these
+cases assert on OBSERVABLE behaviour instead.
 
-Except for the one case that exercises the double itself in isolation, every
-test here installs the fake via ``auth._rate_client``. They also assert
+Every test but one installs the fake via ``auth._rate_client`` and asserts
 ``fake.violations == []``: ``_consume_counter`` wraps the Redis exchange in
-``except Exception`` and either fails closed with 503 or silently degrades to
-the in-process fallback, so a double that merely raised would keep the suite
-green while proving nothing. A violation is data, and it is asserted on.
+``except Exception`` and either fails closed or degrades to the in-process
+fallback, so a double that merely raised would keep the suite green while
+proving nothing. A violation is data, and it is asserted on.
 """
 
 import asyncio
@@ -31,8 +27,7 @@ KEY = "auth:rl:login:203.0.113.7"
 
 @pytest.fixture
 def fake(monkeypatch):
-    # A frozen clock, so TTL assertions are exact instead of racing real time
-    # and being compared with a tolerance that would hide a real drift.
+    # A frozen clock, so TTL assertions are exact instead of hiding real drift.
     f = RateLimitRedisFake(clock=lambda: 1000.0)
     monkeypatch.setattr(auth, "_rate_client", f)
     return f
@@ -45,10 +40,9 @@ def _consume(fake, key=KEY, limit=2, window=WINDOW, fail_closed=True):
 def test_counter_window_is_attached_and_the_key_is_reclaimed(fake):
     """A TTL is not an optimisation: without it the key is immortal.
 
-    Drive the real limiter to exhaustion, confirm the subject is refused, then
-    move fake time past the window and confirm the SAME key is served again
-    from a fresh count. A limiter that stopped passing ``ex=`` leaves the key
-    alive forever, so the post-advance attempt is still refused.
+    Drive the real limiter to exhaustion, move fake time past the window, and
+    confirm the SAME key is served again from a fresh count. A limiter that
+    stopped passing ``ex=`` leaves the key alive forever.
     """
     for _ in range(2):
         asyncio.run(_consume(fake, limit=2))
@@ -85,8 +79,7 @@ def test_nx_does_not_reset_a_counter_created_earlier_in_the_window(fake):
     """Without ``NX`` the limiter re-arms its own window on every request.
 
     That pins the count at 1 forever, so the limit is never reached and the
-    endpoint is effectively unrated. Seed a mid-window counter and check the
-    next hit continues from it.
+    endpoint is effectively unrated.
     """
 
     async def seed():
@@ -111,8 +104,7 @@ def test_window_is_established_before_the_first_increment(fake):
 
     If the window-establishing write moved after the increment, ``INCR`` would
     create the key first and that key would carry no expiry. The ``NX`` SET that
-    follows is then DECLINED, because the key already exists -- so nothing ever
-    attaches a TTL and the subject stays locked out permanently.
+    follows is then DECLINED, so nothing ever attaches a TTL.
     """
     asyncio.run(_consume(fake, limit=100))
     assert fake.calls == [
@@ -126,9 +118,8 @@ def test_fake_records_a_counter_written_without_a_ttl():
     """The double's own acceptance clause, tested on the double.
 
     Production wraps the Redis exchange in ``except Exception``, so a fake that
-    raised here would push the request onto the in-process fallback and keep the
-    suite green. It records instead -- and still performs the write, so the
-    consequence is observable.
+    raised here would push the request onto the in-process fallback. It records
+    instead -- and still performs the write, so the consequence is observable.
     """
     fake = RateLimitRedisFake(clock=lambda: 2000.0)
     asyncio.run(fake.set(KEY, 0, nx=True))
@@ -149,8 +140,7 @@ def test_fake_records_a_counter_written_without_a_ttl():
 def test_in_process_fallback_honours_its_window(monkeypatch):
     """The degraded path is still a limiter, with the same fixed window.
 
-    This is the path every request in a Redis-less deployment actually takes, so
-    a fallback that ignored its window would be an unrated login endpoint.
+    It is the path every request in a Redis-less deployment actually takes.
     """
     clock = {"t": 1000.0}
     monkeypatch.setattr(auth.time, "monotonic", lambda: clock["t"])

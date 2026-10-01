@@ -39,8 +39,7 @@ def test_split_names_json_dedupes_plain_dedupes():
     # JSON-list values are flattened (nested lists unwrapped) and de-duplicated.
     assert split_names('["Alice", "Alice", "Bob"]') == ["Alice", "Bob"]
     assert split_names('[["Alice", "Bob"], "Bob"]') == ["Alice", "Bob"]
-    # Delimited (comma/pipe) values are de-duplicated and trimmed. Slashes are
-    # NOT a delimiter — they are legitimate within facet values.
+    # Slashes are NOT a delimiter -- they are legitimate within facet values.
     assert split_names("Fintech/Healthtech") == ["Fintech/Healthtech"]
     assert split_names("TMT, Technology") == ["TMT", "Technology"]
     assert split_names("") == []

@@ -210,13 +210,11 @@ _TRIGGERS: list[tuple[list[str], list[str]]] = [
 def expand_query(q: str) -> str:
     """Return ``q`` with a bounded set of corpus-friendly synonym phrases appended.
 
-    Detection matches trigger terms on word boundaries (not raw substring
-    containment), so short triggers like "ai"/"ml"/"ev" no longer fire inside
-    unrelated words ("email"/"small"/"every"). Only concepts that actually appear
-    in the query contribute expansions, terms already present in the query are
-    dropped, and the appended words never exceed ``_MAX_EXTRA_TOKENS`` tokens.
-    The original query text is preserved unchanged at the front. Returns ``q``
-    untouched when nothing matches.
+    Detection matches trigger terms on word boundaries, so short triggers like "ai"/"ml"/"ev"
+    do not fire inside unrelated words ("email"/"small"/"every"). Only concepts actually present
+    in the query contribute expansions, terms already in the query are dropped, and the appended
+    words never exceed ``_MAX_EXTRA_TOKENS``. The original text is preserved at the front; ``q``
+    is returned untouched when nothing matches.
     """
     q_lower = q.lower()
     candidates: list[str] = []

@@ -31,9 +31,8 @@ _ORIG_CT: dict = {}
 
 def setup_function(_) -> None:
     global _ORIG_DEAL, _ORIG_IND, _ORIG_CT
-    # Snapshot whatever the module globals currently hold so teardown can restore
-    # them exactly, preventing any cross-module leakage (the extractors read these
-    # module-global facet maps).
+    # Snapshot the globals so teardown can restore them exactly; the extractors
+    # read these module-global facet maps.
     _ORIG_DEAL = dict(main._DEALTYPE_FACETS)
     _ORIG_IND = dict(main._INDUSTRY_FACETS)
     _ORIG_CT = dict(main._CONTENT_TYPE_FACETS)
@@ -41,9 +40,8 @@ def setup_function(_) -> None:
 
 
 def teardown_function(_) -> None:
-    # Restore the globals to their pre-test state rather than just clearing, so
-    # other test modules never see this module's simulated vocabulary (nor lose
-    # any state they had installed).
+    # Restore rather than clear, so other modules neither see this module's
+    # simulated vocabulary nor lose the state they had installed.
     main._DEALTYPE_FACETS.clear()
     main._DEALTYPE_FACETS.update(_ORIG_DEAL)
     main._INDUSTRY_FACETS.clear()
@@ -69,8 +67,7 @@ def test_extract_dealtype_private_equity() -> None:
 
 
 def test_extract_dealtype_none_when_no_match() -> None:
-    # No IPO facet exists in the corpus; extraction degrades to None (the query is
-    # still cleaned so the embedding focuses on 'ipo').
+    # No IPO facet exists in the corpus; extraction degrades to None.
     assert main.extract_dealtype("ipo news") is None
     assert main.extract_dealtype("latest news") is None
     assert main.extract_dealtype("how are you") is None
@@ -89,7 +86,6 @@ def test_extract_industry_none() -> None:
 
 
 def test_extract_content_type() -> None:
-    # Content-type modifiers resolve to a real `content_type` facet value.
     assert main.extract_content_type("interviews with Narayana Murthy") == "Interview"
     assert main.extract_content_type("founders of Curefit") == "Founder"
     assert main.extract_content_type("competitors of Zomato") == "Competitor"
@@ -158,14 +154,12 @@ def test_facet_load_failure_names_the_exception(monkeypatch, caplog) -> None:
 
 
 def test_extract_content_type_none_when_no_match() -> None:
-    # Queries without a content-type modifier degrade to None (current behavior).
     assert main.extract_content_type("top funding deals 2025") is None
     assert main.extract_content_type("latest news") is None
 
 
 def test_extract_content_type_unknown_facet_degrades() -> None:
-    # When the corpus has no matching `content_type` facet, resolution degrades
-    # to None rather than emitting a bogus value.
+    # No matching `content_type` facet -> None rather than a bogus value.
     main._CONTENT_TYPE_FACETS.clear()
     main._CONTENT_TYPE_FACETS.update({"article": "Article", "interview": "Interview"})
     assert main.extract_content_type("interviews with X") == "Interview"
@@ -174,11 +168,9 @@ def test_extract_content_type_unknown_facet_degrades() -> None:
 
 
 def test_build_facet_filter_content_type() -> None:
-    # A content_type facet value becomes a Qdrant `content_type` filter condition.
     f = main.build_facet_filter(None, None, None, None, None, "Interview")
     assert f is not None
     assert [c.key for c in f.must] == ["content_type"]
-    # None content_type yields no filter (current behavior).
     assert main.build_facet_filter(None, None, None, None, None, None) is None
 
 
@@ -188,7 +180,6 @@ def test_effective_intent_funding_news_june() -> None:
     assert rq == "funding news"
     assert dt == "Venture Capital"
     assert ind is None
-    # June auto date filter is derived from the query.
     assert f is not None and t is not None
     assert f.startswith("20") and "-06-" in f
 

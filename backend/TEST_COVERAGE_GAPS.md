@@ -67,21 +67,21 @@ Overall: 95.2% (245 of 5153 statements uncovered)
 
 | Module | Coverage | Statements | Missed | Uncovered lines |
 | --- | --- | --- | --- | --- |
-| `app/recommender.py` | 69.1% | 262 | 81 | 111-114, 120, 125-128, 130-132, 136-137, 142-143, 145, 147, 170-172, 200, 327, 342, 395-397, 414, 427, 461-463, 503-505, 521, 582-583, 588-589, 593-594, 598-599, 603-604, 616-620, 622-645, 647-652 |
-| `app/query_intent.py` | 91.8% | 367 | 30 | 310, 465, 471, 477-478, 490-496, 500-508, 514, 595, 820-824, 860, 906 |
-| `app/observability.py` | 93.8% | 65 | 4 | 98, 119-120, 253 |
-| `app/user_profile.py` | 93.9% | 280 | 17 | 185-186, 193, 303-304, 363, 366, 369, 389-390, 408, 411, 414, 426, 432-433, 436 |
-| `app/llm.py` | 94.3% | 106 | 6 | 88-90, 92, 127, 134 |
-| `app/health.py` | 94.8% | 155 | 8 | 179-180, 183, 390, 393, 429, 432-433 |
-| `app/analytics.py` | 95.2% | 248 | 12 | 138, 209-211, 359-360, 471-472, 548, 553, 570-571 |
-| `app/chat.py` | 95.5% | 1081 | 49 | 239, 511-514, 707-708, 729, 739, 1135-1136, 1304, 1313, 1694, 1696, 2577-2578, 2697, 2699, 2837, 2965, 3001, 3004-3007, 3017, 3107-3108, 3114, 3119-3120, 3125-3127, 3147-3148, 3151-3153, 3157-3159, 3185, 3189-3190, 3215, 3220-3221 |
-| `app/request_context.py` | 95.5% | 44 | 2 | 46, 104 |
-| `app/main.py` | 96.9% | 748 | 23 | 215, 247, 663-666, 699, 701, 732-734, 1335, 1444, 1447, 1486, 1493-1494, 1517, 1533, 1562, 2007, 2278, 2485 |
-| `app/rerank_boost.py` | 97.6% | 83 | 2 | 199, 285 |
-| `app/index_text.py` | 98.8% | 81 | 1 | 42 |
-| `app/auth.py` | 98.9% | 710 | 8 | 949, 1035, 1041, 1285, 1288, 1433-1434, 2299 |
-| `app/redis_cache.py` | 99.3% | 147 | 1 | 161 |
-| `app/config.py` | 99.7% | 292 | 1 | 267 |
+| `app/recommender.py` | 69.1% | 262 | 81 | 65-68, 72, 77-80, 83-85, 89-90, 95-96, 98, 100, 118-120, 130, 235, 250, 301-303, 312, 321, 354-356, 392-394, 407, 452-453, 458-459, 463-464, 468-469, 473-474, 479-483, 486-509, 511-516 |
+| `app/query_intent.py` | 91.8% | 367 | 30 | 242, 366, 370, 374-375, 383-389, 392-400, 407, 469, 638-642, 667, 708 |
+| `app/observability.py` | 93.8% | 65 | 4 | 45, 60-61, 143 |
+| `app/user_profile.py` | 93.9% | 280 | 17 | 120-121, 128, 205-206, 249, 252, 255, 269-270, 288, 291, 294, 302, 308-309, 312 |
+| `app/llm.py` | 94.3% | 106 | 6 | 85-87, 89, 123, 130 |
+| `app/health.py` | 94.8% | 155 | 8 | 98-99, 102, 227, 230, 248-250 |
+| `app/analytics.py` | 95.2% | 248 | 12 | 70, 104-106, 189-190, 247-248, 302, 307, 324-325 |
+| `app/chat.py` | 95.5% | 1081 | 49 | 200, 425-428, 588-589, 602, 612, 900-901, 1031, 1040, 1348, 1350, 2042-2043, 2129, 2131, 2232, 2316, 2337, 2340-2343, 2353, 2417-2418, 2424, 2428-2429, 2431-2433, 2447-2448, 2451-2453, 2456-2458, 2475, 2478-2479, 2501, 2505-2506 |
+| `app/request_context.py` | 95.5% | 44 | 2 | 43, 100 |
+| `app/main.py` | 96.9% | 748 | 23 | 180, 202, 527-530, 554, 556, 577-579, 1009, 1079, 1082, 1117, 1124-1125, 1146, 1159, 1180, 1495, 1693, 1865 |
+| `app/rerank_boost.py` | 97.6% | 83 | 2 | 170, 231 |
+| `app/index_text.py` | 98.8% | 81 | 1 | 38 |
+| `app/auth.py` | 98.9% | 710 | 8 | 704, 778, 784, 977, 980, 1094-1095, 1798 |
+| `app/redis_cache.py` | 99.3% | 147 | 1 | 109 |
+| `app/config.py` | 99.7% | 292 | 1 | 152 |
 | `app/__init__.py` | 100.0% | 0 | 0 | none |
 | `app/answer_fallback.py` | 100.0% | 48 | 0 | none |
 | `app/click_boost.py` | 100.0% | 26 | 0 | none |
@@ -101,15 +101,15 @@ Overall: 95.2% (245 of 5153 statements uncovered)
 
 `except` and `raise` statements that no test executes — 29 of the 245 uncovered statements:
 
-- `app/recommender.py`: 113, 170, 395, 461, 503
-- `app/user_profile.py`: 303, 366, 369, 436
-- `app/llm.py`: 88, 127, 134
-- `app/health.py`: 179, 429
-- `app/analytics.py`: 209, 359, 471, 570
-- `app/chat.py`: 239, 707, 1135, 2577, 2965, 3114, 3151
-- `app/main.py`: 2278
-- `app/auth.py`: 949, 1433
-- `app/config.py`: 267
+- `app/recommender.py`: 67, 118, 301, 354, 392
+- `app/user_profile.py`: 205, 252, 255, 312
+- `app/llm.py`: 85, 123, 130
+- `app/health.py`: 98, 248
+- `app/analytics.py`: 104, 189, 247, 324
+- `app/chat.py`: 200, 588, 900, 2042, 2316, 2424, 2451
+- `app/main.py`: 1693
+- `app/auth.py`: 704, 1094
+- `app/config.py`: 152
 <!-- coverage:end -->
 
 ## What the numbers do and do not mean
@@ -180,129 +180,129 @@ the generated table.
   recommendation engine is the least covered module in the backend, and the
   reason this document used to be misleading. What the tests reach is the
   happy path; what they miss is every branch that decides *which* articles a
-  user sees. In `get_similar_articles` the vector `retrieve` call (line 120),
-  the source-article payload lookup (lines 125-128), the same-industry /
-  same-dealtype `FieldCondition` filter (lines 130-132, 136-137, 142-143, 145,
-  147), the non-numeric `exclude_ids` guard (lines 111-114) and the catch-all
-  that logs and returns `[]` (lines 170-172) are all uncovered — a typo in any
+  user sees. In `get_similar_articles` the vector `retrieve` call (line 72),
+  the source-article payload lookup (lines 77-80), the same-industry /
+  same-dealtype `FieldCondition` filter (lines 83-85, 89-90, 95-96, 98,
+  100), the non-numeric `exclude_ids` guard (lines 65-68) and the catch-all
+  that logs and returns `[]` (lines 118-120) are all uncovered — a typo in any
   of those `FieldCondition`s returns an empty or wrongly-scoped related list
   for every user while the suite stays green. In
-  `get_personalized_recommendations` the cold-start return (line 200), the two
-  per-candidate `continue` guards (lines 327, 342) and the catch-all (lines
-  395-397) are uncovered. `rerank_acquisition_relation` is untested apart from
-  its two early returns — lines 622-645 and 647-652, its whole scoring body,
+  `get_personalized_recommendations` the cold-start return (line 130), the two
+  per-candidate `continue` guards (lines 235, 250) and the catch-all (lines
+  301-303) are uncovered. `rerank_acquisition_relation` is untested apart from
+  its two early returns — lines 486-509 and 511-516, its whole scoring body,
   are uncovered —
-  and `_entity_acquisition_role` (lines 582-583, 588-589, 593-594, 598-599,
-  603-604) not at all, so
+  and `_entity_acquisition_role` (lines 452-453, 458-459, 463-464, 468-469,
+  473-474) not at all, so
   the acquisition-direction promote/demote scoring the rerank boost depends on
-  has no test: the `PROMOTE`/`DEMOTE` weights at line 622 and the
-  target/buyer × role matrix at lines 638-645 can all be wrong without one test
+  has no test: the `PROMOTE`/`DEMOTE` weights at line 486 and the
+  target/buyer × role matrix at lines 502-509 can all be wrong without one test
   going red. Also uncovered: the trending-feed fallback to latest top stories
-  (line 427) and its catch-all (lines 461-463), the latest-stories catch-all
-  (lines 503-505), and the `tzinfo` normalisation in `_calculate_recency_score`
-  (line 521).
+  (line 321) and its catch-all (lines 354-356), the latest-stories catch-all
+  (lines 392-394), and the `tzinfo` normalisation in `_calculate_recency_score`
+  (line 407).
 - `app/user_profile.py` — 93.9% (17/280 statements uncovered). What is left is
   the profile *aggregation* and its cold-start degradation, not the Redis
-  plumbing. `get_user_profile_vector` lines 363, 366, 369: the bytes decode, the
+  plumbing. `get_user_profile_vector` lines 249, 252, 255: the bytes decode, the
   non-array `TypeError` and the non-finite `ValueError` — so a corrupted
-  stored vector has no test. `build_user_profile` lines 408, 411, 414 (three
-  `continue` guards), 426 (the scalar-category wrap), 432-433 (the
-  `log_recovered` path) and 436, the inconsistent-dimension `ValueError`; its
-  sibling `log_recovered` at lines 389-390. The re-seed catch-all lines
-  303-304, and the lazy `_redis_client` construction lines 185-186, 193.
+  stored vector has no test. `build_user_profile` lines 288, 291, 294 (three
+  `continue` guards), 302 (the scalar-category wrap), 308-309 (the
+  `log_recovered` path) and 312, the inconsistent-dimension `ValueError`; its
+  sibling `log_recovered` at lines 269-270. The re-seed catch-all lines
+  205-206, and the lazy `_redis_client` construction lines 120-121, 128.
 - `app/query_intent.py` — 91.8% (30/367 statements uncovered). The largest
-  single gap is `extract_recency_range` lines 490-496 and 500-508, the
+  single gap is `extract_recency_range` lines 383-389 and 392-400, the
   relative-range parsing that turns text like "last 3 quarters" or "this
   month" into dates — untested, so a wrong `_UNIT_DAYS` multiplier silently
   widens or narrows the date window. `acquisition_relation` is uncovered
-  throughout, lines 820-824: the "X acquired Y" / "X was acquired by Y" forms
+  throughout, lines 638-642: the "X acquired Y" / "X was acquired by Y" forms
   that pick `target` against `buyer` and the fall-through, so the passive and
   active phrasings can be swapped without a test noticing. Also the
-  empty-entity `continue` in `_strip_entities` line 860, the no-intersection
-  early return of `detect_multi_entity` line 906, the date helpers
-  `_days_ago_iso` line 465, `_month_start_iso` line 471 and `_week_start_iso`
-  lines 477-478, the `full -= 100` branch of `_full_year` line 310,
-  `strip_recency_window` line 514 and `_top_n_to_int` line 595.
+  empty-entity `continue` in `_strip_entities` line 667, the no-intersection
+  early return of `detect_multi_entity` line 708, the date helpers
+  `_days_ago_iso` line 366, `_month_start_iso` line 370 and `_week_start_iso`
+  lines 374-375, the `full -= 100` branch of `_full_year` line 242,
+  `strip_recency_window` line 407 and `_top_n_to_int` line 469.
 - `app/main.py` — 96.9% (23/748 statements uncovered). The
   identical-filter short-circuit in `retrieve_with_auto_facet_fallback` lines
-  1443-1447 is uncovered — the branch taken when no auto facet can be dropped,
+  1078-1082 is uncovered — the branch taken when no auto facet can be dropped,
   so nothing is relaxed and the caller gets the primary filter back. The
   relaxed re-retrieve beside it is now covered, so the retry that widens a
   query when an inferred facet returns nothing — the thing that keeps a search
   from coming back empty — does have a test. The two
   `min(candidates, key=…)` tie-breaks that pick a single facet value are
-  uncovered in both `_resolve_facet` line 215 and `extract_content_type`
-  line 247; the recency-stripping tail of `_effective_intent` lines 663-666;
-  `_merge_results` lines 699, 701; the flashback topic leg of
-  `_retrieval_queries` lines 732-734; the `rerank_acquisition_relation` call
-  inside `retrieve_and_rerank` line 1335, which means the acquisition-direction
+  uncovered in both `_resolve_facet` line 180 and `extract_content_type`
+  line 202; the recency-stripping tail of `_effective_intent` lines 527-530;
+  `_merge_results` lines 554, 556; the flashback topic leg of
+  `_retrieval_queries` lines 577-579; the `rerank_acquisition_relation` call
+  inside `retrieve_and_rerank` line 1009, which means the acquisition-direction
   rescoring is wired in but never observed; the date-windowed fetch and its
-  merge/sort at lines 1486, 1493-1494; two early `return []` guards at lines
-  1517, 1533; the body-attach call in the batched similar-articles path
-  line 1562; the `return False` at line 2007; the 422 for an unknown
-  `interaction_type` line 2278; and the `TrendingResponse` construction
-  line 2485.
+  merge/sort at lines 1117, 1124-1125; two early `return []` guards at lines
+  1146, 1159; the body-attach call in the batched similar-articles path
+  line 1180; the `return False` at line 1495; the 422 for an unknown
+  `interaction_type` line 1693; and the `TrendingResponse` construction
+  line 1865.
 - `app/observability.py` — 93.8% (4/65 statements uncovered). The request-id
-  plumbing: the `Mapping` branch of `_user_id` line 98, the non-HTTP passthrough
-  in `RequestIdMiddleware.__call__` lines 119-120 (the lifespan and websocket
+  plumbing: the `Mapping` branch of `_user_id` line 45, the non-HTTP passthrough
+  in `RequestIdMiddleware.__call__` lines 60-61 (the lifespan and websocket
   traffic that must not be given a request id), and the
-  no-handler-installed return in `attach_request_id_filter` line 253.
+  no-handler-installed return in `attach_request_id_filter` line 143.
 - `app/llm.py` — 94.3% (6/106 statements uncovered). `_retry_after_seconds`
-  lines 88-90 and 92, the `Retry-After` header parsing including its
-  unparseable-value path, and in `generate_answer` lines 127 and 134 the
+  lines 85-87 and 89, the `Retry-After` header parsing including its
+  unparseable-value path, and in `generate_answer` lines 123 and 130 the
   `LLMUnavailableError` for a provider that returns an empty `choices` list
   plus the re-raise. A provider answering 200 with no choices is untested.
 - `app/analytics.py` — 95.2% (12/248 statements uncovered). The click
   aggregation, not the beacon write, is what is left: `click_signals` lines
-  471-472 (a non-numeric stored position falling back to
-  `CLICK_POSITION_MIN`), 548 (a member that fails to decode) and 553 (the
+  247-248 (a non-numeric stored position falling back to
+  `CLICK_POSITION_MIN`), 302 (a member that fails to decode) and 307 (the
   `_ZSUM_BATCH` paging), so a second page of click signals is never read and a
-  poisoned counter is never exercised. `_safe_int`'s failure at lines 570-571
+  poisoned counter is never exercised. `_safe_int`'s failure at lines 324-325
   is uncovered on the same read path, as is the degraded return at lines
-  209-211, the warn-only release-claim path at lines 359-360, and the no-raw
-  `return None` line 138.
+  104-106, the warn-only release-claim path at lines 189-190, and the no-raw
+  `return None` line 70.
 - `app/health.py` — 94.8% (8/155 statements uncovered). `_redis_status` lines
-  179-180 and 183, the `from_url` construction failure that reports `down` and
+  98-99 and 102, the `from_url` construction failure that reports `down` and
   the `client is None` guard that reports `degraded` — the ping-failure and
   timeout legs that also report `degraded` are covered. The two rejection
-  returns in `_is_host_local_probe` lines 390 and 393, and the `except Exception`
-  of `ready_deep` lines 429, 432-433, which must return a 500 rather than
+  returns in `_is_host_local_probe` lines 227 and 230, and the `except Exception`
+  of `ready_deep` lines 248, 249-250, which must return a 500 rather than
   launder a probe defect into a verdict.
 - `app/redis_cache.py` — 99.3% (1/147 statements uncovered): the `_discard`
-  call in the client-loss handler line 161, the one place a dropped Redis
-  connection is actually retired rather than left to fail every later call.
+  call in `get_many`'s client-created-here handler line 109 — the one site that
+  still retires a client after its first command failed.
 - `app/request_context.py` — 95.5% (2/44 statements uncovered). The rejection
-  in `is_valid_request_id` line 46 (a non-string, an over-long value, or the
+  in `is_valid_request_id` line 43 (a non-string, an over-long value, or the
   `NO_REQUEST_ID` placeholder itself) and the `return ""` in
-  `scope_request_id` line 104, where no id is stored and none is assigned.
+  `scope_request_id` line 100, where no id is stored and none is assigned.
 - `app/index_text.py` — 98.8% (1/81 statements uncovered): `split_names` line
-  42, the nested-list `_flatten_names` branch. `_join_vals` is now covered —
+  38, the nested-list `_flatten_names` branch. `_join_vals` is now covered —
   appending tags to `_lead` put it on a path a test actually walks.
 - `app/rerank_boost.py` — 97.6% (2/83 statements uncovered):
-  `_strip_entity_phrase` line 199 and `apply_entity_boost` line 285.
+  `_strip_entity_phrase` line 170 and `apply_entity_boost` line 231.
 - `app/chat.py` — 95.5% (49/1081 statements uncovered). What is left is the
   streaming teardown and the log-shaping helpers, not the turn itself: the
-  `raise` after a mid-turn failure line 2965, the budget `release` line 2837,
-  and four bare `return`s at lines 3001, 3005, 3017, 3185 — so a stream that
+  `raise` after a mid-turn failure line 2316, the budget `release` line 2232,
+  and four bare `return`s at lines 2337, 2341, 2353, 2475 — so a stream that
   dies mid-answer still has no test asserting what is written, what is
   charged, or what is settled. The cancellation-rollback failure path is
-  uncovered too — lines 2577-2578, where a rollback that itself fails after
+  uncovered too — lines 2042-2043, where a rollback that itself fails after
   `CancelledError` is logged rather than raised over the original cancel.
-  Also the unconnected-store `raise` in `ChatStore._require_db` line 239, the
-  whole `ChatStore.delete_message` path lines 511-514 (missing session, and
+  Also the unconnected-store `raise` in `ChatStore._require_db` line 200, the
+  whole `ChatStore.delete_message` path lines 425-428 (missing session, and
   the delegated delete), the sized-less-iterable `except TypeError` in
-  `_container_stub` lines 707-708 and the two `_shrink_for_log` container
-  delegations lines 729, 739, the `except OverflowError` in `_as_float` lines
-  1135-1136, the two `_append_nudge` early returns lines 1304, 1313, and the
-  empty/plain `str` passthroughs in the untrusted-content truncation lines 1694,
-  1696.
+  `_container_stub` lines 588-589 and the two `_shrink_for_log` container
+  delegations lines 602, 612, the `except OverflowError` in `_as_float` lines
+  900-901, the two `_append_nudge` early returns lines 1031, 1040, and the
+  empty/plain `str` passthroughs in the untrusted-content truncation lines 1348,
+  1350.
 - `app/auth.py` — 98.9% (8/710 statements uncovered): the unconnected-store
-  `raise` line 949, the two purge-count logs in `token_purge_loop` lines 1035,
-  1041, the in-process rate-counter eviction `del` line 1285 and its early
-  return line 1288, and the policy-violation hint in `_password_hint`
-  line 2299.
+  `raise` line 704, the two purge-count logs in `token_purge_loop` lines 778,
+  784, the in-process rate-counter eviction `del` line 977 and its early
+  return line 980, and the policy-violation hint in `_password_hint`
+  line 1798.
 - `app/config.py` — 99.7% (1/292 statements uncovered): the `ValueError` in
-  `_parse_allowed_hosts` line 267 for an entry that is not a usable hostname.
+  `_parse_allowed_hosts` line 152 for an entry that is not a usable hostname.
 <!-- gaps:end -->
 
 ## Per-module checklists

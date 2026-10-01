@@ -1,27 +1,16 @@
 """In-memory stand-in for the Redis commands the rate limiter uses.
 
-The production limiter in ``app.auth._consume_counter`` establishes its window
-with a single ``SET key 0 NX EX window`` and then ``INCR``s the key. Both
-properties are load-bearing, and the two properties a test double most
-naturally drops are exactly those two:
+The production limiter establishes its window with a single ``SET key 0 NX EX
+window`` and then ``INCR``s the key, and both properties are invisible to a
+double that accepts ``**kwargs``: ``EX`` is what makes the counter reclaimable,
+and ``NX`` is what stops the window being re-armed on every hit (which would
+pin the count at 1 and turn the limit into no limit). So this fake models them,
+and RECORDS a contract violation when a counter key is written without a TTL.
 
-* ``EX`` is what makes the key reclaimable. Without it the counter is immortal
-  and one source address is locked out forever.
-* ``NX`` is what stops the window from being re-armed on every hit, which would
-  pin the count at 1 forever and turn the limit into "no limit".
-
-A permissive double that ignores both arguments (``**kwargs`` and a plain dict
-of ints) makes the production invariant untestable: a limiter that stopped
-passing ``ex=`` would still pass every test written against it. This fake
-therefore models them, and additionally RECORDS a contract violation when a
-counter key is written without a TTL.
-
-Recording rather than raising is deliberate. ``_consume_counter`` wraps the
-whole Redis exchange in ``except Exception`` and then either fails closed with
-503 or silently falls back to ``_local_rate_hit``. A fake that raised on an
-unexpected call would therefore not fail the test at all -- it would push the
-request onto the in-process fallback path and the suite would stay green while
-proving nothing. Violations are data here; the test asserts on them.
+Recording rather than raising is deliberate: ``_consume_counter`` wraps the
+whole Redis exchange in ``except Exception``, so a fake that raised on an
+unexpected call would push the request onto the in-process fallback and leave
+the suite green while proving nothing.
 """
 
 from __future__ import annotations
@@ -51,28 +40,16 @@ class RateLimitRedisFake:
       ``violations``. The write still happens, so the test sees the
       consequence rather than a swallowed error.
 
-    What this fake does NOT provide, and no test should assume:
-
-    * No connection, server, RESP protocol, or serialization. Values are
-      Python ints; a real deployment may use a different Redis client type.
-    * No pipelining, ``MULTI``/``EXEC``, transactions, ``WATCH``, or Lua.
-      ``app.budget`` has its own Lua tests with their own doubles.
-    * No eviction, maxmemory policy, persistence, replication, or keyspace
-      notifications.
-    * No other commands. ``ttl()``/``expiry()``/``counters`` are inspection
-      helpers, not Redis replies. There is no ``SCAN``/``KEYS``/``DEL``.
-    * No error injection. To exercise the production ``except Exception``
-      branch, patch ``auth._rate_client`` with something that raises.
-    * No concurrency model. Access is not locked, so it is only meaningful
-      from a single-threaded test.
-    * No fidelity above the type level: it cannot catch a client API misuse
-      such as passing ``ex`` as a ``timedelta`` in a way real Redis rejects,
-      nor detect that the production call targets the wrong database or key
-      name.
+    Not provided, and no test should assume: connection, RESP, pipelining or
+    transactions, eviction, persistence, other commands (``ttl()``/``expiry()``
+    /``counters`` are inspection helpers, not Redis replies), error injection
+    (patch ``auth._rate_client`` with something that raises), or concurrency --
+    access is not locked, so this is only meaningful from a single-threaded
+    test.
 
     Time is a plain callable, defaulting to ``time.monotonic``, plus an offset
-    moved by :meth:`advance`. Nothing here sleeps, so a test can cross a
-    window boundary in microseconds.
+    moved by :meth:`advance`, so a test can cross a window boundary without
+    sleeping.
     """
 
     def __init__(self, clock: Callable[[], float] | None = None) -> None:
@@ -80,8 +57,8 @@ class RateLimitRedisFake:
         self._offset: float = 0.0
         self._values: dict[str, int] = {}
         self._expiries: dict[str, float] = {}
-        # Ordered call log, so tests can assert on ORDER and on the arguments
-        # the production code actually passed.
+        # Ordered call log, so tests can assert on the arguments production
+        # actually passed.
         self.calls: list[tuple[Any, ...]] = []
         self.violations: list[str] = []
 
@@ -123,14 +100,9 @@ class RateLimitRedisFake:
     def counters(self) -> CountersView:
         """Live ``key -> count`` view of the unexpired counters.
 
-        A VIEW, not a copy, and not a stored dict. The old hand-rolled fakes
-        returned the very dict their ``incr`` was mutating, so a test could hold
-        on to it across requests and read the current counts afterwards.
-        Returning a copy here would hand those tests a permanently empty dict
-        and silently void their assertions, so the view reads through to the
-        store on every access. Reading it is also what reclaims expired
-        counters, so ``list(...)``, ``.values()``, and ``dict(...)`` over it
-        behave like the plain dict they replaced.
+        A VIEW, not a copy: returning one would hand tests a permanently empty
+        dict. Reading prunes, so ``len``/``in``/iteration see an expired key as
+        absent, exactly as Redis does.
         """
         return CountersView(self)
 

@@ -28,20 +28,16 @@ export default function SimilarArticles({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
-  // Bumped by the error state's Retry button and part of the fetch effect's
-  // deps, so a retry re-runs the request with a fresh deadline.
+  // Bumped by Retry and in the fetch effect's deps, so a retry gets a fresh deadline.
   const [retryCount, setRetryCount] = useState(0)
 
   useEffect(() => {
     if (!articleId) return
 
-    // No AbortController here on purpose. The request is shared with every
-    // other card in this view, so aborting it because THIS card unmounted
-    // would take the rest of the view's data down with it. Unmounting only
-    // means the answer is no longer worth applying. The deadline that bounds
-    // the socket therefore lives in `app/lib/similar.ts`, on the shared
-    // request itself: a backend that accepts the connection and never answers
-    // would otherwise pin every card in the view on "Loading..." forever.
+    // No AbortController here on purpose: the request is shared with every other
+    // card in this view, so aborting it when THIS card unmounts would take the
+    // rest of the view's data down with it. The deadline that bounds the socket
+    // therefore lives on the shared request in `app/lib/similar.ts`.
     let active = true
     setLoading(true)
     setError(null)

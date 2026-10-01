@@ -1,11 +1,11 @@
 """build_index.py: the collection is built, resumed, and payload-indexed.
 
-The payload-index work matters most on a RESUMED build. create_payload_index
-used to run only inside create_collection, which executes only when the
-collection is (re)created — so a collection that predates a new field kept that
-field unfilterable until a full destructive rebuild. These tests drive the real
-main() with a fake Qdrant and fake embedding models to pin that the resumed path
-indexes content_type and stores it on the points it upserts.
+The payload-index work matters most on a RESUMED build: create_payload_index
+used to run only inside create_collection, so a collection that predates a new
+field kept that field unfilterable until a full destructive rebuild. These tests
+drive the real main() with a fake Qdrant and fake embedding models to pin that
+the resumed path indexes content_type and tag_names, and stores them on the
+points it upserts.
 
 Import note: build_index imports sentence_transformers lazily inside main()
 precisely so this module can be imported without the model stack; the fakes
@@ -156,7 +156,7 @@ def test_resumed_build_indexes_content_type_without_recreating(monkeypatch, tmp_
     assert indexed["content_type"] == PayloadSchemaType.KEYWORD
 
 def test_resumed_build_stores_content_type_on_the_points_it_upserts(monkeypatch, tmp_path, fake_models):
-    """The field reaches Qdrant, which is the whole point of the issue."""
+    """The field reaches Qdrant, not just the index definition."""
     client = _FakeQdrant(exists=True, compatible=True)
     monkeypatch.setattr(build_index, "QdrantClient", lambda *a, **k: client)
     _write_dataset(tmp_path, monkeypatch, [_ROW])

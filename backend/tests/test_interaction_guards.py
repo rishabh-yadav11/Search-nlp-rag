@@ -1,17 +1,4 @@
-"""Regression tests for the /recommend/interaction guards (#271).
-
-The endpoint mints persistent Redis state per call: one
-``article:interactions:{id}`` hash FIELD per distinct ``interaction_type``, one
-``user:interaction_detail:{user_id}:{id}`` key, and one member in
-``user:interactions:{user_id}``. Any of the three could be turned into an
-unbounded mint by a single authenticated caller, so each guard is asserted here
-against the REAL route, the REAL ``require_auth`` dependency and the REAL
-Redis-backed rate limiter -- only Redis itself is in memory.
-
-Every "rejected" assertion is paired with evidence that no state was written
-(hash field count, key-presence probes and a full key-dump diff), never a bare
-status code.
-"""
+"""Every rejection here is paired with evidence that no Redis state was written, never a bare status code."""
 
 import asyncio
 import fnmatch
@@ -31,17 +18,14 @@ from app.auth import AuthStore
 from app.config import config
 from app.user_profile import InteractionResult, InteractionType
 
-# Article ids the fake Qdrant index reports as present. Anything else is "not
-# in the index" and must be declined before a single key is written.
+# Anything outside KNOWN_IDS must be declined before a single key is written.
 KNOWN_IDS = (101, 202, 303)
 UNKNOWN_ID = 987654321
 
 _LEGAL_KINDS = tuple(kind.value for kind in InteractionType)
 _BOOKKEEPING_FIELDS = frozenset({"last_timestamp"})
 
-# A long free-form kind and 60 further distinct ones -- the shape of a loop
-# that would mint one permanent hash field per iteration if the kind were
-# unchecked.
+# Sized as a flood loop: each unchecked distinct kind mints one permanent hash field.
 _LONG_JUNK_KIND = "".join(
     random.Random(271).choice(string.ascii_letters + string.digits) for _ in range(8192)
 )
@@ -51,16 +35,8 @@ _JUNK_KINDS = (
 ) + tuple(f"junk-{i}-not-a-kind" for i in range(60))
 
 
-# --- in-memory Redis (profile DB) -------------------------------------------
-
-
 class _FakeProfileRedis:
-    """Minimal async Redis stand-in for the user-profile database.
-
-    Only the commands the profile code actually issues are implemented; an
-    unlisted one would raise, so an unimplemented command surfaces as a test
-    failure instead of silently becoming a no-op that fakes a passing guard.
-    """
+    """An unlisted command raises, so an unimplemented one fails the test instead of faking a passing guard."""
 
     def __init__(self):
         self.strings: dict[str, str] = {}
@@ -69,10 +45,9 @@ class _FakeProfileRedis:
         self.ttls: dict[str, int] = {}
 
     def key_dump(self) -> set[str]:
-        """Every key that exists right now, in any of the three value types."""
+        """Every key that exists right now, across all three value types."""
         return set(self.strings) | set(self.hashes) | set(self.zsets)
 
-    # -- strings ------------------------------------------------------------
     async def get(self, key):
         return self.strings.get(key)
 
@@ -85,8 +60,7 @@ class _FakeProfileRedis:
         return True
 
     async def exists(self, key):
-        # Read by the trending-index bootstrap (#261) to decide whether the
-        # one-time backfill has already run.
+        # The trending bootstrap's one-time backfill check.
         return int(key in self.key_dump())
 
     async def delete(self, *keys):
@@ -105,7 +79,6 @@ class _FakeProfileRedis:
         keys = sorted(k for k in self.key_dump() if match is None or fnmatch.fnmatch(k, match))
         return 0, keys
 
-    # -- hashes -------------------------------------------------------------
     async def hgetall(self, key):
         return dict(self.hashes.get(key, {}))
 
@@ -122,7 +95,6 @@ class _FakeProfileRedis:
         target[str(field)] = str(int(target.get(str(field), 0)) + int(amount))
         return int(target[str(field)])
 
-    # -- sorted sets --------------------------------------------------------
     async def zadd(self, key, mapping):
         target = self.zsets.setdefault(key, {})
         added = 0
@@ -132,7 +104,6 @@ class _FakeProfileRedis:
         return added
 
     async def zincrby(self, key, amount, member):
-        # Advances the trending index (#261) by the article's interaction total.
         target = self.zsets.setdefault(key, {})
         target[str(member)] = target.get(str(member), 0.0) + float(amount)
         return target[str(member)]
@@ -150,18 +121,12 @@ class _FakeProfileRedis:
             return [(member, score) for member, score in window]
         return [member for member, _ in window]
 
-    # -- pipelining ---------------------------------------------------------
     def pipeline(self):
         return _FakePipeline(self)
 
 
 class _FakePipeline:
-    """Queues the same commands as the real pipeline and applies them in order.
-
-    ``record_interaction`` builds its whole write set in one pipeline, so the
-    queue has to replay in FIFO order for the hash fields and the sorted set to
-    end up in the same state a real MULTI/EXEC leaves them in.
-    """
+    """FIFO replay of the queued commands, so the hash and zset end in the state MULTI/EXEC would leave."""
 
     def __init__(self, client: _FakeProfileRedis):
         self._client = client
@@ -209,8 +174,6 @@ class _FakePipeline:
 
 
 class _FakeRateRedis:
-    """The limiter's counter store: SET NX EX opens the window, then INCR."""
-
     def __init__(self):
         self.counts: dict[str, int] = {}
         self.ttls: dict[str, int | None] = {}
@@ -227,11 +190,7 @@ class _FakeRateRedis:
         return self.counts[key]
 
 
-# --- in-memory Qdrant ------------------------------------------------------
-
-
 def _scored_point(pid: int, title: str) -> ScoredPoint:
-    """A minimal Qdrant point the recommender can score and format."""
     return ScoredPoint(
         id=pid,
         version=0,
@@ -249,8 +208,6 @@ _NEIGHBOUR_ID = 555
 
 
 class _FakeQdrant:
-    """Reports only ``known_ids`` from ``retrieve``; records candidate queries."""
-
     def __init__(self, known_ids):
         self.known_ids = set(known_ids)
         self.vector_queries: list[dict] = []
@@ -268,17 +225,8 @@ class _FakeQdrant:
         return ([_scored_point(_NEIGHBOUR_ID, "trending hit")], None)
 
 
-# --- harness ----------------------------------------------------------------
-
-
 def _via_local_proxy(app):
-    """Present requests as if they arrived via the loopback reverse proxy.
-
-    Same wrapper as tests/test_main_http.py: the shipped default only honours
-    X-Forwarded-For behind a loopback peer, and every request here comes from
-    that one peer on purpose, so the per-IP axis behaves as it is deployed.
-    """
-
+    """Pin the peer to loopback: the shipped default only honours X-Forwarded-For behind a loopback peer."""
     async def wrapper(scope, receive, send):
         if scope["type"] == "http":
             scope = {**scope, "client": ("127.0.0.1", 40000)}
@@ -292,7 +240,6 @@ _client = TestClient(_via_local_proxy(main.app), raise_server_exceptions=False)
 
 @pytest.fixture(autouse=True)
 def profile_redis(monkeypatch):
-    """Back the profile database with the in-memory store above."""
     fake = _FakeProfileRedis()
     monkeypatch.setattr(user_profile, "_redis_client", lambda: fake)
     return fake
@@ -300,12 +247,6 @@ def profile_redis(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def rate_redis(monkeypatch):
-    """Back the rate limiter with its own in-memory counter store.
-
-    Rebuilt per test, so no counter leaks between cases. The store is the
-    limiter's real dependency; the route, its dependencies and the INCR/EXPIRE
-    sequence are the shipped ones.
-    """
     fake = _FakeRateRedis()
     monkeypatch.setattr(auth_module, "_rate_client", fake)
     return fake
@@ -313,15 +254,13 @@ def rate_redis(monkeypatch):
 
 @pytest.fixture
 def generous_limits(monkeypatch):
-    """Move both rate limits off the path for the tests that are not about
-    them, so a shipped default can never turn a state assertion into a 429."""
+    """Raise both limits so a shipped default cannot turn a state assertion into a 429."""
     monkeypatch.setattr(config, "PUBLIC_INTERACTION_RATE_PER_MIN", 10_000)
     monkeypatch.setattr(config, "INTERACTION_USER_RATE_PER_MIN", 10_000)
 
 
 @pytest.fixture
 def qdrant(monkeypatch):
-    """Install a Qdrant double that knows exactly which article ids exist."""
     fake = _FakeQdrant(KNOWN_IDS)
     monkeypatch.setitem(main.state, "qdrant", fake)
     return fake
@@ -329,7 +268,6 @@ def qdrant(monkeypatch):
 
 @pytest.fixture
 def account(tmp_path, monkeypatch):
-    """Real accounts holding real session cookies from the real auth store."""
     store = AuthStore(str(tmp_path / "auth.db"))
     asyncio.run(store.connect())
     monkeypatch.setattr(auth_module, "store", store)
@@ -353,12 +291,7 @@ def _interact(cookie, article_id, kind="click"):
     )
 
 
-# --- synchronous state inspectors -------------------------------------------
-# The store's commands are coroutines because the app awaits them; the
-# assertions read the same three dicts directly so a test can check what was
-# written without borrowing an event loop between HTTP calls.
-
-
+# The dicts hold the post-await state, so assertions need no event loop between HTTP calls.
 def _hash(redis, key):
     return redis.hashes.get(key, {})
 
@@ -379,20 +312,10 @@ def _zset(redis, key):
     return redis.zsets.get(key, {})
 
 
-# --- 1. free-form / oversized interaction types are rejected ---------------
-
-
 def test_junk_interaction_types_never_become_hash_fields(
     account, profile_redis, qdrant, generous_limits
 ):
-    """A non-enum kind must not add a field to the article hash.
-
-    ``interaction_type`` is stored as the hash FIELD, so an unchecked string
-    mints one permanent field per call. Over HTTP the request is rejected by
-    the closed-enum body model (422) before the handler runs, and the guard
-    behind it is checked directly on ``record_interaction``. Either way the
-    seeded click's field set must be byte-identical afterwards.
-    """
+    """An unchecked kind would mint one permanent hash field per request; the seeded field set must stay byte-identical."""
     user, headers = account("junk-kind@example.com")
     article = KNOWN_IDS[0]
 
@@ -402,8 +325,6 @@ def test_junk_interaction_types_never_become_hash_fields(
     assert before == {"click", "last_timestamp"}
     assert _detail_hash(profile_redis, user.id, article)["type"] == "click"
 
-    # 40 real HTTP posts, alternating the plausible free-form string with the
-    # 8192-character payload.
     statuses = [_interact(headers, article, _JUNK_KINDS[i % 2]).status_code for i in range(40)]
     assert set(statuses) == {422}, statuses
 
@@ -411,12 +332,10 @@ def test_junk_interaction_types_never_become_hash_fields(
     assert len(after) == len(before), "the article hash grew from a junk interaction_type"
     assert after == before, after
     assert not after & {kind[:64] for kind in _JUNK_KINDS}
-    # The per-user detail record still describes the seeded click: an accepted
-    # junk kind would have overwritten the stored type.
+    # An accepted junk kind would have overwritten the stored type.
     assert _detail_hash(profile_redis, user.id, article)["type"] == "click"
 
-    # The guard itself, for a caller that reaches record_interaction with a
-    # kind the body model never lets through: declined, and still no field.
+    # The same guard for a caller that reaches record_interaction directly.
     for kind in _JUNK_KINDS:
         result = asyncio.run(
             user_profile.record_interaction(
@@ -427,17 +346,9 @@ def test_junk_interaction_types_never_become_hash_fields(
     assert set(_article_hash(profile_redis, article)) == before
 
 
-# --- 2. a flooding loop cannot grow the hash without bound ------------------
-
-
 def test_flood_of_distinct_kinds_stays_within_the_enum(
     account, profile_redis, qdrant, generous_limits
 ):
-    """Field growth is bounded by the enum, not by the number of requests.
-
-    Two halves: the flood proves nothing new appears, and the three legal kinds
-    pin the concrete maximum the hash is allowed to reach.
-    """
     user, headers = account("flood@example.com")
     flooded, saturated = KNOWN_IDS[0], KNOWN_IDS[1]
 
@@ -448,8 +359,7 @@ def test_flood_of_distinct_kinds_stays_within_the_enum(
         _interact(headers, flooded, kind)
     assert set(_article_hash(profile_redis, flooded)) == flooded_fields
 
-    # The same flood straight at the writer, for a caller that skips the body
-    # model: the field set still cannot move.
+    # Same flood straight at the writer, for a caller that skips the body model.
     for kind in _JUNK_KINDS:
         result = asyncio.run(
             user_profile.record_interaction(
@@ -459,8 +369,6 @@ def test_flood_of_distinct_kinds_stays_within_the_enum(
         assert result is InteractionResult.INVALID_TYPE, kind
     assert set(_article_hash(profile_redis, flooded)) == flooded_fields
 
-    # Concrete bound: at most one field per legal kind plus the timestamp
-    # bookkeeping field -- no request count anywhere in it.
     for kind in _LEGAL_KINDS:
         assert _interact(headers, saturated, kind).status_code == 200
     saturated_fields = set(_article_hash(profile_redis, saturated))
@@ -470,20 +378,10 @@ def test_flood_of_distinct_kinds_stays_within_the_enum(
     assert flooded_fields <= saturated_fields
 
 
-# --- 3. an unknown article id is rejected and mints no keys -----------------
-
-
 def test_unknown_article_is_rejected_without_minting_keys(
     account, profile_redis, qdrant, generous_limits
 ):
-    """404 for an id that is not indexed, leaving Redis COMPLETELY untouched.
-
-    A declined id must not even be remembered. Caching the rejection would key
-    it to the caller-chosen id, so the flood would still grow the keyspace (one
-    key per probed id) and an index blip would be latched as "absent" for the
-    whole TTL, 404ing genuine articles long after recovery. So the residue check
-    below demands a key diff that is not merely small but EMPTY.
-    """
+    """A declined id must not even be cached: the rejection is keyed to a caller-chosen id, so a flood still grows the keyspace."""
     user, headers = account("unknown-article@example.com")
     article = KNOWN_IDS[0]
 
@@ -491,18 +389,15 @@ def test_unknown_article_is_rejected_without_minting_keys(
     assert declined.status_code == 404
     assert declined.json()["detail"] == "Unknown article"
 
-    # The write path minted nothing for the unknown id.
     assert not _exists(profile_redis, f"article:interactions:{UNKNOWN_ID}")
     assert not _exists(profile_redis, f"user:interaction_detail:{user.id}:{UNKNOWN_ID}")
     assert str(UNKNOWN_ID) not in _zset(profile_redis, f"user:interactions:{user.id}")
     assert not _zset(profile_redis, f"user:interactions:{user.id}")
 
-    # Full key-dump diff: a declined id leaves no key of ANY kind behind.
     residue = {key for key in profile_redis.key_dump() if str(UNKNOWN_ID) in key}
     assert residue == set(), residue
 
-    # And the check is not "reject everything": a real id in the same test is
-    # accepted and creates exactly the keys the decline above did not.
+    # The guard is not "reject everything": a real id in the same test is accepted.
     accepted = _interact(headers, article)
     assert accepted.status_code == 200
     assert accepted.json() == {"status": "ok", "article_id": article}
@@ -511,20 +406,10 @@ def test_unknown_article_is_rejected_without_minting_keys(
     assert list(_zset(profile_redis, f"user:interactions:{user.id}")) == [str(article)]
 
 
-# --- 4. the rate limit bounds a genuinely repeated call ---------------------
-
-
 def test_repeated_interactions_are_rate_limited_per_account(
     account, rate_redis, qdrant, monkeypatch
 ):
-    """Real HTTP calls in a real loop: the surplus is answered 429.
-
-    Phase 1 keeps the per-IP axis at a limit this call volume cannot reach, so
-    the 429s can only come from the per-account bucket. Phase 2 disables the
-    per-IP axis entirely and shows a second account, hitting the route from the
-    SAME peer address, still gets its own full budget -- which is only possible
-    if the bucket key carries the account id.
-    """
+    """Only the per-account bucket is in reach, and a second account from the same peer still gets a full budget."""
     monkeypatch.setattr(config, "PUBLIC_INTERACTION_RATE_PER_MIN", 50)
     monkeypatch.setattr(config, "INTERACTION_USER_RATE_PER_MIN", 3)
     user, headers = account("flooder@example.com")
@@ -534,42 +419,28 @@ def test_repeated_interactions_are_rate_limited_per_account(
     assert statuses[:3] == [200, 200, 200]
     assert statuses[3:] == [429] * 5
 
-    # Both axes counted; the per-IP counter never reached its own limit, so it
-    # is not what answered 429.
+    # Both axes counted; the per-IP bucket never reached its own limit.
     assert rate_redis.counts[f"user:rl:interaction:{user.id}"] == 8
     public_keys = [key for key in rate_redis.counts if key.startswith("public:rl:interaction:")]
     assert sum(rate_redis.counts[key] for key in public_keys) == 8
     assert all(rate_redis.counts[key] <= 50 for key in public_keys)
 
-    # Phase 2: the per-IP axis is off, so nothing is charged to it. A second
-    # account from the same peer is unaffected by the first account's usage.
+    # The per-IP axis is off, so nothing is charged to it.
     monkeypatch.setattr(config, "PUBLIC_INTERACTION_RATE_PER_MIN", 0)
     other, other_headers = account("bystander@example.com")
     assert other.id != user.id
     assert [_interact(other_headers, article).status_code for _ in range(3)] == [200, 200, 200]
     assert _interact(other_headers, article).status_code == 429
-    # ...while the first account's spent budget is unchanged, i.e. the two
-    # accounts did not share a bucket.
+    # The first account's spent budget is unchanged: they did not share a bucket.
     assert rate_redis.counts[f"user:rl:interaction:{other.id}"] == 4
     assert rate_redis.counts[f"user:rl:interaction:{user.id}"] == 8
     assert sum(rate_redis.counts[key] for key in public_keys) == 8
 
 
-# --- 5. the legitimate path still works and still feeds recommendations -----
-
-
 def test_legitimate_click_is_recorded_and_reaches_the_recommender(
     account, profile_redis, qdrant, generous_limits
 ):
-    """A real click on a real article: recorded, counted, and consumed.
-
-    The recorded interaction is asserted at every consumer the app actually
-    uses: the per-article counter, the per-user detail record,
-    ``get_user_interactions`` (the exact input
-    ``get_personalized_recommendations`` builds its vector-similarity candidate
-    queries from) and that function itself, driven end to end over the same
-    fake Redis and fake Qdrant.
-    """
+    """Asserted at every consumer: the counter, the detail record, get_user_interactions and the candidate generator itself."""
     user, headers = account("reader@example.com")
     article = KNOWN_IDS[0]
 
@@ -577,14 +448,12 @@ def test_legitimate_click_is_recorded_and_reaches_the_recommender(
     assert response.status_code == 200, response.text
     assert response.json() == {"status": "ok", "article_id": article}
 
-    # Counter incremented by exactly one, under the canonical kind.
     assert _article_hash(profile_redis, article)["click"] == "1"
     detail = _detail_hash(profile_redis, user.id, article)
     assert detail["type"] == "click"
     assert detail["dwell_time_ms"] == "0"
     assert float(detail["timestamp"]) > 0
 
-    # The trending consumer sums the article counters.
     assert asyncio.run(user_profile.get_trending_articles()) == [
         {"article_id": article, "score": 1.0}
     ]
@@ -593,8 +462,7 @@ def test_legitimate_click_is_recorded_and_reaches_the_recommender(
     interactions = asyncio.run(user_profile.get_user_interactions(user.id))
     assert [article_id for article_id, _ in interactions] == [article]
 
-    # And the generator itself, end to end: the clicked article is the vector
-    # query, and is excluded from what comes back.
+    # The clicked article is the vector query and is excluded from what comes back.
     with patch.object(recommender, "state", {"qdrant": qdrant}):
         recommendations = asyncio.run(
             recommender.get_personalized_recommendations(user.id, limit=5)
@@ -609,17 +477,10 @@ def test_legitimate_click_is_recorded_and_reaches_the_recommender(
     assert [rec["id"] for rec in recommendations] == [_NEIGHBOUR_ID]
 
 
-# --- 6. the per-user distinct-article cap ----------------------------------
-
-
 def test_distinct_interaction_cap_declines_new_article_but_allows_a_repeat(
     account, profile_redis, qdrant, generous_limits, monkeypatch
 ):
-    """The cap stops new articles; re-visiting a known one still records.
-
-    Re-interacting must keep working: the cap is about minting NEW key pairs,
-    and a returning reader is the documented, expected case.
-    """
+    """The cap bounds NEW key pairs, so a repeat of a seen article still records."""
     monkeypatch.setattr(config, "USER_MAX_DISTINCT_INTERACTIONS", 2)
     user, headers = account("capped@example.com")
     first, second, third = KNOWN_IDS
@@ -634,15 +495,12 @@ def test_distinct_interaction_cap_declines_new_article_but_allows_a_repeat(
     assert not _exists(profile_redis, f"article:interactions:{third}")
     assert not _exists(profile_redis, f"user:interaction_detail:{user.id}:{third}")
     assert str(third) not in _zset(profile_redis, f"user:interactions:{user.id}")
-    # `third` IS indexed, so the existence cache legitimately holds a POSITIVE
-    # entry for it. The cap refuses the interaction, not the id's validity --
-    # unlike an unknown id, which must leave no key at all (see test 3).
+    # The cap refuses the interaction, not the id's validity, so a positive cache entry is legitimate here.
     assert {key for key in profile_redis.key_dump() if str(third) in key} == {
         f"user_profile:article_exists:{third}"
     }
     assert profile_redis.strings[f"user_profile:article_exists:{third}"] == "1"
 
-    # A repeat of an already-seen article is still recorded, not capped.
     assert _interact(headers, first).status_code == 200
     assert _article_hash(profile_redis, first)["click"] == "2"
     assert _detail_hash(profile_redis, user.id, first)["type"] == "click"
@@ -651,17 +509,8 @@ def test_distinct_interaction_cap_declines_new_article_but_allows_a_repeat(
     } == {first, second}
 
 
-# --- 7. an index outage is not latched as "article does not exist" ----------
-
-
 def test_index_outage_does_not_poison_the_existence_cache(account, profile_redis, qdrant, generous_limits):
-    """A Qdrant failure must not make real articles 404 for the cache's TTL.
-
-    Caching the outcome of a FAILED lookup would latch "absent" for the whole
-    300s TTL, so a momentary index blip would keep rejecting genuine articles
-    long after the index recovered. This drives a real outage and a real
-    recovery through the endpoint.
-    """
+    """Caching the outcome of a failed lookup would latch "absent" for the whole TTL, 404ing real articles long after recovery."""
     _user, headers = account("outage@example.com")
     article = KNOWN_IDS[0]
 
@@ -670,16 +519,13 @@ def test_index_outage_does_not_poison_the_existence_cache(account, profile_redis
 
     qdrant.retrieve = _explode
     during = _interact(headers, article)
-    # The index could not answer, so the endpoint must say so -- NOT claim the
-    # article is unknown, which is a different, permanent-sounding statement.
+    # A failed lookup must not be reported as "unknown article", which reads as permanent.
     assert during.status_code == 503, during.text
     assert during.json()["detail"] == "Interaction store unavailable"
-    # Nothing was recorded, and crucially nothing about this id was cached.
     assert not _exists(profile_redis, f"article:interactions:{article}")
     assert f"user_profile:article_exists:{article}" not in profile_redis.key_dump()
 
-    # The index recovers. The very next click must succeed, not replay a
-    # cached rejection.
+    # The index recovers; the next click must not replay a cached rejection.
     qdrant.retrieve = _FakeQdrant(KNOWN_IDS).retrieve
     after = _interact(headers, article)
     assert after.status_code == 200, after.text
@@ -687,24 +533,9 @@ def test_index_outage_does_not_poison_the_existence_cache(account, profile_redis
     assert profile_redis.strings[f"user_profile:article_exists:{article}"] == "1"
 
 
-# --- 8. legacy junk fields must not score on the READ side -------------------
-#
-# The write-side enum stops new junk, but article:interactions:{id} keys live
-# for USER_INTERACTION_TTL_DAYS (90 by default). Any field minted BEFORE the
-# enum landed is still sitting in the hash, and the pre-existing trending sum
-# was name-blind, so it counted those fields too -- letting an attacker who
-# poisoned the hash before this fix keep inflating a chosen article's score for
-# the whole TTL. A write-only fix would leave that exposure open.
-
-
+# Pre-enum junk fields outlive any write-side fix (the article hash lives 90 days), so the read side needs its own allow-list.
 def test_trending_ignores_legacy_junk_fields_seeded_before_the_enum(profile_redis):
-    """Only the known kinds contribute to an article's trending score.
-
-    The hash is seeded the way a PRE-FIX attacker would have left it: many
-    junk fields plus a couple of genuine clicks. Without a read-side
-    allow-list the junk sums in and the article scores far higher than it
-    earned.
-    """
+    """Junk fields seeded before the enum must not sum in with the genuine clicks."""
     article = 101
     key = f"article:interactions:{article}"
     profile_redis.hashes[key] = {
@@ -712,23 +543,17 @@ def test_trending_ignores_legacy_junk_fields_seeded_before_the_enum(profile_redi
         "view": "1",
         "last_timestamp": "1758000000.0",
     }
-    # 20 fields an attacker minted before this fix shipped.
     for i in range(20):
         profile_redis.hashes[key][f"junk-{i}-" + "z" * 40] = "1"
 
     trending = asyncio.run(user_profile.get_trending_articles())
 
     assert trending == [{"article_id": article, "score": 3.0}], trending
-    # Explicitly: the score is the three real interactions, not 23.
     assert trending[0]["score"] != 23.0
 
 
 def test_trending_excludes_the_last_timestamp_bookkeeping_field(profile_redis):
-    """last_timestamp is not a counter and must never add to the score.
-
-    It is a float-ish string, so a naive sum that accepted it would silently
-    add a huge number to every article.
-    """
+    """last_timestamp is a timestamp, not a counter; a naive sum would add ~1.7e9."""
     article = 202
     profile_redis.hashes[f"article:interactions:{article}"] = {
         "click": "4",
@@ -741,7 +566,6 @@ def test_trending_excludes_the_last_timestamp_bookkeeping_field(profile_redis):
 
 
 def test_trending_article_with_only_junk_fields_does_not_rank(profile_redis):
-    """An article poisoned only with junk drops out of trending entirely."""
     profile_redis.hashes["article:interactions:303"] = {
         f"junk-{i}": "50" for i in range(10)
     }
@@ -749,17 +573,8 @@ def test_trending_article_with_only_junk_fields_does_not_rank(profile_redis):
     assert asyncio.run(user_profile.get_trending_articles()) == []
 
 
-# --- 9. an invalid interaction_type is not reported as an unknown article -----
-#
-# Before the InteractionResult split, a rejected kind returned the same result
-# as an unindexed id, so the route answered 404 "Unknown article" for an
-# article that demonstrably exists. Unreachable over HTTP (the pydantic model
-# rejects first with 422), but the write layer is the last line of defence for
-# direct callers, and it must not lie either.
-
-
+# A kind the body model already rejected must answer INVALID_TYPE, not 404 "Unknown article".
 def test_invalid_type_is_distinct_from_unknown_article(account, profile_redis, qdrant, generous_limits):
-    """A junk kind on a KNOWN article yields INVALID_TYPE, not UNKNOWN_ARTICLE."""
     from app.user_profile import record_interaction
 
     user, _headers = account("invalid-type@example.com")
@@ -771,17 +586,12 @@ def test_invalid_type_is_distinct_from_unknown_article(account, profile_redis, q
 
     assert result is InteractionResult.INVALID_TYPE, result
     assert result is not InteractionResult.UNKNOWN_ARTICLE
-    # And it wrote nothing, for the same reason every other decline does.
     assert not _exists(profile_redis, f"article:interactions:{known}")
     assert f"user_profile:article_exists:{known}" not in profile_redis.key_dump()
 
 
 def test_known_article_with_invalid_type_is_not_404_over_http(account, profile_redis, qdrant, generous_limits):
-    """End to end: a junk kind on a real article is 422, never 404.
-
-    404 would assert the article does not exist. 422 says the request body was
-    invalid, which is the truth.
-    """
+    """404 would assert the article does not exist -- false for a real article."""
     _user, headers = account("invalid-type-http@example.com")
     known = KNOWN_IDS[0]
 
@@ -792,16 +602,8 @@ def test_known_article_with_invalid_type_is_not_404_over_http(account, profile_r
     assert not _exists(profile_redis, f"article:interactions:{known}")
 
 
-# --- 10. the per-account bucket is keyed on the ACCOUNT, not the client IP ---
-#
-# This is the property a careless merge silently loses: if the key line keeps
-# only the client IP, user_rate_limit still works, still returns 429, and no
-# test of the ROUTE fails -- the per-account axis has silently become a second
-# per-IP axis, and a distributed flood is unbounded again.
-
-
+# A bucket keyed on the client IP still returns 429, so the per-account axis would silently collapse into a second per-IP axis.
 def test_per_account_bucket_key_contains_the_subject_not_the_client_ip(monkeypatch):
-    """Two subjects behind one IP must occupy two DIFFERENT buckets."""
     import asyncio as _asyncio
 
     from app import auth as auth_mod
@@ -842,9 +644,7 @@ def test_per_account_bucket_key_contains_the_subject_not_the_client_ip(monkeypat
             )
         )
 
-    # The bucket identity IS the subject...
+    # Keying on the client IP would put both accounts in one budget.
     assert seen == ["user:rl:interaction:alice", "user:rl:interaction:bob"], seen
-    # ...so the two accounts from ONE shared IP are in different buckets...
     assert seen[0] != seen[1]
-    # ...and the client IP appears in neither, or the axis would be per-IP.
     assert not any("10.0.0.5" in key for key in seen), seen

@@ -1,6 +1,3 @@
-"""Chat store and API tests: per-user session CRUD, ownership isolation,
-retention purging, and the message-turn flow (retrieval + LLM stubbed)."""
-
 import asyncio
 import json
 import logging
@@ -37,10 +34,7 @@ EMAIL_B = "user-b@example.com"
 
 @pytest.fixture(autouse=True)
 def _stub_temporal_date_window(monkeypatch):
-    """retrieve_by_date_window needs a live Qdrant client (state['qdrant']); chat
-    unit tests stub retrieval at retrieve_and_rerank and do not stand up Qdrant,
-    so neutralize the temporal fallback here. The fallback itself is exercised by
-    the date-window retrieval path, not by these chat unit tests."""
+    """retrieve_by_date_window needs a live Qdrant client; these tests stub retrieval above it."""
     from app import main as _main
 
     async def _noop(*args, **kwargs):
@@ -51,15 +45,7 @@ def _stub_temporal_date_window(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _shipped_weak_gate(monkeypatch):
-    """Pin the answerability knobs chat's weak-fallback path reads.
-
-    They used to be module constants in app/answer_fallback.py, unreachable
-    from the environment; #300 made them deployment settings, so a machine
-    whose .env retunes them would otherwise decide whether the tests below
-    still take the weak-fallback branch. Mirrors the pin in
-    test_answer_fallback.py; the shipped values themselves are asserted there
-    against a clean parse of config.py.
-    """
+    """Deployment settings: a machine whose .env retunes them would decide whether these tests take the weak-fallback branch."""
     monkeypatch.setattr(chat_module.config, "WEAK_RESULT_SCORE", 0.3)
     monkeypatch.setattr(chat_module.config, "WEAK_RESULT_MIN_STRONG", 3)
 
@@ -77,11 +63,7 @@ def _auth_store(tmp_path):
 
 
 def _auth_cookies(auth_store, email=EMAIL_A, role="user"):
-    """Create/upgrade the account and return the auth cookie for it.
-
-    The credential is an HttpOnly cookie, so a test authenticates exactly the
-    way a browser does: by cookie, never by an ``Authorization`` header.
-    """
+    """The credential is an HttpOnly cookie, so a test authenticates as a browser does: by cookie, never by an ``Authorization`` header."""
     user = _run(auth_store.get_user_by_email(email))
     if user is None:
         user = _run(auth_store.create_user(email, "secret1", email.split("@")[0], role))
@@ -97,7 +79,7 @@ def test_create_and_list_sessions(tmp_path):
         a = _run(store.create_session(USER_A))
         b = _run(store.create_session(USER_A))
         listed = _run(store.list_sessions(USER_A))
-        assert [s.id for s in listed] == [b.id, a.id]  # most recent first
+        assert [s.id for s in listed] == [b.id, a.id]
         assert _run(store.list_sessions(USER_B)) == []
     finally:
         _run(store.close())
@@ -142,7 +124,7 @@ def test_recent_turns_order(tmp_path):
         for role, text in [("user", "q1"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a2")]:
             _run(store.append_message(a.id, USER_A, role, text))
         turns = _run(store.recent_turns(a.id, USER_A, max_turns=2))
-        assert [t.content for t in turns] == ["q1", "a1", "q2", "a2"]  # oldest first, newest pair kept
+        assert [t.content for t in turns] == ["q1", "a1", "q2", "a2"]
     finally:
         _run(store.close())
 
@@ -174,7 +156,6 @@ def test_purge_expired(tmp_path):
 
 
 def _legacy_db(path, messages_schema):
-    """Create a pre-token-tracking SQLite DB (the schema chat.py must migrate)."""
     conn = sqlite3.connect(str(path))
     conn.execute(
         "CREATE TABLE sessions ("
@@ -192,8 +173,6 @@ def _legacy_db(path, messages_schema):
 
 
 def test_connect_migrates_legacy_messages_schema(tmp_path):
-    """A DB created before token/cost tracking gets the missing columns added by
-    connect() (ERROR PATH — legacy/malformed SQLite schema)."""
     db_path = tmp_path / "chat.db"
     _legacy_db(
         db_path,
@@ -211,15 +190,13 @@ def test_connect_migrates_legacy_messages_schema(tmp_path):
         for name in ("prompt_tokens", "completion_tokens", "cost", "latency_ms"):
             assert name in names
         rows = _run(store._db.execute_fetchall("SELECT * FROM messages"))
-        assert rows[0]["prompt_tokens"] == 0  # migrated columns default to 0
+        assert rows[0]["prompt_tokens"] == 0
         assert rows[0]["latency_ms"] == 0
     finally:
         _run(store.close())
 
 
 def test_connect_adds_missing_latency_ms_only(tmp_path):
-    """connect() also adds latency_ms on its own when only that column is
-    missing from an otherwise current schema."""
     db_path = tmp_path / "chat.db"
     _legacy_db(
         db_path,
@@ -245,7 +222,7 @@ def test_close_is_idempotent(tmp_path):
     store = _store(tmp_path)
     _run(store.close())
     assert store._db is None
-    _run(store.close())  # already closed -> no-op
+    _run(store.close())
     assert store._db is None
 
 
@@ -263,9 +240,7 @@ def test_rename_delete_missing_session_404(tmp_path):
 
 
 def test_global_stats_raises_on_error(tmp_path, monkeypatch):
-    """global_stats must raise a typed error when the underlying query fails
-    (ERROR PATH — DB/query failure), so the endpoint can answer 503 instead of
-    a 200 body indistinguishable from a genuinely empty chat store (#281)."""
+    """Raise rather than degrade, so the endpoint can answer 503 instead of a 200 indistinguishable from an empty store."""
     store = _store(tmp_path)
     try:
         async def boom(*args, **kwargs):
@@ -295,7 +270,7 @@ def test_api_requires_auth(tmp_path):
     try:
         assert client.post("/api/chat/sessions").status_code == 401
         assert client.get("/api/chat/sessions").status_code == 401
-        # A device-id header (X-User-Id) no longer bypasses auth.
+        # X-User-Id is not a credential
         assert client.post("/api/chat/sessions", headers={"X-User-Id": USER_A}).status_code == 401
         assert client.post("/api/chat/sessions", cookies=auth_cookie("garbage")).status_code == 401
     finally:
@@ -329,7 +304,6 @@ def test_api_get_rename_delete_flow(tmp_path):
         renamed = client.patch(f"/api/chat/sessions/{sid}", cookies=h, json={"content": "Renamed"}).json()
         assert renamed["title"] == "Renamed"
 
-        # Other accounts cannot read this conversation.
         assert client.get(f"/api/chat/sessions/{sid}", cookies=h_b).status_code == 404
 
         assert client.delete(f"/api/chat/sessions/{sid}", cookies=h).status_code == 200
@@ -347,7 +321,7 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
 
         async def fake_turn(question, history):
             assert question == "Who invested in fintech?"
-            assert [m.role for m in history] == ["user"]  # prior turn context included
+            assert [m.role for m in history] == ["user"]
             return "A fintech investor is [1].", [{"id": 1, "title": "Fintech funding"}], None, 120, 45, 0.0012
 
         monkeypatch.setattr(chat_module, "_run_turn", fake_turn)
@@ -374,10 +348,7 @@ def test_api_send_message_runs_turn(tmp_path, monkeypatch):
 
 
 class _RoundTripCounter:
-    """Proxy over the shared aiosqlite connection that records every round
-    trip a turn makes. Each execute / execute_fetchall / commit is its own
-    await onto aiosqlite's single worker thread -- that serialization behind
-    one connection per worker is what #259 was paying for."""
+    """Recording round trips, each a serialized await on aiosqlite's single worker thread."""
 
     def __init__(self, inner):
         self._inner = inner
@@ -400,9 +371,8 @@ class _RoundTripCounter:
 
 
 SESSION_AUTH_SELECT = "FROM sessions WHERE id = ? AND user_id = ?"
-# Measured on this code before #259: one chat turn issued 13 serialized round
-# trips, FOUR of them this exact SELECT (once per append_message, once in
-# _auto_title, once more inside rename_session).
+# A turn once made 13 serialized round trips, FOUR of them this exact SELECT: once per
+# append_message, once in _auto_title, once inside rename_session.
 TURN_ROUND_TRIPS_BEFORE_259 = 13
 
 
@@ -411,9 +381,6 @@ async def _ok_turn(question, history):
 
 
 def test_one_turn_makes_fewer_round_trips_and_authorises_once(tmp_path, monkeypatch):
-    """A turn re-read the same session row four times. Three were pure
-    re-reads of a row the turn already held, each one a serialized await on
-    the single connection while 4 gunicorn workers contend for the WAL."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -431,23 +398,14 @@ def test_one_turn_makes_fewer_round_trips_and_authorises_once(tmp_path, monkeypa
 
         assert len(counter.log) < TURN_ROUND_TRIPS_BEFORE_259
         session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
-        assert len(session_selects) == 1  # the turn's single authorisation check
+        assert len(session_selects) == 1
     finally:
         _run(auth_store.close())
         _run(chat_store.close())
 
 
 def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monkeypatch):
-    """The rollback paths are the ones the happy-path counter cannot see.
-
-    Every way a turn can fail -- provider error, budget exceeded, budget
-    unavailable, client disconnect, and the SSE fail_turn -- rolled the user
-    message back through delete_message(), which re-ran the same
-    `id AND user_id` SELECT the turn had just passed. A failed turn is
-    precisely the turn worth making cheap: it is the one that must not also
-    hold the shared connection open for a redundant read. The turn has
-    already proved it owns the row by the time it is able to fail, so the
-    rollback is authorised by that same proof."""
+    """A failed turn has already proved it owns the row, so the rollback reuses that proof instead of re-SELECTing."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -467,13 +425,10 @@ def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monke
                 json={"content": "Who invested in fintech?"},
             )
 
-        # Asserted before the GET below, which is itself a session-authorising
-        # read and would otherwise be counted as part of the turn.
+        # Counted before the GET below, which is itself a session-authorising read.
         session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
         assert len(session_selects) == 1, [e[1] for e in session_selects]
 
-        # And the rollback still happened: no dangling user message survives a
-        # failed turn. The authorisation was removed, not the cleanup.
         detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["messages"] == []
     finally:
@@ -488,18 +443,6 @@ def test_a_failed_turn_rolls_back_without_a_second_authorisation(tmp_path, monke
 def test_a_cancelled_turn_rolls_back_without_a_second_authorisation(
     tmp_path, monkeypatch, parked_at
 ):
-    """A cancellation reconciles through the proof the turn already holds.
-
-    #292 made a cancelled turn roll itself back, and #259 removed the
-    per-operation `id AND user_id` re-reads. On the cancel path the two meet:
-    the reconcilers (_start_turn's own guards, `_drop_unbound_user_row` and
-    `rollback_unreplied_turn`) are the most expensive place to leave a second
-    authorisation, because that is a serialized await on the one connection
-    every worker contends for, taken on the disconnect path. Whichever of the
-    three awaits the cancel lands on, the whole turn is exactly one
-    `id AND user_id` SELECT -- and the row is still gone afterwards, so the
-    cheap write removed the re-read and not the cleanup.
-    """
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)
@@ -552,8 +495,7 @@ def test_a_cancelled_turn_rolls_back_without_a_second_authorisation(
 
         assert _run(run_it()) is True
 
-        # Asserted before reading the rows back, which is itself a
-        # session-authorising read.
+        # Counted before reading the rows back, which is itself a session-authorising read.
         session_selects = [e for e in counter.log if SESSION_AUTH_SELECT in e[1]]
         assert len(session_selects) == 1, [e[1] for e in session_selects]
         assert _turn_rows(store, sid) == []
@@ -562,16 +504,7 @@ def test_a_cancelled_turn_rolls_back_without_a_second_authorisation(
 
 
 def test_cancel_at_the_authorisation_read_writes_nothing(tmp_path, monkeypatch):
-    """The ordering inside `_start_turn`: authorise, THEN write.
-
-    The authorisation is deliberately the one await the cancellation guards
-    do not wrap, and that is only sound because it runs first: the INSERT that
-    writes the user message has not been issued, so a cancel delivered at that
-    read has nothing to reconcile and simply propagates. Move the write ahead
-    of the proof -- or read the session again after it -- and this turn would
-    park on a statement that already left a row behind. The statement log
-    pins both halves: one read, and no write at all.
-    """
+    """The authorisation is the one await the cancellation guards do not wrap, sound only because the INSERT has not been issued yet."""
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)
@@ -580,9 +513,7 @@ def test_cancel_at_the_authorisation_read_writes_nothing(tmp_path, monkeypatch):
         real_get = store.get_session
 
         async def slow_get(session_id, user_id):
-            # Parked AFTER the read returns, the way aiosqlite resolves a
-            # statement on its worker thread: the SELECT is in the log and the
-            # turn is cancelled before it can issue anything else.
+            # Parks after the read resolves, as aiosqlite does on its worker thread, so the SELECT is still logged.
             result = await real_get(session_id, user_id)
             if not parked["done"]:
                 parked["done"] = True
@@ -609,8 +540,7 @@ def test_cancel_at_the_authorisation_read_writes_nothing(tmp_path, monkeypatch):
                 return True
             return False
 
-        # The cancel still reaches the client of the request: swallowing it
-        # would end the task normally and hide the disconnect.
+        # Swallowing the cancel would end the task normally and hide the disconnect.
         assert _run(run_it()) is True
         assert [kind for kind, _sql in counter.log] == ["select"]
         assert _turn_rows(store, sid) == []
@@ -619,10 +549,7 @@ def test_cancel_at_the_authorisation_read_writes_nothing(tmp_path, monkeypatch):
 
 
 def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypatch):
-    """#259 deleted three of the four `id AND user_id` SELECTs a turn made.
-    The one survivor is the only thing keeping a user out of another user's
-    conversation, so it must still run before any write -- on both the JSON
-    and the SSE turn -- and must still reject."""
+    """The surviving `id AND user_id` SELECT is the only thing keeping a user out of another user's conversation, so it must run before any write on both turn paths."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h_a = _auth_cookies(auth_store, email=EMAIL_A)
@@ -643,12 +570,10 @@ def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypat
             json={"content": "what did they invest in?"},
         ).status_code == 404
 
-        # The rejected turns wrote nothing into the victim's conversation.
         detail = client.get(f"/api/chat/sessions/{sid}", cookies=h_a).json()
         assert detail["messages"] == []
         assert detail["title"] == "New chat"
 
-        # And the owner is unaffected.
         monkeypatch.setattr(chat_module, "_run_turn", _ok_turn)
         assert client.post(
             f"/api/chat/sessions/{sid}/messages", cookies=h_a,
@@ -660,10 +585,9 @@ def test_turn_on_a_session_the_user_does_not_own_is_rejected(tmp_path, monkeypat
 
 
 def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
-    """The observable turn is unchanged by the authorisation rework: both
-    messages land in order, the conversation is named after the FIRST
-    question, the next turn's prompt carries this turn's history, and a
-    second turn must not clobber that title."""
+    """The turn's observable behaviour is pinned: history carries forward, the
+    conversation is named after the FIRST question, and a second turn must not
+    clobber that name."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -687,7 +611,6 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
             json={"content": "And in mobility?"},
         ).status_code == 200
 
-        # The second turn was prompted with the first turn's exchange.
         assert seen == [
             ("Who invested in fintech?", ["Who invested in fintech?"]),
             (
@@ -701,7 +624,7 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
         ]
 
         detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
-        assert detail["title"] == "Who invested in fintech?"  # named once, then left alone
+        assert detail["title"] == "Who invested in fintech?"
         assert [m["role"] for m in detail["messages"]] == [
             "user", "assistant", "user", "assistant",
         ]
@@ -719,11 +642,9 @@ def test_turn_still_persists_messages_titles_and_history(tmp_path, monkeypatch):
 
 
 def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, monkeypatch):
-    """#259 stopped re-reading the session before auto-titling, so the untitled
-    test now has to come from the UPDATE itself. A rename that lands while the
-    answer is being produced must survive: the user's chosen name wins, not the
-    question text. Before #259 the pre-write re-read gave this for free; this
-    pins it so the cheap path cannot quietly give it back."""
+    """Auto-titling no longer re-reads the session, so the untitled test has to
+    come from the UPDATE itself: a rename made while the answer is in flight
+    must win over the question text."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -731,7 +652,6 @@ def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, mon
         sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def rename_mid_turn(question, history):
-            # The user renames the conversation while the answer is in flight.
             await chat_store.rename_session(sid, user_id, "My carefully chosen name")
             return "An answer [1].", [], None, 1, 1, 0.0
 
@@ -745,7 +665,6 @@ def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, mon
 
         detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert detail["title"] == "My carefully chosen name"
-        # The turn itself still completed and persisted normally.
         assert [m["content"] for m in detail["messages"]] == [
             "Who invested in fintech?", "An answer [1].",
         ]
@@ -755,12 +674,8 @@ def test_auto_title_does_not_clobber_a_rename_made_during_the_turn(tmp_path, mon
 
 
 def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkeypatch):
-    """The `get_session` a turn used to re-run was doing double duty: not only
-    authorisation, but existence. If the owner deletes the conversation while
-    the answer is in flight, the assistant INSERT must still fail the way it
-    always did -- a 404, not an unhandled FOREIGN KEY error from the
-    messages.session_id constraint. The existence test now lives in the
-    INSERT's own WHERE clause so this costs no extra round trip."""
+    """Existence is now enforced by the INSERT's own WHERE clause, so a mid-turn
+    delete must still answer a clean 404, not a FOREIGN KEY error."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -779,8 +694,6 @@ def test_turn_on_a_conversation_deleted_mid_turn_is_a_clean_404(tmp_path, monkey
         )
         assert r.status_code == 404
         assert "conversation not found" in r.text
-        # The cascade really did remove the user message written this turn;
-        # nothing was resurrected by the failed assistant write.
         assert _run(chat_store.get_session(sid, user_id)) is None
     finally:
         _run(auth_store.close())
@@ -807,11 +720,10 @@ def test_api_usage_stats(tmp_path, monkeypatch):
 
         usage = client.get("/api/chat/usage", cookies=h).json()
         assert usage["sessions"] == 1
-        assert usage["messages"] == 4  # 2 user + 2 assistant
-        assert usage["total_tokens"] == 300  # 2 * (100 + 50)
+        assert usage["messages"] == 4
+        assert usage["total_tokens"] == 300
         assert abs(usage["total_cost"] - 0.001) < 1e-9
 
-        # Other users see their own usage only.
         assert client.get("/api/chat/usage", cookies=h_b).json()["total_tokens"] == 0
     finally:
         _run(auth_store.close())
@@ -854,7 +766,6 @@ def test_smalltalk_short_circuits_rag(monkeypatch):
 
 
 def test_api_stream_smalltalk_short_circuits(tmp_path, monkeypatch):
-    """SSE stream for small talk emits a single done event with a canned reply."""
     from app import main
 
     client, chat_store, auth_store = _make_client(tmp_path)
@@ -877,7 +788,6 @@ def test_api_stream_smalltalk_short_circuits(tmp_path, monkeypatch):
         assert "Hello!" in body
         assert "event: error" not in body
 
-        # Assistant message persisted.
         detail = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()
         assert len(detail["messages"]) == 2
         assert detail["messages"][1]["role"] == "assistant"
@@ -887,7 +797,6 @@ def test_api_stream_smalltalk_short_circuits(tmp_path, monkeypatch):
 
 
 def test_api_stream_full_turn(tmp_path, monkeypatch):
-    """SSE stream with a real LLM path emits deltas + a done event with usage."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -905,7 +814,6 @@ def test_api_stream_full_turn(tmp_path, monkeypatch):
             for piece in ["Hello ", "world", "!"]:
                 yield piece
             if usage_holder is not None:
-                # Real stream_answer fills the holder with an LLMResult.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
 
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -941,8 +849,6 @@ def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
             return chat_module.PreparedTurn(answer="prompt-text", sources=[{"id": 1}], note=None, needs_llm=True)
 
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
-        # $10.00 already spent against a $2.00 cap: the first gate's reserve is
-        # refused, so no billed call is ever started.
         _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=10.0)
 
         with client.stream("POST", f"/api/chat/sessions/{sid}/messages/stream", cookies=h, json={"content": "question"}) as r:
@@ -958,7 +864,6 @@ def test_api_stream_budget_exceeded(tmp_path, monkeypatch):
 
 
 def test_global_stats_aggregates(tmp_path):
-    """global_stats returns cross-user counts, tokens, cost and top tables."""
     store = _store(tmp_path)
     try:
         for user, q, a, pt, ct, cost in [
@@ -990,7 +895,6 @@ def test_global_stats_aggregates(tmp_path):
 
 
 def test_analytics_chat_endpoint(tmp_path):
-    """/analytics/chat returns global chat stats through the app (admin-only)."""
     from fastapi.testclient import TestClient
 
     from app import main
@@ -1005,10 +909,8 @@ def test_analytics_chat_endpoint(tmp_path):
         sid = client.post("/api/chat/sessions", cookies=admin_h).json()["id"]
         client.post(f"/api/chat/sessions/{sid}/messages", cookies=admin_h, json={"content": "hello"})
 
-        # Regular users are denied analytics.
         user_h = _auth_cookies(auth_store, email=EMAIL_A)
         assert client.get("/analytics/chat", cookies=user_h).status_code == 403
-        # Unauthenticated requests are rejected.
         assert client.get("/analytics/chat").status_code == 401
 
         res = client.get("/analytics/chat", cookies=admin_h)
@@ -1025,14 +927,12 @@ def test_analytics_chat_endpoint(tmp_path):
         _run(chat_store.close())
 
 
-# A distinctive, non-generic user question. global_stats is cross-user, so if a
-# session title can appear in it, one user's private text leaks to every admin.
+# global_stats is cross-user, so a title in it leaks one user's text to every admin.
 PRIVATE_QUESTION = "my doctor prescribed 40mg of sertraline for my bipolar, should i stop"
 
 
 def _seeded_titled_sessions(store):
-    """Create one session per user, titled through the real _auto_title path.
-    Returns (session_ids, titles)."""
+    """Titles come from the real _auto_title path, not a hand-set string."""
     ids, titles = [], []
     for user in (USER_A, USER_B):
         session = _run(store.create_session(user))
@@ -1049,13 +949,9 @@ def _seeded_titled_sessions(store):
 
 
 def test_global_stats_omits_user_question_text(tmp_path):
-    """global_stats is cross-user, so it must never carry session titles —
-    the first 60 chars of the user's own question (regression: it did)."""
     store = _store(tmp_path)
     try:
         _ids, titles = _seeded_titled_sessions(store)
-        # Precondition: _auto_title really did set a title derived from the
-        # question, so this test covers the real path rather than a stub.
         assert titles == [PRIVATE_QUESTION[:60], PRIVATE_QUESTION[:60]]
 
         blob = json.dumps(_run(store.global_stats()))
@@ -1071,8 +967,6 @@ def test_global_stats_omits_user_question_text(tmp_path):
 
 
 def test_global_stats_top_rows_use_session_ids(tmp_path):
-    """The replacement for the title is the opaque session id, not a hash or
-    a prefix of the user's text — rows stay a usable 4-list."""
     store = _store(tmp_path)
     try:
         ids, titles = _seeded_titled_sessions(store)
@@ -1088,7 +982,6 @@ def test_global_stats_top_rows_use_session_ids(tmp_path):
 
 
 def test_analytics_chat_endpoint_omits_titles(tmp_path, monkeypatch):
-    """The admin-facing /analytics/chat payload carries no user-authored text."""
     from app import main
 
     async def fake_turn(question, history):
@@ -1109,8 +1002,6 @@ def test_analytics_chat_endpoint_omits_titles(tmp_path, monkeypatch):
             f"/api/chat/sessions/{sid}/messages", cookies=admin_h,
             json={"content": PRIVATE_QUESTION},
         )
-        # Precondition: the real turn titled the session from the question, so
-        # a title leak would actually be observable below.
         title = _run(chat_store.get_session(sid, admin_id)).title
         assert title == PRIVATE_QUESTION[:60]
 
@@ -1130,8 +1021,6 @@ def test_analytics_chat_endpoint_omits_titles(tmp_path, monkeypatch):
 
 
 def test_analytics_chat_records_admin_audit(tmp_path):
-    """Every admin read of the cross-user payload lands in the audit trail;
-    a denied request writes nothing."""
     from app import main
 
     chat_store = _store(tmp_path)
@@ -1152,7 +1041,6 @@ def test_analytics_chat_records_admin_audit(tmp_path):
         assert log[0]["action"] == "analytics.chat.read"
         assert log[0]["created_at"] > 0
 
-        # A non-admin is denied and leaves no trace of a read it never made.
         before = len(log)
         assert client.get("/analytics/chat", cookies=user_h).status_code == 403
         after = _run(chat_store.admin_audit_log())
@@ -1166,8 +1054,6 @@ def test_analytics_chat_records_admin_audit(tmp_path):
 
 
 def test_analytics_chat_survives_a_failing_audit_write(tmp_path, monkeypatch):
-    """The audit write is best-effort by design — a broken trail must not take
-    the admin dashboard down with it. Pins the try/except at the call site."""
     from app import main
 
     chat_store = _store(tmp_path)
@@ -1189,7 +1075,6 @@ def test_analytics_chat_survives_a_failing_audit_write(tmp_path, monkeypatch):
 
         res = client.get("/analytics/chat", cookies=admin_h)
         assert res.status_code == 200
-        # The read still returns real data, not a degraded error payload.
         assert res.json()["sessions"] >= 1
         assert [row[0] for row in res.json()["top_by_cost"]] == [sid]
     finally:
@@ -1200,10 +1085,6 @@ def test_analytics_chat_survives_a_failing_audit_write(tmp_path, monkeypatch):
 
 
 def test_admin_audit_expires_via_retention_sweep(tmp_path):
-    """The trail gains a row on every 30s dashboard poll, so it must stay
-    bounded. Expiry rides on the existing retention sweep rather than the hot
-    write path: a row past AUDIT_RETENTION_DAYS is dropped by `purge_expired`,
-    and a row inside the window survives it."""
     store = _store(tmp_path)
     try:
         stale = time.time() - (chat_module.AUDIT_RETENTION_DAYS + 1) * 86400
@@ -1218,7 +1099,6 @@ def test_admin_audit_expires_via_retention_sweep(tmp_path):
         _run(store._db.commit())
         assert len(_run(store.admin_audit_log())) == 2
 
-        # Recording a read must not prune: the hot path is one INSERT.
         _run(store.record_admin_audit("current-admin", "analytics.chat.read"))
         assert len(_run(store.admin_audit_log())) == 3
 
@@ -1232,16 +1112,7 @@ def test_admin_audit_expires_via_retention_sweep(tmp_path):
 
 
 def test_global_stats_docstring_makes_no_false_safety_claim():
-    """Guard against re-introducing the specific false claim that let the
-    title leak through review.
-
-    Deliberately only negative assertions. Pinning the *replacement* wording
-    would fail on any harmless rewording, creating pressure against editing
-    the docs — the opposite of the intent, since the original defect was a
-    documentation problem. The real behavioural guard is
-    `test_analytics_chat_endpoint_omits_titles`, which drives the live
-    endpoint and fails against the pre-fix code.
-    """
+    """Negative-only on purpose: pinning the replacement wording would fail on any harmless rewording."""
     doc = ChatStore.global_stats.__doc__
     assert doc is not None
     low = doc.lower()
@@ -1252,8 +1123,6 @@ def test_global_stats_docstring_makes_no_false_safety_claim():
 
 
 def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
-    """Chat must apply the auto date filter derived by _effective_intent,
-    matching /search (regression: chat passed qfilter=None)."""
     from app import main
     from app.main import SourceArticle
 
@@ -1285,10 +1154,6 @@ def test_prepare_turn_passes_intent_date_filter_to_retrieval(monkeypatch):
 
 
 def test_prepare_turn_no_note_when_sources_score_gated_empty(monkeypatch):
-    """Empty (score-gated) sources must NOT carry a weak_results_note: the
-    'No sufficiently relevant articles' answer already explains the miss, and a
-    note saying 'Showing the closest 2020 matches' alongside zero results is a
-    lie (regression: weak_results_note([]) returned a misleading string)."""
     from app import main
     from app.main import SourceArticle
 
@@ -1314,8 +1179,6 @@ def test_prepare_turn_no_note_when_sources_score_gated_empty(monkeypatch):
 
 
 def test_prepare_turn_weak_nonempty_sources_keep_note(monkeypatch):
-    """Non-empty weak sources (score above the ASK_MIN_SCORE gate but below the
-    weak threshold) must still get the weak_results_note on the fallback turn."""
     from app import main
     from app.main import SourceArticle
 
@@ -1340,10 +1203,6 @@ def test_prepare_turn_weak_nonempty_sources_keep_note(monkeypatch):
 
 
 def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
-    """A vague follow-up ('make this into a table') has no standalone topic:
-    retrieval must inherit the previous turn's query + date filter + top-N,
-    otherwise the embedding on the bare follow-up finds nothing and the turn
-    short-circuits to 'no relevant articles' before the LLM sees the history."""
     from app import main
     from app.chat import MessageOut
     from app.main import SourceArticle
@@ -1384,29 +1243,23 @@ def test_prepare_turn_vague_followup_inherits_previous_retrieval(monkeypatch):
     turn = _run(chat_module._prepare_turn("make this into a table", history))
     assert turn.needs_llm
     assert captured["rq"] == "Flashback 2025 IPO"
-    assert captured["top_k"] == 10  # previous turn's 'top ...' list size
-    assert "make this into a table" in turn.answer  # current question in prompt
-    assert "top ipo in 2025" in turn.answer  # history included for the LLM
+    assert captured["top_k"] == 10
+    assert "make this into a table" in turn.answer
+    assert "top ipo in 2025" in turn.answer
 
 
 def test_is_vague_followup_treats_prior_result_reference_as_vague():
-    """A follow-up that references the previous result/answer with only generic
-    words ('share the data in chart', 'share the last result data in chart') has
-    no standalone topic and must be treated as vague so retrieval inherits the
-    prior turn's query instead of searching the non-topical words."""
     from app.chat import _is_vague_followup
 
     assert _is_vague_followup("share the data in chart") is True
     assert _is_vague_followup("share the last result data in chart") is True
     assert _is_vague_followup("show that data as a chart") is True
     assert _is_vague_followup("give the previous answer in a table") is True
-    # Regression: anaphoric 'this deals' + format words is a follow-up reference
-    # to the prior result, not a new topic ('m&a deals in 2025' -> tabular/table).
+    # 'this deals' + format words references the prior result, not a new topic.
     assert _is_vague_followup("share this deals in tabular format") is True
     assert _is_vague_followup("share this deals in table format") is True
     assert chat_module._requested_view("share this deals in tabular format") == "table"
     assert chat_module._requested_view("share this deals in table format") == "table"
-    # A real topic must NOT be swallowed as vague.
     assert _is_vague_followup("m&a deals in 2025") is False
     assert _is_vague_followup("make a table of top 15 deals in 2024-25") is False
     # A new predication on the noun is a standalone topic, not a reference.
@@ -1418,9 +1271,6 @@ def test_is_vague_followup_treats_prior_result_reference_as_vague():
 
 
 def test_previous_user_question_skips_chained_vague_followups():
-    """When the immediately preceding turn is itself a vague follow-up, the prior
-    topic lookup must skip past it and return the real preceding query (the IPO
-    table turn), not the degenerate 'share the last result' question."""
     from app.chat import MessageOut, _previous_user_question
 
     def msg(i, role, content):
@@ -1438,10 +1288,8 @@ def test_previous_user_question_skips_chained_vague_followups():
 
 
 def test_prepare_turn_prior_result_followup_inherits_real_previous_query(monkeypatch):
-    """'share the last result data in chart' must inherit the real preceding IPO
-    query (not a degenerate earlier follow-up) so retrieval finds the same
-    sources the IPO table was built from (regression for the 'No relevant
-    articles' dead-end)."""
+    """A prior-result follow-up must inherit the real preceding query, not an
+    earlier degenerate one, or retrieval dead-ends on 'No relevant articles'."""
     from app import main
     from app.chat import MessageOut
     from app.main import SourceArticle
@@ -1489,8 +1337,7 @@ def test_prepare_turn_prior_result_followup_inherits_real_previous_query(monkeyp
 
 
 def test_prepare_turn_real_question_does_not_inherit_previous_retrieval(monkeypatch):
-    """A standalone question (even one that asks for a table) must use its own
-    retrieval topic, not the previous turn's."""
+    """A standalone question -- even one asking for a table -- uses its own retrieval topic."""
     from app import main
     from app.chat import MessageOut
     from app.main import SourceArticle
@@ -1528,8 +1375,6 @@ def test_prepare_turn_real_question_does_not_inherit_previous_retrieval(monkeypa
 
 
 def test_chat_imports_shared_retrieval_helpers():
-    """The names chat lazily imports from app.main must stay available after
-    endpoint removals (regression: /ask removal dropped source_context)."""
     from app import main
 
     for name in ("_effective_intent", "retrieve_and_rerank", "body_rescue", "source_context", "to_summary"):
@@ -1560,9 +1405,7 @@ def test_parse_dataviz_malformed_json_returns_none():
 
 
 def test_parse_dataviz_invalid_shape_returns_none():
-    # inconsistent row widths
     assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A","B"], "rows": [["x", 1], ["y"]]}\n```') is None
-    # value column is not numeric
     assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A","B"], "rows": [["x", "y"], ["z", "w"]]}\n```') is None
 
 
@@ -1575,8 +1418,6 @@ def test_parse_dataviz_infers_numeric_column():
 
 
 def test_parse_dataviz_allows_missing_values():
-    """A top-N table may include rows whose value isn't stated ("" or None) as
-    long as at least one row has a number and no non-empty cell is non-numeric."""
     data = chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Proceeds (₹ Cr)"], '
         '"rows": [["Wakefit", ""], ["Groww", 1200], ["Meesho", ""]], "value_column": 1}\n```'
@@ -1599,25 +1440,21 @@ def test_parse_dataviz_allows_missing_values():
     assert data is not None
     assert data["rows"][0][1] == "value not stated"
 
-    # A genuinely non-numeric cell still invalidates the block.
     assert chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Value"], '
         '"rows": [["Wakefit", "abc"], ["Groww", 1200]], "value_column": 1}\n```'
     ) is None
-    # A value column with no numeric cell at all is invalid for a chart block...
+    # No numeric cell invalidates a chart block, but a plain text table (value_column null) is valid.
     assert chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Value"], '
         '"rows": [["Wakefit", ""], ["Groww", "value not stated"]], "value_column": 1}\n```'
     ) is None
-    # ...but a table block with no numeric column (value_column null) is valid
-    # for a plain text table (e.g. every item's value is 'not stated').
     data = chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Status"], '
         '"rows": [["Wakefit", "not stated"], ["Groww", "not stated"]], "value_column": null, "view": "table"}\n```'
     )
     assert data is not None
     assert data["value_column"] is None
-    # When a numeric column exists, a missing value_column still auto-detects it.
     data = chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Company", "Value"], '
         '"rows": [["Wakefit", ""], ["Groww", 1200]]}\n```'
@@ -1635,11 +1472,7 @@ def test_sanitize_dataviz_keeps_valid_strips_malformed():
     assert "```dataviz" not in out
     assert "Prose [1]" in out
 
-    # A bare ```dataviz``` tag in prose now matches the (newline-optional)
-    # grammar, carries an empty body, fails to parse, and is stripped like any
-    # other malformed block. It used to survive only because the old pattern
-    # required a newline after the tag -- the bypass #255 removes. The frontend
-    # already stripped it, so this is the two sides agreeing (#255).
+    # A bare ```dataviz``` tag in prose matches the newline-optional grammar, so it is stripped too.
     plain = "Just prose with a ```dataviz``` mention."
     out = chat_module._sanitize_dataviz(plain)
     assert "```dataviz" not in out
@@ -1648,9 +1481,7 @@ def test_sanitize_dataviz_keeps_valid_strips_malformed():
 
 
 def test_parse_dataviz_rejects_all_empty_label_cells():
-    """A table whose label column is blank on every row (e.g. the model emitted
-    only values and no deal/company names) is useless and must be treated as
-    malformed so the nudge retry rebuilds it."""
+    """An all-blank label column is treated as malformed so the nudge retry gets a chance to rebuild it."""
     empty_labels = (
         '```dataviz\n{"columns": ["Deal", "Value ($B)"], '
         '"rows": [["", 8.5], ["", 4.3], ["", 0.35]], "value_column": 1, "format": "$B"}\n```'
@@ -1660,7 +1491,6 @@ def test_parse_dataviz_rejects_all_empty_label_cells():
     assert "```dataviz" not in out
     assert "Prose [1]" in out
 
-    # A block with names present (even if a few rows are blank) stays valid.
     partly = (
         '```dataviz\n{"columns": ["Deal", "Value ($B)"], '
         '"rows": [["Reliance", 8.5], ["", 4.3], ["Zepto", 0.35]], "value_column": 1}\n```'
@@ -1669,11 +1499,6 @@ def test_parse_dataviz_rejects_all_empty_label_cells():
 
 
 def test_parse_dataviz_accepts_numeric_identifier_labels():
-    """A numeric identifier column (e.g. Year: 2024/2025) is valid identifying
-    content for the label side of a table, so such a block must parse — it is
-    not an all-empty-label malformed block. Checked both with an explicit
-    value_column and on the auto-detect path."""
-    # Explicit value_column: the numeric Year labels count as label content.
     explicit = (
         '```dataviz\n{"columns": ["Year", "Revenue"], '
         '"rows": [[2024, 100], [2025, 150]], "value_column": 1}\n```'
@@ -1683,41 +1508,33 @@ def test_parse_dataviz_accepts_numeric_identifier_labels():
     assert data["value_column"] == 1
     assert data["rows"] == [[2024, 100], [2025, 150]]
 
-    # Auto-detect: no value_column, so the first numeric column (Year here, since
-    # both columns are numeric) is inferred; the block still parses successfully.
     auto = (
         '```dataviz\n{"columns": ["Year", "Revenue"], '
         '"rows": [[2024, 100], [2025, 150]]}\n```'
     )
     data = chat_module.parse_dataviz(auto)
     assert data is not None
-    assert data["value_column"] == 0  # _first_numeric_column picks Year
+    assert data["value_column"] == 0  # no value_column, so the first numeric one wins
     assert data["rows"] == [[2024, 100], [2025, 150]]
 
 
 def test_finalize_answer_only_keeps_charts_on_explicit_request():
-    """Charts must never appear unless the user explicitly asked for one
-    (guards non-deterministic model emission of dataviz blocks)."""
+    """Charts must never appear unasked: model emission of a dataviz block is non-deterministic."""
     with_block = (
         "Prose [1].\n\n```dataviz\n"
         '{"columns": ["Company", "Value"], "rows": [["Wakefit", 1.0]], "value_column": 1}\n'
         "```"
     )
-    # No chart ask -> the block is stripped, prose kept.
     out = chat_module._finalize_answer(with_block, "top 10 ipo deals in 2025")
     assert "dataviz" not in out
     assert "Prose [1]" in out
-    # Explicit table ask -> block kept (and pinned).
     out = chat_module._finalize_answer(with_block, "make a table of top 10 ipo deals")
     assert "dataviz" in out
     assert chat_module.parse_dataviz(out)["view"] == "table"
-    # Plain prose, no ask -> untouched.
     assert chat_module._finalize_answer("Just prose [1].", "top deals") == "Just prose [1]."
 
 
 def test_chart_intent_regex():
-    """Only an explicit chart/graph/plot/table request counts as chart intent;
-    ranked/numeric questions without a visual ask must stay plain prose."""
     for q in [
         "show me a chart of top deals",
         "show me a bar chart",
@@ -1732,7 +1549,6 @@ def test_chart_intent_regex():
         "in tabular format",
     ]:
         assert chat_module._CHART_INTENT_RE.search(q), q
-    # Bare 'in table' is a common-noun phrase, not a view request.
     assert not chat_module._CHART_INTENT_RE.search("in table tennis"), "in table tennis"
     assert not chat_module._CHART_INTENT_RE.search("present table tennis scores")
     assert not chat_module._CHART_INTENT_RE.search("in the plot of the story")
@@ -1771,9 +1587,7 @@ def test_answer_with_dataviz_retries_when_block_missing(monkeypatch):
 
     result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", [], "SYSTEM"))
     assert len(calls) == 2
-    # The retry instruction is ours, so it rides in the system role: the user
-    # message is the one the system prompt declares entirely untrusted, and
-    # trusted prose there would undercut the retry's authority.
+    # The retry instruction rides in the system role: the user message is the one the system prompt declares untrusted.
     assert chat_module._dataviz_nudge("show me a chart of top 5 deals") in systems[1]
     assert chat_module._dataviz_nudge("show me a chart of top 5 deals") not in calls[1]
     assert calls[1] == "PROMPT"
@@ -1819,8 +1633,6 @@ def test_answer_with_dataviz_no_retry_for_non_numeric_question(monkeypatch):
 
 
 def test_answer_with_dataviz_no_retry_for_ranked_question_without_chart_ask(monkeypatch):
-    """A ranked-list question that does NOT ask for a visual must not nudge a
-    dataviz block into the answer (regression: top-N used to auto-chart)."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -1836,8 +1648,6 @@ def test_answer_with_dataviz_no_retry_for_ranked_question_without_chart_ask(monk
 
 
 def test_effective_chat_k_dynamic():
-    """The chat source count scales to the requested 'top N' (floored at TOP_K,
-    capped at CHAT_MAX_SOURCES) instead of always being TOP_K."""
     assert chat_module._effective_chat_k("top 10 ipo deals in 2025") == 10
     assert chat_module._effective_chat_k("top ipo deals in 2025") == 10  # bare top -> list default
     assert chat_module._effective_chat_k("who invested in Ola Electric?") == chat_module.config.TOP_K
@@ -1850,19 +1660,13 @@ def test_dataviz_nudge_row_cap_scales():
 
 
 def test_chat_prompt_instructs_constructing_top_n_lists():
-    """A 'top N' request must be answered by extracting and ranking the named
-    items from the articles, not refused because no pre-made ranking exists
-    (regression: 'top 10 ipo deals in 2025' was refused despite relevant data)."""
     assert "Build the list only from items the articles actually name" in chat_module.CHAT_PROMPT
     assert "Never refuse" in chat_module.CHAT_PROMPT
     assert "just because the articles lack exact values or a pre-made ranking" in chat_module.CHAT_PROMPT
     assert "always beats a refusal" in chat_module.CHAT_PROMPT
-    # IPO questions must yield companies that went public, not M&A/stake deals,
-    # and a list item with no stated value must still be included.
     assert "are COMPANIES that went public or filed for an IPO" in chat_module.CHAT_PROMPT
     assert "never private funding rounds, stake sales, or M&A" in chat_module.CHAT_PROMPT
     assert "write \"value not stated\"" in chat_module.CHAT_PROMPT
-    # The dataviz table must include every listed item; missing values use "".
     assert "every item mentioned in your prose answer must appear as a row" in chat_module.CHAT_PROMPT
     assert "never drop the row" in chat_module.CHAT_PROMPT
     assert "set `\"value_column\"` to `null`" in chat_module.CHAT_PROMPT
@@ -1875,9 +1679,7 @@ def test_requested_view_detection():
     assert chat_module._requested_view("show me a line chart of funding") == "line"
     assert chat_module._requested_view("pie chart of sectors") == "pie"
     assert chat_module._requested_view("make a pictogram of deals") == "picto"
-    # Generic chart ask, no specific view.
     assert chat_module._requested_view("show me a chart of top deals") is None
-    # Not a chart request at all.
     assert chat_module._requested_view("who invested in Ola Electric?") is None
 
 
@@ -1899,13 +1701,10 @@ def test_apply_requested_view_pins_block_view():
     assert block["kind"] == "pie"
     assert "```dataviz" in out
 
-    # A table ask pins view to table and leaves the table rendered as-is.
     out = chat_module._apply_requested_view(text, "show me a table of deals")
     block = chat_module.parse_dataviz(out)
     assert block["view"] == "table"
 
-    # A value-less table block (every item's value 'not stated') is accepted for
-    # an explicit table ask and rendered as a plain text table (value_column null).
     text2 = (
         "Top IPOs [1].\n\n```dataviz\n"
         '{"columns": ["Company", "Status"], "rows": [["Wakefit", "not stated"], ["Groww", "not stated"]]}\n'
@@ -1918,16 +1717,11 @@ def test_apply_requested_view_pins_block_view():
     assert block["value_column"] is None
     assert "not stated" in out
 
-    # Generic chart ask leaves the block untouched.
     assert chat_module._apply_requested_view(text, "show me a chart of deals") == text
-    # No block -> untouched.
     assert chat_module._apply_requested_view("Just prose [1].", "show me a pie chart") == "Just prose [1]."
 
 
 def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
-    """Chat must retrieve as many sources as the question asks for ('top 10 ...'
-    -> top_k=10) and budget the body excerpts so the prompt stays bounded
-    (regression: chat always retrieved TOP_K)."""
     from app import main
     from app.main import SourceArticle
 
@@ -1957,7 +1751,7 @@ def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
     turn = _run(chat_module._prepare_turn("top 10 ipo deals in 2025", []))
     assert captured["top_k"] == 10
     assert len(turn.sources) == 10
-    assert "max 10" in turn.system  # dataviz cap matches the requested N
+    assert "max 10" in turn.system
 
     monkeypatch.setattr(main, "retrieve_and_rerank", make_fake(chat_module.config.TOP_K))
     turn = _run(chat_module._prepare_turn("who invested in Ola Electric?", []))
@@ -1966,8 +1760,6 @@ def test_prepare_turn_scales_sources_to_requested_top_n(monkeypatch):
 
 
 def test_prepare_turn_budgets_body_excerpts_across_sources(monkeypatch):
-    """With more sources than body-budget / CHAT_BODY_CHAR_LIMIT, each source's
-    body excerpt is trimmed so the total prompt stays bounded."""
     from app import main
     from app.main import SourceArticle
 
@@ -1984,20 +1776,17 @@ def test_prepare_turn_budgets_body_excerpts_across_sources(monkeypatch):
     async def fake_retrieve(rq, top_k, qfilter, need_body=False):
         return [
             SourceArticle(id=i, title=f"t{i}", url=f"u{i}", published_date="2025-03-01",
-                          summary="s", body="x" * 50000, score=0.9)  # 50K body each
+                          summary="s", body="x" * 50000, score=0.9)
             for i in range(20)
         ]
 
     monkeypatch.setattr(main, "retrieve_and_rerank", fake_retrieve)
     turn = _run(chat_module._prepare_turn("top 20 ipo deals in 2025", []))
-    # 20 sources x 20K excerpt = 400K, the total body budget.
     assert turn.answer.count("x" * 20000) >= 20
-    assert "x" * 20001 not in turn.answer  # no source exceeds its share
+    assert "x" * 20001 not in turn.answer
 
 
 def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
-    """A failed dataviz nudge retry must keep the first answer instead of
-    erroring the turn."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2019,18 +1808,13 @@ def test_answer_with_dataviz_keeps_first_answer_when_nudge_fails(monkeypatch):
 
 
 def test_failed_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
-    """Regression (#347): a nudge that fails after burning its retries is a real
-    billed call. The turn must settle for those attempts too, not record the
-    turn as having cost only the answer call -- which is what made the daily cap
-    under-count exactly when the provider was flaky and retries were most
-    likely."""
+    """A nudge that burned its retries is a real billed call; settling only the successful one under-counts the cap when the provider is flaky."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=10, completion_tokens=5)
-        # 3 requests were really sent and billed before the nudge gave up.
         raise chat_module.LLMUnavailableError(attempts=3)
 
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
@@ -2045,15 +1829,11 @@ def test_failed_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
         )
     )
     assert len(calls) == 2
-    # The first answer is still served, so the turn is not an error...
     assert result.content == "No chart here [1]."
-    # ...but the failed retry's three billed attempts are charged.
     assert spend.usd == pytest.approx(3 * 0.02)
 
 
 def test_failed_ranking_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
-    """The ranking nudge is the same defect on a second call site: a refusal
-    followed by a failed retry must charge the retry's billed attempts."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2078,16 +1858,11 @@ def test_failed_ranking_nudge_retry_is_charged_to_the_turn_settle(monkeypatch):
         )
     )
     assert len(calls) == 2
-    # The refusal answer is still served, so the turn is not an error...
     assert "cannot be generated" in result.content
     assert spend.usd == pytest.approx(2 * 0.02)
 
 
 def test_zero_attempt_nudge_failure_is_not_charged(monkeypatch):
-    """`LLM_MAX_RETRIES < 0` sends no request at all, so a nudge that fails
-    having attempted nothing is genuinely free -- the honest exception, and the
-    reason charge() ignores a zero attempt count rather than charging an
-    estimate for a call that never happened."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2108,11 +1883,6 @@ def test_zero_attempt_nudge_failure_is_not_charged(monkeypatch):
 
 
 def test_run_turn_settles_failed_nudge_retries_with_the_turn(monkeypatch):
-    """End-to-end (#347): a turn whose answer succeeds while both nudges fail
-    after retries must settle ONE figure that includes the billed attempts of
-    the failed retries. Before the fix the settle carried only the answer
-    call's cost, so the daily cap silently forgave every retry the provider
-    had already billed."""
     generate_calls = []
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
@@ -2123,12 +1893,10 @@ def test_run_turn_settles_failed_nudge_retries_with_the_turn(monkeypatch):
     async def fake_generate(client, prompt, model, system_prompt=None):
         generate_calls.append(prompt)
         if len(generate_calls) == 1:
-            # A chart ask whose answer refuses, so BOTH nudges fire and both
-            # then fail after being billed.
+            # A chart ask whose answer refuses, so both nudges fire and fail after being billed.
             return chat_module.LLMResult(
                 content="I cannot generate a ranked list [1].", prompt_tokens=100_000, completion_tokens=0
             )
-        # dataviz nudge: 3 billed attempts; ranking nudge: 2 billed attempts.
         raise chat_module.LLMUnavailableError(attempts=3 if len(generate_calls) == 2 else 2)
 
     monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -2141,9 +1909,6 @@ def test_run_turn_settles_failed_nudge_retries_with_the_turn(monkeypatch):
 
     assert len(generate_calls) == 3
     assert answer.startswith("I cannot generate a ranked list")
-    # The answer call's real cost ($0.10) PLUS the failed retries' 5 billed
-    # attempts at the $0.02 estimate = $0.20. Settled ONCE, and the stored cost
-    # is that same number.
     assert budget.writes == [("settle", 200_000)]
     assert budget.counter == 200_000
     assert budget.holds == {}
@@ -2151,14 +1916,6 @@ def test_run_turn_settles_failed_nudge_retries_with_the_turn(monkeypatch):
 
 
 def test_run_turn_no_usage_still_settles_positive_reserve_estimate(monkeypatch):
-    """The #255 invariant this change must not break: a non-streaming call that
-    returns WITHOUT LLM usage must settle the POSITIVE reserve estimate, and
-    the stored message cost must be that very same number -- never a different
-    one on the accounting path than on the reserve path.
-
-    #347 adds a per-turn accumulator, which is exactly the kind of change that
-    can let the two paths drift apart, so the invariant is pinned here: the
-    settle amount and the returned cost are one number, and it is positive."""
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
 
@@ -2166,8 +1923,7 @@ def test_run_turn_no_usage_still_settles_positive_reserve_estimate(monkeypatch):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
     async def fake_generate(client, prompt, model, system_prompt=None):
-        # A delivered answer carrying zero tokens: cost() is 0.0, which means
-        # "usage unknown", never "free".
+        # Zero tokens means cost() is 0.0 = "usage unknown", never "free".
         return chat_module.LLMResult(content="A delivered answer [1].", prompt_tokens=0, completion_tokens=0)
 
     monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -2176,30 +1932,16 @@ def test_run_turn_no_usage_still_settles_positive_reserve_estimate(monkeypatch):
 
     _answer, _sources, _note, _pt, _ct, cost = _run(chat_module._run_turn("Who invested in fintech?", []))
 
-    # The POSITIVE reserve estimate, not zero...
     assert budget.writes == [("settle", 20_000)]
     assert budget.counter == 20_000
-    # ...and the same number on the accounting path and the stored path.
     assert cost == pytest.approx(0.02)
     assert cost == pytest.approx(budget.writes[0][1] / 1_000_000)
 
 
 def test_run_turn_no_usage_with_failed_nudge_settles_reserve_plus_nudge(monkeypatch):
-    """Pins the ORDERING of the accumulator against the #255 fallback (#347).
-
-    The two rules interact, and only one order is correct:
-      cost_usd = to_usd(result.cost())
-      if cost_usd <= 0: cost_usd = LLM_CALL_RESERVE_USD   # #255 fallback
-      cost_usd += spend.usd                              # #347 accumulator
-
-    Adding `spend.usd` FIRST would make this turn's total 3 x $0.02 = $0.06,
-    which is already positive, so the `<= 0` fallback would never fire and the
-    answer call's own reserve estimate would be silently never charged -- the
-    #255 invariant broken with no error anywhere. The other two tests cannot
-    catch that: this one's predecessor has no failed nudge, and the end-to-end
-    one reports real usage. So the reserve estimate and the nudge attempts must
-    BOTH appear, as one identical number on both the accounting and stored
-    paths."""
+    """Ordering: the reserve fallback must be computed BEFORE spend.usd is added.
+    Adding it first would make the total already positive, the `<= 0` fallback
+    would never fire, and the answer call's reserve would silently go uncharged."""
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
     generate_calls = []
@@ -2210,9 +1952,7 @@ def test_run_turn_no_usage_with_failed_nudge_settles_reserve_plus_nudge(monkeypa
     async def fake_generate(client, prompt, model, system_prompt=None):
         generate_calls.append(prompt)
         if len(generate_calls) == 1:
-            # Chart ask, answered without a block AND with no usage reported.
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=0, completion_tokens=0)
-        # The nudge burned three billed attempts before giving up.
         raise chat_module.LLMUnavailableError(attempts=3)
 
     monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -2224,18 +1964,13 @@ def test_run_turn_no_usage_with_failed_nudge_settles_reserve_plus_nudge(monkeypa
     )
 
     assert len(generate_calls) == 2
-    # The answer call's $0.02 reserve estimate PLUS the nudge's 3 x $0.02.
-    # A settle of 60_000 (nudge only) is the ordering bug this guards.
     assert budget.writes == [("settle", 80_000)]
     assert budget.counter == 80_000
-    # One identical number on the accounting path and the stored path.
     assert cost == pytest.approx(0.08)
     assert cost == pytest.approx(budget.writes[0][1] / 1_000_000)
 
 
 def test_json_loads_malformed_returns_empty(caplog):
-    """Decode failures on a str/bytes payload still degrade to [] but must be
-    logged, so corrupt stored rows are diagnosable instead of silently empty."""
     with caplog.at_level(logging.WARNING, logger="chat"):
         assert chat_module.json_loads("{not json") == []
         assert chat_module.json_loads(None) == []
@@ -2246,8 +1981,6 @@ def test_json_loads_malformed_returns_empty(caplog):
 
 
 def test_json_loads_logs_unexpected_shape(caplog):
-    """Corrupt payloads that decode but are not a list-of-objects are logged,
-    not silently dropped (#175)."""
     with caplog.at_level(logging.WARNING, logger="chat"):
         assert chat_module.json_loads('{"sources": 1}') == []
         assert chat_module.json_loads('[1, {"a": 1}]') == [{"a": 1}]
@@ -2256,9 +1989,6 @@ def test_json_loads_logs_unexpected_shape(caplog):
 
 
 def test_json_loads_non_str_payload_degrades_to_empty(caplog):
-    """A non-str/bytes payload is a caller bug, but still must not break a
-    history read: it degrades to [] and is logged at error level with the type,
-    the row id and a bounded preview (#175)."""
     with caplog.at_level(logging.ERROR, logger="chat"):
         assert chat_module.json_loads(123, row_id=5) == []
         assert chat_module.json_loads({"a": 1}) == []
@@ -2270,8 +2000,6 @@ def test_json_loads_non_str_payload_degrades_to_empty(caplog):
 
 
 def test_json_loads_logs_row_id_for_shape_problems(caplog):
-    """Every degraded path names the row, so the corrupt stored row can be found
-    from the logs (#175)."""
     with caplog.at_level(logging.WARNING, logger="chat"):
         assert chat_module.json_loads('{"sources": 1}', row_id=99) == []
         assert chat_module.json_loads("[1]", row_id=99) == []
@@ -2281,8 +2009,6 @@ def test_json_loads_logs_row_id_for_shape_problems(caplog):
 
 
 def test_row_to_message_passes_row_id_to_json_loads(caplog):
-    """The only caller must identify the row it read, otherwise the corruption
-    warning cannot be traced back to a stored message (#175)."""
     row = {
         "id": 7,
         "role": "user",
@@ -2301,8 +2027,6 @@ def test_row_to_message_passes_row_id_to_json_loads(caplog):
 
 
 def test_log_preview_is_bounded_for_large_payloads():
-    """A huge non-str payload must not be repr'd in full on the error path: the
-    render cost is capped by the preview limits, not the payload size (#175)."""
     budget = chat_module._JSON_LOG_PREVIEW + 100  # clip marker + omitted-count suffix
 
     huge_list = [{"id": i, "body": "x" * 50_000} for i in range(5_000)]
@@ -2322,17 +2046,12 @@ def test_log_preview_is_bounded_for_large_payloads():
     long_str = "s" * 1_000_000
     assert chat_module._log_preview(long_str) == "s" * chat_module._JSON_LOG_PREVIEW + "...(truncated)"
 
-    # Small payloads are rendered verbatim, with no truncation or omission marker.
     assert chat_module._log_preview([{"a": 1}]) == "[{'a': 1}]"
     assert chat_module._log_preview("{not json") == "{not json"
 
 
 class _LazyItemsDict(dict):
-    """Mapping that counts how many of its members a consumer actually walks.
-
-    Lazy on purpose: the count is what distinguishes a preview that streams the
-    first few members from one that materialises the whole mapping first.
-    """
+    """Counts the members a consumer walks, which is what separates a streaming preview from a materialising one."""
 
     def __init__(self, source):
         super().__init__(source)
@@ -2345,8 +2064,6 @@ class _LazyItemsDict(dict):
 
 
 class _ReprSpy:
-    """Value that records whether anything ever rendered it."""
-
     rendered: ClassVar[list[str]] = []
 
     def __init__(self, label):
@@ -2358,12 +2075,7 @@ class _ReprSpy:
 
 
 def test_log_preview_does_not_materialise_a_huge_mapping():
-    """A preview must pull only the members it renders: building the whole
-    items() list first would cost O(size of the payload) on an error path, which
-    is exactly what the preview limits are there to prevent (#175).
-
-    A repr-then-truncate implementation walks every member, so it fails here.
-    """
+    """Asserted on members walked, not on preview length: a repr-then-truncate preview renders everything first."""
     mapping = _LazyItemsDict({f"key-{i}": i for i in range(500_000)})
 
     preview = chat_module._log_preview(mapping)
@@ -2373,12 +2085,7 @@ def test_log_preview_does_not_materialise_a_huge_mapping():
 
 
 def test_log_preview_never_renders_dropped_or_over_deep_values():
-    """Members past the preview window and containers nested deeper than the
-    depth cap must be stubbed out, not rendered: both are unbounded otherwise,
-    and only the final clip would hide it (#175).
-
-    A repr-then-truncate implementation renders both spies, so it fails here.
-    """
+    """Asserted on the spy, not on length: a repr-then-truncate preview renders both dropped and over-deep members."""
     _ReprSpy.rendered = []
     dropped = _ReprSpy("dropped-member")
     over_deep = _ReprSpy("over-deep-member")
@@ -2395,9 +2102,7 @@ def test_log_preview_never_renders_dropped_or_over_deep_values():
 
 
 def test_json_loads_degrades_on_pathological_nesting(caplog):
-    """Nesting deep enough to blow the decoder's stack raises RecursionError,
-    which is not a ValueError: it must degrade to [] with the row id instead of
-    escaping as a 500 out of a history read (#175)."""
+    """Deep nesting raises RecursionError, not ValueError, so it must degrade to [] rather than escape as a 500."""
     payload = "[" * 100_000 + "]" * 100_000
     with pytest.raises(RecursionError):  # guard: the payload really hits the limit
         json.loads(payload)
@@ -2411,8 +2116,6 @@ def test_json_loads_degrades_on_pathological_nesting(caplog):
 
 
 def test_json_loads_empty_payload_is_not_corruption(caplog):
-    """An empty payload holds no data, in any str/bytes flavour: it degrades to
-    [] silently rather than reporting b''/bytearray(b'') as corrupt (#175)."""
     with caplog.at_level(logging.WARNING, logger="chat"):
         assert chat_module.json_loads("") == []
         assert chat_module.json_loads(b"") == []
@@ -2421,9 +2124,6 @@ def test_json_loads_empty_payload_is_not_corruption(caplog):
 
     assert "chat.json_loads" not in caplog.text
 def test_answer_with_dataviz_skips_nudge_when_budget_exhausted(monkeypatch):
-    """Regression (#177): the nudge retry is a second billed call, so it must
-    re-check the daily cap instead of relying on the outer caller's check. An
-    exhausted budget skips the retry and keeps the first answer."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2436,13 +2136,12 @@ def test_answer_with_dataviz_skips_nudge_when_budget_exhausted(monkeypatch):
             completion_tokens=8,
         )
 
-    # $10.00 already spent against a $2.00 cap: the guard's own reserve is refused.
     _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=10.0)
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
     result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", []))
-    assert len(calls) == 1  # retry never billed
+    assert len(calls) == 1
     assert result.content == "No chart here [1]."
     assert result.prompt_tokens == 10
     assert result.completion_tokens == 5
@@ -2456,18 +2155,7 @@ def _async(fn):
 
 
 class _FakeBudgetRedis:
-    """Fake Redis implementing the server-side contract of _BUDGET_LUA.
-
-    It is a real (if in-memory) implementation of that script, not a stub that
-    returns 0: the counter is integer micro-USD, holds live in a hash with an
-    expiry zset, the cap is measured against counter PLUS every live hold, and
-    every mode sweeps lapsed holds first. Without that, a test would prove the
-    fake rather than the module (#255).
-
-    Every counter write is recorded in `writes` as (mode, amount_micros) so a
-    test can assert how many times a turn wrote the day total and for how much,
-    without re-pinning the script's argument layout.
-    """
+    """Real in-memory implementation of _BUDGET_LUA, so a test exercises the module rather than a stub: the counter is micro-USD, live holds sit in a hash with an expiry zset, the cap measures counter PLUS live holds, and every mode sweeps lapsed holds first. Counter writes are recorded in `writes` as (mode, amount_micros)."""
 
     def __init__(self, counter_micros=0):
         self.counter = int(counter_micros)
@@ -2506,8 +2194,6 @@ class _FakeBudgetRedis:
             for rid in args[7:]:
                 self.holds.pop(rid, None)
                 self.expiry.pop(rid, None)
-            # The hold was never added to the counter, so the real cost is
-            # recorded whole — deliberately allowed to exceed the estimate.
             self.counter = max(0, self.counter + amount)
             self.writes.append(("settle", amount))
             return 0
@@ -2520,12 +2206,7 @@ class _FakeBudgetRedis:
 
 
 def _route_real_budget(monkeypatch, budget_usd, counter_micros=0):
-    """Point the REAL app.cost_budget at a _FakeBudgetRedis, leaving
-    reserve/settle/release unpatched so the tests exercise the shipped module.
-
-    The cached script handle is dropped so the fake client is the one the
-    module registers against. Returns the fake, whose `writes` list shows every
-    counter write a turn made."""
+    """Drops the cached script handle so the module registers against the fake rather than reusing the real one."""
     fake = _FakeBudgetRedis(counter_micros)
     monkeypatch.setattr(cost_budget_module, "_BUDGET_SCRIPT", None)
     monkeypatch.setattr(cost_budget_module, "_client", lambda: fake)
@@ -2535,11 +2216,7 @@ def _route_real_budget(monkeypatch, budget_usd, counter_micros=0):
 
 
 def _pin_cost_accounting(monkeypatch, budget_usd, spend_usd):
-    """Pin pricing so the turn's cost arithmetic is deterministic ($1 per 1M
-    prompt tokens, ₹100 == $1) and route the real budget module at a fake
-    counter already holding `spend_usd` of today's spend.
-
-    Returns the _FakeBudgetRedis driving the gate; `spend_usd` is in USD."""
+    """Pricing pinned to $1 per 1M prompt tokens so the cost arithmetic in these tests reads directly."""
     monkeypatch.setattr(cost_budget_module.config, "INR_PER_USD", 100.0)
     monkeypatch.setattr(cost_budget_module.config, "LLM_PRICE_INPUT_PER_1M", 1.0)
     monkeypatch.setattr(cost_budget_module.config, "LLM_PRICE_OUTPUT_PER_1M", 0.0)
@@ -2547,8 +2224,6 @@ def _pin_cost_accounting(monkeypatch, budget_usd, spend_usd):
 
 
 def _pin_budget_disabled(monkeypatch):
-    """Pin the budget gate to a no-op that records nothing, for tests whose
-    subject is not cost accounting (LLM output, streaming, persistence)."""
 
     async def reserve(estimate_usd: float = 0.0) -> str:
         return ""
@@ -2574,10 +2249,7 @@ class _TimingOutCompletions:
 
 
 class _TimingOutLLM:
-    """A provider that never answers: every request it is sent times out, so the
-    REAL generate_answer / stream_answer retry loops run to exhaustion. The
-    `calls` counter is the number of requests the provider was actually sent, and
-    the provider bills the prompt of every one of them."""
+    """A provider that never answers, so the real retry loop runs to exhaustion; `calls` counts requests actually sent, each billed."""
 
     def __init__(self):
         self.calls = 0
@@ -2585,9 +2257,6 @@ class _TimingOutLLM:
 
 
 def _pin_llm_outage(monkeypatch, retries, reserve_usd):
-    """Point chat at a provider that times out on every call, with the backoff
-    pinned to zero so the retry loop runs for real without sleeping. Returns the
-    _TimingOutLLM standing in for the model."""
     monkeypatch.setattr(chat_module.config, "LLM_MAX_RETRIES", retries)
     monkeypatch.setattr(chat_module.config, "LLM_RETRY_BACKOFF", 0.0)
     monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", reserve_usd)
@@ -2597,17 +2266,13 @@ def _pin_llm_outage(monkeypatch, retries, reserve_usd):
 
 
 def test_answer_with_dataviz_skips_nudge_when_turn_spend_exhausts_budget(monkeypatch):
-    """Regression (#177, the ORDINARY single-turn case): the first call's cost
-    only reaches the daily counter at the end of the turn, so the guard must
-    count it. Here the recorded total is still under the cap but this turn's
-    first call pushes the day past it, so the retry is skipped and the first
-    answer is kept (no error surfaced)."""
+    """The first call's cost reaches the daily counter only at the turn's end, so
+    the guard must count the live hold: the retry is skipped, first answer kept."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
-            # 1M prompt tokens == $1.00 with the pinned pricing.
             return chat_module.LLMResult(content="No chart here [1].", prompt_tokens=1_000_000, completion_tokens=0)
         return chat_module.LLMResult(
             content='Prose [1].\n\n```dataviz\n{"columns": ["A", "B"], "rows": [["x", 1.0]], "value_column": 1}\n```',
@@ -2615,10 +2280,6 @@ def test_answer_with_dataviz_skips_nudge_when_turn_spend_exhausts_budget(monkeyp
             completion_tokens=8,
         )
 
-    # $1.50 recorded, and this turn's first call still holds $1.00: the guard's
-    # own reserve is measured against counter PLUS live hold = $2.50 > $2.00, so
-    # the retry is refused. The first call's cost reaches the counter only at the
-    # turn's settle, so counting the live hold is what closes that window.
     budget = _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=1.5)
     budget.holds["h-inflight"] = 1_000_000
     budget.expiry["h-inflight"] = cost_budget_module._now_ts() + 900
@@ -2626,14 +2287,12 @@ def test_answer_with_dataviz_skips_nudge_when_turn_spend_exhausts_budget(monkeyp
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
     result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", []))
-    assert len(calls) == 1  # retry never billed
+    assert len(calls) == 1
     assert result.content == "No chart here [1]."
     assert result.prompt_tokens == 1_000_000
 
 
 def test_answer_with_dataviz_nudges_when_turn_spend_still_within_budget(monkeypatch):
-    """Counterpart to the case above: with headroom left after this turn's
-    first call, the guard must NOT block the retry."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2646,7 +2305,6 @@ def test_answer_with_dataviz_nudges_when_turn_spend_still_within_budget(monkeypa
             completion_tokens=8,
         )
 
-    # $0.00 recorded and no live hold: the guard's reserve fits under the cap.
     _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
@@ -2657,9 +2315,6 @@ def test_answer_with_dataviz_nudges_when_turn_spend_still_within_budget(monkeypa
 
 
 def test_row_to_message_coerces_legacy_fields():
-    """_row_to_message must tolerate malformed/legacy rows: bad sources JSON and
-    NULL/string token/cost fields fall back to 0 defaults (ERROR PATH — malformed
-    stored rows)."""
     row = {
         "id": 1,
         "role": "user",
@@ -2681,10 +2336,9 @@ def test_row_to_message_coerces_legacy_fields():
 
 
 def test_smalltalk_reply_empty_and_long_fallthrough():
-    """Line 436: empty queries and >12-word messages are NOT small talk."""
     assert chat_module._smalltalk_reply("") is None
     assert chat_module._smalltalk_reply("   ") is None
-    assert chat_module._smalltalk_reply("hi " * 13) is None  # 13 words > 12
+    assert chat_module._smalltalk_reply("hi " * 13) is None
     assert chat_module._smalltalk_reply("who invested in Ola Electric and also in Zepto and also in Meesho?") is None
 
 
@@ -2701,38 +2355,26 @@ def test_dataviz_helpers_edge_branches():
     assert chat_module._missing_cell(0) is False
     assert chat_module._missing_cell("present") is False
 
-    # _valid_value_column: no present cell at all -> False; numeric cells -> True.
     assert chat_module._valid_value_column([["x", ""], ["y", "not stated"]], 1) is False
     assert chat_module._valid_value_column([["x", 1.0]], 1) is True
     assert chat_module._valid_value_column([["x", "abc"]], 1) is False
 
-    # _has_label_content: no label columns -> True; all-empty labels -> False.
     assert chat_module._has_label_content([["x"]], ["A"], 0) is True
     assert chat_module._has_label_content([["", 1.0], ["", 2.0]], ["A", "B"], 1) is False
     assert chat_module._has_label_content([["x", 1.0], ["", 2.0]], ["A", "B"], 1) is True
 
-    # _first_numeric_column: empty rows / empty first row short-circuit to None.
     assert chat_module._first_numeric_column([]) is None
     assert chat_module._first_numeric_column([[]]) is None
     assert chat_module._first_numeric_column([["x", 3.0]]) == 1
 
 
 def test_as_float_rejects_bool_before_int_coercion():
-    """Regression (#176): bool is a subclass of int, so an int-first coercion
-    turns True/False into 1.0/0.0. _as_float must reject bools before the
-    int/float branch, while genuine numbers (and numeric strings, including a
-    legit 0/1 cell) still coerce and non-numeric input still returns None.
-
-    The isinstance(v, bool) guard already existed when #176 was reported, so
-    this test locks in behaviour that was already correct: it exists purely to
-    fail if the guard is ever removed or reordered below the int/float branch.
-    """
+    """bool is a subclass of int, so the isinstance(v, bool) guard must precede the int/float branch."""
     assert chat_module._as_float(True) is None
     assert chat_module._as_float(False) is None
     assert chat_module._as_float("true") is None
     assert chat_module._as_float("false") is None
 
-    # Genuine ints (0 and 1 included), floats and numeric strings still coerce.
     assert chat_module._as_float(0) == 0.0
     assert chat_module._as_float(1) == 1.0
     assert chat_module._as_float(-3) == -3.0
@@ -2740,34 +2382,28 @@ def test_as_float_rejects_bool_before_int_coercion():
     assert chat_module._as_float("0") == 0.0
     assert chat_module._as_float("-1.5") == -1.5
 
-    # Non-numeric input keeps returning None.
     assert chat_module._as_float("abc") is None
     assert chat_module._as_float(None) is None
     assert chat_module._as_float([]) is None
     assert chat_module._as_float({}) is None
 
-    # Callers (_valid_value_column / _first_numeric_column, reached from
-    # parse_dataviz) must not treat a boolean column as numeric either.
+    # The parse_dataviz callers must not treat a boolean column as numeric either.
     assert chat_module._valid_value_column([["x", True]], 1) is False
     assert chat_module._valid_value_column([["x", 1.0], ["y", False]], 1) is False
     assert chat_module._first_numeric_column([["Funded", True], ["Not", False]]) is None
     assert chat_module._first_numeric_column([["Flag", True, 5.0], ["Amount", False, 6.0]]) == 2
 
-    # A chart block whose only value column holds JSON true/false is malformed.
     assert chat_module.parse_dataviz(
         '```dataviz\n{"columns": ["Deal", "Flag"], "rows": [["A", true], ["B", false]], "view": "bar"}\n```'
     ) is None
 
 
 def test_parse_dataviz_rejection_paths():
-    # line 561: data is not a dict
     assert chat_module.parse_dataviz("```dataviz\n[1, 2, 3]\n```") is None
     assert chat_module.parse_dataviz("```dataviz\n\"just a string\"\n```") is None
-    # line 565: columns not a non-empty list of strings
     assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A", 1], "rows": [["x", 1.0]]}\n```') is None
     assert chat_module.parse_dataviz('```dataviz\n{"columns": [], "rows": []}\n```') is None
     assert chat_module.parse_dataviz('```dataviz\n{"columns": "A", "rows": [["x"]]}\n```') is None
-    # line 567: rows not a non-empty list of lists
     assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A"], "rows": [1]}\n```') is None
     assert chat_module.parse_dataviz('```dataviz\n{"columns": ["A"], "rows": []}\n```') is None
 
@@ -2786,13 +2422,9 @@ def test_dataviz_nudge_pins_requested_view():
 
 
 def test_parse_dataviz_with_view_invalid():
-    # line 712: no fence
     assert chat_module._parse_dataviz_with_view("no block here", "table") is None
-    # lines 715-716: invalid JSON
     assert chat_module._parse_dataviz_with_view("```dataviz\n{not json}\n```", "table") is None
-    # line 718: data not a dict
     assert chat_module._parse_dataviz_with_view("```dataviz\n[1, 2]\n```", "table") is None
-    # dict data gets the view applied
     out = chat_module._parse_dataviz_with_view(
         '```dataviz\n{"columns": ["A"], "rows": [["x"]]}\n```', "table"
     )
@@ -2801,7 +2433,7 @@ def test_parse_dataviz_with_view_invalid():
 
 
 def test_apply_requested_view_keeps_malformed_block():
-    """Line 734: a block that fails to re-parse is left verbatim (never dropped)."""
+    """A block that fails to re-parse is left verbatim, never dropped."""
     text = "Prose.\n\n```dataviz\n{not json}\n```"
     assert chat_module._apply_requested_view(text, "show me a pie chart") == text
 
@@ -2817,8 +2449,6 @@ def test_is_ranking_refusal():
 
 
 def test_answer_ranked_nudges_after_refusal(monkeypatch):
-    """A ranked-list answer that refuses must be re-asked once with the ranking
-    nudge (lines 799-808)."""
     calls = []
     systems = []
 
@@ -2837,8 +2467,7 @@ def test_answer_ranked_nudges_after_refusal(monkeypatch):
 
     result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", [], "SYSTEM"))
     assert len(calls) == 2
-    # Our instruction goes to the instruction channel, never into the user
-    # message the system prompt declares untrusted.
+    # The nudge rides in the instruction channel, never the untrusted user message.
     assert chat_module._RANKING_NUDGE in systems[1]
     assert chat_module._RANKING_NUDGE not in calls[1]
     assert calls[1] == "PROMPT"
@@ -2849,8 +2478,6 @@ def test_answer_ranked_nudges_after_refusal(monkeypatch):
 
 
 def test_answer_ranked_keeps_first_answer_when_nudge_fails(monkeypatch):
-    """A failed ranking-nudge retry must keep the first answer (LLMUnavailableError
-    guard at lines 803-804)."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2872,9 +2499,6 @@ def test_answer_ranked_keeps_first_answer_when_nudge_fails(monkeypatch):
 
 
 def test_answer_ranked_skips_nudge_when_budget_exhausted(monkeypatch):
-    """Regression (#177): the ranking-refusal nudge is a second billed call, so
-    it must re-check the daily cap like the dataviz nudge does. An exhausted
-    budget skips the retry and keeps the refusal (no error surfaced)."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -2885,37 +2509,28 @@ def test_answer_ranked_skips_nudge_when_budget_exhausted(monkeypatch):
             )
         return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
-    # $10.00 already spent against a $2.00 cap: the guard's own reserve is refused.
     _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=10.0)
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
     result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", []))
-    assert len(calls) == 1  # retry never billed
+    assert len(calls) == 1
     assert result.content == "I cannot generate a ranked list [1]."
     assert result.prompt_tokens == 10
     assert result.completion_tokens == 5
 
 
 def test_answer_ranked_skips_nudge_when_turn_spend_exhausts_budget(monkeypatch):
-    """Regression (#177, the ORDINARY single-turn case) for the ranking nudge:
-    the first call's cost only reaches the daily counter at the end of the turn,
-    so the guard must count it. The recorded total is still under the cap but
-    this turn's first call pushes the day past it, so the refusal is kept."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         calls.append(prompt)
         if len(calls) == 1:
-            # 1M prompt tokens == $1.00 with the pinned pricing.
             return chat_module.LLMResult(
                 content="I cannot generate a ranked list [1].", prompt_tokens=1_000_000, completion_tokens=0
             )
         return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
-    # $1.50 recorded, and this turn's first call still holds $1.00: the guard's
-    # own reserve is measured against counter PLUS live hold = $2.50 > $2.00, so
-    # the ranking retry is refused and the refusal is kept.
     budget = _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=1.5)
     budget.holds["h-inflight"] = 1_000_000
     budget.expiry["h-inflight"] = cost_budget_module._now_ts() + 900
@@ -2923,14 +2538,12 @@ def test_answer_ranked_skips_nudge_when_turn_spend_exhausts_budget(monkeypatch):
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
 
     result = _run(chat_module._answer_ranked("top 10 ipo deals in 2025", "PROMPT", []))
-    assert len(calls) == 1  # retry never billed
+    assert len(calls) == 1
     assert result.content == "I cannot generate a ranked list [1]."
     assert result.prompt_tokens == 1_000_000
 
 
 def test_answer_ranked_nudges_when_turn_spend_still_within_budget(monkeypatch):
-    """Counterpart to the case above: with headroom left after this turn's first
-    call, the ranking-nudge guard must NOT block the retry."""
     calls = []
     systems = []
 
@@ -2943,7 +2556,6 @@ def test_answer_ranked_nudges_when_turn_spend_still_within_budget(monkeypatch):
             )
         return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
-    # $0.00 recorded and no live hold: the guard's reserve fits under the cap.
     _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
     monkeypatch.setattr(chat_module, "state_llm", lambda: object())
@@ -2971,8 +2583,6 @@ def test_answer_ranked_single_call_when_not_refusal(monkeypatch):
 
 
 def test_prepare_turn_vague_followup_with_year_range(monkeypatch):
-    """A vague follow-up that adds a year window ('for 2024') keeps the previous
-    turn's topic but pins the new date range (lines 856-859)."""
     from app import main
     from app.chat import MessageOut
     from app.main import SourceArticle
@@ -3046,8 +2656,6 @@ def test_prepare_turn_calls_body_rescue_when_enabled(monkeypatch):
 
 
 def test_prepare_turn_no_sources_short_circuit(monkeypatch):
-    """line 876: sources below ASK_MIN_SCORE yield a plain 'no articles' answer
-    instead of an LLM call."""
     from app import main
     from app.main import SourceArticle
 
@@ -3074,8 +2682,6 @@ def test_prepare_turn_no_sources_short_circuit(monkeypatch):
 
 
 def test_prepare_turn_weak_fallback(monkeypatch):
-    """line 879: weak-but-nonempty sources produce the honest fallback answer
-    with a note, no LLM call."""
     from app import main
     from app.main import SourceArticle
 
@@ -3102,17 +2708,13 @@ def test_prepare_turn_weak_fallback(monkeypatch):
 
 
 def test_prepare_turn_faceted_low_score_surfaces(monkeypatch):
-    """A query that resolves a category facet (e.g. 'funding news in jun 2025')
-    must surface its on-topic matches even when the cross-encoder scores them
-    below ASK_MIN_SCORE: the facet filter is the relevance signal, so the gate is
-    dropped and the matches are presented normally (no weak disclaimer)."""
+    """With a facet resolved the filter is the relevance signal, so the score gate is dropped and matches present normally."""
     from app import main
     from app.main import SourceArticle
 
     monkeypatch.setattr(chat_module, "_smalltalk_reply", lambda q: None)
     monkeypatch.setattr(chat_module.config, "ENABLE_BODY_RESCUE", False)
     monkeypatch.setattr(chat_module.config, "ENABLE_WEAK_FALLBACK", True)
-    # dealtype resolved -> faceted path
     monkeypatch.setattr(
         main, "_effective_intent",
         lambda q, f, t: (q, "2025-06-01", "2025-06-30", "Venture Capital", None),
@@ -3133,7 +2735,7 @@ def test_prepare_turn_faceted_low_score_surfaces(monkeypatch):
     monkeypatch.setattr(main, "body_rescue", fake_rescue)
 
     turn = _run(chat_module._prepare_turn("funding news in jun 2025", []))
-    assert turn.needs_llm  # normal answer, not the weak/empty short-circuit
+    assert turn.needs_llm
     assert len(turn.sources) == 2
     assert "No sufficiently relevant" not in turn.answer
     assert "closest" not in turn.answer
@@ -3141,10 +2743,6 @@ def test_prepare_turn_faceted_low_score_surfaces(monkeypatch):
 
 
 def test_prepare_turn_multiple_moderate_sources_not_weak(monkeypatch):
-    """Regression (issue #196): a query whose several on-topic sources each
-    score only modestly above the inclusion gate (but below WEAK_RESULT_SCORE)
-    must still be answered, not refused as 'weakly related'. Retrieval with
-    several relevant sources is genuinely sufficient."""
     from app import main
     from app.main import SourceArticle
 
@@ -3167,7 +2765,7 @@ def test_prepare_turn_multiple_moderate_sources_not_weak(monkeypatch):
     monkeypatch.setattr(main, "body_rescue", fake_rescue)
 
     turn = _run(chat_module._prepare_turn("broad but moderate topic", []))
-    assert turn.needs_llm  # answered, not the weak short-circuit
+    assert turn.needs_llm
     assert len(turn.sources) == 5
     assert "No sufficiently relevant" not in turn.answer
     assert "closest" not in turn.answer
@@ -3175,9 +2773,6 @@ def test_prepare_turn_multiple_moderate_sources_not_weak(monkeypatch):
 
 
 def test_run_turn_records_cost_and_finalizes(monkeypatch):
-    """_run_turn holds budget before the billed call, calls the LLM, settles the
-    hold with the real cost, and finalizes the answer (strips unrequested
-    dataviz blocks)."""
     calls = {}
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
 
@@ -3200,13 +2795,10 @@ def test_run_turn_records_cost_and_finalizes(monkeypatch):
     expected_cost = chat_module.to_usd(
         chat_module.LLMResult(content="", prompt_tokens=10, completion_tokens=5).cost()
     )
-    # The turn wrote the counter exactly once, for the real cost, and left no
-    # hold behind: the gate holds before the call and settles after it.
     assert len(budget.writes) == 1
     assert budget.writes[0][1] == round(expected_cost * 1_000_000)
     assert budget.counter == round(expected_cost * 1_000_000)
-    assert budget.holds == {}  # every hold discharged
-    # No chart intent -> dataviz block stripped by _finalize_answer.
+    assert budget.holds == {}
     assert "dataviz" not in answer
     assert "Prose [1]" in answer
     assert sources == [{"id": 1}]
@@ -3215,15 +2807,6 @@ def test_run_turn_records_cost_and_finalizes(monkeypatch):
 
 
 def test_run_turn_charges_every_attempt_of_a_failed_call_and_reraises(monkeypatch):
-    """A total outage is a BILLED failure, and the turn FAILS (#280).
-
-    The provider is sent one request per retry and charges the prompt of every
-    one of them, so the hold this turn took is settled for all three attempts
-    rather than released. This path used to release it on the strength of a
-    comment claiming nothing had been billed, which hid the outage from the
-    daily cap and let the caller store a fabricated "no answer" as if the model
-    had replied -- so the exception must now escape to the 503 handler.
-    """
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
     llm = _pin_llm_outage(monkeypatch, retries=2, reserve_usd=0.02)
 
@@ -3237,17 +2820,12 @@ def test_run_turn_charges_every_attempt_of_a_failed_call_and_reraises(monkeypatc
 
     assert llm.calls == 3  # LLM_MAX_RETRIES + 1 requests, every one billed
     assert excinfo.value.attempts == 3
-    # $0.02 held per call, settled once for the whole failed call.
     assert budget.writes == [("settle", 60_000)]
     assert budget.counter == 60_000
     assert budget.holds == {}
 
 
 def test_run_turn_releases_the_hold_when_no_request_was_sent(monkeypatch):
-    """The counterpart, so the rule above cannot pass by charging unconditionally:
-    with LLM_MAX_RETRIES < 0 the retry loop never runs and the provider is sent
-    nothing, so there is nothing to bill -- the hold is released and the day's
-    total is untouched."""
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
     llm = _pin_llm_outage(monkeypatch, retries=-1, reserve_usd=0.02)
 
@@ -3263,16 +2841,10 @@ def test_run_turn_releases_the_hold_when_no_request_was_sent(monkeypatch):
     assert excinfo.value.attempts == 0
     assert budget.writes == []
     assert budget.counter == 0
-    assert budget.holds == {}  # released, not left eating the cap
+    assert budget.holds == {}
 
 
 def test_run_turn_settles_summed_turn_cost_exactly_once(monkeypatch):
-    """The end-of-turn settle must be the ONLY counter write for the turn and
-    must carry the SUMMED cost of every billed call in it.
-
-    Each nudge takes its own hold, so a future change that ALSO recorded one
-    again — a second settle, or settling the summed figure twice — would
-    double-count the day and fail here instead of passing silently."""
     generate_calls = []
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
 
@@ -3281,9 +2853,7 @@ def test_run_turn_settles_summed_turn_cost_exactly_once(monkeypatch):
 
     async def fake_generate(client, prompt, model, system_prompt=None):
         generate_calls.append(prompt)
-        # A chart ask whose answer refuses: the dataviz nudge (call 2) and then
-        # the ranking nudge (call 3) all fire, so the turn is billed three
-        # times and only their SUM may reach the counter.
+        # A chart ask whose answer refuses, so both nudges fire and the turn is billed 3x.
         prompt_tokens = {1: 100_000, 2: 200_000, 3: 300_000}[len(generate_calls)]
         return chat_module.LLMResult(
             content="I cannot generate a ranked list [1].", prompt_tokens=prompt_tokens, completion_tokens=0
@@ -3296,37 +2866,21 @@ def test_run_turn_settles_summed_turn_cost_exactly_once(monkeypatch):
     _run(chat_module._run_turn("show me a chart of top 10 ipo deals in 2025", []))
 
     assert len(generate_calls) == 3
-    # The COUNTER is written exactly once for the whole turn, carrying the
-    # SUM of all three calls. The three reserve calls touch only the holds
-    # hash, so they are not counter writes.
+    # The three reserve calls touch only the holds hash, so they are not counter writes.
     assert [mode for mode, _ in budget.writes] == ["settle"]
     assert budget.writes[0][1] == 600_000
     assert budget.counter == 600_000
-    assert budget.holds == {}  # gate hold + both nudge holds all discharged
+    assert budget.holds == {}
 
 
 def test_api_json_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypatch):
-    """The NON-STREAMING half of the rule the streaming path already has (#255).
-
-    `generate_answer` fills token counts from `response.usage`, so a provider
-    that sends no usage yields a TRUTHY LLMResult carrying ZERO tokens and
-    `LLMResult.cost()` is 0.0. _run_turn then settles 0.0 and the turn's hold
-    is dropped: the delivered, billed answer is recorded as FREE, and the cap
-    is silently inert against every such provider on the JSON path.
-
-    A zero is not evidence that nothing was spent, it is evidence that the cost
-    is unknown, so the estimate the gate held is charged instead -- the same
-    figure the streaming path's mid_stream_estimate uses -- and the stored
-    message cost is that same number, so the budget and the reported cost
-    cannot disagree."""
+    """A provider sending no usage yields a TRUTHY LLMResult with cost() 0.0; a zero is unknown, not free."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
         sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_generate(client, prompt, model, system_prompt=None):
-            # Exactly what generate_answer returns when the response carries no
-            # usage: a delivered answer whose cost() is 0.0.
             return chat_module.LLMResult(content="A fully delivered answer [1].", prompt_tokens=0, completion_tokens=0)
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
@@ -3339,9 +2893,7 @@ def test_api_json_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypat
             f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "Who invested in fintech?"}
         )
 
-        # An ordinary, complete turn: no disconnect, no failure.
         assert r.status_code == 200
-        # Charged, not released, and the stored cost is the figure charged.
         assert budget.writes == [("settle", 20_000)]
         assert budget.counter == 20_000
         assert budget.holds == {}
@@ -3352,10 +2904,7 @@ def test_api_json_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypat
 
 
 def test_run_turn_with_reported_usage_still_uses_the_real_cost(monkeypatch):
-    """The other side of that rule, on the non-streaming path: a provider that
-    DOES report usage must be charged its real cost, not the estimate.
-    Without this the previous test would also pass if every turn were blindly
-    charged the reserve."""
+    """A provider that DOES report usage must be charged its real cost, or the no-usage test would pass with every turn charged the reserve."""
     budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
     monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
 
@@ -3363,8 +2912,6 @@ def test_run_turn_with_reported_usage_still_uses_the_real_cost(monkeypatch):
         return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
     async def fake_answer_ranked(question, prompt, holds, system_prompt="", *, spend=None):
-        # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10, five
-        # times the $0.02 estimate -- the two must not be confused.
         return chat_module.LLMResult(content="A fully delivered answer [1].", prompt_tokens=100_000, completion_tokens=0)
 
     monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -3374,7 +2921,6 @@ def test_run_turn_with_reported_usage_still_uses_the_real_cost(monkeypatch):
 
     assert budget.writes == [("settle", 100_000)]
     assert budget.counter == 100_000
-    # The reported cost, and the figure handed back to be stored on the message.
     assert cost == pytest.approx(0.1)
 
 
@@ -3392,10 +2938,7 @@ def test_api_require_store_uninitialized_503(tmp_path):
 
 
 def test_api_send_message_too_long_422(tmp_path):
-    """An oversized message is refused at the model boundary, so the answer is
-    the standard 422 rather than a route's ad-hoc 400 (#350). The bound and the
-    accept-at-the-limit / store-nothing behaviour are covered in
-    test_chat_content_bound.py."""
+    """The bound itself is covered in test_chat_content_bound.py."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3409,8 +2952,6 @@ def test_api_send_message_too_long_422(tmp_path):
 
 
 def test_api_send_message_budget_exceeded_429(tmp_path, monkeypatch):
-    """send_message fails closed with 429 when the daily LLM budget is hit
-    (ERROR PATH — daily budget)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3429,15 +2970,6 @@ def test_api_send_message_budget_exceeded_429(tmp_path, monkeypatch):
 
 
 def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path, monkeypatch):
-    """One outage, two chat paths, ONE answer (#280).
-
-    Both turns run through the real retry loop against a provider that times
-    out on every request. The JSON turn must answer 503 and the SSE turn must
-    emit an `error` event carrying the identical payload, with neither path
-    storing a message. Before this, _run_turn swallowed the outage and returned
-    a fabricated "no answer" as HTTP 200, so the 503 branch was unreachable
-    dead code and any uptime check saw total success while chat was broken.
-    """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3458,8 +2990,6 @@ def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path,
         r = client.post(f"/api/chat/sessions/{json_sid}/messages", cookies=h, json={"content": "Who invested in fintech?"})
         assert r.status_code == 503
         assert r.json()["detail"] == expected
-        # No fabricated answer is stored, and the failed turn leaves no dangling
-        # user message behind.
         assert client.get(f"/api/chat/sessions/{json_sid}", cookies=h).json()["messages"] == []
 
         sse_sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
@@ -3469,7 +2999,6 @@ def test_api_total_llm_outage_is_503_and_the_sse_path_reports_the_same(tmp_path,
         assert json.loads(re.search(r"event: error\ndata: (.*)", body).group(1)) == expected
         assert client.get(f"/api/chat/sessions/{sse_sid}", cookies=h).json()["messages"] == []
 
-        # The outage cost money on both paths: 3 billed attempts x $0.02.
         assert llm.calls == 6
         assert budget.writes == [("settle", 60_000), ("settle", 60_000)]
         assert budget.counter == 120_000
@@ -3493,8 +3022,6 @@ def _fake_prepare_llm():
 
 
 def test_api_stream_dataviz_nudge_replaces_answer(tmp_path, monkeypatch):
-    """Streaming: an explicit chart ask without a block re-asks once and swaps in
-    the nudge answer, summing token usage (lines 1173-1176)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3532,8 +3059,6 @@ def test_api_stream_dataviz_nudge_replaces_answer(tmp_path, monkeypatch):
 
 
 def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
-    """Streaming: a failed dataviz nudge retry keeps the streamed answer instead
-    of erroring the turn (lines 1171-1172)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3557,7 +3082,7 @@ def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
 
         body = _stream_body(client, h, sid, "show me a chart of top deals")
         assert "streamed answer without a block [1]." in body
-        assert '"prompt_tokens":10' in body  # unchanged
+        assert '"prompt_tokens":10' in body
         assert "event: done" in body
         assert "event: error" not in body
     finally:
@@ -3566,9 +3091,6 @@ def test_api_stream_dataviz_nudge_failure_keeps_answer(tmp_path, monkeypatch):
 
 
 def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkeypatch):
-    """Streaming regression (#177): a dataviz nudge retry is a second billed
-    call that re-checks the cap; once the budget is gone the retry is skipped
-    and the already-streamed answer is served."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3589,8 +3111,7 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
                 completion_tokens=8,
             )
 
-        # The stream's own hold is granted; the nudge's second hold is refused,
-        # so the retry never starts.
+        # The stream's hold is granted; the nudge's second hold is refused.
         budget_calls = {"n": 0}
 
         async def exhausted_after_first_reserve(estimate_usd=0.0):
@@ -3613,9 +3134,9 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
         monkeypatch.setattr(chat_module, "release", release)
 
         body = _stream_body(client, h, sid, "show me a chart of top deals")
-        assert nudge_calls == []  # retry never billed
+        assert nudge_calls == []
         assert "streamed answer without a block [1]." in body
-        assert '"prompt_tokens":10' in body  # unchanged
+        assert '"prompt_tokens":10' in body
         assert "event: done" in body
         assert "event: error" not in body
     finally:
@@ -3624,11 +3145,6 @@ def test_api_stream_dataviz_nudge_skipped_when_budget_exhausted(tmp_path, monkey
 
 
 def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_path, monkeypatch):
-    """Streaming regression (#177, the ORDINARY single-turn case): the streamed
-    call's cost is recorded only at the end of the turn, so the guard must count
-    it. The recorded total is under the cap but the stream alone pushes the day
-    past it, so the retry is skipped and the streamed answer is served (no
-    error event)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3637,7 +3153,6 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "streamed answer without a block [1]."
             if usage_holder is not None:
-                # 1M prompt tokens == $1.00 with the pinned pricing.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=1_000_000, completion_tokens=0))
 
         nudge_calls = []
@@ -3653,13 +3168,7 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         async def noop(*args, **kwargs):
             return None
 
-        # $1.50 recorded + $1.00 streamed = $2.50 > $2.00 cap, while the
-        # outer pre-turn check still passes ($1.50 < $2.00).
         budget = _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=1.5)
-        # A call already in flight in THIS turn is holding $0.45. The stream's
-        # own gate still fits (1.50 + 0.45 + 0.05 = $2.00), but the nudge's
-        # second reserve does not (1.50 + 0.45 + 0.05 + 0.05 = $2.05 > cap), so
-        # the retry is refused while the already-streamed answer is served.
         budget.holds["h-inflight"] = 450_000
         budget.expiry["h-inflight"] = cost_budget_module._now_ts() + 900
         monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
@@ -3667,9 +3176,9 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
 
         body = _stream_body(client, h, sid, "show me a chart of top deals")
-        assert nudge_calls == []  # retry never billed
+        assert nudge_calls == []
         assert "streamed answer without a block [1]." in body
-        assert '"prompt_tokens":1000000' in body  # unchanged
+        assert '"prompt_tokens":1000000' in body
         assert "event: done" in body
         assert "event: error" not in body
     finally:
@@ -3678,8 +3187,6 @@ def test_api_stream_dataviz_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
 
 
 def test_api_stream_ranking_nudge_replaces_answer(tmp_path, monkeypatch):
-    """Streaming: a ranked-list refusal is re-asked once with the ranking nudge
-    (lines 1185-1188)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3712,8 +3219,6 @@ def test_api_stream_ranking_nudge_replaces_answer(tmp_path, monkeypatch):
 
 
 def test_api_stream_ranking_nudge_failure_keeps_answer(tmp_path, monkeypatch):
-    """Streaming: a failed ranking-nudge retry keeps the streamed refusal
-    (lines 1183-1184)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3746,9 +3251,6 @@ def test_api_stream_ranking_nudge_failure_keeps_answer(tmp_path, monkeypatch):
 
 
 def test_api_stream_ranking_nudge_skipped_when_budget_exhausted(tmp_path, monkeypatch):
-    """Streaming regression (#177): the ranking nudge is a second billed call,
-    so it re-checks the cap; once the budget is gone the retry is skipped and
-    the already-streamed refusal is served (no error event)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3765,8 +3267,7 @@ def test_api_stream_ranking_nudge_skipped_when_budget_exhausted(tmp_path, monkey
             nudge_calls.append(prompt)
             return chat_module.LLMResult(content="Top deal: Zepto [1].", prompt_tokens=20, completion_tokens=8)
 
-        # The stream's own hold is granted; the ranking nudge's second hold is
-        # refused, so the retry never starts.
+        # The stream's hold is granted; the ranking nudge's second hold is refused.
         budget_calls = {"n": 0}
 
         async def exhausted_after_first_reserve(estimate_usd=0.0):
@@ -3789,9 +3290,9 @@ def test_api_stream_ranking_nudge_skipped_when_budget_exhausted(tmp_path, monkey
         monkeypatch.setattr(chat_module, "release", release)
 
         body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
-        assert nudge_calls == []  # retry never billed
+        assert nudge_calls == []
         assert "I cannot generate a ranked list because amounts are missing." in body
-        assert '"prompt_tokens":10' in body  # unchanged
+        assert '"prompt_tokens":10' in body
         assert "event: done" in body
         assert "event: error" not in body
     finally:
@@ -3800,11 +3301,8 @@ def test_api_stream_ranking_nudge_skipped_when_budget_exhausted(tmp_path, monkey
 
 
 def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_path, monkeypatch):
-    """Streaming regression (#177, the ORDINARY single-turn case) for the ranking
-    nudge: the stream's cost is recorded only at the end of the turn, so the
-    guard must count it. The recorded total is under the cap but the stream alone
-    pushes the day past it, so the retry is skipped and the streamed refusal is
-    served (no error event)."""
+    """As above for the ranking nudge: the stream's cost is recorded only at the
+    turn's end, so the guard must count it."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3813,7 +3311,6 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
-                # 1M prompt tokens == $1.00 with the pinned pricing.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=1_000_000, completion_tokens=0))
 
         nudge_calls = []
@@ -3825,11 +3322,7 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         async def noop(*args, **kwargs):
             return None
 
-        # $1.50 recorded + $1.00 streamed = $2.50 > $2.00 cap, while the
-        # outer pre-turn check still passes ($1.50 < $2.00).
         budget = _pin_cost_accounting(monkeypatch, budget_usd=2.0, spend_usd=1.5)
-        # As above: the stream's gate fits, the ranking nudge's second reserve
-        # does not, so the refusal is served instead of an error event.
         budget.holds["h-inflight"] = 450_000
         budget.expiry["h-inflight"] = cost_budget_module._now_ts() + 900
         monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
@@ -3837,9 +3330,9 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
         monkeypatch.setattr(chat_module, "generate_answer", fake_generate)
 
         body = _stream_body(client, h, sid, "top 10 ipo deals in 2025")
-        assert nudge_calls == []  # retry never billed
+        assert nudge_calls == []
         assert "I cannot generate a ranked list because amounts are missing." in body
-        assert '"prompt_tokens":1000000' in body  # unchanged
+        assert '"prompt_tokens":1000000' in body
         assert "event: done" in body
         assert "event: error" not in body
     finally:
@@ -3848,14 +3341,7 @@ def test_api_stream_ranking_nudge_skipped_when_turn_spend_exhausts_budget(tmp_pa
 
 
 def test_api_stream_records_summed_turn_cost_exactly_once(tmp_path, monkeypatch):
-    """Streaming counterpart of the non-streaming case, and the one test that
-    drives the REAL cost_budget module through chat.py's whole turn path:
-    real reserve -> billed stream -> real settle, against a contract-level fake
-    store. It is what catches a wrong-arity or wrong-semantics call in chat.py
-    (settling the wrong amount, or reserving and never settling).
-
-    The stream plus the dataviz and ranking nudges are ONE turn: the day counter
-    is written exactly once, carrying all three calls' summed cost."""
+    """The only test driving the REAL cost_budget module through chat.py's whole turn path, so it catches a wrong-arity or wrong-semantics call."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3870,7 +3356,6 @@ def test_api_stream_records_summed_turn_cost_exactly_once(tmp_path, monkeypatch)
 
         async def fake_generate(client, prompt, model, system_prompt=None):
             nudge_calls.append(prompt)
-            # 200K for the dataviz nudge, 300K for the ranking nudge.
             prompt_tokens = 200_000 if len(nudge_calls) == 1 else 300_000
             return chat_module.LLMResult(
                 content="I cannot be generated [1].", prompt_tokens=prompt_tokens, completion_tokens=0
@@ -3883,14 +3368,12 @@ def test_api_stream_records_summed_turn_cost_exactly_once(tmp_path, monkeypatch)
 
         body = _stream_body(client, h, sid, "show me a chart of top 10 ipo deals in 2025")
 
-        assert len(nudge_calls) == 2  # both nudges billed
-        # The COUNTER is written once for the turn; the three reserves only
-        # touched the holds hash, so they are not counter writes.
+        assert len(nudge_calls) == 2
+        # The three reserves only touched the holds hash, so they are not counter writes.
         assert [mode for mode, _ in budget.writes] == ["settle"]
-        # 100K streamed + 200K + 300K = 600K tokens @ $1/1M == 600_000 micro-USD.
         assert budget.writes[0][1] == 600_000
         assert budget.counter == 600_000
-        assert budget.holds == {}  # stream hold + both nudge holds discharged
+        assert budget.holds == {}
         assert '"prompt_tokens":600000' in body
         assert "event: done" in body
         assert "event: error" not in body
@@ -3900,8 +3383,6 @@ def test_api_stream_records_summed_turn_cost_exactly_once(tmp_path, monkeypatch)
 
 
 def test_api_stream_llm_unavailable_sse(tmp_path, monkeypatch):
-    """Streaming: an LLMUnavailableError mid-stream yields an error SSE event
-    (line 1213) instead of a done event (ERROR PATH — LLM retry exhaustion)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3928,8 +3409,6 @@ def test_api_stream_llm_unavailable_sse(tmp_path, monkeypatch):
 
 
 def test_api_stream_generic_error_sse(tmp_path, monkeypatch):
-    """Streaming: an unexpected exception yields a generic error SSE event
-    (lines 1216-1218), never a 500 to the client."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -3956,8 +3435,6 @@ def test_api_stream_generic_error_sse(tmp_path, monkeypatch):
 
 
 def test_retention_loop_purges_and_swallows_errors(monkeypatch, tmp_path):
-    """retention_loop purges expired conversations on each tick and swallows
-    per-tick errors (lines 1225-1233)."""
     store = _store(tmp_path)
     chat_module.store = store
     try:
@@ -3987,28 +3464,16 @@ def test_retention_loop_purges_and_swallows_errors(monkeypatch, tmp_path):
 
         with pytest.raises(asyncio.CancelledError):
             _run(chat_module.retention_loop())
-        assert len(attempts) == 2  # first raised, second succeeded
+        assert len(attempts) == 2
         assert sleeps == [chat_module.config.CHAT_PURGE_INTERVAL_SECONDS] * 2
-        assert _run(store.get_session(a.id, USER_A)) is None  # purged on 2nd tick
+        assert _run(store.get_session(a.id, USER_A)) is None
     finally:
         chat_module.store = None
         _run(store.close())
 
 
-# ---------------------------------------------------------------------------
-# Issue #255: the abort/persist rule, char-bounded history, and the shared
-# dataviz fence grammar.
-# ---------------------------------------------------------------------------
-
-
 def _disconnect_after(monkeypatch, n_deltas):
-    """Make the client disappear once `n_deltas` delta events have been emitted.
-
-    `streamed` in chat.py counts exactly the deltas it has yielded, so a client
-    that drops after N deltas is the "deltas already sent" case; dropping before
-    any is the clean-rollback case. Returns a counter of how many deltas the
-    turn actually emitted, so a test can assert which side of the rule it hit.
-    """
+    """`streamed` in chat.py counts the deltas it has yielded, so `n_deltas` selects which side of the abort rule a test hits."""
     state = {"deltas": 0}
 
     # Patched onto the class, so the function is bound and receives `self`.
@@ -4029,14 +3494,9 @@ def _disconnect_after(monkeypatch, n_deltas):
 
 
 def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
-    """The rule: once any delta has been streamed, the turn is PERSISTED, never
-    deleted.
-
-    The old code erased the user message whenever the client disconnected, even
-    after the client had already rendered the answer, so the server's history
-    and the client's screen disagreed (#255). Here the client drops after the
-    first delta, and the store must still hold the user message plus an
-    assistant message flagged aborted."""
+    """Once any delta has been streamed the turn is PERSISTED, never deleted:
+    erasing it after the client already rendered the answer would leave the
+    server's history and the client's screen disagreeing."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4060,7 +3520,6 @@ def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
 
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         roles = [m["role"] for m in msgs]
-        # The user message survives: the client already saw its answer.
         assert roles == ["user", "assistant"]
         assistant = msgs[1]
         assert assistant["aborted"] is True
@@ -4073,9 +3532,6 @@ def test_stream_abort_after_deltas_persists_the_turn(tmp_path, monkeypatch):
 
 
 def test_stream_abort_before_any_delta_deletes_user_message(tmp_path, monkeypatch):
-    """The other half of the same rule: with nothing streamed yet there is
-    nothing the client saw, so the dangling user message is rolled back and no
-    assistant row is written."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4089,7 +3545,6 @@ def test_stream_abort_before_any_delta_deletes_user_message(tmp_path, monkeypatc
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=50, completion_tokens=10))
 
-        # Disconnects immediately: the stream is never entered.
         _disconnect_after(monkeypatch, 0)
         _pin_budget_disabled(monkeypatch)
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -4105,10 +3560,6 @@ def test_stream_abort_before_any_delta_deletes_user_message(tmp_path, monkeypatc
 
 
 def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypatch):
-    """A mid-stream failure AFTER deltas were sent must persist the truncated
-    turn even when the client is already gone — the bytes were on the wire, so
-    deleting the turn would recreate the history divergence (#255). The row is
-    flagged aborted."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4121,8 +3572,6 @@ def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypa
             yield "half an answer"
             raise RuntimeError("provider dropped the connection")
 
-        # Gone as soon as the first delta is out, which is also when the
-        # failure hits.
         _disconnect_after(monkeypatch, 1)
         _pin_budget_disabled(monkeypatch)
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
@@ -4141,19 +3590,7 @@ def test_stream_mid_failure_with_gone_client_persists_aborted(tmp_path, monkeypa
 
 
 def _delete_mid_turn_scenario(tmp_path, monkeypatch, delete_after_deltas):
-    """Drive an SSE turn whose conversation is deleted while it is in flight.
-
-    `delete_after_deltas` picks the side of the abort rule that matters: False
-    deletes before any delta is streamed, True deletes once the client is
-    already showing text. Both must end the same way -- a closed stream
-    carrying an `error` event -- because the conversation is gone and there is
-    nothing left to roll back or persist (#358).
-
-    Returns the raw response body, which the caller inspects: the assertion
-    under test is what the CLIENT sees, so a body that cannot even be collected
-    (the pre-fix behaviour, where the escaping 404 aborted the response) fails
-    the test by raising out of _stream_body.
-    """
+    """Returns the raw body: the assertion is what the client sees, so an uncollectable body must fail by raising out of _stream_body."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4185,32 +3622,14 @@ def _delete_mid_turn_scenario(tmp_path, monkeypatch, delete_after_deltas):
 
 @pytest.mark.parametrize("delete_after_deltas", [False, True], ids=["before_any_delta", "after_first_delta"])
 def test_stream_conversation_deleted_mid_turn_closes_with_error_event(tmp_path, monkeypatch, delete_after_deltas):
-    """Deleting the conversation mid-turn must not break the stream (#358).
-
-    The turn's final write is the assistant append, and once the conversation
-    is gone that write raises 404. That failure lands in the catch-all handler,
-    which called fail_turn() -- and fail_turn() re-entered the very write that
-    had just failed and re-raised, so the exception escaped the generator and
-    Starlette's task group surfaced it as an ExceptionGroup. Headers were
-    already sent, so the client just saw the response break with no terminal
-    event at all.
-
-    A deleted conversation is a non-event: there is no row to roll back and
-    nowhere to store the partial turn, so the stream must close the way every
-    other turn failure does -- with a terminal `error` event."""
     body = _delete_mid_turn_scenario(tmp_path, monkeypatch, delete_after_deltas)
 
     assert "event: start" in body
     assert "event: error" in body
-    # A deleted conversation can never yield a completed turn, and the bytes
-    # already on the wire must not be reported as a stored answer.
     assert "event: done" not in body
 
 
 def test_send_message_disconnect_rolls_back_without_assistant(tmp_path, monkeypatch):
-    """The non-stream path never checked the client at all. A JSON client
-    receives nothing until the turn is persisted, so a disconnect is a clean
-    rollback: no assistant message, and the user message is removed."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4227,7 +3646,6 @@ def test_send_message_disconnect_rolls_back_without_assistant(tmp_path, monkeypa
         monkeypatch.setattr(chat_module.Request, "is_disconnected", always_gone)
 
         r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
-        # Not a success, and certainly not a 200 TurnOut.
         assert r.status_code >= 400
         assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
     finally:
@@ -4236,10 +3654,6 @@ def test_send_message_disconnect_rolls_back_without_assistant(tmp_path, monkeypa
 
 
 def test_send_message_budget_unavailable_is_503_not_empty_answer(tmp_path, monkeypatch):
-    """A BudgetUnavailable at the FIRST gate must fail closed with an explicit
-    503. Treating an unreadable counter as "budget fine" is exactly the
-    fail-open hole #255 removes, and returning the retrieval fallback answer
-    instead would hide it behind a plausible 200."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4253,7 +3667,6 @@ def test_send_message_budget_unavailable_is_503_not_empty_answer(tmp_path, monke
         r = client.post(f"/api/chat/sessions/{sid}/messages", cookies=h, json={"content": "top deals"})
         assert r.status_code == 503
         assert "budget" in json.dumps(r.json()).lower()
-        # The dangling user message is rolled back, not left behind.
         assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
     finally:
         _run(auth_store.close())
@@ -4261,8 +3674,6 @@ def test_send_message_budget_unavailable_is_503_not_empty_answer(tmp_path, monke
 
 
 def test_api_stream_budget_unavailable_is_error_event(tmp_path, monkeypatch):
-    """Same rule on the SSE path: an unreadable counter at the first gate is an
-    explicit error event, never a silently served answer."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4288,9 +3699,6 @@ def test_api_stream_budget_unavailable_is_error_event(tmp_path, monkeypatch):
 
 
 def test_nudge_unreachable_counter_degrades_without_billing(monkeypatch, caplog):
-    """The OPTIONAL nudge path may degrade to the answer already produced, but it
-    must admit no further spend: an unreachable counter skips the billed call
-    and is logged."""
     calls = []
 
     async def fake_generate(client, prompt, model, system_prompt=None):
@@ -4307,7 +3715,7 @@ def test_nudge_unreachable_counter_degrades_without_billing(monkeypatch, caplog)
     with caplog.at_level(logging.WARNING, logger="chat"):
         result = _run(chat_module._answer_with_dataviz("show me a chart of top 5 deals", "PROMPT", []))
 
-    assert len(calls) == 1  # the billed retry never started
+    assert len(calls) == 1
     assert result.content == "No chart here [1]."
     assert "unavailable" in caplog.text.lower()
 
@@ -4317,7 +3725,6 @@ def _msg(role, content):
 
 
 def test_trim_history_drops_oldest_until_within_budget():
-    """Oldest-first, keeping the newest messages that fit, never splitting one."""
     history = [_msg("user", "a" * 40), _msg("assistant", "b" * 40), _msg("user", "c" * 40)]
 
     kept = chat_module._trim_history(history, 80)
@@ -4326,13 +3733,10 @@ def test_trim_history_drops_oldest_until_within_budget():
     kept = chat_module._trim_history(history, 40)
     assert [m.content for m in kept] == ["c" * 40]
 
-    # Fits entirely -> untouched.
     assert chat_module._trim_history(history, 10_000) == history
 
 
 def test_trim_history_keeps_oversized_newest_message():
-    """A single message larger than the cap is kept on its own: dropping it
-    would leave the prompt with no context at all."""
     history = [_msg("user", "a" * 100), _msg("assistant", "b" * 5000)]
     kept = chat_module._trim_history(history, 100)
     assert [m.content for m in kept] == ["b" * 5000]
@@ -4345,8 +3749,6 @@ def test_trim_history_zero_disables_the_cap():
 
 
 def test_start_turn_applies_the_char_cap(tmp_path, monkeypatch):
-    """_start_turn bounds history by BOTH knobs: turns in the query, characters
-    in what actually reaches the prompt."""
     store = _store(tmp_path)
     try:
         sid = _run(store.create_session(USER_A)).id
@@ -4358,60 +3760,49 @@ def test_start_turn_applies_the_char_cap(tmp_path, monkeypatch):
 
         _user_msg, history, _session = _run(chat_module._start_turn(store, sid, USER_A, "next question"))
 
-        # 6 x 5000 = 30000 chars of history, trimmed to at most 12000 + the
-        # newly appended question. The cap really bound the prompt.
         assert sum(len(m.content) for m in history) <= 12_000 + len("next question")
-        assert len(history) < 7  # some were dropped
+        assert len(history) < 7
     finally:
         _run(store.close())
 
 
 def test_dataviz_unclosed_fence_never_leaks_json():
-    """A fence the model never finished must not render its raw JSON. Both the
-    chart-intent and the plain branch truncate from the marker to the end."""
     unclosed = 'Here is the data:\n\n```dataviz\n{"columns": ["A"], "rows": [[1, 2'
     for question in ("show me a chart of top deals", "who invested in Ola Electric?"):
         out = chat_module._finalize_answer(unclosed, question)
         assert '{"' not in out
         assert "```dataviz" not in out
-        assert "Here is the data:" in out  # the prose survives
+        assert "Here is the data:" in out
 
     assert '{"' not in chat_module._sanitize_dataviz(unclosed)
     assert '{"' not in chat_module._append_nudge("Answer [1].", unclosed)
 
 
 def test_dataviz_newline_optional_fence_is_handled():
-    """A fence written without a newline after the tag is the same grammar the
-    frontend uses. The old backend pattern required a newline, so such a block
-    was left in the stored answer while the UI had already stripped it (#255)."""
     body = '{"columns": ["Deal", "Value"], "rows": [["Zepto", 1.0]], "value_column": 1}'
     no_newline = f"Prose [1].\n\n```dataviz{body}```"
     assert chat_module.parse_dataviz(f"```dataviz{body}```") is not None
     out = chat_module._finalize_answer(no_newline, "show me a table of top deals")
-    assert "```dataviz" in out  # recognised and preserved, not left as raw text
+    assert "```dataviz" in out
     assert "Prose [1]." in out
 
 
 def test_dataviz_valid_fence_survives_the_unclosed_rule():
-    """The unclosed-fence pass must not truncate at a marker inside a VALID
-    closed fence, or every chart would lose its block."""
     valid = (
         'Prose [1].\n\n```dataviz\n'
         '{"columns": ["Deal", "Value"], "rows": [["Zepto", 1.0]], "value_column": 1}\n```'
     )
     assert chat_module._sanitize_dataviz(valid) == valid
-    # _finalize_answer may legitimately REWRITE a valid block (it pins the view
-    # the question asked for), so the invariant under test is that the block
-    # SURVIVED the unclosed pass -- not that the text is byte-identical.
+    # _finalize_answer may legitimately REWRITE a valid block (it pins the view), so
+    # the invariant is that the block SURVIVED, not that the text is byte-identical.
     finalized = chat_module._finalize_answer(valid, "show me a table of top deals")
     assert finalized.startswith("Prose [1].")
     assert finalized.rstrip().endswith("```")
     assert chat_module.parse_dataviz(finalized) is not None
 
 
-# The dataviz grammar (fence regex, unclosed-fence truncation and the whole
-# block validator) lives in this ONE module, so the backend can execute the
-# shipped frontend rules under node instead of re-typing them (#267).
+# The dataviz grammar lives in this ONE module, so the backend can execute the shipped
+# frontend rules under node instead of re-typing them.
 _DATAVIZ_CONTRACT_TS = (
     pathlib.Path(__file__).resolve().parents[2]
     / "frontend"
@@ -4422,11 +3813,8 @@ _DATAVIZ_CONTRACT_TS = (
 
 
 def test_fence_src_matches_python_fence_pattern():
-    """The frontend and the backend must use the SAME grammar string, so a fence
-    the UI renders is the fence the server finalized (#255)."""
     raw = re.search(r"const FENCE_SRC = '([^']*)'", _DATAVIZ_CONTRACT_TS.read_text()).group(1)
-    # The literal is single-quoted TS, where \S is written \\S; unescape it the
-    # way JS would before comparing to the Python source string.
+    # Single-quoted TS, so \S is written \\S: unescape it the way JS would first.
     js_runtime = json.loads('"' + raw + '"')
     assert js_runtime == chat_module.DATAVIZ_FENCE_PATTERN
 
@@ -4440,11 +3828,9 @@ _FENCE_FIXTURES = {
 
 
 def _node_strip_open_fence(fixtures):
-    """Run the TSX's own regex + truncation rule under node.
-
-    `stripOpenFence` and `FENCE_SRC` are read verbatim out of the frontend
-    contract module so this exercises the shipped frontend rule, not a re-typed
-    approximation."""
+    """Run the TSX's own regex + truncation rule under node. Both are read verbatim
+    out of the frontend contract module, so this is the shipped rule, not a
+    re-typed approximation."""
     tsx = _DATAVIZ_CONTRACT_TS.read_text()
     fence_src = re.search(r"const FENCE_SRC = '([^']*)'", tsx).group(1)
     strip = re.search(r"(function stripOpenFence\(md: string\): string \{.*?\n\})", tsx, re.DOTALL).group(1)
@@ -4478,15 +3864,10 @@ console.log(JSON.stringify(out))
 
 
 def test_fence_parity_between_frontend_and_backend_behaviour():
-    """Cross-language parity, checked BEHAVIOURALLY.
-
-    The repo has no JS test runner, but `node -e` needs no node_modules, so the
-    TSX's own FENCE_SRC and stripOpenFence are executed under node and their
-    match spans, captures and resulting text are compared with Python's.
-
-    Comparing rendered text rather than just match/null matters: the `unclosed`
-    fixture matches NOTHING on both sides, so a match-only comparison would
-    assert nothing about the acceptance item that raw JSON must not leak."""
+    """Cross-language parity, checked BEHAVIOURALLY: `node -e` needs no
+    node_modules, so the TSX's own FENCE_SRC and stripOpenFence run under node and
+    their spans, captures and rendered text are compared with Python's. Rendered
+    text matters because the `unclosed` fixture matches NOTHING on both sides."""
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not on PATH; cannot run the frontend fence rule")
@@ -4501,7 +3882,6 @@ def test_fence_parity_between_frontend_and_backend_behaviour():
             assert list(py_match.span()) == js[name]["span"], name
             assert py_match.group(1) == js[name]["captured"], name
 
-    # The unclosed case: neither side renders the JSON, both keep the prose.
     unclosed = _FENCE_FIXTURES["unclosed"]
     js_rendered = js["unclosed"]["rendered"]
     py_rendered = chat_module._finalize_answer(unclosed, "show me a chart of top deals")
@@ -4513,8 +3893,6 @@ def test_fence_parity_between_frontend_and_backend_behaviour():
 
 
 def test_connect_migrates_legacy_db_without_aborted_column(tmp_path):
-    """A DB created before the abort flag existed is migrated by connect(), so
-    the abort rule works on conversations that predate it."""
     db_path = tmp_path / "chat.db"
     _legacy_db(
         db_path,
@@ -4533,7 +3911,6 @@ def test_connect_migrates_legacy_db_without_aborted_column(tmp_path):
     try:
         cols = {c["name"] for c in _run(store._db.execute_fetchall("PRAGMA table_info(messages)"))}
         assert "aborted" in cols
-        # Reconnecting is idempotent: the column already exists.
         _run(store.close())
         _run(store.connect())
         cols2 = {c["name"] for c in _run(store._db.execute_fetchall("PRAGMA table_info(messages)"))}
@@ -4543,8 +3920,6 @@ def test_connect_migrates_legacy_db_without_aborted_column(tmp_path):
 
 
 def test_aborted_flag_round_trips_through_the_store(tmp_path):
-    """aborted is PERSISTED, not just carried in memory: a read back from SQLite
-    reports it, and an ordinary message defaults to False."""
     store = _store(tmp_path)
     try:
         sid = _run(store.create_session(USER_A)).id
@@ -4564,26 +3939,7 @@ def test_aborted_flag_round_trips_through_the_store(tmp_path):
 
 
 def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
-    """A disconnect between the gate reserve and the first delta must CHARGE
-    the gate hold, not release it (#255).
-
-    The loop's disconnect check runs before `streamed = True`, so the rollback
-    branch is taken and the user message is deleted: nothing reached the
-    client, so that is right. What was wrong was the MONEY. The provider has
-    already billed the call by the time it emits a piece, and releasing the
-    hold is the one option that guarantees free spend -- letting a hold lapse
-    is precisely the mechanism that CHARGES a crashed call, so the alternative
-    to releasing is never "no cost".
-
-    This reverses a previously test-pinned behaviour that asserted the hold was
-    released. Its reasoning weighed only that a live hold would sit in the
-    store for the full COST_RESERVATION_TTL_SECONDS, billing the day against "a
-    call whose cost was never recorded" -- true, and precisely why the call is
-    not free. The hold is settled at the estimate it was taken at, which is the
-    same figure the sweeper would have charged had it been left to lapse.
-
-    stream_answer yields one piece, then the client is reported gone at the
-    in-loop check — which runs BEFORE `streamed = True`."""
+    """The provider bills the call by the time it emits a piece, so letting the gate hold lapse would charge the estimate anyway."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4595,21 +3951,16 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
         entered = {"v": False}
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
-            # The LLM call has now happened and been billed; the loop's
-            # disconnect check runs immediately after, with `streamed` still
-            # False because the piece has not been yielded yet.
+            # The call has been billed; the disconnect check runs next, with `streamed`
+            # still False because the piece has not been yielded.
             entered["v"] = True
             yield "one piece nobody will see"
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
 
-        # Connected for every check up to and including the budget gate, gone
-        # from the first check that follows the billed call.
         async def is_disconnected(self):
             return entered["v"]
 
-        # Pinned so the assertion below reads as "charged at the estimate this
-        # call reserved" rather than tracking an unrelated config default.
         monkeypatch.setattr(chat_module.config, "LLM_CALL_RESERVE_USD", 0.02)
 
         monkeypatch.setattr(chat_module.Request, "is_disconnected", is_disconnected)
@@ -4618,15 +3969,10 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
 
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
-        # The turn really did reach the billed call, so the gate hold existed.
         assert entered["v"] is True
-        # It aborted on the disconnect rule, NOT via the catch-all error
-        # handler: an error would emit an 'error' event instead.
+        # The disconnect rule, not the catch-all: an error would emit an 'error' event.
         assert "event: error" not in body
-        # Rollback branch: nothing reached the client, so the user message is gone.
         assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
-        # ...and the gate hold is NOT refunded: the call was made and billed, so
-        # the money is settled, not handed back.
         assert budget.holds == {}
         assert budget.writes == [("settle", 20_000)]  # the $0.02 estimate, charged once
         assert budget.counter == 20_000
@@ -4636,15 +3982,7 @@ def test_stream_abort_in_gate_window_charges_the_hold(tmp_path, monkeypatch):
 
 
 def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch):
-    """A mid-stream failure AFTER deltas were sent is a billed call, not a free
-    one (#255).
-
-    `stream_answer` only reports usage once the whole response has arrived, so
-    here usage_holder is empty -- but the provider generated and billed the
-    tokens that were already on the wire. The turn used to release the gate
-    hold on the strength of that empty usage_holder, which is a different
-    question from the one that matters. The turn is still persisted with its
-    truncation marker (the ONE rule); it is simply also charged."""
+    """usage_holder is empty because the response never completed, but the provider already billed the tokens on the wire."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4666,11 +4004,9 @@ def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch)
         _stream_body(client, h, sid, "Who invested in fintech?")
 
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
-        # The ONE rule still holds: deltas were on the wire, so the turn persists.
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert "half an answer" in msgs[1]["content"]
         assert "[answer truncated]" in msgs[1]["content"]
-        # ...and the billed call is charged at the estimate it held, not refunded.
         assert budget.writes == [("settle", 20_000)]
         assert budget.counter == 20_000
         assert budget.holds == {}
@@ -4680,15 +4016,6 @@ def test_stream_mid_failure_after_deltas_charges_the_hold(tmp_path, monkeypatch)
 
 
 def test_stream_failure_before_any_delta_charges_every_attempt(tmp_path, monkeypatch):
-    """The other side of the gate-window rule (#255), corrected by #280: a turn
-    that made a call and produced NO text was still billed for it.
-
-    The provider is sent one request per retry and charges the prompt of each,
-    so the turn's hold is settled for all three attempts instead of being
-    released back to the cap -- releasing is what makes a billed outage free
-    spend. The turn still rolls back cleanly, because no answer was ever
-    produced: nothing is stored, and the client is told with an error event.
-    """
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4707,7 +4034,6 @@ def test_stream_failure_before_any_delta_charges_every_attempt(tmp_path, monkeyp
         assert "LLM temporarily unavailable" in body
         assert client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"] == []
         assert llm.calls == 3  # LLM_MAX_RETRIES + 1 requests, every one billed
-        # $0.02 held per call, settled once for the whole failed call.
         assert budget.writes == [("settle", 60_000)]
         assert budget.counter == 60_000
         assert budget.holds == {}
@@ -4717,19 +4043,7 @@ def test_stream_failure_before_any_delta_charges_every_attempt(tmp_path, monkeyp
 
 
 def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, monkeypatch):
-    """A Redis blip while recording the cost of a turn whose answer is ALREADY
-    on the wire must not rewrite that answer (#255).
-
-    The settle is the last thing the completed path does, after the final
-    disconnect check, so a BudgetUnavailable here used to reach the handler,
-    persist the turn through fail_turn() as `<answer>\n\n[answer truncated]`
-    with aborted=True, and emit `error` instead of `done` -- while the client
-    held the complete answer. That is the exact client/server divergence this
-    issue removed, reintroduced through the accounting path, and it is also a
-    regression: the pre-fix cost recording was best-effort and never raised.
-
-    Failing closed here prevents no spend either -- the hold stays live and the
-    sweep charges it -- so it could only destroy a delivered answer."""
+    """The settle is the last step, so failing closed could only destroy an already-delivered answer and prevents no spend either."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4754,8 +4068,6 @@ def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, m
 
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
-        # The turn completed normally: the failure was in the accounting, not
-        # in the answer the client already received.
         assert "event: done" in body
         assert "event: error" not in body
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
@@ -4769,8 +4081,6 @@ def test_settle_failure_after_a_delivered_stream_does_not_rewrite_it(tmp_path, m
 
 
 def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypatch):
-    """The same defect on the non-stream path: a 503 plus deletion of the user
-    message for an answer the LLM had already produced and been billed for."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4802,12 +4112,7 @@ def test_settle_failure_after_a_billed_call_keeps_the_answer(tmp_path, monkeypat
 
 
 class _DeadBudgetRedis:
-    """A spend counter that cannot be reached at all.
-
-    Every attempt to run a script on it raises, so a test can assert that a
-    turn never consults the store -- which is what the documented cap opt-out
-    (`LLM_DAILY_BUDGET_USD <= 0`, "a deliberate opt-out for deployments that
-    meter spend elsewhere") has to mean if it is to mean anything (#255)."""
+    """A counter that cannot be reached, so a test can assert a turn never consults it -- which is what the cap opt-out has to mean."""
 
     def __init__(self):
         self.touched = 0
@@ -4818,8 +4123,7 @@ class _DeadBudgetRedis:
 
 
 def _pin_budget_disabled_with_dead_store(monkeypatch):
-    """The cap switched off AND its counter unreachable -- the exact
-    combination that used to 503 a chat for a deployment that opted out."""
+    """The cap off AND its counter unreachable -- the combination that must not 503 a chat for a deployment that opted out."""
     dead = _DeadBudgetRedis()
     monkeypatch.setattr(cost_budget_module, "_BUDGET_SCRIPT", None)
     monkeypatch.setattr(cost_budget_module, "_client", lambda: dead)
@@ -4828,13 +4132,7 @@ def _pin_budget_disabled_with_dead_store(monkeypatch):
 
 
 def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
-    """With the cap switched off, a dead spend counter must not affect chat at
-    all (#255). `reserve()` returns "" without touching the store in that mode,
-    but the turn's settle used to run anyway -- and with an empty hold list and
-    a non-zero amount it deliberately does not return early, so a Redis outage
-    503'd the turn and deleted the user message for a deployment that never
-    intended to consult a counter, AFTER the LLM call had been made and
-    billed."""
+    """An empty hold list with a non-zero amount deliberately does not return early, so settle really reaches the store."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4856,7 +4154,6 @@ def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
         assert r.json()["assistant"]["content"] == "An unmetered answer [1]."
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert [m["role"] for m in msgs] == ["user", "assistant"]
-        # Opting out means opting out: not one command reached the counter.
         assert dead.touched == 0
     finally:
         _run(auth_store.close())
@@ -4864,9 +4161,6 @@ def test_disabled_cap_never_consults_the_store(tmp_path, monkeypatch):
 
 
 def test_disabled_cap_never_consults_the_store_on_the_stream_path(tmp_path, monkeypatch):
-    """The same opt-out on the SSE path: `finish_holds` discharged a
-    `charged_usd > 0` turn against an empty hold list, so a dead counter turned
-    a completed answer into an `error` event (#255)."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4897,14 +4191,6 @@ def test_disabled_cap_never_consults_the_store_on_the_stream_path(tmp_path, monk
 
 
 def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypatch):
-    """A disconnect at a POST-stream check must be charged for the finished
-    call (#255).
-
-    Both nudge gates re-check the client after the stream has completed and its
-    usage is known, so a client that drops there produced a fully billed turn.
-    Those two checks passed tokens but no cost, which sent the abort down the
-    persist branch with cost 0.0: the turn was stored as though it were free
-    and its hold RELEASED, so the money was handed back instead of recorded."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -4914,16 +4200,12 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
             return chat_module.PreparedTurn(answer="PROMPT", sources=[], note=None, needs_llm=True)
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
-            # No dataviz block, so the chart-intent nudge gate re-checks the
-            # client after the stream has finished.
+            # No dataviz block, so the chart-intent nudge gate re-checks the client after the stream has finished.
             yield "No chart here [1]."
             if usage_holder is not None:
-                # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
-        # Gone as soon as the single delta is out: connected through the
-        # stream, disconnected at the post-stream check that follows it.
         _disconnect_after(monkeypatch, 1)
         monkeypatch.setattr(chat_module, "_prepare_turn", fake_prepare)
         monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
@@ -4932,11 +4214,9 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
 
         assert "event: error" not in body
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
-        # Deltas reached the client, so the turn is persisted and flagged.
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["aborted"] is True
         assert "No chart here" in msgs[1]["content"]
-        # The finished call is billed, exactly once, and not released.
         assert msgs[1]["cost"] == pytest.approx(0.1)
         assert budget.writes == [("settle", 100_000)]
         assert budget.counter == 100_000
@@ -4947,28 +4227,18 @@ def test_disconnect_after_a_completed_stream_is_still_charged(tmp_path, monkeypa
 
 
 def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkeypatch):
-    """The SECOND post-stream disconnect check, which is a different call site
-    from the dataviz one and needs its own coverage (#255).
-
-    A ranked-list question whose streamed answer is a refusal reaches the
-    ranking nudge gate after the stream has completed. A client that drops
-    there produced a fully billed answer, and it must be charged for it rather
-    than stored at cost 0.0 with its hold released."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
         sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
-            # A refusal, so the RANKING nudge gate is the post-stream check that
-            # runs -- the dataviz gate is skipped because there is no chart ask.
+            # A refusal, so the ranking gate is the post-stream check that runs.
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
-        # Gone as soon as the single delta is out: disconnected at the
-        # post-stream check that follows it.
         _disconnect_after(monkeypatch, 1)
         monkeypatch.setattr(chat_module, "_prepare_turn", _fake_prepare_llm())
         monkeypatch.setattr(chat_module, "stream_answer", fake_stream)
@@ -4989,35 +4259,17 @@ def test_disconnect_at_the_ranking_nudge_check_is_still_charged(tmp_path, monkey
 
 
 def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tmp_path, monkeypatch):
-    """A failure raised OUTSIDE the stream loop must still CHARGE the turn
-    (#255) -- this is the `fail_turn` sibling of the mid-stream-failure path.
-
-    A ranked-list question whose answer is a refusal reaches the ranking nudge
-    gate after the stream completed; a nudge that raises a non-LLM error lands
-    in `fail_turn` with `streamed` True. Passing a flat 0.0 there would release
-    the gate hold for an answer already on the wire and already billed.
-
-    `stream_answer` fills usage_holder whenever a stream completes, so this
-    branch always has the real cost; the assertion pins that it is charged and
-    not released. (The `else` arm on that line is defence in depth for a
-    backend that reports no usage at all, and is deliberately not claimed as
-    covered here -- it cannot be reached through `stream_answer`.)"""
+    """fail_turn with `streamed` True would release the gate hold for an answer already on the wire and already billed."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
         sid = client.post("/api/chat/sessions", cookies=h).json()["id"]
 
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
-            # A ranking refusal, so the turn reaches the ranking nudge gate
-            # after the stream; the nudge below then raises, which lands the
-            # turn in fail_turn with its answer already delivered.
+            # A ranking refusal reaches the nudge gate after the stream; the nudge then raises into fail_turn.
             yield "I cannot generate a ranked list because amounts are missing."
             if usage_holder is not None:
-                # Exactly what stream_answer does when a provider sends no
-                # usage chunk: a TRUTHY LLMResult carrying ZERO tokens. Its
-                # cost is 0.0, so anything testing `usage` for truthiness
-                # would settle 0.0 -- and finish_holds(0.0) RELEASES the hold,
-                # making a delivered, billed call free.
+                # A TRUTHY LLMResult with ZERO tokens, whose cost 0.0 would make finish_holds release the hold.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=0, completion_tokens=0))
 
         async def exploding_nudge(client, prompt, model):
@@ -5033,12 +4285,9 @@ def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tm
 
         assert "event: error" in body
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
-        # Deltas reached the client, so the ONE rule persists the turn.
         assert [m["role"] for m in msgs] == ["user", "assistant"]
         assert msgs[1]["aborted"] is True
         assert "I cannot generate a ranked list" in msgs[1]["content"]
-        # ...and the billed call is CHARGED at the estimate it held, because a
-        # zero-token usage report means the cost is unknown, not zero.
         assert budget.writes == [("settle", 20_000)]
         assert budget.counter == 20_000
         assert budget.holds == {}
@@ -5048,19 +4297,7 @@ def test_fail_turn_after_deltas_charges_the_estimate_when_usage_is_unreported(tm
 
 
 def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypatch):
-    """The SUCCESS path must charge too, and this is where the trap hides (#255).
-
-    `stream_answer` fills usage_holder whenever a stream completes, but a
-    provider that sends no usage chunk produces an LLMResult with zero tokens.
-    `LLMResult.cost()` is then 0.0, so the turn's cost computed to zero --
-    and `finish_holds(0.0)` RELEASES the hold. For a provider that never
-    reports usage that makes the cap silently inert: every turn is free, and
-    the answer was delivered and billed the whole time.
-
-    A zero is not evidence that nothing was spent, it is evidence that the cost
-    is unknown, so the estimate the gate held is charged instead. The stored
-    message cost is the same figure, so the budget and the reported cost
-    cannot disagree."""
+    """A zero means the cost is unknown, not free, so the held estimate is charged and stored."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -5069,8 +4306,6 @@ def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypa
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A fully delivered answer [1]."
             if usage_holder is not None:
-                # Exactly what stream_answer does with no usage chunk: a truthy
-                # result carrying zero tokens.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=0, completion_tokens=0))
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
@@ -5080,12 +4315,10 @@ def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypa
 
         body = _stream_body(client, h, sid, "Who invested in fintech?")
 
-        # An ordinary, complete turn: no disconnect, no failure.
         assert "event: done" in body
         assert "event: error" not in body
         msgs = client.get(f"/api/chat/sessions/{sid}", cookies=h).json()["messages"]
         assert msgs[1]["aborted"] is False
-        # Charged, not released, and the stored cost matches what was charged.
         assert msgs[1]["cost"] == pytest.approx(0.02)
         assert budget.writes == [("settle", 20_000)]
         assert budget.counter == 20_000
@@ -5096,9 +4329,7 @@ def test_completed_turn_with_no_usage_report_is_still_charged(tmp_path, monkeypa
 
 
 def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, monkeypatch):
-    """The other side of that rule: a provider that DOES report usage must be
-    charged its real cost, not the estimate. Without this the previous test
-    would also pass if every turn were blindly charged the reserve."""
+    """A provider that DOES report usage must be charged its real cost, or the no-usage test would pass with every turn charged the reserve."""
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
         h = _auth_cookies(auth_store)
@@ -5107,8 +4338,6 @@ def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, m
         async def fake_stream(client, prompt, model, usage_holder=None, system_prompt=None):
             yield "A fully delivered answer [1]."
             if usage_holder is not None:
-                # 100k prompt tokens at the pinned $1 / 1M is exactly $0.10,
-                # five times the $0.02 estimate -- the two must not be confused.
                 usage_holder.append(chat_module.LLMResult(content="", prompt_tokens=100_000, completion_tokens=0))
 
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
@@ -5126,8 +4355,7 @@ def test_completed_turn_with_reported_usage_still_uses_the_real_cost(tmp_path, m
 
 
 def _seed_messages(store, sid, count, *, user_id=USER_A, sources_per_message=0, content_len=1):
-    """Append `count` messages directly, bypassing the turn pipeline, so a
-    thread can be made far longer than the read cap without invoking the LLM."""
+    """Bypasses the turn pipeline, so a thread can exceed the read cap without an LLM."""
     for i in range(count):
         sources = (
             [{"id": j, "title": f"s{j}", "summary": "x" * 200, "score": 0.5} for j in range(sources_per_message)]
@@ -5146,9 +4374,6 @@ def _seed_messages(store, sid, count, *, user_id=USER_A, sources_per_message=0, 
 
 
 def test_session_read_returns_only_the_most_recent_messages(tmp_path, monkeypatch):
-    """#258: the history read returned every row of a session that is retained
-    for CHAT_RETENTION_DAYS. With a thread many times the cap, exactly the cap
-    is returned, in chronological order, and it is the *tail* of the thread."""
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 20)
     store = _store(tmp_path)
     try:
@@ -5168,11 +4393,7 @@ def test_session_read_returns_only_the_most_recent_messages(tmp_path, monkeypatc
 
 
 def test_session_read_is_deterministic_when_timestamps_tie(tmp_path, monkeypatch):
-    """`ORDER BY created_at DESC` alone leaves the tail of a thread undefined
-    when rows share a timestamp — which happens whenever the clock resolution
-    is coarser than the write rate, or a backfill stamps whole seconds. The
-    `id` tiebreak is what makes the selection stable, so it is asserted here
-    rather than left resting on timestamps that never actually tie."""
+    """`ORDER BY created_at DESC` alone leaves the tail undefined when rows share a timestamp; the `id` tiebreak is what makes the selection stable."""
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 5)
     store = _store(tmp_path)
     try:
@@ -5202,7 +4423,6 @@ def test_session_read_under_the_cap_is_returned_completely_and_unchanged(tmp_pat
         assert total == 7
         assert total == len(msgs)
         assert [m.content for m in msgs] == [f"msg-{i:04d}-c" for i in range(7)]
-        # Every field survives untouched, including sources and the counters.
         assert msgs[0].role == "user"
         assert msgs[1].role == "assistant"
         assert msgs[1].sources == [
@@ -5215,8 +4435,7 @@ def test_session_read_under_the_cap_is_returned_completely_and_unchanged(tmp_pat
 
 
 def test_session_read_caps_sources_per_message(tmp_path, monkeypatch):
-    """Each row deserialises its sources JSON, so an unbounded per-message
-    source list multiplies the response on top of the row cap (#258)."""
+    """Each row deserialises its sources, so an unbounded list multiplies the response on top of the row cap."""
     monkeypatch.setattr(chat_module.config, "CHAT_MESSAGE_SOURCE_LIMIT", 3)
     store = _store(tmp_path)
     try:
@@ -5226,15 +4445,12 @@ def test_session_read_caps_sources_per_message(tmp_path, monkeypatch):
         msgs, _total = _run(store.messages_page(sid, USER_A))
 
         assert [len(m.sources) for m in msgs] == [3, 3]
-        # The kept sources are the first ones, so the citation list stays stable.
         assert [s["id"] for s in msgs[1].sources] == [0, 1, 2]
     finally:
         _run(store.close())
 
 
 def test_api_session_detail_flags_truncation_to_the_client(tmp_path, monkeypatch):
-    """A silently shortened thread is its own bug — the user sees history vanish.
-    The response must say so."""
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 5)
     client, chat_store, auth_store = _make_client(tmp_path)
     try:
@@ -5271,9 +4487,6 @@ def test_api_session_detail_under_the_cap_is_not_flagged_truncated(tmp_path, mon
 
 
 def test_session_read_response_size_is_bounded_by_the_caps(tmp_path, monkeypatch):
-    """The point of the caps: growing the thread must not grow the response.
-    A 4x longer thread, each message carrying 4x the sources, returns the same
-    number of bytes as the capped read of the smaller thread."""
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 20)
     monkeypatch.setattr(chat_module.config, "CHAT_MESSAGE_SOURCE_LIMIT", 5)
     store = _store(tmp_path)
@@ -5291,17 +4504,13 @@ def test_session_read_response_size_is_bounded_by_the_caps(tmp_path, monkeypatch
         assert sum(len(m.sources) for m in big_msgs) == 100
         big_bytes = len(json.dumps([m.model_dump() for m in big_msgs]))
         small_bytes = len(json.dumps([m.model_dump() for m in small_msgs]))
-        # Same per-message shape, so the sizes are equal up to the digits of
-        # differing ids/offsets; well under 2x either way.
+        # Same per-message shape, so the sizes differ only by id/offset digits.
         assert big_bytes < small_bytes * 2
     finally:
         _run(store.close())
 
 
 def test_session_cap_does_not_touch_the_prompt_history_path(tmp_path, monkeypatch):
-    """The read cap and the prompt budget (#255) are deliberately different:
-    a user may read further back in a thread than the model is given context
-    for. Shrinking the read cap must not shrink the prompt."""
     monkeypatch.setattr(chat_module.config, "CHAT_SESSION_MESSAGE_LIMIT", 2)
     monkeypatch.setattr(chat_module.config, "CHAT_MAX_HISTORY_TURNS", 5)
     store = _store(tmp_path)
@@ -5319,22 +4528,10 @@ def test_session_cap_does_not_touch_the_prompt_history_path(tmp_path, monkeypatc
 
 
 def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
-    """The knobs must be settable per deployment, not hard-coded constants.
-
-    The class body reads the environment at import time, so this loads a
-    STANDALONE copy of app/config.py under a throwaway module name: a plain
-    importlib.reload of `app.config` would rebind `app.config.config` to a new
-    object, so every module that already did `from app.config import config`
-    would silently keep the old one for the rest of the session.
-
-    Nothing here asserts against the live `app.config.config` singleton:
-    `app/config.py` calls `load_dotenv()` at import, so that object's values
-    come from whatever `backend/.env` a developer or deployment happens to
-    have. Asserting "== 200" on it would mean a deployment that legitimately
-    sets CHAT_SESSION_MESSAGE_LIMIT (the knob this adds) fails the suite. The
-    default is therefore proved from the source in a clean process, with
-    `load_dotenv` neutralised so the real .env cannot be picked up.
-    """
+    """A plain importlib.reload would rebind app.config.config and every module that did
+    `from app.config import config` would keep the old one, so this loads a STANDALONE
+    copy. Nothing asserts against the live singleton: app/config.py calls load_dotenv()
+    at import, so a deployment legitimately setting these knobs would fail the suite."""
     import importlib.util
 
     import dotenv
@@ -5342,10 +4539,9 @@ def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
     from app import config as config_module
 
     src = pathlib.Path(config_module.__file__)
-    # `app.config` does `from dotenv import load_dotenv` at import, so patching
-    # the attribute before exec_module keeps the real .env out. Patching the
-    # CWD is not enough: load_dotenv() searches upward from the *calling
-    # file*, which is inside the repo.
+    # app/config.py does `from dotenv import load_dotenv`, so patch it before
+    # exec_module; patching the CWD is not enough because load_dotenv searches
+    # upward from the calling file, which is inside the repo.
     monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
 
     def load(name: str):
@@ -5367,27 +4563,13 @@ def test_session_cap_defaults_are_bounded_and_read_from_env(monkeypatch):
     assert overridden.CHAT_SESSION_MESSAGE_LIMIT == 25
     assert overridden.CHAT_MESSAGE_SOURCE_LIMIT == 4
 
-    # Both knobs are documented where an operator will actually set them
-    # (backend/.env.example, one level up from app/).
     example = (src.parent.parent / ".env.example").read_text()
     assert "CHAT_SESSION_MESSAGE_LIMIT=200" in example
     assert "CHAT_MESSAGE_SOURCE_LIMIT=20" in example
 
 
-# ---------------------------------------------------------------------------
-# Issue #292: a cancelled turn must not leave a dangling user message.
-# ---------------------------------------------------------------------------
-
-
 def _cancel_request():
-    """A Request whose `receive()` never returns, so `is_disconnected()` is
-    always False.
-
-    That is the point of these tests: the turn's own `await aborted()` polling
-    guard never sees a disconnect, so nothing but the cancellation under test
-    can reconcile the stored turn. A client that merely *stopped reading* is the
-    easy case; a client that is gone without the handler noticing is the leak.
-    """
+    """`is_disconnected()` is always False, so nothing but the cancellation under test can reconcile the stored turn."""
     from starlette.requests import Request
 
     scope = {
@@ -5408,13 +4590,7 @@ def _cancel_request():
 
 
 async def _cancel_while_consuming(agen, ready):
-    """Drain the SSE body iterator, cancelling the consuming task the moment
-    `ready` fires -- i.e. at whichever await the test parked itself on.
-
-    Returns True only if the CancelledError kept propagating out of the
-    generator. A turn that swallows the cancellation returns normally instead,
-    which is a bug of its own: the task must still end cancelled.
-    """
+    """Returns True only if the CancelledError kept propagating; a turn that swallows it returns normally, a bug of its own."""
     async def consume():
         async for _ in agen:
             pass
@@ -5435,8 +4611,6 @@ def _turn_rows(store, sid, user_id=USER_A):
 
 
 def _store_with_session(tmp_path):
-    """A chat store bound as the module singleton, with one session, torn down
-    again by `_release_store`."""
     store = _store(tmp_path)
     chat_module.store = store
     sid = _run(store.create_session(USER_A)).id
@@ -5449,13 +4623,7 @@ def _release_store(store):
 
 
 def test_stream_cancelled_during_retrieval_rolls_back_the_user_message(tmp_path, monkeypatch):
-    """Cancelled before a single delta reached the client: clean rollback, no
-    rows at all.
-
-    A disconnect during retrieval never reaches one of the turn's `await
-    aborted()` checkpoints, and `except Exception` cannot see a CancelledError,
-    so before the fix the user message survived with no assistant reply.
-    """
+    """Retrieval never reaches an `await aborted()` checkpoint, and `except Exception` cannot see a CancelledError."""
     store, sid = _store_with_session(tmp_path)
     try:
         ready = asyncio.Event()
@@ -5479,14 +4647,7 @@ def test_stream_cancelled_during_retrieval_rolls_back_the_user_message(tmp_path,
 
 
 def test_stream_cancelled_inside_the_provider_stream_rolls_back_the_user_message(tmp_path, monkeypatch):
-    """Cancelled inside stream_answer's own network await, before any delta.
-
-    This is the window the polling guard cannot cover: the turn is suspended in
-    the provider call, not at a checkpoint, and the budget gate has already let
-    a billed call through. Nothing reached the client, so the user message is
-    rolled back -- the same side of the ONE abort rule as the polled
-    disconnect, reached by a mechanism the old code had no handler for.
-    """
+    """The window the polling guard cannot cover: the turn is suspended in the provider call, not at a checkpoint."""
     store, sid = _store_with_session(tmp_path)
     try:
         ready = asyncio.Event()
@@ -5515,12 +4676,6 @@ def test_stream_cancelled_inside_the_provider_stream_rolls_back_the_user_message
 
 
 def test_stream_cancelled_after_deltas_persists_the_truncated_turn(tmp_path, monkeypatch):
-    """The other side of the same rule, reached by cancellation.
-
-    Two deltas were already on the wire, so the client is rendering text the
-    server has not stored. Deleting the turn would re-create exactly the history
-    divergence #255 forbids: the turn is persisted, truncated and flagged
-    aborted, and the user message is kept."""
     store, sid = _store_with_session(tmp_path)
     try:
         ready = asyncio.Event()
@@ -5557,13 +4712,7 @@ def test_stream_cancelled_after_deltas_persists_the_truncated_turn(tmp_path, mon
 
 
 def test_stream_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(tmp_path, monkeypatch):
-    """A cancellation that lands once the reply is already in the database must
-    change nothing.
-
-    A turn that needs no LLM persists its reply and then awaits the auto-title;
-    cancelling there used to run the rollback, which would delete the user
-    message and leave the client reading a reply the server had orphaned. The
-    `persisted` flag is what stops that."""
+    """Rolling back after the reply is stored would orphan a reply the client is reading; the `persisted` flag is what stops it."""
     store, sid = _store_with_session(tmp_path)
     try:
         ready = asyncio.Event()
@@ -5590,9 +4739,6 @@ def test_stream_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(tmp
 
 
 def test_json_turn_cancelled_mid_generation_rolls_back_the_user_message(tmp_path, monkeypatch):
-    """The non-streaming path rolls back too, under the rule its own comment
-    states: a JSON client is never shown a partial answer, so a lost connection
-    is a clean rollback, not a partial turn to persist (#255)."""
     store, sid = _store_with_session(tmp_path)
     try:
         ready = asyncio.Event()
@@ -5623,8 +4769,6 @@ def test_json_turn_cancelled_mid_generation_rolls_back_the_user_message(tmp_path
 
 
 def test_json_turn_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(tmp_path, monkeypatch):
-    """Same guard as the stream path: once the reply is stored, a cancellation
-    during the auto-title must leave the finished turn intact."""
     store, sid = _store_with_session(tmp_path)
     try:
         ready = asyncio.Event()
@@ -5661,25 +4805,11 @@ def test_json_turn_cancelled_after_the_reply_is_stored_keeps_the_completed_turn(
 
 
 def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=False):
-    """Run the real ASGI stack and drop the connection mid-response.
-
-    `park_in_send` decides where the turn is when the disconnect lands: by
-    default inside the provider stream, which is a `stream_answer` await the
-    turn's own polling gate never reaches; with it set, inside Starlette's own
-    `send()` between two deltas, where the cancellation reaches the CONSUMER
-    and the generator is finalised with GeneratorExit instead.
-
-    This is the production shape, not a stub: FastAPI hands the request to
-    Starlette's StreamingResponse, which runs the body iterator in an anyio task
-    group and cancels it when `receive()` reports `http.disconnect`. The fake
-    provider emits `n_deltas` chunks and then parks forever, so the turn is
-    suspended INSIDE `stream_answer` -- a checkpoint the turn's `await aborted()`
-    polling guard does not cover -- when the disconnect cancels it. anyio
-    delivers that as a LEVEL cancellation, re-raising at every following await,
-    so a rollback written as a plain `await` in the handler is interrupted
-    before it writes; that is what the shield in `_reconcile_cancelled_turn` is
-    for, and only a test through the real stack can catch its removal.
-    """
+    """`park_in_send` decides where the turn is when the disconnect lands: inside
+    `stream_answer` by default, or inside Starlette's `send()` between deltas, where
+    the cancellation reaches the CONSUMER and the generator is finalised with
+    GeneratorExit. anyio delivers it as a LEVEL cancellation, re-raising at every
+    following await, so an unshielded rollback is interrupted before it writes."""
     chat_store = _store(tmp_path)
     auth_store = _auth_store(tmp_path)
     app = FastAPI()
@@ -5687,11 +4817,9 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=
     chat_module.store = chat_store
     auth_module.store = auth_store
     session = _auth_cookies(auth_store)
-    # A raw ASGI scope has no client cookie jar behind it, so the header a
-    # browser would attach is written out explicitly.
+    # A raw ASGI scope has no cookie jar, so write out the header a browser would attach.
     cookie_header = "; ".join(f"{name}={value}" for name, value in session.items())
-    # The session must belong to the user the cookie authenticates, or the turn
-    # 404s on a conversation it does not own and nothing streams at all.
+    # The session must belong to the cookie's user, or the turn 404s and nothing streams.
     user_id = _run(auth_store.get_user_by_email(EMAIL_A)).id
     sid = _run(chat_store.create_session(user_id)).id
     state = {"drop": False}
@@ -5721,16 +4849,14 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=
         if message["type"] == "http.response.body" and b"event: delta" in message.get("body", b""):
             sent["deltas"] += 1
             if park_in_send and sent["deltas"] >= n_deltas:
-                # Park HERE, inside Starlette's send(): the generator is
-                # suspended at its yield, so the cancellation lands on the
-                # consumer and no handler inside the generator can run.
+                # The generator is suspended at its yield, so the cancellation lands
+                # on the consumer and no generator handler runs.
                 state["drop"] = True
                 await asyncio.sleep(3600)
 
     async def receive():
-        # FastAPI reads the request body through this same callable, so the
-        # body must come first; the disconnect follows once the provider stream
-        # has parked.
+        # FastAPI reads the body through this same callable, so it must come first;
+        # the disconnect follows once the provider stream has parked.
         nonlocal sent_body
         if not sent_body:
             sent_body = True
@@ -5760,22 +4886,14 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=
 
     async def call_app():
         await asyncio.wait_for(app(scope, receive, send), timeout=10)
-        # The turn really streamed, and exactly the deltas expected reached the
-        # wire: without this a 404 or an early error would make the rollback
-        # assertions below pass for the wrong reason.
+        # Without this a 404 or an early error would make the rollback assertions pass for the wrong reason.
         assert any(b"event: start" in body for body in sent["bodies"]), sent["bodies"]
         assert sent["deltas"] == n_deltas, sent["bodies"]
 
     def run():
-        """Drive the app, and read the turn back, on one daemon thread.
-
-        Both halves live on the worker so the join timeout covers both. A turn
-        whose cancellation rollback is missing does not merely get the wrong
-        rows: the abandoned in-flight commit leaves the aiosqlite connection
-        unusable, so a read issued from the main thread blocks forever and the
-        whole suite wedges instead of reporting. Joining with a timeout turns
-        that stall into a plain failure.
-        """
+        """A missing cancellation rollback does not merely give the wrong rows: the
+        abandoned commit leaves the aiosqlite connection unusable and a main-thread
+        read blocks forever, wedging the suite instead of reporting."""
         outcome: dict = {}
 
         async def call_and_read():
@@ -5805,10 +4923,7 @@ def _asgi_disconnect_after_deltas(tmp_path, monkeypatch, n_deltas, park_in_send=
 
 
 def test_real_disconnect_before_any_delta_rolls_back_the_turn(tmp_path, monkeypatch):
-    """A real `http.disconnect` through the real ASGI stack, before any delta:
-    the user message is rolled back and no assistant row is written. Fails
-    outright if the rollback is unshielded -- the level cancellation would
-    interrupt it before the delete lands."""
+    """An unshielded rollback is interrupted before the delete lands."""
     run, chat_store, auth_store, _sid, _user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 0)
     try:
         assert run() == []
@@ -5820,9 +4935,6 @@ def test_real_disconnect_before_any_delta_rolls_back_the_turn(tmp_path, monkeypa
 
 
 def test_real_disconnect_after_deltas_persists_the_truncated_turn(tmp_path, monkeypatch):
-    """The same real disconnect, once a delta is on the wire: the ONE abort
-    rule persists the truncated turn flagged aborted and keeps the user
-    message, instead of erasing what the client is still displaying."""
     run, chat_store, auth_store, _sid, _user_id = _asgi_disconnect_after_deltas(tmp_path, monkeypatch, 1)
     try:
         rows = run()
@@ -5838,15 +4950,7 @@ def test_real_disconnect_after_deltas_persists_the_truncated_turn(tmp_path, monk
 
 
 def test_stream_cancelled_after_the_gate_charges_the_billed_call(tmp_path, monkeypatch):
-    """A cancelled turn that already passed the budget gate must SETTLE its
-    hold, never release it.
-
-    The provider bills the prompt the moment the request is sent, and the
-    cancellation arrived inside that call. Releasing the reservation would make
-    real spend invisible to the daily cap for the rest of the TTL -- free
-    spend, which is the one outcome the reserve/settle/sweep design exists to
-    prevent (#255). A turn cancelled before the gate has nothing to charge and
-    must release instead."""
+    """The provider billed the prompt when the request went out, so releasing would make that spend invisible to the cap."""
     store, sid = _store_with_session(tmp_path)
     try:
         budget = _pin_cost_accounting(monkeypatch, budget_usd=10.0, spend_usd=0.0)
@@ -5871,7 +4975,6 @@ def test_stream_cancelled_after_the_gate_charges_the_billed_call(tmp_path, monke
         )
         assert _run(_cancel_while_consuming(response.body_iterator, ready)) is True
 
-        # Charged at the estimate the gate held, and no hold left behind.
         assert budget.writes == [("settle", 20_000)]
         assert budget.holds == {}
         assert _turn_rows(store, sid) == []
@@ -5883,10 +4986,7 @@ def test_stream_cancelled_after_the_gate_charges_the_billed_call(tmp_path, monke
 def test_turn_cancelled_before_its_own_handlers_roll_back_the_user_message(
     tmp_path, monkeypatch, streaming
 ):
-    """`_start_turn` writes the user message and then reads history, and BOTH
-    turn paths call it before their cancellation handlers exist. A cancel in
-    that window used to leave the row with no assistant reply and no handler
-    able to remove it; the shared helper now rolls it back itself."""
+    """Both turn paths call `_start_turn` before their cancellation handlers exist, so a cancel in that window has no handler able to remove the user row."""
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)
@@ -5927,23 +5027,12 @@ def test_turn_cancelled_before_its_own_handlers_roll_back_the_user_message(
 
 
 def _park_at_first_assistant_commit(monkeypatch, store, parked):
-    """Make the turn's own reply write look cancelled the instant it commits.
-
-    aiosqlite runs each statement on a worker thread and only then resolves an
-    independently cancellable future, so a cancellation delivered at a row's own
-    COMMIT finds the write already done while the append never returns.
-    A local "did the append return" flag is still False in that window, which
-    is what used to make the rollback delete the user message under a stored
-    reply (JSON) or store a SECOND assistant row for the same turn (SSE).
-
-    Parked on `_append_authorized`, not on `append_message`: a turn that has
-    already proved it owns the conversation writes through the authorised
-    entry point (#259), so parking the authorising wrapper would never be
-    reached and the window would go untested.
-
-    Only the first assistant append parks, so a reconciliation's own write
-    still completes and the test measures the fix, not a deadlock.
-    """
+    """aiosqlite resolves an independently cancellable future only after running the
+    statement, so a cancel at a row's own COMMIT finds the write done while the append
+    never returns -- and a local "did the append return" flag is still False, which is
+    what used to delete the user message under a stored reply. Parked on
+    `_append_authorized` for the first assistant append so a reconciliation's own
+    write still lands."""
     ready = asyncio.Event()
     real_append = store._append_authorized
 
@@ -5960,9 +5049,6 @@ def _park_at_first_assistant_commit(monkeypatch, store, parked):
 
 
 def test_json_turn_cancelled_at_the_reply_commit_keeps_the_completed_turn(tmp_path, monkeypatch):
-    """The reply row is committed, then the task is cancelled before
-    `append_message` returns. The turn is complete, so nothing is rolled back:
-    deleting the user message here would orphan a reply the client can read."""
     store, sid = _store_with_session(tmp_path)
     parked = {"done": False}
     try:
@@ -5995,10 +5081,7 @@ def test_json_turn_cancelled_at_the_reply_commit_keeps_the_completed_turn(tmp_pa
 
 
 def test_stream_cancelled_at_the_reply_commit_stores_no_second_row(tmp_path, monkeypatch):
-    """Same window on the SSE path, with the worse outcome: a rollback that
-    only trusted a local flag would persist a truncated SECOND assistant row
-    for a turn that already has its complete reply, so the client would see
-    the answer twice."""
+    """A rollback trusting only a local flag would persist a SECOND truncated assistant row, so the client sees the answer twice."""
     store, sid = _store_with_session(tmp_path)
     parked = {"done": False}
     try:
@@ -6033,12 +5116,7 @@ def test_stream_cancelled_at_the_reply_commit_stores_no_second_row(tmp_path, mon
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["json", "sse"])
 def test_turn_cancelled_at_the_user_insert_commit_rolls_back(tmp_path, monkeypatch, streaming):
-    """A cancel inside the INSERT that writes the user message, before the
-    append returns an id: the row exists but nothing knows its id.
-    `_start_turn` finds it instead, so neither path leaves a dangling user
-    message. Parked on `_append_authorized`, the write the turn makes once it
-    has authorised the session (#259); parking `append_message` would never
-    be reached."""
+    """The row exists but nothing knows its id, so `_start_turn` finds it instead."""
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)
@@ -6083,16 +5161,7 @@ def test_turn_cancelled_at_the_user_insert_commit_rolls_back(tmp_path, monkeypat
 
 
 def test_real_disconnect_while_starlette_is_sending_persists_the_turn(tmp_path, monkeypatch):
-    """A disconnect delivered while Starlette is inside its own `send()`.
-
-    `stream_response` iterates the generator and awaits `send()` between
-    deltas, so at that moment the generator is suspended at its `yield` and the
-    CANCELLATION reaches the consumer, not the generator: the generator is
-    never resumed and is later finalised with GeneratorExit, which no
-    `except CancelledError` or `except Exception` can catch. One delta was on
-    the wire, so the ONE abort rule applies -- persist the truncated turn,
-    flagged aborted -- and the response's background task is what does it.
-    """
+    """The generator is finalised with GeneratorExit, which no `except` in it can catch, so the response's background task must persist the truncated turn."""
     run, chat_store, auth_store, _sid, _user_id = _asgi_disconnect_after_deltas(
         tmp_path, monkeypatch, 1, park_in_send=True
     )
@@ -6109,17 +5178,7 @@ def test_real_disconnect_while_starlette_is_sending_persists_the_turn(tmp_path, 
 
 
 def test_cancelled_inside_the_body_iterator_finishes_its_own_rollback(tmp_path, monkeypatch):
-    """The cancellation lands INSIDE the generator, under a live anyio cancel
-    scope, with nothing to fall back on.
-
-    This is Starlette's `stream_response` loop -- `async for chunk in
-    body_iterator` inside a task group whose scope is cancelled on disconnect
-    -- with the response wrapper (and its background task) left out, so the
-    generator's own handler is the only thing that can finish the turn. It has
-    to: anyio re-raises the cancellation at every await while the scope is
-    live, so the delete lands only if the handler's write is shielded. This is
-    the one test that can catch that shield being removed.
-    """
+    """The generator's own handler is the only thing that can finish the turn, and anyio re-raises at every await, so the delete lands only if that handler's write is shielded."""
     store, sid = _store_with_session(tmp_path)
     try:
         _pin_budget_disabled(monkeypatch)

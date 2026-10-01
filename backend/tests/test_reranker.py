@@ -1,13 +1,8 @@
-"""Reranker tests: the torch-only construction and predict path.
-
-The ONNX/optimum fast path and its load/export/lock tests were removed together
-with the code they covered (optimum-onnx is not installable alongside the pinned
-transformers 5.x, so that path could never run — see app/reranker.py).
+"""Reranker: the torch-only construction and predict path.
 
 ``sentence_transformers`` is faked in ``sys.modules`` so nothing downloads a
-model or runs real inference. A working ``optimum`` fake is installed in the
-default-backend test to prove construction does not take an ONNX path even when
-optimum *is* importable.
+model or runs real inference; a working ``optimum`` fake proves a default
+construction takes no ONNX path even when optimum *is* importable.
 """
 
 import inspect
@@ -39,8 +34,7 @@ def _fake_torch(monkeypatch):
 
 def _fake_onnx_importable(monkeypatch):
     """Install a *working* optimum.onnxruntime/transformers pair, recording any
-    attempt to use the ONNX path, so a default construction can be shown not to
-    take it. Returns the recorder."""
+    attempt to use the ONNX path. Returns the recorder."""
     calls = []
 
     class _RecordingORT:
@@ -77,8 +71,8 @@ def _fake_onnx_importable(monkeypatch):
 
 
 def test_backend_parameter_defaults_to_torch():
-    # Pins the signature default itself: flipping it back to "onnx" (with the
-    # ONNX branch gone) must fail here rather than silently degrading to torch.
+    # Pins the signature default itself: flipping it back to "onnx" must fail
+    # here rather than silently degrading to torch.
     assert inspect.signature(Reranker.__init__).parameters["backend"].default == "torch"
 
 
@@ -89,8 +83,7 @@ def test_default_backend_is_torch_even_when_optimum_is_importable(monkeypatch, c
     with caplog.at_level(logging.DEBUG, logger="reranker"):
         rer = Reranker("model-x")
 
-    # No ONNX export/load attempt of any kind, and no fallback warning: a
-    # default construction goes straight to the torch CrossEncoder.
+    # No ONNX export/load attempt and no fallback warning.
     assert onnx_calls == []
     assert not [rec for rec in caplog.records if "ONNX" in rec.getMessage()]
     assert rer.backend == "torch"

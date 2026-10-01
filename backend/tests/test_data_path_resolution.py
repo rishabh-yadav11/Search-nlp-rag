@@ -1,12 +1,11 @@
-"""Data paths must be absolute and validated, or startup must fail loudly (#294).
+"""Data paths must be absolute and validated, or startup must fail loudly.
 
-The defect: every data location defaulted to a path relative to the process
-working directory (`data/chat.db`, `data/auth.db`, `data/query_vocab.json.gz`),
-and the stores' `os.makedirs(..., exist_ok=True)` + `sqlite3.connect` happily
-opened a BRAND-NEW EMPTY database at whatever directory the process happened to
-be started from. pm2 was configured with a hardcoded CWD, so any checkout at
-another path turned the deployment into "all conversations and users are gone"
-with no error at any level.
+Every data location (`data/chat.db`, `data/auth.db`, `data/query_vocab.json.gz`)
+used to be relative to the process working directory, and the stores'
+`os.makedirs(..., exist_ok=True)` + `sqlite3.connect` happily opened a BRAND-NEW
+EMPTY database at whatever directory the process happened to be started from --
+so any checkout at another path turned the deployment into "all conversations and
+users are gone" with no error at any level.
 
 These tests pin the two halves of the fix:
 

@@ -35,8 +35,7 @@ def test_extract_year_range_span():
 
 
 def test_extract_year_range_span_reversed():
-    """A span written end-first is the same window, not an inverted one:
-    '2025 to 2024' must match '2024 to 2025' rather than from_date > to_date."""
+    """A reversed span must resolve to the same ascending window, never from_date > to_date."""
     assert extract_year_range("deals 2025 to 2024") == ("2024-01-01", "2025-12-31")
     assert extract_year_range("deals 2025-2024") == ("2024-01-01", "2025-12-31")
     assert extract_year_range("deals 2025 through 2024") == ("2024-01-01", "2025-12-31")
@@ -48,8 +47,6 @@ def test_extract_year_range_span_reversed_matches_ascending():
 
 
 def test_extract_year_range_last_and_this_year():
-    # query_intent derives "this/last year" from _CURRENT_YEAR, so assert relative
-    # to it instead of hardcoding 2025/2026.
     cur = _current_year()
     last = cur - 1
     assert extract_year_range("top articles last year") == (f"{last}-01-01", f"{last}-12-31")
@@ -66,9 +63,7 @@ def test_extract_year_range_no_year_returns_none():
 
 
 def test_extract_year_range_event_year_not_a_date_filter():
-    """A year naming a historical event is a topic reference, not a
-    publication-date filter: 'the 2008 crisis' must find retrospectives written
-    later instead of being restricted to 2008 articles."""
+    """A year naming a historical event is a topic word; filtering on it hides retrospectives written later."""
     assert extract_year_range("lessons from the 2008 crisis") is None
     assert extract_year_range("the 2008 financial crisis") is None
     assert extract_year_range("financial crisis of 2008") is None
@@ -185,8 +180,6 @@ def test_extract_list_topic_year_span_removed():
 
 
 def test_rewrite_niche_topic_flashback_kept_but_topic_extractable():
-    """The Flashback rewrite still fires, but the bare topic is recoverable for
-    the second (direct) retrieval leg used to surface niche articles."""
     new_q, changed = rewrite_year_in_review("top venture debt providers in 2024")
     assert changed is True
     assert new_q == "Flashback 2024 venture debt providers"
@@ -223,13 +216,7 @@ def test_rewrite_skipped_for_month_query():
 
 
 def test_range_query_topic_covers_month_scoped_queries():
-    """Month-scoped topic extraction lives in ``range_query_topic`` (#303).
-
-    The old public ``month_query_topic`` was reachable only from its own
-    tests, so a change made there would silently not affect search. These
-    cases are pinned against the one path the app actually calls, so deleting
-    the duplicate cannot quietly drop month coverage.
-    """
+    """Pin on range_query_topic, the only path the app calls, so its test-only duplicate cannot drift unnoticed."""
     assert range_query_topic("top pharma deals of month january 2025") == "pharma deals"
     assert range_query_topic("deals in feb 2024") == "deals"
     assert range_query_topic("january 2025") is None
@@ -269,23 +256,19 @@ def test_extract_year_range_month_span_crosses_year():
 
 
 def test_extract_month_range_span_crosses_year_with_end_year():
-    """A single year written after the END month anchors the end: a span that
-    crosses the boundary must start the year BEFORE it, not return a future
-    span (issue #172: 'dec to jan 2024' was 2024-12..2025-01)."""
+    """A year written after the END month anchors the end, so a crossing span must start the year BEFORE it."""
     assert extract_month_range("deals in dec to jan 2024") == ("2023-12-01", "2024-01-31")
     assert extract_month_range("deals from december to january 2024") == ("2023-12-01", "2024-01-31")
     assert extract_month_range("deals in dec-jan 2024") == ("2023-12-01", "2024-01-31")
 
 
 def test_extract_month_range_span_crosses_year_with_start_year():
-    """A single year written after the START month anchors the start, so a
-    crossing span ends the year after it."""
+    """A year written after the START month anchors the start, so a crossing span ends the year after."""
     assert extract_month_range("deals in dec 2023 to jan") == ("2023-12-01", "2024-01-31")
     assert extract_month_range("deals in december 2023 through january") == ("2023-12-01", "2024-01-31")
 
 
 def test_extract_month_range_span_single_year_not_crossing_boundary():
-    """A forward span inside one year keeps that year on both sides."""
     assert extract_month_range("deals in jan to mar 2024") == ("2024-01-01", "2024-03-31")
     assert extract_month_range("deals in january to march 2024") == ("2024-01-01", "2024-03-31")
     assert extract_month_range("deals in jan 2024 to mar") == ("2024-01-01", "2024-03-31")
@@ -323,19 +306,14 @@ def test_extract_year_range_fiscal_span_rollover():
 
 
 def test_extract_year_range_fiscal_span_multi_year():
-    """A multi-year FY span must cover every fiscal year in it, not silently
-    collapse to the last one ('fy 2020-2025' -> 2020-04-01..2025-03-31, which
-    spans FY2020 through FY2024, i.e. five fiscal years)."""
+    """'fy 2020-2025' spans FY2020 through FY2024, not only the last fiscal year."""
     assert extract_year_range("deals fy 2020-2025") == ("2020-04-01", "2025-03-31")
     assert extract_year_range("deals fy 2019-2021") == ("2019-04-01", "2021-03-31")
-    # End-first (reversed) multi-year spans resolve to the same window.
     assert extract_year_range("deals fy 2025-2020") == ("2020-04-01", "2025-03-31")
 
 
 def test_extract_year_range_fiscal_span_same_year_is_single_fy():
-    """A degenerate span naming one year twice is a single fiscal year, so it
-    must yield the same valid window as 'FY 2025' (start < end), never an
-    inverted Apr-N..Mar-N range that matches zero rows."""
+    """A span naming one year twice is one fiscal year; reading it as a span inverts the window to match zero rows."""
     for q in ("deals fy 25-25", "deals fy 2025-25", "deals fy 2025 to 2025"):
         from_date, to_date = extract_year_range(q)
         assert from_date < to_date, f"inverted window for {q!r}: {from_date}..{to_date}"
@@ -344,8 +322,6 @@ def test_extract_year_range_fiscal_span_same_year_is_single_fy():
 
 
 def test_extract_year_range_fiscal_single_and_consecutive_unchanged():
-    """Single-FY and consecutive two-year spans are unaffected by the
-    multi-year fix: their start is always end - 1."""
     assert extract_year_range("deals fy 2025") == ("2024-04-01", "2025-03-31")
     assert extract_year_range("top 15 deals in FY25") == ("2024-04-01", "2025-03-31")
     assert extract_year_range("top 15 deals in FY 2024-25") == ("2024-04-01", "2025-03-31")
@@ -354,33 +330,22 @@ def test_extract_year_range_fiscal_single_and_consecutive_unchanged():
     assert extract_year_range("deals fy 2025-24") == ("2024-04-01", "2025-03-31")
 
 
-# `_fiscal_range` resolves a date range from the fiscal-year grammar while
-# `_strip_time_tokens` deletes the same tokens from the retrieval query. Both
-# read one compiled regex (`_FY_RE`, whose groups are named); these cases pin
-# the resolved range AND the stripped text, so the two halves of the grammar
-# cannot drift apart again. Expected values are the pre-refactor behaviour.
+# _fiscal_range and _strip_time_tokens share one compiled regex, so each case pins the range AND the stripped text.
 _FY_CASES = (
-    # span forms
     ("fy 2020-2021", ("2020-04-01", "2021-03-31"), " "),
     ("fy 2020 to 2021", ("2020-04-01", "2021-03-31"), " "),
     ("fy 2020 through 2021", ("2020-04-01", "2021-03-31"), " "),
-    # bare fiscal year, all three spellings
     ("fy 2020", ("2019-04-01", "2020-03-31"), " "),
     ("fiscal 2025", ("2024-04-01", "2025-03-31"), " "),
     ("fiscal year 2025", ("2024-04-01", "2025-03-31"), " "),
     ("deals in fiscal year 2025", ("2024-04-01", "2025-03-31"), "deals    "),
-    # no fiscal reference at all
     ("latest startup deals", None, "latest startup deals"),
     ("top 10 companies", None, "top 10 companies"),
-    # a span outranks a bare fiscal year even when the bare one comes first,
-    # and a bare 'fy' outranks 'fiscal' — tier order, not leftmost order
+    # Tier order, not leftmost: a span outranks a bare fiscal year, and 'fy' outranks 'fiscal'.
     ("fiscal 2025 and fy 2020-2021", ("2020-04-01", "2021-03-31"), "  and  "),
     ("fiscal 2025 plus fy 2020", ("2019-04-01", "2020-03-31"), "  plus  "),
     ("fy 2020-2021 then fy 2022", ("2020-04-01", "2021-03-31"), "  then  "),
-    # the fused 'fiscal2020' spelling: `_fiscal_range` resolved it before the
-    # two grammars were unified, so the shared regex must keep resolving it —
-    # a regression to the stripping-only `\bfiscal\s+` form would drop the
-    # range here. Stripping it too is the deliberate convergence.
+    # The fused 'fiscal2020' must still RESOLVE a range; a stripping-only '\bfiscal\s+' form would silently drop it.
     ("fiscal2020", ("2019-04-01", "2020-03-31"), " "),
     ("deals in fiscal2020", ("2019-04-01", "2020-03-31"), "deals    "),
 )
@@ -388,7 +353,6 @@ _FY_CASES = (
 
 @pytest.mark.parametrize(("query", "expected_range", "expected_stripped"), _FY_CASES)
 def test_fiscal_range_and_stripping_share_one_grammar(query, expected_range, expected_stripped):
-    """Both halves of the fiscal-year grammar must agree, for every spelling."""
     got_range = query_intent._fiscal_range(query)
     assert got_range == expected_range, f"{query!r}: range {got_range!r} != {expected_range!r}"
     got_stripped = query_intent._strip_time_tokens(query)
@@ -401,8 +365,6 @@ def test_referenced_year_explicit_flashback_prefix():
 
 
 def test_rewrite_not_fired_for_range_queries():
-    """Range/fiscal/quarter queries must not collapse into a single annual
-    Flashback roundup — they want the span's own data."""
     for q in (
         "top 15 deals in 2024-25",
         "top 15 deals in jan to march 2025",
@@ -432,9 +394,7 @@ def test_range_query_topic():
 
 
 def test_chart_request_filler_stripped_from_topic():
-    """Chart/table request words ('make a table of') describe the output format,
-    not the topic: they must not leak into the retrieval query or embedding
-    match is diluted and retrieval can fail ('make a table deals')."""
+    """Chart/table request words name the output format; leaking one yields 'make a table deals'."""
     for q, expected in (
         ("make a table of top 15 deals in 2024-25", "deals"),
         ("show me a bar chart of top 15 deals in 2024-25", "deals"),
@@ -450,27 +410,14 @@ def test_chart_request_filler_stripped_from_topic():
 
 
 def test_chart_filler_not_stripped_from_real_topic_words():
-    """'table' as a real topic word (not part of a chart request) must survive."""
     assert extract_list_topic("top table manufacturing deals in 2025") == "table manufacturing deals"
     assert range_query_topic("top table games funding") is None
-    # The 'table tennis' collocation is a topic, not a view request: the table
-    # noun must survive stripping so retrieval keeps the full topic.
     assert query_intent._strip_chart_filler("share table tennis news") == "share table tennis news"
     assert not query_intent._is_chart_request("share table tennis news")
 
 
 def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
-    """Pin the module's clock to ``when``, which MUST be tz-aware (the stdlib
-    has no ``AwareDatetime`` to annotate that with, so it is enforced here).
-
-    Only the clock is frozen: the module still converts to Asia/Kolkata
-    itself, so the date assertions below fail if that conversion is dropped
-    instead of passing on whatever the implementation happens to return.
-
-    A naive datetime is rejected rather than converted, because
-    ``astimezone`` would silently read it in the *host's* timezone -- the very
-    naive/aware bug this freeze exists to catch.
-    """
+    """Pin the module clock; ``when`` MUST be tz-aware (no stdlib type says so) or it is read in the host's timezone."""
     if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
         raise ValueError(f"_freeze_utc needs an aware datetime, got {when!r}")
     frozen = when.astimezone(dt.UTC)
@@ -478,48 +425,35 @@ def _freeze_utc(monkeypatch, when: dt.datetime) -> None:
 
 
 def test_today_is_resolved_in_indian_timezone(monkeypatch):
-    """Between 18:30Z and 24:00Z India is already on the next calendar day:
-    at 2023-12-31T20:00Z the Indian date is 2024-01-01 while the UTC date is
-    still 2023-12-31, so a naive date.today() on a UTC server resolves a day
-    (and, across New Year, a whole year) behind."""
+    """20:00Z on 2023-12-31 is already 2024-01-01 in Asia/Kolkata, so a naive UTC clock resolves a whole year behind."""
     _freeze_utc(monkeypatch, dt.datetime(2023, 12, 31, 20, 0, tzinfo=dt.UTC))
     assert _today() == dt.date(2024, 1, 1)
     assert _current_year() == 2024
 
 
 def test_current_year_uses_indian_date_across_new_year(monkeypatch):
-    """'last year'/'this year' and the default year for a bare month must follow
-    the Indian calendar: at 2024-12-31T19:00Z India is in 2025, UTC in 2024."""
+    """19:00Z on 2024-12-31 is already 2025 in Asia/Kolkata, so relative-year defaults must resolve there."""
     _freeze_utc(monkeypatch, dt.datetime(2024, 12, 31, 19, 0, tzinfo=dt.UTC))
     assert _current_year() == 2025
     assert extract_year_range("top articles last year") == ("2024-01-01", "2024-12-31")
     assert extract_year_range("this year's funding") == ("2025-01-01", "2025-12-31")
-    # A month range without an explicit year defaults to the Indian year too.
     assert extract_month_range("top deals in march") == ("2025-03-01", "2025-03-31")
 
 
 def test_today_matches_utc_date_outside_the_offset_window(monkeypatch):
-    """Outside the 18:30Z-24:00Z window both calendars agree, so resolving in
-    Asia/Kolkata must not shift the date in the other direction either."""
+    """Outside 18:30Z-24:00Z the two calendars agree, so the Asia/Kolkata conversion must not shift the date."""
     _freeze_utc(monkeypatch, dt.datetime(2024, 6, 15, 12, 0, tzinfo=dt.UTC))
     assert _today() == dt.date(2024, 6, 15)
     assert _current_year() == 2024
 
 
 def test_freeze_rejects_naive_datetime(monkeypatch):
-    """A naive instant would be reinterpreted in the host's timezone, so the
-    freeze helper refuses it instead of letting the suite pass or fail by
-    accident of where it runs."""
     naive = dt.datetime(2023, 12, 31, 20, 0)  # noqa: DTZ001
     with pytest.raises(ValueError, match="aware datetime"):
         _freeze_utc(monkeypatch, naive)
 
 
-# --- issue #253: the connective-span patterns must stay linear-time ---------
-# The five patterns frozen below are the PRE-FIX versions, copied verbatim
-# from app/query_intent.py. They are the oracle: bounding the gap is a
-# semantic narrowing, so every change to the live patterns has to be shown not
-# to move the result on realistic input.
+# Frozen PRE-FIX copies of the live patterns; resyncing them would make the equivalence asserts vacuous.
 _ORIG_BOTH_AND_RE = re.compile(r"\bboth\b.+?\band\b", re.IGNORECASE)
 _ORIG_ALL_OF_RE = re.compile(r"\ball (?:of )?.+?\b(?:and|with)\b", re.IGNORECASE)
 _ORIG_ACQUIRED_BY_RE = re.compile(
@@ -536,11 +470,7 @@ _ORIG_BUYER_TRAILING_RE = re.compile(
     re.IGNORECASE,
 )
 
-# `_BOTH_AND_RE`/`_ALL_OF_RE` are applied as SUBSTITUTIONS by
-# `_multi_entity_scaffold` (the whole "both A and B" span is what gets removed
-# to leave the scaffold), so equivalence for those two is compared on
-# `.sub(" ", s)`. The other three are only ever asked as booleans by
-# `acquisition_relation`, so their equivalence is compared as match truthiness.
+# The first two feed _multi_entity_scaffold's substitution (compare removed text); the rest only as booleans.
 _SUB_PAIRS = (
     (query_intent._BOTH_AND_RE, _ORIG_BOTH_AND_RE),
     (query_intent._ALL_OF_RE, _ORIG_ALL_OF_RE),
@@ -556,19 +486,7 @@ _ORACLES_BY_NAME = {
     "_BUYER_TRAILING_RE": _ORIG_BUYER_TRAILING_RE,
 }
 
-# `_ALL_OF_RE` is written with a `\b` before "all" -- the literal is the word
-# "all", NOT `\a` + "ll" (a BEL escape, which would make the pattern unable to
-# match ordinary English).
-#
-# The corpus below carries inputs chosen to DISCRIMINATE the pre-fix patterns
-# from the bounded ones. The sharpest is a connective with nothing (or almost
-# nothing) between its two ends: `_ALL_OF_RE`'s prefix `\ball ` ends in a
-# literal space, so a zero-width gap would let `\b(?:and|with)\b` match
-# straight after it and the pattern would match "all and" -- which the pre-fix
-# one-or-more gap could not. That widened the matcher, changed the
-# `_multi_entity_scaffold` substitution and flipped `detect_multi_entity` from
-# 'comparison' to 'intersection'. These fixtures are in the corpus so that
-# widening turns the equivalence assertions below red instead of passing.
+# A zero-width gap after '\ball ' matches "all and", flipping detect_multi_entity to 'intersection'.
 _ZERO_GAP_FIXTURES = (
     "all and",
     "all with",
@@ -580,7 +498,6 @@ _ZERO_GAP_FIXTURES = (
     "both with",
 )
 _INTERSECTION_CORPUS = (
-    # Positives.
     "companies backed by both SoftBank and Tiger Global",
     "funds that have backed both Acme and Beta Capital",
     "deals with all of A, B and C",
@@ -588,12 +505,9 @@ _INTERSECTION_CORPUS = (
     "all of Acme, Beta and Gamma",
     "all of the seed cohort and their angels",
     "what do all of these investors have in common and who led them",
-    # Negatives: a connective with no closing "and"/"with" after it, or with
-    # the closing term only BEFORE it.
     "both companies are large",
     "all of the above",
     "startups that SoftBank and Tiger Global have both backed",
-    # "all" inside a larger word must not trigger the literal.
     "small allocations across the portfolio and the follow-on",
 )
 _INTERSECTION_CORPUS = _INTERSECTION_CORPUS + _ZERO_GAP_FIXTURES
@@ -622,8 +536,6 @@ _ACQUISITION_CORPUS = (
     "new,orig", _SUB_PAIRS, ids=["both_and", "all_of"]
 )
 def test_intersection_substitutions_match_pre_fix_patterns(new, orig):
-    """The scaffold depends on the exact text the substitution removes, so the
-    bounded patterns have to remove precisely what the unbounded ones did."""
     for text in _INTERSECTION_CORPUS:
         assert new.sub(" ", text) == orig.sub(" ", text), text
 
@@ -637,8 +549,7 @@ def test_acquisition_detection_matches_pre_fix_patterns(new, orig):
 
 
 def test_intersection_corpus_exercises_both_polarities():
-    """Equivalence alone would pass if every pattern matched nothing, so pin
-    that the corpus really does produce hits *and* misses."""
+    """Equivalence alone would pass if every pattern matched nothing, so pin the oracle's hits and misses."""
     both_hit = "companies backed by both SoftBank and Tiger Global"
     assert _ORIG_BOTH_AND_RE.search(both_hit)
     assert _ORIG_BOTH_AND_RE.sub(" ", both_hit) != both_hit
@@ -649,7 +560,6 @@ def test_intersection_corpus_exercises_both_polarities():
         "both companies are large",
         "all of the above",
         "startups that SoftBank and Tiger Global have both backed",
-        # "all" embedded in a larger word must not fire the `\ball` literal.
         "small allocations across the portfolio and the follow-on",
     ):
         assert _ORIG_BOTH_AND_RE.sub(" ", text) == text, text
@@ -667,10 +577,7 @@ def test_acquisition_corpus_exercises_both_polarities():
             assert not orig.search(text), text
 
 
-# One realistic multi-clause query per pattern, a few hundred characters each
-# with a connective span in the tens of characters -- the shape of query this
-# code is actually asked about. A bound that were set too low, or an escaping
-# mistake in the f-string (`{{0,N}}` -> a literal brace), shows up here.
+# The connective spans run to tens of characters, so a too-low bound or a literal-brace escape bug shows up here.
 _LONG_BOTH_AND = (
     "Among the Series B rounds announced across India and Southeast Asia this quarter, "
     "the two funds that showed up on the most term sheets were the ones backed by both "
@@ -715,59 +622,31 @@ def test_long_realistic_queries_still_match_exactly_as_before():
         (_LONG_BUYER_TRAILING, _ORIG_BUYER_TRAILING_RE),
     ):
         assert len(text) > 200, text
-        assert orig.search(text), text  # the fixture still drives the pattern
+        assert orig.search(text), text
         assert bool(query_intent._ACQUIRED_BY_RE.search(text)) == bool(_ORIG_ACQUIRED_BY_RE.search(text))
         assert bool(query_intent._BUYER_AUX_RE.search(text)) == bool(_ORIG_BUYER_AUX_RE.search(text))
         assert bool(query_intent._BUYER_TRAILING_RE.search(text)) == bool(_ORIG_BUYER_TRAILING_RE.search(text))
 
 
 def test_connective_gaps_are_bounded_and_groups_preserved():
-    """A stray `{{0,N}}` in an f-string would compile to a literal brace and
-    silently turn the gap back into a 1-char match, so assert the compiled
-    pattern really carries a bound, and that no unbounded gap survived.
-
-    The LOWER bound is per-pattern: `_ALL_OF_RE` needs `{1,N}` because its
-    pre-fix gap was one-or-more, and a zero floor there would widen the
-    matcher (see `_ALL_OF_RE`'s comment). The rest take `{0,N}`.
-    """
+    """Lower bound is per-pattern: _ALL_OF_RE needs {1,N} (its pre-fix gap was one-or-more); the rest {0,N}."""
     n = query_intent._MAX_CONNECTIVE_SPAN
     for new, orig in _SUB_PAIRS + _SEARCH_PAIRS:
         assert f"{{0,{n}}}" in new.pattern or f"{{1,{n}}}" in new.pattern, new.pattern
         assert ".*" not in new.pattern, new.pattern
         assert "*?" not in new.pattern, new.pattern
         assert new.groups == orig.groups, new.pattern
-    # Pin which patterns use which lower bound, so a blanket "make them all {0,N}"
-    # edit cannot silently reintroduce the widening.
     assert "{1," in query_intent._ALL_OF_RE.pattern
     assert "{0," in query_intent._BOTH_AND_RE.pattern
 
 
 def test_oracles_reproduce_pre_fix_reachability():
-    """The equivalence assertions are only as good as the frozen oracles, so
-    pin the oracles' own behaviour on inputs that DISCRIMINATE them from the
-    live patterns.
-
-    A previous version of this derived the expected oracle source from the
-    live pattern by string substitution. That certified a *transformation*
-    rather than a behaviour, and it was blind to the real defect: the live
-    `_ALL_OF_RE` gap had been changed from one-or-more to zero-or-more, which
-    that substitution happily "undid" back to `+?`, so the test stayed green
-    while the matcher had silently widened to match "all and".
-
-    Checking behaviour means an oracle that drifts -- in either direction, or
-    in the same direction as the live pattern -- fails here instead.
-    """
-    # `_ALL_OF_RE`'s prefix ends in a literal space, so a zero-width gap lets
-    # `\b(?:and|with)\b` match immediately after it. The pre-fix gap was
-    # one-or-more, so neither of these matched before the gap was bounded.
-    # These two are the ONLY discriminating inputs: "all of and" and the
-    # longer fixtures DO match pre-fix, because their gap is at least one
-    # character, so asserting they do not match would fail on correct code.
+    """Pin the oracles' own behaviour: one drifting the same way as the live pattern voids the equivalence."""
+    # The ONLY discriminating inputs: "all of and" and the longer fixtures DO match pre-fix (gap >= 1 char).
     for text in ("all and", "all with"):
         assert not _ORIG_ALL_OF_RE.search(text), text
         assert not query_intent._ALL_OF_RE.search(text), text
 
-    # ... and the over-tight-bound failure mode: matching nothing at all.
     for text in ("deals with all of A, B and C", "all of Acme, Beta and Gamma"):
         assert _ORIG_ALL_OF_RE.sub(" ", text) != text, text
         assert query_intent._ALL_OF_RE.sub(" ", text) == _ORIG_ALL_OF_RE.sub(" ", text), text
@@ -775,8 +654,6 @@ def test_oracles_reproduce_pre_fix_reachability():
         assert _ORIG_BOTH_AND_RE.sub(" ", text) != text, text
         assert query_intent._BOTH_AND_RE.sub(" ", text) == _ORIG_BOTH_AND_RE.sub(" ", text), text
 
-    # Each fixture is one the pre-fix pattern genuinely matched, so a broken
-    # oracle cannot hide behind "both sides are wrong in the same way".
     _POSITIVES = {
         "_ACQUIRED_BY_RE": (
             "the payments startup was bought by a consortium led by SoftBank, "
@@ -795,9 +672,7 @@ def test_oracles_reproduce_pre_fix_reachability():
         assert not _ORACLES_BY_NAME[name].search("the company acquired a stake in the market"), name
 
 
-# Pathological inputs: the repeated connective with the closing term left out,
-# so every one of the k literal start positions has to scan to the end of the
-# string. That is exactly the shape the unbounded gaps made quadratic.
+# Closing term left out so all k start positions scan to EOF -- the shape unbounded gaps made quadratic.
 _PATHOLOGICAL = (
     ("both_and", query_intent._BOTH_AND_RE, lambda n: "both " * n),
     ("all_of", query_intent._ALL_OF_RE, lambda n: "all bbbb " * n),
@@ -816,22 +691,9 @@ def _time_search(pat: re.Pattern, text: str, repeats: int) -> float:
 
 @pytest.mark.parametrize("name,pat,make", _PATHOLOGICAL, ids=[p[0] for p in _PATHOLOGICAL])
 def test_pathological_query_scales_linearly(name, pat, make):
-    """Each pattern is timed on its own: 8x the query must not cost ~64x the
-    time (quadratic). Bounding the gap caps the work per start position, so the
-    cost is linear in the query and the ratio sits near 8.
-
-    Per-pattern rather than summed -- summing lets four fixed patterns hide one
-    that is still quadratic, which is the exact regression this guards.
-
-    The small input is repeated so the denominator is a stable multi-call
-    number rather than a single sub-millisecond call, and the absolute ceiling
-    is seconds rather than milliseconds so a loaded CI box cannot fail on
-    scheduling noise. The growth ratio is the assertion that bites.
-    """
+    """Timed per pattern over min() of trials: summing hides a quadratic matcher; one trial admits CI noise."""
     small, large = 256, 2048
-    _time_search(pat, make(8), 1)  # warm up
-    # min() over trials: a scheduler hiccup can only ever add time, so taking
-    # the minimum keeps it out of the ratio.
+    _time_search(pat, make(8), 1)  # keep cold-start cost out of the ratio
     t_small = min(_time_search(pat, make(small), 3) for _ in range(3))
     t_large = min(_time_search(pat, make(large), 1) for _ in range(3))
     ratio = t_large / t_small

@@ -1,6 +1,7 @@
-"""LLM client tests: generate_answer/stream_answer retry, backoff, exhaustion,
-and error classification. The OpenAI-compatible client is mocked; backoff delays
-are asserted by recording asyncio.sleep calls instead of actually sleeping."""
+"""LLM client: generate_answer/stream_answer retry, backoff, exhaustion, errors.
+
+The client is mocked; backoff delays are asserted by recording asyncio.sleep.
+"""
 
 import asyncio
 
@@ -101,11 +102,12 @@ class _FakeStream:
 
 
 class _FakeCompletions:
-    """Mirrors chat.completions.create. ``side_effect`` items may be exceptions,
-    responses, or zero-arg callables returning a fresh stream. Side effects are
-    returned in order and wrap around once the list is exhausted, so a single
-    exception models permanent failure. Raises IndexError if configured with no
-    side effects at all."""
+    """Mirrors chat.completions.create.
+
+    ``side_effect`` items may be exceptions, responses, or zero-arg callables
+    returning a fresh stream; they are returned in order and wrap around once
+    exhausted, so a single exception models permanent failure.
+    """
 
     def __init__(self, side_effect):
         self.side_effect = list(side_effect)

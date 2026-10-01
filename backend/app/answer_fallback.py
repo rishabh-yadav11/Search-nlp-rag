@@ -10,9 +10,8 @@ _MONTH_NAMES = {
 
 
 def date_label(from_date: str | None, to_date: str | None) -> str | None:
-    """Human-readable label for an effective date window used by the note, or
-    None when the window isn't a plain month or year range. E.g. ('2025-01-01',
-    '2025-01-31') -> 'January 2025'; ('2025-01-01','2025-12-31') -> '2025'."""
+    """Human-readable label for an effective date window, or None when the window is not a plain
+    month or year range. E.g. ('2025-01-01','2025-01-31') -> 'January 2025'."""
     if not from_date or not to_date:
         return None
     m1 = re.match(r"^(\d{4})-(\d{2})-01$", from_date)
@@ -37,20 +36,18 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
 
 
 def results_are_weak(scores: list[float], limit: int | None = None) -> bool:
-    """True when fewer than `limit` of the top reranked scores exceed the
-    WEAK_RESULT_SCORE knob, i.e. retrieval is too weak to answer the query.
+    """True when fewer than ``limit`` of the top reranked scores exceed the WEAK_RESULT_SCORE knob.
 
-    ``limit`` defaults to the WEAK_RESULT_MIN_STRONG knob and is capped at the
-    number of available scores, never below 1: a topic with only 1-2 strong
-    matches in the corpus is NOT treated as weak — refusing to answer then
-    would suppress every narrow/niche question. The floor of 1 also keeps a
-    nonsensical WEAK_RESULT_MIN_STRONG (<= 0) from opening the gate on
+    ``limit`` defaults to the WEAK_RESULT_MIN_STRONG knob and is capped at the number of
+    available scores, never below 1: a topic with only 1-2 strong matches in the corpus is NOT
+    treated as weak, since refusing to answer then would suppress every narrow question. The
+    floor of 1 also keeps a nonsensical WEAK_RESULT_MIN_STRONG from opening the gate on
     everything. An empty scores list still counts as weak.
 
-    The knob names are spelled without their ``config.`` prefix on purpose:
-    tests/test_config_knobs.py counts a ``config.KNOB`` mention anywhere in the
-    source as a reader, so naming them in dotted form here would let this
-    docstring vouch for a knob whose live read had been deleted."""
+    The knob names are spelled without their dotted prefix on purpose: tests/test_config_knobs.py
+    counts a dotted mention anywhere in the source as a reader, so naming them in dotted form
+    here would let this docstring vouch for a knob whose live read had been deleted.
+    """
     if not scores:
         return True
     strong = sum(1 for s in scores if s > config.WEAK_RESULT_SCORE)
@@ -62,14 +59,10 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
     """Honest fallback for chat: never fabricates facts, mentions the query.
     With a date label, frames the result as a best-effort for that period."""
     if label:
-        # `n_weak` counts the sources actually retrieved, so the message must
-        # never advertise a count (or sources) that don't exist: with zero
-        # matches there is nothing below to check.
-        #
-        # Defensive branch: the only production caller (chat.py) returns early
-        # on an empty source list, so it always passes n_weak >= 1. Kept
-        # because this function is public and any caller may pass 0 — the
-        # wording therefore claims no count and references no source.
+        # `n_weak` counts the sources actually retrieved, so the message must never advertise a
+        # count (or sources) that don't exist. Defensive branch: the only production caller
+        # returns early on an empty source list, but this function is public, so any caller may
+        # pass 0.
         if n_weak <= 0:
             return (
                 f"I couldn't find any articles matching '{query}' for {label}. "
@@ -105,13 +98,12 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
 
 
 def weak_results_note(scores: list[float], label: str | None = None) -> str | None:
-    """Short annotation for /search when results are weak, else None. With a
-    date label the note is framed as a best-effort for that period.
+    """Short annotation for /search when results are weak, else None; with a date label the note
+    is framed as a best-effort for that period.
 
-    ``results_are_weak`` still reports an empty score list as weak — chat relies
-    on that to refuse to answer instead of guessing — but the note must not then
-    claim to be showing matches that do not exist, so the empty case gets its
-    own honest wording."""
+    ``results_are_weak`` reports an empty score list as weak -- chat relies on that to refuse to
+    answer -- but the note must not claim to be showing matches that do not exist, so the empty
+    case gets its own honest wording."""
     if not results_are_weak(scores):
         return None
     if not scores:

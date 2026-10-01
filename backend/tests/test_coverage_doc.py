@@ -1,22 +1,15 @@
 """Check TEST_COVERAGE_GAPS.md against itself, in about a second.
 
-The document used to quote one headline percentage that nothing re-measured, so
-it was free to rot (issue #295). `scripts/measure_coverage.py` re-measures and
-fails on drift, but it costs a full instrumented suite run -- two minutes -- and
-it only tells you the document is wrong, not which number.
-
-These tests are the cheap half. They import nothing from `app`, run nothing,
-read no environment, and check the document's own claims against each other and
-against the real source files on disk: a percentage has to follow from that
-row's statements and missed count, the missed count has to equal the line
+`scripts/measure_coverage.py` re-measures the document and fails on drift, but
+it costs a full instrumented suite run and only tells you the document is
+wrong, not which number. These tests are the cheap half: they import nothing
+from `app`, run nothing, and check the document's own claims against each other
+and against the real source files on disk -- a percentage has to follow from
+that row's statements and missed count, the missed count has to equal the line
 numbers the row lists, the totals have to equal the sum of the table, the
 "uncovered error handling" bullets have to equal the `except`/`raise` lines
-among the uncovered lines, and every hand-written gap entry has to repeat its
-table row exactly and cite only lines that are actually uncovered.
-
-A hand-edited number breaks exactly one of those, and the failure message names
-the line and the expected value. `measure_coverage.py` remains the authority
-for whether the numbers match a real run.
+among the uncovered lines, and every gap entry has to repeat its table row
+exactly and cite only lines that are actually uncovered.
 
 The document and `app/` are resolved from this file, never from the working
 directory, so the result does not depend on where pytest was started.
@@ -37,9 +30,8 @@ BACKEND = Path(__file__).resolve().parents[1]
 DOCUMENT = BACKEND / "TEST_COVERAGE_GAPS.md"
 APP = BACKEND / "app"
 
-# The block format has exactly one definition, in the gate: the writer, the
-# gate's own comparison and these tests all read the same constants and the same
-# line-compression helper, so a format change cannot be half-applied.
+# One definition of the block format, in the gate: the writer, the gate's own
+# comparison and these tests all read the same constants and helpers.
 _spec = importlib.util.spec_from_file_location(
     "measure_coverage", BACKEND / "scripts" / "measure_coverage.py"
 )
@@ -68,10 +60,8 @@ SUITE_RE = re.compile(
     r"^Suite: \d+ passed, \d+ skipped, \d+ failed, \d+ errors, \d+ xfailed, \d+ xpassed$"
 )
 # The entry prefix without the prose tail, so "no prose at all" is reported as
-# the missing prose it is rather than as an unparseable line. The figures are
-# followed by `.` or `:` -- a period introduces a sentence of prose, a colon
-# introduces the list of cited lines, and which one is used carries no claim the
-# machine has to check.
+# missing prose rather than as an unparseable line. A period introduces prose, a
+# colon the list of cited lines; which is used carries no claim to check.
 GAP_PREFIX_RE = re.compile(
     r"^- `(?P<module>app/[^`]+\.py)` — (?P<percent>\d+\.\d)% "
     r"\((?P<missed>\d+)/(?P<statements>\d+) statements uncovered\)[.:](?P<rest>.*)$"
@@ -81,8 +71,7 @@ TABLE_ROW_RE = gate.ROW_RE
 CITATION_RE = gate.LINE_CITATION_RE
 MODULE_REF_RE = re.compile(r"\bapp/[\w./]+\.py\b")
 PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s*%")
-# Values that differ per machine or per run. The block has to be identical on
-# every checkout, so none of these may appear anywhere in it.
+# Values that differ per machine or per run; the block must be identical on every checkout.
 ENVIRONMENT_VALUE_RES = (
     re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
     re.compile(r"\b[0-9a-f]{40}\b"),
@@ -255,8 +244,7 @@ def _gap_entries(section: Section) -> tuple[list[GapEntry], list[str]]:
                 percent=entry.percent,
                 missed=entry.missed,
                 statements=entry.statements,
-                # A long entry's prose wraps onto its continuation lines, so what
-                # counts as the prose is everything after the figures.
+                # A long entry's prose wraps onto its continuation lines.
                 prose=f"{entry.prose} {line.strip()}".strip(),
                 line_number=entry.line_number,
                 text=f"{entry.text} {line.strip()}",
@@ -268,9 +256,6 @@ def _gap_entries(section: Section) -> tuple[list[GapEntry], list[str]]:
             )
             open_index = None
     return entries, errors
-
-
-# --------------------------------------------------------------------------
 
 
 def test_document_declares_both_machine_verified_blocks():
@@ -321,14 +306,9 @@ def test_generated_block_is_machine_written():
 def test_generated_block_carries_no_environment_specific_values():
     """No date or commit SHA, and no version outside the one `Measured with:` line.
 
-    The block must be identical on every checkout so a diff means the document
-    rotted. That is true of everything here except the interpreter, and the
-    interpreter was the one thing that had to be recorded: statement counts are
-    parser-dependent (the same source yields 5135 statements under 3.11 and
-    5073 under 3.14), so a block written on 3.14 and compared on CI's 3.11 was a
-    62-statement diff whose cause appeared nowhere. Recording it converts an
-    unreadable diff into a named mismatch, and the gate now fails with that
-    name instead of the arithmetic.
+    Statement counts are parser-dependent, so the interpreter is the one value
+    that has to be recorded: recording it turns an unreadable numeric diff into
+    a named mismatch.
     """
     section = _coverage_section()
     measured = [
@@ -613,11 +593,9 @@ def _counts(passed: int, failed: int = 0, errors: int = 0) -> dict:
 def test_a_stale_document_can_actually_be_regenerated():
     """`--write` must not be blocked by the very staleness it exists to repair.
 
-    The block is generated and `tests/test_coverage_doc.py` polices it, so a
-    stale document fails those tests -- and they are part of the run that
-    produces the measurement. Treating that as a broken measurement deadlocks
-    the gate: `--write` exits 2, the document is never touched, and the only
-    way out is moving the test file aside by hand.
+    A stale document fails the tests in this file, and they are part of the run
+    that produces the measurement; treating that as a broken measurement would
+    deadlock the gate.
     """
     output = (
         "FAILED tests/test_coverage_doc.py::test_overall_line_agrees_with_the_table\n"
@@ -660,7 +638,7 @@ def test_a_broken_measurement_is_never_tolerated(summary, counts, why):
     """Fail closed: `--write` must leave the document alone for anything else.
 
     A gate that writes the block from a run it could not vouch for is worse
-    than no gate, so every other reason a run can be red has to be refused.
+    than no gate.
     """
     assert gate.staleness_failures(summary, counts) is None, why
 
@@ -670,9 +648,7 @@ def test_gate_refuses_to_run_off_the_target_interpreter(monkeypatch, capsys):
 
     Statement counts are interpreter-dependent -- 3.11 and 3.14 disagree on
     byte-identical source -- so a `--write` from the wrong interpreter produces
-    a document that passes locally and is rejected by CI. That is how this gate
-    stayed red on every push to main, so the refusal is checked here rather
-    than left to a comment describing an intent the code does not enforce.
+    a document that passes locally and is rejected by CI.
     """
     monkeypatch.setattr(gate.sys, "version_info", (3, 14, 7, "final", 0))
     assert gate.main([]) == 3
@@ -686,8 +662,8 @@ def test_measured_with_comparison_ignores_the_coverage_version():
     """Only the interpreter decides a match; the tool version is provenance.
 
     The coverage.py version is recorded so a reader can tell what produced the
-    block, but it was measured to make no difference to statement counts, so
-    comparing it would report a mismatch that is not one.
+    block, but it makes no difference to statement counts, so comparing it would
+    report a mismatch that is not one.
     """
     matched = gate.MEASURED_WITH_RE.match("Measured with: Python 3.11.16, coverage 7.16.2")
     assert matched is not None

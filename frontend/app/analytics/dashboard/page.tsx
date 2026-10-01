@@ -20,18 +20,9 @@ interface Summary {
   click_top_queries: [string, number][]
 }
 
-// The first element of each top-query row is an opaque per-query DIGEST
-// (`q1:` + 32 hex chars), never the search text. A query is user-authored
-// content and these sets aggregate by query text, so the backend used to hand
-// this table a harvested corpus of what every user searched (#348). Counts and
-// ranking still work because the digest is stable per query; there is no text
-// to show and none to "helpfully" recover.
+// Row[0] is an opaque keyed digest, never the query text: a bare hash of a
+// short query is reversible offline by anyone who can read this dashboard.
 
-// The first element of each chat row is the OPAQUE session id, never the
-// session title. The title is the first 60 characters of the user's own
-// question, so surfacing it here would leak one user's message text to every
-// `analytics:read` holder. The backend sends the id instead; do not
-// "helpfully" render a title here — there isn't one to render.
 type ChatRow = [sessionId: string, messages: number, cost: number, updatedAt: number]
 type ChatTokenRow = [sessionId: string, messages: number, tokens: number, updatedAt: number]
 
@@ -55,17 +46,10 @@ function pct(v: number | null | undefined): string {
   return v == null ? '0%' : `${v}%`
 }
 
-// One analytics feed, or the reason it could not be read. A degraded feed is
-// never rendered as data: the backend's counters are legitimately all zero on a
-// quiet day, so a feed that failed to load must be shown as failed (#281).
+// A failed feed is never rendered as zeros, which are the legitimate state of a quiet day.
 type Feed<T> = { data: T } | { degraded: string }
 
-/**
- * Classify one analytics response. The 503 status is the primary signal; the
- * `error` key in the body is checked as well, because a body carrying `error`
- * with a 200 is precisely the failure this guards against, and because an
- * intermediary may rewrite the status line.
- */
+/** A 200 carrying `error` is a failure, not data. */
 async function readFeed<T>(res: Response, label: string): Promise<Feed<T>> {
   if (!res.ok) return { degraded: `${label} (HTTP ${res.status})` }
   let body: unknown
@@ -140,14 +124,8 @@ function ChatTable({
       </thead>
       <tbody>
         {rows.map(([sessionId, msgs, value, ts]) => (
-          // Keyed by the session id, never the timestamp: a session updated
-          // twice within one poll would otherwise remount the row and lose
-          // whatever the cell holds.
           <tr key={sessionId}>
-            {/* A non-identifying surrogate for the conversation: a short
-                prefix is enough to correlate rows, and the full id lives in
-                the `title` attribute so an admin can still copy it. The
-                conversation text itself must never reach this table. */}
+            {/* Surrogate only: the conversation text behind this id must never reach the table. */}
             <td title={sessionId}>Session {sessionId.slice(0, 8)}</td>
             <td className="num">{fmt(msgs)}</td>
             <td className="num">{cost ? formatCost(value) : fmt(value)}</td>
@@ -165,33 +143,19 @@ export default function AnalyticsDashboardPage() {
   const [updated, setUpdated] = useState('loading…')
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
-  // The signed-in user, shared with the top bar so it does not run a second
-  // `/api/auth/me` of its own. `load` below resolves it from the same call the
-  // admin gate uses. Seeded `undefined` so the bar renders no account control
-  // until the identity check answers, rather than flashing "Sign in" at a
-  // signed-in admin.
   const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
 
-  // Which feeds the last poll could not read, and why. A feed listed here is
-  // NOT rendered as zeros: the page shows an explicit unavailable state in its
-  // place, so a dead store is never mistaken for a quiet day (#281).
   const [degraded, setDegraded] = useState<{ summary: string | null; chat: string | null }>({
     summary: null,
     chat: null,
   })
 
-  // Tracks the in-flight load so a polling tick can't race a previous
-  // load still running, and so we can abort the request on unmount.
   const inFlight = useRef(false)
   const controllerRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
   const FETCH_TIMEOUT_MS = 15000
   const GETME_TIMEOUT_MS = 10000
 
-  // Races the given promise against a timeout. Resolves with `{ timedOut: true }`
-  // if the promise doesn't settle in time (so a hung getMe can't keep inFlight
-  // stuck true forever), otherwise returns the resolved value. The dangling
-  // timer is always cleared once the wrapped promise settles.
   function withTimeout<T>(p: Promise<T>, ms: number): Promise<{ timedOut: true } | { timedOut: false; value: T }> {
     let timer: ReturnType<typeof setTimeout>
     const onTimeout = new Promise<{ timedOut: true }>((resolve) => {
@@ -211,38 +175,26 @@ export default function AnalyticsDashboardPage() {
   }
 
   async function load() {
-    // Skip a poll if a previous load is still in flight; we never want
-    // two overlapping fetches overwriting each other.
     if (inFlight.current) return
     inFlight.current = true
     const controller = new AbortController()
     controllerRef.current = controller
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     try {
-      // Guard against a hung getMe: race it with a timeout, and release
-      // inFlight below regardless of how this resolves.
       const meResult = await withTimeout(getMe(false, controller.signal), GETME_TIMEOUT_MS)
       if (meResult.timedOut) {
-        // Abandoning the promise is not enough: abort so the in-flight
-        // `/api/auth/me` socket actually closes. Without this the request
-        // outlives the race while `inFlight` is already released below.
         controller.abort()
         if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
         return
       }
       const user = meResult.value
       if (!user) {
-        // A genuine auth rejection (401 / no session). A network failure never
-        // reaches here: getMe rethrows it, and it is surfaced as an error below
-        // rather than being mistaken for a logout.
         redirectToLogin('/analytics/dashboard')
         return
       }
       if (!mountedRef.current) return
       setMe(user)
-      // Client-side admin gate is a UX convenience only. Authoritative
-      // enforcement happens in the backend API (which rejects non-admin
-      // requests), so this check can never be the source of truth.
+      // Non-admins get the forbidden panel; the API is the authoritative gate, so hiding data here is UX only.
       if (user.role !== 'admin') {
         if (mountedRef.current) setForbidden(true)
         return
@@ -261,8 +213,6 @@ export default function AnalyticsDashboardPage() {
         readFeed<ChatStats>(cRes, 'Chat analytics'),
       ])
       if (!mountedRef.current) return
-      // A feed that failed is dropped, not kept: stale figures from an earlier
-      // poll must not sit under a fresh-looking "Updated" stamp either.
       setSummary('data' in sFeed ? sFeed.data : null)
       setChat('data' in cFeed ? cFeed.data : null)
       setDegraded({
@@ -276,7 +226,6 @@ export default function AnalyticsDashboardPage() {
         setUpdated(`Updated ${formatClockTime(Date.now())}`)
       }
     } catch (e) {
-      // An aborted fetch (timeout/unmount) shouldn't clobber the UI with an error.
       if ((e as Error).name === 'AbortError') return
       if (mountedRef.current) setError(`Analytics unavailable: ${(e as Error).message}`)
     } finally {
@@ -292,7 +241,6 @@ export default function AnalyticsDashboardPage() {
     return () => {
       mountedRef.current = false
       clearInterval(t)
-      // Abort any in-flight load so an unmounted component never sets state.
       controllerRef.current?.abort()
     }
   }, [])
@@ -366,8 +314,6 @@ export default function AnalyticsDashboardPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {/* The backend owns this bound: it returns exactly
-                            CLICK_POSITION_MIN..CLICK_POSITION_MAX, so don't cap here. */}
                         {Object.entries(d.click_positions)
                           .sort(([a], [b]) => Number(a) - Number(b))
                           .map(([k, n]) => (

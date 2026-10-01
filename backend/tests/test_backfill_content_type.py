@@ -34,7 +34,7 @@ class _FakeQdrant:
         self.index_calls: list[tuple[str, str]] = []
 
     def scroll(self, *, limit, with_payload, with_vectors, offset, **kwargs):
-        # One page is enough: the fake collection is small and a second page
+        # One page is enough: the fake collection is small, and a second page
         # would not be returned by the real API either (no next offset).
         field = with_payload[0]
         pts = [
@@ -76,9 +76,8 @@ def test_backfill_writes_the_value_from_mysql():
 def test_backfill_is_idempotent_across_runs():
     """The second run finds nothing to do and writes nothing.
 
-    This is the property that makes the script safe to rerun in production, so
-    it is asserted by actually running the pass twice over one collection
-    rather than by inspecting a flag.
+    Asserted by running the pass twice over one collection, not by inspecting
+    a flag -- that is what makes the script safe to rerun in production.
     """
     client = _FakeQdrant({1: {"title": "a"}, 2: {"title": "b"}, 3: {"title": "c"}})
     records = {1: {"content_type": "Interview"}, 2: {"content_type": ""}, 3: {"content_type": "Article"}}
@@ -96,13 +95,8 @@ def test_backfill_is_idempotent_across_runs():
 
 
 def test_backfill_treats_an_empty_stored_value_as_already_backfilled():
-    """Key presence, not truthiness, is the marker.
-
-    Point 2's MySQL value is genuinely empty, so the backfill stores an empty
-    string. A test that treated that as "still missing" would rewrite it on
-    every run; key presence is what stops that while still backfilling points
-    that have no key at all.
-    """
+    """Key presence, not truthiness, is the marker: point 2's empty string is a
+    genuine value, and rewriting it every run would never converge."""
     client = _FakeQdrant({2: {"content_type": ""}, 5: {"title": "e"}})
 
     pending = list(scroll_points_missing_content_type(client))
@@ -113,9 +107,7 @@ def test_backfill_treats_an_empty_stored_value_as_already_backfilled():
 def test_backfill_matches_the_writer_for_a_missing_mysql_value():
     """No content_type in MySQL stores "", the same value make_point would.
 
-    If the backfill stored None where the writer stores "", a collection would
-    end up with a mixed-type field and the two halves would disagree about what
-    an article with no content type looks like.
+    Storing None where the writer stores "" would make the field mixed-type.
     """
     client = _FakeQdrant({9: {}})
     records = {9: {}}  # row present, content_type column NULL
@@ -147,10 +139,9 @@ def _async_records(records):
 def test_dry_run_writes_nothing_and_creates_no_index(monkeypatch):
     """--dry-run is a strictly read-only rehearsal.
 
-    It must not only skip set_payload but also skip create_payload_indexes:
-    creating a payload index mutates the collection schema, so a "rehearsal"
-    that indexes fields is not a rehearsal. The counts and log line would still
-    look right either way, so this asserts the absence of both kinds of write.
+    It must skip create_payload_indexes too: creating a payload index mutates
+    the collection schema, and the counts and log line would look right either
+    way, so this asserts the absence of both kinds of write.
     """
     client = _FakeQdrant({1: {}, 2: {}})
     monkeypatch.setattr(bct, "QdrantClient", lambda *a, **k: client)
@@ -165,11 +156,9 @@ def test_dry_run_writes_nothing_and_creates_no_index(monkeypatch):
 
 
 def test_a_real_run_creates_the_content_type_index(monkeypatch):
-    """The real run indexes the field it just backfilled, so it is filterable.
-
-    A collection built before content_type existed has no index for it, so
+    """A collection built before content_type existed has no index for it, so
     backfilling the payload alone would leave the values unfiltersable until a
-    separate rebuild. The run creates the index as part of the same step.
+    separate rebuild.
     """
     client = _FakeQdrant({1: {}})
     monkeypatch.setattr(bct, "QdrantClient", lambda *a, **k: client)
@@ -209,9 +198,8 @@ def test_content_type_payload_index_is_created():
 def test_every_field_the_search_can_filter_on_has_a_payload_index():
     """Drift guard: the indexed set must cover every key build_facet_filter uses.
 
-    The keys are read back out of the Filter the real read path builds, rather
-    than restated here, so adding a new facet filter without indexing its field
-    fails this test instead of shipping an unfilterable facet.
+    The keys are read back out of the Filter the real read path builds, so a new
+    facet filter without an indexed field fails here.
     """
     from app.main import build_facet_filter
 

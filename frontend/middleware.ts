@@ -1,17 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { devApiBase, readApiBaseEnv, sanitizeApiBaseOrigin } from './app/lib/api-base'
 
-// The connect-src API base, the dev-loopback fallback and the validity rule
-// all come from `app/lib/api-base.ts` — the same module `app/lib/auth.ts`
-// resolves its request base from. This file used to carry its own
-// `sanitizeApiBase`, its own `NEXT_PUBLIC_API_BASE` read and its own
-// `'http://localhost:8001'` literal, and its copy accepted a base with
-// embedded credentials that the browser-side validator rejected.
-
-// The base still goes through `sanitizeApiBaseOrigin`, which returns a bare
-// origin and `''` for anything unusable, because a `connect-src` source is an
-// origin list: never emit an operator- or attacker-influenced value into a
-// CSP directive.
+// The connect-src API base, the dev-loopback fallback and the validity rule all
+// come from `app/lib/api-base.ts` — the same module `app/lib/auth.ts` resolves
+// its request base from. The base still goes through `sanitizeApiBaseOrigin`,
+// which returns a bare origin and `''` for anything unusable, because a
+// `connect-src` source is an origin list: never emit an operator- or
+// attacker-influenced value into a CSP directive.
 
 const buildCsp = (nonce: string, apiBase: string, devLoopback: string) => {
   const connectSrc = ["'self'", apiBase, devLoopback].filter(Boolean).join(' ')
@@ -32,10 +27,8 @@ const buildCsp = (nonce: string, apiBase: string, devLoopback: string) => {
 export function middleware(request: NextRequest) {
   const nonce = crypto.randomUUID()
   const apiBase = sanitizeApiBaseOrigin(readApiBaseEnv())
-  // Emit the dev loopback origin only in development and only when no API base
-  // is configured, so production CSP stays locked to 'self' (or the configured
-  // origin) and never whitelists an extra loopback endpoint. `devApiBase()`
-  // already yields '' outside development.
+  // Emit the dev loopback origin only in development and only when no API base is
+  // configured, so production CSP never whitelists an extra loopback endpoint.
   const devLoopback = !apiBase ? sanitizeApiBaseOrigin(devApiBase()) : ''
 
   const csp = buildCsp(nonce, apiBase, devLoopback)

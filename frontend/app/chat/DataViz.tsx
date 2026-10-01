@@ -25,10 +25,9 @@ import {
   YAxis,
 } from 'recharts'
 
-// The dataviz accept/reject grammar — fence, missing-value tokens, numeric
-// coercion, value-column selection — lives in datavizContract.ts, which the
-// backend executes through node in its cross-language contract test so the two
-// validators cannot drift apart (#267). Only rendering lives here.
+// The accept/reject grammar lives in datavizContract.ts, which the backend
+// executes through node so the two validators cannot drift apart. Only
+// rendering lives here.
 import { isMissing, toNum } from './datavizContract'
 import type { DataVizBlock } from './datavizContract'
 
@@ -36,7 +35,6 @@ import type { DataVizBlock } from './datavizContract'
 export type { DataVizBlock } from './datavizContract'
 export { parseDataViz, splitContent } from './datavizContract'
 
-// Labels come from the first column that is not the value column.
 function labelColumnIndex(columns: string[], valueColumn: number | null): number {
   const v = valueColumn ?? 0
   const j = columns.findIndex((_, k) => k !== v)
@@ -65,8 +63,6 @@ function trim(v: number): string {
   return Number.isInteger(s) ? String(s) : String(s)
 }
 
-// Recharts data mapping
-
 function chartData(block: DataVizBlock): { label: string; value: number | null }[] {
   const { rows, value_column: vc, columns } = block
   const v = vc ?? 0
@@ -79,16 +75,12 @@ function chartData(block: DataVizBlock): { label: string; value: number | null }
 const VALUE_KEY = 'value'
 const LABEL_KEY = 'label'
 
-// Colors
-
 const COLORS = [
   '#0072b2', '#e69f00', '#009e73', '#d55e00', '#cc79a7', '#56b4e9',
   '#007777', '#e07b00', '#332288', '#44aa99', '#882255', '#88ccee',
   '#6699cc', '#aa4499', '#117733', '#ddaa33', '#55aa77', '#bb5566',
   '#336699', '#cc6600', '#2299aa', '#ee7733', '#6b4a99', '#446688',
 ]
-
-// Charts
 
 function BarChart({ block }: { block: DataVizBlock }) {
   const data = chartData(block)
@@ -207,8 +199,6 @@ function PieChart({ block }: { block: DataVizBlock }) {
   )
 }
 
-// Table
-
 const TABLE_PAGE_SIZE = 25
 const TABLE_PAGINATE_AT = 50
 const PIE_LABEL_MIN_PCT = 5
@@ -295,8 +285,6 @@ function TableView({ block }: { block: DataVizBlock }) {
     </div>
   )
 }
-
-// Main component
 
 function RenderView({ block, view }: { block: DataVizBlock; view: NonNullable<DataVizBlock['view']> }) {
   switch (view) {

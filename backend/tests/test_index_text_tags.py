@@ -1,10 +1,8 @@
-"""tag_names: the MySQL tag column, from row to embedded text.
+"""``tag_names``: the MySQL tag column, from row to embedded text.
 
-Tags are the one facet that also enters the *embedded* text (_lead), so a tag
-edit changes a point's vectors, not only its payload. What these tests pin is
-therefore the re-index contract as much as the storage one: an article tagged
-in MySQL but indexed without its tags is invisible to a tag filter, and no
-later repair fixes it.
+Tags are the one facet that also enters the *embedded* text, so an article
+tagged in MySQL but indexed without its tags is invisible to a tag filter and
+no later repair fixes it.
 """
 
 from app.index_text import compose_dense_text, compose_sparse_text, record_from_row
@@ -60,9 +58,8 @@ def test_tags_reach_both_embedded_texts():
 
 
 def test_tags_follow_dealtype_in_the_lead():
-    """Ordering is the contract for the lead: a tag is appended last, after the
-    other facets, so it can never displace the title or the facet values the
-    embedder's truncation is meant to protect."""
+    """A tag is appended last, so it can never displace the title or the facet
+    values the embedder's truncation is meant to protect."""
     rec = record_from_row(_row(tag_names="VCC Startups"))
 
     lead = compose_dense_text(rec)

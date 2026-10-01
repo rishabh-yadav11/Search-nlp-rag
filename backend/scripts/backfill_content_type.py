@@ -1,30 +1,21 @@
-"""One-off backfill: populate the `content_type` payload field for Qdrant points
-that were indexed before any write path stored it.
+"""One-off backfill: populate the `content_type` payload field for points that
+were indexed before any write path stored it.
 
 `content_type` was produced by record_from_row and requested on every search
-read (`main._PAYLOAD_FIELDS` -> `SourceArticle.content_type`, plus the live
-facet vocabulary), but no write path persisted it, so the feature was dead end
-to end: every content-type filter matched nothing and the facet vocabulary was
-empty. make_point now stores it, so new and updated points carry the field.
-This script fixes the points that are ALREADY in the collection, in place, with
-no re-embedding and no collection rebuild — dense/sparse vectors are untouched
-because the payload is metadata only.
+read, but no write path persisted it, so the feature was dead end to end: every
+content-type filter matched nothing and the facet vocabulary was empty.
+make_point now stores it; this fixes the points already in the collection in
+place, with no re-embedding and no rebuild, since the payload is metadata only.
 
-Idempotent by stored VALUE, not key presence: a point is skipped when its
-payload's `content_type` is not None. So the empty string an article with no
-content type in MySQL legitimately gets is left alone and never rewritten, and a
-second run after a complete first run writes nothing. A stored JSON `null` is
-treated as missing and re-written to "" — that is deliberate, since make_point
-never stores null and normalising it is what keeps the KEYWORD-indexed field
-single-typed.
+Idempotent by stored VALUE, not key presence: a point whose `content_type` is
+not None is skipped, so the empty string an article with no content type
+legitimately gets is left alone and a second run writes nothing. A stored JSON
+`null` counts as missing and is rewritten to "", which is what keeps the
+KEYWORD-indexed field single-typed.
 
-Safe to rehearse: `--dry-run` reports what would change and touches nothing —
-it writes no payload AND creates no payload index (indexing is a schema change,
-so a rehearsal that indexes fields would not be a rehearsal).
-
-Usage:
-    python scripts/backfill_content_type.py --dry-run   # rehearse
-    python scripts/backfill_content_type.py             # apply
+Safe to rehearse: ``--dry-run`` reports what would change and touches nothing --
+it writes no payload AND creates no payload index, because indexing is a schema
+change and a rehearsal that mutates the schema is not a rehearsal.
 """
 import asyncio
 import os
@@ -49,7 +40,7 @@ BATCH_SIZE = 200
 
 def scroll_points_missing_content_type(client: QdrantClient) -> Iterator[int]:
     """Yield point IDs whose payload has no `content_type` key, one page at a
-    time, so the caller never holds the full id list in memory."""
+    time so the caller never holds the full id list in memory."""
     next_offset = None
     while True:
         pts, next_offset = client.scroll(
@@ -74,10 +65,9 @@ def set_content_type(
 ):
     """Set each point's own content_type, grouped by value.
 
-    set_payload applies the same payload dict to many points at once, so points
-    sharing a value go in a single call instead of one call per point. The
-    stored value is normalised the same way make_point normalises it, so a
-    backfilled point and a freshly written one are indistinguishable.
+    set_payload applies one payload dict to many points, so points sharing a
+    value go in a single call. Values are normalised exactly as make_point
+    normalises them, so a backfilled point is indistinguishable from a new one.
     """
     by_type: dict[str, list[int]] = {}
     for pid in batch:
@@ -102,12 +92,10 @@ def main():
 
     client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     try:
-        # A stored field is not filterable until it is indexed, and a collection
-        # built before this field existed has no index for it. Creating the
-        # indexes here means the backfilled values are immediately usable as a
-        # content-type filter, with no separate rebuild step.
-        # Skipped on --dry-run: creating an index mutates the collection, and a
-        # rehearsal that silently changes the schema is worse than no rehearsal.
+        # Index the fields here: a collection built before this field existed has
+        # no index for it, and the backfilled values are unusable as a filter
+        # until it does. Skipped on --dry-run, since indexing mutates the
+        # collection and a rehearsal that changes the schema is not a rehearsal.
         if dry_run:
             log("dry-run: no payload written and no payload index created")
         else:

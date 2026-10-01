@@ -16,14 +16,12 @@ from app.config import config
 def share_gate(total: int, min_share: float) -> int:
     """The click count an article must reach to count as the query's favourite.
 
-    Defined once, here, because ``scripts/click_boost_report.py`` scores the
-    stored per-query click tallies against this same rule to answer "how often
-    would a real clicked article actually clear the gate" (#391). A report
-    that computed the threshold its own way would be measuring a rule the
-    ranking path does not run, and the number it produced would be worthless.
+    Defined once, here, because ``scripts/click_boost_report.py`` scores the stored per-query
+    click tallies against this same rule to answer "how often would a real clicked article
+    actually clear the gate". A report that computed the threshold its own way would be
+    measuring a rule the ranking path does not run, and its number would be worthless.
 
-    ``round`` is Python's banker's rounding, unchanged: the two agree on every
-    exact ``.5`` because they are the same call.
+    ``round`` is Python's banker's rounding, unchanged.
     """
     return max(1, round(total * min_share))
 
@@ -36,18 +34,14 @@ def boosting_ids(
 ) -> set:
     """Ids in a per-query click tally that the boost would act on.
 
-    The same two-part test ``apply_click_boost`` applies per result: enough
-    clicks of the article's own, and enough of the query's total to be
-    believed. The share half is the one a single client cannot satisfy alone,
-    which is why the two are kept as two terms rather than folded together.
+    The same two-part test ``apply_click_boost`` applies per result: enough clicks of the
+    article's own, and enough of the query's total to be believed. The share half is the one a
+    single client cannot satisfy alone, which is why the two are kept as two terms.
 
-    The key type is left open because only the counts are read: the app keys
-    this by article id, and the ops report that scores the same tallies
-    (``scripts/click_boost_report.py``) keys them by the stored member.
-
-    Ids absent from the tally are not returned: with a positive
-    ``min_article`` they can never clear the count half anyway, so this agrees
-    with the ranking path for every policy the app ships or would sensibly run.
+    The key type is left open because only the counts are read: the app keys this by article id
+    and the ops report that scores the same tallies keys them by the stored member. Ids absent
+    from the tally are not returned -- with a positive ``min_article`` they can never clear the
+    count half anyway.
     """
     gate = share_gate(total, min_share)
     return {aid for aid, clicks in by_id.items() if clicks >= min_article and clicks >= gate}

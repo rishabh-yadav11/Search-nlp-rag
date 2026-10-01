@@ -1,7 +1,3 @@
-"""Diversity tests: MMR `diversify` short-circuit, the greedy MMR loop
-(sim_thresh floor, lam weighting, multi-chosen max_sim), the NaN early-stop,
-and the `_tokens` helper plus the shared `jaccard` it is paired with."""
-
 import itertools
 import logging
 import random
@@ -16,11 +12,7 @@ def _res(title, score):
 
 
 def _legacy_diversify(results, n, lam=0.7, sim_thresh=0.4):
-    """Reference implementation of the pre-#193 loop.
-
-    It popped the winning index out of ``order`` with ``list.remove`` (O(n) per
-    round). Selection must stay byte-for-byte identical to this.
-    """
+    """Golden reference loop; ``diversify`` must select identically."""
     if len(results) <= n:
         return list(results[:n])
     tok = [_tokens(r.title) for r in results]
@@ -53,16 +45,9 @@ def _legacy_diversify(results, n, lam=0.7, sim_thresh=0.4):
 
 
 def _ids(selected, results):
-    """Index of each selected result in ``results``, matched by identity.
-
-    ``list.index`` would match an equal-but-distinct result first and mask a
-    real ordering difference when two results share a title and a score.
-    """
+    """Index by identity; ``list.index`` matches equal-but-distinct results first."""
     by_id = {id(r): i for i, r in enumerate(results)}
     return [by_id[id(r)] for r in selected]
-
-
-# --- _tokens ---
 
 
 def test_tokens_splits_lowercases_and_strips_punctuation():
@@ -76,9 +61,6 @@ def test_tokens_empty_or_none_title_returns_empty():
     assert _tokens(None) == frozenset()
 
 
-# --- jaccard ---
-
-
 def test_jaccard_empty_set_returns_zero():
     assert jaccard(frozenset(), frozenset({"a"})) == 0.0
     assert jaccard(frozenset({"a"}), frozenset()) == 0.0
@@ -87,9 +69,6 @@ def test_jaccard_empty_set_returns_zero():
 
 def test_jaccard_overlap_ratio():
     assert jaccard(frozenset({"a", "b", "c"}), frozenset({"b", "c", "d"})) == 2 / 4
-
-
-# --- diversify short-circuit (line 34) ---
 
 
 def test_diversify_short_circuit_when_len_at_or_below_n():
@@ -103,17 +82,12 @@ def test_diversify_short_circuit_single_result_kept():
     assert diversify(results, 5) == results
 
 
-# --- diversify MMR loop (lines 38-59) ---
-
-
 def test_diversify_mmr_greedy_picks_diverse_over_similar_second():
     results = [
         _res("acme buys widget corp", 0.9),
         _res("acme buys widget corp again", 0.8),
         _res("completely different news story", 0.7),
     ]
-    # Pair jaccard 0.8 exceeds sim_thresh -> the similar-but-high-scoring r1 is
-    # penalised and the diverse r2 is chosen second.
     assert diversify(results, 2) == [results[0], results[2]]
 
 
@@ -123,8 +97,6 @@ def test_diversify_sim_thresh_floor_disables_penalty():
         _res("acme buys widget corp again", 0.8),
         _res("completely different news story", 0.7),
     ]
-    # Pair similarity (0.8) is below the 0.9 floor -> contributes 0 to the
-    # penalty, so relevance ordering wins: r1 over r2.
     assert diversify(results, 2, sim_thresh=0.9) == [results[0], results[1]]
 
 
@@ -134,6 +106,7 @@ def test_diversify_lam_one_is_pure_relevance():
         _res("acme buys widget corp again", 0.8),
         _res("completely different news story", 0.7),
     ]
+    # lam weights relevance: 1.0 is pure relevance, 0.0 pure diversity.
     assert diversify(results, 2, lam=1.0) == [results[0], results[1]]
 
 
@@ -143,8 +116,7 @@ def test_diversify_lam_zero_weights_only_diversity():
         _res("acme buys widget corp again", 0.8),
         _res("completely different news story", 0.7),
     ]
-    # sim all zero on the first pass -> strict > keeps the first result; then
-    # only the sim term (score weight 0) separates the rest.
+    # sim is 0 on the first pass, so strict > keeps the first candidate on ties.
     assert diversify(results, 2, lam=0.0) == [results[0], results[2]]
 
 
@@ -155,12 +127,7 @@ def test_diversify_mmr_loop_max_sim_over_multiple_chosen():
         _res("x y z", 0.7),
         _res("a b c e", 0.6),
     ]
-    # Third pick evaluates sim against both already-chosen indices; the best of
-    # the remaining similar articles (r1) is recovered after the diverse r2.
     assert diversify(results, 3) == [results[0], results[2], results[1]]
-
-
-# --- #193: no-mutation selection must keep the legacy order identical ---
 
 
 def test_diversify_matches_legacy_order_on_random_inputs():
@@ -188,7 +155,6 @@ def test_diversify_matches_legacy_order_on_random_inputs():
 
 
 def test_diversify_matches_legacy_order_on_every_permuted_case():
-    # Exhaustive over small inputs: distinct scores exercise the tie-breaks.
     vocab = ["a", "b", "c"]
     titles = [" ".join(p) for p in itertools.product(vocab, repeat=2)]
     for size in (3, 4):
@@ -226,18 +192,12 @@ def test_diversify_stops_after_all_candidates_when_n_exceeds_len():
     assert _ids(_legacy_diversify(results, 5), results) == [0, 1]
 
 
-# --- NaN early-stop (lines 92-104) ---
-
-
 def _warnings(caplog):
     return [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 def test_diversify_all_nan_scores_returns_empty_and_warns(caplog):
-    # NaN compares false against everything, so no candidate ever beats -inf
-    # and nothing is selected. The pre-#193 loop crashed here
-    # (``order.remove(-1)`` -> ValueError); on the /search read path a short
-    # list plus a warning is better than a failed request.
+    # NaN compares false against everything, so no candidate ever beats -inf.
     nan = float("nan")
     results = [_res("a b", nan), _res("a b c", nan), _res("x y", nan)]
     try:
@@ -254,8 +214,6 @@ def test_diversify_all_nan_scores_returns_empty_and_warns(caplog):
 
 
 def test_diversify_nan_remainder_stops_after_usable_scores_and_warns(caplog):
-    # The usable candidate is picked first; the NaN ones can never be, so
-    # selection stops at 1 of 3 instead of padding the tail with the sentinel.
     nan = float("nan")
     results = [
         _res("a b", 0.9),
@@ -270,8 +228,6 @@ def test_diversify_nan_remainder_stops_after_usable_scores_and_warns(caplog):
 
 
 def test_diversify_usable_scores_never_warn(caplog):
-    # Guards against the early-stop warning becoming noise on healthy input,
-    # None scores included (they are coerced to 0.0, not NaN).
     results = [
         _res("acme buys widget corp", 0.9),
         _res("acme buys widget corp again", 0.8),

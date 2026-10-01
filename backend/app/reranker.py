@@ -1,19 +1,14 @@
 """Cross-encoder reranker backed by a torch ``CrossEncoder``.
 
-This module used to try an ONNX fast path (optimum/onnxruntime) first and fall
-back to torch. That branch was removed: ``optimum-onnx`` pins
-``transformers<4.58`` while this project pins ``transformers==5.10.1`` for the
-CVE-2026-4372 / CVE-2026-5241 / CVE-2026-1839 fixes, so ``optimum`` is not
-installable here (see backend/requirements.txt). With optimum absent the branch
-could only ever raise a caught ``ImportError`` and log a fallback warning on
-every gunicorn worker at startup, so it was dead code that cost startup time
-and hid the real backend. The ONNX path may be reinstated if the transformers
-pin is ever relaxed enough for ``optimum-onnx`` to install.
+There is deliberately no ONNX fast path: ``optimum-onnx`` pins ``transformers<4.58`` while this
+project pins a much newer ``transformers`` for CVE fixes, so ``optimum`` is not installable here
+(see backend/requirements.txt). With optimum absent such a branch could only raise a caught
+``ImportError`` and log a fallback warning on every worker at startup. It may be reinstated if
+the pin is ever relaxed enough for ``optimum-onnx`` to install.
 
-``backend`` is accepted so callers can keep passing ``config.RERANK_BACKEND``;
-only ``"torch"`` is implemented. Any other value logs a warning and uses torch,
-so a stale ``RERANK_BACKEND=onnx`` in a deployment's environment degrades the
-same way the old fallback did instead of breaking startup.
+``backend`` is accepted so callers can keep passing ``config.RERANK_BACKEND``; only ``"torch"``
+is implemented, and any other value warns and uses torch so a stale ``RERANK_BACKEND=onnx``
+degrades instead of breaking startup.
 """
 
 import logging

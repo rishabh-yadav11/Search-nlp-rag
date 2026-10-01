@@ -1,6 +1,7 @@
-"""DenseEncoder tests: fastembed/ONNX fast-path init, torch fallback on load
-failure, and both encode branches. fastembed / sentence_transformers are faked
-in sys.modules so nothing downloads a model or runs real inference."""
+"""DenseEncoder: fastembed/ONNX fast-path init, torch fallback, encode branches.
+
+fastembed / sentence_transformers are faked in sys.modules so nothing
+downloads a model or runs real inference."""
 
 import sys
 import types
@@ -103,8 +104,7 @@ def test_init_fastembed_failure_falls_back_to_torch(monkeypatch):
 
 def test_encode_fastembed_generator_path():
     raw = np.array([0.1, 0.2])
-    # encode() L2-normalizes the fastembed vector before returning it, so the
-    # expectation is the raw generator output scaled to unit length.
+    # encode() L2-normalizes the fastembed vector before returning it.
     expected = raw / np.linalg.norm(raw)
     model_cls, fe_calls = _make_text_embedding(vectors=[raw])
     enc = DenseEncoder.__new__(DenseEncoder)

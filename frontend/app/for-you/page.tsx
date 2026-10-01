@@ -30,15 +30,14 @@ export default function ForYouPage() {
   const [feedType, setFeedType] = useState<FeedType>('personalized')
   const [coldStart, setColdStart] = useState(false)
   const [limit] = useState(20)
-  // Bumped by the error state's Retry button and part of the fetch effect's
-  // deps, so a retry re-runs the request with a fresh deadline.
+  // Bumped by Retry and in the fetch effect's deps, so a retry gets a fresh deadline.
   const [retryCount, setRetryCount] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
 
-    // The deadline aborts the socket on its own; `controller` still owns the
-    // unmount path, and only that path suppresses the state updates below.
+    // The deadline aborts the socket on its own; `controller` owns the unmount
+    // path, and only that path suppresses the state updates below.
     const deadline = createDeadline(RECOMMEND_DEADLINE_MS, controller.signal)
 
     const fetchFeed = async () => {
@@ -94,11 +93,9 @@ export default function ForYouPage() {
   }, [feedType, limit, retryCount])
 
   const handleInteraction = async (articleId: number | string, e: MouseEvent) => {
-    // Fire-and-forget, but still bounded: a hung beacon would otherwise hold
-    // its socket open indefinitely, and nothing here would ever release it.
-    // The session is an httpOnly cookie, so this POST is credentialed rather
-    // than header-bearing: `authRequestInit` attaches the cookie when API_BASE
-    // is a trusted backend and omits `credentials` when it is not.
+    // Fire-and-forget but bounded: nothing here would ever release a hung socket.
+    // The httpOnly session cookie makes this credentialed, not header-bearing:
+    // `authRequestInit` attaches the cookie only when API_BASE is a trusted backend.
     const deadline = createDeadline(RECOMMEND_DEADLINE_MS)
     try {
       await fetch(

@@ -1,13 +1,4 @@
-"""Tests for the per-request correlation id: middleware, log stamping and the
-top-level exception handlers.
-
-The apps under test are built locally (middleware + handlers, no lifespan) so the
-cases stay hermetic and independent of ``app.main``'s global state -- with two
-deliberate exceptions: ``test_real_app_search_qdrant_outage_is_500_with_a_request_id``
-and ``test_real_app_registers_the_middleware_and_stamps_a_response`` drive the
-REAL ``app.main.app``, so a regression that drops the wiring from ``main.py`` is
-caught here rather than in production.
-"""
+"""Per-request correlation id: middleware, log stamping and the top-level exception handlers."""
 
 import logging
 import os
@@ -57,7 +48,6 @@ def _build_app() -> FastAPI:
 
 
 class _ListHandler(logging.Handler):
-    """Collects records instead of rendering them."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.NOTSET)
@@ -69,20 +59,7 @@ class _ListHandler(logging.Handler):
 
 @pytest.fixture
 def log():
-    """Capture every record the request produces, stamped exactly as in prod.
-
-    #293's `configure_logging()` is what makes an INFO app record exist at all,
-    so it is called here rather than relied on from whatever a previous test
-    happened to import -- `app` lands at the app level, `app.access` and
-    `app.observability` with it, and the root logger stays at WARNING. It is a
-    process-wide change, so the previous state of every logger and of root is
-    snapshotted and put back afterwards.
-
-    The RequestIdFilter is attached to the capture handler exactly as
-    `attach_request_id_filter` attaches it to the app's real one, so a record
-    only carries `request_id` because the filter that ships in
-    app.observability put it there.
-    """
+    """Capture records; `configure_logging()` is process-wide, so its state is restored."""
     root = logging.getLogger()
     root_state = (root.level, list(root.handlers))
     loggers = {
@@ -137,8 +114,7 @@ def test_dependency_failure_is_500_with_the_id_and_leaks_nothing(log):
 
 
 class _VectorOnlyCache:
-    """Cache stand-in that answers the query-vector key and misses everything
-    else, so /search skips the encoders and goes straight to Qdrant."""
+    """Answers only the query-vector key, so /search skips the encoders and calls Qdrant."""
 
     def __init__(self):
         self.store: dict = {}
@@ -162,9 +138,7 @@ class _BoomQdrant:
 
 
 class _FakeRateRedis:
-    """In-memory limiter store: /search fails CLOSED with 503 when the limiter's
-    Redis is unreachable, which would make an outage test pass for the wrong
-    reason."""
+    """Must look reachable: /search fails CLOSED with 503 when the limiter's Redis is down, masking the Qdrant outage."""
 
     def __init__(self) -> None:
         self.counters: dict[str, int] = {}
@@ -182,8 +156,6 @@ def test_real_app_search_qdrant_outage_is_500_with_a_request_id(log, monkeypatch
 
     monkeypatch.setattr(auth, "_rate_client", _FakeRateRedis())
     monkeypatch.setattr(main, "cache", _VectorOnlyCache())
-    # state is a dict, so the qdrant client is swapped with setitem (the
-    # dict-aware form of setattr, and the one monkeypatch can undo).
     monkeypatch.setitem(main.state, "qdrant", _BoomQdrant())
 
     async def fake_record_search(*args, **kwargs):
@@ -233,8 +205,7 @@ class _Payload(BaseModel):
     @classmethod
     def _reject(cls, value: str) -> str:
         if value == "bad":
-            # A raw exception object lands in the pydantic error's `ctx`, which
-            # is what makes the stock 422 handler unserialisable.
+            # A raw exception in `ctx` makes the stock 422 handler unserialisable.
             raise ValueError("sentinel-validator-message")
         return value
 
@@ -255,8 +226,6 @@ def test_request_validation_error_stays_a_422(log):
     assert isinstance(body["detail"], list) and body["detail"]
     first = body["detail"][0]
     assert first["loc"][-1] == "name"
-    # `ctx` holds the raw exception object and `input` the rejected value;
-    # neither is guaranteed JSON-serialisable, so neither is echoed.
     assert set(first) <= {"type", "loc", "msg", "url"}
     assert "ctx" not in first and "input" not in first
     assert _errors(log) == []
@@ -298,10 +267,7 @@ def test_absent_request_id_is_generated_and_echoed(log):
         "x\nFAKE ERROR forged",
         "has space",
         "",
-        # Newline/CR on their own, with NO other disqualifying character: the
-        # cases above are rejected partly for their spaces, so they would still
-        # pass if someone widened the character class to admit CR/LF. These two
-        # are the log-forgery guard, tested by the guard alone.
+        # Bare newline/CR: the cases above also carry spaces, so these pin log forgery alone.
         "x\n",
         "x\rFORGED",
     ],
@@ -368,21 +334,13 @@ def test_a_normal_200_logs_exactly_one_access_record(log):
     assert "200" in message
     assert re.search(r"in \d+\.\d+ms", message)
     assert resp.headers[REQUEST_ID_HEADER] in message
-    # The field the shipped formatter interpolates, not just the text: the
-    # access line is emitted from the middleware's `finally`, where the
-    # ContextVar is already reset, so the id has to be passed explicitly or
-    # every access line would render the "no id" placeholder.
+    # Emitted from the middleware's `finally`, after the ContextVar reset, so the id is passed explicitly.
     assert access[0].request_id == resp.headers[REQUEST_ID_HEADER]
     assert _errors(log) == []
 
 
 def test_the_no_id_placeholder_is_not_usable_as_a_real_id(log):
-    """NO_REQUEST_ID means "no id bound" everywhere it is rendered.
-
-    A hyphen is inside the allowed character class, so the class alone does not
-    exclude it: without an explicit refusal a caller could label a live request
-    `-` and make it indistinguishable from a record emitted outside any request.
-    """
+    """`-` is inside the allowed character class, so the placeholder needs an explicit refusal."""
     assert not is_valid_request_id(NO_REQUEST_ID)
     app = _build_app()
 
@@ -416,10 +374,6 @@ def test_no_contextvar_leak_between_requests(log):
     assert second.headers[REQUEST_ID_HEADER] == "second-id"
     ours = [r for r in log if r.name.startswith("app.")]
     assert ours
-    # The ContextVar is already reset when the access line is emitted from the
-    # middleware's `finally`, so that record carries its id explicitly. What
-    # matters is that no record is stamped with, or names, the previous
-    # request's id.
     assert {r.request_id for r in ours} == {"second-id"}
     assert "first-id" not in "".join(r.getMessage() for r in log)
     assert current_request_id() == NO_REQUEST_ID
@@ -450,33 +404,20 @@ def test_streaming_response_keeps_every_chunk_and_the_id(log):
 
 
 def test_the_request_id_filter_extends_the_app_handler_and_never_stacks_one(log):
-    """#293's `configure_logging()` is the single owner of the root handler.
-
-    Correlation must extend that handler, not install a second one: two root
-    handlers write every record in the process twice, which is exactly the
-    single-write property #293 pins. So the filter goes on the handler
-    `installed_handler()` returns, and calling this twice still attaches one.
-    """
+    """Correlation extends `configure_logging()`'s root handler; a second one logs every record twice."""
     before = list(logging.getLogger().handlers)
 
     handler = attach_request_id_filter()
     again = attach_request_id_filter()
 
     assert handler is again is installed_handler()
-    # The root handler list is byte-for-byte what it was: this added a filter,
-    # not a handler, and it is a filter on the one #293 already installed.
     assert list(logging.getLogger().handlers) == before
     assert handler in before
     assert sum(isinstance(f, RequestIdFilter) for f in handler.filters) == 1
 
 
 def test_the_id_survives_into_the_line_the_app_handler_actually_renders(log):
-    """The filter sets a field; #293's format string renders no field.
-
-    What makes the id greppable in a shipped deployment is therefore the message
-    text, so this renders a captured record through the real handler's own
-    formatter and looks for the id in the output -- not on the record.
-    """
+    """The app format string renders no field, so the id must reach the line via the message text."""
     app = _build_app()
 
     @app.get("/boom")
@@ -490,10 +431,9 @@ def test_the_id_survives_into_the_line_the_app_handler_actually_renders(log):
     assert handler is not None
     rendered = "".join(handler.formatter.format(r) for r in log)
     assert rid in rendered
-    assert "Traceback" in rendered  # the traceback reaches the same line
+    assert "Traceback" in rendered
 
-# The script the fresh-interpreter ordering check runs: importing app.main is what
-# calls configure_logging() and then the correlation wiring, in that order.
+
 _PROBE = (
     "import logging\n"
     "from app import main  # the real import path: configure_logging, then the wiring\n"
@@ -509,22 +449,7 @@ _PROBE = (
 
 
 def test_the_real_import_path_actually_attaches_the_filter():
-    """The ordering constraint, pinned: the attach must happen AFTER #293 runs.
-
-    `configure_logging()` is called from `app.main` near the top of that module
-    and `installed_handler()` returns None before it, so a call site that
-    drifted above it would leave the filter permanently unattached and no app
-    line would carry an id -- silently, because every other case here would
-    still pass. That is the failure this turns into a red test.
-
-    Run in a fresh interpreter, deliberately: whether the filter is attached
-    depends on the ORDER of two module-level calls at import, and this test
-    session's own fixtures (mine and #293's) add and remove root handlers. An
-    in-process assertion would read whatever the previously-run test left
-    behind instead of the real import path. This is the same
-    fresh-interpreter technique `tests/test_api_surface_hardening.py` and
-    `tests/test_logging_config.py` already use for import-time behaviour.
-    """
+    """The attach must happen after `configure_logging()`, so the probe runs in a fresh interpreter."""
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     proc = subprocess.run(
         [
@@ -542,21 +467,11 @@ def test_the_real_import_path_actually_attaches_the_filter():
     assert "HANDLER True" in proc.stdout, proc.stdout
     assert "FILTERS 1" in proc.stdout, proc.stdout
     assert "ON_ROOT True" in proc.stdout, proc.stdout
-    # And still exactly one app handler: a second one would double every line.
     assert "APP_HANDLERS 1" in proc.stdout, proc.stdout
 
 
 def test_real_app_registers_the_middleware_and_stamps_a_response():
-    """main.py's own wiring, not a locally rebuilt copy of it.
-
-    The other cases build their app from the same three calls, so a regression
-    that changed the wiring itself -- dropping the middleware, or registering a
-    catch-all over HTTPException -- would leave every one of them green. This
-    pins the real app instead: the Exception handler must be ours, and
-    HTTPException must still be Starlette's own (a catch-all there would turn a
-    deliberate 404/401/429 into an opaque 500 and log a server fault for what
-    is a client error).
-    """
+    """main.py's own wiring, which `_build_app` only mirrors: HTTPException must stay Starlette's or a 404/401/429 becomes a 500."""
     from fastapi import applications as fastapi_applications
     from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -573,8 +488,6 @@ def test_real_app_registers_the_middleware_and_stamps_a_response():
     assert resp.status_code == 200
     assert _GENERATED_ID_RE.match(resp.headers[REQUEST_ID_HEADER])
 
-    # A route that does not exist is a client error and has to survive the
-    # catch-all untouched -- 404, not 500, and correlated like any response.
     missing = client.get("/definitely-not-a-route")
     assert missing.status_code == 404
     assert _GENERATED_ID_RE.match(missing.headers[REQUEST_ID_HEADER])

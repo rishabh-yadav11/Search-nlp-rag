@@ -1,15 +1,14 @@
 """Per-request correlation id: resolution, propagation and log stamping.
 
-One inbound or generated id follows a request end to end: it is echoed on the
-response as ``X-Request-ID``, carried in a ContextVar for every log record
-emitted downstream, and handed to the top-level exception handler so a bare
-``500 Internal Server Error`` can be traced back to the request that caused it.
+One inbound or generated id follows a request end to end: it is echoed on the response as
+``X-Request-ID``, carried in a ContextVar for every log record emitted downstream, and handed to
+the top-level exception handler so a bare ``500 Internal Server Error`` can be traced back to
+the request that caused it.
 
-The inbound header is honoured ONLY when it matches ``[A-Za-z0-9._-]{1,64}``.
-That restriction is a log-injection / header-spoofing guard, not cosmetics: a
-value carrying ``\\n`` would otherwise be echoed verbatim into a response header
-and stamped into a log line, letting a caller forge a whole log record (or
-smuggle a second header) with a single request.
+The inbound header is honoured ONLY when it matches ``[A-Za-z0-9._-]{1,64}``. That restriction is
+a log-injection / header-spoofing guard, not cosmetics: a value carrying ``\\n`` would otherwise
+be echoed verbatim into a response header and stamped into a log line, letting a caller forge a
+whole log record (or smuggle a second header) with a single request.
 """
 
 import logging
@@ -22,11 +21,10 @@ from typing import Any
 
 REQUEST_ID_HEADER = "X-Request-ID"
 REQUEST_ID_MAX_LEN = 64
-# Stands in for "no id bound", so a formatter can interpolate the field
-# unconditionally. It is a placeholder, NOT an id: `is_valid_request_id` refuses
-# it (a hyphen is inside the allowed character class, so the class alone does
-# not exclude it) and `scope_request_id` returns the empty string instead, so a
-# caller can tell "absent" from "present" everywhere.
+# Stands in for "no id bound", so a formatter can interpolate the field unconditionally. It is a
+# placeholder, NOT an id: `is_valid_request_id` refuses it (a hyphen is inside the allowed
+# character class, so the class alone does not exclude it) and `scope_request_id` returns the
+# empty string instead, so a caller can tell "absent" from "present" everywhere.
 NO_REQUEST_ID = "-"
 
 _REQUEST_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{1,64}\Z")
@@ -36,11 +34,10 @@ _request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 def is_valid_request_id(value: object) -> bool:
     """True only for a str of 1..64 chars drawn from ``[A-Za-z0-9._-]``.
 
-    Non-strings, empty strings, anything with whitespace/CR/LF/colon and
-    anything longer than 64 chars are rejected -- see the module docstring.
-    So is the ``NO_REQUEST_ID`` placeholder itself: accepting it would let a
-    caller label a live request with the very value that means "no id", making
-    the two indistinguishable in a log field.
+    Non-strings, empty strings, anything with whitespace/CR/LF/colon and anything longer than 64
+    chars are rejected -- see the module docstring. So is the ``NO_REQUEST_ID`` placeholder:
+    accepting it would let a caller label a live request with the value that means "no id",
+    making the two indistinguishable in a log field.
     """
     if not isinstance(value, str):
         return False
@@ -88,13 +85,12 @@ def scope_request_id(scope: MutableMapping[str, Any], *, assign: str | None = No
     """Read (and optionally seed) the id cached in ``scope["state"]``.
 
     ``scope["state"]`` survives the ContextVar reset: by the time Starlette's
-    ``ServerErrorMiddleware`` -- which sits OUTSIDE the user middleware stack and
-    therefore outside the ``bound_request_id`` block -- invokes the ``Exception``
-    handler, the id is only still available here.
+    ``ServerErrorMiddleware`` -- which sits OUTSIDE the user middleware stack and therefore
+    outside the ``bound_request_id`` block -- invokes the ``Exception`` handler, the id is only
+    still available here.
 
-    Returns ``""`` when no id is stored, so a caller can write the idiomatic
-    ``scope_request_id(scope) or resolve_request_id(None)``. It does NOT return
-    ``NO_REQUEST_ID``: ``"-"`` is truthy and would pass for a real id.
+    Returns ``""`` when no id is stored, never ``NO_REQUEST_ID``: ``"-"`` is truthy and would
+    pass for a real id.
     """
     state = scope.setdefault("state", {})
     stored = state.get("request_id")
@@ -109,10 +105,9 @@ def scope_request_id(scope: MutableMapping[str, Any], *, assign: str | None = No
 class RequestIdFilter(logging.Filter):
     """Stamp ``record.request_id`` unless the record already carries one.
 
-    An explicit ``extra={"request_id": ...}`` wins, so a caller that knows
-    better than the ambient ContextVar (a background job correlating several
-    requests, say) is never overwritten. Returns True for every record: the
-    field is decoration, and dropping records would hide real errors.
+    An explicit ``extra={"request_id": ...}`` wins, so a caller that knows better than the
+    ambient ContextVar is never overwritten. Returns True for every record: the field is
+    decoration, and dropping records would hide real errors.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

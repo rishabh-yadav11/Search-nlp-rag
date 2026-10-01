@@ -10,13 +10,8 @@ from app.redis_cache import HybridCache
 
 
 class _LatchClock:
-    """Callable stand-in for ``time.monotonic`` that moves only when told.
-
-    The cache's two latches rate-limit their lines against the clock, so a
-    test that has to separate two incidents by more than the re-announce
-    window would otherwise have to sleep. Injecting the clock makes that
-    explicit and keeps the tests hermetic.
-    """
+    """Callable stand-in for ``time.monotonic`` that advances only when told,
+    so latch-window tests never have to sleep."""
 
     def __init__(self, now: float = 0.0) -> None:
         self.now = now
@@ -29,13 +24,11 @@ class _LatchClock:
 
 
 def _cache_on(clock, **kwargs):
-    """A real HybridCache whose two latches read the injected clock.
+    """A real HybridCache with its two latches rebound to the injected clock.
 
-    ``HybridCache`` builds its latches with the real ``time.monotonic`` and
-    takes no clock argument, so the only way to keep a latch-policy test
-    hermetic is to rebind them on the real object. Nothing else is faked: the
-    logger is the module's own, so caplog sees exactly the records the
-    shipping code would emit.
+    ``HybridCache`` takes no clock argument, so rebinding after construction is
+    the only way to keep a latch-policy test hermetic; nothing else is faked,
+    so caplog sees exactly the records the shipping code would emit.
     """
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10, **kwargs)
     cache._conn_latch = DegradedLatch(redis_cache.logger, "cache Redis", now=clock)
@@ -59,9 +52,7 @@ class _FakeRedis:
 
     async def mget(self, keys, *_rest):
 
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls mget both as ``mget(keys)`` and ``mget(*keys)``.
 
         if isinstance(keys, str):
 
@@ -70,13 +61,10 @@ class _FakeRedis:
         else:
 
             keys = [*keys, *_rest]
-        # A Redis that is down fails every command, so the batched read must
-        # take the same degraded branch ``get`` does.
         raise self.error
 
     async def delete(self, *keys):
-        # A Redis that is down fails every command, not just reads and writes;
-        # without this the delete paths would raise AttributeError instead of
+        # Without this the delete paths would raise AttributeError instead of
         # taking the degraded branch they are meant to exercise.
         raise self.error
 
@@ -100,9 +88,7 @@ class _RecordingRedis:
 
     async def mget(self, keys, *_rest):
 
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls mget both as ``mget(keys)`` and ``mget(*keys)``.
 
         if isinstance(keys, str):
 
@@ -154,9 +140,7 @@ class _FlakyRedis(_RecordingRedis):
 
     async def mget(self, keys, *_rest):
 
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls mget both as ``mget(keys)`` and ``mget(*keys)``.
 
         if isinstance(keys, str):
 
@@ -211,8 +195,7 @@ def test_degraded_mode_falls_back_and_warns_once(caplog):
 
     _run(scenario())
 
-    # Five failing commands, one outage, one line. Both lines of the latch
-    # policy are WARNING, so no level override is needed to capture them.
+    # Both latch lines are WARNING, so no level override is needed to capture them.
     assert [r.levelname for r in caplog.records] == ["WARNING"]
     assert "Redis unavailable" in caplog.records[0].getMessage()
 
@@ -220,12 +203,10 @@ def test_degraded_mode_falls_back_and_warns_once(caplog):
 def test_degraded_latch_rearms_after_success(caplog):
     """A second outage in the same process must be announced again.
 
-    A plain "warn once" flag never cleared, so it silenced every later outage
-    for the lifetime of the worker; the latch re-arms on the first success.
-    Both lines are WARNING, so the messages carry the ordering proof. The two
-    incidents are separated by a clock jump past the re-announce window: a
-    second outage that arrives inside the window is deliberately swallowed as
-    a flap, which is what keeps a flapping cache off the log.
+    A one-way "warn once" flag silenced every later outage for the life of the
+    worker; the latch re-arms on the first success. The two incidents are
+    separated by a clock jump past the re-announce window, because a second
+    outage inside the window is deliberately swallowed as a flap.
     """
     clock = _LatchClock()
     cache = _cache_on(clock)
@@ -237,7 +218,7 @@ def test_degraded_latch_rearms_after_success(caplog):
     flaky.fail = False
     _run(cache.set("b", 2))
     flaky.fail = True
-    # Two incidents minutes apart, not one flap: the window has to pass.
+    # Past the window: a new incident, not a flap.
     clock.advance(REANNOUNCE_SECONDS + 1)
     _run(cache.set("c", 3))
 
@@ -270,11 +251,10 @@ class _FlakyCorruptRedis(_RecordingRedis):
 def test_decode_latch_is_independent_of_connection_latch(caplog):
     """A decode failure, a good decode, then a decode failure again == W, W, W.
 
-    The two latches must stay separate: if they shared state, a corrupt payload
-    would silence (or falsely recover) the connection incident. Both lines are
-    WARNING, so the messages carry the ordering proof. The clock jumps past
-    the re-announce window before the second corrupt payload, so the second
-    decode failure is a separate incident rather than a suppressed flap.
+    The two latches must stay separate: shared state would let a corrupt
+    payload silence (or falsely recover) the connection incident. The clock
+    jumps past the re-announce window before the second corrupt payload so it
+    is a separate incident, not a suppressed flap.
     """
     clock = _LatchClock()
     cache = _cache_on(clock)
@@ -297,24 +277,17 @@ def test_decode_latch_is_independent_of_connection_latch(caplog):
 def test_decode_latch_rearms_after_a_miss_between_two_corrupt_payloads(caplog):
     """A cache miss is a clean response, so it ends a corrupt-payload incident.
 
-    A miss decodes nothing, but the round trip succeeded. If the decode latch
-    only re-armed on a *successful* decode, a corrupt payload, then a miss,
-    then a second corrupt payload would log the second failure NEVER -- the
-    one-way latch this module exists to eliminate. The clock jumps past the
-    re-announce window between the two, because inside the window the second
-    corrupt payload is suppressed by design rather than by the re-arm.
+    A miss decodes nothing, but the round trip succeeded. A latch that
+    re-armed only on a *successful* decode would log the second corrupt
+    payload NEVER. The clock jumps past the re-announce window between them,
+    since inside it the second payload is suppressed by design.
     """
     clock = _LatchClock()
     cache = _cache_on(clock)
-    # ``_RecordingRedis`` answers an unstored key with None, so "absent" is a
-    # genuine miss rather than another undecodable payload.
     cache._redis = _RecordingRedis({"k": "{not json"})
 
-    # 1. Corrupt payload -> one decode warning, latch closes.
     assert _run(cache.get("k")) is None
-    # 2. A different key with nothing stored: Redis returns None, a clean miss.
     assert _run(cache.get("absent")) is None
-    # 3. Corrupt payload again -> this MUST be announced.
     clock.advance(REANNOUNCE_SECONDS + 1)  # past the window: a new incident
     _run(cache.get("k"))
 
@@ -327,22 +300,21 @@ def test_decode_latch_rearms_after_a_miss_between_two_corrupt_payloads(caplog):
 def test_decode_failure_does_not_silence_the_connection_latch(caplog):
     """A corrupt payload must not consume or re-arm the connection latch.
 
-    If the two shared state, the decode failure here would either swallow the
-    next connection outage or fake a recovery for it. The clock jumps past the
-    re-announce window before the second connection outage, so that outage is
-    a separate incident and not a flap the window is entitled to drop.
+    Shared state would let the decode failure swallow the next outage or fake
+    a recovery for it. The clock jumps past the re-announce window before the
+    second outage, so it is a separate incident, not a flap.
     """
     clock = _LatchClock()
     cache = _cache_on(clock)
     flaky = _FlakyCorruptRedis()
     cache._redis = flaky
     flaky.fail = True
-    _run(cache.get("k"))  # connection down -> conn warning
+    _run(cache.get("k"))
     flaky.fail = False
-    _run(cache.get("k"))  # round trip OK, payload corrupt -> conn recovery + decode warning
+    _run(cache.get("k"))
     flaky.fail = True
     clock.advance(REANNOUNCE_SECONDS + 1)  # past the window: a new incident
-    _run(cache.get("k"))  # connection down again -> conn warning again
+    _run(cache.get("k"))
 
     assert [r.levelname for r in caplog.records] == ["WARNING"] * 4
     assert "Redis unavailable" in caplog.records[0].getMessage()
@@ -369,10 +341,9 @@ def test_get_redis_hit_decodes_json():
 
 def test_get_redis_miss_falls_through_to_mem():
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
-    # _mem entries are (value, expiry, byte cost) tuples -- the only shape the
-    # cache itself writes (see HybridCache.set) and the shape _get_mem
-    # unpacks. The expiry is fixed at creation: _get_mem no longer slides it.
-    # This hand-written entry is deliberately not counted in _mem_bytes.
+    # _mem entries are (value, expiry, byte cost) tuples with the expiry fixed
+    # at creation; this hand-written one is deliberately not counted in
+    # _mem_bytes.
     cache._mem["k"] = ({"from": "mem"}, time.monotonic() + 60, 60)
     cache._redis = _RecordingRedis({})
     assert _run(cache.get("k")) == {"from": "mem"}
@@ -392,8 +363,7 @@ def test_get_many_reads_every_key_in_one_round_trip():
 def test_get_many_falls_back_per_key_to_the_in_process_cache():
     """A Redis miss falls through to memory exactly as ``get`` does."""
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
-    # _mem entries are (value, expiry, byte cost) tuples; see the same note in
-    # test_get_redis_miss_falls_through_to_mem.
+    # _mem entries are (value, expiry, byte cost) tuples.
     cache._mem["a"] = ({"from": "mem"}, time.monotonic() + 60, 60)
     cache._redis = _RecordingRedis({})
     assert _run(cache.get_many(["a", "b"])) == [{"from": "mem"}, None]
@@ -402,9 +372,8 @@ def test_get_many_falls_back_per_key_to_the_in_process_cache():
 def test_get_many_degrades_to_memory_when_redis_is_down(monkeypatch):
     """A down Redis must not fail the batched read or lose the fallback.
 
-    ``get`` already degrades to the in-process cache; a batched read that did
-    not would turn a Redis outage into a /search 500, and one that degraded
-    without consulting memory would silently drop warm entries.
+    Degrading without consulting memory would silently drop warm entries, and
+    not degrading at all would turn a Redis outage into a /search 500.
     """
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
     cache._redis = _FakeRedis()
@@ -467,8 +436,8 @@ def test_set_success_writes_json_with_ttl():
     _run(cache.set("k", {"b": 2}))
     _run(cache.set("k2", {"b": 3}, ttl=5))
     assert json.loads(redis.sets[0][1]) == {"b": 2}
-    assert redis.sets[0][2] == 60  # default ttl from the cache
-    assert redis.sets[1][2] == 5  # per-call override
+    assert redis.sets[0][2] == 60
+    assert redis.sets[1][2] == 5
     assert redis.store["k"] == '{"b": 2}'
 
 
@@ -563,7 +532,7 @@ def test_losing_client_closed_when_another_task_published_first():
 def test_published_client_kept_when_a_later_command_fails():
     redis = _FlakyRedis()
     cache = HybridCache("redis://fake:6379/0", ttl=60, maxsize=10)
-    cache._redis = redis  # already published by an earlier success
+    cache._redis = redis
 
     async def scenario():
         await cache.set("k", "v")
@@ -572,7 +541,7 @@ def test_published_client_kept_when_a_later_command_fails():
 
     _run(scenario())
 
-    assert cache._redis is redis  # connection pool survives a transient failure
+    assert cache._redis is redis
     assert redis.closed is False
 
 
@@ -605,10 +574,8 @@ class _FakeClock:
 def test_mem_ttl_does_not_slide_when_the_entry_is_read(monkeypatch):
     """A read must not extend the in-process TTL.
 
-    The expiry is fixed when the entry is created, so a hot key still
-    disappears once its original window has passed. Sliding it would keep a
-    frequently-read key alive forever during a Redis outage and serve stale
-    data without bound.
+    Sliding the expiry would keep a frequently-read key alive forever during a
+    Redis outage and serve stale data without bound.
     """
     clock = _FakeClock(1000.0)
     monkeypatch.setattr(redis_cache, "time", clock)
@@ -639,8 +606,8 @@ def test_byte_budget_evicts_large_vectors_before_small_results():
     big_cost = len(json.dumps([round(0.001 * (i % 977), 8) for i in range(768)]).encode())
     small_values = {f"search:{i}": {"id": i, "title": "x" * 20} for i in range(50)}
     small_total = sum(len(json.dumps(v).encode()) for v in small_values.values())
-    # The budget comfortably fits every small entry many times over, plus a
-    # handful of vectors -- but nowhere near all 20 vectors together.
+    # Fits every small entry many times over plus a few vectors, but nowhere
+    # near all 20 of them together.
     budget = small_total * 4 + big_cost * 3
     cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=1000, max_bytes=budget)
     cache._redis = _FakeRedis()
@@ -698,8 +665,8 @@ def test_delete_keys_purge_keeps_byte_total_in_sync():
 
 def test_delete_keys_with_no_keys_issues_no_redis_command():
     """An empty invalidation set must be a true no-op: no command, no
-    connection. Asserted structurally by counting the commands a spy Redis
-    sees, so a regression that acquires a client cannot pass."""
+    connection. Counted through a spy Redis, so a regression that acquires a
+    client cannot pass."""
     calls = []
 
     class _CountingRedis:
@@ -722,10 +689,9 @@ def test_delete_keys_with_no_keys_issues_no_redis_command():
 def test_expired_entry_read_gives_its_bytes_back(monkeypatch):
     """Reading an entry past its TTL must subtract it from the byte total.
 
-    The count-eviction and purge paths were pinned, but the expiry path was
-    not: a read that returns None while leaving the cost behind inflates
-    _mem_bytes on every expiry, and the byte budget then evicts live entries
-    far earlier than CACHE_MAX_BYTES says.
+    A read that returns None while leaving the cost behind inflates
+    _mem_bytes on every expiry, and the budget then evicts live entries far
+    earlier than CACHE_MAX_BYTES says.
     """
     clock = _FakeClock(1000.0)
     monkeypatch.setattr(redis_cache, "time", clock)
@@ -750,10 +716,9 @@ def test_expired_entry_read_gives_its_bytes_back(monkeypatch):
 def test_count_eviction_gives_evicted_bytes_back():
     """Dropping an entry to satisfy the entry-count cap must subtract its cost.
 
-    The byte budget was checked after inserts, which is why a count eviction
-    that discards the entry but keeps its bytes went unnoticed: the total
-    drifts upward with every insert until the budget starts evicting live
-    entries for no reason.
+    A count eviction that discards the entry but keeps its bytes drifts the
+    total upward with every insert until the budget evicts live entries for
+    no reason.
     """
     cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=2, max_bytes=1 << 20)
     cache._redis = _FakeRedis()

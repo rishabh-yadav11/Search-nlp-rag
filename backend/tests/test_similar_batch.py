@@ -1,10 +1,9 @@
-"""Tests for the batched similar-articles route (#353).
+"""The batched similar-articles route.
 
-A search view renders one ``<SimilarArticles>`` per result, so before this
-route existed that view cost one HTTP request, one cache read and one Qdrant
-point-id query per result -- eight of each for a ``top_k=8`` page. These
-tests pin the properties that make the batched form cheaper rather than just
-differently shaped:
+A search view renders one ``<SimilarArticles>`` per result, so a per-article
+route cost one HTTP request, one cache read and one Qdrant point-id query per
+result -- eight of each for a ``top_k=8`` page. These tests pin the properties
+that make the batched form cheaper rather than just differently shaped:
 
 * a whole view is read with ONE cache command, not one per article;
 * the Qdrant work is unchanged (one query per uncached id) and a warm view
@@ -41,9 +40,7 @@ class _StubRedis:
 
     async def mget(self, keys, *_rest):
 
-        # Production calls this BOTH ways: redis_cache.py:148 `mget(keys)` and
-
-        # :201 `mget(*keys)`. Accept either shape rather than pinning one.
+        # Production calls this BOTH ways (`mget(keys)` and `mget(*keys)`); accept either.
 
         if isinstance(keys, str):
 
@@ -86,9 +83,8 @@ def _key(article_id, limit=3, same_category=False):
     """The production cache key, spelled out here.
 
     The version is read from the module rather than pasted, so bumping it does
-    not break this file; the rest is written out, so a change to the rest of
-    the key is visible here instead of being quietly absorbed.
-    """
+    not break this file; the rest is written out, so a change to it is visible
+    here instead of being quietly absorbed."""
     version = main.RECOMMEND_CACHE_VERSION
     return f"recommend:similar:{version}:{article_id}:{limit}:{same_category}"
 
@@ -104,9 +100,7 @@ def env(monkeypatch):
 
     The vector search itself is stubbed: what these tests are about is how many
     times the route reaches for it, not what a nearest-neighbour search
-    returns. What they assert is the routing -- which ids were computed, which
-    came from cache, and how many commands it took to find out.
-    """
+    returns."""
     redis_stub = _StubRedis()
     cache = HybridCache("redis://fake:6379/0", ttl=600, maxsize=1000, max_bytes=1 << 24)
     cache._redis = redis_stub
@@ -145,8 +139,7 @@ def test_a_whole_view_is_read_from_cache_in_one_command(client, env):
 
     The single command is the whole point of the batch: reading the view's
     cached lists one key at a time is what the N+1 looked like from inside
-    the server, and no amount of client-side batching changes that.
-    """
+    the server, and no amount of client-side batching changes that."""
     ids = list(range(1, 9))
     response = client.post("/recommend/similar/batch", json={"article_ids": ids, "limit": 3})
 
@@ -162,7 +155,7 @@ def test_a_whole_view_is_read_from_cache_in_one_command(client, env):
 
 
 def test_a_batch_costs_fewer_cache_commands_than_the_per_article_route(client, env):
-    """The comparison the issue is actually about, measured on both routes."""
+    """The comparison this file exists to make, measured on both routes."""
     ids = list(range(1, 9))
 
     for article_id in ids:
@@ -185,8 +178,7 @@ def test_a_batch_costs_fewer_cache_commands_than_the_per_article_route(client, e
         f"({batched_commands} vs {per_article_commands})"
     )
     # The vector work is deliberately NOT reduced: batching is a request-shape
-    # fix, and a test that let the Qdrant call count silently drop with it
-    # would be asserting a cheaper algorithm that does not exist.
+    # fix, not a cheaper algorithm that does not exist.
     assert env.computed == ids, "each uncached id still costs exactly one query"
 
 
@@ -238,10 +230,8 @@ def test_the_batched_and_per_article_routes_share_one_cache_key(client, env):
     """A view warmed through either route must be a hit for the other.
 
     Two spellings of the same key would each miss the other's entries, so every
-    navigation back to a page would re-run the Qdrant query the cache exists
-    to avoid -- the exact cost this issue exists to remove, reintroduced
-    through a one-character difference in a format string.
-    """
+    navigation back to a page would re-run the Qdrant query the cache exists to
+    avoid, through a one-character difference in a format string."""
     assert client.get("/recommend/similar/4", params={"limit": 3}).status_code == 200
     env.computed.clear()
 
@@ -256,8 +246,7 @@ def test_an_empty_result_is_not_cached(client, env, monkeypatch):
     """Parity with the per-article route: no rows means no hour-long entry.
 
     An article with nothing similar is usually a transient Qdrant miss, and
-    caching that emptiness would make the view render blank for the whole TTL.
-    """
+    caching that emptiness would make the view render blank for the whole TTL."""
     async def _no_rows(article_id, limit=3, same_category=False, **kwargs):
         return []
 
@@ -274,14 +263,12 @@ def test_an_empty_result_is_not_cached(client, env, monkeypatch):
 def test_a_legacy_unversioned_entry_is_not_served(client, env):
     """The batch route must honour the payload version too, not just the single one.
 
-    ``test_similar_articles_payload`` pins this for ``/recommend/similar/{id}``
-    (#257): entries written before the payload narrowed still carry the full
-    article body, and the handler returns a cached value verbatim. The batched
-    route reads a cache too, so a key of its own that omitted the version
-    would serve those bodies for the rest of their TTL -- a regression that
-    only the batched surface would have had, and that no other test here
-    would notice.
-    """
+    ``test_similar_articles_payload`` pins this for ``/recommend/similar/{id}``:
+    entries written before the payload narrowed still carry the full article
+    body, and the handler returns a cached value verbatim. The batched route
+    reads a cache too, so a key of its own that omitted the version would serve
+    those bodies for the rest of their TTL -- a regression only the batched
+    surface would have had, and that no other test here would notice."""
     env.redis.store["recommend:similar:3:3:False"] = json.dumps(
         [{"id": 3, "title": "stale", "url": "https://x/y", "body": "x" * 4000}]
     )

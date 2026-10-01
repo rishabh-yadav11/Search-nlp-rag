@@ -1,13 +1,10 @@
 """Query-time dense encoder behind a single ``encode()`` interface.
 
-The index is built with a full-precision sentence-transformers bge model, but
-at query time fastembed's ONNX (INT8) variant of the same model runs roughly
-3-5x faster on CPU while producing L2-normalized vectors with the same
-direction, so cosine search against the existing index stays correct.
-
-If fastembed cannot load the model (e.g. model not downloaded yet or no
-network), we fall back to the torch sentence-transformers model so startup
-never fails.
+The index is built with a full-precision sentence-transformers bge model, but at query time
+fastembed's ONNX (INT8) variant of the same model is roughly 3-5x faster on CPU while
+producing L2-normalized vectors with the same direction, so cosine search against the existing
+index stays correct. If fastembed cannot load the model (not downloaded, no network), the torch
+model is used so startup never fails.
 """
 
 import logging

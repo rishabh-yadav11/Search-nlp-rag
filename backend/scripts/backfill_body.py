@@ -3,20 +3,13 @@ Qdrant payloads and recompute the sparse (BM25) vector from that text, for
 points whose stored body differs from the freshly fetched, consistently
 truncated one.
 
-Reads all MySQL rows, truncates each body to BODY_CHAR_LIMIT (the same cap every
-index path uses), scrolls Qdrant for the currently stored body, and for every
-point whose stored body differs from the freshly fetched one, sets the new body
-payload and updates the sparse vector. Dense vectors are untouched (the dense
-embedder ignores body by design), so this is a lightweight in-place update — no
-collection rebuild, no re-embedding of unchanged articles.
+Dense vectors are untouched (the dense embedder ignores body by design), so this
+needs no collection rebuild and no re-embedding of unchanged articles.
+Idempotent: a rerun after a completed run finds nothing to change.
 
-Idempotent: rerunning after a completed run finds nothing to change. After it
-completes, run 'python scripts/update_index.py --init' to re-seed the delta
-fingerprints (they include body), so future incremental runs don't flag these
-rows as changed.
-
-Usage:
-    python scripts/backfill_body.py
+After it completes, run `python scripts/update_index.py --init` to re-seed the
+delta fingerprints (they include body), or incremental runs will flag these rows
+as changed forever.
 """
 import asyncio
 import os
@@ -45,9 +38,7 @@ VECTOR_BATCH = 100
 async def fetch_records_by_ids(pool, ids: list[int]) -> dict[int, dict]:
     """Published rows for the given ids, mapped to the canonical record.
 
-    Only the requested slice of the table is queried (chunked by the caller via
-    repeated PAGE_SIZE-sized id lists), so the whole table is never materialized
-    in memory at once.
+    Only the requested slice is queried, so the whole table is never in memory.
     """
     if not ids:
         return {}
@@ -90,9 +81,8 @@ def main():
     async def run():
         pool = await make_pool()
         try:
-            # Page through Qdrant (bounded memory) and resolve each page's MySQL
-            # rows on demand, so neither the collection nor the table is ever
-            # loaded whole.
+            # Page through Qdrant and resolve each page's MySQL rows on demand,
+            # so neither the collection nor the table is ever loaded whole.
             next_offset = None
             total = 0
             updated = 0
@@ -111,11 +101,9 @@ def main():
                         p.id: (p.payload or {}).get("body") or "" for p in pts
                     }
                     records = await fetch_records_by_ids(pool, ids)
-                    # Only update points that already exist in Qdrant (this is an
-                    # in-place backfill). Rows whose id is absent from Qdrant are
-                    # out of scope here (they get seeded by the normal index
-                    # path), so excluding them prevents a massive unintended
-                    # backfill when Qdrant is empty or partially built.
+                    # In-place only: an id absent from Qdrant is out of scope (the
+                    # normal index path seeds it), and including them would turn
+                    # an empty or partial collection into a mass backfill.
                     affected = [
                         i
                         for i in ids

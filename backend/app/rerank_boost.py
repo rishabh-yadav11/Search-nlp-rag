@@ -102,11 +102,8 @@ _BRAND_ENTITIES = [
     "Ashok Leyland",
 ]
 
-# Common nouns / sector labels that are NOT proper-noun entities. A capitalized
-# word in this set is never treated as a standalone entity, and it is stripped
-# from the tail of a multi-word entity phrase. This stops a bare sector noun
-# (e.g. "internet" / "consumer") from over-boosting unrelated articles, and
-# keeps a query like "consumer internet" from drifting to every "internet" hit.
+# Sector/common nouns: never standalone entities, and stripped from a phrase tail so "consumer
+# internet" cannot over-boost every "internet" hit.
 _GENERIC_NOUNS = {
     "consumer", "internet", "sector", "sectors", "industry", "industries",
     "market", "markets", "funding", "news", "deal", "deals", "company",
@@ -119,20 +116,11 @@ _GENERIC_NOUNS = {
     "quarter", "month", "months",
 }
 
-# Legal-entity suffixes stripped from the tail of a multi-word entity phrase so
-# e.g. "Banyan Netfaqs Pvt Ltd" resolves to the distinct entity "banyan
-# netfaqs" rather than the bare, over-broad token "banyan".
 _ENTITY_SUFFIXES = {
     "pvt", "ltd", "private", "limited", "inc", "incorporated", "corp",
     "corporation", "co", "company", "llp", "llc", "plc", "sa", "ag",
 }
 
-# Trailing query-context nouns stripped from the tail of a multi-word entity
-# phrase so e.g. "Banyan Netfaqs IPO Price Band" resolves to the recognizable
-# base entity "banyan netfaqs" rather than an over-long phrase that fails to
-# match the same company named without that context in other articles. Stripping
-# stops at len==1 so a trailing context word can never collapse a distinct
-# multi-word entity into a single bare token.
 _CONTEXT_NOUNS = {
     "ipo", "price", "band", "bands", "result", "results", "earnings",
     "share", "shares", "stock", "stocks", "outlook", "performance",
@@ -141,23 +129,12 @@ _CONTEXT_NOUNS = {
     "ventures", "capital", "partners", "enterprises", "industries",
 }
 
-# A run of two or more consecutive capitalized words is treated as a single
-# proper-noun phrase (a company / fund / person name spoken as one entity),
-# rather than being exploded into individual tokens that would each boost
-# independently and conflate distinct entities sharing a headword.
+# Two or more consecutive capitalized words are ONE entity; exploding them conflates distinct
+# entities that share a headword.
 _RUN_RE = re.compile(r"[A-Z][A-Za-z0-9.']+(?:\s+[A-Z][A-Za-z0-9.']+)+")
 
-# A single capitalized word (e.g. "Apple", "HDFC") that is NOT part of a
-# multi-word run and NOT a generic/common word is extracted as its own entity so
-# single-word companies still get a boost even when absent from the curated
-# brand list. Matches like "banyan" inside "Banyan Netfaqs" are excluded by span
-# checks in extract_entities.
 _SINGLE_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9.']+\b")
 
-# Capitalized words never treated as standalone entities: question/function
-# words likely capitalized at a query's start, plus the generic-noun and
-# query-context sets, so common sentence starts and bare query nouns (e.g.
-# "Results", "Earnings") don't over-boost unrelated articles.
 _SINGLE_WORD_IGNORE = (
     _GENERIC_NOUNS
     | _CONTEXT_NOUNS
@@ -184,13 +161,7 @@ _BRAND_RE = re.compile(r"\b(?:" + "|".join(re.escape(b) for b in _NORMALIZED_BRA
 
 
 def _strip_entity_phrase(phrase: str) -> str:
-    """Normalize a multi-word capitalized run into one entity: lowercased, with
-    leading/trailing legal-entity suffixes, generic nouns, and query-context
-    nouns removed so the result is the recognizable base entity (e.g. "banyan
-    netfaqs") rather than an over-long phrase. Returns "" when the run is empty,
-    consists solely of generic/suffix/context tokens, or is left with only a
-    bare such token after stripping (which would otherwise over-boost unrelated
-    articles)."""
+    """Lowercase a capitalized run and strip generic/suffix/context words off its edges; "" when nothing survives."""
     words = [_normalize(w) for w in phrase.split()]
     _strip_trail = _GENERIC_NOUNS | _ENTITY_SUFFIXES | _CONTEXT_NOUNS
     while len(words) > 1 and words[-1] in _strip_trail:
@@ -203,15 +174,6 @@ def _strip_entity_phrase(phrase: str) -> str:
 
 
 def extract_entities(q: str) -> list[str]:
-    """Extract proper-noun-like entities from a query. Handles known brand names
-    (including spaces and apostrophes) plus multi-word capitalized phrases,
-    normalizes to lowercase with possessive apostrophes removed, and returns
-    distinct entities.
-
-    Consecutive capitalized words are kept as ONE entity (e.g. "Banyan Netfaqs
-    Pvt Ltd" -> "banyan netfaqs"), so distinct entities sharing a headword are
-    not conflated, and generic sector nouns ("consumer internet") are not
-    over-expanded into bare tokens that over-boost unrelated articles."""
     nq = _normalize(q)
     if not nq:
         return []
@@ -221,10 +183,6 @@ def extract_entities(q: str) -> list[str]:
         phrase = _strip_entity_phrase(run)
         if phrase and phrase not in raw:
             raw.append(phrase)
-    # Single capitalized proper nouns NOT inside a multi-word run and NOT a
-    # generic/common word are extracted as their own entity, so single-word
-    # companies ("Apple", "HDFC") still boost even when absent from the curated
-    # brand list. This restores the recall the old single-cap path provided.
     for m in _SINGLE_CAP_RE.finditer(q):
         s, e = m.span()
         if any(lo <= s < hi for lo, hi in run_spans):
@@ -238,11 +196,6 @@ def extract_entities(q: str) -> list[str]:
     for e in raw:
         if e not in ordered:
             ordered.append(e)
-    # Drop any entity fully contained in a longer one (e.g. "acme" inside
-    # "acme corp"). Sort by descending length so the longer entity is kept first
-    # and the shorter substring is rejected in a single pass. A known brand is
-    # never dropped even when a longer non-brand run subsumes it (e.g. "ola
-    # electric" must survive the run "ola electric ipo price band").
     ordered.sort(key=len, reverse=True)
     kept: list[str] = []
     for e in ordered:
@@ -256,18 +209,11 @@ def extract_entities(q: str) -> list[str]:
 
 
 def apply_entity_boost(q: str, results: list) -> list:
-    """Return a NEW list of copies of `results` whose `.score` is boosted when a
-    query entity appears in the result title (BOOST_TITLE) or, failing that, in
-    the summary (BOOST_SUMMARY). Inputs are never mutated. Boosted scores are
-    sorted descending; ties keep the original input order (stable sort)."""
     entities = extract_entities(q)
     if not entities:
         return list(results)
-    # Compile once per entity: require a word boundary at the START (so "ola"
-    # does NOT match inside "solar"/"polar"), allow a trailing non-letter (so
-    # "tcs" still matches "tcs2024"/"tcs." but not "tcsql"), and tolerate a
-    # possessive suffix ("'s" or bare "s") so "Ola Electric" still matches the
-    # apostrophe-stripped "ola electrics" in a summary.
+    # Asymmetric boundary: a leading \b keeps "ola" out of "solar" while (?![a-zA-Z]) still allows
+    # "tcs2024"; the optional 's absorbs possessives.
     entity_res = [
         re.compile(rf"\b{re.escape(e)}(?:['’]?s)?(?![a-zA-Z])", re.IGNORECASE)
         for e in entities

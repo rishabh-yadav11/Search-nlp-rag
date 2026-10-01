@@ -9,10 +9,8 @@ import { isSafeRedirect } from '../lib/safe-url'
 function SignupForm() {
   const router = useRouter()
   const params = useSearchParams()
-  // Same shape as app/login/page.tsx: the shared guard narrows the raw param
-  // to `string`, and anything it refuses falls back to /chat. The guard used to
-  // be re-implemented here, as a `boolean`-returning copy that could drift
-  // from the one login used.
+  // The shared guard in app/login/page.tsx narrows the raw param to `string`;
+  // anything it refuses falls back to /chat.
   const rawNext = params.get('next')
   const next = isSafeRedirect(rawNext) ? rawNext : '/chat'
   const [name, setName] = useState('')
@@ -24,9 +22,8 @@ function SignupForm() {
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    // The session is an httpOnly cookie, so `/api/auth/me` is the only way to
-    // know whether someone is already signed in. A network failure is not a
-    // logout, so it must not redirect.
+    // The httpOnly session cookie is unreadable by JS, so `/api/auth/me` is the
+    // only sign-in check. A network failure is not a logout; do not redirect.
     getMe()
       .then((me) => {
         if (me) router.replace(next)
@@ -75,10 +72,8 @@ function SignupForm() {
         setError((body as { detail?: string }).detail ?? `Sign up failed (${res.status}).`)
         return
       }
-      // Signup is deliberately indistinguishable for a fresh and an already
-      // registered address: the server always answers 200 with the same
-      // message and never issues a token, so that submitting an existing
-      // email cannot be used to probe which addresses are registered.
+      // Deliberately indistinguishable for a fresh and an already registered
+      // address, so an existing email cannot be probed for registration.
       const data = (await res.json()) as { message?: string }
       setSuccess(
         data.message ||

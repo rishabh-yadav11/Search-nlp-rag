@@ -1,27 +1,9 @@
-"""Behavioural tests for the `record_interaction` write transaction (#288).
+"""`record_interaction` must evict the cached profile in the same Redis
+transaction as the new signal.
 
-The point of these tests is the property the source claims: a newly recorded
-interaction evicts the user's cached profile vector and category aggregates *in
-the same Redis transaction as the new signal*, so a reader can never observe a
-derived value that predates the signal it was derived from.
-
-To test that, the Redis double below is a stateful store rather than a mock:
-
-* commands are applied to typed in-memory stores (`zsets`, `hashes`, `strings`),
-  so every assertion is on data a real reader would go on to see;
-* `execute()` is copy-on-write, so a failure part-way through a pipeline leaves
-  the store exactly as it was. Note this is the double's model, not Redis's:
-  a real `MULTI`/`EXEC` gives isolation, not rollback, so a command that fails
-  at EXEC time still lets the rest of the batch commit.
-* every buffered command is logged with the id of the pipeline that buffered it,
-  because *which transaction a command rode in* is not observable from the
-  resulting state: a delete issued in a second pipeline after `execute()` would
-  leave the same final bytes as one issued in the same transaction.
-
-Anything the double does not model raises `AssertionError` naming the command.
-`record_interaction` swallows that, so the name reaches the captured log rather
-than the test's own failure message -- the guarantee is only that the double
-never silently no-ops.
+Counters must advance atomically (`zincrby`/`hincrby`, never a read-modify-write),
+and transaction identity is not observable from the final state, so the double
+logs the pipeline id that buffered each command.
 """
 
 from __future__ import annotations
@@ -46,10 +28,8 @@ OTHER_USER = "user-2"
 ARTICLE = 7
 OTHER_ARTICLE = 9
 
-#: Module constant: raw interactions are kept a full year for profile building.
 INTERACTION_SET_TTL_DAYS = 365
-#: Value substituted for the ambient `config.USER_INTERACTION_TTL_DAYS` in the
-#: TTL test, so the asserted seconds never depend on the environment.
+#: Pinned so the asserted TTL seconds never depend on the ambient environment.
 CONTROLLED_TTL_DAYS = 7
 
 
@@ -58,13 +38,6 @@ def _unmodelled(where: str, name: str) -> AssertionError:
 
 
 class _FakePipeline:
-    """Buffers commands; touches no state until `execute()` succeeds.
-
-    `hset` is called by the source both as `hset(key, mapping={...})` and as
-    `hset(key, field, value)`, so both spellings are normalised to a single
-    `(key, field, value)` triple in the pending list and in the command log.
-    """
-
     def __init__(self, redis: _FakeRedis, pipeline_id: int) -> None:
         self._redis = redis
         self.pipeline_id = pipeline_id
@@ -78,9 +51,6 @@ class _FakePipeline:
         self._queue("zadd", key, dict(mapping))
 
     def zcard(self, key: str) -> None:
-        # Buffered, never applied: the caller is the distinct-article cap check
-        # (USER_MAX_DISTINCT_INTERACTIONS), which reads its answer off
-        # `execute()` rather than off the committed stores.
         self._queue("zcard", key)
 
     def zscore(self, key: str, member: str) -> None:
@@ -90,7 +60,6 @@ class _FakePipeline:
         self._queue("hincrby", key, field, amount)
 
     def zincrby(self, key: str, amount: int, member: str) -> None:
-        # Advances the trending index (#261) inside the write transaction.
         self._queue("zincrby", key, amount, str(member))
 
     def hset(self, key: str, field: Any = None, value: Any = None, *, mapping: Any = None) -> None:
@@ -108,35 +77,26 @@ class _FakePipeline:
         self._queue("delete", keys)
 
     def __getattr__(self, name: str) -> Any:
-        # `record_interaction` swallows every exception, so an unmodelled
-        # command surfaces only through the captured log record. Raising a
-        # named error puts the command in that message, so the tests below fail
-        # on missing state *and* say which command the double failed to model.
         if name.startswith("_"):
             raise AttributeError(name)
         raise _unmodelled("_FakePipeline", name)
 
     async def execute(self) -> list[Any]:
-        """Apply the buffered commands atomically, or not at all."""
         self._redis.executes += 1
         batch = list(self.pending)
         self.pending.clear()
         staged = self._redis.snapshot()
         results: list[Any] = []
         for method, args in batch:
-            # `staged` is the only thing written, so a raise part-way through
-            # leaves the committed stores exactly as they were.
+            # Only `staged` is written, so a mid-batch raise leaves the committed stores untouched.
             results.append(self._redis._apply(staged, method, args, count_executes=False))
         self._redis.commit(staged)
         return results
 
 
 class _FakeRedis:
-    """Minimal stateful Redis covering the types the profile code actually uses.
-
-    Stores are kept per type so a `zadd` cannot silently satisfy a `get` and
-    vice versa, which is what makes a wrong key prefix show up as missing data
-    rather than as a passing assertion.
+    """Stores are split per type so a `zadd` cannot satisfy a `get`, which is what
+    makes a wrong key prefix fail as missing data instead of passing.
     """
 
     def __init__(self) -> None:
@@ -144,15 +104,12 @@ class _FakeRedis:
         self.hashes: dict[str, dict[str, str]] = {}
         self.strings: dict[str, str] = {}
         self.ttls: dict[str, int] = {}
-        # Expiries set with `SET ... EX` (the article-exists cache), kept apart
-        # from `ttls` (expiries set with EXPIRE inside the write transaction).
+        # Expiries set by `SET ... EX`, kept apart from `ttls` (EXPIRE inside the write).
         self.set_expiries: dict[str, int] = {}
-        # (pipeline_id, method, args) for every buffered command, in order.
         self.commands: list[tuple[int, str, tuple[Any, ...]]] = []
         self.pipeline_calls = 0
         self.executes = 0
 
-    # ---- transaction plumbing -------------------------------------------------
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         return {
@@ -169,7 +126,6 @@ class _FakeRedis:
         self.ttls = staged["ttls"]
 
     def pipeline(self) -> _FakePipeline:
-        """Sync, as in redis-py: the returned object only buffers commands."""
         self.pipeline_calls += 1
         return _FakePipeline(self, self.pipeline_calls)
 
@@ -204,11 +160,7 @@ class _FakeRedis:
             key, field, amount = args
             current = int(hs.setdefault(key, {}).get(field, "0"))
             hs[key][field] = str(current + int(amount))
-            # Redis returns the POST-increment value, and #261 now depends on
-            # it: record_interaction reads the first result to learn whether
-            # these counters were just created, which decides whether the
-            # trending index must be re-seeded. A constant here would make
-            # every write look like a fresh counter.
+            # Redis returns the post-increment value; the source reads it to detect brand-new counters.
             return current + int(amount)
         if method == "hset":
             key, field, value = args
@@ -230,28 +182,17 @@ class _FakeRedis:
             return removed
         raise _unmodelled("_FakeRedis._apply", method)
 
-    # ---- async commands (the shape the real client exposes) ------------------
 
     async def get(self, key: str) -> str | None:
         return self.strings.get(key)
 
     async def hgetall(self, key: str) -> dict[str, str]:
-        # Read by the trending-index re-seed (#261) after a pipeline reports
-        # that the article's counters were just created.
         return dict(self.hashes.get(key, {}))
 
     async def exists(self, key: str) -> int:
-        # Read by the trending-index bootstrap (#261).
         return int(key in self.strings or key in self.hashes or key in self.zsets)
 
     async def set(self, key: str, value: str, ex: int | None = None) -> bool:
-        """`SET ... EX`, as awaited by the article-exists negative cache.
-
-        The expiry is kept in `set_expiries` rather than `ttls`, because
-        `ttls` is what the EXPIRE-buffered write transaction is asserted
-        against: folding a pre-transaction cache key in there would make that
-        assertion cover a key the transaction never touched.
-        """
         self.strings[key] = value
         if ex is not None:
             self.set_expiries[key] = int(ex)
@@ -276,7 +217,6 @@ class _FakeRedis:
         live = {"zsets": self.zsets, "hashes": self.hashes, "strings": self.strings, "ttls": self.ttls}
         return self._apply(live, "delete", (keys,), count_executes=False)
 
-    # ---- sync setup helpers ---------------------------------------------------
 
     def seed_string(self, key: str, value: str) -> None:
         self.strings[key] = value
@@ -294,7 +234,6 @@ class _FakeRedis:
 
 
 def _seed_derived_profile(redis: _FakeRedis, user_id: str) -> dict[str, Any]:
-    """Populate the two derived keys a prior profile build would have cached."""
     vector_key = f"user:profile_vector:{user_id}"
     categories_key = f"user:categories:{user_id}"
     vector = [0.1, 0.2, 0.3]
@@ -304,12 +243,8 @@ def _seed_derived_profile(redis: _FakeRedis, user_id: str) -> dict[str, Any]:
 
 
 class _FakeQdrant:
-    """Answers the pre-write article-exists guard with a known article.
-
-    `record_interaction` refuses an article the index does not hold, so this
-    double confirms every id it is asked about. That guard is not what these
-    tests pin -- it has its own coverage -- and an unmodelled index here would
-    make `record_interaction` decline before the write pipeline is ever built.
+    """Every requested id is known: `record_interaction` refuses an article the
+    index does not hold, so an unmodelled index would decline the write.
     """
 
     def __init__(self, unknown_ids: set[int] | None = None) -> None:
@@ -323,7 +258,6 @@ class _FakeQdrant:
 
 @pytest.fixture
 def qdrant(monkeypatch) -> _FakeQdrant:
-    """An index that knows every article, installed on the app state."""
     fake = _FakeQdrant()
     monkeypatch.setitem(state, "qdrant", fake)
     return fake
@@ -331,11 +265,8 @@ def qdrant(monkeypatch) -> _FakeQdrant:
 
 @pytest.fixture
 def redis(monkeypatch, qdrant) -> _FakeRedis:
-    """Point the module at a fresh in-memory Redis; no network, no env deps.
-
-    The distinct-article cap is pinned so its guard always runs the same way:
-    an ambient `USER_MAX_DISTINCT_INTERACTIONS=0` would skip the check, and
-    these tests would then cover a write pipeline that is not the real one.
+    """Pins the distinct-article cap: an ambient 0 would skip the check, leaving
+    these tests covering a different pipeline.
     """
     fake = _FakeRedis()
     monkeypatch.setattr(user_profile, "_redis_client", lambda: fake)
@@ -343,21 +274,11 @@ def redis(monkeypatch, qdrant) -> _FakeRedis:
     return fake
 
 
-# ---- 1. the signal lands where the readers look for it -----------------------
-
-
 @pytest.mark.asyncio
 async def test_recording_an_interaction_is_visible_to_the_interactions_reader(redis):
-    """`get_user_interactions` returns the new signal as `(42, timestamp)`.
-
-    The reader builds its own key from the same format string, so a changed
-    prefix on the writer would leave the reader looking at a key that was never
-    written and this assertion would fail.
-    """
     await record_interaction(USER, 42)
 
-    # The writer also maintains the trending index (#261), so this asserts the
-    # reader's key is there and correct rather than that it is the only zset.
+    # The writer also maintains the trending index, so this pins the reader's key is present, not that it is alone.
     assert f"user:interactions:{USER}" in redis.zsets
     assert list(redis.zsets[f"user:interactions:{USER}"]) == ["42"], (
         "the sorted set member is the article id as a string"
@@ -368,17 +289,8 @@ async def test_recording_an_interaction_is_visible_to_the_interactions_reader(re
     assert recorded[0][1] == pytest.approx(redis.zsets[f"user:interactions:{USER}"]["42"])
 
 
-# ---- 2. article-level counters ----------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_article_counters_are_keyed_by_article_and_accumulate_per_type(redis):
-    """Counts live at `article:interactions:{id}` and add up per type.
-
-    A click then a read on article 7 leave `click=1, read=1`. A third click on
-    a different article must land in its own counter key, so a key that dropped
-    the article id would merge the two articles' counts and fail here.
-    """
     await record_interaction(USER, ARTICLE, interaction_type="click")
     await record_interaction(USER, ARTICLE, interaction_type="read")
     await record_interaction(USER, OTHER_ARTICLE, interaction_type="click")
@@ -387,31 +299,16 @@ async def test_article_counters_are_keyed_by_article_and_accumulate_per_type(red
     assert counters["click"] == "1"
     assert counters["read"] == "1"
     assert float(counters["last_timestamp"]) == pytest.approx(redis.zsets[f"user:interactions:{USER}"]["7"])
-    # The other article's counter is separate, so nothing bled across.
     assert redis.hashes[f"article:interactions:{OTHER_ARTICLE}"]["click"] == "1"
-    # Exactly two article counters exist, so no count bled across articles.
     assert {key for key in redis.hashes if key.startswith("article:interactions:")} == {
         f"article:interactions:{ARTICLE}",
         f"article:interactions:{OTHER_ARTICLE}",
     }
 
 
-# ---- 3. TTLs on every written key -------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_every_written_key_receives_its_ttl(redis, monkeypatch):
-    """Every written key gets a TTL, asserted exactly.
-
-    The interaction set is pinned to the module's one-year raw-signal horizon
-    (it exists so profile building has long-term history to read); the detail
-    hash, the counter hash and the trending index (#261) share the configured
-    TTL, pinned here so the assertion is independent of the ambient
-    environment. The index and its ready marker deliberately carry the COUNTER
-    TTL, so neither can outlive the counters it ranks or the seed state that
-    backfills it. The 365 is written out rather than imported, so shortening
-    the retention horizon has to update this test.
-    """
+    """The 365-day interaction set is written out, not imported, so shortening the horizon must update this test."""
     monkeypatch.setattr(user_profile.config, "USER_INTERACTION_TTL_DAYS", CONTROLLED_TTL_DAYS)
 
     await record_interaction(USER, ARTICLE)
@@ -425,17 +322,8 @@ async def test_every_written_key_receives_its_ttl(redis, monkeypatch):
     }
 
 
-# ---- 4. the invariant: derived data is evicted, and cannot be read back -------
-
-
 @pytest.mark.asyncio
 async def test_recording_an_interaction_evicts_the_cached_derived_profile(redis, monkeypatch):
-    """Both derived keys are gone, and a read rebuilds rather than serving stale.
-
-    The stale vector is seeded, then a distinct replacement is returned by
-    `build_user_profile`; `get_user_profile_vector` must hand back the
-    replacement, which it can only do by missing the cache.
-    """
     seeded = _seed_derived_profile(redis, USER)
     new_vector = [9.0, 9.0]
 
@@ -454,7 +342,6 @@ async def test_recording_an_interaction_evicts_the_cached_derived_profile(redis,
 
 @pytest.mark.asyncio
 async def test_eviction_of_categories_is_observable_through_the_categories_reader(redis):
-    """The category aggregate is cleared too, not just the vector."""
     seeded = _seed_derived_profile(redis, USER)
 
     await record_interaction(USER, ARTICLE)
@@ -463,33 +350,16 @@ async def test_eviction_of_categories_is_observable_through_the_categories_reade
     assert await get_user_profile_categories(USER) == []
 
 
-# ---- 5. same transaction ------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_the_derived_key_deletes_ride_in_the_same_transaction_as_the_write(redis):
-    """One write pipeline, one execute, and the delete shares its pipeline id.
-
-    Transaction identity is not visible in the final state -- deleting in a
-    second pipeline after `execute()` would leave identical bytes -- so it is
-    read off the command log.
-
-    Two other pipelines may appear. One is read-only and precedes the write: the
-    distinct-article cap check asks ZCARD/ZSCORE. The other is the trending
-    index re-seed (#261), which can only learn that the article's counters are
-    brand new FROM the write's own result, so it is necessarily a post-commit
-    repair. It may write, but only to the index. Splitting the write in two, or
-    moving the delete into its own pipeline, still fails both halves.
-    """
+    """Transaction identity is not visible in the final state, so it is read off the pipeline id."""
     await record_interaction(USER, ARTICLE)
 
     ids_by_method: dict[str, set[int]] = {}
     for pipeline_id, method, _args in redis.commands:
         ids_by_method.setdefault(method, set()).add(pipeline_id)
 
-    # The article counter is buffered by exactly one pipeline, and that is the
-    # write. The trending index advances in it too, so the index can never lag
-    # a committed counter: both land in the same MULTI/EXEC or neither does.
+    # The counter and the trending index share the one write pipeline, so the index can never lag a committed counter.
     write_ids = ids_by_method["hincrby"]
     assert len(write_ids) == 1, (
         f"the whole write must be buffered by one pipeline; saw {write_ids} for hincrby "
@@ -501,8 +371,8 @@ async def test_the_derived_key_deletes_ride_in_the_same_transaction_as_the_write
         f"not in a pipeline of its own; seen pipeline ids per command: {ids_by_method}"
     )
 
-    # Every other pipeline either only reads, or is the post-commit index
-    # re-seed, which is allowed to write but only to the index.
+    # Tolerated extras: a read-only distinct-article cap check, and a trending-index
+    # re-seed that can only learn the counters are new from the write's own result.
     other_ids = {pid for pid, _method, _args in redis.commands} - {write_id}
     for pipeline_id in other_ids:
         buffered = [(m, a) for pid, m, a in redis.commands if pid == pipeline_id]
@@ -528,12 +398,8 @@ async def test_the_derived_key_deletes_ride_in_the_same_transaction_as_the_write
     assert delete_args[0] == (f"user:profile_vector:{USER}", f"user:categories:{USER}")
 
 
-# ---- 6. scoping ---------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_eviction_is_scoped_to_the_recording_user(redis):
-    """Another user's derived keys survive an interaction by this user."""
     other = _seed_derived_profile(redis, OTHER_USER)
 
     await record_interaction(USER, ARTICLE)

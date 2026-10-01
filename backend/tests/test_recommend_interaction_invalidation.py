@@ -1,10 +1,8 @@
-"""Regression tests for the /recommend/interaction cache invalidation (#278).
+"""Regression tests for the /recommend/interaction cache invalidation.
 
-The endpoint used to call ``cache.delete_prefix(f"recommend:for-you:{uid}:")``
-unconditionally, and ``delete_prefix`` is implemented with ``SCAN``. SCAN walks
-*every* key in the database and only then applies MATCH, so a request that
-touches at most 20 keys of its own paid for the whole keyspace. These tests pin
-the replacement: derive the (bounded, knowable) key set and ``DEL`` it directly.
+Invalidation must cost a bounded number of key names: a ``SCAN``-based prefix
+delete walks every key in the database and only then applies ``MATCH``, so the
+endpoint derives the (bounded, knowable) key set and ``DEL``s it directly.
 """
 
 import asyncio
@@ -29,24 +27,21 @@ def _for_you_key(user_id: str, limit: int) -> str:
 FOR_YOU_KEYS = [
     _for_you_key(USER, n) for n in range(main.FOR_YOU_MIN_LIMIT, main.FOR_YOU_MAX_LIMIT + 1)
 ]
-# Unrelated cache traffic standing in for the rest of the database. Nothing in
-# the invalidation path may depend on how large this is.
+# Unrelated cache traffic standing in for the rest of the database.
 FOREIGN_KEYS = [f"search:q{i}" for i in range(500)]
 
 
 class _SpyRedis:
-    """Redis stand-in that records commands and, crucially, how many keys a
-    keyspace-wide operation had to walk past.
+    """Redis stand-in that records commands and how many keys a keyspace-wide
+    operation had to walk past.
 
-    ``scan_iter`` returns a real async generator, so the pre-fix code path runs
-    for real against this store: if anything reintroduces the prefix delete,
-    ``scans``/``scanned_keys`` go up and the tests below fail, rather than the
-    fake quietly never being called.
+    ``scan_iter`` returns a real async generator, so a reintroduced prefix
+    delete runs for real against this store: ``scans``/``scanned_keys`` go up
+    and the tests fail, rather than the fake quietly never being called.
     """
 
     def __init__(self, store):
-        # Real Redis hands back the serialized value, so the store holds strings
-        # and HybridCache keeps doing its own json.loads -- as it must.
+        # Real Redis hands back serialized values, so the store holds strings and HybridCache does its own json.loads.
         self.store = {key: json.dumps(value) for key, value in store.items()}
         self.scans = 0
         self.scanned_keys = 0
@@ -59,8 +54,7 @@ class _SpyRedis:
 
     async def set(self, key, value, ex=None):
         self.commands.append("set")
-        # `value` arrives already JSON-encoded (HybridCache serializes before
-        # it talks to Redis), so store it verbatim -- re-encoding here would
+        # ``value`` arrives already JSON-encoded; re-encoding here would
         # double-encode, and a later get() would hand back a raw string.
         self.store[key] = value
         return True
@@ -76,8 +70,7 @@ class _SpyRedis:
         self.scans += 1
 
         async def _walk():
-            # SCAN's defining property, reproduced faithfully: MATCH filters the
-            # keys it already walked, it does not make it walk fewer of them.
+            # SCAN's defining property: MATCH filters keys it already walked, it does not walk fewer of them.
             for key in list(self.store):
                 self.scanned_keys += 1
                 if match is None or key.startswith(match.rstrip("*")):
@@ -130,12 +123,9 @@ def env(monkeypatch):
 def _working_interaction_limiter(monkeypatch):
     """Give the interaction endpoint's rate limiter a working counter store.
 
-    #271 put this endpoint behind both a per-IP and a per-account limit, and
-    those limits fail CLOSED: with no limiter Redis the route answers 503
-    rather than serve an unlimited write path. That is the shipped behaviour
-    these tests must not accidentally paper over -- they are about cache
-    invalidation, not rate limiting -- so they get a counting store here, the
-    same way tests/test_main_http.py does for /search.
+    The per-IP and per-account limits fail CLOSED: with no limiter Redis the
+    route answers 503 rather than serve an unlimited write path. These tests are
+    about cache invalidation, so they must not paper over that behaviour.
     """
     from app import auth
 
@@ -157,8 +147,7 @@ def _working_interaction_limiter(monkeypatch):
 def client(monkeypatch, env):
     """TestClient authenticated as USER."""
 
-    # Annotated: an unannotated `request` here would be inferred as a *query*
-    # parameter by FastAPI and every request would 422 before reaching the app.
+    # Annotated: an unannotated ``request`` would be read as a *query* parameter and every request would 422.
     async def _authed(request: Request) -> None:
         request.state.user_id = USER
 
@@ -174,12 +163,11 @@ def _post_interaction(client, article_id=7):
 
 
 def test_interaction_invalidates_for_you_cache_without_scanning_the_keyspace(client, env):
-    """The whole point of #278: no keyspace walk on a request path.
+    """The whole point: no keyspace walk on a request path.
 
     Asserted structurally rather than by timing -- the spy counts SCAN
-    invocations and the keys they were made to walk. A request must cost a
-    bounded number of key names regardless of how many unrelated keys the
-    database holds.
+    invocations and the keys they were made to walk, so a request must cost a
+    bounded number of key names however many unrelated keys the database holds.
     """
     assert env.redis.scans == 0 and env.redis.scanned_keys == 0, "precondition: nothing scanned yet"
     assert len(FOREIGN_KEYS) > 10 * len(FOR_YOU_KEYS), "the store must be big enough for a scan to hurt"
@@ -199,11 +187,9 @@ def test_interaction_invalidates_for_you_cache_without_scanning_the_keyspace(cli
 
 
 def test_the_cache_exposes_no_scan_based_delete(client, env):
-    """There is no longer a keyspace-scan delete for a request path to reach
-    for. This is what stops the #278 regression from being reintroduced by
-    someone who finds prefix invalidation convenient, and it is the strongest
-    statement available: the primitive is gone, not merely unused.
-    """
+    """There is no keyspace-scan delete left for a request path to reach for:
+    the primitive is gone, not merely unused, which is what stops the
+    regression from creeping back in as a convenient prefix invalidation."""
     assert not hasattr(env.cache, "delete_prefix"), "the SCAN-based helper must not come back"
     assert hasattr(env.cache, "delete_keys"), "the derived-key-set delete must be the primitive"
 
@@ -224,9 +210,7 @@ def test_interaction_leaves_another_users_for_you_cache_alone(client, env):
 
 
 def test_for_you_recomputes_after_an_interaction(client, env):
-    """Invalidation must still be *correct*. A stale hit here is a silent
-    personalization bug, so prove the recompute really happens."""
-    # The fixture seeds this user's for-you entry, so the endpoint starts warm.
+    """Invalidation must still be *correct*: a stale hit here is a silent personalization bug."""
     before = client.get("/recommend/for-you", params={"limit": 5})
     assert before.status_code == 200, before.text
     assert before.json()["cached"] is True, "precondition: a warm entry is served from cache"
@@ -239,8 +223,7 @@ def test_for_you_recomputes_after_an_interaction(client, env):
     assert after.json()["cached"] is False, "the interaction must have dropped the cached entry"
     assert len(env.recommend_calls) == 1, "the recommendation must actually be recomputed"
 
-    # ...and the recomputed entry is cached again, so invalidation did not
-    # degrade into permanently-missing cache.
+    # The recomputed entry is cached again, so invalidation did not degrade into a permanently missing cache.
     rewarmed = client.get("/recommend/for-you", params={"limit": 5})
     assert rewarmed.json()["cached"] is True
     assert len(env.recommend_calls) == 1
@@ -250,19 +233,16 @@ def test_every_writable_for_you_limit_is_invalidated(client, env):
     """The invalidation set must cover the WRITABLE band, proved from the
     request side and never from the constants.
 
-    Deriving expectations from ``FOR_YOU_MIN_LIMIT``/``FOR_YOU_MAX_LIMIT``
-    would restate ``_for_you_cache_keys`` instead of testing it: if the
-    ``get_for_you`` Query were widened without widening the invalidation
-    range, a test built from those constants would still pass while stale
-    entries survived. So this drives real requests, discovers which limits the
-    endpoint accepts, and then requires that every key it actually wrote is
-    gone afterwards -- matched by string prefix, not by list membership.
+    Building expectations from ``FOR_YOU_MIN_LIMIT``/``FOR_YOU_MAX_LIMIT`` would
+    restate ``_for_you_cache_keys`` instead of testing it: a widened Query with
+    an unchanged invalidation range would still pass. So this drives real
+    requests, discovers the accepted band, and requires every key the endpoint
+    actually wrote to be gone -- matched by string prefix, not list membership.
     """
     prefix = _for_you_key(USER, 0).rsplit(":", 1)[0] + ":"
     env.redis.store = {k: v for k, v in env.redis.store.items() if not k.startswith(prefix)}
 
-    # Discover the band from the request side, and probe well past the current
-    # bound so a widened Query is caught rather than silently truncated.
+    # Probe well past the current bound so a widened Query is caught rather than silently truncated.
     accepted, rejected = [], []
     for limit in range(1, 121):
         response = client.get("/recommend/for-you", params={"limit": limit})
@@ -272,16 +252,14 @@ def test_every_writable_for_you_limit_is_invalidated(client, env):
 
     assert _post_interaction(client).status_code == 200
 
-    # THE property under test, asserted first and independently of the band
-    # arithmetic below: nothing the endpoint could have written may survive.
+    # The property under test, asserted first and independently of the band arithmetic below.
     survivors = [key for key in env.redis.store if key.startswith(prefix)]
     assert survivors == [], (
         f"{len(survivors)} stale for-you entries survived the interaction "
         f"(accepted limits {min(accepted)}..{max(accepted)}): {survivors[:5]}"
     )
 
-    # Supporting detail: the band the endpoint exposes is contiguous from 1 and
-    # ends exactly where the invalidation range does.
+    # Supporting detail: the band is contiguous from 1 and ends where the invalidation range does.
     assert accepted, "the endpoint rejected every limit probed"
     assert min(accepted) == 1 and accepted == list(range(1, max(accepted) + 1)), (
         f"the accepted band must be contiguous and start at 1: {accepted[:5]}..{accepted[-5:]}"
@@ -300,10 +278,9 @@ def test_every_writable_for_you_limit_is_invalidated(client, env):
 def test_interaction_purges_the_in_process_fallback_when_redis_is_down(client, env):
     """The degraded path is the one that can still serve stale personalization.
 
-    ``delete_keys`` drops the in-process entries *before* talking to Redis
-    precisely so a Redis outage cannot keep handing back pre-interaction
-    recommendations from the fallback tier. This is the only test that
-    exercises that branch, so it is asserted here rather than assumed.
+    ``delete_keys`` drops the in-process entries *before* talking to Redis so an
+    outage cannot keep handing back pre-interaction recommendations from the
+    fallback tier.
     """
     unreachable = ConnectionError("redis unreachable")
 

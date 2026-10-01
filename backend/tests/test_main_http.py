@@ -1,6 +1,4 @@
-"""HTTP-level tests for the /search, /facets, /analytics/click and
-/analytics/summary endpoints of app.main (cache hit/miss wiring, qdrant/redis
-error mapping, and analytics beacons)."""
+"""HTTP-level coverage of the /search, /facets and /analytics routes of app.main."""
 
 import asyncio
 import json
@@ -27,9 +25,7 @@ async def _noop_async(*args, **kwargs):
 
 
 def _via_local_proxy(app):
-    """Present requests to `app` as if they arrived from a reverse proxy on this
-    host -- nginx forwarding to 127.0.0.1, as the reference deploy in setup.sh
-    does -- instead of the TestClient's default non-IP peer."""
+    """Fake a loopback peer, so the proxy-trust paths see what setup.sh's nginx sends."""
 
     async def wrapper(scope, receive, send):
         if scope["type"] == "http":
@@ -44,15 +40,7 @@ _client = TestClient(main.app, raise_server_exceptions=False)
 
 @pytest.fixture(autouse=True)
 def _public_rate_limiter(monkeypatch):
-    """Install a working in-memory limiter store for the public endpoints.
-
-    /search, /facets and /analytics/click now fail CLOSED (503) when the
-    limiter's Redis is unreachable, so the tests that are about search wiring
-    rather than rate limiting get a counting stub instead of a real Redis. The
-    shared fake models SET NX EX / INCR for real, so the limiter's window
-    bookkeeping is exercised here too. Rebuilt per test, so no counter leaks
-    between cases.
-    """
+    """/search, /facets and /analytics/click fail CLOSED (503) when the limiter's Redis is unreachable."""
     fake = RateLimitRedisFake()
     monkeypatch.setattr(auth, "_rate_client", fake)
 
@@ -60,7 +48,6 @@ def _public_rate_limiter(monkeypatch):
 
 
 def _cached_search_client(monkeypatch):
-    """Wire /search to a pure cache hit so the limiter is the only variable."""
     monkeypatch.setattr(main, "cache", FakeCache(get_result=[_summary_dict(1, 0.9)]))
     monkeypatch.setattr(main, "fix_query", lambda q: (q, "fixed"))
     monkeypatch.setattr(main, "_effective_intent", lambda q, fd, td: (q, None, None, None, None))
@@ -86,9 +73,7 @@ def test_search_over_the_limit_is_rejected_with_429(monkeypatch):
 
 
 def test_search_rejects_over_long_q_and_accepts_a_normal_one(monkeypatch):
-    """`q` reaches retrieval, query expansion and the reranker verbatim, so an
-    unbounded q is an unbounded amount of work per request. The bound is a
-    422 from validation, before any of that runs."""
+    """An unbounded q is unbounded work per request, so validation rejects it with 422 before retrieval runs."""
     _cached_search_client(monkeypatch)
 
     ok = _client.get("/search", params={"q": "a" * config.SEARCH_QUERY_MAX_CHARS})
@@ -100,19 +85,7 @@ def test_search_rejects_over_long_q_and_accepts_a_normal_one(monkeypatch):
 
 
 def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
-    """Two clients behind the reference proxy each get their own bucket.
-
-    AUTH_TRUST_X_FORWARDED_FOR is deliberately NOT stubbed: this asserts the
-    SHIPPED default, which is what a real host runs. Behind the loopback peer
-    nginx presents, the forwarded client IP is honored without any .env edit;
-    stubbing the flag true here would only prove the code works under a
-    deployment the operator has to configure by hand, and would hide the
-    single-bucket collapse that a default of "off" actually caused.
-    """
-    # Precondition, so this cannot silently degrade into asserting whatever the
-    # ambient config happens to be: the shipped value is "auto" (.env.example)
-    # or absent (config.py's default), and any explicit true/false override
-    # would make the assertion below prove something else.
+    """Two proxied clients get their own bucket; the XFF trust flag is deliberately left at the shipped default."""
     assert os.environ.get("AUTH_TRUST_X_FORWARDED_FOR", "auto").lower() == "auto", (
         "this test asserts the shipped default; unset AUTH_TRUST_X_FORWARDED_FOR or set it to 'auto'"
     )
@@ -124,24 +97,17 @@ def test_search_limit_is_per_client_ip_not_one_global_bucket(monkeypatch):
 
     assert client_a.get("/search", params={"q": "test"}).status_code == 200
     assert client_a.get("/search", params={"q": "test"}).status_code == 429
-    # A different client IP must still be served: its own first request.
     assert client_b.get("/search", params={"q": "test"}).status_code == 200
 
 
 def test_search_limit_ignores_xff_from_a_client_that_is_not_behind_a_proxy(monkeypatch):
-    """A direct caller cannot forge X-Forwarded-For to escape its rate-limit
-    bucket -- the other side of trusting that header only for a loopback peer.
-
-    Each request carries a DIFFERENT forged address. Reusing one forged value
-    would prove nothing, since a client that always claims the same IP lands in
-    the same bucket whether or not the header is honored at all."""
+    """XFF is trusted only from a loopback peer; the two requests forge different IPs, so reusing one would prove nothing."""
     monkeypatch.setattr(config, "PUBLIC_SEARCH_RATE_PER_MIN", 1)
     _cached_search_client(monkeypatch)
     first = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "9.9.9.9"})
     second = TestClient(main.app, raise_server_exceptions=False, headers={"x-forwarded-for": "8.8.8.8"})
 
     assert first.get("/search", params={"q": "test"}).status_code == 200
-    # Same socket peer, so still the same bucket despite the new claimed IP.
     assert second.get("/search", params={"q": "test"}).status_code == 429
 
 
@@ -169,18 +135,9 @@ def test_facets_over_the_limit_is_rejected_with_429(monkeypatch):
 
 
 def test_exhausting_the_search_limit_does_not_spend_the_facets_budget(monkeypatch):
-    """The per-endpoint limits are separate budgets, not one shared counter.
-
-    The limiter key is public:rl:<action>:<client ip>. If the action segment
-    were ever dropped, a client that burned its /search allowance would also
-    be throttled on /facets and its click beacons, and a runaway /ready prober
-    could throttle search -- with every other limit test still green, since
-    each of them only ever exhausts one endpoint at a time.
-    """
+    """Limiter key is public:rl:<action>:<ip>; other limit tests exhaust one endpoint, so a dropped action stays green."""
 
     class _BothEndpointsCache:
-        """One cache serving both routes: facets wants a mapping, search a list."""
-
         async def get(self, key):
             if key == main.FACETS_CACHE_KEY:
                 return {"industry": [], "dealtype": []}
@@ -199,7 +156,6 @@ def test_exhausting_the_search_limit_does_not_spend_the_facets_budget(monkeypatc
 
     assert _client.get("/search", params={"q": "test"}).status_code == 200
     assert _client.get("/search", params={"q": "test"}).status_code == 429
-    # The search allowance is spent, but facets has its own.
     assert _client.get("/facets").status_code == 200
 
 
@@ -226,12 +182,7 @@ def _summary_dict(id_: int, score: float = 0.5) -> dict:
     }
 
 
-# This file's copy derived every field from the id, which is what the shared
-# defaults already do.
 _article = make_article
-
-
-# --- /search ---
 
 
 async def _passthrough_boost(q, results):
@@ -387,9 +338,7 @@ def test_search_passes_built_facet_filter_to_retrieve(monkeypatch, fake_cache):
 
 
 def test_search_cache_miss_does_not_cache_empty_results(monkeypatch, fake_cache):
-    """Regression: an empty result set was cached and then replayed as
-    authoritative 'no results' for the whole TTL, so a date-filtered query that
-    transiently retrieved nothing kept returning nothing for minutes."""
+    """An empty set replayed as 'no results' pins a date-filtered query to nothing for the whole TTL."""
     cache = fake_cache()
 
     async def fake_retrieve(q, top_k, qfilter, need_body=False, prefetched=None):
@@ -417,8 +366,6 @@ def test_search_cache_miss_does_not_cache_empty_results(monkeypatch, fake_cache)
 
 
 def test_search_empty_results_are_not_served_from_cache(monkeypatch, fake_cache):
-    """The whole point of the guard: a second identical query must re-run
-    retrieval instead of being answered from a poisoned empty cache entry."""
     cache = fake_cache()
     calls = []
 
@@ -451,8 +398,6 @@ def test_search_empty_results_are_not_served_from_cache(monkeypatch, fake_cache)
 
 
 def test_search_non_empty_results_are_still_cached(monkeypatch, fake_cache):
-    """Guard against over-correcting: the cache must stay enabled for real
-    result sets, only empty ones are skipped."""
     cache = fake_cache()
     articles = [_article(1, 0.9)]
 
@@ -480,12 +425,7 @@ def test_search_non_empty_results_are_still_cached(monkeypatch, fake_cache):
     assert [d["id"] for d in cache.sets[0][1]] == [1]
 
 
-# --- retrieve_and_rerank caching ---
-
-
 def _patch_retrieval_pipeline(monkeypatch, articles):
-    """Wires retrieve_and_rerank's collaborators to fakes returning `articles`."""
-
     async def fake_leg(rq, top_k, qfilter):
         return list(articles)
 
@@ -536,13 +476,7 @@ def test_search_retrieve_error_returns_500(monkeypatch, fake_cache):
 
 
 def test_search_cache_error_returns_500(monkeypatch, fake_cache):
-    """A cache read that raises must surface as a 500.
-
-    Retrieval is stubbed to succeed, so the only thing that can turn this
-    request into a 500 is the cache raising. With a working cache the very same
-    wiring answers 200, which is what makes the 500 attributable to the cache
-    instead of to whatever the unstubbed pipeline would have done.
-    """
+    """Retrieval is stubbed to succeed, so the raising cache read is the only path to this 500."""
 
     async def fake_retrieve(*args, **kwargs):
         return [_article(1, 0.9)]
@@ -561,9 +495,6 @@ def test_search_cache_error_returns_500(monkeypatch, fake_cache):
 
     r = _client.get("/search", params={"q": "test"})
     assert r.status_code == 500
-
-
-# --- /facets ---
 
 
 def test_facets_cache_hit(monkeypatch, fake_cache):
@@ -616,14 +547,7 @@ def test_facets_qdrant_error_returns_500(monkeypatch, fake_cache):
     assert r.status_code == 500
 
 def test_facets_survives_a_failed_tag_scan(monkeypatch, fake_cache):
-    """The tag walk is the slowest scan and the only optional one.
-
-    It ranks the whole collection with no early exit where industry/dealtype
-    stop early, so it is the one most likely to time out -- and a timeout must
-    not 500 the two controlled vocabularies the UI's autocomplete already
-    depends on. The tag input is free text, so an empty suggestion list still
-    filters correctly on a typed tag.
-    """
+    """A failed tag walk must still 200 with the two controlled vocabularies the UI autocomplete needs."""
     async def fake_facet_values(key):
         return {"industry_names": ["Fintech"], "dealtype_names": ["M&A"]}[key]
 
@@ -644,20 +568,11 @@ def test_facets_survives_a_failed_tag_scan(monkeypatch, fake_cache):
 
 
 def test_facets_concurrent_misses_share_one_scan_and_one_cache_write(monkeypatch):
-    """K callers that miss together must cost one scan per key, not one each.
-
-    `cache.get` then `cache.set` is a check-then-act, so every caller that
-    arrived while the first was still walking the collection used to start its
-    own walk. Counted on the scan seam, never on elapsed time: each scan refuses
-    to finish until all K callers have been through the cache, so a scan from a
-    second caller cannot hide behind the first one completing early.
-    """
+    """Counted on the scan seam, never on elapsed time: each scan waits for every caller, so a later scan cannot hide."""
     callers = 6
     state: dict = {}
 
     class _ArrivalCache(FakeCache):
-        """Records how many callers have been through the cache."""
-
         async def get(self, key):
             value = await super().get(key)
             if key == main.FACETS_CACHE_KEY:
@@ -697,9 +612,7 @@ def test_facets_concurrent_misses_share_one_scan_and_one_cache_write(monkeypatch
 
 
 def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkeypatch):
-    """A scan that raises must leave the guard free and write nothing to the
-    cache, so the next caller scans again instead of being served -- or wedged
-    on -- the failure."""
+    """A raising scan must release the single-flight guard, or the next caller wedges on it forever."""
     attempts: list[str] = []
 
     async def down_facet_values(key):
@@ -707,10 +620,6 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
         raise RuntimeError("qdrant down")
 
     async def working_top_facet_values(key, limit):
-        # The tag scan degrades to [] on failure instead of propagating (see
-        # _facets_uncached), so this test keeps it healthy: what it is about is
-        # the guard being released when a CONTROLLED vocabulary fails, and a tag
-        # failure no longer reaches the caller at all.
         attempts.append(key)
         return ["IPO"]
 
@@ -721,7 +630,7 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
         monkeypatch.setattr(main, "_facet_values", down_facet_values)
         monkeypatch.setattr(main, "_top_facet_values", working_top_facet_values)
         outcomes = await asyncio.gather(main.facets(), main.facets(), return_exceptions=True)
-        # Let the scan's done callback run, so the guard is observably released.
+        # Yield so the scan task's done callback runs and the guard is observably released.
         await asyncio.sleep(0)
         return cache, outcomes, main._facet_scan_task
 
@@ -743,10 +652,7 @@ def test_facets_failed_scan_releases_the_single_flight_and_caches_nothing(monkey
 
 
 def test_facets_scans_the_vocabularies_concurrently(monkeypatch):
-    """The keys are independent, so the second scan has to start before the
-    first finishes. Each scan refuses to finish until the others have started, so
-    the awaited-back-to-back version times out here instead of merely being
-    slower -- this is ordering, not a race on a stopwatch."""
+    """Each scan blocks until all three start, so a serial implementation times out here, not merely slower."""
     scans_expected = 3
 
     async def scenario():
@@ -775,22 +681,12 @@ def test_facets_scans_the_vocabularies_concurrently(monkeypatch):
     assert result == {"industry": ["industry_names"], "dealtype": ["dealtype_names"],
                       "tags": ["tag_names"]}
 
-    # The point of the test is that no scan ran to completion before the others
-    # started, so the industry scan is not necessarily the one recorded first.
     assert len(started) == scans_expected
 
 
 
 @pytest.mark.parametrize("cancels", ["creator", "waiter"])
 def test_facets_cancelled_caller_does_not_abort_the_scan_the_others_share(monkeypatch, cancels):
-    """A request that goes away mid-scan (client disconnect, request timeout)
-    must not take the shared scan down with it for the callers still waiting.
-
-    Both callers who can be holding the scan are covered: the one that started
-    it and the one that joined it. A waiter that is cancelled while it awaits
-    the shared scan has to let go of it, not tear it down for everybody.
-    """
-
     async def scenario():
         release = asyncio.Event()
         scans: list[str] = []
@@ -827,9 +723,6 @@ def test_facets_cancelled_caller_does_not_abort_the_scan_the_others_share(monkey
     assert result == {"industry": ["Fintech"], "dealtype": ["M&A"], "tags": ["IPO"]}
 
 
-# --- /analytics/summary ---
-
-
 class _NoopStore:
     async def record_admin_audit(self, actor_id, action):
         return None
@@ -842,10 +735,6 @@ class _AuditReq:
 
 
 def test_analytics_summary(monkeypatch):
-    # The handler takes a Request and resolves a store because it records the
-    # read in the admin audit trail, as /analytics/chat does (#348). A bare
-    # call supplies neither, so both are provided here; the end-to-end route
-    # (including a real audit row) is covered in test_analytics.py.
     monkeypatch.setattr(main.chat_module, "_require_store", lambda: _NoopStore())
 
     async def fake_analytics_data():
@@ -857,9 +746,7 @@ def test_analytics_summary(monkeypatch):
 
 
 def test_analytics_summary_endpoint_maps_store_failure_to_503(monkeypatch):
-    """When the analytics store fails, the handler must return a 503 response
-    whose body carries the error — not the error dict as a 200, which the
-    dashboard rendered as a legitimate all-zero report (#281)."""
+    """503, not an error-shaped 200: the dashboard read the error dict as an all-zero report."""
     async def failing_analytics_data():
         raise AnalyticsUnavailableError("analytics unavailable")
 
