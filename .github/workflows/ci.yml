@@ -33,44 +33,29 @@ jobs:
           cache-dependency-path: |
             backend/requirements.txt
             backend/requirements-dev.txt
-      # node is not a backend dependency, but tests/test_dataviz_contract.py is the
-      # only coverage of the frontend's dataviz validator (#267): it imports
-      # frontend/app/chat/datavizContract.ts under node to run one shared corpus
-      # through both implementations. That needs node >= 22.6, so the backend job
-      # needs the same "22" pin the frontend and security jobs already use, or the
-      # suite is red on a runner's default node. No npm cache: this job installs
-      # no node packages.
+      # node is not a backend dependency, but tests/test_dataviz_contract.py runs the frontend's
+      # dataviz validator under node, so this job needs the same "22" pin as the others.
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      # The runtime stack is required, not just the dev tools. app/main.py does
-      # `from fastembed import SparseTextEmbedding` at module scope and six test
-      # modules import app.main, so the suite cannot even be collected without
-      # it. (app/encoders.py and app/reranker.py import fastembed and
-      # sentence_transformers lazily inside their constructors, and the tests
-      # for those fake them in sys.modules -- so the collection-time dependency
-      # is specifically app.main's module-scope import.)
+      # The runtime stack is required, not just the dev tools: app/main.py imports fastembed at
+      # module scope and six test modules import app.main, so the suite cannot even be collected
+      # without it. (app/encoders.py and app/reranker.py import it lazily and are faked in tests.)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
-      # tests/test_budget_lua.py runs the real shipped _BUDGET_LUA source
-      # under lua5.1 and is the only thing that catches drift between that
-      # script and the Python model. It skips itself when the interpreter is
-      # absent, so without this step CI would report success while leaving the
-      # spend cap unverified. lua5.1 is in Ubuntu noble universe, which
-      # GitHub-hosted runners enable.
+      # test_budget_lua.py runs the real shipped _BUDGET_LUA under lua5.1 and is the only thing
+      # catching drift between that script and the Python model. It skips itself when the
+      # interpreter is absent, so without this step CI would pass with the spend cap unverified.
       - name: Install lua5.1
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends lua5.1
           lua5.1 -v
-      # -rs prints the skip reasons, and the assertion turns a silent skip
-      # into a red build. `set -o pipefail` is load-bearing: without it `tee`
-      # would swallow a pytest failure. Developers running the suite locally
-      # without lua5.1 are unaffected -- this lives in CI only.
+      # `set -o pipefail` is load-bearing: without it `tee` would swallow a pytest failure.
       - name: Pytest (no skipped tests)
         run: |
           set -o pipefail
@@ -79,14 +64,9 @@ jobs:
             echo "::error::pytest skipped tests in CI. The suite must be fully covered; see the SKIPPED lines above."
             exit 1
           fi
-      # The coverage figures in TEST_COVERAGE_GAPS.md are generated, and nothing
-      # else keeps them honest: they rot silently the first time a test is added
-      # and the document is not re-measured, which is exactly what issue #295
-      # was. This step re-measures the suite and fails the build when the
-      # committed block no longer matches. It runs the whole suite a SECOND
-      # time under pytest-cov -- about two minutes on top of the step above,
-      # well inside the job's 30-minute timeout, and it stays in this job
-      # rather than a new one so it reuses this job's installed dependencies.
+      # The coverage figures in TEST_COVERAGE_GAPS.md are generated and nothing else keeps them
+      # honest, so this step re-measures and fails the build on drift. It re-runs the suite a
+      # second time under pytest-cov, reusing this job's installed dependencies.
       - name: Coverage document is not stale
         run: python scripts/measure_coverage.py
 
