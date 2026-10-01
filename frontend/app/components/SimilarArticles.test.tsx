@@ -119,10 +119,9 @@ describe('SimilarArticles — safe URLs still link out', () => {
 })
 
 /**
- * The request pattern, not the payload. Before #353 each card fetched its own
- * `/recommend/similar/{id}`, so a `top_k=8` view cost eight round trips --
- * and, because the cache lived in the component, another eight on every
- * return to the page. These pin the two properties that replaced it.
+ * The request pattern, not the payload: a `top_k=8` view costs one batched
+ * round trip, and the cache outlives the component so returning to the page
+ * costs none. These pin both properties.
  */
 describe('SimilarArticles — a view costs one request, not one per card', () => {
   function mockBatch(

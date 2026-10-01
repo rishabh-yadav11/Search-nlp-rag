@@ -1,8 +1,8 @@
 /**
- * Issue #287 — the deadline helper that bounds every previously unbounded
- * `fetch` call site. The behaviour under test is the guarantee the call sites
- * rely on: the signal fires at the deadline, `clear()` cancels it, and an
- * unmount abort stays distinguishable from a timeout via `timedOut()`.
+ * The deadline helper that bounds every `fetch` call site. The behaviour under
+ * test is the guarantee the call sites rely on: the signal fires at the
+ * deadline, `clear()` cancels it, and an unmount abort stays distinguishable
+ * from a timeout via `timedOut()`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDeadline } from './deadline'
