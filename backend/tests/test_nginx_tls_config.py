@@ -1,34 +1,8 @@
-"""Structural tests for the nginx config setup.sh generates (issue #244).
+"""Structural tests for the nginx config setup.sh generates.
 
-setup.sh used to emit a single `server { listen 80; ... }` block, so passwords,
-bearer tokens, X-Service-Token and chat bodies all crossed the network in
-cleartext, and the Strict-Transport-Security header the frontend sets was
-ignored -- browsers only honour HSTS delivered over https, so over plain HTTP it
-was decoration. The fix renders the same proxy body from one place and adds a
-443 server once a certificate exists; `./setup.sh tls` obtains that certificate
-through certbot's webroot plugin.
-
-The generator is split in two, and these tests use both:
-
-* `render_nginx_config on|off` is the emitting half. The mode arrives as a
-  positional parameter, only the path/port knobs come from the environment, and
-  it never reads NGINX_TLS or probes the certificate store -- so either mode
-  renders deterministically, with nothing created under /etc.
-* `nginx_site_config` is the env-resolving wrapper. It decides the mode from
-  NGINX_TLS / LE_DOMAIN / cert readability, refuses to emit anything when the
-  mode is on and the certificate cannot be read, and delegates.
-
-Asserting against the real function keeps this file from drifting away from the
-config nginx is actually handed: deleting the `^~` on the ACME location, dropping
-`$request_uri` from the redirect, or letting the two servers drift apart all turn
-it red.
-
-Nothing here runs `run_nginx`, `run_tls` or the script as a program with a stage
-argument. Those need sudo, certbot and the deploy host, and this suite has to
-stay runnable offline, so the validity checks below are structural only --
-balanced braces, terminated directives, one listen and one server_name per
-server, no two servers on the same port. They catch a malformed render; they
-cannot replace nginx's own parser.
+Nothing here runs a stage: `run_nginx`/`run_tls` need sudo, certbot and the
+deploy host, so the validity checks are structural only and cannot replace
+`nginx -t`.
 """
 
 import os
@@ -44,9 +18,7 @@ import pytest
 SETUP_SH = Path(__file__).resolve().parents[2] / "setup.sh"
 
 # Ports are pinned to values that differ from the shipped defaults, so a config
-# that hardcodes them fails here instead of passing by coincidence. That only
-# holds while the pins really are different, which is what
-# test_port_pins_differ_from_the_shipped_defaults guards.
+# that hardcodes them fails here instead of passing by coincidence.
 PUBLIC_PORT = 8080
 API_PORT = 18001
 NEXT_PORT = 13000
@@ -87,10 +59,9 @@ def _openssl(cwd, *args):
 def _valid_pair(domain):
     """(cert, key) PEM text for a real, unexpired self-signed pair.
 
-    Real rather than placeholder text because setup.sh now asks openssl whether
-    the leaf is still in date: a file that merely exists says nothing about
-    whether it can be served. Minted once per session, then copied into each
-    test's own tmp_path.
+    Real rather than placeholder text because setup.sh asks openssl whether the
+    leaf is still in date: a file that merely exists says nothing. Minted once
+    per session, then copied into each test's own tmp_path.
     """
     with tempfile.TemporaryDirectory() as scratch:
         scratch = Path(scratch)
@@ -137,12 +108,8 @@ def _shipped_default(name):
 
 
 def test_port_pins_differ_from_the_shipped_defaults():
-    """The claim every assertion in this module rests on.
-
-    A pin equal to the shipped default makes a template that hardcodes that
-    default indistinguishable from one that interpolates the knob, so the pins
-    have to stay off the defaults for this file to mean anything.
-    """
+    """A pin equal to the shipped default makes a template that hardcodes that
+    default indistinguishable from one that interpolates the knob."""
     for name, pinned in (("PUBLIC_PORT", PUBLIC_PORT), ("API_PORT", API_PORT), ("NEXT_PORT", NEXT_PORT)):
         default = _shipped_default(name)
         assert pinned != default, (
@@ -150,14 +117,13 @@ def test_port_pins_differ_from_the_shipped_defaults():
             f"baking in {default} would pass every test here unnoticed"
         )
 
-# A domain with a cert present, and the ACME path that must keep answering on
-# port 80 for renewals to keep working once the redirect exists.
+# The ACME path must keep answering on port 80 or renewals break once the
+# redirect exists.
 DOMAIN = "search.example.com"
 ACME_PATH = "/.well-known/acme-challenge/"
 REDIRECT_TARGET = "https://$host$request_uri"
 
-# Routes proxied to gunicorn, and routes proxied to the frontend. Dropping one
-# silently 404s it in production, so both sets are asserted in full.
+# Dropping a route silently 404s it in production, so both sets are asserted in full.
 API_LOCATIONS = (
     "/search",
     "/health",
@@ -175,11 +141,6 @@ API_LOCATIONS = (
 FRONTEND_LOCATIONS = ("/analytics", "/")
 
 
-# --------------------------------------------------------------------------
-# fixtures for the knobs the generator reads
-# --------------------------------------------------------------------------
-
-
 def _webroot(tmp_path):
     return tmp_path / "certbot-webroot"
 
@@ -191,12 +152,11 @@ def _missing_cert_root(tmp_path):
 
 
 def _certified_root(tmp_path, domain, *, pair=None):
-    """A letsencrypt root holding a cert/key pair for `domain`, under tmp_path
-    so nothing here can touch a real certificate store.
+    """A letsencrypt root holding a cert/key pair for `domain`, under tmp_path.
 
-    Without openssl there is no way to mint one, and setup.sh's own rule
-    degrades to the file test in that case, so the placeholder it is happy
-    with is written instead. Both paths mean the same thing to the script.
+    Without openssl there is no way to mint one, so the placeholder setup.sh's
+    own rule is happy with is written instead; both paths mean the same to the
+    script.
     """
     root = tmp_path / "letsencrypt"
     live = root / "live" / domain
@@ -211,8 +171,8 @@ def _certified_root(tmp_path, domain, *, pair=None):
 
 def _broken_cert_root(tmp_path, domain, how):
     """A letsencrypt root holding a pair that is not something nginx should be
-    pointed at. `unparseable_cert` and `expired` still keep TLS (see the test
-    that uses them); the rest have no pair to serve and answer "off"."""
+    pointed at. `unparseable_cert` and `expired` still keep TLS; the rest have no
+    pair to serve and answer "off"."""
     if how == "expired":
         return _certified_root(tmp_path, domain, pair=_expired_pair(domain))
     root = _certified_root(tmp_path, domain)
@@ -228,8 +188,8 @@ def _broken_cert_root(tmp_path, domain, how):
     elif how == "unparseable_cert":
         (live / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\nnot base64\n")
     elif how == "unreadable_cert":
-        # The mode certbot gives privkey.pem, and the reason readability is
-        # never tested: this user cannot open it, but nginx runs as root.
+        # certbot's privkey.pem mode, and the reason readability is never a
+        # reason to downgrade: this user cannot open it, but nginx runs as root.
         (live / "fullchain.pem").chmod(0o000)
     else:
         raise AssertionError(f"unknown breakage {how!r}")
@@ -239,15 +199,11 @@ def _broken_cert_root(tmp_path, domain, how):
 def _env(tmp_path, **over):
     """A complete environment for the generator.
 
-    Every knob is set explicitly, defaults included: the mode must be decided
-    by what the test asks for, never by a value leaked in from the environment
-    pytest happens to be started in.
-
-    NGINX_CONF and NGINX_LINK belong in that list now, not just as hygiene:
-    "auto" consults the INSTALLED config (nginx_conf_serves_tls) and the domain
-    recovery block reads its ssl_certificate line, so an inherited or default
-    /etc/nginx path would make those tests answer on whatever this machine
-    happens to be serving.
+    Every knob is set explicitly, defaults included, so the mode is decided only
+    by what the test asks for. NGINX_CONF and NGINX_LINK are in that list
+    because "auto" consults the installed config and the domain recovery block
+    reads its ssl_certificate line: an inherited /etc/nginx path would answer
+    with whatever this machine happens to be serving.
     """
     env = dict(os.environ)
     env.update(
@@ -294,11 +250,6 @@ def _site_config(tmp_path, **over):
     proc = _call(_env(tmp_path, **over), "nginx_site_config")
     assert proc.returncode == 0, f"nginx_site_config exited {proc.returncode}: {proc.stderr}"
     return proc.stdout
-
-
-# --------------------------------------------------------------------------
-# parsing helpers
-# --------------------------------------------------------------------------
 
 
 def _server_blocks(config):
@@ -361,10 +312,9 @@ def _location_body(block, path):
         if opener.match(line):
             depth, body = line.count("{") - line.count("}"), [line]
             if depth == 0:
-                # A whole location on one line, e.g. the TLS redirect. The
-                # loop below would never see depth return to 0, so without
-                # this it falls through and reports a location that is
-                # plainly there.
+                # A whole location on one line, e.g. the TLS redirect: the loop
+                # below would never see depth return to 0, so without this it
+                # falls through and reports a location that is plainly there.
                 return line
             for following in lines[at + 1 :]:
                 body.append(following)
@@ -372,11 +322,6 @@ def _location_body(block, path):
                 if depth == 0:
                     return "\n".join(body)
     raise AssertionError(f"no location {path!r} in:\n{block}")
-
-
-# --------------------------------------------------------------------------
-# the script itself
-# --------------------------------------------------------------------------
 
 
 def test_setup_script_is_syntactically_valid():
@@ -388,9 +333,9 @@ def test_setup_script_is_syntactically_valid():
 def test_sourcing_setup_sh_runs_no_stage(tmp_path):
     """Sourcing must only define functions.
 
-    Every renderer here is called from a subshell that sources this script, so
-    if the top-level argument parsing still ran unguarded it would print usage
-    and exit before any function was reachable.
+    Every renderer is called from a subshell that sources this script, so
+    unguarded top-level argument parsing would print usage and exit before any
+    function was reachable.
     """
     proc = subprocess.run(
         ["bash", "-c", f'source "{SETUP_SH}"\necho SOURCED-OK'],
@@ -403,17 +348,9 @@ def test_sourcing_setup_sh_runs_no_stage(tmp_path):
     assert proc.stdout == "SOURCED-OK\n", f"sourcing must print nothing of its own, got: {proc.stdout!r}"
 
 
-# --------------------------------------------------------------------------
-# the seam itself
-# --------------------------------------------------------------------------
-
-
 def test_render_nginx_config_takes_the_mode_positionally_not_from_the_env(tmp_path):
-    """The mode is an argument, not a second source of truth.
-
-    If the emitter went back to reading NGINX_TLS, a caller that resolved the
-    mode and passed it in could be silently overridden by the environment.
-    """
+    """The mode is an argument, not a second source of truth: an emitter that
+    read NGINX_TLS could silently override a caller that resolved the mode."""
     on = _rendered(tmp_path, "on", NGINX_TLS="off", LE_DOMAIN=DOMAIN)
     assert "listen 443" in on, f"render_nginx_config on must emit TLS whatever NGINX_TLS says:\n{on}"
 
@@ -425,9 +362,9 @@ def test_render_nginx_config_takes_the_mode_positionally_not_from_the_env(tmp_pa
 def test_render_nginx_config_does_not_probe_the_certificate_store(tmp_path):
     """The emitter has no cert-existence gate; the wrapper owns it.
 
-    Two different gates in two halves is how they drift -- so the emitter is
-    required to emit the same TLS config whether or not anything is on disk, and
-    the refusal is asserted separately against nginx_site_config.
+    Two gates in two halves is how they drift, so the emitter must emit the same
+    TLS config whether or not anything is on disk, and the refusal is asserted
+    separately against nginx_site_config.
     """
     config = _rendered(tmp_path, "on", LE_DOMAIN=DOMAIN, LE_ROOT=str(_missing_cert_root(tmp_path)))
     cert = _directive(_server_on(config, 443), "ssl_certificate")
@@ -445,11 +382,6 @@ def test_auto_mode_with_a_certificate_matches_render_nginx_config_on(tmp_path):
         "with a domain and a readable certificate, NGINX_TLS=auto must render exactly "
         "render_nginx_config on"
     )
-
-
-# --------------------------------------------------------------------------
-# plain HTTP (the rollback posture, and the default with no certificate)
-# --------------------------------------------------------------------------
 
 
 def test_plain_mode_emits_no_tls_at_all(tmp_path):
@@ -479,11 +411,9 @@ def test_plain_mode_serves_the_whole_site_on_the_public_port(tmp_path):
 def test_proxied_ports_come_from_the_env_knobs(tmp_path):
     """The rendered config must interpolate the ports it is given.
 
-    Because API_PORT and NEXT_PORT are pinned away from the shipped defaults,
-    a literal 8001 or 3000 baked into the template fails here instead of
-    quietly proxying to whatever happens to answer on the host. They used to be
-    pinned to the defaults themselves, which made this assertion pass for a
-    template that had hardcoded them.
+    The API and Next ports are pinned away from the shipped defaults, so a
+    literal 8001 or 3000 baked into the template fails here instead of quietly
+    proxying to whatever happens to answer on the host.
     """
     config = _rendered(tmp_path, "off")
     assert f"127.0.0.1:{API_PORT}" in config, f"API routes must proxy to $API_PORT:\n{config}"
@@ -504,13 +434,12 @@ def _api_location_bodies(block):
 def test_every_api_location_forwards_the_public_host(tmp_path, mode):
     """Each API location must set `proxy_set_header Host $host`.
 
-    nginx's default proxy Host is `$proxy_host` — the proxy_pass target — so a
+    nginx's default proxy Host is `$proxy_host` -- the proxy_pass target -- so a
     location that does not override it reaches the backend as
-    `Host: 127.0.0.1:8001` rather than the host the browser addressed. The
-    CSRF guard compares `Origin` against `Host`, and browsers send `Origin` on
+    `Host: 127.0.0.1:8001` rather than the host the browser addressed. The CSRF
+    guard compares `Origin` against `Host`, and browsers send `Origin` on
     same-origin unsafe requests too, so every cookie-authenticated POST through
-    such a location is 403 for every user. `/recommend/` shipped that way and
-    took `POST /recommend/interaction` down in production.
+    such a location is 403 for every user.
 
     Driven off the RENDERED config, not the template, because the escaping is
     the other half of the bug: this heredoc is unquoted, so a `\\$host` typo
@@ -529,8 +458,8 @@ def test_every_api_location_forwards_the_public_host(tmp_path, mode):
 def test_the_host_header_is_asserted_on_every_api_location_not_just_api(tmp_path):
     """The regression itself, named: /recommend/ is not special-cased.
 
-    Guards against a fix that adds the header to the one location the bug
-    report named, leaving the same failure waiting for the next location added.
+    Guards against a fix that adds the header to only the location the bug
+    report named, leaving the same failure for the next location added.
     """
     block = _server_on(_rendered(tmp_path, "off"), PUBLIC_PORT)
     api_paths = {path for path, _ in _api_location_bodies(block)}
@@ -538,11 +467,6 @@ def test_the_host_header_is_asserted_on_every_api_location_not_just_api(tmp_path
         f"the API-location set changed; update API_LOCATIONS so it stays the full list. "
         f"got {sorted(api_paths)}, expected {sorted(API_LOCATIONS)}"
     )
-
-
-# --------------------------------------------------------------------------
-# TLS mode
-# --------------------------------------------------------------------------
 
 
 def test_tls_mode_adds_a_tls_server(tmp_path):
@@ -587,7 +511,7 @@ def test_auto_mode_falls_back_to_plain_when_there_is_no_certificate(tmp_path):
 
 
 def test_acme_challenge_is_still_served_over_http_under_the_redirect(tmp_path):
-    """The point of the whole issue: renewals keep working.
+    """Renewals keep working.
 
     Once :80 redirects, the challenge would be redirected to https -- where
     certbot's renewal request does not follow -- and the certificate would
@@ -633,18 +557,10 @@ def test_the_two_servers_serve_the_same_routes(tmp_path):
     )
 
 
-# --------------------------------------------------------------------------
-# guards against emitting an unusable config
-# --------------------------------------------------------------------------
-
-
 def test_tls_mode_refuses_to_render_a_config_for_a_missing_certificate(tmp_path):
-    """The whole point of the cert-existence gate.
-
-    A config naming a certificate that is not there is not a warning, it is a
-    failed `nginx -t` and a site that will not reload -- so the generator must
-    write nothing at all and fail instead.
-    """
+    """The cert-existence gate: a config naming a certificate that is not there
+    is not a warning, it is a failed `nginx -t` and a site that will not reload
+    -- so the generator must write nothing at all and fail instead."""
     root = _missing_cert_root(tmp_path)
     proc = _call(_env(tmp_path, NGINX_TLS="on", LE_DOMAIN=DOMAIN, LE_ROOT=str(root)), "nginx_site_config")
     expected = str(root / "live" / DOMAIN / "fullchain.pem")
@@ -655,8 +571,8 @@ def test_tls_mode_refuses_to_render_a_config_for_a_missing_certificate(tmp_path)
 
 def test_tls_mode_refuses_to_render_a_config_for_a_missing_private_key(tmp_path):
     """The other half of the pair. `nginx -t` reads privkey.pem from the same
-    config it reads the certificate from, so a config pointing at a missing key
-    fails exactly as hard, and the generator must not write it."""
+    config it reads the certificate from, so a missing key fails exactly as hard
+    and the generator must not write the config."""
     root = _broken_cert_root(tmp_path, DOMAIN, "no_key")
     proc = _call(_env(tmp_path, NGINX_TLS="on", LE_DOMAIN=DOMAIN, LE_ROOT=str(root)), "nginx_site_config")
 
@@ -670,10 +586,9 @@ def test_tls_mode_refuses_to_render_a_config_for_a_missing_private_key(tmp_path)
 def test_auto_mode_refuses_a_pair_that_is_not_there(how, tmp_path):
     """"auto" has to mean present-and-complete, not just present.
 
-    Each of these is a half-written pair from an interrupted run: a file that
-    nginx would name in a config it cannot load, so there is nothing to serve
-    TLS with. Plain HTTP is the only honest answer, and the loud warning says
-    so.
+    Each of these is a half-written pair from an interrupted run: a file nginx
+    would name in a config it cannot load, so there is nothing to serve TLS with.
+    Plain HTTP is the only honest answer, and the loud warning says so.
     """
     root = _broken_cert_root(tmp_path, DOMAIN, how)
     config = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
@@ -691,19 +606,17 @@ def test_auto_mode_refuses_a_pair_that_is_not_there(how, tmp_path):
 def test_a_key_only_its_owner_can_read_still_renders(tmp_path):
     """certbot writes privkey.pem 0600 root:root, and that is the normal case.
 
-    The pre-emit gate in nginx_site_config runs as whoever invoked the script,
-    while `nginx -t` runs as root. A readability test in the gate therefore
-    refused to emit a config that nginx loads perfectly well -- permanently,
-    because the key stays 0600 forever -- and the error told the operator to
-    run the command they had just run. Existence is the gate's job; what nginx
-    can read is `nginx -t`'s, and it is the gate that rolls back.
+    The pre-emit gate in nginx_site_config runs as whoever invoked the script
+    while `nginx -t` runs as root, so a readability test in the gate would refuse
+    a config nginx loads perfectly well -- permanently, because the key stays 0600
+    forever. Existence is the gate's job; what nginx can read is `nginx -t`'s,
+    and it is the gate that rolls back.
     """
     root = _certified_root(tmp_path, DOMAIN)
     key = root / "live" / DOMAIN / "privkey.pem"
     key.chmod(0o000)
     try:
-        # The premise, stated as a check: this really is a complete, non-empty
-        # pair that this process cannot read.
+        # The premise: a complete, non-empty pair this process cannot read.
         assert key.is_file() and key.stat().st_size > 0, "the key must be present and non-empty"
         assert not os.access(key, os.R_OK), (
             f"the premise needs a key this user cannot read, but {key} is readable"
@@ -722,14 +635,14 @@ def test_a_key_only_its_owner_can_read_still_renders(tmp_path):
 def test_auto_mode_keeps_tls_for_a_pair_that_is_only_unusable(how, tmp_path):
     """The other half of the rule, and the part that must NOT downgrade.
 
-    These pairs are on disk, non-empty, and complete. What is wrong with them
-    is something only the certificate itself can tell you: text that does not
-    parse, or a notAfter in the past. Answering "off" would strip a live :443
-    server and hand the site back in cleartext -- and `nginx_tls_mode` is
-    reachable from `./setup.sh nginx` and `./setup.sh all`, where no certbot
-    ever runs to put TLS back. A lapsed certificate is a browser warning;
-    `./setup.sh tls` renews it. Refusing to load a bad certificate is `nginx
-    -t`'s job, and run_nginx rolls back when it says no.
+    These pairs are on disk, non-empty, and complete. What is wrong with them is
+    something only the certificate itself can tell you: text that does not parse,
+    or a notAfter in the past. Answering "off" would strip a live :443 server and
+    hand the site back in cleartext -- and `nginx_tls_mode` is reachable from
+    `./setup.sh nginx` and `./setup.sh all`, where no certbot ever runs to put TLS
+    back. A lapsed certificate is a browser warning; `./setup.sh tls` renews it.
+    Refusing to load a bad certificate is `nginx -t`'s job, and run_nginx rolls
+    back when it says no.
     """
     root = _broken_cert_root(tmp_path, DOMAIN, how)
     config = _site_config(tmp_path, NGINX_TLS="auto", LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
@@ -756,25 +669,22 @@ def test_auto_mode_keeps_tls_for_a_pair_openssl_still_accepts(tmp_path):
 def test_cert_state_is_unknown_when_openssl_is_missing(tmp_path):
     """The absence of a tool is not evidence, in either direction.
 
-    This used to assert that `auto` kept TLS without openssl, which stopped
-    testing anything the moment the expiry check left the mode decision -- it
-    would have passed with openssl present too. Now that openssl only feeds
-    `nginx_tls_cert_state`, the honest claim is that it reports "unknown" and
-    never guesses "expired" or "corrupt" about a certificate it could not open.
+    openssl only feeds `nginx_tls_cert_state`, so the honest claim is that it
+    reports "unknown" and never guesses "expired" or "corrupt" about a
+    certificate it could not open.
     """
     root = _certified_root(tmp_path, DOMAIN)
     env = _env(tmp_path, LE_DOMAIN=DOMAIN, LE_ROOT=str(root))
-    # A PATH holding only what is needed to reach and source the script:
-    # `dirname` for SCRIPT_DIR, `bash` for this call, `env` for the subprocess
-    # lookup. `command -v openssl` then cannot succeed.
+    # A PATH holding only what is needed to reach and source the script, so
+    # `command -v openssl` cannot succeed.
     lean_path = tmp_path / "lean-path"
     lean_path.mkdir()
     for tool in ("bash", "dirname", "env"):
         os.symlink(shutil.which(tool), lean_path / tool)
     env["PATH"] = str(lean_path)
 
-    # The premise, asserted: if this ever stops hiding openssl the test below
-    # would be measuring nothing at all.
+    # The premise: if this ever stops hiding openssl the test below would be
+    # measuring nothing at all.
     premise = _call(env, "command -v openssl")
     assert premise.returncode != 0, f"openssl is still reachable on the lean PATH: {premise.stdout!r}"
 
@@ -799,9 +709,7 @@ def test_cert_state_is_unknown_when_openssl_is_missing(tmp_path):
 def test_cert_state_tells_a_lapsed_certificate_from_an_unusable_one(how, expected, tmp_path):
     """`openssl x509 -checkend` exits non-zero for a lapsed notAfter, for text
     that is not a certificate, and for a file it cannot open -- and the three
-    need different advice. Collapsing them into "expired" sent the operator to
-    re-run a command that, because of --keep-until-expiring, could not fix a
-    corrupt file at all."""
+    need different advice."""
     root = _broken_cert_root(tmp_path, DOMAIN, how)
     cert = root / "live" / DOMAIN / "fullchain.pem"
     try:
@@ -841,15 +749,10 @@ def test_rendered_config_is_structurally_sound(tmp_path, mode):
 
 def test_an_unrelated_letsencrypt_entry_is_never_adopted_as_the_domain(tmp_path):
     """/etc/letsencrypt is shared, so "the only entry under live/" is not
-    evidence of anything.
-
-    Recovery used to fall back to it, which meant that on a host where this
-    site had never been on TLS -- the installed config plain, no
-    ssl_certificate to read -- it would adopt an unrelated service's
-    cert-name and repoint both server_name and ssl_certificate at that other
-    domain, serving a certificate for a domain this site does not answer for.
-    Recovery is now justified by exactly one thing: the certificate the
-    installed config already names.
+    evidence of anything: adopting it repoints both server_name and
+    ssl_certificate at another domain, serving a certificate this site does not
+    answer for. Recovery is justified by exactly one thing -- the certificate
+    the installed config already names.
     """
     foreign = tmp_path / "letsencrypt" / "live" / "someone-elses-blog.example.org"
     foreign.mkdir(parents=True)

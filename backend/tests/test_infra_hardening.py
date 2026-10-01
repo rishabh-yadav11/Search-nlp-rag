@@ -1,51 +1,7 @@
-"""Infra hardening that must hold on the host, not just in the source (issue #256).
-
-The audit that produced #256 listed eight things under one heading. This file
-covers the ones whose failure mode is a host that is quietly worse than it looks
--- and every assertion here is made against the REAL script, the REAL ecosystem
-file and the REAL artifacts they produce, never against a copy of them:
-
-* the logrotate config is never installed, so `logs/*.log` and `~/.pm2/logs/*.log`
-  grow without bound. The documented command was
-  `sudo install -m 644 /etc/logrotate.d/vccircle` -- one operand, where `install`
-  is `install SOURCE DEST`; it aborts with "missing file destination operand" and
-  the file that exists in the repo is never the file that reaches /etc. The fix
-  installs a rendered config with both operands, and these tests RUN the stage
-  with `sudo` and `logrotate` stubbed and then stat what landed on disk.
-  Asserting the command's shape instead of its effect would have passed against
-  the broken one.
-
-* `backend/.env` holds the service credentials and the two SQLite databases hold
-  every conversation and every user record, yet nothing ever chmod'ed them; they
-  arrive at whatever `cp` and `sqlite3` chose, which is world-readable. These
-  tests apply the real function to a real temp tree and stat the result, so a
-  comment claiming the modes are set cannot pass.
-
-* `REDIS_IMAGE` was a mutable tag while Qdrant was digest-pinned: the same
-  `docker pull` on a rebuilt host could hand the deploy a different Redis.
-  A pin is only a pin if it carries a digest, so the assertion is on the digest,
-  not on the presence of a version.
-
-* `ecosystem.config.js` declared no `min_uptime` and hardcoded both the checkout
-  path and the worker count, so `pm2 start ecosystem.config.js` only worked on
-  the one host it was written on and a crash-looping frontend was never treated
-  as unstable.
-
-* The only health coverage probed the backend, so a wedged frontend -- nginx
-  proxying to a dead port, every page 502 -- was reported as healthy.
-
-* nginx had no `limit_req` at all, while the application already limits
-  `/search`, `/facets`, `/analytics/click`, `/ready` and auth. A second limiter
-  on those paths would mean two layers emitting 429 with different bodies and
-  would make the application's own `PUBLIC_*_RATE_PER_MIN` / `AUTH_*_RATE_PER_MIN`
-  knobs unreachable, so the edge limiter is scoped to the SSE chat stream, which
-  is the one expensive path with no application-level limit. The
-  non-duplication test derives the application's limited paths from the
-  application source rather than restating them, so adding a new application
-  limiter turns it red until the edge agrees.
+"""Infra hardening asserted against the REAL script, ecosystem file and artifacts.
 
 Nothing here reaches the network, writes outside its own tmp_path, or touches a
-real /etc, a real certificate store or a real pm2. `sudo`, `curl` and `pm2` are
+real /etc, a real certificate store or a real pm2: `sudo`, `curl` and `pm2` are
 stubs on PATH that act only inside the sandbox.
 """
 
@@ -73,23 +29,15 @@ BACKEND = REPO_ROOT / "backend"
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node evaluates ecosystem.config.js")
 
-# Ports are pinned to values that differ from the shipped defaults, so a config
-# that hardcodes them fails here instead of passing by coincidence.
+# Ports differ from the shipped defaults so a hardcoded config fails here, not by coincidence.
 PUBLIC_PORT = "8080"
 API_PORT = "18001"
 NEXT_PORT = "13000"
 
 
-# --------------------------------------------------------------------------
-# running the real thing
-# --------------------------------------------------------------------------
-
-
 def _bash_env(**over) -> dict[str, str]:
     """A complete environment for a bash subshell.
 
-    Every knob these tests care about is set explicitly so nothing answers from
-    a value the machine running pytest happens to export. In particular
     NGINX_CONF/NGINX_LINK point at paths that do not exist: sourcing setup.sh
     consults the INSTALLED config to recover a TLS domain, and a real /etc path
     would make the result depend on whatever this host is serving.
@@ -114,9 +62,8 @@ def _bash_env(**over) -> dict[str, str]:
 def _source(body: str, env: dict[str, str], tmp_path: Path) -> subprocess.CompletedProcess:
     """Source setup.sh in a subshell, then run `body` against it.
 
-    Sourcing rather than executing is what the script is built for: every
-    generator is a function, and the stages are guarded by
-    `if [ "${BASH_SOURCE[0]}" = "$0" ]`, so sourcing runs no stage.
+    Sourcing rather than executing runs no stage: every generator is a function
+    and the stages are guarded by `if [ "${BASH_SOURCE[0]}" = "$0" ]`.
     """
     return subprocess.run(
         ["bash", "-c", f'source "{SETUP_SH}"\n{body}\n'],
@@ -137,30 +84,21 @@ def _stub(tmp_path: Path, name: str, body: str) -> None:
     path.chmod(0o755)
 
 
-# --------------------------------------------------------------------------
-# the logrotate stage
-# --------------------------------------------------------------------------
-
-
 _RECORD = '#!/bin/sh\nprintf "%s %%s\\n" "$*" >> "$STUB_LOG"\n'
 
 
 def _logrotate_stage(tmp_path: Path, **env_over) -> subprocess.CompletedProcess:
     """Run the real `run_logrotate` with sudo + logrotate stubbed.
 
-    LOGROTATE_CONF is redirected into the sandbox, so the install the stage
-    performs is the real `install` binary writing the real rendered config -- to
-    a path this test owns. That is the whole point: the previous command had no
-    source operand at all, and only executing it can tell that apart from a
-    command that merely looks plausible.
+    LOGROTATE_CONF is redirected into the sandbox, so only executing the stage
+    can tell a real `install` from a command with no source operand.
     """
     dest = tmp_path / "etc" / "logrotate.d" / "vccircle"
     dest.parent.mkdir(parents=True, exist_ok=True)
     log = tmp_path / "stub.log"
     log.write_text("")
 
-    # `sudo` is a passthrough, so the stage really does run `install`. The only
-    # path it is ever handed is the sandboxed LOGROTATE_CONF above.
+    # `sudo` is a passthrough, so the stage really does run `install`, against the sandboxed LOGROTATE_CONF only.
     _stub(tmp_path, "sudo", _RECORD % "sudo" + 'exec "$@"\n')
     _stub(tmp_path, "logrotate", _RECORD % "logrotate" + "exit 0\n")
 
@@ -176,11 +114,8 @@ def _logrotate_stage(tmp_path: Path, **env_over) -> subprocess.CompletedProcess:
 def test_the_logrotate_stage_installs_a_real_file(tmp_path: Path):
     """`run_logrotate` must put a file where logrotate looks for one.
 
-    Executed, not pattern-matched: the stage runs with a passthrough `sudo`
-    stub, and the assertion is the installed file's existence, mode and
-    content. Before the fix there was no stage at all, only a README line
-    reading `install -m 644 /etc/logrotate.d/vccircle` -- one operand, which
-    `install` rejects before it copies anything.
+    Executed, not pattern-matched: the assertion is the installed file's
+    existence, mode and content.
     """
     proc = _logrotate_stage(tmp_path)
 
@@ -201,12 +136,9 @@ def test_the_logrotate_stage_installs_a_real_file(tmp_path: Path):
 def test_the_installed_config_has_no_unsubstituted_template_values(tmp_path: Path):
     """Whatever lands in /etc must be a config for THIS host.
 
-    The template in the repo carries placeholder paths and a placeholder `su`
-    account. Installing it verbatim produces a config that silently rotates
-    nothing on any host: the globs match no files and logrotate reports success.
-    So the assertion is that none of the template's placeholders survived the
-    render -- including the `su` line, which has to come out ACTIVATED, since a
-    policy that names no account runs every rotation as root.
+    An unsubstituted template path or `su` account makes logrotate rotate
+    nothing while reporting success, so the `su` line must come out ACTIVATED:
+    a policy naming no account runs every rotation as root.
     """
     _logrotate_stage(tmp_path)
     installed = (tmp_path / "etc" / "logrotate.d" / "vccircle").read_text()
@@ -232,20 +164,10 @@ def _rendered_logrotate(tmp_path: Path, **env_over) -> str:
 def test_the_generated_logrotate_config_is_valid(tmp_path: Path):
     """Shape of a logrotate config, checked the way logrotate's parser reads it.
 
-    logrotate is not installed here, so this is structural rather than a real
-    parse, and the two rules it does enforce are the ones a substitution can
-    actually break:
-
-    * a directive is only legal INSIDE a stanza. A `su` line that lost its
-      opening brace, or a stanza that closed early, puts the directives after
-      it at depth 0 and logrotate rejects the file.
-    * a stanza header is a list of absolute path globs. If the renderer leaves
-      an unsubstituted placeholder in one, the glob matches nothing and the
-      rotation silently stops -- with no error anywhere.
-
-    Note the directives themselves are bare keywords: `daily`, `compress` and
-    `missingok` carry no terminator, so requiring a `;` here would be checking
-    a rule logrotate does not have.
+    logrotate is not installed here, so this is structural. The two rules a
+    substitution can break: a directive is only legal INSIDE a stanza, and a
+    stanza header is a list of absolute path globs -- an unsubstituted glob
+    matches nothing and the rotation silently stops.
     """
     config = _rendered_logrotate(tmp_path)
 
@@ -284,9 +206,8 @@ def test_the_generated_logrotate_config_is_valid(tmp_path: Path):
 def test_the_generated_config_rotates_the_directories_the_app_actually_writes(tmp_path: Path):
     """The globs must name this deployment's log roots, resolved at render time.
 
-    A rotation config is worthless if it points at a directory nothing writes
-    to, and the value it needs is only knowable on the host: setup.sh's own
-    `$LOGS`, and pm2's log directory under the invoking user's home.
+    A config pointing at a directory nothing writes to is worthless, and both
+    roots are only knowable on the host.
     """
     config = _rendered_logrotate(tmp_path)
 
@@ -307,14 +228,14 @@ def test_the_generated_config_rotates_the_directories_the_app_actually_writes(tm
 def test_the_generated_config_names_a_user_that_exists(tmp_path: Path):
     """`su` takes a user and a group; logrotate runs each rotation as that pair.
 
-    Naming an account that is not on this host makes the rotation fail, and the
-    failure surfaces in logrotate's own mail rather than at install time.
+    An account missing from this host fails the rotation, and only in logrotate's
+    own mail rather than at install time.
     """
     config = _rendered_logrotate(tmp_path)
     match = re.search(r"^\s*su\s+(\S+?)\s+(\S+?)\s*;?\s*$", config, re.MULTILINE)
     assert match, f"the generated config has no `su` directive:\n{config}"
     user, group = match.group(1), match.group(2)
-    pwd.getpwnam(user)  # raises KeyError naming an account that is not on this host
+    pwd.getpwnam(user)
     assert grp.getgrnam(group), f"the group {group!r} is not on this host"
 
     operator = subprocess.run(
@@ -338,21 +259,13 @@ def test_the_logrotate_template_the_stage_renders_exists():
     )
     text = LOGROTATE_TEMPLATE.read_text()
     assert "*.log" in text, f"{LOGROTATE_TEMPLATE} rotates no log files:\n{text}"
-    # A COMMENTED `su` is what ships, and deliberately: this file is also
-    # installed by hand, and a shipped deploy file carrying an ACTIVE `su` pins
-    # one account into every copy of it -- backend/tests/test_deploy_paths.py
-    # fails exactly that. The renderer ACTIVATES the line, and that the
-    # activated policy names the real operator is asserted on the RENDERED
-    # config above, which is the state that actually reaches /etc.
+    # A COMMENTED `su` is what ships, deliberately: this file is also installed
+    # by hand, so an ACTIVE `su` would pin one account into every copy (which
+    # backend/tests/test_deploy_paths.py fails). The renderer activates it.
     assert re.search(r"^\s*#\s*su\s+\S+\s+\S+\s*;?\s*$", text, re.MULTILINE), (
         f"{LOGROTATE_TEMPLATE} has no `su` directive for the renderer to activate "
         f"with this host's user:\n{text}"
     )
-
-
-# --------------------------------------------------------------------------
-# file permissions
-# --------------------------------------------------------------------------
 
 
 def _perm_tree(tmp_path: Path, env_lines: str = "") -> Path:
@@ -363,8 +276,7 @@ def _perm_tree(tmp_path: Path, env_lines: str = "") -> Path:
     (root / "backend" / ".env").write_text("SECRET=not-a-real-credential\n" + env_lines)
     (root / "backend" / "data" / "chat.db").write_text("chat")
     (root / "backend" / "data" / "auth.db").write_text("auth")
-    # Start from the modes a fresh checkout would really have, so the test
-    # measures the change and not the umask of whoever created the files.
+    # Start from real checkout modes so the test measures the change, not the umask.
     for path in (
         root / "backend" / ".env",
         root / "backend" / "data" / "chat.db",
@@ -386,9 +298,8 @@ def _harden(root: Path, tmp_path: Path) -> subprocess.CompletedProcess:
 def test_the_secrets_and_databases_are_left_owner_only(tmp_path: Path):
     """Apply the real function to a real tree and stat what it did.
 
-    `backend/.env` carries the service credentials, and the two SQLite files
-    carry every conversation and every user record. Asserting that a comment
-    says they are chmod'ed proves nothing; asserting the resulting mode does.
+    `backend/.env` and the two SQLite files hold the credentials and every
+    conversation and user record, so the resulting mode is the only evidence.
     """
     root = _perm_tree(tmp_path)
 
@@ -422,10 +333,9 @@ def test_the_backup_directory_is_not_world_readable(tmp_path: Path):
 def test_the_databases_are_found_where_the_application_puts_them(tmp_path: Path):
     """The chmod must follow CHAT_DB_PATH / AUTH_DB_PATH, not assume the default.
 
-    config.py resolves both relative to the backend working directory and lets
-    the environment move them. A harden step that hardcoded `data/chat.db`
-    would tighten a file the application never opens and leave the real one
-    world-readable -- worse than doing nothing, because it looks done.
+    A hardcoded default path would tighten a file the application never opens
+    and leave the real one world-readable -- worse than doing nothing, because
+    it looks done.
     """
     root = _perm_tree(tmp_path)
     (root / "backend" / "data" / "elsewhere").mkdir()
@@ -476,10 +386,8 @@ def test_a_database_that_does_not_exist_yet_is_not_an_error(tmp_path: Path):
 def test_the_stages_that_create_these_files_call_the_hardening():
     """A function nothing calls is not a fix.
 
-    run_backend is what creates `.env`, and run_services is what starts a host
-    that already carries databases from before the fix. Calling it from only one
-    of them leaves the other half of the exposure in place, so both must reach
-    it.
+    run_backend creates `.env` and run_services starts a host that already
+    carries databases, so both must reach the hardening.
     """
     script = SETUP_SH.read_text()
 
@@ -499,11 +407,6 @@ def test_the_stages_that_create_these_files_call_the_hardening():
         )
 
 
-# --------------------------------------------------------------------------
-# image pinning
-# --------------------------------------------------------------------------
-
-
 def _image_defaults() -> dict[str, str]:
     """`VAR="${VAR:-default}"` for the two container images, read from setup.sh."""
     return {
@@ -519,8 +422,7 @@ def _image_defaults() -> dict[str, str]:
 def _setup_sh_defaults() -> dict[str, str]:
     """Every `VAR="${VAR:-default}"` setup.sh declares, as {name: default}.
 
-    Read out of the script rather than restated, so an assertion about a
-    default follows the file instead of drifting from it.
+    Read out of the script rather than restated, so the assertions follow it.
     """
     return {
         m.group(1): m.group(2)
@@ -534,9 +436,8 @@ def _setup_sh_defaults() -> dict[str, str]:
 def test_the_service_images_are_pinned_by_digest(var: str):
     """A tag is a name, not a pin: the same pull can return different bytes.
 
-    Qdrant was already pinned; Redis was a bare `redis:7-alpine`, so a rebuilt
-    host could pull a different Redis than the deploy was tested against, with
-    no diff anywhere to show for it.
+    A rebuilt host could pull a different Redis than the deploy was tested
+    against, with no diff anywhere to show for it.
     """
     defaults = _image_defaults()
     assert var in defaults, f"setup.sh declares no default for {var}"
@@ -577,10 +478,6 @@ def test_the_documented_default_matches_the_pinned_one():
     )
 
 
-# --------------------------------------------------------------------------
-# ecosystem.config.js
-# --------------------------------------------------------------------------
-
 _ECOSYSTEM_QUERY = (
     "const cfg = require('./ecosystem.config.js');"
     "process.stdout.write(JSON.stringify(cfg.apps.map(a => ({"
@@ -591,9 +488,8 @@ _ECOSYSTEM_QUERY = (
 def _ecosystem_apps() -> list[dict]:
     """The app objects, evaluated by node from the real file.
 
-    Parsing JavaScript with a regex is how a file with template literals,
-    arithmetic and defaults gets misread. The ecosystem file is small and node
-    is a hard dependency of this repo's frontend, so the file itself is asked.
+    A regex misreads template literals, arithmetic and defaults; the ecosystem
+    file is small and node is a hard dependency of this repo's frontend.
     """
     proc = subprocess.run(
         ["node", "-e", _ECOSYSTEM_QUERY],
@@ -612,9 +508,8 @@ def test_every_app_declares_a_min_uptime():
     """pm2 only counts a process as an unstable restart if it lasted this long.
 
     Without min_uptime a process that dies seconds after every start is
-    indistinguishable from one that is merely being restarted, so pm2 will
-    happily loop a frontend that cannot bind its port forever, and the only
-    symptom is a log file that fills up.
+    indistinguishable from one merely being restarted, so pm2 loops a frontend
+    that cannot bind its port forever and the only symptom is a log that fills.
     """
     apps = _ecosystem_apps()
     assert {a["name"] for a in apps} == {"vccircle-backend", "vccircle-frontend"}
@@ -631,15 +526,11 @@ def test_every_app_declares_a_min_uptime():
 def test_min_uptime_is_actually_raised_above_pm2s_default():
     """Declaring min_uptime is not the same as it doing anything.
 
-    pm2's own default is 1000ms, so a test that only checks the key exists --
-    or that only checks ecosystem.config.js and setup.sh AGREE with each other
-    -- passes just as happily on 1000 as on 30000. A coordinated edit that sets
-    both files to pm2's default keeps every parity check green while undoing the
-    entire point of the option: at 1000ms a frontend that starts and dies four
-    seconds later has cleared the bar, so pm2 scores every one of those
-    restarts as stable, and stable restarts never reach max_restarts or the
-    backoff. The value is therefore pinned to setup.sh's own default (one
-    source of truth) and required to clear pm2's default by a wide margin.
+    pm2's own default is 1000ms, so a test that only checks the key exists -- or
+    that only checks ecosystem.config.js and setup.sh AGREE with each other --
+    passes just as happily on 1000 as on 30000. The value is therefore pinned to
+    setup.sh's own default (one source of truth) and required to clear pm2's
+    default by a wide margin.
     """
     declared = _setup_sh_defaults().get("MIN_UPTIME_MS")
     assert declared is not None and declared.isdigit(), (
@@ -662,13 +553,11 @@ def test_min_uptime_is_actually_raised_above_pm2s_default():
 
 @needs_node
 def test_the_apps_run_from_this_checkout_rather_than_a_hardcoded_path():
-    """The cwd must be derived from where the file lives, not from the machine
-    that typed it.
+    """The cwd must be derived from where the file lives.
 
-    The shipped value was `/home/ubuntu/search-nlp-rag/...`, which exists on
-    exactly one host. pm2 resolves cwd before the process starts, so a stale
-    absolute path does not fail loudly at boot -- it produces a process that
-    is instantly restarting with no working directory at all.
+    pm2 resolves cwd before the process starts, so a stale absolute path does
+    not fail loudly at boot -- it produces a process that is instantly
+    restarting with no working directory at all.
     """
     expected = {
         "vccircle-backend": str(REPO_ROOT / "backend"),
@@ -723,12 +612,9 @@ def test_the_worker_count_follows_the_environment_and_survives_a_bad_one():
 
     assert workers(None) == "4", "the default worker count must stay 4"
     assert workers("7") == "7", "GUNICORN_WORKERS must actually take effect"
-    # The two overflow entries are the non-obvious ones. A digit-only validation
-    # accepts them, and the resulting Number stringifies in EXPONENTIAL form,
-    # so `999999999999999999999` reaches gunicorn as `--workers 1e+21` -- which
-    # gunicorn's int() rejects with ValueError, producing exactly the unbootable
-    # backend this test exists to rule out. 1025 is here for the other reason: a
-    # value that is a perfectly valid integer but an absurd number of workers.
+    # A digit-only validation accepts these two, and Number stringifies the
+    # overflow in EXPONENTIAL form, so `999999999999999999999` reaches gunicorn
+    # as `--workers 1e+21`, which gunicorn's int() rejects; 1025 is valid but absurd.
     for bad in ("abc", "0", "-2", "4; rm -rf /", "", "999999999999999999999", "1025"):
         got = workers(bad)
         assert got == "4", (
@@ -737,11 +623,6 @@ def test_the_worker_count_follows_the_environment_and_survives_a_bad_one():
             f"than reach gunicorn"
         )
     assert workers("1024") == "1024", "a large but legitimate worker count must survive"
-
-
-# --------------------------------------------------------------------------
-# the edge rate limiter
-# --------------------------------------------------------------------------
 
 
 def _render_nginx(tmp_path: Path, mode: str, **over) -> str:
@@ -753,8 +634,7 @@ def _render_nginx(tmp_path: Path, mode: str, **over) -> str:
 def _server_blocks(config: str) -> list[str]:
     """Top-level `server { ... }` blocks, located by brace depth.
 
-    A nested location block must never be mistaken for a server, or the
-    http-scope check below would carve a hole in the middle of one.
+    A nested location block must never be mistaken for a server.
     """
     blocks, current, depth = [], None, 0
     for line in config.splitlines():
@@ -806,8 +686,8 @@ def _http_scope(config: str) -> str:
 
     `limit_req_zone` is http-only. setup.sh installs this file from
     sites-enabled, which nginx includes from inside its `http` block, so a zone
-    declared at the top of this file is legal -- but only there, and one nested
-    inside a server block makes `nginx -t` reject the whole site.
+    declared at the top of the file is legal -- but one nested inside a server
+    block makes `nginx -t` reject the whole site.
     """
     out, skip = [], 0
     for line in config.splitlines():
@@ -873,12 +753,10 @@ def test_the_rate_limiting_zone_is_declared_in_http_scope(tmp_path: Path):
 def test_no_path_the_application_limits_gets_a_second_limiter(tmp_path: Path):
     """The edge must not shadow the application's own limits.
 
-    The application enforces per-IP limits on /search, /facets,
-    /analytics/click and /ready, and on auth signup and login, each tuned by a
-    PUBLIC_* / AUTH_* env knob. A limit_req on the same path means nginx
-    rejects first, with an HTML body and no knob the operator can turn -- the
-    application's limits become unreachable and an operator watching
-    PUBLIC_SEARCH_RATE_PER_MIN sees nothing happen.
+    The application enforces per-IP limits on the paths derived below, each
+    tuned by a PUBLIC_* / AUTH_* env knob. A limit_req on the same path means
+    nginx rejects first, with an HTML body and no knob the operator can turn, so
+    the application's limits become unreachable.
 
     The limited set is read out of the application source, so adding a new
     application limiter turns this red until the edge agrees about it.
@@ -901,18 +779,13 @@ def test_no_path_the_application_limits_gets_a_second_limiter(tmp_path: Path):
 def _application_limited_paths() -> dict[str, str]:
     """Paths the FastAPI app rate-limits, and the knob that tunes each.
 
-    Read out of the route declarations with `ast`, because the reason a path is
-    in this set is not a naming convention: it is a `public_rate_limit(...)`
-    dependency on the decorator, or a `_check_rate_limit(...)` call in the
-    handler. A list restated here would go stale the moment a route changed --
-    and a stale list is precisely what would let a second limiter be added on
-    top of a path that already has one.
-
-    `ast` rather than a regex because these decorators are multi-line and their
-    arguments nest: `@app.get("/search", dependencies=[Depends(public_rate_limit(
-    "search", "PUBLIC_SEARCH_RATE_PER_MIN"))])` cannot be matched by pattern
-    without a paren-balancing hack, and a pattern that quietly stops matching
-    is a guard that quietly stops guarding.
+    Read out of the route declarations with `ast`, because a path is in this set
+    only because of a `public_rate_limit(...)` dependency or a
+    `_check_rate_limit(...)` call -- a list restated here would go stale and let
+    a second limiter land on top of a path that already has one. `ast` rather
+    than a regex because these decorators are multi-line and their arguments
+    nest, and a pattern that quietly stops matching is a guard that quietly
+    stops guarding.
     """
     limited: dict[str, str] = {}
 
@@ -1020,10 +893,8 @@ def test_both_servers_carry_the_same_limiter(tmp_path: Path):
     """The two servers that actually proxy must not drift apart.
 
     In plain mode that is the :80 server; once TLS is on, :80 is redirect-only
-    and :443 is the one proxying, so the pair worth comparing is off-mode :80
-    against on-mode :443. If only one of them limits the chat stream, turning
-    TLS on silently removes the protection -- the likeliest time for an
-    operator not to notice, because nothing errors and the site keeps serving.
+    and :443 is the one proxying. If only one of them limits the chat stream,
+    turning TLS on silently removes the protection, and nothing errors.
     """
     plain = _render_nginx(tmp_path, "off")
     tls = _render_nginx(tmp_path, "on", LE_DOMAIN="example.test")
@@ -1037,11 +908,6 @@ def test_both_servers_carry_the_same_limiter(tmp_path: Path):
         "the chat location differs between the plain and TLS servers, so the two "
         f"can drift apart:\n--- plain :80 ---\n{off_chat}\n--- tls :443 ---\n{tls_chat}"
     )
-
-
-# --------------------------------------------------------------------------
-# frontend health coverage
-# --------------------------------------------------------------------------
 
 
 _CURL_STUB = """#!/bin/sh
@@ -1096,7 +962,7 @@ def _healthcheck(
 
     `healthy` maps a URL prefix to the status curl reports for it (a bare set
     means 200 everywhere); every URL absent from it is a connection failure.
-    curl is stubbed with a script rather than a mock object, because the
+    curl is stubbed with a script rather than a mock object because the
     question is what the healthcheck does when a port is dead, and the only
     faithful way to ask that is to let the real curl invocation return non-zero
     with nothing on stdout -- which is what a refused connection looks like.
@@ -1151,7 +1017,7 @@ def test_a_healthy_host_is_left_alone(tmp_path: Path):
 
 
 def test_a_wedged_frontend_is_restarted_even_when_the_backend_is_fine(tmp_path: Path):
-    """The gap this fixes: the backend is healthy, the frontend is not.
+    """The backend is healthy, the frontend is not.
 
     nginx keeps proxying to a port nothing is listening on and every page 502s,
     while a backend-only healthcheck exits 0 and reports the host as good.
@@ -1192,10 +1058,9 @@ def test_a_frontend_that_answers_at_all_is_healthy(tmp_path: Path, status: str):
     Next.js legitimately answers `/` with a redirect or a 404 depending on the
     route, and a 500 still proves the process is bound and serving. Treating
     any of those as "unhealthy" makes the script restart a perfectly good
-    frontend every five minutes forever, which is a self-inflicted outage
-    created by the monitor. Only the absence of an HTTP exchange -- connection
-    refused, reset, or a timeout, all of which make curl exit non-zero with
-    nothing on stdout -- means the frontend is actually down.
+    frontend every five minutes forever. Only the absence of an HTTP exchange
+    -- connection refused, reset, or a timeout, all of which make curl exit
+    non-zero with nothing on stdout -- means the frontend is actually down.
     """
     proc, calls = _healthcheck(
         tmp_path,
@@ -1214,10 +1079,9 @@ def test_an_api_answering_500_is_restarted(tmp_path: Path):
     """The two services are probed differently, and this is the difference.
 
     The backend publishes /health precisely so that "running but broken" can be
-    told from "merely absent", so a 500 there is actionable and the API gets
-    restarted. A frontend has no such endpoint, and treating any response as
-    failure (the previous behaviour) would restart it constantly -- so the
-    asymmetry has to hold in both directions, not just the lenient one.
+    told from "merely absent", so a 500 there is actionable. A frontend has no
+    such endpoint, and treating any response as failure would restart it
+    constantly, so the asymmetry has to hold in both directions.
     """
     proc, calls = _healthcheck(
         tmp_path,
@@ -1247,11 +1111,9 @@ def test_a_frontend_that_never_answers_is_restarted(
 ):
     """Both shapes of "no HTTP exchange" mean down -- and they look different.
 
-    This is the branch the fix turns on, and the two ways it can arrive are not
-    the same input: a refused connection makes curl print `000` and exit 7,
-    while a timeout leaves stdout empty and exits non-zero. A healthcheck that
-    only understood one of them would report a half-dead frontend as healthy
-    whenever the failure happened to take the other shape.
+    A refused connection makes curl print `000` and exit 7, while a timeout
+    leaves stdout empty and exits non-zero. A healthcheck that only understood
+    one of them would report a half-dead frontend as healthy.
     """
     proc, calls = _healthcheck(
         tmp_path,

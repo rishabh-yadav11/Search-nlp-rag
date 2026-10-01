@@ -1,10 +1,10 @@
-"""Tests for the batched similar-articles route (#353).
+"""Tests for the batched similar-articles route.
 
-A search view renders one ``<SimilarArticles>`` per result, so before this
-route existed that view cost one HTTP request, one cache read and one Qdrant
-point-id query per result -- eight of each for a ``top_k=8`` page. These
-tests pin the properties that make the batched form cheaper rather than just
-differently shaped:
+A search view renders one ``<SimilarArticles>`` per result, so before this route
+existed that view cost one HTTP request, one cache read and one Qdrant point-id
+query per result -- eight of each for a ``top_k=8`` page. These tests pin the
+properties that make the batched form cheaper rather than just differently
+shaped:
 
 * a whole view is read with ONE cache command, not one per article;
 * the Qdrant work is unchanged (one query per uncached id) and a warm view
@@ -239,8 +239,7 @@ def test_the_batched_and_per_article_routes_share_one_cache_key(client, env):
 
     Two spellings of the same key would each miss the other's entries, so every
     navigation back to a page would re-run the Qdrant query the cache exists
-    to avoid -- the exact cost this issue exists to remove, reintroduced
-    through a one-character difference in a format string.
+    to avoid.
     """
     assert client.get("/recommend/similar/4", params={"limit": 3}).status_code == 200
     env.computed.clear()
@@ -274,13 +273,12 @@ def test_an_empty_result_is_not_cached(client, env, monkeypatch):
 def test_a_legacy_unversioned_entry_is_not_served(client, env):
     """The batch route must honour the payload version too, not just the single one.
 
-    ``test_similar_articles_payload`` pins this for ``/recommend/similar/{id}``
-    (#257): entries written before the payload narrowed still carry the full
-    article body, and the handler returns a cached value verbatim. The batched
-    route reads a cache too, so a key of its own that omitted the version
-    would serve those bodies for the rest of their TTL -- a regression that
-    only the batched surface would have had, and that no other test here
-    would notice.
+    ``test_similar_articles_payload`` pins this for ``/recommend/similar/{id}``:
+    entries written before the payload narrowed still carry the full article
+    body, and the handler returns a cached value verbatim. The batched route
+    reads a cache too, so a key of its own that omitted the version would serve
+    those bodies for the rest of their TTL -- a regression only the batched
+    surface would have had, and that no other test here would notice.
     """
     env.redis.store["recommend:similar:3:3:False"] = json.dumps(
         [{"id": 3, "title": "stale", "url": "https://x/y", "body": "x" * 4000}]

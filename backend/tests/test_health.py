@@ -1,7 +1,5 @@
-"""Health probe tests: /health, /live, the Qdrant/models/LLM/Redis checks, and
-the /ready + /readyz readiness endpoints (200 vs 503). Redis reachability is
-mocked so no real Redis is needed; the module-global ``_redis_client`` is reset
-between tests."""
+"""Health probe tests. Redis is mocked, so no real Redis is needed; the
+module-global ``_redis_client`` is reset between tests."""
 
 import asyncio
 import importlib
@@ -32,15 +30,12 @@ async def _concurrent_status(count: int) -> list[tuple[bool, str]]:
 
 
 def _recording_lock(created: list) -> type[asyncio.Lock]:
-    """Build an asyncio.Lock subclass that records every instance in `created`
-    and counts how many callers are queued on it.
+    """Build an asyncio.Lock subclass recording every instance in `created` and
+    the queue depth it saw.
 
-    Patching the *class* (rather than the module's lock attribute) is what
-    separates these tests from the old spy tests: the lock object under test is
-    still the one the module itself owns, so a caller that builds its own lock
-    is visible as an extra entry in `created`. acquire() yields once before
-    locking so every caller is forced to queue instead of running straight
-    through the critical section.
+    Patching the *class* keeps the module's own lock under test, so a caller
+    that builds its own lock is visible as an extra entry in `created`.
+    acquire() yields once before locking so every caller is forced to queue.
     """
 
     class RecordingLock(asyncio.Lock):
@@ -67,11 +62,9 @@ def _recording_lock(created: list) -> type[asyncio.Lock]:
 def _reload_health() -> None:
     """Restore app.health to its pristine import-time state.
 
-    The regression under test is a property of the module's *initial* state:
-    the init lock has to exist before the first caller arrives. Once any caller
-    has run, the lazy variant is indistinguishable from the eager one, so these
-    tests must not inherit whatever an earlier test left behind. monkeypatch
-    cannot rewind a module's globals; a real reload can.
+    The init lock has to exist before the first caller arrives, and once any
+    caller has run the lazy variant is indistinguishable from the eager one.
+    monkeypatch cannot rewind a module's globals; a real reload can.
     """
     importlib.reload(health)
 
@@ -106,11 +99,10 @@ def _reset_redis_client(monkeypatch):
 def _public_rate_limiter(monkeypatch):
     """Install a counting in-memory limiter store for /ready.
 
-    /ready is rate-limited per client IP, so the endpoint tests need a working
-    store or every poll would fall through to the fail-open path and the
-    limiter itself would go untested. The shared fake models SET NX EX / INCR
-    for real, so these cases see the production window bookkeeping rather than
-    a permissive stub. Rebuilt per test, so no counter leaks between cases.
+    /ready is rate-limited per client IP, so without a working store every poll
+    would fall through to the fail-open path. The shared fake models SET NX EX /
+    INCR for real, so these cases see production window bookkeeping; it is
+    rebuilt per test, so no counter leaks between cases.
     """
     fake = RateLimitRedisFake()
     monkeypatch.setattr(auth, "_rate_client", fake)
@@ -207,13 +199,9 @@ def test_models_ok_any_missing(missing):
 
 # A real Google key is "AIza" + 35 URL-safe characters, and the shape is exactly
 # what is under test -- a random 39-char string would be a fixture that passes
-# for the wrong reason.
-#
-# Assembled from parts, and deliberately kept off any line that also names a key:
-# a credential-shaped literal in a test file is indistinguishable from a leaked
-# credential to a secrets scanner, and this file must not be the thing that reds
-# that gate. "Tidy this into one literal" is the regression to watch for, so the
-# assertions below restate the shape it has to keep.
+# for the wrong reason. Assembled from parts, and deliberately kept off any line
+# that also names a key, so a secrets scanner cannot mistake this fixture for a
+# leaked credential.
 _GOOGLE_KEY_HEAD = "AI" + "za"
 _GOOGLE_KEY_TAIL = "SyD-Example_Key" + "0123456789" + "abcdefghij"
 REAL_GEMINI_KEY = _GOOGLE_KEY_HEAD + _GOOGLE_KEY_TAIL
@@ -230,8 +218,7 @@ def _shipped_api_key() -> str:
 
     Read from the file rather than copied into a literal, so the test follows the
     file if the shipped placeholder ever changes -- and so no credential-shaped
-    literal has to live in this module. A fresh clone runs with exactly this
-    value, so it is the one that matters most.
+    literal has to live in this module.
     """
     line = next(line for line in ENV_EXAMPLE.read_text().splitlines() if line.startswith("GEMINI_API_KEY="))
     return line.split("=", 1)[1].strip()
@@ -245,9 +232,9 @@ def test_the_key_shipped_in_env_example_is_rejected(monkeypatch):
     assert health._llm_status() == (False, "placeholder")
 
 # Filler that has actually shipped in a .env, plus the spellings a template or a
-# careless copy-paste produces. Every one of these is non-empty, so
-# `bool(config.GEMINI_API_KEY)` -- the check this replaced -- called all of them
-# healthy while chat answered every question from the canned fallback.
+# careless copy-paste produces. Every one of these is non-empty, so a bare
+# truthiness check called all of them healthy while chat answered from the
+# canned fallback.
 PLACEHOLDER_KEYS = [
     "your_key_here",  # the literal value shipped in backend/.env.example
     "YOUR_KEY_HERE",
@@ -273,10 +260,8 @@ PLACEHOLDER_KEYS = [
 
 # Filler that is not in the known-sentinel list, so it is caught by the shape
 # check rather than the list -- and classified "malformed" instead of
-# "placeholder". Listed separately because the classification is meant to be
-# truthful; what matters for the readiness verdict is that both are NOT ok.
-# Assembled for the same secrets-scanner reason as REAL_GEMINI_KEY: a
-# credential-shaped literal is not written out anywhere in this file.
+# "placeholder"; for the readiness verdict both are NOT ok. Assembled for the
+# same secrets-scanner reason as REAL_GEMINI_KEY.
 _GATEWAY_CREDENTIAL = "sk-live-0123" + "456789abcdef"
 
 UNLISTED_FILLER = [
@@ -299,7 +284,7 @@ def test_llm_status_rejects_unlisted_filler_as_not_usable(monkeypatch, value):
 
 @pytest.mark.parametrize("value", PLACEHOLDER_KEYS)
 def test_llm_status_rejects_every_placeholder_spelling(monkeypatch, value):
-    """A placeholder is not a key. It must never read as a healthy LLM (#279)."""
+    """A placeholder is not a key: it must never read as a healthy LLM."""
     monkeypatch.setattr(config, "GEMINI_API_KEY", value)
 
     ok, reason = health._llm_status()
@@ -344,8 +329,8 @@ MASKED_KEYS = [
 
 @pytest.mark.parametrize("value", MASKED_KEYS)
 def test_llm_status_rejects_a_correctly_shaped_but_masked_key(monkeypatch, value):
-    """Right length, right prefix, no key. This is the case a prefix-plus-length
-    shape check cannot see, and shipping one is how #279 happens again."""
+    """Right length, right prefix, no key: the case a prefix-plus-length shape
+    check cannot see."""
     monkeypatch.setattr(config, "GEMINI_API_KEY", value)
 
     ok, reason = health._llm_status()
@@ -382,10 +367,9 @@ def test_llm_status_accepts_a_real_shaped_key(monkeypatch):
 
 def test_llm_status_does_not_impose_google_s_shape_on_a_custom_endpoint(monkeypatch):
     """GEMINI_BASE_URL is configurable, so a deployment behind an
-    OpenAI-compatible gateway legitimately holds a differently shaped key.
-    Rejecting it would report a working configuration as broken."""
-    # Assembled, for the same reason as REAL_GEMINI_KEY above: a long literal on
-    # a line that names GEMINI_API_KEY is what a secrets scanner flags.
+    OpenAI-compatible gateway legitimately holds a differently shaped key;
+    rejecting it would report a working configuration as broken. The credential
+    is assembled for the same secrets-scanner reason as REAL_GEMINI_KEY."""
     gateway_credential = "gateway-" + "token-" + "0123456789"
     monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://llm-gateway.internal/v1")
     monkeypatch.setattr(config, "GEMINI_API_KEY", gateway_credential)
@@ -453,15 +437,11 @@ def test_redis_status_client_reused_between_concurrent_calls(monkeypatch):
     """Three concurrent first-callers must all queue on the module's one
     pre-existing lock and initialize a single Redis client.
 
-    Regression: with the lock created lazily the module starts with
-    ``_redis_init_lock = None``, so the first caller to arrive has to build the
-    lock itself and the lock in use afterwards is not the one that existed
-    before the calls — there wasn't one. The client count alone cannot detect
-    this (the lazy check-then-assign has no await between the two, so late
-    callers still share the first lock and rebuild nothing); the lock's
-    identity and creation phase can. Reloading first, and patching
-    asyncio.Lock rather than the module attribute, is what exposes them.
-    """
+    With a lazily created lock the module starts with ``_redis_init_lock =
+    None``, so the first caller builds the lock itself; the client count cannot
+    detect that (the lazy check-then-assign has no await between the two), but
+    the lock's identity and creation phase can. Reloading first, and patching
+    asyncio.Lock rather than the module attribute, exposes them."""
     created: list[asyncio.Lock] = []
     monkeypatch.setattr(health.asyncio, "Lock", _recording_lock(created))
     _reload_health()  # the module-level lock (if any) is built through the spy
@@ -486,8 +466,7 @@ def test_redis_status_client_reused_between_concurrent_calls(monkeypatch):
 
 def test_redis_status_serializes_on_shared_lock(monkeypatch):
     """While the module's lock is held by one caller, no other caller may
-    initialize a client — and the lock they queue on is the module's own, not
-    one they built on arrival."""
+    initialize a client -- and the lock they queue on is the module's own."""
     created: list[asyncio.Lock] = []
     monkeypatch.setattr(health.asyncio, "Lock", _recording_lock(created))
     _reload_health()
@@ -584,11 +563,9 @@ def test_redis_status_ping_times_out_degraded(monkeypatch):
 
 
 class _EqualSentinel:
-    """Client stand-in whose instances compare equal but are not identical.
-
-    Two distinct instances satisfy ``==`` while failing ``is``, so only an
-    identity check can separate them - a guard regressed to value comparison
-    cannot."""
+    """Client stand-in whose instances compare equal but are not identical, so
+    only an identity check can separate them: a guard regressed to value
+    comparison cannot."""
 
     def __init__(self, tag):
         self.tag = tag
@@ -606,10 +583,9 @@ class _EqualSentinel:
 
 def test_drop_redis_client_is_identity_guarded(monkeypatch):
     """Invalidation only clears the client that actually failed: a client
-    installed by another caller in the meantime survives.
-
-    The sentinels compare equal while being distinct objects, so swapping the
-    ``is`` guard for ``==`` would null the surviving client and fail here."""
+    installed by another caller in the meantime survives. The sentinels compare
+    equal while being distinct objects, so swapping the ``is`` guard for ``==``
+    would null the surviving client and fail here."""
     stale = _EqualSentinel("stale")
     current = _EqualSentinel("current")
     assert stale == current and stale is not current
@@ -658,9 +634,8 @@ def test_drop_redis_client_close_failure_is_suppressed(monkeypatch):
 
 
 def test_close_quietly_lets_cancellation_propagate(monkeypatch):
-    """Only ``Exception`` is swallowed: a cancellation raised by the close (or
-    by the probe being cancelled) is a ``BaseException`` and must unwind, as the
-    docstring states."""
+    """Only ``Exception`` is swallowed: a cancellation raised by the close is a
+    ``BaseException`` and must unwind."""
 
     class CancelledClose:
         def __init__(self):
@@ -712,7 +687,7 @@ def test_drop_redis_client_closes_outside_the_init_lock(monkeypatch):
     monkeypatch.setattr(health, "_redis_client", stale)
 
     async def scenario():
-        # A hang would mean the close ran while the lock was still held.
+        # a hang would mean the close ran while the lock was still held
         await asyncio.wait_for(health._drop_redis_client(stale), timeout=2.0)
 
     _run(scenario())
@@ -723,10 +698,7 @@ def test_drop_redis_client_closes_outside_the_init_lock(monkeypatch):
 
 def test_drop_redis_client_hung_close_is_abandoned(monkeypatch):
     """A close that never completes is cancelled at the close timeout, so a
-    dying connection cannot stall the probe that is releasing it.
-
-    Without the bound, ``await outcome`` in ``_close_quietly`` never returns and
-    the guard below trips."""
+    dying connection cannot stall the probe releasing it."""
     close_started = asyncio.Event()
 
     class HungClose:
@@ -817,12 +789,10 @@ def test_redis_status_ping_failure_closes_the_client(monkeypatch):
 
 
 def test_redis_status_stale_ping_failure_keeps_replacement(monkeypatch):
-    """A slow failing ping must not invalidate a client created after it started.
-
-    The ping runs outside the init lock, so it can resolve after another caller
-    already dropped the dead client and reconnected. Nulling ``_redis_client``
+    """A slow failing ping must not invalidate a client created after it started:
+    the ping runs outside the init lock, so nulling ``_redis_client``
     unconditionally discards that healthy replacement and forces another
-    reconnect (issue #184)."""
+    reconnect."""
     monkeypatch.setattr(config, "REDIS_URL", "redis://x/0")
     created = []
     stale_ping_started = asyncio.Event()
@@ -1194,22 +1164,14 @@ def test_readyz_fails_open_when_the_limiter_store_is_down(client, monkeypatch):
 
 
 def test_ready_survives_a_sustained_one_hertz_probe(client, monkeypatch):
-    """The default limit must sit above the poll rate it exists to absorb.
-
-    A load balancer probing /ready once a second makes 60 requests per 60s
-    window, and it treats 429 as unhealthy and pulls the node from rotation --
-    so a limit at exactly the prober rate turns the very traffic the readiness
-    cache was added for into an outage. Piling on a second prober (two full
-    windows back to back) must still not be throttled at the shipped default;
-    nothing here stubs PUBLIC_READY_RATE_PER_MIN, because the default is
-    exactly what is under test.
-    """
+    """The default limit must sit above the poll rate it exists to absorb: a load
+    balancer probing /ready once a second makes 60 requests per 60s window and
+    treats 429 as unhealthy, so a limit at exactly the prober rate turns the very
+    traffic the readiness cache was added for into an outage."""
     # The invariant, stated against the configured window rather than a magic
     # number: a 1 Hz prober sends one request per second, so it spends exactly
     # PUBLIC_RATE_WINDOW_SECONDS requests per window and the limit has to clear
-    # that. Without this the behavioural check below would also pass with the
-    # limiter disabled outright (0 short-circuits before any counting), which is
-    # a different and wrong answer to the same question.
+    # that -- and stay enabled, since 0 short-circuits before any counting.
     assert config.PUBLIC_READY_RATE_PER_MIN > config.PUBLIC_RATE_WINDOW_SECONDS, (
         "the /ready limit must clear a 1 Hz prober over the window, and must "
         "stay enabled (0 disables it)"
@@ -1224,16 +1186,12 @@ def test_ready_survives_a_sustained_one_hertz_probe(client, monkeypatch):
 
 
 def test_ready_fails_open_when_the_limiter_store_is_down(client, monkeypatch):
-    """/ready deliberately tolerates a broken limiter, unlike /search and the
-    rest of the public surface, which fail closed with 503.
-
-    Failing closed here would pull a healthy node out of rotation for a
-    dependency the service does not need in order to be ready (the HybridCache
-    falls back to in-process). The store is still consulted -- the call count
-    proves the dependency ran and the error was tolerated rather than the
-    limiter having quietly vanished from the route -- and a rate that IS
-    exceeded still answers 429 (test_ready_over_the_limit_is_rejected_with_429).
-    """
+    """/ready deliberately tolerates a broken limiter, unlike /search and the rest
+    of the public surface, which fail closed with 503: pulling a healthy node out
+    of rotation for a dependency the service does not need in order to be ready is
+    the wrong trade. The store is still consulted -- the call count proves the
+    dependency ran and the error was tolerated -- and an exceeded rate still
+    answers 429."""
     calls = {"set": 0, "incr": 0}
 
     class _BrokenRedis:
@@ -1286,16 +1244,10 @@ def test_readiness_report_probes_dependencies_concurrently(monkeypatch):
 
 
 def test_readiness_cache_miss_is_single_flight(monkeypatch):
-    """A burst of pollers that miss the cache together must cost ONE probe
-    round, not one per request.
-
-    The cached entry bounds the serial probe rate, but the instant it expires
-    every request arriving in that instant misses at once. The rate limiter
-    does not prevent that herd -- it bounds arrivals, not concurrency -- so
-    without single-flight a 1 Hz prober plus its permitted burst can fan out a
-    full Qdrant + Redis probe round per request. The probe count is the
-    assertion: all callers get the same verdict, and only one of them probes.
-    """
+    """A burst of pollers that miss the cache together must cost ONE probe round,
+    not one per request. The rate limiter does not prevent that herd -- it bounds
+    arrivals, not concurrency -- so the probe count is the assertion: all callers
+    get the same verdict, and only one of them probes."""
     calls = {"probes": 0}
 
     async def counting_report(state):
@@ -1311,7 +1263,6 @@ def test_readiness_cache_miss_is_single_flight(monkeypatch):
 
     results = _run(scenario())
 
-    # Every poller is served, from the one probe round, with the same verdict.
     assert results == [(True, {"ready": True, "probes": 1})] * 12
     assert calls["probes"] == 1
 
@@ -1346,14 +1297,9 @@ def test_readiness_cache_hit_needs_no_lock(monkeypatch):
 
 
 def test_readiness_single_flight_lock_does_not_outlive_the_cache_entry():
-    """reset_readiness_cache must drop the single-flight lock as well.
-
-    A contended asyncio.Lock binds itself to the event loop that contended it
-    and refuses to be used from another one. These tests each run their own
-    event loop, so a lock carried over from an earlier test would make the next
-    concurrent miss raise "is bound to a different event loop". Resetting it
-    alongside the cached entry is what keeps each test's lock local to its own
-    loop.
+    """reset_readiness_cache must drop the single-flight lock as well: a contended
+    asyncio.Lock binds itself to the loop that contended it and refuses to be used
+    from another one, and these tests each run their own event loop.
     """
     assert health._readiness_probe_lock is None, "the autouse fixture resets it between tests"
 
@@ -1370,16 +1316,11 @@ def test_readiness_single_flight_lock_does_not_outlive_the_cache_entry():
 
 
 def test_readiness_single_flight_survives_a_change_of_event_loop(monkeypatch):
-    """Two contended probe rounds in two different event loops must both work.
-
-    This is the regression the loop-aware lock exists for. A contended
-    asyncio.Lock binds itself to the loop that contended it and then refuses to
-    be used from any other, raising "is bound to a different event loop" -- so
-    a single module-level lock breaks as soon as a second loop contends it, and
-    these tests run a fresh loop apiece. Expiring only the cache entry, and
-    deliberately keeping the lock, is what forces the second loop down the
-    contended path.
-    """
+    """Two contended probe rounds in two different event loops must both work: a
+    contended asyncio.Lock binds itself to the loop that contended it and refuses
+    any other, so a single module-level lock breaks as soon as a second loop
+    contends it. Expiring only the cache entry, and keeping the lock, forces the
+    second loop down the contended path."""
     probes = {"n": 0}
 
     async def counting_report(state):
@@ -1401,9 +1342,8 @@ def test_readiness_single_flight_survives_a_change_of_event_loop(monkeypatch):
     monkeypatch.setattr(health, "_readiness_cache", None)
     second = _run(burst())
 
-    # What must hold is that each round ran exactly one probe and that every
-    # caller in it shared that verdict. The two rounds' payloads differ only in
-    # the counter this fake stamps into the report.
+    # Each round must run exactly one probe and every caller in it share that
+    # verdict; the rounds' payloads differ only in the counter this fake stamps in.
     assert probes["n"] == 2, "each loop runs its own single probe round"
     assert all(result == second[0] for result in second), "all four callers share one round"
     assert second[0][0] is True
@@ -1449,32 +1389,28 @@ def test_readiness_report_surfaces_unexpected_probe_error(monkeypatch):
         _run(health._readiness_report({}))
 
 
-# --- #279: what each probe is allowed to answer, and for whom ------------
+# --- what each probe is allowed to answer, and for whom ---
 #
-# The three endpoints answer three different questions, and the bug this file
-# pins down is a consumer asking the wrong one:
+# The three endpoints answer three different questions, and the bug pinned down
+# here is a consumer asking the wrong one:
 #
-#   /health      liveness.  "Is the process up?" It cannot fail by design, so
-#                it is the correct probe for the only question a restart can
-#                answer -- and the wrong one for "is the service healthy",
-#                because it reports nothing about any dependency.
-#   /ready       readiness. "Can this node serve?" Real answer, short cache,
-#                rate limited: right for a load balancer or orchestrator
-#                polling once per node, wrong for a watchdog (a cached verdict
-#                hides an outage for the rest of the TTL, and a 429 is
-#                indistinguishable from one).
-#   /ready/deep  readiness for host-local monitoring: the same report with no
-#                cache and no rate limit. This is what deploy/healthcheck.sh
-#                and setup.sh's deploy gate must use.
+#   /health      liveness: "is the process up?" -- the right probe for a restart
+#                decision, the wrong one for "is the service healthy", since it
+#                reports nothing about any dependency.
+#   /ready       readiness for a load balancer: a real answer, but short-cached
+#                and rate-limited, so a watchdog reading it can be served a stale
+#                200 or an indistinguishable 429.
+#   /ready/deep  the same report with no cache and no rate limit, refused to any
+#                non-local caller. What deploy/healthcheck.sh and setup.sh's
+#                deploy gate must use.
 
 
 class _PeerOverride:
     """ASGI shim that pins the connection's client address in the scope.
 
     TestClient always reports the peer as the string "testclient", which the
-    /ready/deep host-local gate correctly refuses. The watchdog and the deploy
-    gate reach the API from 127.0.0.1, so the cases that must be allowed have
-    to be exercised with a loopback peer rather than by weakening the gate.
+    /ready/deep host-local gate correctly refuses, so the cases that must be
+    allowed need a loopback peer rather than a weakened gate.
     """
 
     def __init__(self, app, peer):
@@ -1497,9 +1433,8 @@ def host_client(client):
 def live_state(monkeypatch):
     """A fully healthy process state, installed in the real app.main.state.
 
-    Endpoint tests elsewhere mock _readiness_report wholesale, which cannot
-    show that the endpoint and the report agree; these tests drive the real
-    report so the 200/503 a caller sees is the one the dependencies produce.
+    Endpoint tests elsewhere mock _readiness_report wholesale, which cannot show
+    that the endpoint and the report agree; these tests drive the real report.
     Returns the Qdrant double, whose `ok` flag is the outage switch.
     """
     from app import main
@@ -1524,13 +1459,11 @@ def live_state(monkeypatch):
 
 
 def test_health_answers_200_while_readiness_says_503(client, host_client, live_state):
-    """The two probes must disagree about a broken node, or the watchdog is
-    probing the wrong one.
-
-    /health is liveness and is allowed to keep answering 200 while Qdrant is
-    down: that is what tells a supervisor "restarting the process will not
-    help, a dependency is gone". It is NOT an answer about health, so a consumer
-    that needs one must use /ready (load balancer) or /ready/deep (watchdog).
+    """The two probes must disagree about a broken node. /health is liveness and
+    keeps answering 200 while Qdrant is down: that is what tells a supervisor
+    "restarting the process will not help, a dependency is gone". It is NOT an
+    answer about health, so a consumer needing one uses /ready (load balancer) or
+    /ready/deep (watchdog).
     """
     assert host_client.get("/ready/deep").status_code == 200
     live_state.ok = False
@@ -1561,12 +1494,10 @@ def test_a_real_key_makes_readiness_answer_200(client, live_state):
 
 
 def test_watchdog_probe_ignores_a_stale_cached_readiness(host_client, live_state):
-    """The cache is what would hide an outage from a watchdog.
-
-    /ready primes its cache with a healthy verdict; Qdrant then dies. /ready
-    still serves the cached 200 for the rest of READY_CACHE_TTL_SECONDS, which
-    is fine for a load balancer and fatal for a prober that acts on the answer
-    -- so /ready/deep must re-probe and report the outage on the same tick.
+    """The cache is what would hide an outage from a watchdog: /ready primes it
+    with a healthy verdict, Qdrant then dies, and /ready still serves the cached
+    200 for the rest of READY_CACHE_TTL_SECONDS -- fine for a load balancer,
+    fatal for a prober that acts on the answer, so /ready/deep must re-probe.
     """
     assert host_client.get("/ready").status_code == 200
     live_state.ok = False
@@ -1614,11 +1545,9 @@ def test_a_watchdog_polling_once_a_second_is_never_throttled_and_never_gets_a_st
     client, host_client, live_state, monkeypatch, _public_rate_limiter
 ):
     """One cron-style minute of polling: the shipped 600/60s budget, an outage
-    halfway through, and a probe that answers truthfully on both sides of it.
-
-    The limit is asserted at its shipped default rather than lowered, because
-    the claim under test is that a 1 Hz prober sits far below it -- and the deep
-    probe must be unaffected by the budget being exhausted anyway.
+    halfway through, and a probe that answers truthfully on both sides of it. The
+    limit is asserted at its shipped default because the claim is that a 1 Hz
+    prober sits far below it.
     """
     assert config.PUBLIC_READY_RATE_PER_MIN >= 60, "the shipped budget must absorb a 1 Hz prober"
     monkeypatch.setattr(config, "READY_CACHE_TTL_SECONDS", 3600.0)  # a cache long enough to hide anything

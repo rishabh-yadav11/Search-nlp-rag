@@ -23,10 +23,8 @@ def date_label(from_date: str | None, to_date: str | None) -> str | None:
         last = calendar.monthrange(year, month)[1]
     except ValueError:
         # Only the month is range-checked: calendar.monthrange raises
-        # calendar.IllegalMonthError (a ValueError subclass) for a month
-        # outside 1-12. There is no calendar.IllegalYearError and an
-        # out-of-range year is normalized rather than rejected
-        # (calendar.monthrange(0, 1) succeeds, CPython 3.11+), so this handler
+        # IllegalMonthError (a ValueError) for a month outside 1-12, while an
+        # out-of-range year is normalized rather than rejected, so this handler
         # exists for the month case and any other ValueError monthrange raises.
         return None
     if to_date == f"{year}-{month:02d}-{last:02d}":
@@ -40,17 +38,15 @@ def results_are_weak(scores: list[float], limit: int | None = None) -> bool:
     """True when fewer than `limit` of the top reranked scores exceed the
     WEAK_RESULT_SCORE knob, i.e. retrieval is too weak to answer the query.
 
-    ``limit`` defaults to the WEAK_RESULT_MIN_STRONG knob and is capped at the
-    number of available scores, never below 1: a topic with only 1-2 strong
-    matches in the corpus is NOT treated as weak — refusing to answer then
-    would suppress every narrow/niche question. The floor of 1 also keeps a
-    nonsensical WEAK_RESULT_MIN_STRONG (<= 0) from opening the gate on
-    everything. An empty scores list still counts as weak.
+    ``limit`` defaults to the WEAK_RESULT_MIN_STRONG knob, is capped at the
+    number of available scores and never falls below 1: a topic with only 1-2
+    strong corpus matches is NOT weak, or every narrow question would go
+    unanswered, and the floor also stops a nonsensical (<= 0) knob from opening
+    the gate on everything. An empty scores list still counts as weak.
 
-    The knob names are spelled without their ``config.`` prefix on purpose:
+    Knob names are spelled without their ``config.`` prefix on purpose:
     tests/test_config_knobs.py counts a ``config.KNOB`` mention anywhere in the
-    source as a reader, so naming them in dotted form here would let this
-    docstring vouch for a knob whose live read had been deleted."""
+    source as a reader, so dotted names here would vouch for a deleted read."""
     if not scores:
         return True
     strong = sum(1 for s in scores if s > config.WEAK_RESULT_SCORE)
@@ -62,14 +58,10 @@ def fallback_answer(query: str, n_weak: int, label: str | None = None) -> str:
     """Honest fallback for chat: never fabricates facts, mentions the query.
     With a date label, frames the result as a best-effort for that period."""
     if label:
-        # `n_weak` counts the sources actually retrieved, so the message must
-        # never advertise a count (or sources) that don't exist: with zero
-        # matches there is nothing below to check.
-        #
-        # Defensive branch: the only production caller (chat.py) returns early
-        # on an empty source list, so it always passes n_weak >= 1. Kept
-        # because this function is public and any caller may pass 0 — the
-        # wording therefore claims no count and references no source.
+        # `n_weak` counts the sources actually retrieved, so no wording below may
+        # advertise a count or a source that does not exist.
+        # Defensive: the only production caller (chat.py) returns early on an
+        # empty source list, but this function is public and any caller may pass 0.
         if n_weak <= 0:
             return (
                 f"I couldn't find any articles matching '{query}' for {label}. "
@@ -108,10 +100,9 @@ def weak_results_note(scores: list[float], label: str | None = None) -> str | No
     """Short annotation for /search when results are weak, else None. With a
     date label the note is framed as a best-effort for that period.
 
-    ``results_are_weak`` still reports an empty score list as weak — chat relies
-    on that to refuse to answer instead of guessing — but the note must not then
-    claim to be showing matches that do not exist, so the empty case gets its
-    own honest wording."""
+    ``results_are_weak`` still reports an empty score list as weak -- chat relies
+    on that to refuse to answer rather than guess -- but the note must not claim
+    to show matches that do not exist, so the empty case gets its own wording."""
     if not results_are_weak(scores):
         return None
     if not scores:

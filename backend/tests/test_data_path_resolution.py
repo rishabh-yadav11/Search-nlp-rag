@@ -1,24 +1,21 @@
-"""Data paths must be absolute and validated, or startup must fail loudly (#294).
+"""Data paths must be absolute and validated, or startup must fail loudly.
 
-The defect: every data location defaulted to a path relative to the process
-working directory (`data/chat.db`, `data/auth.db`, `data/query_vocab.json.gz`),
-and the stores' `os.makedirs(..., exist_ok=True)` + `sqlite3.connect` happily
-opened a BRAND-NEW EMPTY database at whatever directory the process happened to
-be started from. pm2 was configured with a hardcoded CWD, so any checkout at
-another path turned the deployment into "all conversations and users are gone"
-with no error at any level.
+Every data location used to default to a path relative to the process working
+directory, and the stores' `os.makedirs(..., exist_ok=True)` + `sqlite3.connect`
+happily opened a BRAND-NEW EMPTY database at whatever directory the process
+happened to be started from. Any checkout at another path therefore turned the
+deployment into "all conversations and users are gone" with no error at any
+level.
 
-These tests pin the two halves of the fix:
-
-1. the configured values are absolute and anchored to the backend root, so the
-   working directory cannot change their meaning; and
-2. a location that cannot be used is a hard startup failure, not an empty DB.
+These tests pin the two halves of the fix: the configured values are absolute
+and anchored to the backend root, so the working directory cannot change their
+meaning; and a location that cannot be used is a hard startup failure, not an
+empty DB.
 
 Hermeticity note: `app.config` calls `load_dotenv()` at import, and
 python-dotenv's `find_dotenv()` walks up from the CALLING FILE, not the CWD --
 so `monkeypatch.chdir` alone would leave a developer's real `.env` feeding these
-tests. The fixture below therefore owns the environment explicitly AND
-neutralises `load_dotenv` itself for the duration of each reload.
+tests.
 """
 
 import asyncio
@@ -49,13 +46,8 @@ def load_config(monkeypatch):
 
     `Config` computes every knob in the class body at import time, so
     `monkeypatch.setattr(config, "CHAT_DB_PATH", ...)` would only prove the
-    attribute is assignable -- not what the real parsing code produces. Only a
-    reload exercises the actual `os.getenv` path, so that is what this does.
-
-    `load_dotenv` is neutralised for the reload because the module calls it at
-    import and it resolves its file from the caller's location, i.e. regardless
-    of the environment set here. The original module-level `config` object is
-    restored afterwards so the rest of the suite sees exactly what it saw before.
+    attribute is assignable. `load_dotenv` is neutralised because the module
+    calls it at import and it resolves its file from the caller's location.
     """
     saved_config = config_module.config
     for name in _DATA_PATH_ENV:

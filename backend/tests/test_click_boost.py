@@ -84,8 +84,8 @@ def test_no_click_signals_passthrough_unchanged(monkeypatch):
 
 
 def test_redis_down_degraded_signals_passthrough(monkeypatch):
-    # click_signals degrades to None when Redis is down -> apply_click_boost is
-    # a silent pass-through (no mutation, no re-sort). ERROR PATH — Redis down.
+    # click_signals degrades to None when Redis is down, so apply_click_boost is
+    # a silent pass-through: no mutation, no re-sort.
     _enable(monkeypatch)
     monkeypatch.setattr(click_boost, "click_signals", _no_signals())
     results = [_res(1, 0.4), _res(2, 0.9)]

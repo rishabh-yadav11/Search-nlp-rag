@@ -8,26 +8,14 @@ import {
 
 /**
  * Similar articles for one article, batched across every caller that asks in
- * the same tick (#353).
+ * the same tick.
  *
- * A search view renders one `<SimilarArticles>` per result and the chat
- * sources list does the same per source, so each of those components used to
- * issue its own request for the same view. Eight results meant eight round
- * trips, eight cache reads and eight vector queries to render eight short
- * lists, and because nothing outlived the component, navigating away and back
- * repeated all of it.
- *
- * Two things fix that, and both are here:
- *
- *  - **Coalescing.** Callers that ask within the same tick are answered by one
- *    POST carrying all their ids, so the cost of a view is one request no
- *    matter how many cards it renders.
- *  - **A module-level cache.** The result outlives the component that fetched
- *    it, so a card that remounts renders from memory and issues nothing.
- *
- * The client TTL is deliberately far shorter than the hour the server caches
- * these for: the cache here is about not re-fetching a view the user is
- * looking at, not about being a second source of truth.
+ * A view renders one `<SimilarArticles>` per result (and chat the same per
+ * source), so the cost of a view is one request no matter how many cards it
+ * renders, and a module-level cache outlives the component that fetched it.
+ * The client TTL is far shorter than the hour the server caches these for:
+ * this cache avoids re-fetching a view the user is looking at, it is not a
+ * second source of truth.
  */
 
 export interface SimilarArticle {
@@ -66,11 +54,9 @@ class BatchRequestError extends Error {
 const CLIENT_TTL_MS = 5 * 60 * 1000
 
 /**
- * How many ids to put in one request. This mirrors the server's
- * SIMILAR_BATCH_MAX_IDS, which is the one number on the other side of the
- * wire that has to agree -- so `requestBatch` splits and retries rather than
- * trusting it: if the two ever drift, a view is answered in more requests
- * instead of going blank.
+ * Mirrors the server's SIMILAR_BATCH_MAX_IDS. Because the two copies can drift,
+ * `requestBatch` splits and retries rather than trusting this number: a view
+ * is answered in more requests instead of going blank.
  */
 const MAX_BATCH_IDS = 20
 
@@ -85,14 +71,10 @@ const waiting = new Map<string, Waiter>()
 let flushScheduled = false
 
 /**
- * Store an answer, making room if the cache is full.
- *
- * Two bounds, because either alone leaks. Entries expire on read, but a
- * session that only ever moves forward never reads the old ones again, so
- * expired keys are swept when a new entry is written rather than left to
- * pile up. And a sweep cannot help a session that reads faster than it
- * expires, so the ceiling is the backstop: past it, the oldest entry goes
- * regardless of whether it is still fresh.
+ * Store an answer, making room if the cache is full. Two bounds, because
+ * either alone leaks: expired keys are swept on write (a forward-only session
+ * never re-reads them), and the ceiling is the backstop for a session that
+ * reads faster than it expires.
  */
 function remember(key: string, articles: SimilarArticle[], expiresAt: number): void {
   if (!cache.has(key) && cache.size >= CLIENT_CACHE_MAX_ENTRIES) {
@@ -128,9 +110,8 @@ function readCache(key: string): SimilarArticle[] | null {
 }
 
 /**
- * A cache hit, for callers that can render synchronously. A card that remounts
- * inside the TTL shows its list on the first paint instead of flashing a
- * loading state for one frame.
+ * A cache hit, for callers that can render synchronously — a remount inside
+ * the TTL paints its list on the first frame instead of flashing a loader.
  */
 export function peekSimilarArticles(
   articleId: number | string,
@@ -141,10 +122,8 @@ export function peekSimilarArticles(
 
 /**
  * The server takes indexed article ids, and `Result.id` is `number | string`.
- * A result whose id is not a plain integer has no vector to search from, so it
- * is answered as empty here rather than sent along: it would fail validation
- * for the WHOLE batch, and one unsearchable row in a results page would then
- * cost every other row its similar list too.
+ * A non-integer id has no vector to search from and would fail validation for
+ * the WHOLE batch, so it is answered as empty here instead of being sent.
  */
 function isIndexable(articleId: number | string): articleId is number {
   if (typeof articleId === 'number') return Number.isInteger(articleId) && articleId > 0
@@ -152,10 +131,8 @@ function isIndexable(articleId: number | string): articleId is number {
 }
 
 /**
- * Similar articles for one article.
- *
- * Concurrent callers coalesce: everything asked for in the same tick goes out
- * as a single request.
+ * Similar articles for one article. Callers that ask in the same tick coalesce
+ * into a single request.
  */
 export function fetchSimilarArticles(
   articleId: number | string,
@@ -176,10 +153,9 @@ export function fetchSimilarArticles(
   inFlight.set(key, promise)
 
   if (!flushScheduled) {
-    // A macrotask rather than a microtask on purpose. React runs every effect
-    // of a commit synchronously, so all the cards of one view have registered
-    // their waiter by the time this fires and the batch sees all of them. A
-    // microtask would flush between two of those effects and split the view.
+    // A macrotask, not a microtask: React runs every effect of a commit
+    // synchronously, so by the time this fires all of one view's cards have
+    // registered. A microtask would flush between two effects and split the view.
     flushScheduled = true
     setTimeout(flush, 0)
   }
@@ -212,10 +188,9 @@ async function send(waiters: Waiter[]): Promise<void> {
   }
   if (!ids.length) return settle(waiters, new Map())
 
-  // A view wider than the server's cap is asked for in as many requests as
-  // it takes, rather than having its tail quietly dropped: an unanswered id
-  // settles as "no similar articles", which looks the same as the truth and
-  // is not. A 25-source chat message is the case this is for.
+  // A view wider than the server's cap is asked for in as many requests as it
+  // takes, rather than having its tail quietly dropped: an unanswered id
+  // settles as "no similar articles", which looks the same as the truth and is not.
   const chunks: number[][] = []
   for (const articleId of ids) {
     const open = chunks[chunks.length - 1]
@@ -223,12 +198,11 @@ async function send(waiters: Waiter[]): Promise<void> {
     else chunks.push([articleId])
   }
   // One deadline for the whole batch, armed here rather than in the card: the
-  // request is shared by every SimilarArticles in the view (that is the point
-  // of this module), so a backend that accepts the connection and never
-  // answers would otherwise pin all of them on "Loading..." forever. No
-  // caller signal is composed in — a single card unmounting must not take the
-  // rest of the view's request down with it — so a timeout is the only thing
-  // that can abort this.
+  // request is shared by every SimilarArticles in the view, so a backend that
+  // accepts the connection and never answers would pin all of them on
+  // "Loading..." forever. No caller signal is composed in — one card unmounting
+  // must not take the rest of the view's request down — so a timeout is the
+  // only thing that can abort this.
   const deadline = createDeadline(RECOMMEND_DEADLINE_MS)
   try {
     const answers = await Promise.all(
@@ -245,17 +219,14 @@ async function send(waiters: Waiter[]): Promise<void> {
       const key = cacheKey(waiter.articleId, waiter.limit)
       articles.set(key, list)
       // An empty list is not cached, the same rule the server follows: it is
-      // usually a transient miss, and pinning it client-side for five minutes
-      // would hold the blank card long after the data came back.
+      // usually a transient miss, and caching it holds a blank card for five minutes.
       if (list.length) remember(key, list, expiresAt)
     }
     settle(waiters, articles)
   } catch (error) {
-    // Drop the in-flight entry so a later mount retries rather than replaying
-    // this failure from memory for the rest of the session.
+    // Drop the in-flight entry so a later mount retries instead of replaying this failure.
     for (const waiter of waiters) inFlight.delete(cacheKey(waiter.articleId, waiter.limit))
-    // Callers distinguish this from a transport failure, so a card can say the
-    // request ran out of time instead of surfacing an opaque AbortError.
+    // Distinct from a transport failure, so a card can report a timeout, not an opaque AbortError.
     for (const waiter of waiters) {
       waiter.reject(
         deadline.timedOut() ? new RequestTimeoutError(RECOMMEND_DEADLINE_MS) : error
@@ -269,13 +240,10 @@ async function send(waiters: Waiter[]): Promise<void> {
 /**
  * Ask for one chunk, splitting it if the server will not take it whole.
  *
- * The cap is a number on the other side of the wire, so the two copies can
- * drift. If the server ever accepts fewer ids than MAX_BATCH_IDS, a 422 is
- * not one card failing -- it is every card in the view failing at once, and
- * the results page goes blank over a configuration detail. Halving and
- * retrying on that one status costs a few extra round trips in a case that
- * should never arise. Every other failure is a real failure and is reported
- * as one: splitting those would turn an outage into a storm of requests.
+ * A 422 means the server's cap has drifted below MAX_BATCH_IDS, which is every
+ * card in the view failing at once, so the chunk is halved and retried. Every
+ * other failure is a real failure and is reported as one: splitting those would
+ * turn an outage into a storm of requests.
  */
 async function fetchChunk(
   ids: number[],
@@ -303,11 +271,9 @@ async function requestBatch(
   limit: number,
   deadline: Deadline
 ): Promise<Map<string, SimilarArticle[]>> {
-  // The session is an httpOnly cookie, so this batch POST is credentialed
-  // rather than header-bearing: `authRequestInit` attaches the cookie when
-  // API_BASE is a trusted backend and omits `credentials` when it is not, so
-  // a runtime-injected attacker base never receives the session. There is no
-  // `Authorization` header any more.
+  // The session is an httpOnly cookie, so this POST is credentialed rather than
+  // header-bearing: `authRequestInit` attaches the cookie only when API_BASE is
+  // a trusted backend, so a runtime-injected base never receives the session.
   const response = await fetch(
     `${API_BASE}/recommend/similar/batch`,
     authRequestInit({

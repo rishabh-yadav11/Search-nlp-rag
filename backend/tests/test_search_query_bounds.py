@@ -1,13 +1,8 @@
-"""Bounds on a user-supplied search query (#241).
+"""Bounds on a user-supplied search query.
 
-A megabyte of `q` used to reach the transformer tokenizers and be embedded
-verbatim in a Redis key, so an unauthenticated caller could burn encode CPU
-and create multi-KB cache keys. The fix has three separately-falsifiable parts,
-and each is asserted here on its own:
-
-  * the HTTP surface rejects an over-long `q` with 422 instead of truncating,
-  * the retrieval cache keys stay short whatever the query is,
-  * nothing handed to the dense encoder or the cross-encoder is unbounded.
+Three separately-falsifiable bounds: the HTTP surface refuses an over-long `q`
+with 422 instead of truncating, the retrieval cache keys stay short whatever the
+query is, and nothing handed to an encoder or the cross-encoder is unbounded.
 """
 
 import asyncio
@@ -32,8 +27,7 @@ _client = TestClient(main.app, raise_server_exceptions=False)
 
 @pytest.fixture(autouse=True)
 def _public_rate_limiter(monkeypatch):
-    """The public endpoints fail closed (503) without a limiter store, so give
-    them a counting stub; the limiter itself is covered in test_main_http."""
+    """The public endpoints fail closed (503) without a limiter store."""
     counters: dict[str, int] = {}
 
     class _FakeRateRedis:
@@ -67,9 +61,8 @@ class _FakeCache:
         return self.store.get(key)
 
     async def get_many(self, keys):
-        """Mirrors ``HybridCache.get_many``: positional results, one per key,
-        each read through ``get()`` so the recorded key list still shows every
-        key the request actually looked at."""
+        """Mirrors ``HybridCache.get_many``: positional results, one per key, each
+        read through ``get()`` so the recorded keys show every lookup."""
         return [await self.get(key) for key in keys]
 
     async def set(self, key, value, ttl=None):
@@ -186,25 +179,20 @@ def _detail_message(response) -> str:
 
 @pytest.mark.parametrize("length", [config.SEARCH_QUERY_MAX_CHARS + 1, 1000, 8000, 32000])
 def test_search_rejects_an_over_long_query_and_names_the_limit(length):
-    """A long q must be refused rather than truncated, and the response has to
-    name the limit so the UI can explain the refusal instead of showing a
-    generic failure. (1MB is not exercised through the HTTP client: httpx
-    refuses to even build a URL that long, so the 1MB case is proven against
-    hybrid_search/retrieve_and_rerank directly below.)"""
+    """A long q must be refused rather than truncated, and the response has to name
+    the limit so the UI can explain the refusal.
+
+    1 MB is not exercised over HTTP: httpx refuses to build a URL that long, so it
+    is proven against hybrid_search/retrieve_and_rerank below."""
     resp = _client.get("/search", params={"q": "A" * length})
 
     assert resp.status_code == 422
     body = _detail_message(resp)
     assert str(config.SEARCH_QUERY_MAX_CHARS) in body
-    # The error must point at `q` itself, not some unrelated field.
     assert any("q" in loc for err in resp.json()["detail"] for loc in err["loc"])
-    # The wire contract the frontend's 422 classifier keys on: it decides
-    # "too long" from `type == "string_too_long"` AND `loc` naming `q`, so
-    # those two fields are pinned here. Without this, a change to the
-    # validation-error shape (or a pydantic rename) would not fail anything
-    # backend-side -- it would silently downgrade every over-long-query UI
-    # message to the generic "not valid" 422, which is what page.tsx's
-    # isQueryTooLong() cannot see.
+    # The frontend's 422 classifier keys on `type == "string_too_long"` AND `loc`
+    # naming `q`; with either unpinned, a pydantic rename would silently downgrade
+    # every over-long-query UI message to the generic "not valid" 422.
     assert any(
         err.get("type") == "string_too_long" and "q" in err.get("loc", [])
         for err in resp.json()["detail"]
@@ -212,8 +200,7 @@ def test_search_rejects_an_over_long_query_and_names_the_limit(length):
 
 
 def test_search_accepts_a_query_at_the_limit(monkeypatch):
-    """Boundary: the limit is inclusive. A query exactly at it — and one just
-    under it — must still be served normally rather than refused."""
+    """The limit is inclusive: a query exactly at it, and one under it, still serve."""
     _wire_encoders(monkeypatch)
     monkeypatch.setattr(main, "cache", _FakeCache())
     monkeypatch.setattr(main, "record_search", _noop_record_search)
@@ -231,8 +218,7 @@ def test_search_accepts_a_query_at_the_limit(monkeypatch):
 
 
 async def _fake_retrieve(q, top_k, qfilter=None, **kwargs):
-    # retrieve_with_auto_facet_fallback returns the reranked set plus the
-    # facets it actually applied (used to detect a relaxed auto facet).
+    # retrieve_with_auto_facet_fallback returns the reranked set plus the facets it actually applied.
     return ([_article(1, 0.9)], kwargs.get("industry"), kwargs.get("dealtype"),
             kwargs.get("content_type"))
 
@@ -259,8 +245,7 @@ async def _passthrough_rerank(query, results):
 
 
 def test_a_short_query_still_names_itself_in_the_key():
-    """The bound must not rewrite normal keys: a 5-char query is unchanged, so
-    the cache entries already in Redis keep hitting."""
+    """The bound must not rewrite normal keys, or entries already in Redis stop hitting."""
     assert main._cache_key_component("deals") == "deals"
 
 
@@ -274,8 +259,7 @@ def test_a_long_query_is_replaced_by_a_digest_not_cut_short():
 
 
 def test_two_different_long_queries_do_not_share_a_cache_key():
-    """Truncating the text instead of digesting it would collide every query
-    with the same long prefix onto one key and serve the wrong results."""
+    """Truncating instead of digesting would collide every query sharing a long prefix onto one key."""
     prefix = "A" * (config.CACHE_KEY_QUERY_MAX_CHARS + 1)
     a = main._cache_key_component(prefix + "one")
     b = main._cache_key_component(prefix + "two")
@@ -290,8 +274,7 @@ def test_the_same_long_query_always_maps_to_the_same_component():
 
 
 def test_the_digest_does_not_depend_on_the_process():
-    """A per-process salt (e.g. hash()) would make the key non-deterministic
-    and every request would miss the cache."""
+    """A per-process salt (e.g. hash()) would make every request miss the cache."""
     import hashlib
 
     long_q = "C" * 20_000
@@ -315,13 +298,11 @@ def test_megabyte_query_produces_a_bounded_vec_key(monkeypatch):
         assert len(key) < 300, f"cache key grew to {len(key)} chars: {key[:80]!r}"
         assert key.startswith("vec:")
         assert "dense-model" in key and "sparse-model" in key
-        # #252 length-prefixes the parts, so the query digest is no longer the
-        # very next segment: what matters is that the key carries the digest of
-        # the clamped text and none of the text itself.
+        # Key parts are length-prefixed, so the key must carry the digest of the
+        # clamped text and none of the text itself.
         assert main._cache_key_component("A" * config.RETRIEVAL_QUERY_MAX_CHARS) in key
         assert "A" * 200 not in key, "the raw query reached the key"
-    # The key is bounded because the text is digested, not because the text was
-    # quietly dropped: the encoder still got a full-length (clamped) query.
+    # The key is bounded because the text is digested, not quietly dropped: the encoder still got a full-length (clamped) query.
     assert dense.seen and len(dense.seen[0]) == config.RETRIEVAL_QUERY_MAX_CHARS
 
 
@@ -365,33 +346,18 @@ def test_long_but_accepted_query_produces_a_bounded_search_key(monkeypatch):
 
 
 def _max_sized_facet() -> str:
-    """The longest facet #252 accepts: 10 values of MAX_FACET_VALUE_LEN
-    characters, ~2 KB of query-string payload, i.e. the largest value that
-    reaches a key or a Qdrant MatchAny at all. Anything beyond it is a 400 (see
-    ``input_hygiene.split_facet_values``), so a test that wants "a long facet"
-    has to mean this one."""
+    """The longest facet accepted: MAX_FACET_VALUES values of MAX_FACET_VALUE_LEN
+    chars, the largest value that reaches a key or a Qdrant MatchAny at all.
+    Anything beyond it is a 400 (see ``input_hygiene.split_facet_values``)."""
     return ",".join("B" * MAX_FACET_VALUE_LEN for _ in range(MAX_FACET_VALUES))
 
 
 
 def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
-    """Scope of this fix, stated honestly.
-
-    The facet params (`industry`, `dealtype`, `author`, `content_type`, `tag`)
-    are plain `Query(None)` strings that reach the same two keys through
-    `facet_cache_token` and `_filter_token`; `from_date`/`to_date` reach them
-    through the filter JSON. #252 bounds them:
-    `input_hygiene.split_facet_values` rejects a facet over
-    MAX_FACET_VALUES values of MAX_FACET_VALUE_LEN chars with a 400, and
-    `input_hygiene.build_cache_key` digests any key body over MAX_KEY_LEN=256,
-    which covers the filter JSON too.
-
-    What this PR owns, and what this asserts, is the QUERY segment: with a
-    facet at that maximum in the request, the query must still be a digest
-    rather than raw text, so no unbounded query reaches the key on this path
-    either. The facet is at the cap rather than over it, because over the cap
-    the request is refused and no key is built at all.
-    """
+    """Scope: the QUERY segment. The facet params reach the same two keys through
+    ``facet_cache_token`` and ``_filter_token``, and their own caps are enforced in
+    ``input_hygiene``; the facet here sits AT the cap, because over it the request
+    is refused and no key is built at all."""
     cache = _FakeCache()
     monkeypatch.setattr(main, "cache", cache)
     monkeypatch.setattr(main, "record_search", _noop_record_search)
@@ -405,7 +371,6 @@ def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
     assert resp.status_code == 200
     assert cache.gets
     key = cache.gets[0]
-    # The key must carry the query's digest verbatim, and none of its text.
     expected = main._cache_key_component("A" * 300)
     assert expected.startswith("h:") and len(expected) == 34
     assert expected in key, f"key does not carry the query digest: {key[:80]!r}"
@@ -415,10 +380,9 @@ def test_the_query_segment_is_still_digested_when_a_facet_is_long(monkeypatch):
 
 
 def test_the_retrieve_key_digests_its_query_segment_under_a_long_filter(monkeypatch):
-    """The retrieve: key is built at a different call site from the search:
-    key, so the query segment needs its own assertion. The filter segment is
-    bounded by #252's caps, and this pins the maximum filter that can reach
-    this call site at all."""
+    """The retrieve: key is built at a different call site from the search: key, so
+    the query segment needs its own assertion; this pins the maximum filter that
+    can reach this call site at all."""
     cache = _FakeCache()
     monkeypatch.setattr(main, "cache", cache)
     _wire_encoders(monkeypatch)
@@ -431,10 +395,8 @@ def test_the_retrieve_key_digests_its_query_segment_under_a_long_filter(monkeypa
 
     assert cache.gets
     key = cache.gets[0]
-    # The filter is ~1 KB, so the whole key body is digested: strictly stronger
-    # than the query digest this test used to look for, since nothing at all is
-    # spelled out any more. What still has to hold is that no caller text is
-    # present and the key is bounded.
+    # The filter is ~1 KB, so the whole key body is digested and nothing at all is
+    # spelled out. What still has to hold is that no caller text is present.
     assert key.startswith("retrieve:sha256:")
     assert len(key) == len("retrieve:sha256:") + 64
     assert "A" * 200 not in key, "the raw query reached the key"
@@ -467,9 +429,8 @@ def test_cross_encoder_never_sees_more_than_the_limit(monkeypatch):
 
 
 def test_body_rescue_never_sees_more_than_the_limit(monkeypatch):
-    """body_rescue is a SECOND cross-encoder call site, driven by chat with a
-    message of up to MAX_CONTENT_LEN (8000). The clamp in rerank() is a local
-    and cannot reach it, so it needs its own bound and its own assertion."""
+    """body_rescue is a SECOND cross-encoder call site, driven by chat with a message
+    of up to MAX_CONTENT_LEN; the clamp in rerank() is a local and cannot reach it."""
     reranker = _RecordingReranker()
     monkeypatch.setitem(main.state, "reranker", reranker)
     monkeypatch.setattr(main.config, "BODY_RESCUE_THRESHOLD", 0.9)
@@ -482,8 +443,7 @@ def test_body_rescue_never_sees_more_than_the_limit(monkeypatch):
     assert reranker.pairs, "body_rescue must actually have reached the reranker"
     for query_side, passage in reranker.pairs:
         assert len(query_side) <= config.RETRIEVAL_QUERY_MAX_CHARS
-        # The passage side is the article window and is never truncated by this
-        # bound — clamping the query must not cost the window its context.
+        # The passage side is the article window, never truncated by this bound.
         assert "body" in passage
 
 
@@ -492,9 +452,7 @@ def test_body_rescue_never_sees_more_than_the_limit(monkeypatch):
 
 def test_chats_accepted_message_length_is_not_silently_cut(monkeypatch):
     """Chat accepts up to MAX_CONTENT_LEN and puts the WHOLE message in the LLM
-    prompt. If retrieval clamped chat to /search's 512, the model would see
-    terms retrieval never matched -- a relevance bug, not a performance trade.
-    This pins the two limits as separate, agreeing values."""
+    prompt; clamping chat to /search's 512 would hide matched terms from the model."""
     from app.chat import MAX_CONTENT_LEN
 
     assert config.RETRIEVAL_QUERY_MAX_CHARS == MAX_CONTENT_LEN
@@ -503,19 +461,17 @@ def test_chats_accepted_message_length_is_not_silently_cut(monkeypatch):
 
 
 def test_an_8000_char_chat_message_reaches_every_encoder_in_full(monkeypatch):
-    """The end-to-end version of the above: a message chat ACCEPTS must arrive
-    at the dense encoder, the sparse encoder and the cross-encoder unmangled."""
+    """A message chat ACCEPTS must reach every encoder unmangled."""
     from app.chat import MAX_CONTENT_LEN
 
     dense, sparse = _wire_encoders(monkeypatch)
     reranker = _RecordingReranker()
     monkeypatch.setitem(main.state, "reranker", reranker)
     monkeypatch.setattr(main, "cache", _FakeCache())
-    # Filler that ends mid-word so it is exactly MAX_CONTENT_LEN with no
-    # trailing whitespace: every query is canonicalised before it reaches an
-    # encoder (#252), and a trailing space is stripped, so a message that ended
-    # in one would measure the canonicaliser rather than the clamp this test is
-    # about. MAX_CONTENT_LEN % 5 == 0, so the tail word is a whole 5 chars.
+    # Filler ending mid-word, so the message is exactly MAX_CONTENT_LEN with no
+    # trailing whitespace: queries are canonicalised before they reach an encoder
+    # and a trailing space is stripped, so this must measure the clamp, not the
+    # canonicaliser.
     message = ("zeta " * (MAX_CONTENT_LEN // 5 - 1)) + "zetas"
     assert len(message) == MAX_CONTENT_LEN
 
@@ -528,8 +484,7 @@ def test_an_8000_char_chat_message_reaches_every_encoder_in_full(monkeypatch):
 
 
 def test_a_normal_query_reaches_the_encoders_unharmed(monkeypatch):
-    """Guard against over-correcting: the clamp must not disturb a short query,
-    and the passage side of the pair must never be truncated."""
+    """Guard against over-correcting: the clamp must not disturb a short query."""
     dense, _sparse = _wire_encoders(monkeypatch)
     reranker = _RecordingReranker()
     monkeypatch.setitem(main.state, "reranker", reranker)
@@ -543,9 +498,7 @@ def test_a_normal_query_reaches_the_encoders_unharmed(monkeypatch):
 
 
 def test_the_vec_key_actually_still_round_trips(monkeypatch):
-    """A digested key must remain a usable key: the value written under it has
-    to be readable back on the next identical query, and a different long query
-    must still miss rather than read someone else's vectors."""
+    """A digested key must still round-trip, and a different long query must miss."""
     cache = _FakeCache()
     monkeypatch.setattr(main, "cache", cache)
     _wire_encoders(monkeypatch)
@@ -563,8 +516,7 @@ def test_the_vec_key_actually_still_round_trips(monkeypatch):
 
 
 def test_prefetch_still_receives_the_cached_vector(monkeypatch):
-    """The digested key must not break the retrieval itself: the Qdrant call
-    still needs a real dense vector and a real sparse vector."""
+    """The digested key must not break retrieval: Qdrant still needs a real dense and a real sparse vector."""
     qdrant = _FakeQdrant([_Point(1, {"title": "T", "url": "u"})])
     monkeypatch.setattr(main, "cache", _FakeCache())
     monkeypatch.setitem(main.state, "model", _RecordingDense((0.4, 0.5)))

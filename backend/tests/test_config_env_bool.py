@@ -3,17 +3,16 @@
 Each toggle used to be parsed inline as
 ``os.getenv(name, "true").lower() in ("1", "true", "yes")``. That already
 lowercased, so ``TRUE`` and ``True`` were fine; what it lacked was a strip and
-an ``on``, so ``on``, ``" true "`` and ``"1 "`` read as OFF. A retrieval
-feature then sits switched off with nothing wrong visible anywhere -- the knob
-looks configured, ``.env.example`` says ``true``, the API answers as though
-the operator had asked for off, and no log line exists to say so. The only
-way to notice is to already suspect it.
+an ``on``, so ``on``, ``" true "`` and ``"1 "`` read as OFF. A retrieval feature
+then sits switched off with nothing wrong visible anywhere -- the knob looks
+configured, ``.env.example`` says ``true``, the API answers as though the
+operator had asked for off, and no log line exists to say so.
 
 ``config._env_bool`` fixes that by normalising surrounding space as well as
 case, and by sharing one spelling set with ``_env_tristate`` so the same
 question has one answer in this file. Three properties of that answer are
-pinned here, because each of them was got wrong in an implementation that was
-written and then reverted:
+pinned here, because each was got wrong in an implementation that was written
+and then reverted:
 
 1. **A blank value stays OFF.** ``KEY=`` in a .env is how an operator clears a
    knob, python-dotenv writes it as an empty string, and ``.env.example`` ships
@@ -25,7 +24,7 @@ written and then reverted:
    at import turns a mistyped .env into a boot failure of the whole API, which
    is strictly worse than the ambiguity it removes, and it contradicts this
    module's own stated rule in ``_clamped_int``. The value is warned about and
-   the default is used instead.
+   the default used instead.
 
 3. **A toggle only counts as switched when the ``Config`` attribute says so.**
    Testing the helper is not enough: the defect was eight call sites choosing
@@ -49,9 +48,8 @@ from app.config import _FALSE_SPELLINGS, _TRUE_SPELLINGS, _env_bool, _env_trista
 CONFIG_PY = Path(config_module.__file__).resolve()
 BACKEND = CONFIG_PY.parent.parent
 
-# The eight toggles the issue names. Restated literally on purpose: if the set
-# below were derived from config, deleting a knob would quietly shrink the
-# assertions that cover it instead of failing.
+# The eight toggles. Restated literally on purpose: if the set below were
+# derived from config, deleting a knob would quietly shrink its assertions.
 FEATURE_TOGGLES = (
     "ENABLE_QUERY_EXPANSION",
     "ENABLE_ENTITY_BOOST",

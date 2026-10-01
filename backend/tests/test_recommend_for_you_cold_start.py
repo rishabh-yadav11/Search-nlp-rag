@@ -1,18 +1,12 @@
-"""Tests for the /recommend/for-you cold-start contract (#303).
+"""Tests for the /recommend/for-you cold-start contract.
 
-The handler used to open with::
-
-    if user_id == "unknown":
-        articles = await get_latest_top_stories(limit)
-        return RecommendationsResponse(user_id="anonymous", ..., cold_start=True)
-
-That branch could never run. The route depends on ``require_auth``, which
-either raises 401 or sets ``request.state.user_id`` to a real user id or to
-``SERVICE_USER_ID``; the literal ``"unknown"`` is only ever produced by
-``auth._client_ip`` for rate limiting. The branch therefore advertised an
-anonymous response no client could receive, while the real cold-start case --
-authenticated but with no history -- is served by
-``recommender.get_personalized_recommendations``.
+The handler used to open with a ``user_id == "unknown"`` branch returning an
+anonymous ``cold_start=True`` response. That branch could never run: the route
+depends on ``require_auth``, which either raises 401 or sets
+``request.state.user_id`` to a real user id or to ``SERVICE_USER_ID``, and the
+literal ``"unknown"`` is only ever produced by ``auth._client_ip`` for rate
+limiting. The real cold-start case -- authenticated but with no history -- is
+served by ``recommender.get_personalized_recommendations``.
 
 These tests pin the contract that actually holds:
 
@@ -154,8 +148,8 @@ def test_cold_start_response_is_cached_under_the_authenticated_user_id(client, e
     assert body["cached"] is True
     assert body["user_id"] == USER
     # Built by the endpoint's own helper, not re-spelled here: the key carries a
-    # cache-version segment (#257), and repeating the format string is how the
-    # writer and the reader of this key drift apart while both stay green.
+    # cache-version segment, and repeating the format string is how the writer
+    # and the reader of this key drift apart while both stay green.
     assert main._for_you_cache_key(USER, 5) in env.store, "precondition: the entry is cached"
 
 

@@ -1,12 +1,7 @@
 /**
- * Issue #273 — the admin dashboard must never render a chat conversation's
- * text. The backend used to send the session title (the first 60 characters of
- * the user's own question) as the first element of each `/analytics/chat` top-N
- * row, and this page printed it. It now sends the opaque session id, and the
- * page renders a short non-identifying label derived from that id.
- *
- * These tests drive the real page against a stubbed `fetch`, so they hold
- * whether the value rendered is the id or the question text.
+ * The dashboard must never render a chat conversation's text: the backend used to send the session title
+ * (the first 60 characters of the user's own question) in each `/analytics/chat` top-N row and the page
+ * printed it. It now sends the opaque session id, from which the page renders a short label.
  */
 import { act, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -41,16 +36,15 @@ const SUMMARY = {
   click_top_queries: [],
 }
 
-/** ts values chosen so the rendered "Updated" cells differ per row. */
+// ts values chosen so the rendered "Updated" cells differ per row.
 const COST_TS = 1_700_000_000
 const TOKEN_TS = 1_700_000_500
 
 const COST_ID = 'a1b2c3d4e5f60718'
 const TOKEN_ID = '9988776655443322'
 
-// Row shape: [sessionId, messages, value, updatedAt, ...] — plus a trailing
-// hostile `title` the backend must not need, to prove extra payload data is
-// never rendered.
+// Row shape: [sessionId, messages, value, updatedAt, ...] — plus a trailing `title` the page must
+// never render.
 const CHAT = {
   sessions: 2,
   users: 2,
@@ -91,10 +85,8 @@ function cellsOf(label: string): string[] {
   return Array.from(row.querySelectorAll('td')).map((c) => c.textContent ?? '')
 }
 
-// The shared formatter, imported rather than re-derived, so this expectation
-// cannot drift from what the page actually calls. The point of the assertion
-// is the per-row identity (each row shows ITS timestamp, not the first one's),
-// not a second copy of the date format.
+// The shared formatter, imported rather than re-derived. The assertion is about per-row identity, not
+// the date format.
 function renderedAt(ts: number): string {
   return formatEpochDateTime(ts)
 }
@@ -154,7 +146,7 @@ describe('AnalyticsDashboardPage — empty chat stats', () => {
 })
 
 
-// --- #281: a failed feed is shown as failed, never as an all-zero report ---
+// --- A failed feed is shown as failed, never as an all-zero report ---
 
 const UNAVAILABLE_SUMMARY = { error: 'analytics unavailable', detail: 'the analytics store could not be read' }
 const UNAVAILABLE_CHAT = { error: 'chat analytics unavailable', detail: 'the analytics store could not be read' }
@@ -205,14 +197,12 @@ describe('AnalyticsDashboardPage — a store that cannot be read is not a quiet 
     }
     expect(screen.queryByText('No data yet.')).toBeNull()
     expect(screen.queryByText('No chat activity yet.')).toBeNull()
-    // And it must not claim a successful fresh read.
     expect(document.body.textContent).not.toMatch(/Updated \d/)
   })
 
   it('treats a 503 with no error key as a failure on the status line alone', async () => {
-    // An intermediary (nginx, a gateway) can answer 503 with an HTML error
-    // page or an empty body, so the status line has to be load-bearing on its
-    // own — not only the `error` key.
+    // An intermediary can answer 503 with an HTML error page or empty body, so the status line has to
+    // be load-bearing on its own, not only the `error` key.
     await renderFeeds(statusResponse(503, '<html>502 Bad Gateway</html>'), statusResponse(200, CHAT))
 
     expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
@@ -221,9 +211,8 @@ describe('AnalyticsDashboardPage — a store that cannot be read is not a quiet 
   })
 
   it('still detects the legacy 200-with-error body the backend used to send', async () => {
-    // Status 200 + an `error` key is byte-for-byte what the old backend sent
-    // during a Redis outage; treating it as data is what produced the all-zero
-    // dashboard, so it must be treated as a failure.
+    // Status 200 plus an `error` key is what the backend sent during a Redis outage; treating it as data
+    // produced the all-zero dashboard.
     await renderFeeds(statusResponse(200, UNAVAILABLE_SUMMARY), statusResponse(200, UNAVAILABLE_CHAT))
 
     expect(screen.getByText(/Search analytics \(unavailable\)/)).toBeTruthy()
@@ -257,8 +246,7 @@ describe('AnalyticsDashboardPage — a store that cannot be read is not a quiet 
 describe('AnalyticsDashboardPage — a hung identity check is cancelled, not abandoned', () => {
   it('aborts the in-flight /api/auth/me when the 10 s race gives up', async () => {
     vi.useFakeTimers()
-    // getMe logs the cancelled identity check; that is expected here, and the
-    // assertion below is on the abort itself, not on the log.
+    // getMe logs the cancelled check; the assertion below is on the abort, not the log.
     vi.spyOn(console, 'error').mockImplementation(() => {})
     try {
       const captured: { signal: AbortSignal | null } = { signal: null }
@@ -287,8 +275,7 @@ describe('AnalyticsDashboardPage — a hung identity check is cancelled, not aba
         await vi.advanceTimersByTimeAsync(10_000)
       })
 
-      // Giving up on the promise is not enough: the socket must be closed, or
-      // the request outlives the race while `inFlight` is already released.
+      // Giving up on the promise is not enough: the socket must close, or the request outlives the race.
       expect(captured.signal?.aborted).toBe(true)
       expect(screen.getByText('Analytics unavailable: identity check timed out')).toBeTruthy()
     } finally {

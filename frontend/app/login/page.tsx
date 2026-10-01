@@ -9,9 +9,7 @@ import { isSafeRedirect } from '../lib/safe-url'
 function LoginForm() {
   const router = useRouter()
   const params = useSearchParams()
-  // Only honor `next` when it is a safe, same-origin, root-relative path.
-  // Unvalidated values like `//evil.com` or `https://evil.com` would let an
-  // attacker redirect the victim off-site after login, so fall back to `/chat`.
+  // Honor `next` only when it is a safe, same-origin, root-relative path; an unvalidated value would let an attacker redirect the victim off-site after login.
   const rawNext = params.get('next') || '/chat'
   const next = isSafeRedirect(rawNext) ? rawNext : '/chat'
   const [email, setEmail] = useState('')
@@ -23,15 +21,12 @@ function LoginForm() {
 
   useEffect(() => {
     mountedRef.current = true
-    // There is no synchronous "logged in" flag any more: the session is an
-    // httpOnly cookie that JS cannot read, so `/api/auth/me` is the only way to
-    // know. A network failure is not a logout, so it must not redirect.
+    // The session is an httpOnly cookie JS cannot read, so `/api/auth/me` is the only way to know; a network failure is not a logout and must not redirect.
     getMe()
       .then((me) => {
         if (me) router.replace(next)
       })
       .catch(() => {
-        /* offline or backend down: show the form rather than redirect */
       })
     return () => {
       mountedRef.current = false
@@ -49,7 +44,6 @@ function LoginForm() {
     }
     setBusy(true)
 
-    // Abortable fetch so a hung request can't leave the UI stuck.
     const controller = new AbortController()
     abortRef.current = controller
     const timeout = setTimeout(() => controller.abort(), 15000)
@@ -70,19 +64,14 @@ function LoginForm() {
         setError((body as { detail?: string }).detail ?? `Login failed (${res.status}).`)
         return
       }
-      // The session arrives as an httpOnly cookie on the response, so there is
-      // nothing to read from the body and nothing to persist in JS. Drop any
-      // cached user from a previous session and delete any token left behind by
-      // a pre-cookie build before continuing to the app.
+      // The session arrives as an httpOnly cookie, so there is nothing to read or persist in JS; drop the previous session's cached user and any legacy token.
       clearMeCache()
       clearLegacyToken()
       router.replace(next)
-      // Navigate away immediately; no further state updates after this.
       return
     } catch (err) {
       clearTimeout(timeout)
-      // Guard against state updates on an unmounted component if the request
-      // was aborted by the cleanup (e.g. navigation away during the call).
+      // The cleanup may have aborted this request; don't set state on an unmounted component.
       if (!mountedRef.current) return
       if (controller.signal.aborted) {
         setError('The request timed out. Please try again.')
@@ -91,7 +80,6 @@ function LoginForm() {
       }
       return
     } finally {
-      // Guard against state updates on an unmounted component.
       if (mountedRef.current) setBusy(false)
     }
   }

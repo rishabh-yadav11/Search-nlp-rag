@@ -1,6 +1,5 @@
-"""The LLM module must resolve settings from the config *instance* (`app.config.config`),
-not the `app.config` module object. Regression test for a runtime AttributeError that
-the unit tests missed because they never exercised llm.generate_answer."""
+"""The LLM module must resolve settings from the config *instance*
+(`app.config.config`), not the `app.config` module object."""
 
 import pytest
 

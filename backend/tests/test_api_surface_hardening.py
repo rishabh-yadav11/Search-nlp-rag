@@ -1,4 +1,4 @@
-"""Tests for the API attack surface being closed (#291).
+"""Tests for the API attack surface being closed.
 
 Two things are asserted here:
 

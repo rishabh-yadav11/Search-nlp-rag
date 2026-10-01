@@ -1,4 +1,4 @@
-"""The ONE dataviz validator contract, checked across both sides of the wire (#267).
+"""The ONE dataviz validator contract, checked across both sides of the wire.
 
 The server and the browser each decide whether a ``dataviz`` block is valid, and
 the two verdicts must be the same: the server strips a block it calls malformed
@@ -6,19 +6,18 @@ and bills a nudge retry for it, while the browser renders whatever it accepted.
 When they disagreed, a streamed chart vanished on reload, and a value-less or
 half-numeric block was billed a retry that could never help.
 
-So this test runs ONE fixture corpus (fixtures/dataviz_corpus.json) through
-BOTH implementations — the backend's ``parse_dataviz`` in-process, and the
-frontend's real ``parseDataViz`` executed under node by importing
-frontend/app/chat/datavizContract.ts — and fails if they accept different
+So this test runs ONE fixture corpus through BOTH implementations -- the
+backend's ``parse_dataviz`` in-process, and the frontend's real
+``parseDataViz`` executed under node by importing
+frontend/app/chat/datavizContract.ts -- and fails if they accept different
 fixtures, pick a different value column, coerce a cell to a different number, or
 match a different span of the answer.
 
 Running the frontend half needs a node that can import a ``.ts`` file, which is
-node 22.6+ (the built-in TypeScript support, unflagged from 22.18). The
-frontend itself still builds on node 18+, so that remains the documented
-requirement for the app; only this one test needs the newer node. Because this
-module is the only coverage of the browser-side validator, a node that cannot
-run it is a FAILURE under CI and a skip locally, never a silent pass.
+node 22.6+. The frontend itself still builds on node 18+, so that remains the
+documented requirement for the app; only this one test needs the newer node.
+Because this module is the only coverage of the browser-side validator, a node
+that cannot run it is a FAILURE under CI and a skip locally, never a silent pass.
 """
 
 import json
@@ -154,11 +153,10 @@ def test_node_probe_rejects_versions_that_cannot_import_typescript():
 
     The repo documents node 18+ for the app, and a node 18 or 20 box WOULD pass a
     `shutil.which` check and then die inside the harness on an unknown .ts
-    extension — turning the whole backend suite red with a raw subprocess error
-    instead of a clean, explanatory skip. Pinning the minimum here keeps that
-    path honest, and is the reason the harness also passes
-    --experimental-strip-types: node 22.6-22.17 needs the flag to strip types,
-    while 22.18+ and every 23.x/24.x accept it as a no-op."""
+    extension -- turning the whole backend suite red with a raw subprocess error
+    instead of a clean, explanatory skip. Pinning the minimum here is also why
+    the harness passes --experimental-strip-types: node 22.6-22.17 needs the
+    flag, and 22.18+ accepts it as a no-op."""
     assert MIN_NODE == (22, 6)
     assert _node_version("definitely-not-a-real-node-binary") is None
 

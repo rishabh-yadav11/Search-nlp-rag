@@ -18,28 +18,22 @@ _REDIS_ERRORS = (redis.exceptions.RedisError, OSError, TimeoutError)
 
 
 class HybridCache:
-    """Redis-backed JSON cache with an in-process TTLCache fallback.
-
-    Redis lets multiple gunicorn workers share one cache. If Redis is
-    unreachable the module degrades silently to a per-worker local cache so
-    the API keeps working.
-    """
+    """Redis-backed JSON cache shared by all gunicorn workers; degrades
+    silently to a per-worker in-process cache when Redis is unreachable."""
 
     def __init__(self, redis_url: str, ttl: int, maxsize: int, max_bytes: int | None = None):
         self._url = redis_url
         self._ttl = ttl
         self._maxsize = maxsize
-        # Byte ceiling for the in-process fallback. Entries are wildly
-        # different sizes (small search-result payloads vs ~15KB embedding
-        # vectors), so an entry-count cap alone lets a handful of vectors
-        # thrash out every small entry. ``None``/<=0 means unbounded.
+        # Byte ceiling for the in-process fallback: entry sizes vary hugely (small
+        # search results vs ~15KB embedding vectors), so a count cap alone lets a
+        # handful of vectors thrash out every small entry. None/<=0 is unbounded.
         self._max_bytes = max_bytes
         self._mem: OrderedDict[str, tuple[object, float, int]] = OrderedDict()
         self._mem_bytes = 0
         self._redis: aioredis.Redis | None = None
-        # Two independent latches: a corrupt payload is a different incident
-        # from an unreachable server, and healing one must not silence (or
-        # falsely "recover") the other.
+        # Two independent latches: a corrupt payload is a different incident from
+        # an unreachable server, so healing one must not silence the other.
         self._decode_latch = DegradedLatch(logger, "cache payload decode")
         self._conn_latch = DegradedLatch(logger, "cache Redis")
 
@@ -50,19 +44,15 @@ class HybridCache:
             self._mem_bytes -= entry[2]
 
     def _evict_mem(self) -> None:
-        """Enforce both capacity caps on the in-process fallback.
-
-        Entry count first (oldest first), then the byte budget, evicting the
-        largest entries first so big vectors are sacrificed before the many
-        small search results they would otherwise evict.
-        """
+        """Enforce both caps on the fallback: entry count first (oldest first),
+        then bytes, evicting the largest entries first so big vectors go before
+        the many small results they would otherwise evict."""
         while len(self._mem) > self._maxsize:
             self._drop_mem(next(iter(self._mem)))
         if not self._max_bytes or self._max_bytes <= 0:
             return
         while self._mem and self._mem_bytes > self._max_bytes:
-            # max() by (cost, -position) picks the largest entry and, among
-            # equal costs, the oldest one.
+            # (cost, -position) picks the largest entry, the oldest among ties.
             key = max(
                 enumerate(self._mem.items()), key=lambda pair: (pair[1][1][2], -pair[0])
             )[1][0]
@@ -74,33 +64,24 @@ class HybridCache:
         )
 
     def _acquire(self) -> tuple[aioredis.Redis, bool]:
-        """Return ``(client, is_new)`` for one cache operation.
-
-        A brand new client is *not* published to ``self._redis`` here: it
-        becomes the shared client only once its first command succeeds. If
-        that first command raises, the caller discards it (see
-        :meth:`_discard`) instead of leaving an open connection nobody can
-        reach.
-        """
+        """Return ``(client, is_new)`` for one operation; a new client is not
+        published to ``self._redis`` until its first command succeeds, so a
+        failure lets the caller discard it instead of leaking a connection."""
         if self._redis is not None:
             return self._redis, False
         return self._new_client(), True
 
     @staticmethod
     async def _discard(client: aioredis.Redis) -> None:
-        """Close a client this cache will not keep, either because its first
-        command failed or because it lost the publish race. Close errors are
-        ignored: the caller is already on the degraded path."""
+        """Close a client this cache will not keep (failed first command, or lost
+        publish race). Close errors are ignored: the caller is already degraded."""
         with contextlib.suppress(Exception):
             await client.aclose()
 
     async def _publish(self, client: aioredis.Redis) -> None:
-        """Share ``client`` once one of its commands has succeeded.
-
-        Concurrent calls can each build their own client while ``_redis`` is
-        still unset; the first one to finish wins and the loser is closed
-        rather than silently dropped while still holding a connection.
-        """
+        """Share ``client`` once one of its commands has succeeded; a concurrent
+        caller that built its own client first wins, and the loser is closed
+        rather than dropped while still holding a connection."""
         if self._redis is None:
             self._redis = client
         elif self._redis is not client:
@@ -124,11 +105,9 @@ class HybridCache:
             self._degraded(exc)
             return self._get_mem(key)
         await self._publish(client)
-        # Both latches re-arm here. A miss is a clean response, so a corrupt
-        # payload incident is over even though nothing was decoded -- without
-        # this the decode latch would stay closed across a miss and swallow
-        # the next corrupt payload, which is the one-way latch this module
-        # exists to eliminate.
+        # Both latches re-arm: a miss is a clean response, so a decode incident is
+        # over even though nothing was decoded -- otherwise the one-way decode
+        # latch would swallow the next corrupt payload.
         self._conn_latch.log_recovered()
         self._decode_latch.log_recovered()
         if raw is None:
@@ -136,21 +115,14 @@ class HybridCache:
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as exc:
-            # Corrupt payload in Redis: log it distinctly (don't silently swallow
-            # into the in-process fallback) and degrade to the memory cache.
+            # A corrupt payload is logged distinctly, not silently swallowed.
             self._degraded(exc)
             return self._get_mem(key)
         return value
 
     async def get_many(self, keys: list[str]) -> list[object | None]:
-        """Read several keys in a single Redis round trip (MGET).
-
-        Callers that already know they will need more than one key (e.g. /search
-        reads both its own summary entry and the underlying retrieval entry)
-        must not pay one round trip per key. Results are positional, matching
-        ``keys``; a key with no Redis entry falls back to the in-process cache
-        exactly as :meth:`get` does, so the two paths stay equivalent.
-        """
+        """Read several keys in one MGET round trip; results are positional and a
+        key with no Redis entry falls back to the in-process cache as get() does."""
         if not keys:
             return []
         client, is_new = self._acquire()
@@ -171,8 +143,7 @@ class HybridCache:
             try:
                 values.append(json.loads(raw))
             except json.JSONDecodeError as exc:
-                # Same distinct handling as get(): a corrupt payload degrades to
-                # the memory cache rather than poisoning the whole batch.
+                # As in get(): one corrupt payload degrades to memory.
                 self._degraded(exc)
                 values.append(self._get_mem(key))
         return values
@@ -185,10 +156,8 @@ class HybridCache:
         if expires_at <= time.monotonic():
             self._drop_mem(key)
             return None
-        # The expiry is fixed when the entry is created: a read must never
-        # extend it, or a hot key would live forever during a Redis outage and
-        # the fallback would serve unbounded stale data. Redis itself does not
-        # slide its TTL, so this keeps the fallback faithful to it.
+        # Expiry is fixed at creation: a read must never extend it, or a hot key
+        # would live forever during an outage (Redis does not slide its TTL either).
         self._mem.move_to_end(key)
         return value
 
@@ -207,9 +176,8 @@ class HybridCache:
             return
         effective_ttl = self._ttl if ttl is None else ttl
         cost = len(payload.encode())
-        # Re-caching an existing key replaces the old entry, so its bytes must
-        # come back before the new cost is added or the total inflates on every
-        # refresh until the budget evicts good entries early.
+        # Re-caching replaces the entry, so its bytes must come back before the new
+        # cost is added or the total inflates on every refresh.
         self._drop_mem(key)
         self._mem[key] = (value, time.monotonic() + effective_ttl, cost)
         self._mem.move_to_end(key)
@@ -217,37 +185,19 @@ class HybridCache:
         self._evict_mem()
 
     async def delete_keys(self, keys: Iterable[str]) -> None:
-        """Delete an explicitly known set of keys (Redis + memory).
+        """Delete an explicitly known key set (Redis + memory).
 
-        This is THE invalidation primitive, and the one to use whenever a
-        cache's key space is small and knowable -- as it is for every per-user
-        cache in this service, where the caller derives the key set from what
-        it actually wrote rather than asking Redis to find it.
+        This is THE invalidation primitive for the per-user caches in this
+        service, whose key space is knowable from what the caller wrote. Redis
+        work is a single DEL; the in-process sweep costs nothing while Redis is
+        healthy, since that tier is written only by set()'s Redis-failure
+        fall-through, and does the work Redis cannot when it is down.
 
-        Redis work is O(len(keys)): a single ``DEL`` for the whole set. The
-        only other cost is the in-process sweep, which iterates ``_mem``. That
-        tier is written at exactly one site -- the fall-through in ``set()``
-        after a Redis failure -- so while Redis is healthy ``_mem`` is empty
-        and the sweep is O(1); when Redis is down the sweep is bounded by
-        ``CACHE_MAX_SIZE`` and is doing the work Redis cannot.
-
-        The in-process purge runs unconditionally and BEFORE the Redis call,
-        so the fallback tier cannot keep serving a pre-invalidation value when
-        Redis is unreachable, and so an early abort part-way through the Redis
-        round trip (a cancelled request) cannot leave the memory tier stale
-        either. The guarantee does not depend on the Redis outcome: the
-        degraded path falls through to the same purge.
-
-        ``_mem`` is snapshotted before it is mutated, so a partially purged
-        set is not possible.
+        The memory purge runs unconditionally and BEFORE the Redis call, so the
+        fallback cannot keep serving a pre-invalidation value while Redis is
+        unreachable, and an aborted Redis round trip cannot leave it stale.
 
         An empty set is a no-op that never opens a connection.
-
-        This replaced a ``delete_prefix`` helper, which matched keys with
-        ``SCAN``. SCAN walks *every* key in the database and applies ``MATCH``
-        only afterwards, so its cost scaled with the total number of keys
-        rather than the number that match. Nothing needs that; if something
-        ever does again, it belongs in an offline maintenance script, not here.
         """
         targets = set(keys)
         if not targets:

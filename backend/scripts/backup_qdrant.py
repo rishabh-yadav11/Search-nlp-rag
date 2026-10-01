@@ -1,23 +1,10 @@
-"""
-Create a Qdrant collection snapshot backup and copy local artifacts.
+"""Create a Qdrant collection snapshot backup and copy local artifacts.
 
-A backup directory ``backend/backups/<collection>-<timestamp>`` is created
-containing the Qdrant collection snapshot (downloaded from the server) plus
-copies of ``data/articles.jsonl`` and ``data/index_state.json`` (if present).
-Retention keeps only the most recent ``BACKUP_RETENTION`` (default 5) backups.
-
-The snapshot download is what makes a backup usable: if ``create_snapshot`` or
-the download fails, the error is logged and the exit status is 1 even though
-the local artifacts may still have been copied — a directory without a verified
-local snapshot is not a backup of the collection.
-
-Exit status: 0 only when a verified local snapshot archive was written, or
-when ``--prune-only`` was requested (which writes no snapshot by design); 1 on
-any failure.
-
-Usage:
-    python scripts/backup_qdrant.py            # create a snapshot backup
-    python scripts/backup_qdrant.py --prune-only   # only enforce retention
+A directory without a verified *local* snapshot is not a backup of the
+collection, so a failed ``create_snapshot`` or download exits 1 even when the
+local artifacts were copied. Exit status is 0 only when a verified archive was
+written, or when ``--prune-only`` was requested (which writes no snapshot by
+design).
 """
 import os
 import sys

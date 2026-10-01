@@ -1,4 +1,4 @@
-"""Regression tests for the /recommend/interaction cache invalidation (#278).
+"""Regression tests for the /recommend/interaction cache invalidation.
 
 The endpoint used to call ``cache.delete_prefix(f"recommend:for-you:{uid}:")``
 unconditionally, and ``delete_prefix`` is implemented with ``SCAN``. SCAN walks
@@ -130,12 +130,11 @@ def env(monkeypatch):
 def _working_interaction_limiter(monkeypatch):
     """Give the interaction endpoint's rate limiter a working counter store.
 
-    #271 put this endpoint behind both a per-IP and a per-account limit, and
-    those limits fail CLOSED: with no limiter Redis the route answers 503
-    rather than serve an unlimited write path. That is the shipped behaviour
-    these tests must not accidentally paper over -- they are about cache
-    invalidation, not rate limiting -- so they get a counting store here, the
-    same way tests/test_main_http.py does for /search.
+    That endpoint sits behind both a per-IP and a per-account limit, and those
+    limits fail CLOSED: with no limiter Redis the route answers 503 rather than
+    serve an unlimited write path. That is shipped behaviour these tests must
+    not accidentally paper over -- they are about cache invalidation, not rate
+    limiting.
     """
     from app import auth
 
@@ -174,7 +173,7 @@ def _post_interaction(client, article_id=7):
 
 
 def test_interaction_invalidates_for_you_cache_without_scanning_the_keyspace(client, env):
-    """The whole point of #278: no keyspace walk on a request path.
+    """No keyspace walk on a request path.
 
     Asserted structurally rather than by timing -- the spy counts SCAN
     invocations and the keys they were made to walk. A request must cost a
@@ -200,9 +199,9 @@ def test_interaction_invalidates_for_you_cache_without_scanning_the_keyspace(cli
 
 def test_the_cache_exposes_no_scan_based_delete(client, env):
     """There is no longer a keyspace-scan delete for a request path to reach
-    for. This is what stops the #278 regression from being reintroduced by
-    someone who finds prefix invalidation convenient, and it is the strongest
-    statement available: the primitive is gone, not merely unused.
+    for. The primitive being gone, not merely unused, is what stops the
+    regression from being reintroduced by someone who finds prefix
+    invalidation convenient.
     """
     assert not hasattr(env.cache, "delete_prefix"), "the SCAN-based helper must not come back"
     assert hasattr(env.cache, "delete_keys"), "the derived-key-set delete must be the primitive"

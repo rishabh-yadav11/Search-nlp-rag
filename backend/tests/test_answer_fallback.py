@@ -14,20 +14,20 @@ from app.config import config
 def _shipped_weak_gate(monkeypatch):
     """Pin the two answerability knobs for this module.
 
-    They are deployment settings now (#300), so on a machine whose .env
-    retunes them every assertion below would be deciding something other than
-    what it looks like it is deciding. Pinned here rather than read from
-    `config` so the constants in the assertions mean what they say.
+    They are deployment settings now, so on a machine whose .env retunes them
+    every assertion below would decide something other than what it looks like
+    it decides. Pinned here rather than read from `config` so the literals in
+    the assertions mean what they say.
     """
     monkeypatch.setattr(config, "WEAK_RESULT_SCORE", 0.3)
     monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", 3)
 
 
 def test_weak_result_knobs_ship_the_values_the_pre_knob_constants_had(parse_config):
-    """Issue #300 moved the answerability gate out of answer_fallback.py's
-    module scope into config. Parsed from a clean environment, the knobs must
-    still be exactly the literals that lived there (0.3 and 3), or every
-    answerability decision moves the moment the change lands."""
+    """The answerability gate moved out of answer_fallback.py's module scope
+    into config. Parsed from a clean environment, the knobs must still be
+    exactly the literals that lived there (0.3 and 3), or every answerability
+    decision moves the moment the change lands."""
     shipped = parse_config()
     assert shipped.WEAK_RESULT_SCORE == 0.3
     assert shipped.WEAK_RESULT_MIN_STRONG == 3
@@ -64,10 +64,9 @@ def test_weak_result_min_strong_knob_moves_the_answerability_decision(monkeypatc
 
 
 def test_weak_result_min_strong_cannot_open_the_gate(monkeypatch):
-    """The count is floored at 1: a knob of 0 or less must not turn
-    "is this list weak?" into a permanent no. An unclamped env value reaching
-    `min(0, len(scores))` would silence every weak-result note and every chat
-    refusal."""
+    """The count is floored at 1: a knob of 0 or less must not turn "is this
+    list weak?" into a permanent no, which would silence every weak-result note
+    and every chat refusal."""
     for nonsense in (0, -1):
         monkeypatch.setattr(config, "WEAK_RESULT_MIN_STRONG", nonsense)
         assert results_are_weak([0.01, 0.01]) is True
@@ -184,7 +183,7 @@ def test_date_label_impossible_month_returns_none_instead_of_raising():
     """An out-of-range month must fall back to None like any other window that
     isn't a plain month/year. Regression: the except clause named
     calendar.IllegalYearError, which does not exist, so evaluating the except
-    tuple itself raised AttributeError (issue #169)."""
+    tuple itself raised AttributeError."""
     assert date_label("2025-13-01", "2025-12-31") is None
     assert date_label("2025-00-01", "2025-12-31") is None
     assert date_label("2025-99-01", "2025-99-31") is None
@@ -195,7 +194,7 @@ def test_date_label_out_of_range_year_is_normalized_not_raised():
     calendar.monthrange(0, 1) succeeds, so date_label never raises here. The
     zero-padded window still yields None because to_date is compared against
     the int year ('0-01-31'); the matching unpadded window labels as
-    'January 0'. Regression guard for issue #169: no IllegalYearError exists."""
+    'January 0'. Regression guard: no IllegalYearError exists."""
     assert date_label("0000-01-01", "0000-01-31") is None
     assert date_label("0000-01-01", "0-01-31") == "January 0"
 

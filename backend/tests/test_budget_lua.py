@@ -42,12 +42,10 @@ local store, fails = nil, 0
 
 -- Real key expiry. Redis deletes a key at the instant its TTL runs out, and
 -- the first command issued after that deadline sees a MISSING key. Because
--- expiry is LAZY, that command is usually the very one that needed the data.
--- Modelling it is what makes the holds containers' TTLs observable at all:
--- with EXPIRE a no-op, no scenario can tell a container that outlives the
--- promotion window from one that dies in the same instant the promotion
--- becomes possible -- and a crash that is never charged looks identical to
--- one that is.
+-- expiry is LAZY, that command is usually the very one that needed the data --
+-- so with EXPIRE a no-op, no scenario could tell a container that outlives the
+-- promotion window from one that dies the same instant the promotion becomes
+-- possible, and a crash that is never charged looks identical to one that is.
 --
 -- The clock is the one the SCRIPT is handed (ARGV[2]), so a scenario picks the
 -- instant a key dies by choosing `now`.
@@ -131,7 +129,7 @@ end
 local S = {}
 
 -- The cap is measured against spend plus every LIVE hold, so 0.15 admits 3 of
--- 8 simultaneous 0.05 turns -- the check-then-act fix for #255.
+-- 8 simultaneous 0.05 turns -- the check-then-act fix.
 function S.reserve_caps_concurrent_turns()
   newstore()
   local admitted, rejected = 0, 0
@@ -285,18 +283,15 @@ function S.disabled_cap_admits_everything()
   check(ok, 'cap disabled -> all 5 admitted')
 end
 
--- Acceptance criterion for #255: a CRASH is not free spend -- and the
--- promotion has to be REACHABLE, not just arithmetically correct. Nothing here
--- refreshes the holds containers between the reserve and the sweep: the one
--- later call is the first command the store sees. A hold's score first
--- satisfies `score <= now` exactly hold_ttl after the reserve, which is also
--- when containers expired at hold_ttl are gone (Redis expires lazily, on the
--- first command after the deadline -- the sweep). The spend then evaporates
--- and nothing reports it.
+-- A CRASH is not free spend -- and the promotion has to be REACHABLE, not just
+-- arithmetically correct. Nothing here refreshes the holds containers between
+-- the reserve and the sweep: the one later call is the first command the store
+-- sees. A hold's score first satisfies `score <= now` exactly hold_ttl after
+-- the reserve, which is also when containers expired at hold_ttl are gone. The
+-- spend then evaporates and nothing reports it.
 --
 -- All three modes re-arm the container TTL, so a settle or a release in the
--- gap is as good a way to lose the charge as a second reserve, and each of
--- them is exercised below.
+-- gap loses the charge just as a second reserve would; each is exercised below.
 function S.crashed_hold_is_charged_without_a_keepalive()
   newstore()
   run('reserve', 1000, 900, 500000, 50000, 'crash')
@@ -312,13 +307,13 @@ function S.crashed_hold_is_charged_without_a_keepalive()
   check(holdcount() == 2, 'the two live holds are still held (got ' .. holdcount() .. ')')
 end
 
--- The SAME reachability property, reached through the settle and release
--- branches, which also re-arm the container TTL. Under the old
--- `EXPIRE ... hold_ttl` each of these calls reset the containers' deadline to
--- now + hold_ttl, so a hold created just before one of them still died the
--- instant it became sweepable. Sweeping at the boundary `score == now` (1900,
--- containers exp 2800) pins the near edge; sweeping well past it (2799) pins
--- the far edge, so a future change cannot pass by luck at one instant.
+-- The SAME reachability property through the settle and release branches, which
+-- also re-arm the container TTL. Under the old `EXPIRE ... hold_ttl` each of
+-- these reset the containers' deadline to now + hold_ttl, so a hold created
+-- just before one still died the instant it became sweepable. Sweeping at the
+-- boundary `score == now` (1900, containers exp 2800) pins the near edge;
+-- sweeping well past it (2799) pins the far edge, so a future change cannot
+-- pass by luck at one instant.
 function S.crashed_hold_survives_a_settle_or_release_in_the_gap()
   newstore()
   run('reserve', 1000, 900, 500000, 50000, 'crash')

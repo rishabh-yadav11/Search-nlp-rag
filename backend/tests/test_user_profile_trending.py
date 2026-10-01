@@ -1,10 +1,4 @@
-"""Trending reads: equivalence with the old full-scan ranking, batched hydration,
-and no keyspace walk once the incrementally maintained index is seeded.
-
-A small in-memory Redis stand-in is used (the project has no fakeredis
-dependency) and it records how many *sequential* HGETALL round trips and SCANs a
-call made, which is what the old serial loop and the keyspace walk showed up as.
-"""
+"""Trending reads against an in-memory Redis stand-in (no fakeredis dependency) that records sequential HGETALL round trips and SCANs."""
 
 import asyncio
 
@@ -59,9 +53,8 @@ class _Pipeline:
         for cmd in self._cmds:
             if cmd[0] == "hgetall":
                 self._redis.pipeline_hgetall_batches[-1].append(cmd[1])
-                # Lets a test land a real write between the index read and the
-                # sort: a ZREVRANGE has already happened, and this is the
-                # hydration of that batch.
+                # Lets a test land a real write between the index read and that
+                # batch's hydration.
                 if self._redis.during_hgetall_batch is not None:
                     hook, self._redis.during_hgetall_batch = (
                         self._redis.during_hgetall_batch,
@@ -86,7 +79,7 @@ class _FakeRedis:
         self.during_hgetall_batch = None
         self.ttls: dict = {}
 
-    # --- command execution (sync, like redis-py's command builders) ---
+    # --- command execution, sync like redis-py's builders ---
     def _apply(self, cmd):
         kind = cmd[0]
         if kind == "set":
@@ -156,11 +149,9 @@ class _FakeRedis:
         return (0 if nxt >= len(keys) else nxt, page)
 
     async def zrevrange(self, key, start, stop, withscores=False):
-        # Descending by score, with tied members in REVERSE lexicographic
-        # order, which is what Redis does. Sorting by (score, member) descending
-        # gives both in one pass; reversing an ascending sort instead would
-        # yield reverse-lexicographic ties but ASCENDING scores, which is wrong
-        # for every index that has two different scores.
+        # Redis orders ties reverse-lexicographically, so sort (score, member)
+        # descending: reversing an ascending sort would give reverse-lexicographic
+        # ties but ASCENDING scores.
         items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
         ordered = [m for m, _ in items]
         return ordered[start:stop + 1]
@@ -176,15 +167,12 @@ async def _always_ok(*_args, **_kwargs):
 
 @pytest.fixture
 def fake(monkeypatch):
-    """A bare in-memory Redis, with #271's two write guards stood down.
+    """A bare in-memory Redis, with the two write guards stood down.
 
-    `record_interaction` now refuses an article that is not in the Qdrant index
-    and a user over the distinct-article cap, both of which need a collection
-    this fake deliberately does not carry. That behaviour is the subject of
-    tests/test_interaction_guards.py and tests/test_record_interaction_pipeline.py;
-    here it would only make every write decline before reaching the trending
-    index this module is about. A cap of 0 short-circuits the slot check
-    before it issues ZCARD/ZSCORE, which this fake does not model.
+    ``record_interaction`` refuses an article missing from the Qdrant index and a
+    user over the distinct-article cap, both of which need a collection this fake
+    does not carry. A cap of 0 short-circuits the slot check before it issues
+    ZCARD/ZSCORE, which this fake does not model.
     """
     redis = _FakeRedis()
     monkeypatch.setattr(user_profile, "_redis_client", lambda: redis)
@@ -209,10 +197,9 @@ def _oracle(counts, limit):
 
 
 def _legacy_full_scan_ranking(fake, limit):
-    """The pre-fix ranking, transcribed: SCAN the keyspace, HGETALL every
+    """The old ranking, transcribed: SCAN the keyspace, HGETALL every
     `article:interactions:*` key, sum its digit-valued counters, rank by total
-    descending, cut to `limit`. Ties used to fall out of SCAN order; this fake
-    scans in sorted key order, so the comparison below is exact."""
+    descending, cut to `limit`. Sorted key order makes the comparison exact."""
     article_scores: dict[str, float] = {}
     for key in sorted(fake.store):
         if not key.startswith("article:interactions:"):
@@ -265,14 +252,13 @@ def test_trending_limit_is_honoured(fake):
     counts = _seed_interactions(fake, [(i, "click") for i in range(1, 21)])
 
     assert _run(get_trending_articles(limit=3)) == _oracle(counts, 3)
-    # The window cache key carries no limit (pre-existing behaviour, unchanged),
-    # so drop it before asking for a different one.
+    # The window cache key carries no limit, so drop it before asking for another.
     _drop_window_cache(fake)
     assert _run(get_trending_articles(limit=1)) == _oracle(counts, 1)
 
 
 def test_trending_matches_the_pre_fix_full_scan_ranking(fake):
-    """Differential check against the algorithm this issue replaced."""
+    """Differential check against the full-scan ranking this replaced."""
     _seed_interactions(
         fake,
         [(1, "click"), (2, "click"), (2, "click"), (2, "view"), (3, "click"),
@@ -307,7 +293,7 @@ def test_trending_skips_articles_whose_counters_expired(fake):
     """An indexed article with no counters left is skipped, not ranked."""
     _seed_interactions(fake, [(1, "click"), (2, "click"), (2, "click"), (3, "click")])
     _warm_up_index(fake, limit=5)
-    del fake.store["article:interactions:1"]  # counter hash expired
+    del fake.store["article:interactions:1"]
 
     out = _run(get_trending_articles(limit=2))
 
@@ -319,7 +305,7 @@ def test_trending_pages_past_a_fully_expired_rank_batch(fake):
     _seed_interactions(fake, [(i, "click") for i in range(1, 61)])
     _warm_up_index(fake, limit=10)
     for article_id in range(1, 51):
-        del fake.store[f"article:interactions:{article_id}"]  # counters expired
+        del fake.store[f"article:interactions:{article_id}"]
 
     out = _run(get_trending_articles(limit=10))
 
@@ -362,7 +348,7 @@ def test_legacy_data_is_bootstrap_scanned_at_most_once(fake):
     second = _run(get_trending_articles(limit=3))
 
     assert scans_after_first >= 1
-    assert fake.scan_calls == scans_after_first  # seeded, so no second scan
+    assert fake.scan_calls == scans_after_first
     assert first == second == [
         {"article_id": 3, "score": 3.0},
         {"article_id": 2, "score": 2.0},
@@ -377,7 +363,6 @@ def test_empty_install_bootstraps_without_rescanning(fake):
     assert fake.scan_calls >= 1
     del fake.store[user_profile._TRENDING_INDEX_READY_KEY]
     _run(get_trending_articles(limit=5))
-    # ready marker written on the first pass, so the scan is not repeated
     assert user_profile._TRENDING_INDEX_READY_KEY in fake.store
 
 
@@ -391,7 +376,7 @@ def test_candidate_hydration_is_batched_not_serial(fake):
     out = _run(get_trending_articles(limit=120))
 
     assert out == _oracle(counts, 120)
-    # The old path awaited HGETALL once per key: 120 sequential round trips.
+    # The serial path awaited HGETALL once per key.
     assert fake.hgetall_round_trips == []
     assert [len(b) for b in fake.pipeline_hgetall_batches if b] == [50, 50, 20]
     assert fake.scan_calls == 0
@@ -420,9 +405,6 @@ def test_repeat_interactions_advance_the_index_incrementally(fake):
     )
 
     assert fake.zsets[user_profile._TRENDING_INDEX_KEY] == {"1": 3.0, "2": 2.0}
-
-
-# --- write path keeps the index in step ---
 
 
 def test_record_interaction_advances_the_trending_index(fake):
@@ -480,8 +462,7 @@ def test_write_path_never_marks_the_index_seeded(fake):
     """Interactions alone must not suppress the one-time bootstrap scan.
 
     A legacy install that records an interaction before its first trending read
-    would otherwise be marked seeded without ever being scanned, and trending
-    would silently serve a fraction of the articles it used to.
+    would otherwise be marked seeded without ever being scanned.
     """
     _seed_interactions(fake, [(1, "click"), (2, "click"), (2, "click"), (3, "click")])
 
@@ -513,15 +494,12 @@ def test_window_cache_short_circuits_the_whole_read(fake):
 def test_article_interacted_with_mid_read_still_appears(fake):
     """An ingest landing after the index read is not dropped by that read.
 
-    The read walks the index in rank batches, and the hook fires while the
-    FIRST batch is being hydrated -- so ZREVRANGE has already returned without
-    article 9. The loop must re-read the index for its next batch rather than
-    sorting a snapshot taken before the write, which is the failure mode a
-    single up-front index read would have.
+    The hook fires while the FIRST batch is hydrated, so ZREVRANGE has already
+    returned without article 9; the loop must re-read the index for its next
+    batch rather than sorting a snapshot taken before the write.
     """
-    # Distinct scores, so the new article lands at the BOTTOM of the index --
-    # the case a rank cursor advances past safely. Its single click must be
-    # picked up by the next batch rather than skipped.
+    # Distinct scores put the new article at the BOTTOM of the index, the case a
+    # rank cursor advances past safely; its click must come from the next batch.
     _seed_interactions(fake, [(1, "click"), (1, "click"), (1, "click"),
                               (2, "click"), (2, "click")])
     _warm_up_index(fake, limit=5)
@@ -548,11 +526,9 @@ def test_article_interacted_with_mid_read_still_appears(fake):
 def test_legacy_members_are_backfilled_lazily_on_the_first_read(fake):
     """Counters written by a deploy that predates the index are not lost.
 
-    There is NO migration. The index is built lazily, by a single scan on the
-    first trending read after a deploy, guarded by a ready marker so it never
-    repeats. Every pre-existing `article:interactions:*` hash is therefore
-    discovered and ranked exactly as the old keyspace walk found it, and a
-    member that arrives after that scan is picked up by the write path.
+    There is NO migration: one scan on the first trending read, guarded by a
+    ready marker that keeps it from repeating, discovers every pre-existing
+    `article:interactions:*` hash exactly as the old keyspace walk did.
     """
     # A pre-index install: counters only, no index, no ready marker.
     for article_id in (1, 2, 3):
@@ -567,7 +543,6 @@ def test_legacy_members_are_backfilled_lazily_on_the_first_read(fake):
         {"article_id": 2, "score": 2.0},
         {"article_id": 1, "score": 1.0},
     ]
-    # A member that arrives after the backfill is not lost either.
     _run(record_interaction("u1", 4, "click"))
     _drop_window_cache(fake)
     assert {"article_id": 4, "score": 1.0} in _run(get_trending_articles(limit=10))
@@ -579,10 +554,8 @@ def test_legacy_members_are_backfilled_lazily_on_the_first_read(fake):
 def test_tied_scores_have_a_deterministic_order(fake):
     """Equal scores are broken by article id, so identical requests agree.
 
-    Real Redis breaks a ZREVRANGE score tie in reverse lexicographic order of
-    the member, which is the OPPOSITE of the required order, and the old
-    keyspace-walk version left ties in whatever order the SCAN produced. The
-    final sort must impose a total order itself.
+    Real Redis breaks a ZREVRANGE score tie in reverse lexicographic order, the
+    OPPOSITE of the required order, so the final sort must impose a total order.
     """
     for article_id in (3, 1, 4, 2):
         fake.store[f"article:interactions:{article_id}"] = {"click": "2"}
@@ -606,18 +579,15 @@ def test_tied_scores_have_a_deterministic_order(fake):
 def test_tie_break_survives_a_reverse_lexicographic_index_order(fake):
     """The tie-break comes from the sort, not from the index's member order.
 
-    Real Redis returns tied ZREVRANGE members in reverse lexicographic order,
-    so this index hands back 9 before 10 -- and the required answer is 9 first
-    because ids are compared as integers. A string comparison of the members,
-    or no comparison at all, would put 10 first here.
+    Redis returns tied members reverse-lexicographically -- 9 before 10 -- while
+    the required answer is 9 first, so a string comparison would fail here.
     """
     fake.store["article:interactions:10"] = {"click": "1"}
     fake.store["article:interactions:9"] = {"click": "1"}
     fake.zsets[user_profile._TRENDING_INDEX_KEY] = {"10": 1.0, "9": 1.0}
     fake.store[user_profile._TRENDING_INDEX_READY_KEY] = "1"
 
-    # The index really does return them in the unhelpful order, so this is not
-    # a test that passes because the input was already sorted.
+    # The index really does return them in the unhelpful order.
     assert _run(_zrevrange_now(fake)) == ["9", "10"]
 
     out = _run(get_trending_articles(limit=5))
@@ -639,8 +609,7 @@ def test_ready_marker_shares_the_index_ttl_so_they_cannot_outlive_each_other(fak
     """The seed marker expires with the index it guards.
 
     A permanent marker beside a TTL'd index would suppress the backfill forever
-    once the index itself expired, stranding every later install on an empty
-    trending set with no path back to the counters.
+    once the index expired, stranding later installs on an empty trending set.
     """
     _seed_interactions(fake, [(1, "click")])
     _run(get_trending_articles(limit=5))

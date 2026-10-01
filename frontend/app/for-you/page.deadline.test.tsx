@@ -1,12 +1,6 @@
 /**
- * Issue #287 — a hung `/recommend/*` response must not pin the For You feed in
- * "Loading..." forever.
- *
- * The stub below never settles on its own: it holds the request open until the
- * signal it was handed aborts, which is exactly what a backend that accepts the
- * connection and never responds looks like to `fetch`. If the page has no
- * deadline the socket is cancelled, the catch runs, and the user gets a message
- * plus a Retry.
+ * The stub never settles on its own: it holds the request open until its signal aborts, which is what a
+ * backend that accepts the connection and never responds looks like to `fetch`.
  */
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -21,10 +15,8 @@ let captures: SignalCapture[] = []
 const SIGNED_OUT = { ok: false, status: 401, json: async () => null } as unknown as Response
 
 /**
- * Feed and beacon requests only. The page's shared top bar asks who the
- * visitor is on mount, which the stubs below answer immediately: the deadline
- * under test is the feed's, and a hung `/api/auth/me` would be a second,
- * unrelated thing to account for.
+ * Feed and beacon requests only. The shared top bar's identity check is answered immediately: a hung
+ * `/api/auth/me` would be a second, unrelated thing to account for.
  */
 function feedCaptures(): SignalCapture[] {
   return captures.filter((c) => !c.url.includes('/api/auth/me'))
@@ -99,23 +91,16 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
     })
     expect(feedCaptures()).toHaveLength(2)
     expect(screen.getByText('Loading...')).toBeTruthy()
-    // The retry must be able to reach the same deadline again.
     expect(feedCaptures()[1].signal?.aborted).toBe(false)
     await advance(RECOMMEND_DEADLINE_MS)
     expect(feedCaptures()[1].signal?.aborted).toBe(true)
   })
 
   it('keeps a still-mounted feed out of the cancelled request’s error path', async () => {
-    // The observable form of "unmounting does not report a timeout". Unmounting
-    // destroys the DOM, so an assertion afterwards can only ever see a
-    // torn-down tree — it passes whether or not the page misbehaved, which is
-    // why the old unmount test here asserted nothing. The feed type is switched
-    // instead, which cancels request #1 and starts request #2 while the page
-    // stays mounted: a stray timeout message from the abandoned request has a
-    // live component to render into and cannot hide.
-    //
-    // #1 hangs until the deadline and #2 answers, so exactly one request
-    // fails: if the page painted the abandoned one, the text would show.
+    // Switching feed type cancels request #1 and starts #2 while the page stays mounted, so a stray
+    // timeout from the abandoned request has a live component to render into. Unmounting cannot do
+    // this: the DOM is gone, so the assertion passes either way. #1 hangs until the deadline and #2
+    // answers, so exactly one request fails.
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -154,8 +139,7 @@ describe('ForYouPage — a hung feed request does not pin the loading state', ()
     await advance(RECOMMEND_DEADLINE_MS)
     expect(feedCaptures()[0].signal?.aborted).toBe(true)
 
-    // The feed the user is actually on moved on, so #1's timeout must not be
-    // reported...
+    // The feed the user is on moved on, so #1's timeout must not be reported...
     expect(screen.queryByText(/did not respond in time/)).toBeNull()
     // ...and #2's answer is what the page shows.
     expect(screen.getByText('Trending deal')).toBeTruthy()
@@ -191,8 +175,7 @@ describe('ForYouPage — the click-tracking beacon is bounded too', () => {
     )
 
     render(<ForYouPage />)
-    // Fake timers are installed, so `findBy*` would wait on a clock that is
-    // not moving. Flush the feed's microtasks explicitly instead.
+    // Fake timers are installed, so `findBy*` would wait on a clock that is not moving.
     await advance(0)
     const link = screen.getByText('Deal 1')
     await act(async () => {

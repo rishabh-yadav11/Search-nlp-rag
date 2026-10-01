@@ -2,18 +2,15 @@
 
 The production limiter in ``app.auth._consume_counter`` establishes its window
 with a single ``SET key 0 NX EX window`` and then ``INCR``s the key. Both
-properties are load-bearing, and the two properties a test double most
-naturally drops are exactly those two:
+properties are load-bearing, and they are exactly what a permissive double
+(``**kwargs`` and a plain dict of ints) drops:
 
 * ``EX`` is what makes the key reclaimable. Without it the counter is immortal
   and one source address is locked out forever.
 * ``NX`` is what stops the window from being re-armed on every hit, which would
   pin the count at 1 forever and turn the limit into "no limit".
 
-A permissive double that ignores both arguments (``**kwargs`` and a plain dict
-of ints) makes the production invariant untestable: a limiter that stopped
-passing ``ex=`` would still pass every test written against it. This fake
-therefore models them, and additionally RECORDS a contract violation when a
+So this fake models both, and additionally RECORDS a contract violation when a
 counter key is written without a TTL.
 
 Recording rather than raising is deliberate. ``_consume_counter`` wraps the
@@ -123,14 +120,12 @@ class RateLimitRedisFake:
     def counters(self) -> CountersView:
         """Live ``key -> count`` view of the unexpired counters.
 
-        A VIEW, not a copy, and not a stored dict. The old hand-rolled fakes
-        returned the very dict their ``incr`` was mutating, so a test could hold
-        on to it across requests and read the current counts afterwards.
-        Returning a copy here would hand those tests a permanently empty dict
+        A VIEW, not a copy, and not a stored dict. The hand-rolled fakes this
+        replaced returned the very dict their ``incr`` was mutating, so a test
+        could hold on to it across requests and read the current counts
+        afterwards. A copy here would hand those tests a permanently empty dict
         and silently void their assertions, so the view reads through to the
-        store on every access. Reading it is also what reclaims expired
-        counters, so ``list(...)``, ``.values()``, and ``dict(...)`` over it
-        behave like the plain dict they replaced.
+        store on every access. Reading it also reclaims expired counters.
         """
         return CountersView(self)
 

@@ -6,21 +6,19 @@ Two knobs are governed by that file and disagreed with the code: CORS_ORIGINS
 trusted a dead ``http://localhost:8000`` while the API serves 8001, and
 AUTH_TRUST_X_FORWARDED_FOR read ``true`` in the template against a code default
 of "auto". Both decide, unremarked, whether a client can forge the IP the rate
-limiter buckets on (#286).
+limiter buckets on.
 
-Editing the template to match the code fixes today's file. The guard is what
-stops it drifting again, and it is stated as a property rather than a pair of
-literals: for every key the template ships, setting that key to the template's
-value must leave ``Config`` exactly as it is with the key UNSET. So a default
-edited in config.py and not in the template fails here, and a template value
-that changes a knob's meaning fails here.
+Editing the template to match the code fixes today's file; the guard stops it
+drifting again, stated as a property rather than a pair of literals: for every
+key the template ships, setting that key to the template's value must leave
+``Config`` exactly as it is with the key UNSET.
 
 Both sides are read from files in a clean module, never from the ambient
 process: ``load_dotenv`` is neutralised (it searches upward from the CALLING
 file, so patching the CWD would not keep a real ``backend/.env`` out) and every
 template key is removed from ``os.environ`` before the baseline load. Nothing
-here skips: the keys with a legitimate reason to differ are excluded from the
-comparison, and each exclusion is separately proved to still be needed.
+here skips: keys with a legitimate reason to differ are excluded, and each
+exclusion is separately proved to still be needed.
 """
 import importlib.util
 from pathlib import Path
@@ -146,8 +144,7 @@ def test_every_template_key_is_classified():
 
     A key that is neither a Config attribute nor a documented exclusion would
     otherwise drop out of the guard silently -- and a template key nothing
-    reads is an operator setting a knob that does not exist, the class of
-    defect #263 was filed for.
+    reads is an operator setting a knob that does not exist.
     """
     values = _template()
     assert values, f"{ENV_EXAMPLE} parsed to no keys at all"
@@ -187,11 +184,10 @@ def test_a_placeholder_exclusion_is_still_load_bearing(key, monkeypatch):
 
 
 def test_cors_origins_template_names_the_port_the_api_serves():
-    """CORS_ORIGINS is the concrete #286 symptom, pinned on its own.
+    """The dead :8000 origin is back, named as the operator needs to read it.
 
     The parametrised guard catches any divergence, but reports it as "this
-    value changes the declared default". This says the thing an operator needs
-    to read: the dead :8000 origin is back.
+    value changes the declared default".
     """
     origins = [o.strip() for o in _template()["CORS_ORIGINS"].split(",")]
     assert "http://localhost:8001" in origins, (
@@ -210,9 +206,7 @@ def test_xff_trust_ships_as_auto_not_a_forced_boolean():
     A forced true makes the rate limiter's client IP attacker-supplied for
     anyone reaching the API port directly; a forced false breaks the reference
     deploy, where nginx forwards from loopback. 'auto' (unset) resolves the
-    header against the actual socket peer, which is correct for both
-    topologies at once. Spelt out rather than inferred so a reviewer sees the
-    decision, not just the agreement.
+    header against the actual socket peer, correct for both topologies at once.
     """
     assert _template()["AUTH_TRUST_X_FORWARDED_FOR"].strip().lower() == "auto", (
         "AUTH_TRUST_X_FORWARDED_FOR must ship 'auto': trusting the header from "

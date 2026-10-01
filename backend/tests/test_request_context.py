@@ -71,8 +71,8 @@ class _ListHandler(logging.Handler):
 def log():
     """Capture every record the request produces, stamped exactly as in prod.
 
-    #293's `configure_logging()` is what makes an INFO app record exist at all,
-    so it is called here rather than relied on from whatever a previous test
+    `configure_logging()` is what makes an INFO app record exist at all, so it
+    is called here rather than relied on from whatever a previous test
     happened to import -- `app` lands at the app level, `app.access` and
     `app.observability` with it, and the root logger stays at WARNING. It is a
     process-wide change, so the previous state of every logger and of root is
@@ -80,8 +80,7 @@ def log():
 
     The RequestIdFilter is attached to the capture handler exactly as
     `attach_request_id_filter` attaches it to the app's real one, so a record
-    only carries `request_id` because the filter that ships in
-    app.observability put it there.
+    only carries `request_id` because the shipped filter put it there.
     """
     root = logging.getLogger()
     root_state = (root.level, list(root.handlers))
@@ -450,12 +449,13 @@ def test_streaming_response_keeps_every_chunk_and_the_id(log):
 
 
 def test_the_request_id_filter_extends_the_app_handler_and_never_stacks_one(log):
-    """#293's `configure_logging()` is the single owner of the root handler.
+    """`configure_logging()` is the single owner of the root handler.
 
     Correlation must extend that handler, not install a second one: two root
     handlers write every record in the process twice, which is exactly the
-    single-write property #293 pins. So the filter goes on the handler
-    `installed_handler()` returns, and calling this twice still attaches one.
+    single-write property the logging tests pin. So the filter goes on the
+    handler `installed_handler()` returns, and calling this twice still attaches
+    one.
     """
     before = list(logging.getLogger().handlers)
 
@@ -463,15 +463,15 @@ def test_the_request_id_filter_extends_the_app_handler_and_never_stacks_one(log)
     again = attach_request_id_filter()
 
     assert handler is again is installed_handler()
-    # The root handler list is byte-for-byte what it was: this added a filter,
-    # not a handler, and it is a filter on the one #293 already installed.
+    # The root handler list is unchanged: this added a filter to the existing
+    # handler, not a new handler.
     assert list(logging.getLogger().handlers) == before
     assert handler in before
     assert sum(isinstance(f, RequestIdFilter) for f in handler.filters) == 1
 
 
 def test_the_id_survives_into_the_line_the_app_handler_actually_renders(log):
-    """The filter sets a field; #293's format string renders no field.
+    """The filter sets a field; the app's format string renders no field.
 
     What makes the id greppable in a shipped deployment is therefore the message
     text, so this renders a captured record through the real handler's own
@@ -509,21 +509,18 @@ _PROBE = (
 
 
 def test_the_real_import_path_actually_attaches_the_filter():
-    """The ordering constraint, pinned: the attach must happen AFTER #293 runs.
+    """The ordering constraint, pinned: the attach must happen AFTER
+    `configure_logging()` runs.
 
-    `configure_logging()` is called from `app.main` near the top of that module
-    and `installed_handler()` returns None before it, so a call site that
+    `installed_handler()` returns None before that call, so a call site that
     drifted above it would leave the filter permanently unattached and no app
     line would carry an id -- silently, because every other case here would
-    still pass. That is the failure this turns into a red test.
+    still pass.
 
     Run in a fresh interpreter, deliberately: whether the filter is attached
     depends on the ORDER of two module-level calls at import, and this test
-    session's own fixtures (mine and #293's) add and remove root handlers. An
-    in-process assertion would read whatever the previously-run test left
-    behind instead of the real import path. This is the same
-    fresh-interpreter technique `tests/test_api_surface_hardening.py` and
-    `tests/test_logging_config.py` already use for import-time behaviour.
+    session's own fixtures add and remove root handlers, so an in-process
+    assertion would read whatever the previously-run test left behind.
     """
     backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     proc = subprocess.run(

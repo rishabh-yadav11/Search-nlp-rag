@@ -5,27 +5,20 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { AuthUser, getMe, logout } from '../lib/auth'
 
-// The nav is a literal move of the header that used to live inline on the
-// search page. The active item used to be hardcoded onto "Search"; it is now
-// derived from the route so every page that mounts this bar highlights itself.
 const NAV: { href: string; label: string }[] = [
   { href: '/', label: 'Search' },
   { href: '/for-you', label: 'For You' },
   { href: '/chat', label: 'Chat' },
 ]
 
-// Admin-only route, so it is not part of the always-on nav list.
 const ANALYTICS_HREF = '/analytics/dashboard'
 
 /**
- * The app's single top bar: wordmark (+ optional page subtitle), primary nav,
- * the ASK VCCircle call to action and the account control.
- *
  * `me` is tri-state: `undefined` renders nothing in the account slot, `null` is
  * signed out. Whether the bar resolves the session ITSELF is decided by the
  * PRESENCE of the prop, not its value, so a page that already owns the request
- * can hand over a still-loading `undefined` without this bar firing a second,
- * concurrent `/api/auth/me` (`getMe` caches results, not in-flight calls).
+ * can hand over a still-loading `undefined` without firing a second concurrent
+ * `/api/auth/me` (`getMe` caches results, not in-flight calls).
  */
 export default function TopBar(props: { me?: AuthUser | null; subtitle?: string | null }) {
   const { me: meProp, subtitle } = props
@@ -34,8 +27,6 @@ export default function TopBar(props: { me?: AuthUser | null; subtitle?: string 
   const [fetchedMe, setFetchedMe] = useState<AuthUser | null | undefined>(undefined)
 
   useEffect(() => {
-    // A caller-supplied value wins, loading or not: never re-ask for a session
-    // the page is already fetching.
     if (callerOwnsSession) return
     let live = true
     getMe()
@@ -75,8 +66,7 @@ export default function TopBar(props: { me?: AuthUser | null; subtitle?: string 
           ))}
         </nav>
         <div className="topbar-right">
-          {/* On /chat this CTA would link to the page already on screen, and the
-              nav's "Chat" item already marks the route as current. */}
+          {/* On /chat the CTA would link to the page already on screen. */}
           {pathname !== '/chat' ? (
             <Link href="/chat" className="topbar-cta" aria-label="Open chat assistant">
               ASK VCCircle

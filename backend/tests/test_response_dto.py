@@ -1,7 +1,7 @@
-"""Validate the slim SourceSummary public DTO (parallel task).
+"""Validate the slim SourceSummary public DTO.
 
-The DTO must carry only the fields needed by the frontend plus a short `summary`
-excerpt for editors, and must never leak the full article `body` in API responses.
+It must carry only the fields the frontend needs plus a short `summary`
+excerpt, and must never leak the full article `body`.
 """
 
 from app.main import SourceArticle, SourceSummary

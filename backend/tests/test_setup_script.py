@@ -2,24 +2,17 @@
 
 setup.sh repairs an upgraded host's backend/.env in two steps: it appends the
 shipped default when the key is missing, and warns when the operator has forced
-the header to be trusted. The warning is a safety net -- a forced-true value
-means X-Forwarded-For is trusted from any peer, so a client reaching :8001
-directly can forge it to dodge a rate limit (#245) -- so it has to fire for
-every line an operator can write that the application itself reads as
-forced-true, not just the literal `KEY=true`.
+the header to be trusted. The warning is a safety net -- a forced-true value means
+X-Forwarded-For is trusted from any peer, so a client reaching :8001 directly can
+forge it to dodge a rate limit -- so it has to fire for every line an operator can
+write that the application itself reads as forced-true, not just `KEY=true`.
 
-The guard is EXECUTED here, not read out of the source and handed to grep.
-That is the mistake this section used to make, and it is why #388 survived: the
-regex was matched against candidates built as f"{FLAG}={value}", which cannot
-express a quoted value or a blank around the `=`, so a guard that matched
-nothing for those shapes still passed every test. `migrate_xff_trust` is
-therefore extracted verbatim and run against a throwaway .env, and what is
-asserted is the operator's stderr and the bytes left in their file.
-
-The expected answer is derived from what python-dotenv (the parser
-app/config.py reads .env with) and config._env_tristate make of the same line,
-so the script and the application cannot each hold their own idea of "forced
-true", in either direction.
+The guard is EXECUTED here, not read out of the source and handed to grep:
+candidates built as f"{FLAG}={value}" cannot express a quoted value or a blank
+around the `=`, so a guard that matched nothing for those shapes still passed
+every test. The expected answer is derived from python-dotenv -- the parser
+app/config.py reads .env with -- and config._env_tristate, so the script and the
+application cannot each hold their own idea of "forced true".
 """
 
 import json
@@ -43,9 +36,8 @@ NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node resolves ecosystem.config.js")
 
 
-# The environment `run_services` hands `pm2 start ecosystem.config.js`, at the
-# defaults this module's harness runs it with. The harness below drives the real
-# function, so these are the same values `run_services` exports.
+# The environment `run_services` hands `pm2 start ecosystem.config.js` at the
+# defaults this module's harness runs it with.
 _ECOSYSTEM_ENV = {
     "VCCIRCLE_ROOT": str(ECOSYSTEM_JS.parent),
     "API_PORT": "8001",
@@ -62,13 +54,10 @@ _ECOSYSTEM_ENV = {
 def _ecosystem_apps() -> list[dict]:
     """The pm2 apps `ecosystem.config.js` resolves to, as node computes them.
 
-    `run_services` starts pm2 from this file rather than from inline argv, so
-    what the running process gets is what the file resolves to once setup.sh's
-    exports are applied. Resolving it with node rather than reading the source
-    keeps these assertions about the EXECUTED definition: a `-H 127.0.0.1`
-    present in the text but lost in resolution would still leave the frontend
-    on the wildcard, and only executing the file catches that.
-    """
+    `run_services` starts pm2 from this file rather than from inline argv, so what
+    the running process gets is what the file resolves to once setup.sh's exports
+    are applied. Resolving it with node rather than reading the source keeps these
+    assertions about the EXECUTED definition."""
     proc = subprocess.run(
         [NODE, "-e", "console.log(JSON.stringify(require('./ecosystem.config.js').apps))"],
         cwd=str(ECOSYSTEM_JS.parent),
@@ -90,21 +79,17 @@ def _ecosystem_app(service: str) -> dict:
 
 # The key the migration repairs, and the value it appends when absent.
 FLAG = "AUTH_TRUST_X_FORWARDED_FOR"
-# The shell function that carries the whole repair. Named here so a rename in
-# setup.sh fails in one place with a message that says what broke.
+# The shell function that carries the whole repair, named so a rename in setup.sh
+# fails in one place.
 XFF_FUNCTION = "migrate_xff_trust"
 
 SHIPPED_DEFAULT = "auto"
 APPEND_LINE = f"{FLAG}={SHIPPED_DEFAULT}"
 
 # Every way an operator writes the key that python-dotenv resolves to the same
-# assignment. Each one reaches config._env_tristate as a forced True -- which
-# every test below proves against the parser rather than taking it on trust --
-# and each one has to warn. The bare form is the only SHAPE the pre-#388 guard
-# matched at all -- the truthy spellings and the case variants around it were
-# already covered, and were never the gap. Everything below it is a way of
-# writing the same assignment that the application reads as a forced True and
-# the guard did not, which is the forgeable posture with no signal anywhere.
+# assignment. Each reaches config._env_tristate as a forced True -- which every
+# test below proves against the parser rather than taking it on trust -- so each
+# has to warn.
 FORCED_TRUE_LINES = [
     f"{FLAG}=true",
     f'{FLAG}="true"',
@@ -126,11 +111,9 @@ FORCED_TRUE_LINES = [
 ]
 
 # Shapes that carry the key but not a forced true. Each has to stay silent: a
-# warning the operator cannot act on is a warning they learn to ignore. The
-# last four are the precision cases -- dotenv either refuses the line outright
-# or keeps the punctuation as part of the value, so none of them is a forced
-# True and a guard loose enough to match them is warning about a posture the
-# operator is not in.
+# warning the operator cannot act on is a warning they learn to ignore. The last
+# four are the precision cases -- dotenv either refuses the line outright or keeps
+# the punctuation as part of the value.
 KEY_PRESENT_SILENT_LINES = [
     f"{FLAG}=auto",
     f"{FLAG}=false",
@@ -147,11 +130,10 @@ KEY_PRESENT_SILENT_LINES = [
     f"{FLAG}=\"true'",  # mismatched quotes: a parse error, not a forced true
 ]
 
-# Lines with no assignment to our key at all. The key is absent here, which is
-# the one case setup.sh is allowed to write to: a .env that predates the per-IP
-# rate limits has no trust setting, and every proxied request then keys on the
-# nginx peer. A commented-out line is the operator's own off switch and must
-# read as absent, or commenting it out would do nothing.
+# Lines with no assignment to our key at all -- the one case setup.sh is allowed to
+# write to, since a .env that predates the per-IP rate limits has no trust setting
+# and every proxied request then keys on the nginx peer. A commented-out line is the
+# operator's own off switch and must read as absent.
 KEY_ABSENT_LINES = [
     f"# {FLAG}=true",
     f"  # {FLAG} = \"true\"",
@@ -161,10 +143,9 @@ KEY_ABSENT_LINES = [
 ]
 
 # Templates for the spelling sweep below. The value half of the guard is one
-# alternation and the assignment half is a separate pattern built in front of
-# it, so the sweep has to cross the two: three value forms (bare, double
-# quoted, single quoted) against a plain, a spaced, an exported and a
-# comment-tailed assignment.
+# alternation and the assignment half is a separate pattern built in front of it,
+# so the sweep has to cross the two: three value forms against a plain, a spaced,
+# an exported and a comment-tailed assignment.
 LINE_TEMPLATES = [
     "{key}={value}",
     '{key}="{value}"',
@@ -178,10 +159,9 @@ LINE_TEMPLATES = [
 def _xff_function() -> str:
     """setup.sh's `migrate_xff_trust`, verbatim, or a loud failure.
 
-    These tests run the function rather than a copy of its regex, so a rename,
-    a move or a deletion has to be answered here rather than leaving a test
-    that greps a pattern nothing calls.
- """
+    These tests run the function rather than a copy of its regex, so a rename, a
+    move or a deletion is answered here rather than leaving a test that greps a
+    pattern nothing calls."""
     source = SETUP_SH.read_text()
     assert f"{XFF_FUNCTION}() {{" in source, (
         f"setup.sh no longer defines {XFF_FUNCTION}(), so the forced-true "
@@ -252,8 +232,7 @@ def run_xff_guard(candidates, workers=8):
 
     Returns one ``(warned, untouched, line)`` per candidate, in order. A single
     bash process handles the whole batch so a sweep of the spelling space costs
-    one interpreter rather than thousands.
- """
+    one interpreter rather than thousands."""
     harness = (
         XFF_HARNESS.replace("@FUNCTION@", _xff_function()).replace("@WORKERS@", str(workers))
     )
@@ -280,12 +259,11 @@ def _config_reads_as_forced_true(line: str) -> bool:
     """What app.config makes of this .env LINE, through the parser it uses.
 
     The line is written to a real file and read back with python-dotenv -- the
-    parser `load_dotenv()` uses, and the thing that strips the quotes, the
-    `export` prefix and the blanks around the `=` before any value reaches
-    `_env_tristate`. Asking about a LINE rather than about a value is the whole
-    point: a value cannot be spelled two ways, and a test that only ever builds
-    `f"{FLAG}={value}"` cannot see a shape the guard is missing.
- """
+    parser `load_dotenv()` uses, and the thing that strips the quotes, the `export`
+    prefix and the blanks around the `=` before any value reaches `_env_tristate`.
+    Asking about a LINE rather than about a value is the whole point: a value cannot
+    be spelled two ways, and a test that only ever builds `f"{FLAG}={value}"` cannot
+    see a shape the guard is missing."""
     with tempfile.TemporaryDirectory() as tmp:
         env_file = Path(tmp) / ".env"
         env_file.write_text(line + "\n", encoding="utf-8")
@@ -303,12 +281,11 @@ def _config_reads_as_forced_true(line: str) -> bool:
 
 @pytest.mark.parametrize("line", FORCED_TRUE_LINES)
 def test_every_forced_true_line_shape_warns(line):
-    """A forced True in any shape is the #245 posture, so all of them warn.
+    """A forced True in any shape is the forgeable posture, so all of them warn.
 
-    The value half of this was covered before #388 and `KEY=1` / `KEY=yes` were
-    the fix; the shape half was not, and `KEY="true"` reached the application
-    as a forced True while the guard matched nothing at all.
- """
+    The value half of this was covered first; the shape half was not, and
+    `KEY="true"` reached the application as a forced True while the guard matched
+    nothing at all."""
     (warned, untouched, _), = run_xff_guard([line])
     assert _config_reads_as_forced_true(line), (
         f"{line!r} is not a forced true to the app, so it is not this test's case"
@@ -318,14 +295,13 @@ def test_every_forced_true_line_shape_warns(line):
 
 
 def test_the_quoted_and_spaced_lines_of_issue_388_warn():
-    """The three rows of the issue's table, end to end.
+    """The quoted and spaced spellings end to end.
 
-    `AUTH_TRUST_X_FORWARDED_FOR="true"` and `AUTH_TRUST_X_FORWARDED_FOR = true`
-    are read as a forced True by the application and matched by nothing in the
-    script, which is a warning that fires only for the spelling nobody bothers
-    to write. Asserted as a unit because these two rows are the reported
-    defect; the parametrized test above carries the rest of the shapes.
- """
+    `AUTH_TRUST_X_FORWARDED_FOR="true"` and `AUTH_TRUST_X_FORWARDED_FOR = true` are
+    read as a forced True by the application and matched by nothing in the script,
+    which is a warning that fires only for the spelling nobody bothers to write.
+    Asserted as a unit because these two are the reported defect; the parametrized
+    test above carries the rest of the shapes."""
     lines = [f"{FLAG}=true", f'{FLAG}="true"', f"{FLAG} = true"]
     results = run_xff_guard(lines)
     assert [warned for warned, _, _ in results] == [True, True, True], results
@@ -337,13 +313,11 @@ def test_the_quoted_and_spaced_lines_of_issue_388_warn():
 
 @pytest.mark.parametrize("line", KEY_PRESENT_SILENT_LINES)
 def test_a_value_that_is_not_a_forced_true_stays_silent(line):
-    """`auto`, a falsy spelling and a typo are not the forgeable posture.
+    """`auto`, a falsy spelling and a typo are not the forgeable posture, and a
+    warning the operator cannot act on trains them to skip the one that matters.
 
-    A warning the operator cannot act on trains them to skip the one that
-    matters, and the last four here are the precision cases: python-dotenv
-    either refuses the line or keeps the punctuation as part of the value, so a
-    guard that matched them would be warning about a posture nobody is in.
- """
+    The last four here are the precision cases: python-dotenv either refuses the
+    line or keeps the punctuation as part of the value."""
     (warned, untouched, _), = run_xff_guard([line])
     assert not _config_reads_as_forced_true(line), (
         f"{line!r} IS a forced true to the app; move it to FORCED_TRUE_LINES"
@@ -358,14 +332,11 @@ def test_a_missing_key_is_appended_once_and_never_warned_about(line, tmp_path):
 
     A .env that predates the per-IP rate limits has no trust setting at all, so
     every proxied request keys on the nginx peer and the whole site shares one
-    rate-limit bucket; appending the shipped default is what closes that. Run
-    twice, because a presence check that keeps missing appends a second
-    `=auto` on every deploy, and python-dotenv resolves a repeated key to the
-    last one -- so the operator who later forces the value finds it reset with
-    no warning. A commented-out line and a longer key that starts the same way
-    both read as absent, and commenting the knob out is how an operator turns
-    it off, so it has to keep reading that way.
- """
+    rate-limit bucket; appending the shipped default is what closes that. Run twice,
+    because a presence check that keeps missing appends a second `=auto` on every
+    deploy and python-dotenv resolves a repeated key to the last one. A commented-out
+    line and a longer key that starts the same way both read as absent, and
+    commenting the knob out is how an operator turns it off."""
     env_file = tmp_path / ".env"
     env_file.write_text(line + "\n", encoding="utf-8", newline="\n")
     script = "\n".join(
@@ -396,20 +367,14 @@ def test_a_missing_key_is_appended_once_and_never_warned_about(line, tmp_path):
 def _candidate_spellings():
     """A generated token space, not a hand-written list of the known spellings.
 
-    The lists above pin the values anyone thought of. They cannot catch a
-    spelling nobody thought of, which is precisely how ``y`` reached the
-    parser's truthy set in a reverted change while every test here stayed
-    green: the guard would then stop warning about a value that forces
-    X-Forwarded-For to be trusted from any peer (#245), and the operator would
-    get that posture with no warning anywhere. This space is built to contain
-    whatever the parser is asked about, so the comparison is symmetric.
- """
+    The lists above pin the values anyone thought of and cannot catch one nobody
+    did, which is how ``y`` reached the parser's truthy set while every test here
+    stayed green: the guard would then stop warning about a value that forces
+    X-Forwarded-For to be trusted from any peer."""
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 -_."
     # Every one- and two-character token: that already contains every spelling
     # a person would write, plus all the near-misses worth a warning.
     space = {"".join(p) for n in (1, 2) for p in product(alphabet, repeat=n)}
-    # Three-character tokens over the letters the spellings are built from,
-    # to cover typos of a real spelling ("ture", "onn") as well.
     narrow = "tfynos01 -"
     space |= {"".join(p) for p in product(narrow, repeat=3)}
     # Shapes a fixed-width sweep cannot produce.
@@ -421,22 +386,16 @@ def _candidate_spellings():
 
 
 def test_guard_and_parser_agree_on_every_spelling_in_both_directions():
-    """setup.sh's guard must match precisely the values config reads as True.
+    """setup.sh's guard must match precisely the values config reads as True,
+    bidirectionally, because either drift is a defect in opposite directions:
 
-    Bidirectional, because either drift is a defect and in opposite directions:
+    * the parser is widened (a spelling becomes forced-True) and the guard is not,
+      so the operator is left trusting X-Forwarded-For from any peer with no warning;
+    * the guard is widened, so the operator is nagged about a posture they are not in.
 
-    * the parser is widened (a spelling becomes forced-True) and the guard is
-      not, so the operator is left trusting X-Forwarded-For from any peer with
-      no warning;
-    * the guard is widened, so the operator is nagged about a posture they are
-      not in, and a working setup.sh grows a warning nobody can act on.
-
-    Derived from ``_env_tristate`` reading a line through python-dotenv -- the
-    same two steps app/config.py performs -- rather than from the literals at
-    the top of this file, so neither the script nor the application can hold
-    its own idea of "forced true", and crossed with the line shapes above so
-    the answer is a statement about .env files rather than about values.
- """
+    Derived from ``_env_tristate`` reading a line through python-dotenv -- the same
+    two steps app/config.py performs -- rather than from the literals at the top of
+    this file, so neither side can hold its own idea of "forced true"."""
     candidates = [
         template.format(key=FLAG, value=value)
         for template in LINE_TEMPLATES
@@ -461,13 +420,10 @@ def test_guard_and_parser_agree_on_every_spelling_in_both_directions():
 def test_the_parser_and_the_guard_share_one_spelling_set():
     """The application must not be the only side with a list of its own.
 
-    ``_env_bool`` and ``_env_tristate`` read the same ``_TRUE_SPELLINGS``, and
-    setup.sh's guard is a third copy of it in a language that cannot import the
-    first two -- it runs before the venv is guaranteed to exist. That is a real
-    coupling, so it is pinned here rather than left to a comment in the shell:
-    every spelling the module calls true has to be one the guard warns about,
-    in every shape a forced true can be written.
- """
+    setup.sh's guard is a third copy of ``_TRUE_SPELLINGS`` in a language that
+    cannot import the first two -- it runs before the venv is guaranteed to exist.
+    That is a real coupling, so it is pinned here rather than left to a comment in
+    the shell."""
     assert not _TRUE_SPELLINGS & _FALSE_SPELLINGS
     candidates = [
         template.format(key=FLAG, value=spelling)
@@ -481,12 +437,9 @@ def test_the_parser_and_the_guard_share_one_spelling_set():
 def test_run_backend_still_calls_the_migration():
     """A guard nothing calls prints nothing.
 
-    The rest of this section executes `migrate_xff_trust` directly, which says
-    nothing about whether the backend stage reaches it, so the call site is
-    checked here. The value is passed on, not read from a global, because a
-    function that reaches into `$ENV_FILE` cannot be run against a throwaway
-    file at all.
- """
+    The rest of this section executes `migrate_xff_trust` directly, so the call
+    site is checked here. The value is passed on, not read from a global, because a
+    function that reaches into `$ENV_FILE` cannot be run against a throwaway file."""
     source = SETUP_SH.read_text()
     body = re.search(
         r"^run_backend\(\) \{\n(?P<body>.*?)\n\}", source, re.MULTILINE | re.DOTALL
@@ -502,20 +455,18 @@ def test_run_backend_still_calls_the_migration():
 def test_the_nginx_vhost_refuses_the_uncached_probe():
     """`location /ready` is a PREFIX match, so without an explicit block a public
     GET /ready/deep is proxied to the API and is held dark only by the app's
-    host-local check. /ready/deep is uncached and unrated by design, so a
-    public dependency-probe amplifier deserves a second layer that does not live
-    in the same file as the code it protects."""
+    host-local check. /ready/deep is uncached and unrated by design, so a public
+    dependency-probe amplifier deserves a second layer."""
     source = SETUP_SH.read_text()
 
     assert "location /ready/deep { return 404; }" in source
 
 
 def test_the_cron_entry_probes_the_port_the_api_is_actually_bound_to():
-    """API_PORT is a documented override (usage() lists it), and run_services
-    binds pm2 to 127.0.0.1:$API_PORT. The watchdog's own default is 8001, so a
-    cron entry that does not pass BASE leaves it probing a closed port on any
-    other port -- and a watchdog that cannot reach the backend restarts it every
-    five minutes, which is the outage it exists to prevent."""
+    """API_PORT is a documented override and run_services binds pm2 to
+    127.0.0.1:$API_PORT, while the watchdog's own default is 8001. A cron entry that
+    omits BASE leaves it probing a closed port on any other port, and a watchdog
+    that cannot reach the backend restarts it every five minutes."""
     source = SETUP_SH.read_text()
     cron_lines = [line for line in source.splitlines() if "deploy/healthcheck.sh" in line]
 
@@ -526,27 +477,21 @@ def test_the_cron_entry_probes_the_port_the_api_is_actually_bound_to():
 
 
 def test_the_nginx_vhost_heredoc_contains_no_backticks():
-    """The vhost is written through an UNQUOTED heredoc, so a backtick anywhere
-    in it is a command substitution: setup.sh prints "command not found" to the
-    operator and writes the mangled result into the deployed vhost. The fix is
-    plain text in the comment -- quoting the heredoc delimiter is not available,
-    since $API_PORT and the \\$remote_addr escapes depend on the unquoted form."""
+    """The vhost is written through an UNQUOTED heredoc, so a backtick anywhere in
+    it is a command substitution and setup.sh writes the mangled result into the
+    deployed vhost. Quoting the heredoc delimiter is not available, since $API_PORT
+    and the \\$remote_addr escapes depend on the unquoted form."""
     body = SETUP_SH.read_text().split("<<NGINX\n", 1)[1].split("\nNGINX\n", 1)[0]
 
     assert "`" not in body, "a backtick in the unquoted NGINX heredoc is executed"
 
 
-# --- the deploy gate must wait on readiness, and must not destroy the deploy
-# --- to find out (#279) ---------------------------------------------------
+# --- the deploy gate must wait on readiness, and must not destroy the deploy ---
 #
-# `run_services` is EXECUTED here rather than grepped. Asserting the source
-# contains a URL is the vacuous-test class this project keeps policing: it
-# passes just as well with the gate moved in front of the teardown, which is
-# precisely the regression a reviewer found -- a gate that can now legitimately
-# fail, placed after `pm2 delete` of both services under `set -e`, turned a
-# misconfigured key into a destroyed deployment with the frontend never coming
-# back. The functions are extracted verbatim from setup.sh, so this cannot drift
-# from the script it is policing.
+# `run_services` is EXECUTED here rather than grepped: asserting the source contains
+# a URL is the vacuous-test class this project keeps policing -- it passes just as
+# well with the gate moved in front of the teardown. The functions are extracted
+# verbatim from setup.sh, so this cannot drift from the script it is policing.
 
 CURL_STUB = """\
 #!/usr/bin/env bash
@@ -600,8 +545,7 @@ READY_REPORT_BODY = (
 
 
 def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200, report=READY_REPORT_BODY):
-    """Run the real run_services against stub pm2/curl. Returns (rc, pm2_log,
-    stdout+stderr)."""
+    """Run the real run_services against stub pm2/curl. Returns (rc, pm2_log, stdout+stderr)."""
     home = tmp_path / "host"
     (home / "backend").mkdir(parents=True)
     (home / "frontend").mkdir(parents=True)
@@ -630,10 +574,9 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
             "sleep() { :; }",  # wait_http's 1s backoff would cost 30s per run
             "stage() { :; }",
             "ensure_pm2() { :; }",
-            # run_services calls these, so they have to be here for the function
-            # under test to be the real one. MIN_UPTIME_MS above is the same
-            # reason: it is exported to `pm2 start`, and `set -u` turns a missing
-            # one into a subshell that never reaches pm2 at all.
+            # run_services calls these, so the function under test can be the real
+            # one. MIN_UPTIME_MS is the same reason: it is exported to `pm2 start`,
+            # and `set -u` turns a missing one into a subshell that never reaches pm2.
             _extract_function("env_value"),
             _extract_function("harden_permissions"),
             _extract_function("report_readiness_reason"),
@@ -663,12 +606,10 @@ def run_services(tmp_path, *, env_key=REAL_KEY, env_base="", ready_deep_code=200
 def _started(pm2_log, service):
     """Did this run register `service` with pm2?
 
-    `run_services` starts pm2 ONCE, from `ecosystem.config.js`, so the evidence
-    is both halves: the invocation pm2 actually received (recorded by the stub)
-    and the app that file defines under this name. Either half alone would pass
-    for the wrong reason -- a start of some other file, or a start of this one
-    that happens not to carry the service.
-    """
+    `run_services` starts pm2 ONCE, from `ecosystem.config.js`, so the evidence is
+    both halves: the invocation pm2 actually received (recorded by the stub) and the
+    app that file defines under this name. Either half alone would pass for the
+    wrong reason."""
     started = any(
         "start" in line and "ecosystem.config.js" in line
         for line in pm2_log.splitlines()
@@ -677,10 +618,9 @@ def _started(pm2_log, service):
 
 
 def test_a_failing_readiness_gate_does_not_leave_the_frontend_stopped(tmp_path):
-    """The regression a review found: with the gate in front of the frontend
-    start, a not-ready deploy took the frontend down with it and `set -e`
-    aborted before bringing it back. Both services must be started, and the
-    dump saved, before anything is allowed to fail the deploy."""
+    """With the gate in front of the frontend start, a not-ready deploy took the
+    frontend down with it and `set -e` aborted before bringing it back. Both services
+    must be started, and the dump saved, before anything is allowed to fail."""
     proc, pm2_log = run_services(tmp_path, ready_deep_code=503)
 
     assert "RUN_SERVICES_RC=1" in proc.stdout
@@ -691,8 +631,6 @@ def test_a_failing_readiness_gate_does_not_leave_the_frontend_stopped(tmp_path):
 
 
 def test_the_gate_is_not_satisfied_by_the_liveness_stub(tmp_path):
-    """A backend that answers 200 on /health and 503 on readiness is exactly
-    the deployment this issue is about: it must not be declared done."""
     proc, pm2_log = run_services(tmp_path, ready_deep_code=503)
 
     assert "RUN_SERVICES_RC=1" in proc.stdout
@@ -710,16 +648,13 @@ def test_a_ready_deployment_still_succeeds(tmp_path):
 
 @needs_node
 def test_the_frontend_is_registered_with_a_loopback_bind(tmp_path):
-    """`run_services` must give the frontend a loopback bind, not just mention one (#318).
+    """`run_services` must give the frontend a loopback bind, not just mention one.
 
-    `run_services` starts pm2 from `ecosystem.config.js`, so the argv the
-    frontend actually runs is what that file RESOLVES to once setup.sh's
-    exports are applied -- and this resolves it with node rather than reading
-    the text. A `-H 127.0.0.1` present in the source but lost on the way to the
-    running process would still leave `next start` on the wildcard, and only
-    executing the definition catches that. `next start` binds every interface
-    when no hostname is passed, so the flag is the whole control.
-    """
+    `run_services` starts pm2 from `ecosystem.config.js`, so the argv the frontend
+    actually runs is what that file RESOLVES to once setup.sh's exports are applied
+    -- and this resolves it with node rather than reading the text. `next start`
+    binds every interface when no hostname is passed, so the flag is the whole
+    control."""
     proc, pm2_log = run_services(tmp_path, ready_deep_code=200)
 
     assert "RUN_SERVICES_RC=0" in proc.stdout, proc.stdout + proc.stderr
@@ -740,17 +675,13 @@ def test_the_frontend_is_registered_with_a_loopback_bind(tmp_path):
 
 
 def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
-    """setup.sh must not judge the key at all, so it cannot refuse a deploy the
-    app considers ready.
+    """setup.sh must not judge the key at all, so it cannot refuse a deploy the app
+    considers ready.
 
     GEMINI_BASE_URL is configurable, so a non-Google-shaped key is a supported
-    configuration. While this script had its own pre-flight, that was one of
-    the ways it could block a working deploy; the verdict now comes from the
-    app (app.config.classify_gemini_api_key, which applies its shape rule only
-    to Google's endpoint), and this pins that setup.sh stays out of it. The
-    mirror image is the parametrized test above, which fails if any shell-side
-    judgement of the key comes back.
-    """
+    configuration, and while this script had its own pre-flight that was one of the
+    ways it could block a working deploy. The verdict now comes from the app, and
+    this pins that setup.sh stays out of it."""
     # Assembled, not written out: a credential-shaped literal on a line naming a
     # key is what a secrets scanner reports (same reason as REAL_KEY above).
     home_key = "gateway-" + "token-0123" + "456789"
@@ -765,18 +696,11 @@ def test_a_gateway_deployment_with_a_non_google_key_is_not_blocked(tmp_path):
 
 
 # The drift guard: setup.sh must never hold a copy of the placeholder list.
-#
-# An earlier revision of this change added an `api_key_preflight` that re-implemented
-# app.config.classify_gemini_api_key in bash. It was a second classifier, and a
-# review proved it wrong: it carried 20 of the classifier's 28 sentinels, and the
-# eight it missed (plus the repeated-filler rule) are all reachable when
-# GEMINI_BASE_URL is a non-Google gateway -- a configuration this repo supports.
-# A host in that shape passed the pre-flight, lost both pm2 services to the
-# teardown, and only then learned from the gate that it was never ready.
-#
-# The pre-flight is gone. What is tested instead is the property that actually
-# matters, against every sentinel the app rejects INCLUDING any added later:
-# a not-ready deploy must never leave the frontend stopped.
+# A bash re-implementation of app.config.classify_gemini_api_key carried only 20
+# of the classifier's 28 sentinels, and the eight it missed are all reachable
+# when GEMINI_BASE_URL is a non-Google gateway. What is tested instead is the
+# property that matters, against every sentinel the app rejects INCLUDING any
+# added later: a not-ready deploy must never leave the frontend stopped.
 
 
 def _all_app_placeholders():
@@ -791,10 +715,9 @@ def _all_app_placeholders():
 @pytest.mark.parametrize("placeholder", _all_app_placeholders())
 def test_every_placeholder_the_app_rejects_still_deploys_both_services(tmp_path, placeholder):
     """Whatever the app makes of the key, the deploy is not left torn down: both
-    services are started and the dump is saved before the gate can fail. The
-    base URL is a non-Google gateway on purpose -- that is the path on which the
-    shell-side shape rule was skipped, and therefore the path where the old
-    pre-flight's gaps were reachable."""
+    services are started and the dump is saved before the gate can fail. The base
+    URL is a non-Google gateway on purpose -- that is the path on which the
+    shell-side shape rule was skipped."""
     proc, pm2_log = run_services(
         tmp_path,
         env_key=placeholder,
@@ -809,11 +732,10 @@ def test_every_placeholder_the_app_rejects_still_deploys_both_services(tmp_path,
 
 
 def test_a_failed_gate_names_the_key_fault_from_the_app_not_from_shell(tmp_path):
-    """The operator has to be told WHICH fault, and the only trustworthy source
-    is the app: report_readiness_reason prints the response body, which carries
+    """The operator has to be told WHICH fault, and the only trustworthy source is
+    the app: report_readiness_reason prints the response body, which carries
     checks.llm.reason. Its curl deliberately has no -f -- with -f the body is
-    suppressed on exactly the >=400 response this function only ever sees, and
-    the function becomes dead code."""
+    suppressed on exactly the >=400 response this function only ever sees."""
     proc, _pm2_log = run_services(tmp_path, env_key=PLACEHOLDER_KEY, ready_deep_code=503)
     output = proc.stdout + proc.stderr
 
@@ -823,9 +745,8 @@ def test_a_failed_gate_names_the_key_fault_from_the_app_not_from_shell(tmp_path)
 
 
 def test_a_failed_gate_says_so_even_when_the_probe_returns_no_body(tmp_path):
-    """A probe that cannot be reached at all must not print an empty report
-    silently; the operator is told the difference between 'not ready' and 'no
-    answer'."""
+    """A probe that cannot be reached at all must not print an empty report silently;
+    the operator is told the difference between 'not ready' and 'no answer'."""
     # A refused connection: curl fails and writes no body (the string matters,
     # 000 is curl's "no answer" code -- the int 0 would str() to "0").
     proc, _pm2_log = run_services(tmp_path, ready_deep_code="000", report="")
@@ -834,17 +755,14 @@ def test_a_failed_gate_says_so_even_when_the_probe_returns_no_body(tmp_path):
     assert "not ready after" in proc.stderr
 
 
-# --- run_cron must converge on one healthcheck entry (P1) --------------------
+# --- run_cron must converge on one healthcheck entry ------------------------
 #
-# `run_cron` reconciles the crontab by removing the lines it manages and
-# re-adding its own. When the managed healthcheck line's TEXT changed -- as it
-# did when BASE= was added -- a `grep -vFx` (whole-line) filter stops matching
-# the entry a previous revision wrote, so the stale copy survives every run. On
-# a host with a non-default API_PORT that stale copy carries no BASE=, falls
-# back to the watchdog's :8001 default, gets a refused connection and is read as
-# "not alive": `pm2 restart vccircle-backend` every five minutes against a
-# perfectly healthy backend. run_cron is EXECUTED here against a seeded crontab
-# and a stub `crontab`, so that is caught rather than reasoned about.
+# run_cron reconciles the crontab by removing the lines it manages and re-adding
+# its own. When the managed healthcheck line's TEXT changes, a `grep -vFx`
+# (whole-line) filter stops matching the entry a previous revision wrote, so the
+# stale copy survives every run: on a host with a non-default API_PORT it carries no
+# BASE=, falls back to the watchdog's :8001 default, is read as "not alive" and
+# restarts a perfectly healthy backend every five minutes.
 
 CRONTAB_STUB = """\
 #!/usr/bin/env bash
@@ -905,15 +823,15 @@ def run_cron(tmp_path, seeded_lines, api_port="9001", runs=1):
 
 
 def _previous_revision_entry(script_dir, log, api_port="9001"):
-    """The entry main's run_cron writes: same script, NO BASE=. This is the
-    literal that a whole-line filter can no longer match."""
+    """The entry run_cron writes with the same script but no BASE= -- the literal a
+    whole-line filter can no longer match."""
     return f'*/5 * * * * HEALTHCHECK_WEBHOOK_URL="" LOG={log} {script_dir}/deploy/healthcheck.sh'
 
 
 def test_run_cron_removes_the_entry_a_previous_revision_wrote(tmp_path):
-    """The P1: a stale entry that carries no BASE= would probe :8001 and restart
-    a healthy backend every five minutes. It must be gone, not merely joined by
-    a second copy."""
+    """A stale entry that carries no BASE= would probe :8001 and restart a healthy
+    backend every five minutes. It must be gone, not merely joined by a second
+    copy."""
     log = tmp_path / "healthcheck.log"
     script_dir = tmp_path / "host" / "app"
     proc, crontab = run_cron(
@@ -937,7 +855,6 @@ def test_run_cron_is_idempotent(tmp_path):
 
 
 def test_run_cron_removes_a_duplicate_healthcheck_entry(tmp_path):
-    """Two stale copies and a current one must all collapse to one."""
     log = tmp_path / "healthcheck.log"
     script_dir = tmp_path / "host" / "app"
     current = f'*/5 * * * * BASE="http://localhost:9001" HEALTHCHECK_WEBHOOK_URL="" LOG={log} {script_dir}/deploy/healthcheck.sh'
@@ -972,17 +889,13 @@ def test_run_cron_preserves_a_hand_edited_indexer_entry(tmp_path):
 
 
 def test_run_cron_reclaims_a_users_own_healthcheck_line_by_design(tmp_path):
-    """The accepted cost of filtering on the script path, pinned so it stays a
-    decision.
+    """The accepted cost of filtering on the script path, pinned so it stays a decision.
 
     A user who added their own healthcheck.sh entry on a custom schedule has it
     replaced by the managed one. That is deliberate: `./setup.sh cron` is an
-    explicit operator action and reclaims lines running a script it manages --
-    a stale entry from a previous revision is exactly what caused the P1, and a
-    MANAGED_BY env tag cannot fix that, because the stale entry predates the
-    tag and carries none. If this test ever needs to go, the filter has to change
-    with it, deliberately.
-    """
+    explicit operator action and reclaims lines running a script it manages -- a
+    stale entry from a previous revision is exactly what the convergence test above
+    covers."""
     log = tmp_path / "healthcheck.log"
     script_dir = tmp_path / "host" / "app"
     custom = f"0 * * * * LOG={log} {script_dir}/deploy/healthcheck.sh"
@@ -996,11 +909,9 @@ def test_run_cron_reclaims_a_users_own_healthcheck_line_by_design(tmp_path):
 
 
 def test_run_cron_keeps_a_commented_out_healthcheck_entry(tmp_path):
-    """Commenting the entry out is how an operator switches the watchdog off, so
-    that marker must survive. A plain substring `grep -vF` on the script path
-    deleted it, which would silently re-arm a watchdog the operator believes is
-    disabled -- and the documented contract said such lines were untouched.
-    """
+    """Commenting the entry out is how an operator switches the watchdog off, so that
+    marker must survive. A plain substring `grep -vF` on the script path deleted it,
+    which would silently re-arm a watchdog the operator believes is disabled."""
     script_dir = tmp_path / "host" / "app"
     disabled = f"# disabled for now: {script_dir}/deploy/healthcheck.sh"
     proc, crontab = run_cron(tmp_path, seeded_lines=[disabled], api_port="9001")

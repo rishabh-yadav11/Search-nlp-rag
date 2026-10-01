@@ -37,7 +37,7 @@ from app.user_profile import (
 
 logger = logging.getLogger(__name__)
 
-# Redis keys for cached recommendations
+# Cache TTLs for recommendation results.
 SIMILAR_ARTICLES_TTL_SECONDS = 3600  # 1 hour
 USER_RECOMMENDATIONS_TTL_SECONDS = 1800  # 30 minutes
 
@@ -62,19 +62,14 @@ def _candidate_pool(limit: int, *, over: int = 1) -> int:
     """How many candidates a strategy fetches to fill a page of ``limit``.
 
     The pool is wider than the page on purpose: the hybrid scorer keeps only the
-    best ``limit * 2`` candidates and ``_format_articles`` drops the excluded
-    ids and empty payloads, so a pool of exactly ``limit`` would return a short
-    page.
+    best ``limit * 2`` candidates and ``_format_articles`` drops the excluded ids
+    and empty payloads, so a pool of exactly ``limit`` would return a short page.
 
     ``over`` is the strategy's own over-fetch factor and
-    ``RECOMMEND_CANDIDATES_LIMIT`` is a floor on top of it, never a
-    replacement. That ordering matters at the cold-start scroll, which is called
-    with ``over=3`` because it returns ``limit * 2`` articles after dropping
-    already-seen ids: capping it at the knob would shrink it below the headroom
-    the largest permitted ``limit`` needs, and lowering the knob would make the
-    scroll fetch less than it did before this knob existed. A request asking for
-    more than the pool (the API caps ``limit`` at 20) still gets at least
-    ``limit`` candidates.
+    ``RECOMMEND_CANDIDATES_LIMIT`` is a floor on top of it, never a replacement:
+    capping the cold-start scroll (called with ``over=3`` because it returns
+    ``limit * 2`` articles after dropping already-seen ids) at the knob would
+    shrink it below the headroom the largest permitted ``limit`` needs.
     """
     return max(limit * over, config.RECOMMEND_CANDIDATES_LIMIT)
 
@@ -85,16 +80,11 @@ async def get_similar_articles(
     same_category: bool = False,
     exclude_ids: list[int | str] | None = None,
 ) -> list[dict]:
-    """Get articles similar to the given article using dense vector similarity.
+    """Articles similar to the given one, by dense vector similarity.
 
-    Args:
-        article_id: The article ID to find similar articles for
-        limit: Maximum number of similar articles to return
-        same_category: If True, filter to same industry/dealtype
-        exclude_ids: Articles to exclude from results
-
-    Returns:
-        List of article dicts with 'id', 'title', 'score', etc.
+    ``same_category`` filters to the source article's industry/dealtype;
+    ``exclude_ids`` are dropped from the result. Returns article dicts with
+    'id', 'title', 'score', etc.
     """
     if not config.ENABLE_RECOMMENDATIONS:
         return []
@@ -103,7 +93,7 @@ async def get_similar_articles(
         client = state["qdrant"]
         exclude_ids = exclude_ids or []
 
-        # Build filter to exclude the source article and any specified IDs
+        # Exclude the source article and any specified ids
         must_not = []
         if article_id:
             must_not.append(FieldCondition(key="id", match={"value": int(article_id)}))
@@ -113,10 +103,8 @@ async def get_similar_articles(
             except (ValueError, TypeError):
                 pass
 
-        # Optionally filter to same category
         qfilter = None
         if same_category:
-            # Fetch the source article's categories first
             source_result = await client.retrieve(
                 collection_name=config.QDRANT_COLLECTION,
                 point_id=int(article_id),
@@ -155,11 +143,10 @@ async def get_similar_articles(
             using="dense",  # Collection uses a named 'dense' vector
             query_filter=qfilter,
             # 3x, deliberately not _candidate_pool: there is no scoring or
-            # truncation step below, only _format_articles' exclusion of ids
-            # with no payload. The response is therefore the whole fetch minus
-            # those few rows, so the fetch width is the response width and
-            # widening it to the shared pool would change this endpoint's
-            # payload size rather than the quality of a selection.
+            # truncation step below, only _format_articles' exclusion of ids with
+            # no payload, so the fetch width IS the response width. Widening it to
+            # the shared pool would change this endpoint's payload size rather
+            # than the quality of a selection.
             limit=limit * 3,
             with_payload=_RECOMMEND_PAYLOAD_FIELDS,
             with_vectors=False,
@@ -177,24 +164,11 @@ async def get_personalized_recommendations(
     limit: int = config.RECOMMEND_DEFAULT_LIMIT,
     exclude_ids: list[int | str] | None = None,
 ) -> list[dict]:
-    """Get personalized recommendations for a user.
+    """Personalized recommendations for a user.
 
-    Uses:
-      1. User's interaction history to build preference profile
-      2. Dense vector similarity to find related articles
-      3. Category affinity matching
-      4. Recency boost for fresh content
-      5. Popularity signal from Redis
-
-    Falls back to latest top stories if no user history exists.
-
-    Args:
-        user_id: The user ID to get recommendations for
-        limit: Maximum number of recommendations
-        exclude_ids: Articles to exclude (e.g., already viewed)
-
-    Returns:
-        List of article dicts with scores and metadata
+    Blends dense vector similarity to recent interactions, category affinity, a
+    recency boost and a Redis-backed popularity signal, falling back to latest
+    top stories when the user has no history.
     """
     if not config.ENABLE_RECOMMENDATIONS:
         return []
@@ -203,29 +177,24 @@ async def get_personalized_recommendations(
         client = state["qdrant"]
         exclude_ids = exclude_ids or []
 
-        # Get user's interaction history
         interactions = await get_user_interactions(user_id)
         categories = await get_user_profile_categories(user_id)
 
         if not interactions:
-            # Cold start: return latest diverse articles
             logger.info("Cold start for user %s, returning latest articles", user_id)
             return await _get_latest_top_stories(limit, exclude_ids)
 
-        # Build filter to exclude already-interacted articles
         must_not = [FieldCondition(key="id", match=MatchAny(any=[int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and str(eid).isdigit()]))]
-        # Also exclude recently interacted articles
-        recent_article_ids = [aid for aid, _ in interactions[:10]]  # Last 10 interactions
+        # Also exclude recently interacted articles (last 10)
+        recent_article_ids = [aid for aid, _ in interactions[:10]]
         if recent_article_ids:
             must_not.append(FieldCondition(key="id", match=MatchAny(any=recent_article_ids)))
 
         qfilter = Filter(must_not=must_not) if must_not else None
 
-        # Get user's top categories
         top_categories = categories[:3] if categories else []
         category_filter = None
         if top_categories:
-            # Build a filter for top industries
             industry_conditions = []
             for cat, _ in top_categories:
                 if "industry" in cat.lower():
@@ -236,14 +205,11 @@ async def get_personalized_recommendations(
             if industry_conditions:
                 category_filter = Filter(must=industry_conditions)
 
-        # Fetch candidate articles using different strategies
         candidates: dict[int | str, dict] = {}
 
-        # 1. Vector similarity from recent interactions (semantic)
         async def _vector_candidates():
-            """Get candidates from vector similarity to recent interactions."""
             results = []
-            for article_id, _ in interactions[:5]:  # Use last 5 interactions
+            for article_id, _ in interactions[:5]:
                 try:
                     pts = await client.query_points(
                         collection_name=config.QDRANT_COLLECTION,
@@ -263,9 +229,7 @@ async def get_personalized_recommendations(
                     continue
             return results
 
-        # 2. Category-based candidates
         async def _category_candidates():
-            """Get candidates matching user's top categories."""
             if not category_filter:
                 return []
             try:
@@ -281,18 +245,15 @@ async def get_personalized_recommendations(
                 logger.warning("Error getting category candidates for user %s: %s", user_id, exc)
                 return []
 
-        # 3. Trending candidates
         async def _trending_candidates():
-            """Get trending articles."""
             try:
                 # Bare limit, deliberately not _candidate_pool:
                 # get_trending_articles caches the ranked list under a key that
                 # carries no limit and returns the cached depth verbatim, so the
                 # depth this leg gets is decided by whichever caller warmed that
-                # key, not by what was asked for. Widening it here would buy no
-                # reliable recall, and the scroll below fetches len(ids) * 5
-                # rows, so the extra ids multiply the Qdrant reads by
-                # pool/limit rather than by a constant.
+                # key. Widening it here would buy no reliable recall, and the
+                # scroll below fetches len(ids) * 5 rows, so the extra ids
+                # multiply the Qdrant reads by pool/limit rather than a constant.
                 trending = await get_trending_articles(limit)
                 if not trending:
                     return []
@@ -312,14 +273,12 @@ async def get_personalized_recommendations(
                 logger.warning("Error getting trending candidates for user %s: %s", user_id, exc)
                 return []
 
-        # Fetch all candidate sources in parallel
         vector_results, category_results, trending_results = await asyncio.gather(
             _vector_candidates(),
             _category_candidates(),
             _trending_candidates(),
         )
 
-        # Score and blend candidates
         now = datetime.now(UTC)
         for point in vector_results:
             pid = point.id
@@ -366,7 +325,6 @@ async def get_personalized_recommendations(
                 "trending_score": score,
             }
 
-        # Apply hybrid scoring
         scored = []
         for pid, data in candidates.items():
             final_score = (
@@ -383,7 +341,6 @@ async def get_personalized_recommendations(
                 "point_id": pid,
             })
 
-        # Sort by final score and return top results
         scored.sort(key=lambda x: x["final_score"], reverse=True)
         top_candidates = scored[:limit * 2]
 
@@ -401,15 +358,8 @@ async def get_trending_feed(
     limit: int = config.RECOMMEND_DEFAULT_LIMIT,
     exclude_ids: list[int | str] | None = None,
 ) -> list[dict]:
-    """Get trending/popular articles based on click velocity.
-
-    Args:
-        limit: Maximum number of articles
-        exclude_ids: Articles to exclude
-
-    Returns:
-        List of article dicts sorted by trending score
-    """
+    """Get trending/popular articles based on click velocity, as article dicts
+    sorted by trending score."""
     if not config.ENABLE_RECOMMENDATIONS:
         return []
 
@@ -418,12 +368,11 @@ async def get_trending_feed(
         exclude_ids = exclude_ids or []
 
         # 2x, deliberately not _candidate_pool: Redis returns the trending ids
-        # already ranked, and the feed returns result[:limit], so a pool wider
-        # than the page cannot change the response -- it would only retrieve
-        # more full payloads from Qdrant for candidates that get trimmed.
+        # already ranked, and the feed returns result[:limit], so a pool wider than
+        # the page cannot change the response -- it would only retrieve more full
+        # payloads from Qdrant for candidates that get trimmed.
         trending = await get_trending_articles(limit * 2)
         if not trending:
-            # Fallback to latest articles
             return await _get_latest_top_stories(limit, exclude_ids)
 
         # Fetch full article details from Qdrant by their point IDs.
@@ -467,19 +416,17 @@ async def _get_latest_top_stories(
     limit: int = config.RECOMMEND_DEFAULT_LIMIT,
     exclude_ids: list[int | str] | None = None,
 ) -> list[dict]:
-    """Internal: Get latest top stories with diversity."""
+    """Latest top stories with diversity (cold-start fallback)."""
     try:
         client = state["qdrant"]
         exclude_ids = exclude_ids or []
 
-        # Build filter
         qfilter = None
         if exclude_ids:
             qfilter = Filter(must_not=[
                 FieldCondition(key="id", match=MatchAny(any=[int(eid) for eid in exclude_ids if isinstance(eid, (int, str)) and str(eid).isdigit()]))
             ])
 
-        # Get recent articles (last 30 days)
         pts, _ = await client.scroll(
             collection_name=config.QDRANT_COLLECTION,
             limit=_candidate_pool(limit, over=3),
@@ -488,7 +435,6 @@ async def _get_latest_top_stories(
             scroll_filter=qfilter,
         )
 
-        # Sort by published date and take most recent
         now = datetime.now(UTC)
         scored = []
         for point in pts:
@@ -506,10 +452,7 @@ async def _get_latest_top_stories(
 
 
 def _calculate_recency_score(published_date: str, now: datetime) -> float:
-    """Calculate recency score for an article.
-
-    Returns a value between 0 and 1, where 1 is very recent and 0 is old.
-    """
+    """Recency score for an article, 0 (old) to 1 (very recent)."""
     if not published_date:
         return 0.5  # Default middle score for missing dates
 
@@ -566,7 +509,10 @@ state: dict = {}
 # Acquisition relation-direction reranking. When a query names a company in a
 # specific acquisition role (target vs buyer), results where that company plays
 # the WRONG role (e.g. X as the acquirer in a "who acquired X?" query) are
-# demoted and results where it plays the RIGHT role are promoted. This keeps
+# demoted by the DEMOTE multiplier and results where it plays the RIGHT role are
+# promoted by PROMOTE. The two weights are deliberately far apart and applied to
+# the existing score rather than to a fresh rank, so a role match reorders near
+# equals without letting a weak lexical match outrank a strong one. This keeps
 # "who acquired X?" from surfacing articles where X itself did the buying.
 
 
@@ -574,10 +520,9 @@ def _entity_acquisition_role(text: str, entity: str) -> bool | None:
     """Whether ``entity`` is the acquirer (True) or the acquired/target (False)
     in ``text``, or None when the text states no clear relation.
 
-    "X acquired Y" / "X bought Y" -> X is the acquirer (True). "Y acquired X" /
-    "X was acquired by Y" -> X is the target (False). Target (passive) forms are
-    tested first so the passive "X was acquired by Y" is not mistaken for an
-    active acquirer mention.
+    "X acquired Y" -> X is the acquirer; "Y acquired X" / "X was acquired by Y" ->
+    X is the target. Target (passive) forms are tested first so the passive
+    "X was acquired by Y" is not mistaken for an active acquirer mention.
     """
     e = re.escape(entity)
     if re.search(
@@ -609,9 +554,9 @@ def rerank_acquisition_relation(query: str, results: list, direction: str | None
 
     ``direction`` comes from ``query_intent.acquisition_relation``: ``'target'``
     means the query's company was acquired (so articles where it is the buyer are
-    demoted), ``'buyer'`` means it did the acquiring (so articles where it is the
-    target are demoted). Returns an unchanged copy when ``direction`` is None or
-    no entity can be identified. Inputs are never mutated.
+    demoted), ``'buyer'`` the reverse. Returns an unchanged copy when
+    ``direction`` is None or no entity can be identified. Inputs are never
+    mutated.
     """
     if not direction:
         return list(results)

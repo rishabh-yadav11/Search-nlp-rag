@@ -39,12 +39,11 @@ def diversify(
     are returned in original order. ``sim_thresh`` is a floor on pairwise
     similarity: pairs below it contribute 0 to the diversity penalty.
 
-    Candidates whose ``score`` is NaN are treated as ``-inf`` (dropped): they
-    never outrank a real score, and the selection continues to the remaining
-    valid candidates instead of silently truncating the list. If every
-    remaining candidate is NaN (or ``-inf``) the selection stops early, logs a
-    warning and returns a short list rather than raising: /search is a read
-    path, so one bad score must not fail the request.
+    A NaN ``score`` is treated as ``-inf`` (dropped): it never outranks a real
+    score, and selection continues to the remaining valid candidates instead of
+    silently truncating the list. If every remaining candidate is NaN or ``-inf``
+    the selection stops early, warns and returns a short list rather than
+    raising: /search is a read path, so one bad score must not fail the request.
     """
     if len(results) <= n:
         return list(results[:n])
@@ -57,23 +56,13 @@ def diversify(
             if s >= sim_thresh and s > best:
                 best = s
         return best
-    # Complexity, with m = len(results) and n the requested count: ``order`` is
-    # never mutated -- each round scans it once and skips indices already in
-    # ``chosen_set``. That removes the per-round O(m) ``list.remove``, i.e. an
-    # O(m*n) term across the n rounds, which is the pattern #193 flagged.
-    # It is not a measurable latency win: the number of ``max_sim``/Jaccard
-    # computations is identical to the mutating version, and every candidate
-    # visit still calls ``max_sim``, which is O(len(chosen_idx)) and therefore
-    # O(m*n^2) summed over the rounds -- that remains the dominant cost, with
-    # the removed list-mutation work only a lower-order term. So the change
-    # removes the flagged quadratic list-mutation pattern rather than buying a
-    # better asymptotic bound or a measured constant-factor speedup.
-    #
-    # Termination: every round either appends to ``chosen_idx`` (capped at n)
-    # or breaks below, so the loop cannot spin. No ``len(chosen_set) <
-    # len(order)`` guard is needed: the two collections grow in lockstep and
-    # the early return above guarantees n < len(order), so ``len(chosen_idx) <
-    # n`` already implies it.
+    # ``order`` is never mutated -- each round scans it once and skips indices
+    # already in ``chosen_set`` -- which is what keeps the per-round O(m)
+    # ``list.remove`` out. The dominant cost remains the O(len(chosen_idx))
+    # ``max_sim`` on every candidate visit.
+    # Termination: every round appends to ``chosen_idx`` (capped at n) or breaks,
+    # so the loop cannot spin, and no "chosen_set smaller than order" guard is
+    # needed: the early return above guarantees n < len(order).
     order = list(range(len(results)))
     chosen_idx: list[int] = []
     chosen_set: set[int] = set()
@@ -94,10 +83,9 @@ def diversify(
                 best_val = mmr
                 best_k = k
         if best_k < 0:
-            # Nothing beat -inf: every remaining score is NaN (treated as
-            # -inf) or -inf. Stop instead of re-picking the sentinel, and warn
-            # -- a short list reaches /search as missing results, so the cause
-            # has to be visible in the logs.
+            # Nothing beat -inf: every remaining score is NaN or -inf. Stop
+            # instead of re-picking the sentinel, and warn -- a short list reaches
+            # /search as missing results, so the cause must be visible in the logs.
             logger.warning(
                 "diversify: no candidate beat -inf after %d of %d picks; "
                 "remaining scores are NaN, returning %d results",

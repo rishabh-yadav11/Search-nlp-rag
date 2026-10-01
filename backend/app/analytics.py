@@ -29,8 +29,8 @@ logger = logging.getLogger("analytics")
 class AnalyticsUnavailableError(RuntimeError):
     """The analytics store could not be read.
 
-    Raised by :func:`summary` instead of returning an error-shaped payload, so
-    the HTTP layer can answer 503. Returning ``{"error": ...}`` as a 200 was
+    Raised by :func:`summary` instead of returning an error-shaped payload, so the
+    HTTP layer can answer 503: a 200 carrying ``{"error": ...}`` was
     indistinguishable from a report whose counters are legitimately all zero.
     """
 
@@ -53,11 +53,11 @@ TOP_CLICKED_QUERIES_N = 10
 _ZSUM_BATCH = 200
 
 # Prefix of the per-query click-signal sorted set (see ``_click_query_key``).
-# Named, not spelled inline at the one place it is built, because the ops report
-# in ``scripts/click_boost_report.py`` has to SCAN for these keys: a report
-# holding its own copy of the prefix would silently find nothing if the prefix
-# ever changed, and would report the click boost as inert -- the one answer
-# that must never be wrong.
+# Named, not spelled inline where it is built, because the ops report in
+# ``scripts/click_boost_report.py`` has to SCAN for these keys: a report holding
+# its own copy of the prefix would silently find nothing if the prefix changed
+# and would report the click boost as inert -- the one answer that must never be
+# wrong.
 CLICK_SIGNAL_KEY_PREFIX = "analytics:query_click:"
 
 # Shape of a query digest as stored in Redis and returned by ``summary()``.
@@ -69,12 +69,10 @@ QUERY_DIGEST_HEX_LEN = 32
 _DIGEST_RE = re.compile(r"^q1:[0-9a-f]{32}$")
 
 # How much extra to read from each top-query set before dropping non-digest
-# members (see ``_digest_rows``). Legacy verbatim rows are dropped on read, so
-# a window read of exactly N could be entirely legacy and report an empty list
-# on a deployment whose top queries have not changed at all. Bounded rather
-# than "read everything" because these sets can hold many distinct queries and
-# the response stays a top-N report; this is a safety margin for the upgrade
-# window, not an unbounded scan.
+# members (see ``_digest_rows``). Legacy verbatim rows are dropped on read, so a
+# window read of exactly N could be entirely legacy and report an empty list.
+# Bounded rather than "read everything" because these sets can hold many distinct
+# queries and the response stays a top-N report.
 LEGACY_ROW_OVERFETCH = 5
 
 # Where the auto-generated digest key is persisted. It lives in the analytics
@@ -83,23 +81,21 @@ LEGACY_ROW_OVERFETCH = 5
 QUERY_DIGEST_KEY_REDIS_KEY = "analytics:query_digest_key"
 
 # The secret mixed into every query digest. Digests must be KEYED, not a bare
-# hash: a short natural-language search query has a small enough dictionary
-# that an unkeyed digest of it is reversible offline by anyone who can read the
-# admin dashboard, which would leave this fix cosmetic. A hardcoded default
-# would be no better -- it is published in this repository, so every digest it
-# produces is reversible by anyone who can read the dashboard.
-#
-# So the key is random and lives in the analytics Redis (see ``_digest_key``).
-# It must be stable across the gunicorn workers and across restarts, or one
-# user's query hashes differently per worker and its counts split four ways.
+# hash: a short natural-language query has a small enough dictionary that an
+# unkeyed digest is reversible offline by anyone who can read the admin
+# dashboard, and a hardcoded default would be no better since it ships in this
+# repository. The key is random and lives in the analytics Redis (see
+# ``_digest_key``); it must be stable across the gunicorn workers and across
+# restarts, or one user's query hashes differently per worker and its counts
+# split four ways.
 _QUERY_DIGEST_KEY: str | None = None
 
 _redis = None
-# The digest-key warning is separate from the ``_latch`` outage latch on
-# purpose. A digest-key failure is NOT a Redis outage -- recording continues
-# without the query-keyed fields -- so it must not consume the outage latch,
-# or a transient key hiccup would silence the far more important "recording
-# paused" alert for a real outage later on. Its own message, its own flag.
+# The digest-key warning is separate from the ``_latch`` outage latch on purpose.
+# A digest-key failure is NOT a Redis outage -- recording continues without the
+# query-keyed fields -- so it must not consume the outage latch, or a transient
+# key hiccup would silence the far more important "recording paused" alert for a
+# real outage later on.
 _digest_warned = False
 # Set once the pre-upgrade verbatim members have been deleted from both
 # top-query sets, so the scrub runs once per process rather than per request.
@@ -110,14 +106,14 @@ _legacy_scrubbed = False
 async def _digest_key(c) -> str | None:
     """The secret mixed into every query digest, or None if it cannot be read.
 
-    ``ANALYTICS_QUERY_KEY`` wins when set (an operator can pin the digest
-    namespace across a Redis rebuild). Otherwise the key is generated once and
-    persisted in the analytics Redis, so it is shared by every worker and
-    survives a restart with no operator action and no public default.
+    ``ANALYTICS_QUERY_KEY`` wins when set, so an operator can pin the digest
+    namespace across a Redis rebuild. Otherwise the key is generated once and
+    persisted in the analytics Redis, shared by every worker and surviving a
+    restart with no operator action and no public default.
 
-    Returns None when the key cannot be resolved -- a Redis hiccup must cost
-    the query-keyed fields only, never the counters. Callers treat None as
-    "skip the top-query member this time"; a search still counts.
+    None means a Redis hiccup costs the query-keyed fields only, never the
+    counters: callers skip the top-query member this time and the search still
+    counts.
     """
     global _QUERY_DIGEST_KEY
     if _QUERY_DIGEST_KEY is not None:
@@ -153,27 +149,23 @@ async def _digest_key(c) -> str | None:
 def query_digest(query: str, key: str) -> str:
     """The opaque identifier a query is stored and reported under.
 
-    Search queries are user-authored content and are aggregated BY TEXT, so the
-    top-N lists were a systematically harvested corpus of what every user typed
-    -- and the admin dashboard was the only consumer. Storing a keyed digest
-    instead of the text is what actually closes it: the text never reaches
-    Redis, so no reader of these aggregates (this one, ``click_signals``, or a
-    future one) can hand it back. Redacting only in ``summary()`` would leave
-    the corpus in the store for the next reader to walk off with.
+    Search queries are user-authored content aggregated BY TEXT, so the top-N
+    lists would be a systematically harvested corpus of what every user typed,
+    readable from the store itself. A keyed digest closes that: the text never
+    reaches Redis, so no reader of these aggregates can hand it back. Redacting
+    only in ``summary()`` would leave the corpus in the store for the next
+    reader.
 
-    Truncated to 128 bits. Same-input stability is what makes the counts
-    aggregate and what lets ``click_signals`` find the signal for the query in
-    hand; the truncation keeps the stored member bounded without a length cap.
+    Truncated to 128 bits: same-input stability is what makes the counts
+    aggregate and lets ``click_signals`` find the signal for the query in hand,
+    while the truncation keeps the stored member bounded without a length cap.
 
     The input is canonicalised with ``_normalise_query`` first -- the SAME
-    canonical form the click-signal claim uses (#242). That is what keeps one
-    logical query a single key across spellings: hashing the raw text would
-    give ``"ola ipo"``, ``"OLA IPO"`` and ``"Ola   IPO"`` three different
-    digests, which strands the signal under keys the ranking path never looks
-    up and splits one query's counts three ways. Canonicalising here rather
-    than at each call site keeps the property in one place, and it also bounds
-    the hashed string (an unauthenticated beacon can send an arbitrarily long
-    query).
+    canonical form the click-signal claim uses. That is what keeps one logical
+    query a single key across spellings: hashing raw text would give
+    ``"ola ipo"``, ``"OLA IPO"`` and ``"Ola   IPO"`` three different digests,
+    stranding the signal under keys the ranking path never looks up and
+    splitting one query's counts three ways.
     """
     normalized = _normalise_query(query)
     mac = hmac.new(key.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256)
@@ -183,16 +175,14 @@ def query_digest(query: str, key: str) -> str:
 async def _scrub_legacy_members(c, key: str) -> int:
     """Delete pre-upgrade verbatim members from a top-query set. Returns the count.
 
-    Hiding them at the read boundary is not enough. The write path re-issues
-    EXPIRE on the whole key on every event, so a legacy member's TTL is
-    re-armed continuously: on any deployment still taking searches the verbatim
-    corpus this fix exists to remove would sit in the analytics Redis -- and in
-    its backups -- indefinitely. A read filter stops the HTTP leak but leaves
-    the store holding precisely what #348's point 4 asks about.
+    Hiding them at the read boundary is not enough: the write path re-issues
+    EXPIRE on the whole key on every event, so a legacy member's TTL is re-armed
+    continuously and the verbatim corpus would sit in the analytics Redis -- and
+    its backups -- indefinitely on any deployment still taking searches.
 
-    So the members are actually removed. Guarded to once per process per key
-    (``_legacy_scrubbed``) because after the first pass there is nothing left to
-    delete, and a fresh install never has anything to begin with.
+    Guarded to once per process per key (``_legacy_scrubbed``) because after the
+    first pass there is nothing left to delete, and a fresh install never has
+    anything to begin with.
     """
     try:
         rows = await c.zrange(key, 0, -1)
@@ -273,43 +263,36 @@ def _today() -> str:
 
 def _normalise_query(q: str) -> str:
     """Canonical form of a query for the click-signal dedupe claim: NFKC-normalised
-    with control characters removed and whitespace collapsed, then
-    length-bounded, then casefolded.
+    with control characters removed and whitespace collapsed, then length-bounded,
+    then casefolded.
 
     Applied to the claim input on the write path (``record_click``) so every
-    spelling of one logical query claims the same vote. It is no longer the
-    per-query click key -- that is a keyed digest (see ``_click_query_key``), so
-    no user text is stored under any spelling, and this form therefore needs no
-    read-path counterpart to stay retrievable.
+    spelling of one logical query claims the same vote. The per-query click KEY
+    is a keyed digest (see ``_click_query_key``), so no user text is stored under
+    any spelling and this form needs no read-path counterpart to stay
+    retrievable.
 
-    The NFKC/control-character pass is ``input_hygiene.normalize_text`` (issue
-    #252), the same canonical form the search cache keys use, so a full-width
-    or NUL-bearing spelling cannot open a second key and no NUL/CRLF from an
-    unauthenticated beacon can reach Redis at all. Casefolding stays on top of
-    it: for the boost signal "OLA" and "ola" are the same question, which is
-    the one place the two issues differ on purpose (#242's dedupe vs #252's
-    canonicalisation). The bound is applied before the casefold, so a fold
-    that expands ("ss" from a sharp s) can leave the result a character or two
-    over ``CLICK_QUERY_MAX_LEN``; the claim input is a message, not a key, and
-    key bounding is handled separately by ``_click_query_key``.
+    The NFKC/control-character pass is ``input_hygiene.normalize_text``, the same
+    canonical form the search cache keys use, so a full-width or NUL-bearing
+    spelling cannot open a second key and no NUL/CRLF from an unauthenticated
+    beacon can reach Redis at all. Casefolding stays on top: for the boost signal
+    "OLA" and "ola" are the same question. The bound is applied before the
+    casefold, so a fold that expands ("ss" from a sharp s) can leave the result a
+    character or two over ``CLICK_QUERY_MAX_LEN``; the claim input is a message,
+    not a key, and key bounding is handled by ``_click_query_key``.
     """
     return normalize_text(q or "")[: config.CLICK_QUERY_MAX_LEN].casefold()
 
 
 def _click_query_key(q: str, digest_key: str) -> str:
-    # Normalize identically on the read and write paths so a stored key is
-    # always retrievable; ``query_digest`` is that shared normalization.
+    # Normalize identically on the read and write paths so a stored key is always
+    # retrievable; ``query_digest`` is that shared normalization. Both call sites
+    # hand this function the RAW query and let it normalize internally, so read
+    # and write cannot drift into two different orders of bounding the input.
     #
-    # This key used to embed the query VERBATIM, which put the same corpus into
-    # the Redis keyspace the top-query sets held, and made the per-query click
-    # signal a second place to read user text out of. A digest keeps the key
-    # retrievable -- ``click_signals`` hashes the query in hand the same way --
-    # without the text ever being a key, and without needing a length cap to
-    # bound key size, since a digest is fixed-width.
-    #
-    # Both call sites hand this function the RAW query and let it normalize
-    # internally, so read and write cannot drift into two different orders of
-    # bounding the input.
+    # A digest keeps the key retrievable -- ``click_signals`` hashes the query in
+    # hand the same way -- without the query text ever being a key and without a
+    # length cap, since a digest is fixed-width.
     return f"{CLICK_SIGNAL_KEY_PREFIX}{query_digest(q, digest_key)}"
 
 
@@ -319,17 +302,16 @@ async def _claim_click_signal(client_ip: str | None, query: str, article_id: int
 
     True the first time within the dedupe window, False for every repeat. The
     beacon is anonymous, so the only thing separating a real click from a forged
-    one is where it came from. Counting every beacon verbatim lets a single host
+    one is where it came from: counting every beacon verbatim lets a single host
     cross ``CLICK_BOOST_MIN_ARTICLE_CLICKS`` in a handful of requests and boost
     an article of its choosing, poisoning the ranking every other user sees. One
-    click per client per (query, article) keeps the signal meaningful --
-    re-opening the same result carries no new ranking information -- while
+    click per client per (query, article) keeps the signal meaningful while
     requiring genuinely distinct clients to reach the threshold.
 
-    The claim key is a digest, so no query text or client IP is recoverable
-    from it, and it carries a TTL so the dedupe set cannot grow unbounded. Fails
-    CLOSED on a Redis error: a dropped click only slows the learning signal
-    down, whereas a skipped claim re-opens the forging hole.
+    The claim key is a digest, so no query text or client IP is recoverable from
+    it, and it carries a TTL so the dedupe set cannot grow unbounded. Fails
+    CLOSED on a Redis error: a dropped click only slows the learning signal down,
+    whereas a skipped claim re-opens the forging hole.
     """
     window = config.CLICK_SIGNAL_DEDUPE_WINDOW_SECONDS
     if window <= 0 or not client_ip:
@@ -371,11 +353,10 @@ async def record_search(
     """Count one /search event and its outcome. Never raises."""
     try:
         c = _client()
-        # Counters first and unconditionally: they are the part of the report
-        # that has no user-authored text in it, so a digest-key failure (below)
-        # must cost only the top-query member, never the volume/latency/cache
-        # numbers. Resolved before the pipeline is built, so the member is
-        # hashed from the same text on every path.
+        # Counters first and unconditionally: they are the part of the report with
+        # no user-authored text in it, so a digest-key failure (below) must cost
+        # only the top-query member. Resolved before the pipeline is built, so the
+        # member is hashed from the same text on every path.
         digest_key = await _digest_key(c)
         p = c.pipeline()
         p.incr("analytics:search:total")
@@ -384,13 +365,10 @@ async def record_search(
         p.incr("analytics:search:latency:count")
         p.incr("analytics:search:cached" if cached else "analytics:search:uncached")
         if digest_key is not None:
-            # The member is a digest, not the query. This is the write-side half
-            # of #348: the verbatim text never enters the store, so there is
-            # nothing for any reader to leak.
+            # The member is a digest, so the verbatim text never enters the store.
             p.zincrby("analytics:top_queries", 1, query_digest(query, digest_key))
             # Expire the aggregate so an idle deployment's top_queries key (and
-            # its unbounded distinct-member set) cannot accumulate forever;
-            # refreshed on every search, mirroring the click beacon's TTL.
+            # its unbounded distinct-member set) cannot accumulate forever.
             p.expire("analytics:top_queries", config.CLICK_QUERY_TTL_SECONDS)
         if filtered:
             p.incr("analytics:search:filtered")
@@ -421,13 +399,12 @@ async def record_click(
     as a sorted set of {article_id: count}) so the click-boost layer can learn
     which results users actually open for a query.
 
-    ``client_ip`` is the resolved client address. It gates only the ranking
-    signal (one click per client per query/article per window, see
-    ``_claim_click_signal``); the raw click counters and position buckets are
-    recorded either way, so the admin-facing analytics are unaffected by the
-    dedupe. ``article_id`` is expected to have been checked against the
-    collection by the caller -- recording an id that is not in the index would
-    mint a boost record nothing can ever match.
+    ``client_ip`` gates only the ranking signal (one click per client per
+    query/article per window, see ``_claim_click_signal``); the raw click
+    counters and position buckets are recorded either way, so the admin-facing
+    analytics are unaffected by the dedupe. ``article_id`` is expected to have
+    been checked against the collection by the caller -- recording an id that is
+    not in the index would mint a boost record nothing can ever match.
     """
     claim_key = None
     try:
@@ -438,29 +415,23 @@ async def record_click(
         # one logical query claims the same vote. It must NOT be passed to
         # ``_click_query_key``: that applies ``query_digest`` itself, and
         # normalizing twice is not a no-op -- the length bound can land on a space,
-        # which a second pass strips, so the two results differ. The read path
-        # (``click_signals``) hands a raw query to ``_click_query_key``, so the
-        # write path does too: both keys then come from the same call on the same
-        # input, structurally, rather than from an invariant to be maintained.
-        # (Bounding the raw query first, as this did before, is what made the two
-        # orders disagree for any over-length query containing a whitespace run --
-        # the vote landed on a key the ranking path never reads.)
+        # which a second pass strips. The read path (``click_signals``) hands a
+        # raw query to ``_click_query_key``, so the write path does too: both keys
+        # then come from the same call on the same input, structurally.
         raw_query = query or ""
         canonical = _normalise_query(raw_query)
-        # KNOWN LIMITATION (pre-existing, #242): /search boosts on the
-        # typo-corrected query (apply_click_boost(q_fixed, ...)), while the beacon
-        # posts the raw one. With no vocab artifact built, fix_query is a
-        # documented no-op and the two agree; an operator who HAS built the
-        # vocab will see typo'd traffic's votes stranded under the raw key. Not
-        # fixed here: it is signal loss, not write amplification, and routing the
-        # beacon through fix_query would put a query-correction dependency (and
-        # its failure modes) in the analytics write path, where a raise costs the
-        # whole click.
+        # KNOWN LIMITATION: /search boosts on the typo-corrected query
+        # (apply_click_boost(q_fixed, ...)), while the beacon posts the raw one.
+        # With no vocab artifact built, fix_query is a documented no-op and the
+        # two agree; an operator who HAS built the vocab will see typo'd traffic's
+        # votes stranded under the raw key. Left alone: it is signal loss, not
+        # write amplification, and routing the beacon through fix_query would put
+        # a query-correction dependency in the analytics write path, where a raise
+        # costs the whole click.
         # The aggregate members are NOT written from any of these forms: they
         # carry a keyed digest, so neither the casing nor the text reaches Redis.
-
-        # As in record_search: counters are unconditional, the query-keyed
-        # fields are skipped if the digest key cannot be resolved.
+        # As in record_search: counters are unconditional, the query-keyed fields
+        # are skipped if the digest key cannot be resolved.
         digest_key = await _digest_key(c)
         # Clamp position into the valid display range so a poisoned beacon cannot
         # create arbitrary ``analytics:click:pos:{n}`` keys. Position 0 or
@@ -484,9 +455,8 @@ async def record_click(
         p.incr(f"analytics:click:pos:{pos}")
         if digest_key is not None:
             p.zincrby("analytics:click_top_queries", 1, query_digest(raw_query, digest_key))
-            # Expire the aggregate set too, so distinct-member growth from the
-            # unauthenticated beacon doesn't accumulate forever; refreshed on
-            # each click.
+            # Expire the aggregate set so distinct-member growth from the
+            # unauthenticated beacon cannot accumulate forever.
             p.expire("analytics:click_top_queries", config.CLICK_QUERY_TTL_SECONDS)
             if q_article_id is not None:
                 # The per-query set is keyed by the same digest as the top-query
@@ -495,8 +465,7 @@ async def record_click(
                 claimed, claim_key = await _claim_click_signal(client_ip, canonical, q_article_id)
                 if claimed:
                     p.zincrby(qkey, 1, str(q_article_id))
-                    # Expire the per-query set so distinct-query sets don't accumulate
-                    # forever; refreshed on each click.
+                    # Expire the per-query set for the same reason.
                     p.expire(qkey, config.CLICK_QUERY_TTL_SECONDS)
         await p.execute()
         claim_key = None  # the vote landed, so the claim is now genuinely spent
@@ -523,11 +492,9 @@ async def click_signals(query: str) -> dict | None:
             return None
         key = _click_query_key(query, digest_key)
         # "total clicks" and the per-article breakdown are built from ALL members
-        # of the sorted set, paginated in batches. Using only a top-50 window
-        # would undercount once a query has more than 50 clicked articles and
-        # break the invariant ``sum(by_id.values()) == total`` that the click-boost
-        # layer relies on. Paginate the full set so the reported total and
-        # breakdown stay consistent.
+        # of the sorted set, paginated in batches: a top-50 window would undercount
+        # once a query has more than 50 clicked articles and break the invariant
+        # ``sum(by_id.values()) == total`` that the click-boost layer relies on.
         total = 0
         by_id: dict[int, int] = {}
         offset = 0
@@ -592,27 +559,20 @@ def _pct(part: int, total: int) -> float:
 def _digest_rows(rows, limit: int) -> list:
     """Top-`limit` digest rows from an over-fetched window, newest score first.
 
-    The write path stores digests, so in steady state every member passes and
-    this is a pure format check. It exists for the members recorded BEFORE this
-    change, which are verbatim queries, and is the read-side half of the fix:
-    without it the leak would survive the deploy entirely and this would only
-    be true for a fresh install. Such a member is dropped rather than returned,
-    because the only alternative is handing back the very text being removed.
+    The write path stores digests, so in steady state every member passes and this
+    is a pure format check. It exists for verbatim-query members recorded before
+    the write path switched to digests, and drops them rather than returning
+    them, because the only alternative is handing back the very text being
+    removed.
 
-    Note this WITHHOLDS, it does not REMOVE. The write path re-arms the whole
-    key's TTL on every event, so a legacy member never lapses on a live
-    deployment; ``_scrub_legacy_once`` is what actually deletes them. This
-    filter is what makes the response correct in the meantime, and what still
-    holds if the scrub could not run.
-
-    Dropping is honest about the count too: a legacy row's score is real, but
-    it is only reportable as "some query", which carries no information a
-    dashboard can use.
+    This WITHHOLDS, it does not REMOVE: the write path re-arms the whole key's
+    TTL on every event, so a legacy member never lapses on a live deployment.
+    ``_scrub_legacy_once`` is what actually deletes them; this filter is what
+    makes the response correct in the meantime.
 
     The caller over-fetches (``LEGACY_ROW_OVERFETCH``) precisely because this
     drops rows: reading only N members and filtering afterwards would let a
-    cluster of legacy rows eat the whole window and report an artificially
-    short list on a deployment whose top queries have not changed at all.
+    cluster of legacy rows eat the whole window.
     """
     kept = [[m, _i(s)] for m, s in rows if _is_digest(m)]
     return kept[:limit]
@@ -624,8 +584,7 @@ async def summary() -> dict:
     The two top-N lists carry an opaque per-query DIGEST, never the query text:
     search queries are user-authored content aggregated by text, so returning
     them made this a cross-user read of everyone's search history. See
-    :func:`query_digest` for why the text is kept out of the store entirely
-    rather than only out of this response.
+    :func:`query_digest` for why the text is kept out of the store entirely.
 
     Raises :class:`AnalyticsUnavailableError` if the analytics Redis cannot be
     read; callers must surface that as a failed request rather than as data.
@@ -658,14 +617,11 @@ async def summary() -> dict:
 
         # Delete any pre-upgrade verbatim members before reading the window, so
         # the corpus is gone from the store and not merely withheld from this
-        # response -- a read filter alone would leave it in Redis and its
-        # backups, since the write path re-arms the whole key's TTL on every
-        # event. Best-effort; the filter below still applies either way.
+        # response. Best-effort; the filter below still applies either way.
         await _scrub_legacy_once(c)
         # Read a wider window than we report, because ``_digest_rows`` drops
-        # pre-upgrade verbatim members: reading exactly N would let a run of
-        # legacy rows swallow the whole window and under-report. zrevrange's
-        # end index is INCLUSIVE, hence the -1.
+        # pre-upgrade verbatim members. zrevrange's end index is INCLUSIVE, hence
+        # the -1.
         top_queries = await c.zrevrange(
             "analytics:top_queries",
             0,

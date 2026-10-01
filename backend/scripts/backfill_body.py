@@ -1,22 +1,11 @@
-"""In-place backfill: store the article body (truncated to BODY_CHAR_LIMIT) in
-Qdrant payloads and recompute the sparse (BM25) vector from that text, for
-points whose stored body differs from the freshly fetched, consistently
-truncated one.
+"""In-place backfill: store the body (truncated to BODY_CHAR_LIMIT) in Qdrant
+payloads and recompute the sparse (BM25) vector from that text, for points whose
+stored body differs from the freshly fetched one.
 
-Reads all MySQL rows, truncates each body to BODY_CHAR_LIMIT (the same cap every
-index path uses), scrolls Qdrant for the currently stored body, and for every
-point whose stored body differs from the freshly fetched one, sets the new body
-payload and updates the sparse vector. Dense vectors are untouched (the dense
-embedder ignores body by design), so this is a lightweight in-place update — no
-collection rebuild, no re-embedding of unchanged articles.
-
-Idempotent: rerunning after a completed run finds nothing to change. After it
-completes, run 'python scripts/update_index.py --init' to re-seed the delta
-fingerprints (they include body), so future incremental runs don't flag these
-rows as changed.
-
-Usage:
-    python scripts/backfill_body.py
+Dense vectors are untouched (the dense embedder ignores body by design), so this
+needs no collection rebuild. Idempotent: after it completes, run
+``python scripts/update_index.py --init`` to re-seed the delta fingerprints
+(which include body) so the next incremental run does not flag these rows.
 """
 import asyncio
 import os
@@ -36,8 +25,7 @@ from update_index import EXTERNAL_URL_SQL, record_from_row
 from app.config import config
 from app.index_text import compose_sparse_text
 
-# How many Qdrant points to scroll / MySQL rows to fetch per page. Bounding this
-# keeps the working set in memory small even on huge collections/tables.
+# Bounded pages keep the working set small even on huge collections/tables.
 PAGE_SIZE = 500
 VECTOR_BATCH = 100
 
@@ -45,9 +33,8 @@ VECTOR_BATCH = 100
 async def fetch_records_by_ids(pool, ids: list[int]) -> dict[int, dict]:
     """Published rows for the given ids, mapped to the canonical record.
 
-    Only the requested slice of the table is queried (chunked by the caller via
-    repeated PAGE_SIZE-sized id lists), so the whole table is never materialized
-    in memory at once.
+    Only the requested slice is queried (chunked by the caller), so the whole
+    table is never materialized at once.
     """
     if not ids:
         return {}
@@ -90,9 +77,8 @@ def main():
     async def run():
         pool = await make_pool()
         try:
-            # Page through Qdrant (bounded memory) and resolve each page's MySQL
-            # rows on demand, so neither the collection nor the table is ever
-            # loaded whole.
+            # Page through Qdrant and resolve each page's MySQL rows on demand,
+            # so neither the collection nor the table is loaded whole.
             next_offset = None
             total = 0
             updated = 0
@@ -111,11 +97,9 @@ def main():
                         p.id: (p.payload or {}).get("body") or "" for p in pts
                     }
                     records = await fetch_records_by_ids(pool, ids)
-                    # Only update points that already exist in Qdrant (this is an
-                    # in-place backfill). Rows whose id is absent from Qdrant are
-                    # out of scope here (they get seeded by the normal index
-                    # path), so excluding them prevents a massive unintended
-                    # backfill when Qdrant is empty or partially built.
+                    # In-place backfill: only points that already exist in Qdrant.
+                    # Rows absent from Qdrant are seeded by the normal index path,
+                    # and including them would trigger a massive unintended backfill.
                     affected = [
                         i
                         for i in ids
@@ -145,8 +129,8 @@ def main():
                                 points=vector_points,
                                 wait=True,
                             )
-                            # One bulk payload upload for the whole chunk (no
-                            # per-point wait=True round-trips).
+                            # One bulk payload upload for the whole chunk, rather
+                            # than a per-point wait=True round-trip.
                             client.upload_payload(
                                 collection_name=config.QDRANT_COLLECTION,
                                 payload=(

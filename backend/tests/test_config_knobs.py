@@ -2,24 +2,21 @@
 
 A setting that nothing reads is a false promise to whoever deploys this app:
 it is defined in config.py, it is listed in .env.example, an operator sets it,
-and no behaviour moves. Issue #263 shipped two such knobs -- a profile-decay
-lambda that was never wired to the hardcoded 30-day decay, and a candidate-pool
-limit the recommender never consulted.
+and no behaviour moves. This module makes that class of defect fail the suite.
 
-So this module makes the class of defect fail the suite instead. A knob counts
-as read when it is accessed as ``config.NAME`` / ``Config.NAME``, or when its
-name appears as a string literal, which is how the rate-limit knobs are
-resolved (``public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN")`` reads the
-attribute name out of a string and passes it to ``getattr``).
+A knob counts as read when it is accessed as ``config.NAME`` / ``Config.NAME``,
+or when its name appears as a string literal, which is how the rate-limit knobs
+are resolved (``public_rate_limit("click", "PUBLIC_CLICK_RATE_PER_MIN")`` reads
+the attribute name out of a string and passes it to ``getattr``).
 
 To keep a knob that is deliberately inert, add it to INTENTIONALLY_INERT with a
 reason. The reason is required: an allowlist entry with no explanation is just
 the bug again, one level up.
 
-What it does NOT check, deliberately: a knob's *value* (a getenv whose name
-drifted from the attribute, or a hardcoded literal replacing it, is invisible
-here) and the effect a knob has. Proving "changing this changes behaviour" is
-the job of a behavioural test beside the code that reads the knob.
+Deliberately NOT checked: a knob's *value* (a getenv whose name drifted from the
+attribute, or a hardcoded literal replacing it) and the effect a knob has.
+Proving "changing this changes behaviour" is the job of a behavioural test
+beside the code that reads the knob.
 """
 import ast
 import re
@@ -31,8 +28,7 @@ THIS_FILE = Path(__file__).resolve()
 
 _SKIP_DIRS = {"venv", ".git", "node_modules", "__pycache__", "build", "dist", "data"}
 
-# Config knobs that nothing reads on purpose. Keep the list empty if you can:
-# every entry here is an operator-visible setting with no effect.
+# Config knobs that nothing reads on purpose; keep this list empty if you can.
 INTENTIONALLY_INERT: dict[str, str] = {
     "RERANK_ONNX_DIR": (
         "Inert on purpose: the ONNX reranker backend was removed, so the exported "
@@ -65,13 +61,11 @@ def _config_knobs() -> dict[str, int]:
 def _source_files() -> list[Path]:
     """Every shipped runtime file: the app package and the CLI scripts.
 
-    Deliberately NOT ``BACKEND.rglob("*.py")``. A test is not a reader: a knob
-    that only a test mentions is still inert in production, and including tests/
-    would let ``patch.object(config, "SOME_KNOB", ...)`` in a test vouch for a
-    knob the app ignores -- exactly the failure this guard exists to catch.
-    config.py itself is excluded because every knob appears in its own
-    ``os.getenv`` call, and this test because its allowlist spells knob names
-    out in plain text.
+    Deliberately NOT ``BACKEND.rglob("*.py")``: a test is not a reader, so
+    including tests/ would let ``patch.object(config, "SOME_KNOB", ...)`` vouch
+    for a knob the app ignores. config.py itself is excluded because every knob
+    appears in its own ``os.getenv`` call, and this test because its allowlist
+    spells knob names out in plain text.
     """
     files = [
         path
@@ -95,12 +89,11 @@ def _is_referenced(knob: str, corpus: str) -> bool:
     # caller was handed the knob name as a literal.
     #
     # Deliberately loose: any standalone string literal counts, not only one
-    # passed to getattr/public_rate_limit. Narrowing it to those two call shapes
-    # would make the guard fail the moment the rate-limit helpers change how
-    # they receive the attribute name, and a false positive on a real knob is
-    # worse than the narrow false negative this leaves open (a knob name quoted
-    # only in a log message). The knobs that rely on this rule today are
-    # PUBLIC_SEARCH/FACETS/CLICK_RATE_PER_MIN, all resolved by
+    # passed to getattr/public_rate_limit. Narrowing it would make the guard fail
+    # the moment the rate-limit helpers change how they receive the attribute
+    # name, and a false positive on a real knob is worse than the narrow false
+    # negative this leaves open. The knobs relying on this rule today are
+    # PUBLIC_SEARCH/FACETS/CLICK_RATE_PER_MIN, resolved by
     # int(getattr(config, limit_attr)) in app/auth.py.
     return bool(re.search(rf"""(['"]){re.escape(knob)}\1""", corpus))
 
@@ -123,11 +116,9 @@ def test_every_config_knob_is_read_somewhere():
 def test_inert_allowlist_is_still_accurate():
     """An allowlist entry must name a real, genuinely unread knob, with a reason.
 
-    Three ways an entry goes stale, all of them hiding a live knob from the
-    guard: deleting the knob leaves the entry behind, wiring the knob later
-    leaves the entry behind, and an entry with no reason is just the bug again.
-    An entry therefore has to PROVE it is inert, not merely claim to be -- a
-    wired knob parked here would otherwise silence this test forever.
+    Three ways an entry goes stale, all hiding a live knob from the guard:
+    deleting the knob, wiring it later, and an entry with no reason. An entry
+    therefore has to PROVE it is inert, not merely claim to be.
     """
     knobs = _config_knobs()
     missing = sorted(set(INTENTIONALLY_INERT) - set(knobs))
@@ -147,9 +138,8 @@ def test_inert_allowlist_is_still_accurate():
 def test_scan_actually_sees_knob_references():
     """Guard on the guard: a corpus that found nothing would pass vacuously.
 
-    A scanner that silently stopped matching (renamed module, typo in the
-    pattern, backend moved) would make the test above pass with every knob
-    unreadable.
+    A scanner that silently stopped matching would make the test above pass
+    with every knob unreadable.
     """
     corpus = "\n".join(path.read_text() for path in _source_files())
     known_reader = "RECOMMEND_DEFAULT_LIMIT"
@@ -165,17 +155,11 @@ def test_ranking_tuning_knobs_agree_with_the_shipped_env_template(parse_config):
     """A knob the template quotes at a value the code does not default to is a
     promise to the operator that does not hold on a fresh deploy: copying
     .env.example sets the knob to something other than the shipped default,
-    silently. Same convention as the cost-budget default in
-    test_cost_budget.py.
-
-    The five knobs below are the ones issue #300 moved out of module scope;
-    the module-level recency weights and the weak-result threshold had no
-    template entry at all before, so there was nothing to disagree with.
+    silently.
     """
     shipped = parse_config()
-    # Exact `NAME=value` assignments, compared as whole entries: a substring
-    # match would accept WEAK_RESULT_SCORE=0.35 as the shipped 0.3, which is
-    # the decimal drift this is here to catch.
+    # Exact `NAME=value` entries, compared whole: a substring match would accept
+    # WEAK_RESULT_SCORE=0.35 as the shipped 0.3, the drift this is here to catch.
     template = {}
     for line in (BACKEND / ".env.example").read_text().splitlines():
         stripped = line.strip()

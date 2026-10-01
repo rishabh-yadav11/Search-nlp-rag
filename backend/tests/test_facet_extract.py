@@ -89,7 +89,6 @@ def test_extract_industry_none() -> None:
 
 
 def test_extract_content_type() -> None:
-    # Content-type modifiers resolve to a real `content_type` facet value.
     assert main.extract_content_type("interviews with Narayana Murthy") == "Interview"
     assert main.extract_content_type("founders of Curefit") == "Founder"
     assert main.extract_content_type("competitors of Zomato") == "Competitor"
@@ -158,14 +157,13 @@ def test_facet_load_failure_names_the_exception(monkeypatch, caplog) -> None:
 
 
 def test_extract_content_type_none_when_no_match() -> None:
-    # Queries without a content-type modifier degrade to None (current behavior).
     assert main.extract_content_type("top funding deals 2025") is None
     assert main.extract_content_type("latest news") is None
 
 
 def test_extract_content_type_unknown_facet_degrades() -> None:
-    # When the corpus has no matching `content_type` facet, resolution degrades
-    # to None rather than emitting a bogus value.
+    # With no matching `content_type` facet in the corpus, resolution degrades to
+    # None rather than emitting a bogus value.
     main._CONTENT_TYPE_FACETS.clear()
     main._CONTENT_TYPE_FACETS.update({"article": "Article", "interview": "Interview"})
     assert main.extract_content_type("interviews with X") == "Interview"
@@ -174,7 +172,6 @@ def test_extract_content_type_unknown_facet_degrades() -> None:
 
 
 def test_build_facet_filter_content_type() -> None:
-    # A content_type facet value becomes a Qdrant `content_type` filter condition.
     f = main.build_facet_filter(None, None, None, None, None, "Interview")
     assert f is not None
     assert [c.key for c in f.must] == ["content_type"]

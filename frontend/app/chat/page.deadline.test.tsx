@@ -1,11 +1,7 @@
 /**
- * Issue #287 — chat's JSON `api()` helper had no signal at all, so a hung
- * session-list or session-create call left `send()`'s first-turn await pending
- * forever: the typing indicator never went away, the composer stayed blocked by
- * `sendingRef`, and the user got no error and no way to retry.
- *
- * The stub below hangs only the non-SSE endpoints; the SSE stream keeps its
- * existing 45 s watchdog and is out of scope here.
+ * A hung non-SSE `api()` call left `send()`'s first-turn await pending forever: the typing indicator
+ * never cleared and the composer stayed blocked by `sendingRef`, with no error and no way to retry.
+ * The stub below hangs only the non-SSE endpoints; the SSE stream keeps its own 45 s watchdog.
  */
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -14,12 +10,10 @@ import { clearMeCache } from '../lib/auth'
 import ChatPage from './page'
 
 /**
- * Every fetch the page issues, with the signal it was given. The page's mount
- * now opens with a `/api/auth/me` identity check — the cookie is httpOnly, so
- * that request is the only way to tell a signed-in visitor from a signed-out
- * one — which means the calls can no longer be told apart by position. They
- * are selected by endpoint instead, so a call added at the front cannot make a
- * test quietly re-test its neighbour.
+ * Every fetch the page issues, with its signal. Calls are selected by endpoint rather than position,
+ * because the mount-time `/api/auth/me` identity check (the cookie is httpOnly, so it is the only way
+ * to tell a signed-in visitor from a signed-out one) means a call added at the front could otherwise
+ * make a test quietly re-test its neighbour.
  */
 let calls: { url: string; method: string; signal: AbortSignal | null }[] = []
 
@@ -46,7 +40,6 @@ function jsonResponse(data: unknown): StubResponse {
   return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) }
 }
 
-/** Every chat API call hangs until its signal aborts. */
 function hangingApi() {
   return vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const signal = init?.signal ?? null
@@ -67,11 +60,9 @@ beforeEach(() => {
   vi.useFakeTimers()
   calls = []
   Element.prototype.scrollTo = function scrollTo() {}
-  // `getMe` memoises the session in module state for 60s and only
-  // `clearMeCache()` resets it, and vitest shares one module registry across
-  // every test in this file. An earlier test whose stub answers
-  // `/api/auth/me` would otherwise satisfy the later ones from cache, so the
-  // per-test stub below would never be reached.
+  // `getMe` memoises the session in module state for 60s and only `clearMeCache()` resets it, while
+  // vitest shares one module registry across this file: without this an earlier test's
+  // `/api/auth/me` answer would satisfy the later ones from cache.
   clearMeCache()
   vi.stubGlobal('fetch', hangingApi())
 })
@@ -100,8 +91,6 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
   it('aborts the hung session create and reports the failure instead of spinning', async () => {
     await submitFirstTurn('what happened to the deal?')
 
-    // The mount-time session LIST and the session CREATE both go to
-    // /api/chat/sessions; only the method tells them apart.
     const createCall = callTo('/api/chat/sessions', 'POST')
     expect(createCall.signal).toBeTruthy()
     expect(createCall.signal?.aborted).toBe(false)
@@ -109,8 +98,7 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
     await advance(CHAT_API_DEADLINE_MS)
 
     expect(createCall.signal?.aborted).toBe(true)
-    // The caller's generic copy is replaced by the deadline's own message, so a
-    // timeout is distinguishable from any other failure the user can retry.
+    // The deadline's own message replaces the generic one, so a timeout is distinguishable.
     expect(screen.getByRole('alert').textContent).toMatch(/timed out after 30s/)
   })
 
@@ -134,7 +122,6 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
   })
 
   it('reports a failed delete instead of leaking an unhandled rejection', async () => {
-    // The session list resolves so a row exists to delete; the DELETE hangs.
     const deleteSignals: (AbortSignal | null)[] = []
     vi.stubGlobal(
       'fetch',
@@ -169,8 +156,7 @@ describe('ChatPage — api() calls are deadline-bounded', () => {
     expect(deleteSignals).toHaveLength(1)
     await advance(CHAT_API_DEADLINE_MS)
 
-    // The delete handler has no rethrow of its own, so this must land in the
-    // UI. An uncaught rejection here would fail the run instead.
+    // The delete handler has no rethrow of its own, so this must land in the UI.
     expect(screen.getByRole('alert').textContent).toMatch(/timed out after 30s/)
   })
 })
@@ -192,9 +178,8 @@ describe('ChatPage — the logout beacon is bounded too', () => {
           })
           return promise
         }
-        // The sign-out control now lives in the shared top bar, which renders
-        // it only once the page's own identity check has answered. Hanging this
-        // one would leave nothing to click, so sign the visitor in.
+        // The sign-out control lives in the shared top bar and renders only once the identity check
+        // answers; hanging that would leave nothing to click.
         if (String(input).includes('/api/auth/me')) {
           return Promise.resolve(
             jsonResponse({ id: 'u1', email: 'user@example.com', name: 'User', role: 'user', is_active: true })

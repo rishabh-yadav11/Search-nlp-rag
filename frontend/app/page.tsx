@@ -60,11 +60,7 @@ const SUGGESTIONS = [
 
 const TIMEOUT_MS = 30_000
 
-// A 422 is FastAPI's validation response, which says WHICH field failed and
-// why. Keying the message on the status alone made every 422 claim the search
-// was too long, so a `?top_k=abc` told the user to shorten a query that was
-// never the problem. Only the length case gets the length message; any other
-// validation failure gets an honest generic one.
+// A 422 is FastAPI's validation response and says WHICH field failed, so key on that: only the length case gets the length message, any other failure an honest generic one.
 function friendlyMessage(status: number, detail?: string): string {
   switch (status) {
     case 400:
@@ -82,14 +78,9 @@ function friendlyMessage(status: number, detail?: string): string {
   }
 }
 
-// Mirrors the backend's SEARCH_QUERY_MAX_CHARS DEFAULT, and is used in two
-// places: the input's maxLength below, and the number in the 422 message. The
-// PREDICATE keys on neither -- it reads the backend's own 422 body ("String
-// should have at most 512 characters" on a loc naming `q`), so the frontend
-// cannot silently disagree with the server about WHICH failure happened even
-// if the limit is retuned. The displayed number is display-only: it goes stale
-// if an operator raises the server bound, which is why maxLength stays a
-// courtesy and the server bound stays authoritative.
+// Mirrors the backend's SEARCH_QUERY_MAX_CHARS DEFAULT, used for the input's
+// maxLength and the 422 message. Display-only: the length check itself reads the
+// backend's own 422 body, so the server bound stays authoritative.
 const SEARCH_QUERY_MAX_CHARS = 512
 
 function isQueryTooLong(detail?: string): boolean {
@@ -291,10 +282,6 @@ export default function Page() {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            // Mirrors the API's SEARCH_QUERY_MAX_CHARS so an over-long paste is
-            // cut off in the browser instead of coming back as a 422 the user
-            // would only see as "Something went wrong". The server bound stays
-            // authoritative — this is a courtesy, not the control.
             maxLength={SEARCH_QUERY_MAX_CHARS}
             placeholder="e.g. fintech startups that raised Series A"
             aria-label="Search query"
@@ -388,12 +375,7 @@ export default function Page() {
                   ))}
                 </datalist>
                 <label className="filter-field">
-                  {/* The label carries the truncation note because the tag
-                      vocabulary runs to tens of thousands of values and /facets
-                      ships only the 200 most-used: without it the datalist reads
-                      as the complete list. It rides on the label rather than a
-                      second line, which would break the grid's bottom-aligned
-                      inputs. */}
+                  {/* /facets ships only the 200 most-used tags, so the label itself carries the truncation note. */}
                   <span className="filter-label">tag &middot; top 200 by use</span>
                   <input
                     type="text"

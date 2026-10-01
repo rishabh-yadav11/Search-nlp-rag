@@ -8,8 +8,7 @@ because both of its call sites happened to pre-filter empty sets.
 These tests pin the guard, the ratio, that every caller reaches one function
 object, and that the AST contains exactly one such definition. The stopword
 lists are intentionally NOT unified here -- see `app/lexical.py` -- so
-`test_eval_runner_prompt_grouping_is_unchanged` stands in as the tripwire for
-the one that feeds a reported metric.
+`test_eval_runner_prompt_grouping_is_unchanged` stands in as the tripwire.
 """
 
 import ast
@@ -41,21 +40,15 @@ def test_jaccard_is_one_function_across_callers():
     """Every caller must resolve the *same* function object.
 
     What this pins: the call sites in ``app/diversity.py`` and
-    ``scripts/eval_runner.py`` all reach the guarded implementation, so a
-    future edit cannot move one of them onto a different definition without
-    failing here.
+    ``scripts/eval_runner.py`` all reach the guarded implementation.
 
-    On its own this is not enough, and it is worth recording why. Mutation
-    testing showed this assertion alone stays green for two regressions: a
-    module defining a *private* ``_jaccard`` the ``jaccard`` name never points
-    at, and the ratio re-inlined in ``_pairwise_source_jaccard`` (that
-    function's ``if a or b`` pair filter makes the both-empty case
-    unreachable, so the inlined ratio and the guarded ``jaccard`` return the
-    same number for every input that can actually reach the mean). Both are
-    caught instead by the AST invariants
-    ``test_exactly_one_jaccard_definition_and_it_keeps_the_guard`` and
-    ``test_no_inlined_jaccard_ratio_outside_the_shared_helper``, which was
-    verified by re-running both mutations and confirming they go red.
+    On its own this is not enough. Mutation testing showed it stays green for
+    two regressions: a module defining a *private* ``_jaccard`` the ``jaccard``
+    name never points at, and the ratio re-inlined in
+    ``_pairwise_source_jaccard`` (its ``if a or b`` pair filter makes the
+    both-empty case unreachable, so the inlined ratio and the guarded
+    ``jaccard`` agree on every input that can reach the mean). Both are caught
+    instead by the AST invariants below.
     """
     from app import diversity
     from scripts import eval_runner
@@ -114,13 +107,11 @@ def _function_defs(wanted):
 def test_exactly_one_jaccard_definition_and_it_keeps_the_guard():
     """Structural invariant: one `jaccard` body, and it owns the empty-set guard.
 
-    Behavioural tests cannot enforce this. Mutation testing showed that
-    re-inlining the ratio in `_pairwise_source_jaccard`, or adding a private
-    `_jaccard` that the module's `jaccard` name never points at, leaves every
-    behavioural test green -- the first because the `if a or b` pair filter
-    makes the both-empty case unreachable, the second because an unused copy
-    is invisible at runtime. The divergence this issue is about is a
-    *duplication*, so it has to be asserted on the syntax tree.
+    Behavioural tests cannot enforce this. Re-inlining the ratio in
+    `_pairwise_source_jaccard`, or adding a private `_jaccard` the module's
+    `jaccard` name never points at, leaves every behavioural test green. The
+    divergence being guarded is a *duplication*, so it has to be asserted on
+    the syntax tree.
     """
     defs = _function_defs({"jaccard", "_jaccard"})
     assert [name for name, _ in defs] == ["app/lexical.py"], f"expected one jaccard definition, found {defs}"
@@ -183,13 +174,11 @@ def test_eval_runner_prompt_grouping_is_unchanged(left, right):
     """These pairs must stay in separate groups.
 
     Tripwire for the eval runner's stopword list, which was deliberately left
-    un-unified. Widening that list raises Jaccard (it rises monotonically as
-    tokens are dropped), which merges these pairs and changes the reported
-    cross-variation consistency number even though nothing about the answers
-    or citations changed. Each of these pairs sits just under
-    SIMILARITY_THRESHOLD and flips to at-or-above it once "so"/"not"/"no" join
-    the stopword set, so asserting the grouping outcome -- not the token count
-    -- is what actually catches the drift.
+    un-unified. Widening that list raises Jaccard, which merges these pairs and
+    changes the reported cross-variation consistency number even though nothing
+    about the answers or citations changed. Each pair sits just under
+    SIMILARITY_THRESHOLD and flips once "so"/"not"/"no" join the stopword set,
+    so asserting the grouping outcome is what catches the drift.
     """
     from scripts import eval_runner
 

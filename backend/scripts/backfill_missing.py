@@ -1,17 +1,11 @@
 """Backfill: bring Qdrant in sync with the DB by adding missing points.
 
-When the collection silently loses points (e.g. 60k vs 67k rows), the
-incremental sync's reconcile warns but does not re-add them (they are not
-"new" relative to its state). This script scrolls all Qdrant point ids, diffs
-against the published DB rows, and embeds + upserts only the missing articles
-(a surgical fix — no full rebuild, so the ~30-60 min reindex is avoided).
+When the collection silently loses points, the incremental sync's reconcile warns
+but does not re-add them (they are not "new" relative to its state). This scrolls
+all Qdrant point ids, diffs against the published DB rows, and embeds + upserts
+only the missing articles -- a surgical fix with no full rebuild.
 
-Run from `backend/` with the venv python (needs MySQL + Qdrant reachable):
-
-    ./venv/bin/python scripts/backfill_missing.py
-
-Safe to re-run: idempotent (only upserts ids absent from Qdrant). Does not
-remove extra points; run `update_index.py --init` + reconcile to inspect extras.
+Idempotent (only upserts ids absent from Qdrant). Does not remove extra points.
 """
 import asyncio
 import os

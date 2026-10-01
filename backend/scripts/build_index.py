@@ -1,25 +1,12 @@
-"""
-Reads data/articles.jsonl, embeds in batches (dense + BM25 sparse for hybrid
-search), and upserts into Qdrant. Checkpoints progress so a crash/interrupt
-can resume without re-embedding everything.
+"""Embed ``data/articles.jsonl`` (dense + BM25 sparse) and upsert into Qdrant.
 
-Dense encoding and upserting are pipelined across thread pool workers
-(INDEXER_WORKERS) so encode of a later batch overlaps upsert of an earlier one.
+Checkpoints progress so an interrupted run resumes without re-embedding, and
+pipelines encode against upsert across thread pool workers (``INDEXER_WORKERS``).
 
-Durability & backups:
-  * Upserts are acknowledged (wait=True) and the checkpoint is advanced only
-    after a successful upsert, so a partially-written batch is re-processed
-    from the last saved checkpoint on the next run.
-  * Before the collection is deleted/recreated (incompatible schema), a
-    best-effort snapshot backup is taken via qdrant_backup.make_backup();
-    a backup failure only logs a WARNING and does not abort the build.
-  * A versioned build collection + alias switch was deliberately NOT
-    implemented: the backup-first approach above is simpler, carries no risk of
-    breaking a live collection/alias, and update_index.py keeps operating on
-    config.QDRANT_COLLECTION as-is.
-
-Usage:
-    python scripts/build_index.py
+Durability: upserts are acknowledged (``wait=True``) and the checkpoint advances
+only after a successful upsert, so a partially-written batch is re-processed.
+Before an incompatible-schema recreate a best-effort snapshot backup is taken;
+a backup failure logs a WARNING rather than aborting the build.
 """
 import json
 import os
@@ -54,8 +41,8 @@ def load_checkpoint() -> tuple[int, int]:
 
     `skipped` counts malformed jsonl lines seen on the way to `resume_line`.
     Storing it alongside the position means an aborted run keeps the exact
-    cumulative malformed-line count so a resume neither loses nor double-counts
-    it. A missing checkpoint yields (0, 0).
+    cumulative count, so a resume neither loses nor double-counts it. A missing
+    checkpoint yields (0, 0).
     """
     if os.path.exists(CHECKPOINT_PATH):
         with open(CHECKPOINT_PATH) as f:
@@ -81,8 +68,8 @@ def load_checkpoint() -> tuple[int, int]:
 def save_checkpoint(line_num: int, skipped: int):
     """Persist the resume position together with the cumulative `skipped` count.
 
-    Called on every batch and on abort, so the malformed-line count survives
-    any interruption instead of only being written at the very end of a run.
+    Called on every batch and on abort, so the count survives any interruption
+    rather than being written only at the very end of a run.
     """
     tmp_path = f"{CHECKPOINT_PATH}.tmp"
     with open(tmp_path, "w") as f:
@@ -96,8 +83,7 @@ def backup_collection_best_effort(client: QdrantClient):
     """Snapshot the collection + local artifacts before a destructive change.
 
     Best-effort: a failure only logs a WARNING and the build continues, so a
-    transient Qdrant outage cannot block a rebuild. No-op when the collection
-    does not exist (nothing to protect).
+    transient Qdrant outage cannot block a rebuild.
     """
     try:
         from qdrant_backup import make_backup
@@ -114,10 +100,9 @@ def ensure_collection(client: QdrantClient) -> bool:
     """Ensure the collection matches the current schema.
 
     Returns True if the collection was (re)created empty this run. When that
-    happens the caller MUST reset the embed checkpoint to 0: the previous
-    checkpoint refers to rows embedded into a collection that no longer exists,
-    and resuming from it would silently skip the earlier rows in the new one
-    (a regression that once left feids 1-7171 permanently absent).
+    happens the caller MUST reset the embed checkpoint to 0: the old checkpoint
+    refers to rows embedded into a collection that no longer exists, and
+    resuming from it silently skips the earlier rows in the new one.
     """
     existing = [c.name for c in client.get_collections().collections]
     if config.QDRANT_COLLECTION not in existing:
@@ -126,9 +111,9 @@ def ensure_collection(client: QdrantClient) -> bool:
         return True
 
     info = client.get_collection(collection_name=config.QDRANT_COLLECTION)
-    # Introspection is tolerant: some qdrant server/client combinations don't
-    # surface sparse_vectors_config/hnsw_config on the returned model. When we
-    # can't confirm the existing schema, recreate it so vectors match config.
+    # Introspection is tolerant: some server/client combinations do not surface
+    # sparse_vectors_config/hnsw_config. When the schema cannot be confirmed,
+    # recreate so the vectors match config.
     vectors = info.config.params.vectors
     dense_size = vectors.get("dense").size if isinstance(vectors, dict) else vectors.size
     dim_matches = dense_size == config.EMBED_DIM
@@ -171,11 +156,10 @@ def main():
         print(f"No data file at {DATA_PATH} — run scripts/fetch_data.py first.")
         return
 
-    # Imported here, not at module scope: sentence_transformers pulls in torch,
-    # so importing this module should not require it. That keeps
-    # ensure_collection / create_payload_indexes / the checkpoint helpers
-    # importable and testable in an environment without the model stack. Same
-    # lazy pattern as apply_delta in update_index.py.
+    # Imported here, not at module scope: sentence_transformers pulls in torch, so
+    # importing this module should not require it. That keeps the collection and
+    # checkpoint helpers importable without the model stack. Same lazy pattern as
+    # apply_delta in update_index.py.
     from sentence_transformers import SentenceTransformer
 
     print(f"Loading dense embedding model {config.EMBED_MODEL} on {config.EMBED_DEVICE}...")
@@ -186,16 +170,10 @@ def main():
     client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     recreated = ensure_collection(client)
 
-    # Index the payload fields on a resumed collection too. create_collection
-    # only runs when the collection is (re)created, so without this a collection
-    # that predates a new field keeps that field unfilterable until a full
-
-    # Index the payload fields on a resumed collection too. create_collection
-    # only runs when the collection is (re)created, so without this a collection
-    # that predates a new field keeps that field unfilterable until a full
-    # destructive rebuild -- which is why content_type stayed unfilterable even
-    # for points that carry it. create_payload_index is idempotent for a field
-    # that already has an index, so this costs nothing on a re-run.
+    # Index the payload fields on a resumed collection too: create_collection only
+    # runs when the collection is (re)created, so without this a collection that
+    # predates a new field keeps that field unfilterable until a full destructive
+    # rebuild. create_payload_indexes is idempotent, so a re-run costs nothing.
     try:
         create_payload_indexes(client)
     except Exception as e:
@@ -227,7 +205,7 @@ def main():
         return dense_vecs, sparse_vecs
 
     batch_rows, dense_texts, sparse_texts = [], [], []
-    pending = deque()  # (end_line, future of encode_batch)
+    pending = deque()  # (end_line, encode_batch future)
 
     def submit_batch(end_line: int):
         pending.append((end_line, executor.submit(encode_batch, dense_texts, sparse_texts)))
@@ -293,10 +271,9 @@ def main():
     try:
         info = client.get_collection(config.QDRANT_COLLECTION)
         count = info.points_count or 0
-        # Expected points = valid articles (total lines minus malformed lines
-        # that were skipped and can never be indexed). Comparing against the
-        # full dataset size would wrongly flag INCOMPLETE whenever some lines
-        # were skipped, even though the sync actually succeeded.
+        # Expected = valid articles; malformed lines were skipped and can never be
+        # indexed, so comparing against the raw dataset size would wrongly flag
+        # INCOMPLETE whenever any line was skipped.
         expected = total - skipped
         if count < expected:
             log(

@@ -16,10 +16,10 @@ def _res(title, score):
 
 
 def _legacy_diversify(results, n, lam=0.7, sim_thresh=0.4):
-    """Reference implementation of the pre-#193 loop.
+    """Reference implementation of the loop before no-mutation selection.
 
     It popped the winning index out of ``order`` with ``list.remove`` (O(n) per
-    round). Selection must stay byte-for-byte identical to this.
+    round). Selection must stay identical to this.
     """
     if len(results) <= n:
         return list(results[:n])
@@ -160,7 +160,7 @@ def test_diversify_mmr_loop_max_sim_over_multiple_chosen():
     assert diversify(results, 3) == [results[0], results[2], results[1]]
 
 
-# --- #193: no-mutation selection must keep the legacy order identical ---
+# --- no-mutation selection must keep the legacy order identical ---
 
 
 def test_diversify_matches_legacy_order_on_random_inputs():
@@ -235,7 +235,7 @@ def _warnings(caplog):
 
 def test_diversify_all_nan_scores_returns_empty_and_warns(caplog):
     # NaN compares false against everything, so no candidate ever beats -inf
-    # and nothing is selected. The pre-#193 loop crashed here
+    # and nothing is selected. The old loop crashed here
     # (``order.remove(-1)`` -> ValueError); on the /search read path a short
     # list plus a warning is better than a failed request.
     nan = float("nan")

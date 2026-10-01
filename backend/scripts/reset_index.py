@@ -1,27 +1,11 @@
-"""
-Removes the entire index so the next run starts from zero.
+"""Removes the entire index so the next run starts from zero.
 
-Drops the Qdrant collection and deletes the local data artifacts
-(articles.jsonl, build checkpoint, incremental index state). The embedding
-model cache, venv, and .env are left untouched.
-
-Safety: before deleting anything, a snapshot backup is taken
-via qdrant_backup.make_backup() (Qdrant collection snapshot downloaded to
-backend/backups/ + copies of articles.jsonl/index_state.json). Deletion only
-proceeds when a *verified local* snapshot archive exists on disk, unless the
-explicit --skip-backup flag is passed (dangerous). A snapshot that exists only
-inside the Qdrant container does not count: it is destroyed by a container
-recreate or `docker rm`. Run scripts/backup_qdrant.py to back up without
-resetting.
-
-Exit status: 0 only when the reset ran to completion; 1 on any abort
-(declined confirmation, Qdrant unreachable, or no usable backup).
-
-Usage:
-    python scripts/reset_index.py            # interactive confirmation
-    python scripts/reset_index.py --yes      # skip confirmation
-    python scripts/reset_index.py --keep-data  # drop collection only
-    python scripts/reset_index.py --skip-backup  # delete WITHOUT a backup (dangerous)
+Drops the Qdrant collection and deletes the local data artifacts; the embedding
+model cache, venv, and .env are left untouched. A snapshot backup is taken
+first, and deletion only proceeds once a *verified local* snapshot archive is
+on disk -- unless ``--skip-backup`` is passed (dangerous). A snapshot that
+exists only inside the Qdrant container does not count: a container recreate or
+``docker rm`` destroys it. Exit status is 0 only on completion; 1 on any abort.
 """
 import os
 import socket

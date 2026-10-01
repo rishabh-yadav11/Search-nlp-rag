@@ -1,12 +1,7 @@
 /**
- * Issue #287 — `getMe()` had no signal and no deadline. The analytics
- * dashboard polls every 30 s and races `getMe()` against a 10 s timeout, but a
- * `Promise.race` only abandons a promise: the underlying `/api/auth/me` fetch
- * stayed in flight, so a hung auth service leaked one request per tick. The
- * deadline makes that abandonment real by aborting the socket.
- *
- * `getMe` also must NOT treat a timeout as "logged out" — it rethrows so callers
- * can tell a transport failure from a definitive 401.
+ * A hung auth service must be cancelled, not merely abandoned: `Promise.race` only drops the promise,
+ * leaving the `/api/auth/me` fetch in flight (one leaked request per dashboard poll), so the deadline
+ * aborts the socket. A timeout is a transport failure, not a logout, so `getMe` rethrows.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { clearMeCache, getMe } from './auth'
@@ -31,9 +26,8 @@ function hangingFetch() {
 }
 
 /**
- * `getMe()` attaches its rejection handler only after `await fetch` resumes, so
- * the rejection is unhandled for a tick. Settling it into a value here keeps
- * the harness quiet and still lets the test assert the failure.
+ * `getMe()` attaches its rejection handler only after `await fetch` resumes, so the rejection is
+ * unhandled for a tick. Settling it into a value here keeps the harness quiet.
  */
 function track(promise: Promise<unknown>) {
   return promise.then(
@@ -58,7 +52,7 @@ afterEach(() => {
   clearMeCache()
 })
 
-/** Advance the clock, then flush the microtasks the rejection schedules. */
+/** Advance the clock; `advanceTimersByTimeAsync` also flushes the microtasks the rejection schedules. */
 async function advance(ms: number) {
   await vi.advanceTimersByTimeAsync(ms)
 }
@@ -75,9 +69,7 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
     expect(signals[0]?.aborted).toBe(false)
 
     await advance(1)
-    // Both halves matter: a live, un-aborted signal AND a promise that is
-    // genuinely still pending. Asserting only the signal would pass even if
-    // `getMe` were governed by no deadline at all.
+    // A live signal alone would pass even with no deadline at all, so also pin that it stays pending.
     expect(signals[0]?.aborted).toBe(false)
     expect(settled).toBe(false)
     void pending
@@ -96,12 +88,9 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
   })
 
   it('leaves the session alone on a timeout instead of treating it as a logout', async () => {
-    // There is no stored session left to preserve: the credential is an
-    // httpOnly cookie JS cannot read or clear. What a timeout must NOT do is
-    // resolve `null` — this function's "definitive logged out" sentinel — or
-    // leave one cached, because a cancelled read that reads as a logout is a
-    // forced logout. So the call has to reject, and the NEXT one has to go
-    // back to the network rather than be served a cached "logged out".
+    // The credential is an httpOnly cookie JS cannot read or clear, so a timeout must not resolve
+    // `null` (this function's "definitive logged out" sentinel) nor cache one — a cancelled read
+    // that reads as a logout is a forced logout. It must reject, and the next call must hit the network.
     const pending = track(getMe())
     await advance(ME_DEADLINE_MS)
     expect((await pending).ok).toBe(false)
@@ -111,8 +100,7 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
   })
 
   it('is cancelled by the caller aborting its own signal, as the dashboard does', async () => {
-    // The dashboard gives up on `getMe()` at 10 s and aborts its load
-    // controller. That must cancel the socket, so nothing outlives the race.
+    // The dashboard abandons `getMe()` at 10 s, which must cancel the socket rather than outlive the race.
     const caller = new AbortController()
     const pending = track(getMe(false, caller.signal))
     const signal = signals[0]
@@ -131,9 +119,7 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
 
     caller.abort()
     expect((await pending).ok).toBe(false)
-    // A cancelled load is a cancellation, not a fault. Logging it as
-    // "failed to reach the auth service" would report a healthy auth service
-    // as down on every dashboard unmount and every 10 s race timeout.
+    // Logging this as "failed to reach the auth service" would report a healthy auth service as down.
     expect(console.error).not.toHaveBeenCalled()
   })
 
@@ -146,11 +132,8 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
   })
 
   it('rejects, not resolves null, when a stalled body is cut off by the deadline', async () => {
-    // undici's behaviour: the headers resolve, and the body read rejects with
-    // an AbortError once the signal fires. A stub that never settles cannot
-    // model that, and would leave getMe()'s RESULT unobserved — the very thing
-    // this test exists to pin. `null` is getMe's "definitive logged out"
-    // sentinel, so a cancelled read that resolves null is a forced logout.
+    // undici's behaviour: headers resolve, then the body read rejects on abort. A never-settling stub
+    // cannot model that and would leave getMe()'s result unobserved.
     vi.stubGlobal(
       'fetch',
       vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
@@ -174,11 +157,9 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
     await advance(ME_DEADLINE_MS)
 
     const result = await pending
-    // Must reject. Resolving `null` here would tell the dashboard the user is
-    // logged out when the auth service merely never finished sending a body.
+    // Resolving `null` here would tell the dashboard the user is logged out when no body ever arrived.
     expect(result.ok).toBe(false)
     expect(signals[0]?.aborted).toBe(true)
-    // And it must not be misreported as a malformed payload either.
     expect(console.error).not.toHaveBeenCalledWith(
       'getMe: failed to parse /api/auth/me response',
       expect.anything()
@@ -186,8 +167,7 @@ describe('getMe — a hung auth service is cancelled, not leaked', () => {
   })
 
   it('still returns null (not a throw) for a genuinely malformed 200 body', async () => {
-    // The pre-existing lenient behaviour must survive the abort guard: callers
-    // may lack a .catch, so a real parse failure resolves null.
+    // Callers may lack a .catch, so a real parse failure resolves null rather than throwing.
     vi.stubGlobal(
       'fetch',
       vi.fn(() =>

@@ -15,60 +15,52 @@ GUNICORN_WORKERS="${GUNICORN_WORKERS:-4}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 NGINX_CONF="${NGINX_CONF:-/etc/nginx/sites-available/search-nlp-rag}"
 NGINX_LINK="${NGINX_LINK:-/etc/nginx/sites-enabled/search-nlp-rag}"
-# nginx rate limit for the SSE chat stream only. The application already
-# limits /search, /facets, /analytics/click and /ready per IP
-# (public_rate_limit) and the auth endpoints (_check_rate_limit); adding a
-# second limiter on those would mean two layers emitting 429 with different
-# bodies and would make PUBLIC_*_RATE_PER_MIN / AUTH_*_RATE_PER_MIN
-# unreachable. The chat stream has no application-layer limit at all, so the
-# edge is the only place that can count it.
+# nginx rate limit for the SSE chat stream ONLY. The application already limits
+# /search, /facets, /analytics/click and /ready per IP (public_rate_limit) and
+# the auth endpoints (_check_rate_limit); a second limiter there would mean two
+# layers emitting 429 with different bodies and would make the
+# PUBLIC_*_RATE_PER_MIN / AUTH_*_RATE_PER_MIN knobs unreachable. The chat
+# stream has no application-layer limit, so the edge is the only place that can
+# count it.
 NGINX_CHAT_LIMIT_RATE="${NGINX_CHAT_LIMIT_RATE:-10r/m}"
 NGINX_CHAT_LIMIT_BURST="${NGINX_CHAT_LIMIT_BURST:-10}"
-# pm2 is the process manager for both long-running services, so an unpinned
-# 'npm install -g pm2' means a new release can land on the box unattended and
-# change how processes are started, restarted and reported. The version is an
-# exact one, overridable so an operator can move it deliberately.
+# pm2 supervises both long-running services, so an unpinned install lets a new
+# release land unattended and change how processes are started, restarted and
+# reported. Pinned to one exact version, overridable so an operator can move it
+# deliberately.
 PM2_VERSION="${PM2_VERSION:-7.0.4}"
-# The logrotate policy is host-specific: it names this machine's log
-# directories and the account logrotate must drop privileges to, and both are
-# wrong the instant the repo template is copied somewhere else. It is therefore
-# rendered per host by the logrotate stage rather than copied, and this is
-# where that render is installed.
+# The logrotate policy is host-specific (it names this machine's log directories
+# and the account logrotate drops privileges to), so it is rendered per host by
+# the logrotate stage rather than copied from the repo template.
 LOGROTATE_CONF="${LOGROTATE_CONF:-/etc/logrotate.d/vccircle}"
 CERTBOT_WEBROOT="${CERTBOT_WEBROOT:-/var/www/certbot}"
 LE_ROOT="${LE_ROOT:-/etc/letsencrypt}"
 LE_DOMAIN="${LE_DOMAIN:-}"
 LE_EMAIL="${LE_EMAIL:-}"
-# auto|on|off. "auto" means: TLS once a domain is configured and its
-# certificate pair is there to be served (see nginx_tls_cert_valid),
-# plain HTTP otherwise.
+# auto|on|off. "auto" = TLS once a domain is configured and its certificate pair
+# is there to be served, plain HTTP otherwise.
 NGINX_TLS="${NGINX_TLS:-auto}"
 LE_LIVE="$LE_ROOT/live/$LE_DOMAIN"
 LE_CERT="$LE_LIVE/fullchain.pem"
 LE_KEY="$LE_LIVE/privkey.pem"
 
-# LE_DOMAIN is env-only and is never written anywhere, so an ordinary
-# `./setup.sh nginx` (or the nginx stage inside `./setup.sh all`) in a shell
-# that does not export it used to see no domain at all, resolve "auto" to
-# plain HTTP, and rewrite a live HTTPS site to cleartext -- silently, with
-# exit 0. When it is unset, recover the domain from the certificate the
-# INSTALLED CONFIG already names, and from nowhere else.
+# LE_DOMAIN is env-only and never written anywhere, so a `./setup.sh nginx` in a
+# shell that does not export it used to see no domain, resolve "auto" to plain
+# HTTP, and rewrite a live HTTPS site to cleartext -- silently, with exit 0.
+# When it is unset, recover the domain from the certificate the INSTALLED
+# CONFIG already names, and from nowhere else.
 #
-# "And from nowhere else" is the whole safety argument. Recovery is only ever
-# justified by evidence that the certificate belongs to this site, and the one
-# piece of that evidence available is the config this site is already serving.
-# Falling back to "the only directory under $LE_ROOT/live" looked equivalent
-# and is not: /etc/letsencrypt is shared, so on a host where this site was
-# never on TLS it would adopt an unrelated service's cert-name and repoint
-# both server_name and ssl_certificate at that other domain -- serving a
-# certificate for a domain this site does not answer for. Guessing is only
-# safe when the guess cannot be acted on, and here it very much can.
+# "And from nowhere else" is the whole safety argument. Recovery is only
+# justified by evidence the certificate belongs to this site, and the only such
+# evidence available is the config this site already serves. Falling back to
+# "the only directory under $LE_ROOT/live" is NOT equivalent: /etc/letsencrypt
+# is shared, so on a host where this site was never on TLS it would adopt an
+# unrelated service's cert-name and repoint server_name and ssl_certificate at
+# that other domain.
 #
-# Pure bash on purpose: this runs while the script is sourced, and
-# `test_refuses_when_certbot_is_missing` sources it with almost nothing on
-# PATH.
-# Forced to 0 here rather than defaulted later: it describes what this block
-# did, so an inherited value from the environment must not leak into it.
+# Pure bash on purpose: this runs while the script is sourced, and a test
+# sources it with almost nothing on PATH. Forced to 0 rather than defaulted
+# later: it describes what this block did, so an inherited value must not leak.
 LE_DOMAIN_RECOVERED=0
 if [ -z "$LE_DOMAIN" ]; then
     _le_name=""
@@ -107,27 +99,24 @@ if [ -z "$LE_DOMAIN" ]; then
 fi
 
 # pm2 process tuning. These MUST stay equal to the values in
-# ecosystem.config.js — backend/tests/test_deploy_config.py fails if the two
-# process definitions disagree. `./setup.sh services` starts pm2 from
-# ecosystem.config.js and EXPORTS these to it, rather than passing them as
-# `pm2 start` flags, so a default that differs here would produce a different
-# process on the same host depending on which path started it.
+# ecosystem.config.js; the two process definitions are compared by a test.
+# `./setup.sh services` starts pm2 from ecosystem.config.js and EXPORTS these
+# to it rather than passing them as `pm2 start` flags, so a default that
+# differed here would produce a different process depending on which path
+# started it.
 #
-# min_uptime needs a precise statement because the obvious one is wrong. pm2 is
-# not missing the option by default: min_uptime defaults to 1000ms. At 1s, a
-# Next.js frontend that starts cleanly and then dies four seconds later -- a
-# port it cannot rebind after a half-dead previous process, a missing .next
-# build, an OOM on the first render -- has comfortably cleared the bar, so pm2
-# scores every one of those restarts as STABLE. Stable restarts never count
-# toward max_restarts and never trigger exp_backoff_restart_delay, so pm2
-# hot-loops the broken process forever, restarting it as fast as it can die, and
-# the only symptom is a log file that fills up. Raising the bar to 30s is what
-# reclassifies those restarts as unstable, which is the state pm2's backoff and
-# restart limit actually act on. 30s also has to be long enough to cover a cold
-# first render, or a healthy slow start would be treated as a crash.
+# min_uptime needs a precise statement because the obvious one is wrong: pm2
+# does NOT default it to disabled, it defaults to 1000ms. At 1s, a Next.js
+# frontend that starts cleanly and dies four seconds later -- a port it cannot
+# rebind, a missing .next build, an OOM on the first render -- has cleared the
+# bar, so pm2 scores those restarts STABLE. Stable restarts never count toward
+# max_restarts and never trigger exp_backoff_restart_delay, so pm2 hot-loops the
+# broken process forever and the only symptom is a log file filling up. 30s
+# reclassifies them as unstable, the state pm2's backoff and restart limit
+# actually act on, while still covering a cold first render.
 #
-# These are exported rather than passed as flags because pm2's CLI has no
-# `--min-uptime` in any released version; see the comment in run_services.
+# Exported rather than passed as flags because pm2's CLI has no `--min-uptime`
+# in any released version; see the comment in run_services.
 API_MAX_MEMORY="${API_MAX_MEMORY:-5G}"
 API_MAX_RESTARTS="${API_MAX_RESTARTS:-10}"
 FRONTEND_MAX_MEMORY="${FRONTEND_MAX_MEMORY:-1G}"
@@ -135,18 +124,15 @@ RESTART_BACKOFF_MS="${RESTART_BACKOFF_MS:-100}"
 MIN_UPTIME_MS="${MIN_UPTIME_MS:-30000}"
 
 
-# Pinned docker images by digest. IMPORTANT: the Qdrant version must be >= the
-# version that wrote an existing collection (older versions cannot deserialize
-# newer storage formats). Current default matches the deployment that created
-# the live collection.
+# Pinned docker images by DIGEST, not merely tagged, and that is a supply-chain
+# control rather than a reproducibility nicety: a tag is a mutable name, so
+# whoever controls the registry account can re-point it and the next unattended
+# `./setup.sh backend` pulls and runs the substitute. The redis digest is a
+# multi-arch index, so the same pin resolves on arm64 as on amd64.
 #
-# Both images are pinned by DIGEST, not merely tagged, and that is a
-# supply-chain control rather than a reproducibility nicety. A tag is a mutable
-# name: whoever controls the registry account can re-point the redis tag at a
-# different image tomorrow, and the next unattended `./setup.sh backend` pulls
-# it and runs it. The digest names one immutable OCI image index, so a
-# re-pushed tag no longer decides what runs. The redis digest is a multi-arch
-# index, so the same pin still resolves on an arm64 host as on amd64.
+# IMPORTANT: the Qdrant version must be >= the version that wrote an existing
+# collection; older versions cannot deserialize newer storage formats. The
+# default matches the deployment that created the live collection.
 QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499}"
 
@@ -224,19 +210,16 @@ ensure_node() {
         "import sys,json; print(next(v['version'] for v in json.load(sys.stdin) if v.get('lts') and v['version'].startswith('v22.')))")"
     TARBALL="node-$VER-linux-$ARCH.tar.xz"
     BASE="https://nodejs.org/dist/$VER"
-    # nodejs.org publishes SHASUMS256.txt alongside every release, listing the
-    # sha256 of each artifact in it. Downloading the tarball and extracting it
-    # without checking that file means a truncated download, a CDN serving the
-    # wrong bytes, or a tampered mirror all get installed into the Node that
-    # builds and runs the frontend. The expected digest is read from the
-    # published manifest rather than hardcoded here, so the check stays correct
-    # across the auto-discovered version above.
+    # The expected digest is read from the published SHASUMS256.txt rather than
+    # hardcoded, so the check stays correct across the auto-discovered version
+    # above; without it a truncated download, a CDN serving the wrong bytes or a
+    # tampered mirror gets installed as the Node that builds and runs the
+    # frontend.
     #
-    # Both the tarball and the manifest come from the same origin, so this
-    # verifies INTEGRITY -- the download arrived intact and is the artifact
-    # that was published -- not AUTHENTICITY. Closing that gap needs a
-    # signature or a hardcoded digest, which would freeze the version and defeat
-    # the deliberate LTS auto-discovery, so it is called out rather than faked.
+    # Tarball and manifest come from the same origin, so this verifies
+    # INTEGRITY -- the download arrived intact and is what was published -- not
+    # AUTHENTICITY. Closing that gap needs a signature or a hardcoded digest,
+    # which would freeze the version and defeat the LTS auto-discovery.
     if ! have sha256sum; then
         echo "ERROR: sha256sum not found; refusing to install an unverified node." >&2
         return 1
@@ -271,11 +254,9 @@ ensure_node() {
 ensure_pm2() {
     if ! have pm2; then
         echo "installing pm2@$PM2_VERSION..."
-        # Pinned, because pm2 is what starts, restarts and supervises both
-        # services. An unpinned install pulls whatever is newest when the stage
-        # runs, so an unattended bootstrap can land a new major on a live box
-        # and change restart/backoff behaviour with no code change to point at.
-        # --no-audit/--no-fund only quieten the output.
+        # Pinned because an unpinned install pulls whatever is newest when the
+        # stage runs, so an unattended bootstrap can land a new major on a live
+        # box. --no-audit/--no-fund only quieten the output.
         npm install -g --no-audit --no-fund "pm2@$PM2_VERSION" >/tmp/pm2-install.log 2>&1 || {
             echo "pm2 install failed:" >&2; tail -3 /tmp/pm2-install.log >&2; return 1
         }
@@ -285,12 +266,10 @@ ensure_pm2() {
         ln -sf "$nbin/pm2" ~/.local/bin/pm2
         ln -sf "$nbin/pm2-dev" ~/.local/bin/pm2-dev
     fi
-    # The install above is pinned, but `have pm2` short-circuits when pm2 is
-    # already on PATH, so on an upgraded host the pin alone does not make the
-    # running version match. Say so rather than letting the pin read as a
-    # guarantee it is not: this stage installs, it does not downgrade, because
-    # moving a live process manager under a running backend is an operator
-    # decision.
+    # The pin alone does NOT make the running version match: `have pm2`
+    # short-circuits when pm2 is already on PATH. This stage installs, it does
+    # not downgrade -- moving a live process manager under a running backend is
+    # an operator decision.
     local installed
     installed="$(pm2 -v 2>/dev/null || echo unknown)"
     if [ "$installed" != "$PM2_VERSION" ]; then
@@ -343,9 +322,8 @@ container_binds_localhost() {
     fi
     return 0
 }
-# A random secret, generated from the OS CSPRNG. This is not a token anyone
-# sends over the network, so hex is fine and is the one encoding that survives
-# being pasted into a URL, a docker argv and a shell without quoting rules.
+# A random secret from the OS CSPRNG. Not a token anyone sends over the network,
+# so hex is fine and survives a URL, a docker argv and an unquoted shell.
 random_secret() {
     if have openssl; then
         openssl rand -hex 32
@@ -356,18 +334,15 @@ random_secret() {
 
 # The data stores' credentials, resolved ONCE and then reused.
 #
-# Both are read from backend/.env first and only generated when absent, and
-# that ordering is the whole point. Regenerating either value on a re-run would
-# change the password the running container was started with, so the very next
-# request from the application would be rejected and the site would look broken
-# for a reason that is invisible from the outside. So the value that is already
-# in .env is the value that is used, and the container is only recreated when
-# what it is actually running disagrees with it.
+# Read from backend/.env first and only generated when absent, and that ordering
+# is the whole point: regenerating on a re-run would change the password the
+# running container was started with, so the very next request from the
+# application would be rejected and the site would break invisibly.
 #
-# The container, not .env, is the thing that can be stale: a box that was
-# provisioned before this existed has an unauthenticated redis and qdrant
-# running, and their .env has no credential for them. Storing a generated
-# secret there is what lets the next step detect the gap and fix it.
+# The container, not .env, is what can be stale: a box provisioned before
+# credentials existed has an unauthenticated redis and qdrant running and no
+# credential for them in .env. Storing a generated secret there is what lets the
+# next step detect the gap and fix it.
 store_secrets() {
     local redis_pass qdrant_key
     redis_pass="$(env_value "$ENV_FILE" REDIS_PASSWORD)"
@@ -389,17 +364,14 @@ store_secrets() {
 # Bound docker json-file logs so they can't fill the disk (20MB x 3 files each).
 DOCKER_LOG_OPTS="--log-driver json-file --log-opt max-size=20m --log-opt max-file=3"
 
-# Does the container's OWN configuration carry this exact string?
-#
-# Read from `docker inspect` (what the container was created with), not from
-# anything this script believes. It exists to answer one question on an upgraded
-# host: is the running container the one this .env describes? A box provisioned
-# before credentials existed has an unauthenticated redis/qdrant running, and
-# .env now carries a password for it. Without this check the container looks
-# healthy, is left alone, and the application then fails every request with
-# NOAUTH because it is now correctly sending a password the server never asked
-# for. The reverse case matters too: a password edited in .env must not be
-# silently ignored either, and the same check catches that.
+# Does the container's OWN configuration carry this exact string? Read from
+# `docker inspect` (what the container was created with), not from anything this
+# script believes. It answers one question on an upgraded host: is the running
+# container the one this .env describes? Without it the container looks healthy,
+# is left alone, and the application then fails every request with NOAUTH
+# because it is correctly sending a password the server never asked for. The
+# reverse case -- a password edited in .env -- matters too, and the same check
+# catches it.
 #
 # Cmd and Env are both searched because the two containers express auth
 # differently: redis takes a command flag, qdrant an environment variable.
@@ -465,11 +437,10 @@ wait_http() {
     return 1
 }
 
-# One KEY from a KEY=VALUE .env file, with the optional surrounding quotes an
-# operator may have used and a trailing CR stripped. Prints nothing when the
-# key is absent, which is the caller's signal to fall back to the application's
-# own default. Last match wins, matching how python-dotenv resolves a repeated
-# key.
+# One KEY from a KEY=VALUE .env file, with optional surrounding quotes and a
+# trailing CR stripped. Prints nothing when the key is absent, which is the
+# caller's signal to fall back to the application's own default. Last match
+# wins, matching how python-dotenv resolves a repeated key.
 env_value() {
     local file="$1" key="$2" line value
     if [ ! -f "$file" ]; then
@@ -491,23 +462,20 @@ env_value() {
 # Secrets and user data at rest, tightened. backend/.env carries the JWT secret
 # and the database credentials, and the two SQLite files carry every account and
 # every chat message the site holds; both are world-readable by default, so any
-# local account -- or any process running as another user on the same box --
-# can read them. The backups directory gets 700 for the same reason: it holds
-# copies of exactly those two files.
+# local account -- or any process running as another user -- can read them. The
+# backups directory gets 700 for the same reason.
 #
-# The database paths are read out of .env rather than hard-coded because the
-# application honours the same overrides (config.py reads CHAT_DB_PATH and
-# AUTH_DB_PATH through load_dotenv) and resolves a relative one against the
-# backend working directory. Hard-coding data/chat.db here would silently
-# skip a host that moved its databases, which is the one host whose databases
-# most need tightening.
+# The database paths are read from .env rather than hard-coded because the
+# application honours the same overrides (CHAT_DB_PATH and AUTH_DB_PATH through
+# load_dotenv) and resolves a relative one against the backend working
+# directory. Hard-coding data/chat.db would silently skip a host that moved its
+# databases, which is the one host whose databases most need tightening.
 #
-# Called from BOTH ends of the lifecycle on purpose. run_backend is where .env
-# is created or migrated, so that is the only place the file is guaranteed to
-# exist afterwards; run_services is where a database that was already on disk
-# before this change existed gets tightened on an upgraded host, since ./setup.sh
-# services never re-runs the backend stage. One call would leave one of the two
-# upgrade paths unprotected.
+# Called from BOTH ends of the lifecycle: run_backend, where .env is created or
+# migrated, is the only place the file is guaranteed to exist afterwards, and
+# run_services, where a database already on disk gets tightened on an upgraded
+# host since `./setup.sh services` never re-runs the backend stage. One call
+# would leave one of the two upgrade paths unprotected.
 harden_permissions() {
     local root="${1:-$SCRIPT_DIR}"
     local backend="$root/backend"
@@ -559,31 +527,25 @@ run_deps() {
 # A forced True is a legitimate setting -- it is what a host whose reverse proxy
 # runs on another host needs -- so nothing here ever rewrites a value. The
 # warning is the point of the branch: with the header trusted from ANY peer, a
-# client that reaches the API port directly can forge its rate-limit bucket
-# (#245), and this is the only place an operator is ever told.
+# client that reaches the API port directly can forge its rate-limit bucket.
 #
 # Both greps match the line SHAPE python-dotenv accepts, not "KEY=value" and
-# nothing else. The application reads .env through load_dotenv (app/config.py),
-# which strips an `export` prefix, blanks around the `=` and the quotes around
-# a value before the value ever reaches config._env_tristate -- so
-# `AUTH_TRUST_X_FORWARDED_FOR = "true"` is a forced True in the app while a
-# guard anchored at `^AUTH_TRUST_X_FORWARDED_FOR=` sees no key at all. That is
-# not merely a missing warning. The presence check missed the same shape, so
-# the script appended a SECOND `AUTH_TRUST_X_FORWARDED_FOR=auto`; python-dotenv
-# resolves a repeated key to the last one, so the operator's forced True was
-# silently downgraded on every run, into the branch that was supposed to warn
-# about it, which never ran.
+# nothing else. The application reads .env through load_dotenv, which strips an
+# `export` prefix, blanks around the `=` and the quotes around a value, so
+# `AUTH_TRUST_X_FORWARDED_FOR = "true"` is a forced True in the app while a guard
+# anchored at `^AUTH_TRUST_X_FORWARDED_FOR=` sees no key at all. That is not
+# merely a missing warning: the presence check missed the same shape, so the
+# script appended a SECOND `AUTH_TRUST_X_FORWARDED_FOR=auto`, and python-dotenv
+# resolves a repeated key to the last one -- silently downgrading the operator's
+# forced True on every run, into the branch that was supposed to warn about it.
 #
 # The spellings in the three value patterns are config._TRUE_SPELLINGS and they
-# have to be: that set is the definition of a forced True, and
-# backend/tests/test_setup_script.py fails if the two disagree in EITHER
-# direction -- a value that forces trust unmentioned, and a posture the
-# operator is not actually in. This is a copy in shell rather than an import
-# because it runs before the venv is guaranteed to exist, so the test is what
-# holds the copy to the set. Scope: ASCII whitespace only. A POSIX bracket
-# expression is ASCII in GNU grep under the C locale and under a UTF-8 one
-# alike (measured on this host), so a value padded with U+00A0 is still read as
-# a forced True by config and is still not matched here.
+# have to be, in either direction: that set defines a forced True. This is a copy
+# in shell rather than an import because it runs before the venv is guaranteed
+# to exist, so a test is what holds the copy to the set. Scope: ASCII
+# whitespace only -- a POSIX bracket expression is ASCII in GNU grep under the C
+# locale and under a UTF-8 one alike, so a value padded with U+00A0 is read as a
+# forced True by config and is still not matched here.
 migrate_xff_trust() {
     local env_file="$1"
     # KEY= in every shape load_dotenv accepts: leading blanks, an optional
@@ -605,14 +567,14 @@ migrate_xff_trust() {
     if ! grep -qE "$assignment" "$env_file"; then
         echo "AUTH_TRUST_X_FORWARDED_FOR=auto" >> "$env_file"
     elif grep -qiE -e "$bare" -e "$double_quoted" -e "$single_quoted" "$env_file"; then
-        # Warn, never rewrite. A forced True is the correct setting when the
-        # proxy runs on ANOTHER host, and silently downgrading it to 'auto'
-        # would collapse exactly that deployment back into the single-bucket
-        # outage. Such a host is already rate-limiting per IP correctly; its
-        # residual risk is that the header is trusted from ANY peer, which only
-        # matters when :8001 is also reachable directly (gunicorn binds
-        # 0.0.0.0 -- see issue #245). 'auto' closes that and is safe whenever
-        # the proxy is on this host, but the operator's value is theirs.
+        # Warn, never rewrite. A forced True is correct when the proxy runs on
+        # ANOTHER host; silently downgrading it to 'auto' would collapse exactly
+        # that deployment back into the single-bucket outage. Such a host is
+        # already rate-limiting per IP correctly; its residual risk is that the
+        # header is trusted from ANY peer, which only matters when :8001 is also
+        # reachable directly (gunicorn binds 0.0.0.0). 'auto' closes that and is
+        # safe whenever the proxy is on this host, but the value is the
+        # operator's.
         echo "WARNING: AUTH_TRUST_X_FORWARDED_FOR is set to a forced-true value" >&2
         echo "         (1/true/yes/on), which trusts X-Forwarded-For from ANY" >&2
         echo "         peer, so a client reaching :8001 directly can forge it to" >&2
@@ -627,13 +589,11 @@ run_backend() {
     check_python python3
     docker_up
 
-    # .env first, then the venv, then the secrets, then the containers.
-    #
-    # The order is load-bearing and each step depends on the one before it.
-    # The containers need the credentials to be started AT ALL, so they cannot
-    # come first. The credentials go in .env and are generated with the
-    # interpreter (openssl is not guaranteed on a minimal host), so the venv has
-    # to exist before they are generated. And .env has to exist before either,
+    # .env, then venv, then secrets, then containers -- the order is
+    # load-bearing and each step depends on the one before it. The containers
+    # need the credentials to be started at all. The credentials go in .env and
+    # are generated with the interpreter (openssl is not guaranteed on a minimal
+    # host), so the venv must exist first. And .env must exist before either,
     # since store_secrets reads what is already there and only generates when
     # the key is absent -- that read is what keeps a re-run from rotating the
     # password out from under a running container.
@@ -650,12 +610,11 @@ run_backend() {
     # immediately rather than at the end of the stage.
     chmod 600 "$ENV_FILE"
 
-    # qdrant takes its API key as an environment variable; redis takes its
-    # password as a command flag, which is why these two differ in shape. The
-    # needle passed to each is the literal the container must already be
-    # carrying, so a container started before credentials existed is detected
-    # and recreated instead of being left in a state where the application
-    # sends a password the server never asked for.
+    # qdrant takes its API key as an environment variable, redis its password as
+    # a command flag. The needle passed to each is the literal the container
+    # must already be carrying, so a container started before credentials
+    # existed is detected and recreated instead of being left in a state where
+    # the application sends a password the server never asked for.
     ensure_docker_container qdrant "$QDRANT_IMAGE" \
         "127.0.0.1:$QDRANT_PORT:6333" "-v $SCRIPT_DIR/qdrant_data:/qdrant/storage" \
         "-e QDRANT__SERVICE__API_KEY=$QDRANT_API_KEY" "" \
@@ -671,13 +630,10 @@ run_backend() {
     "$VENV_PY" -m pip install -q -r backend/requirements.txt
 
     # The password is carried IN the URL rather than beside it, because every
-    # redis client in the app (cache, rate limiter, analytics, cost budget,
-    # health, profiles) is built from config.REDIS_URL and none of them take a
-    # separate password argument. Putting it in the URL is the single place that
-    # makes all six authenticate, and redis-py parses the userinfo segment
-    # natively. A URL that already carries credentials is left alone, so an
-    # operator's hand-written password is never overwritten by the generated
-    # one.
+    # redis client in the app is built from config.REDIS_URL and none of them
+    # take a separate password argument. Putting it in the URL is the single
+    # place that makes them all authenticate, and redis-py parses the userinfo
+    # segment natively. A URL that already carries credentials is left alone.
     if ! grep -qE '^REDIS_URL=redis://[^/@]*@' "$ENV_FILE"; then
         if grep -q '^REDIS_URL=' "$ENV_FILE"; then
             # Rewrite the existing line in place: it has no credentials, so it
@@ -697,10 +653,9 @@ run_backend() {
     # Per-IP rate limiting keys on the client IP, which behind nginx comes from
     # X-Forwarded-For. An .env that predates the per-IP public rate limits has
     # no trust setting at all, so every proxied request keys on the nginx peer
-    # (127.0.0.1) and the whole site shares one rate-limit bucket.
-    # migrate_xff_trust appends the shipped default in that one case and warns
-    # when the operator has forced the header to be trusted; the reasoning, and
-    # the line shapes it has to recognise, live with the function.
+    # and the whole site shares one rate-limit bucket. migrate_xff_trust
+    # appends the shipped default in that one case and warns on a forced
+    # header; its reasoning lives with the function.
     migrate_xff_trust "$ENV_FILE"
     echo "backend ready"
     harden_permissions
@@ -745,14 +700,13 @@ start_service() {
     echo "'$name' started (pid $(cat "$pidfile"))"
 }
 
-# Name the reason the readiness gate rejected the deploy, so a 30-second
-# timeout does not end in a bare "not ready".
+# Name the reason the readiness gate rejected the deploy, so a 30-second timeout
+# does not end in a bare "not ready".
 #
-# No -f here, deliberately. This only ever runs when the probe answered >= 400
+# No -f here, deliberately: this only ever runs when the probe answered >= 400
 # (or the connection failed), and `curl -f` suppresses the body on exactly those
-# responses -- which made this function dead code and left the operator with the
-# bare "not ready after 30s" it exists to prevent. The report body, including
-# checks.llm.reason, is the app's own answer and is what gets printed.
+# responses. The report body, including checks.llm.reason, is the app's own
+# answer and is what gets printed.
 report_readiness_reason() {
     local body
     body="$(curl -sS -m 5 "http://localhost:$API_PORT/ready/deep" 2>/dev/null || true)"
@@ -776,22 +730,18 @@ run_services() {
     # Start from ecosystem.config.js, which is the single definition of these two
     # processes, rather than from inline `pm2 start` lines.
     #
-    # The reason is min_uptime, and it is not a preference. pm2's CLI has no
-    # `--min-uptime` flag in ANY released version -- 4.x, 5.x, 6.x and 7.x all
-    # print "error: unknown option `--min-uptime'" and exit 1 -- while
-    # `min_uptime` in an ecosystem file IS honoured at runtime (pm2 reads it in
-    # lib/God.js when deciding whether a restart was stable). An inline start
-    # cannot express the option at all, and because this script runs under
-    # `set -e`, passing the flag would abort the services stage and leave the box
-    # with neither service running. Verified against 4.5.0, 5.4.3, 6.0.14 and
-    # 7.0.4 for the rejection, and against 7.0.4 for the ecosystem route storing
-    # the value.
+    # The reason is min_uptime, and it is not a preference: pm2's CLI has no
+    # `--min-uptime` flag in any released version -- 4.x, 5.x, 6.x and 7.x all
+    # print "error: unknown option" and exit 1 -- while `min_uptime` in an
+    # ecosystem file IS honoured at runtime (pm2 reads it in lib/God.js when
+    # deciding whether a restart was stable). An inline start cannot express the
+    # option, and under `set -e` passing the flag would abort this stage and
+    # leave the box with neither service running.
     #
-    # Every knob setup.sh has always accepted is exported rather than left to
-    # chance, so the overrides keep working on the path that actually starts the
-    # services. ecosystem.config.js falls back to the same defaults when a
-    # variable is absent, so a bare `pm2 start ecosystem.config.js` produces the
-    # same two processes.
+    # Every knob is exported rather than left to chance, so the overrides keep
+    # working on the path that actually starts the services. ecosystem.config.js
+    # falls back to the same defaults, so a bare `pm2 start ecosystem.config.js`
+    # produces the same two processes.
     (cd "$SCRIPT_DIR" && \
         VCCIRCLE_ROOT="$SCRIPT_DIR" \
         GUNICORN_WORKERS="$GUNICORN_WORKERS" \
@@ -807,26 +757,22 @@ run_services() {
     wait_http "http://localhost:$API_PORT/health"
     wait_http "http://localhost:$NEXT_PORT/"
 
-    # Readiness, not liveness (#279): /health is a stub that answers 200 with a
-    # dead Qdrant client, unloaded models or the placeholder GEMINI_API_KEY, so
-    # gating the deploy on it declared broken backends deployed. /ready/deep is
-    # the uncached, unrated, loopback-only form, so this gate cannot pass on a
-    # warm readiness cache and cannot be throttled into a false "not ready".
+    # Readiness, not liveness: /health is a stub that answers 200 with a dead
+    # Qdrant client, unloaded models or a placeholder GEMINI_API_KEY, so gating
+    # the deploy on it declared broken backends deployed. /ready/deep is the
+    # uncached, unrated, loopback-only form, so this gate cannot pass on a warm
+    # readiness cache and cannot be throttled into a false "not ready".
     #
-    # Placed LAST on purpose. This gate can legitimately fail, and `set -e`
+    # Placed LAST on purpose. This gate can legitimately fail and `set -e`
     # aborts on it, so running it before the frontend was started turned a
     # misconfigured key into a torn-down deployment with the frontend never
     # coming back. Here both services are up and the pm2 dump is saved, so the
-    # operator is told the deploy is not ready with everything still running,
-    # and can fix the key and re-run.
+    # operator is told the deploy is not ready with everything still running.
     #
     # There is deliberately NO shell-side check of GEMINI_API_KEY before the
-    # teardown. app.config.classify_gemini_api_key is the only classifier, and
-    # a shell copy of its sentinel list is a second one that silently drifts:
-    # a shorter copy misses placeholders, a longer one refuses deploys the app
-    # would accept. The verdict here is the app's own -- report_readiness_reason
-    # prints checks.llm.reason from the response -- so it cannot disagree with
-    # what /ready will actually say.
+    # teardown: app.config.classify_gemini_api_key is the only classifier, and a
+    # shell copy of its sentinel list silently drifts. The verdict here is the
+    # app's own, so it cannot disagree with what /ready will actually say.
     if ! wait_http "http://localhost:$API_PORT/ready/deep"; then
         report_readiness_reason
         return 1
@@ -894,61 +840,47 @@ run_cron() {
     stage "cron"
     local log="$LOGS/update_index.log"
     local hc_log="$LOGS/healthcheck.log"
-    # update_index.py takes its own flock(2) on data/update.lock (LOCK_EX|LOCK_NB)
-    # and skips when another run holds it, so no external flock wrapper is needed
-    # (wrapping with `flock -n` would conflict with the script's own lock and
-    # cause every run to be skipped).
+    # update_index.py takes its own flock(2) on data/update.lock
+    # (LOCK_EX|LOCK_NB) and skips when another run holds it, so no external
+    # flock wrapper is needed -- `flock -n` would conflict with the script's own
+    # lock and cause every run to be skipped.
     local line_idx="*/15 * * * * nice -n 15 $VENV_PY $SCRIPT_DIR/backend/scripts/update_index.py >> $log 2>&1"
-    # cron does not inherit the operator's shell environment, so pass the
-    # webhook URL (and a minimal PATH via healthcheck.sh) explicitly. Empty
-    # webhook is harmless: healthcheck.sh treats an unset/empty value as "no
-    # webhook". Keep the entry stable for idempotent re-runs.
-    # BASE is passed explicitly because the API is bound to 127.0.0.1:$API_PORT
-    # and the watchdog defaults to 8001: an operator who overrides API_PORT
-    # would otherwise have the watchdog probe a closed port and restart a
-    # perfectly healthy backend every five minutes.
+    # cron does not inherit the operator's shell environment, so the webhook
+    # URL (and a minimal PATH via healthcheck.sh) are passed explicitly. An
+    # empty webhook is harmless: healthcheck.sh treats it as "no webhook".
+    # BASE is explicit because the API is bound to 127.0.0.1:$API_PORT while the
+    # watchdog defaults to 8001 -- an operator who overrides API_PORT would
+    # otherwise have the watchdog probe a closed port and restart a perfectly
+    # healthy backend every five minutes. Keep the entry stable for idempotent
+    # re-runs.
     local line_hc="*/5 * * * * BASE=\"http://localhost:$API_PORT\" HEALTHCHECK_WEBHOOK_URL=\"${HEALTHCHECK_WEBHOOK_URL:-}\" LOG=$hc_log $SCRIPT_DIR/deploy/healthcheck.sh"
     local tmp
     tmp="$(mktemp)"
     # The healthcheck line is removed by SCRIPT PATH, not by exact match.
-    # `grep -vFx` matches whole lines, and this line's text has already changed
-    # once (BASE= was added), so an entry written by a previous revision stopped
-    # matching the literal it had to be deleted by: it survived every run, and
-    # on a host with a non-default API_PORT that stale copy carried no BASE=,
-    # fell back to the watchdog's :8001 default, got a refused connection and
-    # was read as "not alive" -- pm2 restart against a healthy backend every
-    # five minutes.
-    #
-    # Two reasons to filter on the path rather than on the line text:
-    #   1. The P1 comes straight back the moment a future revision edits the
-    #      schedule, because the stale line stops matching on that too. Anchoring
-    #      on schedule AND path would work today and silently break then.
-    #   2. `./setup.sh cron` is an explicit operator action, and reclaiming lines
-    #      that run a script this script manages is the contract. A stale entry
-    #      is not something an operator asked for.
+    # `grep -vFx` matches whole lines, so an entry written by a revision that
+    # changed this line's text stops matching the literal it has to be deleted
+    # by: it survives every run, and on a host with a non-default API_PORT that
+    # stale copy carries no BASE=, falls back to the watchdog's :8001 default,
+    # gets a refused connection and is read as "not alive" -- a pm2 restart
+    # against a healthy backend every five minutes. Filtering on the path
+    # survives a future edit to the schedule; anchoring on schedule AND path
+    # would work today and silently break then.
     #
     # ACCEPTED COST, named so it is a decision and not an accident: a user's own
-    # crontab line that runs healthcheck.sh on a CUSTOM schedule is replaced by
-    # the managed one. Put the webhook or LOG overrides on the managed entry
-    # instead. Two things are NOT touched: a line that does not run these two
+    # crontab line running healthcheck.sh on a CUSTOM schedule is replaced by
+    # the managed one; put the webhook or LOG overrides on the managed entry
+    # instead. Two things are NOT touched: a line that does not run these
     # scripts, and a COMMENTED line that merely mentions healthcheck.sh -- a
     # commented-out entry is how an operator disables the watchdog, and deleting
-    # it would silently re-arm one they believe is off.
+    # it would silently re-arm one they believe is off. A MANAGED_BY=<tag>
+    # prefix cannot be the filter instead: an entry written before the tag
+    # existed carries no tag, so filtering on the tag alone would leave exactly
+    # the stale entry this avoids.
     #
-    # A MANAGED_BY=<tag> env prefix would let us keep such a line, but it cannot
-    # be the filter: an entry written before the tag existed carries no tag, so
-    # filtering on the tag alone would leave precisely the stale entry this P1 is
-    # about.
-    #
-    # The indexer line is still matched exactly -- this branch never changed its
+    # The indexer line is still matched exactly -- that branch never changed its
     # text, and an exact match keeps a user's hand-edited variant (a different
     # schedule, a `nice` tweak) from being deleted out from under them. That
-    # asymmetry is the cost of not wanting the same P1 there.
-    #
-    # The healthcheck filter matches on the path but skips COMMENTED lines, so a
-    # user who disabled the watchdog by commenting its entry out keeps that
-    # marker. A plain substring `grep -vF` deleted it, which would silently
-    # re-arm a watchdog the operator believes they had switched off.
+    # asymmetry is the cost of not having the same problem there.
     crontab -l 2>/dev/null \
         | grep -vFx "$line_idx" \
         | awk -v p="$SCRIPT_DIR/deploy/healthcheck.sh" \
@@ -962,27 +894,25 @@ run_cron() {
     echo "cron installed: */5  * * * * healthcheck.sh"
 }
 
-# The logrotate policy is machine-specific: it names this host's log
-# directories and the account logrotate has to drop privileges to, and neither is
-# knowable when the file is written. deploy/logrotate.conf is therefore a
-# TEMPLATE carrying the placeholder paths, and this renders it for the host it
-# runs on, which is what makes the installed policy correct on any host instead
-# of only on the one the paths were written for.
+# The logrotate policy is machine-specific: it names this host's log directories
+# and the account logrotate has to drop privileges to, neither knowable when the
+# file is written. deploy/logrotate.conf is therefore a TEMPLATE carrying
+# placeholder paths, and this renders it for the host it runs on.
 #
 # The three rewrites are anchored to the whole line, and that is the safety
-# argument rather than a style preference. A free-floating substitution would
-# happily "rewrite" a line that had been edited into something else and leave a
-# half-correct policy installed, which is worse than no rotation at all because
-# the operator has no reason to look again. So the patterns match the exact
-# lines, and the guard inside the renderer asserts that the TEMPLATE still
-# contains each of the three values those patterns match on: if one is gone,
-# nothing was rewritten, and refusing to emit is the only safe answer.
+# argument rather than a style preference: a free-floating substitution would
+# "rewrite" a line that had been edited into something else and leave a
+# half-correct policy installed, which is worse than no rotation because the
+# operator has no reason to look again. So the guard inside the renderer asserts
+# the TEMPLATE still contains each of the three values the patterns match on; if
+# one is gone, nothing was rewritten and refusing to emit is the only safe
+# answer.
 #
 # The third rewrite also UNCOMMENTS the `su` directive. It ships commented out
-# (backend/tests/test_deploy_paths.py fails a shipped deploy file that carries an
-# active `su` pinning one account, because that file is copied by hand as well as
-# rendered), but an installed policy that names no account runs every rotation as
-# root, so the renderer activates it with the account that invoked setup.sh.
+# (a test fails a shipped deploy file carrying an active `su`, because that file
+# is copied by hand as well as rendered), but a policy naming no account runs
+# every rotation as root, so the renderer activates it with the account that
+# invoked setup.sh.
 LOGROTATE_TEMPLATE="$SCRIPT_DIR/deploy/logrotate.conf"
 
 render_logrotate_conf() {
@@ -1001,11 +931,10 @@ render_logrotate_conf() {
         echo "ERROR: could not read $LOGROTATE_TEMPLATE" >&2
         return 1
     fi
-    # The guard is on the TEMPLATE, never on the output. The reason is the same
-    # one the rewrites are anchored to: what can actually go wrong is the
-    # template drifting away from the three values the rewrites above match on.
-    # If a value is gone, no line was rewritten, and a half-substituted policy
-    # would be installed that rotates nothing while logrotate reports success.
+    # The guard is on the TEMPLATE, never on the output: what can go wrong is the
+    # template drifting away from the three values the rewrites match on, which
+    # installs a half-substituted policy that rotates nothing while logrotate
+    # reports success.
     local expected
     for expected in \
         '/path/to/search-nlp-rag/logs/*.log' \
@@ -1039,7 +968,7 @@ run_logrotate() {
         echo "ERROR: could not render the logrotate policy; nothing installed." >&2
         return 1
     fi
-    # The source operand is the rendered file. install takes SOURCE DEST, so
+    # install takes SOURCE DEST, so the rendered file is the source operand and
     # this is what actually creates $LOGROTATE_CONF.
     sudo install -m 644 "$tmp" "$LOGROTATE_CONF"
     rm -f "$tmp"
@@ -1069,16 +998,14 @@ nginx_server_name() {
 #
 #   * Readability. This runs as the operator, but `nginx -t` runs as root.
 #     certbot writes privkey.pem 0600 root:root, so a readability test here
-#     refuses to emit a config that nginx would load happily -- and then points
-#     the operator at the very command they just ran. `nginx -t` is the
-#     authority on readability, and it is already the gate that rolls back.
+#     refuses to emit a config nginx would load happily -- and then points the
+#     operator at the very command they just ran. `nginx -t` is the authority on
+#     readability, and it is already the gate that rolls back.
 #   * Expiry. A lapsed certificate still loads; nothing breaks. Dropping the
 #     :443 server for one trades a browser warning for cleartext, and this
-#     function is reachable from `./setup.sh nginx` and `./setup.sh all`,
-#     where no certbot ever runs to put TLS back. So a lapsed certificate is
-#     reported by nginx_tls_cert_expired and renewed by `./setup.sh tls` (a
-#     certificate that has already lapsed is "until expiring" to certbot) --
-#     never used as a reason to go quiet on the wire.
+#     function is reachable from `./setup.sh nginx` and `./setup.sh all`, where
+#     no certbot ever runs to put TLS back. A lapsed certificate is reported and
+#     renewed by `./setup.sh tls` -- never used as a reason to go quiet.
 nginx_tls_cert_valid() {
     [ -n "$LE_DOMAIN" ] || return 1
     [ -f "$LE_CERT" ] && [ -s "$LE_CERT" ] || return 1
@@ -1087,10 +1014,10 @@ nginx_tls_cert_valid() {
 }
 
 # The full state of the leaf, as one word. Reporting only -- it never feeds
-# nginx_tls_mode, because no state of a certificate is a reason to remove a
-# live HTTPS server (see nginx_tls_mode).
+# nginx_tls_mode, because no state of a certificate is a reason to remove a live
+# HTTPS server.
 #
-# "unreadable" and "corrupt" are kept apart from "expired" on purpose.
+# "unreadable" and "corrupt" are kept apart from "expired" on purpose:
 # `openssl x509 -checkend` exits non-zero when the certificate has expired, when
 # it will not parse, and when it cannot be opened at all, and the three need
 # different advice. So the certificate is parsed FIRST (-enddate must print
@@ -1099,11 +1026,10 @@ nginx_tls_cert_valid() {
 #   missing     no file at all
 #   empty       present but zero bytes (an interrupted certbot)
 #   unreadable  present, non-empty, and not readable by whoever is running this
-#               -- certbot's privkey is 0600 root:root, so this is normal, and
-#               it is emphatically NOT expired. nginx runs as root and will
-#               decide.
-#   corrupt     readable, non-empty, and openssl cannot parse it. --keep-until-
-#               expiring will not fix this, so it needs its own remedy.
+#               -- normal, and emphatically NOT expired. nginx runs as root and
+#               will decide.
+#   corrupt     readable, non-empty, and openssl cannot parse it.
+#               --keep-until-expiring will not fix this; it needs its own remedy.
 #   unknown     no openssl to ask. The absence of a tool is not evidence.
 #   expired     parsed, and past its notAfter
 #   current     parsed, and in date
@@ -1144,15 +1070,14 @@ nginx_conf_serves_tls() {
 # instead of re-parsing NGINX_TLS themselves.
 #
 # "auto" is deliberately status-quo-biased: if the config already installed is
-# serving :443, it keeps serving :443. Removing TLS is something an operator
-# does on purpose with NGINX_TLS=off, not something a routine re-run does
-# because a probe came back empty. Every input this function cannot fully
-# vouch for -- an unset domain, a key this user cannot read, a certificate
-# openssl will not parse, a missing openssl, an ambiguous LE_ROOT -- is "I do
-# not know", and "I do not know" now means "do not change what is serving".
-# That is the whole class of bug, not one instance of it: three separate
-# downgrade paths came from deciding the posture from transient state at the
-# moment the nginx stage happened to run.
+# serving :443, it keeps serving :443. Removing TLS is something an operator does
+# on purpose with NGINX_TLS=off, not something a routine re-run does because a
+# probe came back empty. Every input this function cannot fully vouch for -- an
+# unset domain, a key this user cannot read, a certificate openssl will not
+# parse, a missing openssl, an ambiguous LE_ROOT -- is "I do not know", and "I do
+# not know" means "do not change what is serving". Three separate downgrade paths
+# came from deciding the posture from transient state at the moment the nginx
+# stage happened to run.
 nginx_tls_mode() {
     case "$NGINX_TLS" in
         off|0|false|no) echo "off" ;;
@@ -1319,16 +1244,13 @@ render_nginx_config() {
         # validates over plain HTTP, so redirecting it away would break renewal.
         # certbot's webroot plugin reads the token from CERTBOT_WEBROOT, which
         # must therefore be PUBLIC_PORT-reachable.
-        # limit_req_zone is http-scope: it is declared once, outside every
-        # server block, and this file is included from inside nginx's http block
-        # (sites-enabled/*), so top level HERE is http scope. Declaring it per
-        # server would give the plain-HTTP and TLS servers two independent
-        # buckets, so a client could double its rate by switching schemes.
         #
-        # It covers the chat stream only, for the reason spelled out on the
-        # location below: every other rate-limited route is already limited
-        # inside the application, and a second limiter there would shadow those
-        # knobs.
+        # limit_req_zone is http-scope: declared once, outside every server block,
+        # and this file is included from inside nginx's http block, so top level
+        # HERE is http scope. Declaring it per server would give the plain-HTTP
+        # and TLS servers two independent buckets, so a client could double its
+        # rate by switching schemes. It covers the chat stream only, for the
+        # reason spelled out on the location below.
         cat <<NGINX
 limit_req_zone \$binary_remote_addr zone=vccircle_chat_stream:10m rate=$NGINX_CHAT_LIMIT_RATE;
 
@@ -1362,11 +1284,11 @@ NGINX
         fi
         echo "}"
         if [ "$mode" = "on" ]; then
-            # "ssl http2" on the listen line works on both old and new nginx
-            # (the standalone "http2 on;" directive needs nginx >= 1.25).
-            # Mozilla intermediate settings, none of which need a resolver.
-            # No Strict-Transport-Security here on purpose: the Next.js config
-            # emits that header, and two sources of truth for max-age drift.
+            # "ssl http2" on the listen line works on both old and new nginx (the
+            # standalone "http2 on;" directive needs nginx >= 1.25). Mozilla
+            # intermediate settings, none of which need a resolver. No
+            # Strict-Transport-Security here on purpose: the Next.js config emits
+            # that header, and two sources of truth for max-age drift.
             cat <<NGINX
 
 server {
@@ -1399,10 +1321,10 @@ NGINX
 #
 # Existence and non-emptiness, NOT readability. This gate runs as whoever
 # invoked the script, while `nginx -t` runs as root and certbot writes
-# privkey.pem 0600 root:root, so testing readability here refused to emit a
-# config that nginx loads perfectly well -- and the error told the operator to
-# run the command they had just run. `nginx -t` is the authority on what nginx
-# can read, and it is already the gate that rolls back.
+# privkey.pem 0600 root:root, so a readability test here refuses to emit a config
+# nginx loads perfectly well -- and then tells the operator to run the command
+# they just ran. `nginx -t` is the authority on what nginx can read, and it is
+# already the gate that rolls back.
 nginx_site_config() {
     local mode
     mode="$(nginx_tls_mode)"
@@ -1436,25 +1358,24 @@ run_nginx() {
     local mode
     mode="$(nginx_tls_mode)"
     # Report what this site is actually going to serve, before it serves it.
-    # Gated on the certificate being PRESENT rather than on LE_DOMAIN being
-    # set: the interesting case is a pair on disk that is not being served, and
-    # a recovered domain would otherwise silence the very warning that matters.
+    # Gated on the certificate being PRESENT rather than on LE_DOMAIN being set:
+    # the interesting case is a pair on disk that is not being served, and a
+    # recovered domain would otherwise silence the warning that matters.
     local state
     state="$(nginx_tls_cert_state)"
     if [ "$mode" = "off" ]; then
-        # TLS_BOOTSTRAP=1 marks the pre-flight run_tls makes before certbot
-        # runs. Only THIS advisory is silenced there: certbot is genuinely
-        # about to make "you are on plain HTTP" irrelevant, so saying it would
-        # be noise. The diagnoses below are not silenced, because a corrupt or
-        # lapsed file is exactly what certbot will NOT fix -- it is issued
-        # with --keep-until-expiring and skips anything it cannot read -- and
-        # the pre-flight is often the first run that notices.
+        # TLS_BOOTSTRAP=1 marks the pre-flight run_tls makes before certbot runs.
+        # Only THIS advisory is silenced there: certbot is genuinely about to
+        # make "you are on plain HTTP" irrelevant. The diagnoses below are not
+        # silenced, because a corrupt or lapsed file is exactly what certbot
+        # will NOT fix -- issuance uses --keep-until-expiring and skips anything
+        # it cannot read -- and the pre-flight is often the first run to notice.
         # Braces, because `A || B && C` relies on left-associativity to mean
         # `(A || B) && C` and reads as something else entirely.
         if { [ -n "$LE_DOMAIN" ] || [ "$state" != "missing" ]; } && [ "${TLS_BOOTSTRAP:-0}" != "1" ]; then
-            # "no readable certificate" was wrong twice over: readability is
-            # not what this mode is decided on, and the certificate is often
-            # there and merely unusable. Name the pair instead.
+            # Name the pair, not its readability: readability is not what this
+            # mode is decided on, and the certificate is often there and merely
+            # unusable.
             echo "WARNING: this site is being served over plain HTTP." >&2
             echo "         No certificate and private key were found at" >&2
             echo "           $LE_CERT" >&2
@@ -1465,18 +1386,18 @@ run_nginx() {
         fi
     elif [ "$state" = "expired" ]; then
         # Reporting, not a mode change. The site stays on HTTPS: a lapsed
-        # certificate is a browser warning, and removing the :443 server
-        # over one would trade that warning for cleartext -- on a path
-        # (`./setup.sh nginx`, `./setup.sh all`) where nothing renews it.
+        # certificate is a browser warning, and removing the :443 server over one
+        # would trade that warning for cleartext -- on a path (`./setup.sh nginx`,
+        # `./setup.sh all`) where nothing renews it.
         echo "WARNING: the certificate at $LE_CERT has expired." >&2
         echo "         The site is still being served over HTTPS, but browsers" >&2
         echo "         will warn and clients may refuse the connection." >&2
         echo "         Renew it with: LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
     elif [ "$state" = "corrupt" ]; then
-        # Its own remedy, because re-running the tls stage will NOT fix
-        # this. The stage issues with --keep-until-expiring, which leaves
-        # anything certbot cannot parse exactly as it is -- so the operator
-        # would loop forever on a command that keeps reporting success.
+        # Its own remedy, because re-running the tls stage will NOT fix this: it
+        # issues with --keep-until-expiring, which leaves anything certbot cannot
+        # parse exactly as it is, so the operator would loop forever on a command
+        # that keeps reporting success.
         echo "WARNING: the certificate at $LE_CERT cannot be read as a" >&2
         echo "         certificate at all. This is not an expiry problem and" >&2
         echo "         re-running the tls stage will not fix it: issuance uses" >&2
@@ -1485,11 +1406,10 @@ run_nginx() {
         echo "           sudo rm -f $LE_CERT" >&2
         echo "           LE_DOMAIN=your.domain LE_EMAIL=you@example.com ./setup.sh tls" >&2
     fi
-    # "unreadable" and "unknown" are silent on purpose. An unreadable
-    # certificate is normal -- certbot's key is 0600 root:root -- and nginx
-    # runs as root and will have the last word via `nginx -t`, which
-    # triggers the rollback if the certificate really is unusable. Claiming
-    # expiry there would be the false warning this case exists to avoid.
+    # "unreadable" and "unknown" are silent on purpose. An unreadable certificate
+    # is normal -- certbot's key is 0600 root:root -- and nginx runs as root and
+    # has the last word via `nginx -t`, which rolls back if the certificate is
+    # really unusable. Claiming expiry there is the false warning this avoids.
     local tmp
     tmp="$(mktemp)"
     # Render to a temp file first: nothing reaches the live site until nginx has
@@ -1565,23 +1485,18 @@ run_tls() {
     # modes (only "location /" becomes a redirect, and "^~" outranks it), so
     # dropping to plain HTTP is only ever needed on a first run. Forcing "off"
     # here rewrote a live HTTPS site to cleartext and reloaded nginx even when a
-    # perfectly good certificate was already on disk, so a certbot hiccup
-    # during a routine re-run left the site in cleartext. Under "auto" an
-    # existing, usable certificate is kept and a missing one still falls back
-    # to plain HTTP for the challenge.
+    # perfectly good certificate was already on disk, so a certbot hiccup during
+    # a routine re-run left the site in cleartext.
     #
     # This pre-flight is BEST EFFORT, which is a different policy from the one
-    # run_nginx applies to itself, and deliberately so. run_nginx exists to put
-    # a config in front of a live site, so when it cannot render one it stops
-    # and says so. This step does not exist to manage the config -- it exists to
-    # obtain a certificate. It also cannot improve on what is already there:
-    # when the status-quo default resolves to TLS and the pair is gone or
-    # unreadable, the config already installed is a TLS config, and a TLS config
-    # serves the ACME challenge exactly as well as a plain one. So a failure
-    # here means "leave it alone", not "give up" -- and aborting is what made
-    # a live HTTPS site whose certificate had been deleted impossible to
-    # re-provision: the stage died before certbot ran and told the operator to
-    # run the very command they had just run.
+    # run_nginx applies to itself, and deliberately so: run_nginx exists to put a
+    # config in front of a live site, so when it cannot render one it stops and
+    # says so. This step exists to obtain a certificate, and it cannot improve on
+    # what is already there -- when the status-quo default resolves to TLS and
+    # the pair is gone or unreadable, the installed config is a TLS config, which
+    # serves the ACME challenge exactly as well as a plain one. A failure here
+    # means "leave it alone", not "give up": aborting is what made a live HTTPS
+    # site whose certificate had been deleted impossible to re-provision.
     local preflight
     NGINX_TLS=auto
     preflight="$(nginx_tls_mode)"
@@ -1608,7 +1523,7 @@ run_tls() {
         # Report the posture that is actually installed, not a fixed one: on a
         # re-run the pre-flight above kept the existing TLS config, and telling
         # the operator the site is on plain HTTP is the one thing they must not
-        # be left believing here.
+        # be left believing.
         if [ "$preflight" = "on" ]; then
             echo "ERROR: certbot failed; the existing TLS config is still installed and serving." >&2
         else
@@ -1658,11 +1573,10 @@ main() {
     if [ "$ALL" -eq 1 ]; then
         # tls is deliberately not part of "all": it needs a domain, an email and
         # network access that an unattended bootstrap must not require.
-        # logrotate is deliberately not part of "all" either: it needs the
-        # logrotate binary, and a host that does not have it installed (a
-        # container, a fresh CI box) must still be able to run the full
-        # bootstrap. Unattended rotation is also the wrong default -- the
-        # policy is host-specific, so it is an operator step, run once.
+        # logrotate is not part of "all" either: it needs the logrotate binary,
+        # and a host without it (a container, a fresh CI box) must still be able
+        # to run the full bootstrap. Unattended rotation is also the wrong
+        # default -- the policy is host-specific, so it is an operator step.
         STAGES=(deps backend index frontend services pm2-startup cron nginx)
     fi
     if [ ${#STAGES[@]} -eq 0 ]; then

@@ -50,15 +50,10 @@ describe('isSafeUrl — blocks protocol-relative and backslash escapes', () => {
   })
 })
 
-// The escapes above carry no scheme, so `PROTOCOL_RELATIVE_RE` and the
-// origin comparison catch them. These do: the WHATWG parser reads a backslash
-// as a separator for special schemes, so the backslash spelling still ends up
-// on an `https:` URL and the scheme allowlist alone waves it through. A pinned
-// `false` (not a parity assertion) is the only assertion that catches this.
-//
-// The `https://`-prefixed spellings at the end are the sharp end: their first
-// eight characters really are `https://`, so the old inline `/^https?:\/\//`
-// check the chat source list used admitted them as clickable links.
+// The payload tables above are the guard's security contract. Unlike them, these carry a real
+// scheme, so the scheme allowlist alone waves them through: the WHATWG parser treats a backslash
+// as a separator, leaving a well-formed off-origin https URL. The `https://`-prefixed spellings
+// are the sharp end — they match a plain `/^https?:\/\//` prefix check.
 describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
   const SCHEME_ESCAPES = [
     'https:/\\evil.com',
@@ -84,17 +79,11 @@ describe('isSafeUrl — blocks scheme-prefixed backslash escapes', () => {
   })
 
   it('resolves those payloads to an off-origin https URL in a real parser', () => {
-    // Pins *why* the guard has to refuse them: without the backslash check the
-    // URL is a well-formed off-origin https link, so nothing downstream of the
-    // scheme check can object to it.
     expect(new URL('https:/\\evil.com', BASE).href).toBe('https://evil.com/')
     expect(new URL('https://\\evil.com', BASE).href).toBe('https://evil.com/')
   })
 
   it('refuses the spellings the old inline https-prefix check admitted', () => {
-    // The defect this closes, stated as a test: these payloads pass
-    // `/^https?:\/\//`, which is why the chat source list rendered them as
-    // clickable links that navigate to `https://evil.com/`.
     const OLD_INLINE_RE = /^https?:\/\//
     const ADMITTED = ['https://\\evil.com', 'https://\\/evil.com', 'https://\\\\evil.com']
     for (const payload of ADMITTED) {
@@ -140,8 +129,7 @@ describe('isSafeUrl — relative URLs stay same-origin', () => {
 })
 
 describe('isSafeUrl — SSR parity', () => {
-  // jsdom always defines `window`, so the server path has to be forced or
-  // these assertions silently take the client branch and prove nothing.
+  // jsdom always defines `window`, so the server path must be forced or these assertions prove nothing.
   afterEach(() => {
     vi.unstubAllGlobals()
   })
@@ -150,9 +138,6 @@ describe('isSafeUrl — SSR parity', () => {
     vi.stubGlobal('window', undefined)
     expect(typeof window).toBe('undefined')
 
-    // The old helper passed `undefined` as the base during SSR, so every
-    // relative URL threw and was rejected — server HTML then disagreed with
-    // the client render after hydration.
     expect(isSafeUrl('/articles/9')).toBe(true)
   })
 
@@ -168,16 +153,13 @@ describe('isSafeUrl — SSR parity', () => {
 })
 
 describe('isSafeUrl — server/client parity', () => {
-  // The guard runs during SSR (no `window`) and again after hydration (real
-  // `window`). If those two disagree the server emits markup React throws
-  // away, or worse emits a clickable off-origin link the client then strips.
-  // A parity assertion is the right guard: the defect *is* the divergence.
+  // The guard runs in SSR and again after hydration; if the two disagree, the server emits markup the
+  // client throws away — or a clickable off-origin link. The defect IS the divergence.
   const CLIENT_ORIGIN = 'https://app.vccircle.com/'
 
   function verdictIn(url: string, client: boolean): boolean {
     vi.stubGlobal('window', client ? { location: { href: CLIENT_ORIGIN } } : undefined)
-    // Prove the stub landed; a silently-ineffective `vi.stubGlobal` would let
-    // this whole block pass without ever exercising the server branch.
+    // Prove the stub landed: a silently-ineffective `vi.stubGlobal` would skip the server branch.
     expect(typeof window === 'undefined' ? 'server' : 'client').toBe(
       client ? 'client' : 'server'
     )
@@ -188,9 +170,7 @@ describe('isSafeUrl — server/client parity', () => {
     vi.unstubAllGlobals()
   })
 
-  // `\x00` survives `String.prototype.trim`, so these slip past the
-  // protocol-relative regex; only the origin comparison catches them, and only
-  // if the stand-in base names a host nothing can resolve back to.
+  // `\x00` survives `String.prototype.trim`, so only the origin comparison catches these.
   const NUL_ESCAPES = ['\x00//localhost', '\x00//localhost/x', '\x00//localhost:443']
 
   it.each(NUL_ESCAPES)('rejects %j on the server and on the client alike', (url) => {
@@ -235,10 +215,8 @@ describe('isSafeUrl — server/client parity', () => {
     'data:text/html,<script>alert(1)</script>',
   ]
 
-  // Browsers strip leading C0 controls before parsing, so these look
-  // schemeless on the raw string yet resolve as real protocol-relative
-  // escapes. They are the class that used to make the two environments
-  // disagree, and each must be refused outright rather than left to parsing.
+  // Browsers strip leading C0 controls before parsing, so these look schemeless on the raw string yet
+  // resolve as real protocol-relative escapes. Each must be refused outright rather than left to parsing.
   it.each(['\x00//evil.com', '\x00//ssr.invalid', '\x01//evil.com', '\x1f//localhost'])(
     'rejects the control-prefixed escape %j before parsing',
     (url) => {
@@ -251,12 +229,9 @@ describe('isSafeUrl — server/client parity', () => {
     expect(verdictIn(url, false)).toBe(verdictIn(url, true))
   })
 
-  // Two or more leading slashes/backslashes aimed at the stand-in origin
-  // resolve to exactly that origin on the server, so the origin comparison
-  // alone would wave them through there while the client (base
-  // https://app.vccircle.com/) rejects them as off-origin. A parity assertion
-  // alone would not catch that, because it only compares the two verdicts; the
-  // explicit `false` pins the actual outcome.
+  // Aimed at the stand-in origin, these resolve to exactly that origin on the server, so only the
+  // origin comparison would wave them through there; a parity assertion compares verdicts and would
+  // not catch it. The explicit `false` pins the outcome.
   it.each(['/\\ssr.invalid/x', '\\/ssr.invalid/x', '\\\\ssr.invalid/x'])(
     'rejects the backslash escape %j aimed at the stand-in origin',
     (url) => {
@@ -265,11 +240,8 @@ describe('isSafeUrl — server/client parity', () => {
     }
   )
 
-  // The single-backslash form `\ssr.invalid/x` is absent from the list above
-  // because it is a same-origin path in a browser, not an escape. It is still
-  // refused, by the backslash check rather than by the origin comparison, so
-  // it gets its own pin: the CORPUS parity assertion above passes either way,
-  // and this is the assertion that would notice the strictness being lost.
+  // A browser same-origin path, not an escape — refused anyway by the backslash check, which is why
+  // it needs its own pin: the CORPUS parity assertion above passes either way.
   it('refuses the same-origin single-backslash path on both sides', () => {
     expect(verdictIn('\\ssr.invalid/x', false)).toBe(false)
     expect(verdictIn('\\ssr.invalid/x', true)).toBe(false)
@@ -277,12 +249,9 @@ describe('isSafeUrl — server/client parity', () => {
 })
 
 describe('isSafeUrl — deliberate strictness on control characters', () => {
-  // The browser is not uniform here: it percent-encodes NUL and the other C0
-  // controls, but silently REMOVES tab/CR/LF. These assertions pin the fact
-  // that the guard refuses all of them anyway. The tab case is the one that
-  // costs something — a real URL with a stray tab renders as inert text — and
-  // that is an accepted fail-closed trade-off, not an accident. If someone
-  // relaxes CONTROL_CHAR_RE, this block is the thing that should complain.
+  // The browser percent-encodes NUL and the other C0 controls but silently REMOVES tab/CR/LF. Refusing
+  // tab costs something (a real URL with a stray tab renders as inert text) and is an accepted
+  // fail-closed trade-off. Relaxing CONTROL_CHAR_RE should break this block.
   it.each([
     ['NUL is percent-encoded by the browser but still refused', 'https://ok.com/a\x00b'],
     ['tab is removed by the browser but still refused', 'https://ok.com/a\tb'],
@@ -293,8 +262,7 @@ describe('isSafeUrl — deliberate strictness on control characters', () => {
   })
 
   it('still allows an ordinary URL with a percent-encoded space', () => {
-    // A literal space is not a C0 control, so it is not caught by this guard;
-    // the parser encodes it and the link stays usable.
+    // A literal space is not a C0 control: the parser encodes it and the link stays usable.
     expect(isSafeUrl('https://ok.com/a b', BASE)).toBe(true)
   })
 })

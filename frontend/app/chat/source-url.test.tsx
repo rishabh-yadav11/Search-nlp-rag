@@ -1,11 +1,7 @@
 /**
- * Issue #325 — the chat `SourceList` decided `href` safety with its own inline
- * `/^https?:\/\//` test instead of the shared `isSafeUrl` hardened in #246.
- *
- * These assertions are on the rendered DOM of the real page, not on the guard:
- * what matters is whether a backend-supplied source URL ever reaches an `a`.
- * Each unsafe payload is rendered as a whole thread so the verdict is observed
- * exactly where a reader would click it.
+ * Assertions are on the rendered DOM of the real page, not on the guard: what matters is whether a
+ * backend-supplied source URL ever reaches an `a`. Each unsafe payload is rendered as a whole thread,
+ * so the verdict is observed exactly where a reader would click it.
  */
 import { fireEvent, render, screen } from '@testing-library/react'
 import type * as DataVizModule from './DataViz'
@@ -27,17 +23,10 @@ const SESSION = { id: 's1', title: 'Budget', created_at: 1_700_000_000, updated_
 type Payload = { id: number; title: string; url: string; score: number }
 
 /**
- * The escape spellings #246 was written for, in the three forms that matter:
- * bare (`//evil.com`, `/\evil.com`, …), carrying a scheme but no `//`
- * (`https:/\evil.com`, …) and carrying a full `https://` prefix
- * (`https://\evil.com`, …). A browser resolves every one of them to
- * `https://evil.com/`, so each must end up inert rather than clickable.
- *
- * The third group is the one that proves anything about the old inline
- * `/^https?:\/\//` check: the first eight characters of those payloads *are*
- * `https://`, so that regex admits them and the old code rendered a
- * clickable off-origin link. The first two groups are refused by the old
- * check too, and are here to pin that the shared guard keeps refusing them.
+ * Escape spellings in the three forms that matter: bare (`//evil.com`, `/\evil.com`, …), scheme but no
+ * `//` (`https:/\evil.com`, …), and full `https://` prefix (`https://\evil.com`, …). A browser resolves
+ * every one to `https://evil.com/`. The third group is what the old inline `/^https?:\/\//` check
+ * admitted — those payloads' first eight characters really are `https://`.
  */
 const UNSAFE: Payload[] = [
   { id: 1, title: 'Script scheme', url: "javascript:fetch(localStorage.getItem('vccircle_auth_token'))", score: 1 },
@@ -79,9 +68,7 @@ function jsonResponse(data: unknown): StubResponse {
   return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) }
 }
 
-// The signed-in user the /api/auth/me stub reports. The page decides whether to
-// redirect based on this, and there is no longer any storage-based session to
-// seed.
+// The user /api/auth/me reports; the page's signed-in check reads it, and there is no session in storage.
 const ME_USER = { id: 'u1', email: 'user@example.com', name: 'User', role: 'user', is_active: true }
 
 beforeEach(() => {
@@ -91,8 +78,7 @@ beforeEach(() => {
     'fetch',
     vi.fn(async (input: RequestInfo | URL): Promise<StubResponse> => {
       const url = String(input)
-      // The session guard goes through /api/auth/me; without this the page
-      // treats the visitor as signed out and redirects to /login.
+      // Without this the page treats the visitor as signed out and redirects to /login.
       if (url.endsWith('/api/auth/me')) return jsonResponse(ME_USER)
       if (url.endsWith('/api/chat/sessions')) return jsonResponse([SESSION])
       if (url.includes('/api/chat/sessions/')) return jsonResponse({ ...SESSION, messages: MESSAGES })

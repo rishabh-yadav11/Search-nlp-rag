@@ -10,30 +10,19 @@ import {
 } from './format'
 
 /**
- * These are the assertions the per-page copies could not make, because there
- * was no second copy to compare against. The date ones matter most: the stored
- * `"YYYY-MM-DD"` string is a calendar date, not a UTC instant, and the two
- * recommendation cards used to hand it to `new Date(...)`, which reads it as
- * UTC midnight and then rendered it in the viewer's zone — so the same article
- * showed a different day in a card than on the search page for anyone west of
- * Greenwich.
+ * The stored `"YYYY-MM-DD"` string is a calendar date, not a UTC instant: handing it to `new Date(...)`
+ * reads it as UTC midnight and renders it in the viewer's zone, so the same article showed a different
+ * day in a card than on the search page west of Greenwich.
  */
 
-// The two are the same code, so a helper that takes either is a readability
-// win, not a behavioural one.
 type Fn = (s: string) => string
 
 describe('parseLocalDate — a bare YYYY-MM-DD is a local calendar date', () => {
   it('parses a bare date at local midnight, offset from UTC by the local zone', () => {
-    // A local Date constructor is what makes this a local calendar date.
-    // `Date.parse('2024-05-01')` yields UTC midnight instead, so the two
-    // instants differ by exactly the local UTC offset: 0 in UTC, and
-    // -19800000 ms in IST, where that UTC midnight is still 2024-04-30.
-    // Asserting "the two are not equal" only holds for a non-zero offset and
-    // is false on a UTC runner, so the invariant is stated as the offset.
-    // `getTimezoneOffset()` is minutes west of UTC, so it carries the sign
-    // directly; negating it would both invert the comparison and make UTC
-    // yield -0, which `toBe`'s Object.is check rejects against +0.
+    // A local Date constructor is what makes this a local calendar date; `Date.parse('2024-05-01')`
+    // yields UTC midnight instead. Stating the invariant as the offset holds on a UTC runner too, and
+    // `getTimezoneOffset()` (minutes west of UTC) carries the sign directly: negating it would invert
+    // the comparison and make UTC yield -0, which `toBe`'s Object.is check rejects against +0.
     const localMidnight = new Date(2024, 4, 1).getTime()
     const utcMidnight = Date.parse('2024-05-01')
     expect(parseLocalDate('2024-05-01')).toBe(localMidnight)
@@ -56,8 +45,7 @@ describe('formatArticleDate — the same day for every viewer', () => {
   const FORMATS: Fn[] = [formatArticleDate]
 
   it('renders a bare stored date as that exact calendar day', () => {
-    // The point of the whole consolidation: the label is the day in the
-    // record, not a day that depends on where the reader is.
+    // The point of the consolidation: the label is the day in the record, not a viewer-dependent day.
     for (const format of FORMATS) {
       expect(format('2024-05-01')).toBe('May 1, 2024')
       expect(format('2024-12-31')).toBe('Dec 31, 2024')
@@ -72,8 +60,7 @@ describe('formatArticleDate — the same day for every viewer', () => {
   })
 
   it('does not roll a bare date to the previous day', () => {
-    // The concrete failure the cards had: UTC midnight rendered in a
-    // timezone behind UTC lands on the day before.
+    // The concrete failure the cards had: UTC midnight in a timezone behind UTC lands on the day before.
     for (const format of FORMATS) {
       expect(format('2024-01-01')).not.toMatch(/Dec 31, 2023/)
     }
@@ -151,17 +138,13 @@ describe('formatEpochRelative — labels a UNIX timestamp in seconds', () => {
 
 describe('formatEpochDateTime — a pinned absolute instant', () => {
   it('renders a known timestamp to a known string', () => {
-    // A literal, not a re-derivation: the dashboard test delegates to this
-    // function, so if this assertion also called the function it would only be
-    // comparing the page against itself. The literal is what makes the
-    // locale/zone pinning an actual guarantee rather than an intention.
+    // A literal, not a re-derivation: the dashboard test delegates to this function, so re-deriving
+    // here would compare the page against itself.
     expect(formatEpochDateTime(1_700_000_000)).toBe('Nov 14, 2023, 10:13 PM')
   })
 
   it('does not shift with the ambient timezone', () => {
-    // 10:13 PM UTC is 02:13 the next day in Los Angeles and 23:13 the same day
-    // in Tokyo. Pinning `timeZone: 'UTC'` is what makes the value above true
-    // everywhere, so the pin is asserted rather than assumed.
+    // 10:13 PM UTC is 02:13 the next day in Los Angeles, so the `timeZone: 'UTC'` pin is asserted, not assumed.
     const previousTz = process.env.TZ
     try {
       process.env.TZ = 'America/Los_Angeles'
@@ -195,17 +178,15 @@ describe('formatCost — one US-dollar format for every surface', () => {
     expect(formatCost(1.5)).toBe('$1.50')
     expect(formatCost(12.3456)).toBe('$12.35')
     expect(formatCost(1234.5)).toBe('$1,234.50')
-    // Below a dollar: enough sub-cent precision to show a real per-message
-    // cost, but never padded out with meaningless zeros, and at least two
-    // decimal places so the value still reads as money.
+    // Below a dollar: enough sub-cent precision for a real per-message cost, never padded with
+    // meaningless zeros, and at least two decimal places so it still reads as money.
     expect(formatCost(0.5)).toBe('$0.50')
     expect(formatCost(0.0123)).toBe('$0.0123')
     expect(formatCost(0.000001)).toBe('$0.000001')
   })
 
   it('never shows a fraction finer than the amount carries', () => {
-    // Guards the rule the consolidation chose: a whole-dollar amount is shown
-    // as dollars and cents, not padded out to six decimals.
+    // A whole-dollar amount is shown as dollars and cents, not padded to six decimals.
     expect(formatCost(99.999)).toBe('$100.00')
     expect(formatCost(1234.5678)).toBe('$1,234.57')
   })

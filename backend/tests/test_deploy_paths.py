@@ -34,14 +34,11 @@ APPS = (
 KNOWN_HOME_LITERAL = re.compile(r"home/ubuntu")
 GENERIC_HOME = re.compile(r"/(?:home/[a-z_][a-z0-9_-]*|Users/[A-Za-z0-9_.-]+)/")
 
-# A shipped `su <user> <group>` directive pinning one account. Kept as a
-# separate pattern because, unlike the two above, it names an identity rather
-# than a path and has no leading slash to key off.
-#
-# The shipped placeholders are commented out, so they cannot match `^\s*su\s+`
-# -- and an ACTIVE but unedited `su deploy-user deploy-group` must fail, since
-# that is exactly the state an operator reaches by following the file's own
-# instruction and forgetting to substitute.
+# A shipped `su <user> <group>` directive pinning one account. Separate from
+# the two above because it names an identity rather than a path and has no
+# leading slash to key off. The shipped placeholders are commented out, so they
+# cannot match -- but an ACTIVE unedited `su deploy-user deploy-group` must
+# fail, since that is the state an operator reaches by forgetting to substitute.
 SU_DIRECTIVE = re.compile(r"^\s*su\s+\S+")
 
 # A home-relative path to a `logs/` directory, e.g. `$HOME/search-nlp-rag/logs`.
@@ -49,8 +46,7 @@ SU_DIRECTIVE = re.compile(r"^\s*su\s+\S+")
 # match, so a script defaulting a log path to `$HOME/<fixed-name>/logs` resolves
 # to a different directory on every other checkout -- writing, or rotating,
 # nothing where the operator expects. Scoped to `logs/` deliberately: a plain
-# `$HOME/.local/bin` PATH entry is a legitimate home-relative path, not a
-# checkout pin.
+# `$HOME/.local/bin` PATH entry is legitimate, not a checkout pin.
 HOME_RELATIVE_PIN = re.compile(r"\$(?:\{HOME\}|HOME)/[A-Za-z0-9_.-]+/logs/")
 
 # A quoted string starting at the filesystem root, i.e. a path baked into the
@@ -123,9 +119,9 @@ def test_no_hardcoded_home_directory_in_shipped_deploy_config(
     """No shipped deploy file may pin a path to someone's home or checkout name.
 
     A checkout belonging to anyone else would rotate logs that do not exist, or
-    start pm2 processes in a missing directory. The three patterns cover the
-    distinct spellings that defect takes: a literal absolute home, a home
-    written as `$HOME/...`, and a logrotate `su` account.
+    start pm2 processes in a missing directory. The patterns cover the distinct
+    spellings that defect takes: a literal absolute home, a home written as
+    `$HOME/...`, and a logrotate `su` account.
     """
     found = _violations(pattern, path)
     assert found == [], (
