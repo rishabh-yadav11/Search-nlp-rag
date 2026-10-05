@@ -9,7 +9,8 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
@@ -186,19 +187,33 @@ class ChatStore:
             "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at)"
         )
         # Migration for existing databases created before token/cost tracking.
-        cols = await self._db.execute_fetchall("PRAGMA table_info(messages)")
-        col_names = {row["name"] for row in cols}
-        if "prompt_tokens" not in col_names:
-            await self._db.execute("ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
-            await self._db.execute("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
-            await self._db.execute("ALTER TABLE messages ADD COLUMN cost REAL NOT NULL DEFAULT 0")
-        if "latency_ms" not in col_names:
-            await self._db.execute("ALTER TABLE messages ADD COLUMN latency_ms REAL NOT NULL DEFAULT 0")
-        # Migration: a turn that ended because the client disconnected must stay
-        # visible in history (aborted=1) instead of being silently erased.
-        if "aborted" not in col_names:
-            await self._db.execute("ALTER TABLE messages ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0")
-        await self._db.commit()
+        #
+        # Each column is guarded on its OWN name. The ALTERs are separate
+        # statements, so a crash between two of them leaves a PARTIAL column set,
+        # and a migration that keyed the later columns off the first one read
+        # that as complete and never repaired it: every read path then failed on
+        # the column that never landed, with nothing able to add it afterwards.
+        #
+        # The whole migration is one unit of work, which also settles a
+        # concurrent boot: the four workers' `BEGIN IMMEDIATE`s serialise, so a
+        # worker that arrives second reads `table_info` with the schema already
+        # complete instead of racing the first into `duplicate column name`.
+        async with self._unit_of_work() as db:
+            db.row_factory = aiosqlite.Row
+            cols = await db.execute_fetchall("PRAGMA table_info(messages)")
+            col_names = {row["name"] for row in cols}
+            if "prompt_tokens" not in col_names:
+                await db.execute("ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0")
+            if "completion_tokens" not in col_names:
+                await db.execute("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0")
+            if "cost" not in col_names:
+                await db.execute("ALTER TABLE messages ADD COLUMN cost REAL NOT NULL DEFAULT 0")
+            if "latency_ms" not in col_names:
+                await db.execute("ALTER TABLE messages ADD COLUMN latency_ms REAL NOT NULL DEFAULT 0")
+            # Migration: a turn that ended because the client disconnected must stay
+            # visible in history (aborted=1) instead of being silently erased.
+            if "aborted" not in col_names:
+                await db.execute("ALTER TABLE messages ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -209,6 +224,33 @@ class ChatStore:
         if self._db is None:
             raise RuntimeError("ChatStore is not connected; call connect() first")
         return self._db
+
+    @asynccontextmanager
+    async def _unit_of_work(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Run a group of statements as ONE atomic, durable unit.
+
+        A dedicated connection, not the shared one: transactions are
+        connection-scoped, so an open unit on `self._db` would be committed or
+        rolled back by whichever unrelated request happened to call
+        `commit()`/`rollback()` next. `isolation_level=None` keeps this
+        connection's explicit BEGIN from nesting inside an implicit one, and
+        `BEGIN IMMEDIATE` takes the WAL write lock up front so a mid-transaction
+        lock upgrade cannot fail past the busy timeout.
+
+        `foreign_keys` is per-connection, so it must be set here too.
+        """
+        db = await aiosqlite.connect(self._path, isolation_level=None)
+        try:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("BEGIN IMMEDIATE")
+            yield db
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
 
     async def create_session(self, user_id: str, title: str = "New chat") -> SessionOut:
         db = self._require_db()
@@ -329,6 +371,7 @@ class ChatStore:
         cost: float = 0.0,
         latency_ms: float = 0.0,
         aborted: bool = False,
+        ts: float | None = None,
     ) -> MessageOut:
         """Append to a session whose ownership the caller has ALREADY proven.
         Any entry point that has not proven ownership must go through
@@ -338,31 +381,36 @@ class ChatStore:
         a conversation deleted mid-turn still fails as a clean 404, atomically and
         with no extra round trip.
 
-        The INSERT, the updated_at UPDATE and the COMMIT stay separate: aiosqlite
-        runs one statement per call, and the COMMIT is what makes the message and
-        the bump visible together."""
-        db = self._require_db()
-        ts = _now()
-        cur = await db.execute(
-            "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted)"
-            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
-            " WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
-            (session.id, role, content, json_dumps(sources or []), ts, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted), session.id),
-        )
-        if cur.rowcount == 0:
-            # The guarded INSERT wrote nothing, so there is nothing to roll back.
-            raise HTTPException(status_code=404, detail="conversation not found")
-        await db.execute(
-            "UPDATE sessions SET updated_at = ? WHERE id = ?",
-            (ts, session.id),
-        )
-        await db.commit()
+        The message and the session's `updated_at` bump are one unit, so a turn
+        cancelled between them leaves neither: on the shared connection the
+        half-written message would be published by whichever unrelated request
+        committed next.
+
+        `ts` is the row's `created_at`, for a caller that has to identify this row
+        again later. A cancellation inside this call's own COMMIT returns no id,
+        and the timestamp is what lets that cleanup find THIS turn's row rather
+        than a concurrent one asking the same question.
+        """
+        stamp = _now() if ts is None else ts
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted)"
+                " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+                " WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
+                (session.id, role, content, json_dumps(sources or []), stamp, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted), session.id),
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="conversation not found")
+            await db.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (stamp, session.id),
+            )
         return MessageOut(
             id=cur.lastrowid,
             role=role,
             content=content,
             sources=sources or [],
-            created_at=ts,
+            created_at=stamp,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost=cost,
@@ -436,21 +484,42 @@ class ChatStore:
     async def delete_session(self, session_id: str, user_id: str) -> None:
         if await self.get_session(session_id, user_id) is None:
             raise HTTPException(status_code=404, detail="conversation not found")
-        db = self._require_db()
-        await db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        await db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-        await db.commit()
+        # One statement does the whole job: ON DELETE CASCADE takes the messages
+        # with the session row, so the conversation cannot end up with its
+        # history already destroyed and its own row still there -- which is what
+        # a delete that failed between two statements used to leave behind, for
+        # the next unrelated write to publish.
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "DELETE FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id)
+            )
 
     async def _delete_authorized(self, session: SessionOut, message_id: int) -> None:
         """Roll back a message in a session whose ownership the caller has ALREADY
-        proven. A conversation deleted mid-turn is still a no-op: delete_session
-        removes that conversation's messages before its own row, so by the time
-        this DELETE runs the message is already gone."""
-        db = self._require_db()
-        await db.execute(
-            "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session.id)
+        proven. A conversation deleted mid-turn is still a no-op: delete_session's
+        cascade removes that conversation's messages together with its own row, so
+        by the time this DELETE runs the message is already gone."""
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "DELETE FROM messages WHERE id = ? AND session_id = ?", (message_id, session.id)
+            )
+
+    async def _message_id_at(
+        self, session_id: str, created_at: float, role: str, content: str
+    ) -> int | None:
+        """The id of the message this session holds at exactly `created_at`, or
+        None if it holds none.
+
+        Identity, not resemblance. A caller that lost a row's id looks it up by
+        the timestamp it wrote, so a concurrent turn carrying the same text is a
+        different row and can never be the one this finds.
+        """
+        row = await self._fetchone(
+            "SELECT id FROM messages"
+            " WHERE session_id = ? AND created_at = ? AND role = ? AND content = ?",
+            (session_id, created_at, role, content),
         )
-        await db.commit()
+        return row["id"] if row else None
 
     async def delete_message(self, session_id: str, user_id: str, message_id: int) -> None:
         """Remove a single message. No-op if the session is gone."""
@@ -481,15 +550,14 @@ class ChatStore:
         race. The audit prune rides here so recording a read stays one INSERT on
         this 30s-polled path."""
         now = _now()
-        db = self._require_db()
-        cursor = await db.execute(
-            "DELETE FROM sessions WHERE updated_at < ?", (now - config.CHAT_RETENTION_DAYS * 86400,)
-        )
-        await db.execute(
-            "DELETE FROM admin_audit WHERE created_at < ?",
-            (now - AUDIT_RETENTION_DAYS * 86400,),
-        )
-        await db.commit()
+        async with self._unit_of_work() as db:
+            cursor = await db.execute(
+                "DELETE FROM sessions WHERE updated_at < ?", (now - config.CHAT_RETENTION_DAYS * 86400,)
+            )
+            await db.execute(
+                "DELETE FROM admin_audit WHERE created_at < ?",
+                (now - AUDIT_RETENTION_DAYS * 86400,),
+            )
         return cursor.rowcount
 
     async def stats(self, user_id: str) -> SessionStatsOut:
@@ -2161,12 +2229,14 @@ async def _start_turn(
     if session is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     try:
-        user_msg = await s._append_authorized(session, "user", question)
+        ts = _now()
+        user_msg = await s._append_authorized(session, "user", question, ts=ts)
     except asyncio.CancelledError:
         # In the INSERT's own COMMIT there is no id to delete by (`user_msg`
-        # was never bound), so the row is found instead.
+        # was never bound), so the row is found by the timestamp it was written
+        # with instead.
         await _reconcile_cancelled_turn(
-            lambda: _drop_unbound_user_row(s, session, user_id, question)
+            lambda: _drop_unbound_user_row(s, session, ts, question)
         )
         raise
     try:
@@ -2281,20 +2351,23 @@ async def _reply_is_stored(s: ChatStore, session_id: str, user_id: str, after_id
     return bool(rows) and rows[-1].role == "assistant" and rows[-1].id > after_id
 
 
-async def _drop_unbound_user_row(s: ChatStore, session: SessionOut, user_id: str, question: str) -> None:
-    """Remove a user message row whose id was never returned to the caller.
+async def _drop_unbound_user_row(s: ChatStore, session: SessionOut, ts: float, question: str) -> None:
+    """Remove the user message row this turn wrote, whose id was never returned
+    to the caller.
 
     `_start_turn` can be cancelled inside the INSERT's own COMMIT, before the
-    append hands back a MessageOut, so there is no id to delete by. The newest
-    message in the session is the row being written if it is a user message
-    carrying exactly this question; anything else is some other turn's row.
+    append hands back a MessageOut, so there is no id to delete by. The
+    timestamp the INSERT carried is: two tabs can ask the same question at the
+    same moment, and then the newest user message holding this text is the
+    OTHER turn's row -- deleting that one leaves its tab with a reply and no
+    question.
 
-    `session` is the row `_start_turn` already authorised, so the delete needs no
-    further SELECT on the connection the rollback is competing for.
+    `session` is the row `_start_turn` already authorised, so the lookup needs no
+    session-authorising SELECT on the connection the rollback is competing for.
     """
-    rows = await s.recent_turns(session.id, user_id, 1)
-    if rows and rows[-1].role == "user" and rows[-1].content == question:
-        await s._delete_authorized(session, rows[-1].id)
+    row_id = await s._message_id_at(session.id, ts, "user", question)
+    if row_id is not None:
+        await s._delete_authorized(session, row_id)
 
 
 @router.post("/sessions/{session_id}/messages", response_model=TurnOut)

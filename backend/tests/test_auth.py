@@ -1351,25 +1351,21 @@ def test_delete_user_removes_tokens_and_user(store):
     assert asyncio.run(store.user_for_token(token)) is None
 
 
-def test_issue_token_error_rolls_back_and_raises(store, monkeypatch):
-    """A token INSERT failure must roll back before re-raising."""
-    calls = {"rollback": 0}
-    orig_execute = store._db.execute
+def test_issue_token_error_rolls_back_and_raises(store):
+    """A token INSERT failure must roll back before re-raising: the refused row
+    is not stored, and the store is left usable for the next request.
 
-    async def fake_execute(query, params=()):
-        if query.startswith("INSERT INTO auth_tokens"):
-            raise RuntimeError("db gone")
-        return await orig_execute(query, params)
+    Stated as the state a caller can see rather than as a rollback call, because
+    that is the part that matters and it is what survives the write moving onto
+    its own connection: a connection abandoned mid-transaction takes the whole
+    file's write lock with it.
+    """
+    with pytest.raises(sqlite3.IntegrityError):
+        asyncio.run(store.issue_token("u1", 7))  # no such user, so the row is refused
 
-    async def fake_rollback():
-        calls["rollback"] += 1
-
-    monkeypatch.setattr(store._db, "execute", fake_execute)
-    monkeypatch.setattr(store._db, "rollback", fake_rollback)
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(store.issue_token("u1", 7))
-    assert calls["rollback"] == 1
+    assert asyncio.run(store._fetchall("SELECT * FROM auth_tokens")) == []
+    user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
+    assert asyncio.run(store.user_for_token(asyncio.run(store.issue_token(user.id, 7)))) is not None
 
 
 def test_require_auth_store_uninitialized_503(monkeypatch):

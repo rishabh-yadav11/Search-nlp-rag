@@ -41,7 +41,8 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -472,6 +473,39 @@ class AuthStore:
             await self._db.close()
             self._db = None
 
+    @asynccontextmanager
+    async def _unit_of_work(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Run a group of statements as ONE atomic, durable unit.
+
+        A dedicated connection, not the shared one: a transaction is scoped to a
+        connection, not to a coroutine, so a unit left open on ``self._db`` is
+        committed or rolled back by whichever unrelated request in the worker
+        happens to call ``commit()``/``rollback()`` next -- publishing a
+        half-finished write early, or discarding a finished one.
+        ``isolation_level=None`` keeps this connection's explicit BEGIN from
+        nesting inside an implicit one, and ``BEGIN IMMEDIATE`` takes the WAL
+        write lock up front so a mid-transaction lock upgrade cannot fail past
+        the busy timeout.
+
+        ``foreign_keys`` is per-connection, so it must be set here too.
+        """
+        db = await aiosqlite.connect(self._path, isolation_level=None)
+        try:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("BEGIN IMMEDIATE")
+            yield db
+            await db.commit()
+        except BaseException:
+            # BaseException, not Exception: a request cancelled out from under
+            # this coroutine (client gone, worker shutting down) must not
+            # abandon an open write transaction, which is what leaves the file
+            # locked against every other connection.
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def _fetchone(self, query: str, params: tuple = ()):
         rows = await self._db.execute_fetchall(query, params)
         return rows[0] if rows else None
@@ -516,7 +550,10 @@ class AuthStore:
             # the whole DB with "database is locked").
             await self._db.rollback()
             raise DuplicateEmailError(email) from None
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: see ``_unit_of_work``. A
+            # cancellation between the INSERT and the commit has to roll back
+            # too, or the shared connection is left holding the write lock.
             await self._db.rollback()
             raise
         return user
@@ -575,6 +612,16 @@ class AuthStore:
         return cur.rowcount
 
     async def delete_user(self, user_id: str, guard_last_admin: bool = False) -> int:
+        """Remove one account and every credential that authenticates it.
+
+        One statement does the whole job: the cascade on ``auth_tokens.user_id``
+        takes the tokens with the user row, so there is no second write that
+        could fail and strand this one. That matters because the two used to
+        share a commit on the shared connection with no rollback, so a failure
+        between them left the connection holding the WAL write lock -- the
+        other three workers then failed every write with ``database is locked``
+        until this one exited.
+        """
         where = "id = ?"
         params: tuple = (user_id,)
         if guard_last_admin:
@@ -582,12 +629,9 @@ class AuthStore:
                 " AND NOT (role = 'admin'"
                 " AND (SELECT COUNT(*) FROM users WHERE role = 'admin') <= 1)"
             )
-        cur = await self._db.execute(f"DELETE FROM users WHERE {where}", params)
-        n = cur.rowcount
-        if n:
-            await self._db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
-        await self._db.commit()
-        return n
+        async with self._unit_of_work() as db:
+            cur = await db.execute(f"DELETE FROM users WHERE {where}", params)
+            return cur.rowcount
 
     async def set_password(self, user_id: str, password_hash: str) -> None:
         """Overwrite one user's stored hash on its own.
@@ -646,54 +690,54 @@ class AuthStore:
     async def issue_token(self, user_id: str, ttl_days: int) -> str:
         """Mint a bearer token and return it in plaintext (only its SHA-256 is
         stored). Enforces the per-user active-token cap, so a caller cannot
-        grow the table by logging in repeatedly -- see ``_enforce_token_cap``.
+        grow the table by logging in repeatedly -- see ``_revict_tokens_over_cap``.
+
+        The mint and the eviction are ONE unit. Publishing the new row first
+        meant two ways to be over the cap with nothing left to notice: a worker
+        killed between the two commits, which no later login comes back to undo
+        (enforcement runs from here and nowhere else), and an eviction that lost
+        the write lock and raised, which turned a login into a 500 while its row
+        stayed -- occupying a cap slot and costing a real session its place. So
+        the caller gets the token only after both are durable, or gets neither.
         """
         raw = secrets.token_urlsafe(32)
         created = _now()
-        expires = created + ttl_days * 86400
-        try:
-            await self._db.execute(
+        async with self._unit_of_work() as db:
+            await db.execute(
                 "INSERT INTO auth_tokens (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-                (hash_token(raw), user_id, created, expires),
+                (hash_token(raw), user_id, created, created + ttl_days * 86400),
             )
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
-            raise
-        await self._enforce_token_cap(user_id)
+            await self._revict_tokens_over_cap(db, user_id)
         return raw
 
-    async def _enforce_token_cap(self, user_id: str) -> int:
-        """Keep at most ``config.AUTH_MAX_ACTIVE_TOKENS_PER_USER`` unexpired
-        tokens per user, revoking the oldest surplus. Returns how many were
-        revoked.
+    async def _revict_tokens_over_cap(self, db, user_id: str) -> int:
+        """Delete the user's surplus unexpired tokens on ``db`` and return how
+        many. No commit: the caller's unit is what makes it durable.
 
-        The surplus rows are DELETED, not just hidden: ``user_for_token``
-        resolves a token by looking its hash up in this very table, so a
-        deleted row means the credential no longer authenticates (401) the
-        moment it is evicted. Only unexpired rows count toward the cap, so
-        already-dead rows neither occupy a slot nor get churned by this.
+        Ordered by rowid ALONE. SQLite assigns rowid monotonically at INSERT,
+        so eviction order cannot move when the wall clock does -- whereas
+        ordering by ``created_at`` would let a backwards step (a suspended host,
+        an NTP correction) put the row just minted ahead of the ones it belongs
+        behind, and this pass would then delete the token the caller is about to
+        be handed. That token would authenticate for exactly one request and
+        nobody would see why. ``created_at`` stays for reporting; it just no
+        longer decides who gets evicted.
         """
         cap = int(getattr(config, "AUTH_MAX_ACTIVE_TOKENS_PER_USER", 0))
         if cap <= 0:
             return 0
-        now = _now()
-        # rowid breaks ties between rows minted in the same clock tick so the
-        # eviction order is deterministic rather than storage-dependent.
-        rows = await self._fetchall(
+        rows = await db.execute_fetchall(
             "SELECT token_hash FROM auth_tokens"
             " WHERE user_id = ? AND expires_at >= ?"
-            " ORDER BY created_at ASC, rowid ASC",
-            (user_id, now),
+            " ORDER BY rowid ASC",
+            (user_id, _now()),
         )
         surplus = len(rows) - cap
         if surplus <= 0:
             return 0
-        victims = [r["token_hash"] for r in rows[:surplus]]
+        victims = [row[0] for row in rows[:surplus]]
         for token_hash in victims:
-            await self._db.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,))
-        await self._db.commit()
-        logger.info("auth: revoked %d token(s) over the per-user active-token cap", len(victims))
+            await db.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (token_hash,))
         return len(victims)
 
     async def active_token_count(self, user_id: str) -> int:
@@ -795,18 +839,29 @@ class AuthStore:
         cannot overwrite it, and a value that already has a row is left exactly
         as it is, so this can only ever make a credential deader, never younger.
 
+        Both outcomes are one statement, so there is no ordering left to get
+        wrong. They used to be INSERT OR IGNORE followed by a delegated
+        ``revoke_service_token``, which meant the statement that actually
+        revoked anything was the second commit: against the normal case -- an
+        in-use credential an operator is containing -- the first commit
+        committed an empty transaction, and a worker killed before the second
+        left a leaked credential fully live while the call reported 1. The
+        ``WHERE`` on the DO UPDATE is what keeps that from becoming a rewrite
+        instead: an already-dead row is left alone and not counted.
+
         Returns the number of rows this call changed (1 for a fresh tombstone,
         1 for revoking a live row, 0 if it was already dead).
         """
         now = _now()
-        cur = await self._db.execute(
-            "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (hash_token(raw), ",".join(sorted(scope)), now, now, now),
-        )
-        tombstoned = cur.rowcount
-        await self._db.commit()
-        return tombstoned + await self.revoke_service_token(raw)
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "INSERT INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(token_hash) DO UPDATE SET revoked_at = excluded.revoked_at"
+                " WHERE auth_service_tokens.revoked_at IS NULL",
+                (hash_token(raw), ",".join(sorted(scope)), now, now, now),
+            )
+            return cur.rowcount
 
     async def revoke_all_service_tokens(self) -> int:
         cur = await self._db.execute(
@@ -883,6 +938,14 @@ class AuthStore:
         defence in depth, not the guarantee: no interruption point leaves a
         changed password standing next to a token minted before it.
 
+        The account has to still exist when the hash write runs. The route reads
+        the user, spends a bcrypt round on the old password, and only then calls
+        in here, so an admin DELETE landing in that window used to reach the end
+        of this transaction as a no-op UPDATE -- silently -- and mint a session
+        for a user_id nothing references. Hence the rowcount check below, which
+        fails the whole unit, and the ``foreign_keys`` pragma, which is
+        per-connection and so was off here even though it is on the shared one.
+
         The per-user token cap is not re-applied here: every other token was
         deleted in this same transaction, so the user can hold at most the one
         row inserted below.
@@ -892,9 +955,19 @@ class AuthStore:
         db = await aiosqlite.connect(self._path, isolation_level=None)
         try:
             await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("BEGIN IMMEDIATE")
             await db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
-            await db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_password_hash, user_id))
+            updated = await db.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?", (new_password_hash, user_id)
+            )
+            if updated.rowcount == 0:
+                # Zero rows is not a successful password change, it is a change
+                # to no user at all. Reporting it as success would hand the
+                # caller a session cookie that 401s on the very next request and
+                # leave behind a token row for an account that no longer exists.
+                # The surrounding handler rolls the unit back for this raise.
+                raise ValueError(f"user {user_id} no longer exists")
             raw = secrets.token_urlsafe(32)
             created = _now()
             await db.execute(
