@@ -58,9 +58,9 @@ LE_KEY="$LE_LIVE/privkey.pem"
 # unrelated service's cert-name and repoint server_name and ssl_certificate at
 # that other domain.
 #
-# Pure bash on purpose: this runs while the script is sourced, and a test
-# sources it with almost nothing on PATH. Forced to 0 rather than defaulted
-# later: it describes what this block did, so an inherited value must not leak.
+# Pure bash on purpose: this runs while the script is sourced, which can happen
+# with almost nothing on PATH. Forced to 0 rather than defaulted later: it
+# describes what this block did, so an inherited value must not leak.
 LE_DOMAIN_RECOVERED=0
 if [ -z "$LE_DOMAIN" ]; then
     _le_name=""
@@ -99,7 +99,7 @@ if [ -z "$LE_DOMAIN" ]; then
 fi
 
 # pm2 process tuning. These MUST stay equal to the values in
-# ecosystem.config.js; the two process definitions are compared by a test.
+# ecosystem.config.js; nothing checks the two any more, so change both together.
 # `./setup.sh services` starts pm2 from ecosystem.config.js and EXPORTS these
 # to it rather than passing them as `pm2 start` flags, so a default that
 # differed here would produce a different process depending on which path
@@ -167,7 +167,7 @@ env overrides:
   QDRANT_PORT REDIS_PORT API_PORT NEXT_PORT PUBLIC_PORT GUNICORN_WORKERS
   API_MAX_MEMORY API_MAX_RESTARTS FRONTEND_MAX_MEMORY RESTART_BACKOFF_MS
   MIN_UPTIME_MS
-     pm2 process tuning; must match ecosystem.config.js (tests enforce it)
+     pm2 process tuning; must match ecosystem.config.js (kept in step by hand)
   PUBLIC_BASE_URL   e.g. http://your-host (baked into the Next.js build)
   QDRANT_IMAGE REDIS_IMAGE   docker images pinned by digest (defaults
               qdrant/qdrant:v1.19.0@sha256:057ee3a8..., redis:7-alpine@sha256:858f009f...)
@@ -542,7 +542,7 @@ run_deps() {
 # The spellings in the three value patterns are config._TRUE_SPELLINGS and they
 # have to be, in either direction: that set defines a forced True. This is a copy
 # in shell rather than an import because it runs before the venv is guaranteed
-# to exist, so a test is what holds the copy to the set. Scope: ASCII
+# to exist, so this copy is kept in step with that set by hand. Scope: ASCII
 # whitespace only -- a POSIX bracket expression is ASCII in GNU grep under the C
 # locale and under a UTF-8 one alike, so a value padded with U+00A0 is read as a
 # forced True by config and is still not matched here.
@@ -909,8 +909,8 @@ run_cron() {
 # answer.
 #
 # The third rewrite also UNCOMMENTS the `su` directive. It ships commented out
-# (a test fails a shipped deploy file carrying an active `su`, because that file
-# is copied by hand as well as rendered), but a policy naming no account runs
+# (the shipped file must not carry an active `su`, because that file is copied by
+# hand as well as rendered), but a policy naming no account runs
 # every rotation as root, so the renderer activates it with the account that
 # invoked setup.sh.
 LOGROTATE_TEMPLATE="$SCRIPT_DIR/deploy/logrotate.conf"

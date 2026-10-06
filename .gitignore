@@ -7,6 +7,10 @@ venv/
 # Environment
 .env
 backend/.env
+# Rotated credential backups (setup.sh writes .env.bak.<ts>) hold live secrets
+# and are no less sensitive than the file they came from.
+.env.bak*
+backend/.env.bak*
 
 # Data (fetched articles, index checkpoints, generated vocab)
 backend/data/
@@ -25,7 +29,6 @@ qdrant_config.yaml
 .pid/
 AGENTS.md
 *.log
-backend/.coverage
 REVIEWER.md
 
 # local git worktrees
