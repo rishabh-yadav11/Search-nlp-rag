@@ -34,3 +34,6 @@ REVIEWER.md
 # local git worktrees
 swt/
 wt/
+
+# coverage.py artifact from the (now removed) test suite
+backend/.coverage
