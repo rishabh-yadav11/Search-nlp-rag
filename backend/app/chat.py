@@ -974,7 +974,7 @@ def _strip_unclosed_fence(text: str) -> str:
 
 # A plain decimal numeric literal, in FULL. ASCII-only ([0-9], not \d) so it means
 # the same in Python and in JavaScript, where \d is ASCII-only. Kept as one string
-# so the frontend twin and this one can be asserted equal by the contract test.
+# so the frontend twin and this one can be kept character-for-character equal.
 _NUMERIC_LITERAL_SRC = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _NUMERIC_LITERAL_RE = re.compile(_NUMERIC_LITERAL_SRC)
 
@@ -997,8 +997,8 @@ def _trims(ch: str) -> bool:
 
 
 # Every codepoint either language has an opinion about, and whether the backend
-# trims it; the contract test runs the same probe under node, so a whitespace
-# class that means different things in the two languages is caught.
+# trims it; a whitespace class that means different things in the two languages
+# is a real divergence, so compare the two by hand whenever either side changes.
 _TRIM_PROBES: dict[str, bool] = {
     f"{cp:04x}": _trims(chr(cp))
     for cp in (

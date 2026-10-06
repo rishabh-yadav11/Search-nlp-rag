@@ -5,14 +5,9 @@
  * This module holds the whole accept/reject decision — fence regex, missing
  * value tokens, numeric coercion, value-column selection, label check — and
  * NOTHING else: no React, no JSX, no imports. That keeps it the single place
- * the browser decides a block is renderable, and lets the backend execute this
- * exact code in its cross-language contract test (backend/tests/
- * test_dataviz_contract.py runs this file through node), so the two validators
- * cannot drift apart without a red test.
- *
- * Every rule here has a mirror in backend/app/chat.py. Change one, change the
- * other, and add a fixture to the shared corpus; the paired test fails if the
- * two disagree on any fixture.
+ * the browser decides a block is renderable, mirroring backend/app/chat.py so
+ * the two validators agree. Nothing checks that they do any more, so a change
+ * to one rule has to be made in the other by hand.
  */
 
 // Types
@@ -36,8 +31,8 @@ export type ContentPart =
 
 /**
  * Fence grammar, character-for-character identical to DATAVIZ_FENCE_PATTERN in
- * backend/app/chat.py — the contract test asserts the two source strings are
- * equal. The newline after the tag is OPTIONAL, so a fence written as
+ * backend/app/chat.py; the two source strings must stay equal. The newline
+ * after the tag is OPTIONAL, so a fence written as
  * ```dataviz{...}``` is the same grammar.
  *
  * Whitespace is spelled as an explicit ASCII class, NEVER `\s` or `[^\S\n]`:
@@ -48,8 +43,8 @@ export type ContentPart =
  * says the same thing in both engines; `\r` is there for CRLF answers.
  *
  * Because the trailing class also changes how much trailing text a side
- * consumes rather than the verdict, the contract test compares the full match
- * SPAN on every fixture, not just the accept/reject outcome.
+ * consumes rather than the verdict, the two implementations must be compared on
+ * the full match SPAN, not just on the accept/reject outcome.
  */
 export const FENCE_SRC = '```dataviz[ \\t\\r]*\\n?([\\s\\S]*?)\\n?```[\\t\\n\\v\\f\\r ]*'
 export const KINDS = ['bar', 'line', 'pie'] as const
@@ -92,8 +87,8 @@ export function hasNonFiniteNumber(value: unknown, depth = 0): boolean {
  * "12abc" would plot as 12 — a value the model never stated, and one the
  * backend's `float()` accepts. NUMERIC_LITERAL_SRC is the character-for-
  * character twin of _NUMERIC_LITERAL_SRC in backend/app/chat.py ([0-9] rather
- * than \d, so it means the same in both languages) and the contract test
- * asserts the two are equal: both sides accept the same spellings ("1,200",
+ * than \d, so it means the same in both languages) and the two must stay equal:
+ * both sides accept the same spellings ("1,200",
  * " 1.5 ", "+3", "1e3") and reject the same impostors ("12abc", "0x10",
  * "1_000", "inf", "nan", "").
  */
@@ -104,8 +99,8 @@ const NUMERIC_LITERAL = new RegExp(`^${NUMERIC_LITERAL_SRC}$`)
  * The whitespace trimmed off a cell, spelled out as ASCII whitespace. NOT
  * `String.prototype.trim`, which also removes U+FEFF while Python's
  * `str.strip()` leaves it: a cell carrying a BOM was "missing" here and a real
- * value on the server. The contract test probes each of these characters
- * against the backend's `_TRIM_CHARS`.
+ * value on the server. Each of these characters is probed against the backend's
+ * `_TRIM_CHARS` by hand.
  */
 export const TRIM_SRC = '\\t\\n\\v\\f\\r '
 
@@ -260,9 +255,9 @@ export function splitContent(text: string): ContentPart[] {
  * answer and the rendered answer never disagree.
  *
  * A closed, valid fence never reaches here — `splitContent` consumes those — so
- * any marker left in a markdown chunk starts an unclosed block. Exported for
- * the backend's contract test, which checks the two implementations truncate at
- * the same offset on the same text.
+ * any marker left in a markdown chunk starts an unclosed block. Exported so the
+ * backend can check that the two implementations truncate at the same offset on
+ * the same text.
  */
 export function stripOpenFence(md: string): string {
   const open = md.indexOf('```dataviz')

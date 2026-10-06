@@ -25,13 +25,12 @@ import {
   YAxis,
 } from 'recharts'
 
-// The accept/reject grammar lives in datavizContract.ts, which the backend also
-// executes via node in its cross-language contract test so the two validators
-// cannot drift; only rendering lives here.
+// The accept/reject grammar lives in datavizContract.ts, kept in step with
+// backend/app/chat.py by hand; only rendering lives here.
 import { isMissing, toNum } from './datavizContract'
 import type { DataVizBlock } from './datavizContract'
 
-// Re-exported so the chat page and its tests keep importing them from here.
+// Re-exported so the chat page can keep importing them from here.
 export type { DataVizBlock } from './datavizContract'
 export { parseDataViz, splitContent } from './datavizContract'
 
