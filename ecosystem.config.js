@@ -11,8 +11,7 @@
 // and under `set -e` passing the flag would abort the services stage outright
 // and leave the box with no backend. Starting from this file is what makes the
 // option reachable, and having one definition is also what stops the two
-// startup paths from drifting apart, which backend/tests/test_deploy_config.py
-// guards.
+// startup paths from drifting apart.
 //
 // Four knobs are read from the environment, and each defaults to exactly what
 // setup.sh defaults to: VCCIRCLE_ROOT is the checkout root (which is what

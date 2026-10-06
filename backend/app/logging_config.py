@@ -19,7 +19,7 @@ What is deliberately NOT done, and why:
 * **Only the app's own loggers get the app's level**, so third-party loggers
   keep the root level they have today. ``APP_LOGGERS`` is the list; a module that
   grows a new bare-named module-level ``logger`` must be added there or it goes
-  quiet again -- ``tests/test_logging_config.py`` fails when one is missed.
+  quiet again.
 * **Existing handlers are left alone.** ``logging.config.dictConfig`` in its
   default (non-incremental) mode removes every handler already installed on root
   and calls ``logging.shutdown`` on the process-wide handler list, clobbering

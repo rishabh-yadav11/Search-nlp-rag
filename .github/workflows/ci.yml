@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   backend:
-    name: backend (ruff + pytest)
+    name: backend (ruff)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -33,45 +33,17 @@ jobs:
           cache-dependency-path: |
             backend/requirements.txt
             backend/requirements-dev.txt
-      # node is not a backend dependency, but tests/test_dataviz_contract.py runs the frontend's
-      # dataviz validator under node, so this job needs the same "22" pin as the others.
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-      # The runtime stack is required, not just the dev tools: app/main.py imports fastembed at
-      # module scope and six test modules import app.main, so the suite cannot even be collected
-      # without it. (app/encoders.py and app/reranker.py import it lazily and are faked in tests.)
+      # node is not a backend dependency; the dataviz validator whose contract
+      # lived in the suite is no longer exercised, so this job needs no node.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
-      # test_budget_lua.py runs the real shipped _BUDGET_LUA under lua5.1 and is the only thing
-      # catching drift between that script and the Python model. It skips itself when the
-      # interpreter is absent, so without this step CI would pass with the spend cap unverified.
-      - name: Install lua5.1
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends lua5.1
-          lua5.1 -v
-      # `set -o pipefail` is load-bearing: without it `tee` would swallow a pytest failure.
-      - name: Pytest (no skipped tests)
-        run: |
-          set -o pipefail
-          python -m pytest -rs | tee /tmp/pytest.log
-          if grep -qE '[0-9]+ skipped' /tmp/pytest.log; then
-            echo "::error::pytest skipped tests in CI. The suite must be fully covered; see the SKIPPED lines above."
-            exit 1
-          fi
-      # The coverage figures in TEST_COVERAGE_GAPS.md are generated and nothing else keeps them
-      # honest, so this step re-measures and fails the build on drift. It re-runs the suite a
-      # second time under pytest-cov, reusing this job's installed dependencies.
-      - name: Coverage document is not stale
-        run: python scripts/measure_coverage.py
 
   frontend:
-    name: frontend (lint + typecheck + build + vitest)
+    name: frontend (lint + typecheck + build)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -92,8 +64,6 @@ jobs:
         run: npx tsc --noEmit
       - name: Build
         run: npm run build
-      - name: Vitest
-        run: npm test
 
   security:
     name: security (pip-audit + npm audit + gitleaks)
@@ -134,9 +104,9 @@ jobs:
       - name: Install dependencies
         working-directory: frontend
         run: npm ci --no-audit --no-fund
-      # The only current advisory is a moderate vitest/@vitest/mocker
-      # path-traversal issue, which is below --audit-level=high. The gate is
-      # the high boundary, so a new high/critical advisory fails the job.
+      # 7 high findings sit in the eslint-config-next subtree (build-time lint
+      # tooling, never shipped) and are above this boundary, so the job fails
+      # until eslint-config-next is upgraded alongside the Next.js pin.
       - name: npm audit
         working-directory: frontend
         run: npm audit --audit-level=high

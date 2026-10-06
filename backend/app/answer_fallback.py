@@ -44,9 +44,9 @@ def results_are_weak(scores: list[float], limit: int | None = None) -> bool:
     unanswered, and the floor also stops a nonsensical (<= 0) knob from opening
     the gate on everything. An empty scores list still counts as weak.
 
-    Knob names are spelled without their ``config.`` prefix on purpose:
-    tests/test_config_knobs.py counts a ``config.KNOB`` mention anywhere in the
-    source as a reader, so dotted names here would vouch for a deleted read."""
+    Knob names are spelled without their ``config.`` prefix on purpose: a
+    ``config.KNOB`` mention elsewhere in the source reads as a consumer, so
+    dotted names here would vouch for a read that no longer exists."""
     if not scores:
         return True
     strong = sum(1 for s in scores if s > config.WEAK_RESULT_SCORE)

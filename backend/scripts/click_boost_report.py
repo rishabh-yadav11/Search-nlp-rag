@@ -51,10 +51,9 @@ SCAN_COUNT = 500
 # Bounded so a very large keyspace does not build one enormous reply in memory.
 READ_BATCH = 200
 
-# The thresholds the repository ships, as pinned by
-# tests/test_analytics_click_guard.py. Compared against what this deployment runs,
-# so a report cannot describe one policy while the app runs another -- which is
-# what a ``backend/.env`` pinning CLICK_BOOST_MIN_* does.
+# The thresholds the repository ships. Compared against what this deployment
+# runs, so a report cannot describe one policy while the app runs another --
+# which is what a ``backend/.env`` pinning CLICK_BOOST_MIN_* does.
 PINNED_SHIPPED = (5, 3, 0.3)
 
 
