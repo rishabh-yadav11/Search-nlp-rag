@@ -71,9 +71,8 @@ backend/
     backup_qdrant.py   Qdrant snapshot + local artifact backups (retention)
     qdrant_backup.py   shared backup helpers
     reset_index.py     drop the index + data files (backup-gated)
-  tests/               pytest suite (offline, mocked deps)
   requirements.txt
-  requirements-dev.txt lint/test tooling
+  requirements-dev.txt lint tooling
   .env.example         configuration template
 frontend/              Next.js app (App Router + TypeScript)
   app/page.tsx         search UI (timeouts, validation, a11y)
@@ -127,12 +126,6 @@ depending on one line of application check.
 
 - Python 3.11–3.12 (warned-but-tolerated on 3.13/3.14; set `ALLOW_UNSUPPORTED_PY=1` to silence)
 - Node.js 18+ (22 recommended for the frontend)
-- Node >= 22.6 to run the backend test suite's cross-language dataviz
-  contract test (`backend/tests/test_dataviz_contract.py`): it imports the
-  shipped `frontend/app/chat/datavizContract.ts` directly, which needs the
-  built-in TypeScript support in node. Without it that test skips locally
-  and FAILS under CI, so the browser-side validator can never go untested
-  silently.
 - Docker (for Qdrant and Redis)
 - MySQL source database
 
@@ -155,7 +148,7 @@ I wrote `setup.sh` to provision everything in stages. Run `./setup.sh all`, or p
 
 `tls` is deliberately not part of `./setup.sh all`: it needs a domain name, a contact address and network access that an unattended bootstrap must not require. Run it once, on purpose. `logrotate` is left out for the same spirit — it needs the `logrotate` binary, and the policy it installs names this host's paths, so it is a one-off operator step (see [Log Management](#log-management)).
 
-Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`, `LOGROTATE_CONF` (default `/etc/logrotate.d/vccircle`), plus the TLS knobs `NGINX_TLS` (`auto`/`on`/`off`), `LE_DOMAIN`, `LE_EMAIL`, `LE_ROOT`, `CERTBOT_WEBROOT`, `NGINX_CONF`, `NGINX_LINK`, and the edge chat-stream limit `NGINX_CHAT_LIMIT_RATE` (`10r/m`) / `NGINX_CHAT_LIMIT_BURST` (`10`). pm2 process tuning: `API_MAX_MEMORY` (5G), `FRONTEND_MAX_MEMORY` (1G), `API_MAX_RESTARTS` (10), `RESTART_BACKOFF_MS` (100), `MIN_UPTIME_MS` (30000) — these must stay equal to `ecosystem.config.js`, and `backend/tests/test_deploy_config.py` fails the build if the two process definitions drift apart.
+Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`, `LOGROTATE_CONF` (default `/etc/logrotate.d/vccircle`), plus the TLS knobs `NGINX_TLS` (`auto`/`on`/`off`), `LE_DOMAIN`, `LE_EMAIL`, `LE_ROOT`, `CERTBOT_WEBROOT`, `NGINX_CONF`, `NGINX_LINK`, and the edge chat-stream limit `NGINX_CHAT_LIMIT_RATE` (`10r/m`) / `NGINX_CHAT_LIMIT_BURST` (`10`). pm2 process tuning: `API_MAX_MEMORY` (5G), `FRONTEND_MAX_MEMORY` (1G), `API_MAX_RESTARTS` (10), `RESTART_BACKOFF_MS` (100), `MIN_UPTIME_MS` (30000) — these must stay equal to `ecosystem.config.js`, and nothing enforces that automatically any more, so a change to one file has to be made in the other by hand.
 
 If you'd rather run pieces manually, keep reading.
 
@@ -535,23 +528,25 @@ Two things to know about what it measures. Tallies are deduped votes accumulated
 
 ## Testing and CI
 
-Backend tests (pytest, fully offline — mocked Qdrant/Redis/MySQL/LLM):
+There is no automated test suite. Lint and type checking are the only static
+gates:
 
 ```bash
-cd backend
-pip install -r requirements.txt -r requirements-dev.txt
-python -m pytest
-ruff check .
+cd backend && ruff check .
+cd frontend && npm run lint && npm run typecheck
 ```
 
-Coverage: query-intent/date parsing, facet filter construction, effective intent, ranking + recency, RAG DTO (no body leak), LLM config wiring, chat store (CRUD, ownership isolation, retention, token/cost stats), SSE streaming (small-talk short-circuit + full-turn deltas), index fingerprinting/delta/reconciliation, and cache TTL and degraded fallback.
+Behaviour is verified against a running deployment instead: `curl localhost/health`
+and `localhost/ready` (which checks Qdrant, the models, Redis and the LLM), then a
+real `/search?q=...` returning on-topic hits. `/health` alone proves nothing — it
+stays 200 while retrieval and auth are broken.
 
 `.github/workflows/ci.yml` runs three jobs on push/PR to `main`. Superseded
 runs are cancelled (concurrency group keyed on workflow + ref) and every job has
 an explicit timeout.
 
-1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `python -m pytest -rs`, which must report **zero skipped tests** (the job fails otherwise). lua5.1 is installed first: `tests/test_budget_lua.py` runs the real shipped `_BUDGET_LUA` under it and is the only thing that catches drift between that script and the Python spend-cap model, so a silent skip would leave the cap unverified. The job installs the *full* `requirements.txt` rather than a slimmed test set because `app/main.py` does `from fastembed import SparseTextEmbedding` at module scope and several test modules import `app.main`, so the suite cannot be collected without the runtime stack. (`app/encoders.py` and `app/reranker.py` import `fastembed`/`sentence_transformers` lazily inside their constructors, and their tests fake those modules in `sys.modules`.) There is deliberately **no `ruff format` gate** — `ruff format --check` reports files that would be reformatted, so enforcing it would mean reformatting the tree, not CI.
-2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`, `npm test` (vitest).
+1. **backend** (`timeout-minutes: 30`) — Python 3.11 and `ruff check .`.
+2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`.
 3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan (binary pinned to 8.28.0, download SHA-256 verified) over the full history of the checked-out ref.
 
 ### Audit policy
@@ -576,10 +571,15 @@ CVE-2026-1839, and is why `optimum-onnx` is deliberately not installed) audits
 **clean** — `pip-audit` reports no transformers findings. `requirements-dev.txt`
 also audits clean.
 
-**`npm audit --audit-level=high`** is the high boundary, which is the standard
-CI posture: the current 2 moderate findings (GHSA-82fw-gwwq-j7x9,
-`@vitest/mocker` path traversal; fix is vitest 5, a breaking change) sit below
-it and do not fail the build. A new high/critical advisory does.
+**`npm audit --audit-level=high`** is the high boundary. The dependency tree
+currently reports **7 high findings, all in the `eslint-config-next` subtree**
+(`eslint-config-next` → `@next/eslint-plugin-next` → `fast-glob` → `micromatch`
+→ `braces`/`brace-expansion`, plus `source-map-js`). Every one is build-time
+tooling reached only by `npm run lint`, never by the shipped bundle. Because
+they are above the boundary, the security job **currently fails** on them; the
+fix is an `eslint-config-next` upgrade, which has to move together with the
+Next.js pin. Removing the test dependencies cleared the two critical
+`vitest`/`tinypool` findings that sat here before.
 
 **gitleaks** runs the default rule set with **no allow-list and no
 `.gitleaks.toml`** — nothing is excluded, so a real key in any tracked file

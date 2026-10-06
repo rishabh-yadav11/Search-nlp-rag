@@ -127,10 +127,9 @@ export function toNum(v: unknown): number | null {
 
 /**
  * Cells that mean "no value stated here" rather than a number, so a top-N
- * table can list an item whose value the articles never gave. The key set is
- * asserted equal to the backend's _MISSING_VALUE_TOKENS — and to every other
- * copy of it — by backend/tests/test_dataviz_contract.py, so a one-sided
- * addition turns that test red.
+ * table can list an item whose value the articles never gave. The key set must
+ * stay equal to the backend's _MISSING_VALUE_TOKENS and to every other copy of
+ * it; a one-sided addition silently changes what the UI calls "not stated".
  */
 export const MISSING_VALUE_TOKENS: Record<string, true> = {
   '': true,
