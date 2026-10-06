@@ -281,7 +281,7 @@ the generated table.
 - `app/chat.py` — 95.5% (49/1093 statements uncovered). What is left is the
   streaming teardown and the log-shaping helpers, not the turn itself: the
   `raise` after a mid-turn failure line 2662, the budget `release` line 2564,
-  and four bare `return`s at lines 2689, 2692, 2705, 2838 — so a stream that
+  and four bare `return`s at lines 2689, 2693, 2705, 2838 — so a stream that
   dies mid-answer still has no test asserting what is written, what is
   charged, or what is settled. The cancellation-rollback failure path is
   uncovered too — lines 2334-2335, where a rollback that itself fails after
