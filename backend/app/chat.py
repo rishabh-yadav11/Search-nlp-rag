@@ -253,14 +253,13 @@ class ChatStore:
             await db.close()
 
     async def create_session(self, user_id: str, title: str = "New chat") -> SessionOut:
-        db = self._require_db()
         session_id = uuid.uuid4().hex
         ts = _now()
-        await db.execute(
-            "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, user_id, title, ts, ts),
-        )
-        await db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "INSERT INTO sessions (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, user_id, title, ts, ts),
+            )
         return SessionOut(id=session_id, title=title, created_at=ts, updated_at=ts)
 
     async def list_sessions(self, user_id: str, limit: int = 100) -> list[SessionOut]:
@@ -450,10 +449,11 @@ class ChatStore:
         """Rename a session the caller has ALREADY proven it owns. The UPDATE
         carries no user_id predicate, so it is only safe behind that proof."""
         clean = (title or "").strip()[:200]
-        db = self._require_db()
         ts = _now()
-        await db.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (clean, ts, session.id))
-        await db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (clean, ts, session.id)
+            )
         return SessionOut(
             id=session.id,
             title=clean,
@@ -467,13 +467,12 @@ class ChatStore:
         rename the user made mid-turn has already changed the row, the guard no
         longer matches, and the user's name wins."""
         clean = (title or "").strip()[:200]
-        db = self._require_db()
         ts = _now()
-        await db.execute(
-            "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND title IN ('', 'New chat')",
-            (clean, ts, session.id),
-        )
-        await db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ? AND title IN ('', 'New chat')",
+                (clean, ts, session.id),
+            )
 
     async def rename_session(self, session_id: str, user_id: str, title: str) -> SessionOut:
         session = await self.get_session(session_id, user_id)
@@ -658,13 +657,12 @@ class ChatStore:
 
         Deliberately a single INSERT: the dashboard polls every 30s. Expiry is handled
         by `purge_expired`."""
-        db = self._require_db()
         now = _now()
-        await db.execute(
-            "INSERT INTO admin_audit (actor_id, action, created_at) VALUES (?, ?, ?)",
-            (actor_id, action, now),
-        )
-        await db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "INSERT INTO admin_audit (actor_id, action, created_at) VALUES (?, ?, ?)",
+                (actor_id, action, now),
+            )
 
     async def admin_audit_log(self, limit: int = 100) -> list[dict]:
         capped = max(1, min(int(limit), AUDIT_LOG_MAX_LIMIT))

@@ -537,25 +537,19 @@ class AuthStore:
             created_at=_now(),
         )
         try:
-            await self._db.execute(
-                "INSERT INTO users (id, email, password_hash, name, role, is_active, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user.id, user.email, user.password_hash, user.name, user.role, 1, user.created_at),
-            )
-            await self._db.commit()
+            async with self._unit_of_work() as db:
+                await db.execute(
+                    "INSERT INTO users (id, email, password_hash, name, role, is_active, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user.id, user.email, user.password_hash, user.name, user.role, 1, user.created_at),
+                )
         except sqlite3.IntegrityError:
             # Duplicate email under concurrency (e.g. concurrent worker
-            # bootstrap). Roll back so the failed statement never leaves this
-            # connection holding an open write transaction (which would poison
-            # the whole DB with "database is locked").
-            await self._db.rollback()
+            # bootstrap). The unit has already rolled itself back by the time
+            # this runs, so nothing is left open on any connection -- and no
+            # rollback is issued here, because that would reach the shared
+            # connection and discard whatever another request had pending.
             raise DuplicateEmailError(email) from None
-        except BaseException:
-            # BaseException, not Exception: see ``_unit_of_work``. A
-            # cancellation between the INSERT and the commit has to roll back
-            # too, or the shared connection is left holding the write lock.
-            await self._db.rollback()
-            raise
         return user
 
     async def get_user_by_email(self, email: str) -> StoredUser | None:
@@ -605,11 +599,11 @@ class AuthStore:
             )
             params.append(1 if role == "user" else 0)
             params.append(1 if is_active is False else 0)
-        cur = await self._db.execute(
-            f"UPDATE users SET {', '.join(sets)} WHERE {where}", tuple(params)
-        )
-        await self._db.commit()
-        return cur.rowcount
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE {where}", tuple(params)
+            )
+            return cur.rowcount
 
     async def delete_user(self, user_id: str, guard_last_admin: bool = False) -> int:
         """Remove one account and every credential that authenticates it.
@@ -641,8 +635,10 @@ class AuthStore:
         every previously issued token alive behind a password the owner has
         just changed. ``change_password`` is the atomic form.
         """
-        await self._db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
-        await self._db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id)
+            )
 
     async def upgrade_password_hash(self, user_id: str, observed_hash: str, new_hash: str) -> int:
         """Replace a pre-migration hash with a current one, but only while the
@@ -654,16 +650,16 @@ class AuthStore:
         the newer one -- so the rowcount is returned for the caller to log, not
         retried: a retry would reopen the same race.
 
-        One statement, so it is atomic on its own and needs no transaction
-        around it: a worker killed mid-write leaves the pre-migration hash in
-        place, which still authenticates, so a crash here cannot lock anyone out.
+        One statement, so it is atomic on its own; the unit still wraps it so a
+        cancellation between the write and its commit rolls back rather than
+        stranding the connection on the WAL write lock.
         """
-        cur = await self._db.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
-            (new_hash, user_id, observed_hash),
-        )
-        await self._db.commit()
-        return cur.rowcount
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+                (new_hash, user_id, observed_hash),
+            )
+            return cur.rowcount
 
     async def count_legacy_passwords(self) -> int:
         """How many accounts still hold a pre-migration hash.
@@ -763,12 +759,12 @@ class AuthStore:
             created_at=created,
             expires_at=created + ttl_seconds,
         )
-        await self._db.execute(
-            "INSERT INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
-            " VALUES (?, ?, ?, ?, NULL)",
-            (record.token_hash, ",".join(sorted(record.scope)), record.created_at, record.expires_at),
-        )
-        await self._db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "INSERT INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
+                " VALUES (?, ?, ?, ?, NULL)",
+                (record.token_hash, ",".join(sorted(record.scope)), record.created_at, record.expires_at),
+            )
         return raw, record
 
     async def ensure_bootstrap_service_token(self, raw: str, scope: set[str], ttl_seconds: float) -> None:
@@ -784,12 +780,12 @@ class AuthStore:
         # created_at and expires_at disagree by however long the two calls
         # straddle, which is not a lifetime anyone can reason about.
         created = _now()
-        await self._db.execute(
-            "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
-            " VALUES (?, ?, ?, ?, NULL)",
-            (hash_token(raw), ",".join(sorted(scope)), created, created + ttl_seconds),
-        )
-        await self._db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO auth_service_tokens (token_hash, scope, created_at, expires_at, revoked_at)"
+                " VALUES (?, ?, ?, ?, NULL)",
+                (hash_token(raw), ",".join(sorted(scope)), created, created + ttl_seconds),
+            )
 
     async def service_token_for(self, raw: str) -> StoredServiceToken | None:
         """Resolve a machine credential, or None when it is unknown, revoked or
@@ -817,12 +813,12 @@ class AuthStore:
         revoked -- 0 for an unknown or already-revoked token, which the caller
         must be able to see rather than assume.
         """
-        cur = await self._db.execute(
-            "UPDATE auth_service_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
-            (_now(), hash_token(raw)),
-        )
-        await self._db.commit()
-        return cur.rowcount
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "UPDATE auth_service_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+                (_now(), hash_token(raw)),
+            )
+            return cur.rowcount
 
     async def revoke_configured_service_token(self, raw: str, scope: set[str]) -> int:
         """Kill the env-configured value, including from a cold start.
@@ -864,11 +860,11 @@ class AuthStore:
             return cur.rowcount
 
     async def revoke_all_service_tokens(self) -> int:
-        cur = await self._db.execute(
-            "UPDATE auth_service_tokens SET revoked_at = ? WHERE revoked_at IS NULL", (_now(),)
-        )
-        await self._db.commit()
-        return cur.rowcount
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "UPDATE auth_service_tokens SET revoked_at = ? WHERE revoked_at IS NULL", (_now(),)
+            )
+            return cur.rowcount
 
     async def purge_dead_service_tokens(self, keep_hash: str = "") -> int:
         """Delete service-token rows that can no longer authenticate anything --
@@ -882,14 +878,14 @@ class AuthStore:
         permanent-grant failure this table exists to prevent.
         """
         now = _now()
-        cur = await self._db.execute(
-            "DELETE FROM auth_service_tokens"
-            " WHERE (revoked_at IS NOT NULL OR expires_at < ?)"
-            " AND (? = '' OR token_hash != ?)",
-            (now, keep_hash, keep_hash),
-        )
-        await self._db.commit()
-        return cur.rowcount
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "DELETE FROM auth_service_tokens"
+                " WHERE (revoked_at IS NOT NULL OR expires_at < ?)"
+                " AND (? = '' OR token_hash != ?)",
+                (now, keep_hash, keep_hash),
+            )
+            return cur.rowcount
 
     async def user_for_token(self, raw_token: str) -> StoredUser | None:
         """Resolve a raw session token (the auth cookie's value) to an active
@@ -906,12 +902,14 @@ class AuthStore:
         return user
 
     async def revoke_token(self, raw_token: str) -> None:
-        await self._db.execute("DELETE FROM auth_tokens WHERE token_hash = ?", (hash_token(raw_token),))
-        await self._db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "DELETE FROM auth_tokens WHERE token_hash = ?", (hash_token(raw_token),)
+            )
 
     async def revoke_all_tokens(self, user_id: str) -> None:
-        await self._db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
-        await self._db.commit()
+        async with self._unit_of_work() as db:
+            await db.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
 
     async def change_password(self, user_id: str, new_password_hash: str, ttl_days: int) -> str:
         """Store a new password, revoke every existing token and mint a
@@ -991,9 +989,9 @@ class AuthStore:
         injection; returns the number of rows removed. Run periodically so the
         table can't grow without bound as tokens expire."""
         now = _now()
-        cur = await self._db.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (now,))
-        await self._db.commit()
-        return cur.rowcount
+        async with self._unit_of_work() as db:
+            cur = await db.execute("DELETE FROM auth_tokens WHERE expires_at < ?", (now,))
+            return cur.rowcount
 
 
 def _require_auth_store() -> AuthStore:

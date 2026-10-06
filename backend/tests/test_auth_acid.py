@@ -104,6 +104,32 @@ class _WatchedAioSqlite:
         return getattr(_REAL_AIO_SQLITE, name)
 
 
+class _CancelOnCommit:
+    """Cancel the first commit on every connection the store opens.
+
+    A client disconnect delivered between a unit's last write and its commit is
+    the shape this stands in for, and it is the commit of the unit's own
+    dedicated connection -- the one whose rollback is under test here. A
+    ``BaseException``, because to SQLite a cancellation and a kill are the same
+    event: nothing after them gets to run.
+    """
+
+    def __init__(self):
+        self.tripped = False
+
+    def attach(self, conn):
+        real_commit = conn.commit
+
+        async def commit():
+            if not self.tripped:
+                self.tripped = True
+                raise asyncio.CancelledError()
+            return await real_commit()
+
+        conn.commit = commit
+        return conn
+
+
 def _store(tmp_path) -> AuthStore:
     s = AuthStore(str(tmp_path / "auth.db"))
     asyncio.run(s.connect())
@@ -353,23 +379,21 @@ def test_revoke_configured_service_token_counts_exactly_what_it_changed(tmp_path
 def test_a_cancelled_signup_does_not_lock_out_other_connections(tmp_path, monkeypatch):
     """``create_user`` rolls back on ``BaseException``, not just ``Exception``: a
     request cancelled between its INSERT and its commit has to roll back too, or
-    the shared connection keeps holding the write lock and every other
+    the write transaction it opened holds the WAL write lock and every other
     connection waits out its busy timeout and fails."""
     store = _store(tmp_path)
     other = AuthStore(store._path)
     asyncio.run(other.connect())
     # What is asserted is the refusal, not how long the loser waited for it.
     asyncio.run(other._db.execute("PRAGMA busy_timeout=200"))
+    cancel = _CancelOnCommit()
+    monkeypatch.setattr(auth, "aiosqlite", _WatchedAioSqlite(cancel))
     try:
-
-        async def cancelled():
-            raise asyncio.CancelledError()
-
-        monkeypatch.setattr(store._db, "commit", cancelled)
 
         async def scenario():
             with pytest.raises(asyncio.CancelledError):
                 await store.create_user("a@b.co", "secret12", "A", "user")
+            assert cancel.tripped, "the signup committed without being cancelled"
             assert await store.get_user_by_email("a@b.co") is None, "the cancelled signup became durable"
             # The reason the rollback exists: a second connection can still write.
             created = await other.create_user("b@b.co", "secret12", "B", "user")
@@ -377,6 +401,7 @@ def test_a_cancelled_signup_does_not_lock_out_other_connections(tmp_path, monkey
 
         asyncio.run(scenario())
     finally:
+        monkeypatch.setattr(auth, "aiosqlite", _REAL_AIO_SQLITE)
         asyncio.run(other.close())
         asyncio.run(store.close())
 
