@@ -61,7 +61,7 @@ Command: `python -m pytest --cov=app --cov-report=term-missing`
 Measured with: Python 3.11.16, coverage 7.16.2
 Suite: 2286 passed, 0 skipped, 0 failed, 0 errors, 0 xfailed, 0 xpassed
 
-Overall: 95.3% (245 of 5174 statements uncovered)
+Overall: 95.3% (245 of 5166 statements uncovered)
 
 ### Per-module coverage (least covered first)
 
@@ -74,12 +74,12 @@ Overall: 95.3% (245 of 5174 statements uncovered)
 | `app/llm.py` | 94.3% | 106 | 6 | 81-83, 85, 118, 125 |
 | `app/health.py` | 94.8% | 155 | 8 | 169-170, 173, 370, 373, 408, 411-412 |
 | `app/analytics.py` | 95.2% | 248 | 12 | 134, 199-201, 341-342, 442-443, 515, 520, 537-538 |
-| `app/chat.py` | 95.5% | 1097 | 49 | 225, 526-529, 702-703, 718, 728, 1066-1067, 1216, 1225, 1567, 1569, 2336-2337, 2440, 2442, 2566, 2664, 2691, 2694-2697, 2707, 2775-2776, 2782, 2785-2786, 2790-2792, 2808-2809, 2812-2814, 2818-2820, 2840, 2844-2845, 2868, 2871-2872 |
+| `app/chat.py` | 95.5% | 1093 | 49 | 225, 525-528, 700-701, 716, 726, 1064-1065, 1214, 1223, 1565, 1567, 2334-2335, 2438, 2440, 2564, 2662, 2689, 2692-2695, 2705, 2773-2774, 2780, 2783-2784, 2788-2790, 2806-2807, 2810-2812, 2816-2818, 2838, 2842-2843, 2866, 2869-2870 |
 | `app/request_context.py` | 95.5% | 44 | 2 | 43, 101 |
 | `app/main.py` | 96.9% | 748 | 23 | 215, 247, 642-645, 678, 680, 710-712, 1278, 1372, 1375, 1413, 1420-1421, 1442, 1457, 1485, 1897, 2136, 2324 |
 | `app/rerank_boost.py` | 97.6% | 83 | 2 | 182, 253 |
 | `app/index_text.py` | 98.8% | 81 | 1 | 41 |
-| `app/auth.py` | 98.9% | 715 | 8 | 954, 1049, 1055, 1280, 1283, 1422-1423, 2235 |
+| `app/auth.py` | 98.9% | 711 | 8 | 952, 1047, 1053, 1278, 1281, 1420-1421, 2233 |
 | `app/redis_cache.py` | 99.3% | 147 | 1 | 133 |
 | `app/config.py` | 99.7% | 292 | 1 | 252 |
 | `app/__init__.py` | 100.0% | 0 | 0 | none |
@@ -106,9 +106,9 @@ Overall: 95.3% (245 of 5174 statements uncovered)
 - `app/llm.py`: 81, 118, 125
 - `app/health.py`: 169, 408
 - `app/analytics.py`: 199, 341, 442, 537
-- `app/chat.py`: 225, 702, 1066, 2336, 2664, 2782, 2812
+- `app/chat.py`: 225, 700, 1064, 2334, 2662, 2780, 2810
 - `app/main.py`: 2136
-- `app/auth.py`: 954, 1422
+- `app/auth.py`: 952, 1420
 - `app/config.py`: 252
 <!-- coverage:end -->
 
@@ -278,28 +278,28 @@ the generated table.
   appending tags to `_lead` put it on a path a test actually walks.
 - `app/rerank_boost.py` — 97.6% (2/83 statements uncovered):
   `_strip_entity_phrase` line 182 and `apply_entity_boost` line 253.
-- `app/chat.py` — 95.5% (49/1097 statements uncovered). What is left is the
+- `app/chat.py` — 95.5% (49/1093 statements uncovered). What is left is the
   streaming teardown and the log-shaping helpers, not the turn itself: the
-  `raise` after a mid-turn failure line 2664, the budget `release` line 2566,
-  and four bare `return`s at lines 2691, 2695, 2707, 2840 — so a stream that
+  `raise` after a mid-turn failure line 2662, the budget `release` line 2564,
+  and four bare `return`s at lines 2689, 2692, 2705, 2838 — so a stream that
   dies mid-answer still has no test asserting what is written, what is
   charged, or what is settled. The cancellation-rollback failure path is
-  uncovered too — lines 2336-2337, where a rollback that itself fails after
+  uncovered too — lines 2334-2335, where a rollback that itself fails after
   `CancelledError` is logged rather than raised over the original cancel. Also
   the unconnected-store `raise` in `ChatStore._require_db` line 225, the whole
-  `ChatStore.delete_message` path lines 526-529 (missing session, and the
+  `ChatStore.delete_message` path lines 525-528 (missing session, and the
   delegated delete), the sized-less-iterable `except TypeError` in
-  `_container_stub` lines 702-703 and the two `_shrink_for_log` container
-  delegations lines 718, 728, the `except OverflowError` in `_as_float` lines
-  1066-1067, the two `_append_nudge` early returns lines 1216, 1225, and the
+  `_container_stub` lines 700-701 and the two `_shrink_for_log` container
+  delegations lines 716, 726, the `except OverflowError` in `_as_float` lines
+  1064-1065, the two `_append_nudge` early returns lines 1214, 1223, and the
   empty/plain `str` passthroughs in the untrusted-content truncation lines
-  1567, 1569.
-- `app/auth.py` — 98.9% (8/715 statements uncovered): the unconnected-store
-  `raise` line 954, the two purge-count logs in `token_purge_loop` lines 1049,
-  1055, the in-process rate-counter eviction `del` line 1280 and its early
-  return line 1283, the `except ValueError` on an unparseable expiry line 1422
-  with its `return None` line 1423, and the policy-violation hint in
-  `_password_hint` line 2235.
+  1565, 1567.
+- `app/auth.py` — 98.9% (8/711 statements uncovered): the unconnected-store
+  `raise` line 952, the two purge-count logs in `token_purge_loop` lines 1047,
+  1053, the in-process rate-counter eviction `del` line 1278 and its early
+  return line 1281, the `except ValueError` on an unparseable expiry line 1420
+  with its `return None` line 1421, and the policy-violation hint in
+  `_password_hint` line 2233.
 - `app/config.py` — 99.7% (1/292 statements uncovered): the `ValueError` in
   `_parse_allowed_hosts` line 252 for an entry that is not a usable hostname.
 <!-- gaps:end -->

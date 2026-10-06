@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import hashlib
 import inspect
 import logging
@@ -1302,44 +1303,97 @@ def test_verify_password_malformed_hash_returns_false():
     assert auth.verify_password("secret12", "") is False
 
 
+_REAL_AIO_SQLITE = auth.aiosqlite
+
+
+class _RefusingAioSqlite:
+    """Stand in for the ``aiosqlite`` module, refusing one statement on every
+    connection the store opens after this point.
+
+    Patched at the module rather than on ``store._db`` because a write runs on
+    its own short-lived connection, which the shared one cannot see.
+    """
+
+    def __init__(self, prefix: str, error: BaseException):
+        self.prefix = prefix
+        self.error = error
+        self.tripped = False
+
+    def connect(self, *args, **kwargs):
+        return self._open(_REAL_AIO_SQLITE.connect(*args, **kwargs))
+
+    async def _open(self, coro):
+        conn = await coro
+        real_execute = conn.execute
+
+        async def execute(sql, *args, **kwargs):
+            if not self.tripped and " ".join(sql.split()).startswith(self.prefix):
+                self.tripped = True
+                raise self.error
+            return await real_execute(sql, *args, **kwargs)
+
+        conn.execute = execute
+        return conn
+
+    def __getattr__(self, name):
+        return getattr(_REAL_AIO_SQLITE, name)
+
+
 def test_create_user_generic_error_rolls_back_and_raises(store, monkeypatch):
-    """A non-integrity INSERT failure must roll back so the connection never holds
-    an open write transaction, then re-raise."""
-    calls = {"rollback": 0}
-    orig_execute = store._db.execute
+    """A non-integrity INSERT failure must re-raise, store nothing, and leave the
+    file writable by every other connection.
 
-    async def fake_execute(query, params=()):
-        if query.startswith("INSERT INTO users"):
-            raise RuntimeError("disk full")
-        return await orig_execute(query, params)
+    Stated as the state a caller can see rather than as a rollback call, because
+    that is the part that matters and it is what survives the write moving onto
+    its own connection: a unit abandoned mid-transaction holds the WAL write
+    lock, and the other three workers then fail every write with
+    ``database is locked`` until that connection is gone.
+    """
+    fault = _RefusingAioSqlite("INSERT INTO users", RuntimeError("disk full"))
+    monkeypatch.setattr(auth, "aiosqlite", fault)
+    try:
+        with pytest.raises(RuntimeError, match="disk full"):
+            asyncio.run(store.create_user("x@b.co", "secret12", "X", "user"))
+        assert fault.tripped, "the INSERT never ran, so this proved nothing"
+    finally:
+        monkeypatch.setattr(auth, "aiosqlite", _REAL_AIO_SQLITE)
 
-    async def fake_rollback():
-        calls["rollback"] += 1
+    assert asyncio.run(store.get_user_by_email("x@b.co")) is None, (
+        "the failed signup left a user row behind"
+    )
 
-    monkeypatch.setattr(store._db, "execute", fake_execute)
-    monkeypatch.setattr(store._db, "rollback", fake_rollback)
+    other = AuthStore(store._path)
+    asyncio.run(other.connect())
+    try:
+        # What is asserted is the refusal, not how long the loser waited for it.
+        asyncio.run(other._db.execute("PRAGMA busy_timeout=200"))
+        created = asyncio.run(other.create_user("y@b.co", "secret12", "Y", "user"))
+        assert created.email == "y@b.co"
+        assert asyncio.run(other.get_user_by_email("y@b.co")) is not None
+    finally:
+        asyncio.run(other.close())
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(store.create_user("x@b.co", "secret12", "X", "user"))
-    assert calls["rollback"] == 1
 
+def test_update_user_no_op_and_name_update(store):
+    """An update with nothing to set changes no row, and a name-only update moves
+    the name and leaves every other field exactly as it was.
 
-def test_update_user_no_op_and_name_update(store, monkeypatch):
+    Read back through the store instead of watched on the connection, so what is
+    pinned is the row a caller ends up holding.
+    """
     user = asyncio.run(store.create_user("a@b.co", "secret12", "A", "user"))
-    execs = []
-    orig_execute = store._db.execute
+    before = asyncio.run(store.get_user(user.id))
 
-    async def fake_execute(query, params=()):
-        execs.append(query)
-        return await orig_execute(query, params)
+    assert asyncio.run(store.update_user(user.id, None, None, None)) == 1
+    assert asyncio.run(store.get_user(user.id)) == before, "an empty update rewrote the row"
+    # Reports one change for an account that does not exist, which is the only
+    # observable difference from a real write: an UPDATE would answer 0.
+    assert asyncio.run(store.update_user("no-such-user", None, None, None)) == 1
 
-    monkeypatch.setattr(store._db, "execute", fake_execute)
-    asyncio.run(store.update_user(user.id, None, None, None))
-    assert execs == []  # empty update is a true no-op
-
-    asyncio.run(store.update_user(user.id, "New Name", None, None))
-    assert len(execs) == 1 and execs[0].startswith("UPDATE users SET name = ?")
-    assert asyncio.run(store.get_user(user.id)).name == "New Name"
+    assert asyncio.run(store.update_user(user.id, "New Name", None, None)) == 1
+    after = asyncio.run(store.get_user(user.id))
+    assert after == dataclasses.replace(before, name="New Name"), "the update moved another field"
+    assert after.name == "New Name"
 
 
 def test_delete_user_removes_tokens_and_user(store):
