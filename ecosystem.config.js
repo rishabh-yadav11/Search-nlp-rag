@@ -36,7 +36,13 @@ const NEXT_PORT = boundedInt(process.env.NEXT_PORT, 3000, MAX_PORT);
 
 const MIN_UPTIME = boundedInt(process.env.MIN_UPTIME_MS, 30000, MAX_MIN_UPTIME_MS);
 
-const API_MAX_MEMORY = process.env.API_MAX_MEMORY || "10G";
+// The four knobs below, and MIN_UPTIME above, MUST stay equal to the matching
+// defaults in setup.sh. `./setup.sh services` starts pm2 from this file and
+// EXPORTS them to it, but the documented deploy step is `pm2 restart
+// ecosystem.config.js --update-env`, and an ordinary shell exports none of
+// them -- so on a redeploy these fallbacks are what production actually runs.
+// Nothing checks them against setup.sh any more, so change them together.
+const API_MAX_MEMORY = process.env.API_MAX_MEMORY || "5G";
 const FRONTEND_MAX_MEMORY = process.env.FRONTEND_MAX_MEMORY || "1G";
 const API_MAX_RESTARTS = boundedInt(process.env.API_MAX_RESTARTS, 10, 1000);
 const RESTART_BACKOFF_MS = boundedInt(process.env.RESTART_BACKOFF_MS, 100, 60000);
