@@ -21,8 +21,11 @@ export async function signOut(page: Page): Promise<void> {
 }
 
 /**
- * Sign up a brand-new scratch user on /signup; on success the app redirects to
- * /chat (the signup default next) and the TopBar shows the account control.
+ * Sign up a brand-new scratch user on /signup, then sign in to land on /chat.
+ * Signup does NOT auto-redirect: on success the page shows an "Almost there"
+ * card with a "Sign in" button (the account is registered but not yet signed
+ * in). Completing sign-in proves the credential round-trip and puts the session
+ * cookie in place; the helper ends authenticated on /chat.
  */
 export async function signUpFreshUser(page: Page, email: string): Promise<void> {
   await page.goto('/signup')
@@ -31,9 +34,12 @@ export async function signUpFreshUser(page: Page, email: string): Promise<void> 
   await page.getByLabel('Email', { exact: true }).fill(email)
   await page.getByLabel('Password', { exact: true }).fill(TEST_PASSWORD)
   await page.getByRole('button', { name: 'Sign up' }).click()
-  // Signup success redirects to /chat (default next) — proves the account stuck.
-  await expect(page).toHaveURL(/\/chat$/, { timeout: 20_000 })
-  await expect(page.locator('button.topbar-logout')).toBeVisible()
+  // The account is live only when the "Almost there" success card appears; the
+  // app then routes to /login?next=/chat via its "Sign in" button.
+  await expect(page.getByRole('heading', { name: 'Almost there' })).toBeVisible({ timeout: 20_000 })
+  await page.getByRole('button', { name: 'Sign in' }).click()
+  await expect(page).toHaveURL(/\/login/)
+  await login(page, email)
 }
 
 /**
