@@ -1,0 +1,12 @@
+{
+  "name": "vccircle-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright E2E suite for the VCCircle hybrid-search RAG app; runs against a fully isolated scratch stack on the box",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}

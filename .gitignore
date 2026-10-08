@@ -37,3 +37,12 @@ wt/
 
 # coverage.py artifact from the (now removed) test suite
 backend/.coverage
+
+# Scratch SQLite files written by the backend test suite (see
+# backend/tests/conftest.py); regenerated fresh on every session.
+backend/tests/.testdata/
+
+# Playwright E2E (e2e/) — node install + run artifacts
+e2e/node_modules/
+e2e/playwright-report/
+e2e/test-results/

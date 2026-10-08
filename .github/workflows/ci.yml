@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   backend:
-    name: backend (ruff)
+    name: backend (ruff + pytest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -41,6 +41,12 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Ruff
         run: ruff check .
+
+      # Fuzzy (property-based) + smoke tests. pytest/pytest-cov/hypothesis/httpx
+      # are pinned in requirements-dev.txt. Coverage is reported but NOT gated:
+      # there is no --fail-under, so a coverage regression never surprises CI.
+      - name: Pytest (fuzzy + smoke)
+        run: python -m pytest --cov=app --cov-report=term-missing
 
   frontend:
     name: frontend (lint + typecheck + build)

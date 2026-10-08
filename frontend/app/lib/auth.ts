@@ -71,7 +71,10 @@ function hostInAllowList(url: URL): boolean {
 /** Request base from a parsed base: `origin + pathname` keeps a path prefix
  *  (`https://host/v1`) that a bare origin would discard; query/fragment drop. */
 function baseFromUrl(url: URL): string {
-  return url.origin + url.pathname
+  // Strip a trailing slash: `new URL('http://host').pathname` is '/' so callers
+  // that concatenate `${API_BASE}/api/...` would otherwise produce a `//api`
+  // double slash the backend 404s. A base with a real sub-path keeps it.
+  return url.origin + url.pathname.replace(/\/+$/, '')
 }
 
 /** Trust rule for the session cookie: first-party is trusted — empty (relative

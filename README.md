@@ -528,15 +528,46 @@ Two things to know about what it measures. Tallies are deduped votes accumulated
 
 ## Testing and CI
 
-There is no automated test suite. Lint and type checking are the only static
-gates:
+Three strategies, one commit's worth of surfaces:
+
+1. **Fuzzy** (`backend/tests/test_fuzzy_*`) — hypothesis property tests over the
+   retrieval-pipeline pure functions (`input_hygiene`, `lexical`, `diversity`,
+   `rerank_boost`, `query_intent` via its documented `_now` clock seam,
+   `answer_fallback`, `config` clamps), plus randomized query/facet/date-param
+   fuzz through the faked `/search` endpoint asserting well-formed JSON and no 5xx.
+2. **Smoke** (`backend/tests/test_smoke_*`) — the real FastAPI app behind a
+   `TestClient` with client construction faked (no network): `/health`, `/live`,
+   `/ready`, `/ready/deep`, `/search`, `/facets`, `/chat` (FakeLLM, non-stream +
+   stream), the auth round-trip and admin surface (signup/login/me/logout,
+   change-password, user CRUD, token/service-token revocation), the auth-gated
+   `/recommend/*` and `/analytics/*` endpoints, and `/analytics/click`.
+3. **E2E** (`e2e/`) — Playwright driving the full stack **on the production box in
+   a fully isolated scratch stack** (clone + throwaway Qdrant container on scratch
+   ports + backend on :8099 with no LLM key + frontend on :3099). Six journeys:
+   home SSR, search, auth, chat (honest fallback answer, zero LLM spend), /for-you,
+   /analytics/dashboard. The orchestrator asserts the scratch index is usable
+   (count + guaranteed-hit search) before the UI ever runs.
+
+Run locally (backend venv is Python 3.11, matching CI):
 
 ```bash
+cd backend && venv/bin/python -m pytest        # fuzzy + smoke; 65% coverage, no gate
 cd backend && ruff check .
 cd frontend && npm run lint && npm run typecheck
 ```
 
-Behaviour is verified against a running deployment instead: `curl localhost/health`
+Run E2E against the box (creates and tears down an isolated scratch stack; the
+running deployment, pm2, nginx, ports and data are never touched). The suite
+must be staged on the box first, because the orchestrator runs as a file and
+reads its own sibling directory:
+
+```bash
+scp -r e2e vccircle-search:~/          # stage the suite to ~/e2e on the box
+ssh vccircle-search 'bash ~/e2e/run-on-box.sh'                 # teardown after
+ssh vccircle-search 'bash ~/e2e/run-on-box.sh -- --no-teardown'  # keep for debugging
+```
+
+Deployed behaviour is still verified against a running deployment: `curl localhost/health`
 and `localhost/ready` (which checks Qdrant, the models, Redis and the LLM), then a
 real `/search?q=...` returning on-topic hits. `/health` alone proves nothing — it
 stays 200 while retrieval and auth are broken.
@@ -545,7 +576,7 @@ stays 200 while retrieval and auth are broken.
 runs are cancelled (concurrency group keyed on workflow + ref) and every job has
 an explicit timeout.
 
-1. **backend** (`timeout-minutes: 30`) — Python 3.11 and `ruff check .`.
+1. **backend** (`timeout-minutes: 30`) — Python 3.11, `ruff check .`, then `pytest` (fuzzy + smoke; coverage reported, not gated).
 2. **frontend** (`timeout-minutes: 20`) — Node 22, `npm ci`, `npm run lint` (eslint), `npx tsc --noEmit`, `npm run build`.
 3. **security** (`timeout-minutes: 20`) — `pip-audit` on both requirements files, `npm audit --audit-level=high`, and a gitleaks secret scan (binary pinned to 8.28.0, download SHA-256 verified) over the full history of the checked-out ref.
 
