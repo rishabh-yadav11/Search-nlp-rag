@@ -31,7 +31,10 @@ test('admin sees real analytics fed by backend endpoints', async ({ page }) => {
   expect([200, 202]).toContain(clicks.status())
 
   await page.goto('/analytics/dashboard')
-  await expect(page.getByRole('heading', { name: 'Search analytics' })).toBeVisible()
+  // The dashboard's success state has no "Search analytics" heading: it shows a
+  // stat-card grid plus "Top queries" and "Chat usage" panels, so assert on
+  // what a permitted admin actually sees (proves /analytics/summary + /chat
+  // loaded through the real API).
   await expect(page.getByRole('heading', { name: 'Top queries' })).toBeVisible()
   await expect(page.getByRole('heading', { name: /Chat usage/ })).toBeVisible()
   await expect(page.locator('.dash-cards .dash-card').first()).toBeVisible()

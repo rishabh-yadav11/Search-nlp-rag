@@ -51,9 +51,10 @@ async function assertForYouUnauthenticated(browser: Browser, email: string): Pro
     expect(response?.status()).toBe(200)
     await expect(page.getByRole('heading', { name: 'For You' })).toBeVisible()
     // The feed fetch 401s; the page shows the honest error rather than data.
-    await expect(page.locator('div', { hasText: 'Failed to load feed: 401' })).toBeVisible({
-      timeout: 30_000,
-    })
+    // The error text sits in both the page wrapper and the error panel, so
+    // query the error panel itself (the last matching div).
+    const errPanel = page.locator('div').filter({ hasText: 'Failed to load feed: 401' }).last()
+    await expect(errPanel).toBeVisible({ timeout: 30_000 })
     await expect(page.getByRole('button', { name: 'Retry' })).toBeVisible()
   } finally {
     await ctx.close()

@@ -163,8 +163,12 @@ mkdir -p "$SCRATCH"
 log "scratch root: $SCRATCH"
 
 log "cloning origin/main (HEAD) into scratch (read-only on the prod tree)..."
-git clone --quiet --no-tags "$PROD_TREE" "$SCRATCH/clone" || fail "git clone failed"
-git -C "$SCRATCH/clone" fetch --quiet origin 2>/dev/null || true
+# Clone from the box's REAL origin remote, not the prod working tree: cloning
+# "$PROD_TREE" copies its stale local branch/remote refs (the deployment has
+# not cut over yet), silently testing old code. The origin remote is reachable
+# from the box and carries the deployable main.
+REMOTE_URL="$(git -C "$PROD_TREE" remote get-url origin)" || fail "cannot read origin remote of $PROD_TREE"
+git clone --quiet "$REMOTE_URL" "$SCRATCH/clone" || fail "git clone from origin failed"
 git -C "$SCRATCH/clone" checkout --quiet -B e2e-run origin/main 2>/dev/null \
   || git -C "$SCRATCH/clone" checkout --quiet -B e2e-run main 2>/dev/null \
   || fail "cannot set scratch clone HEAD to origin/main"
