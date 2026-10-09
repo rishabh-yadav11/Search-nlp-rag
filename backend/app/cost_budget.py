@@ -429,7 +429,9 @@ def to_usd(cost_inr: float) -> float:
     costs).
     """
     global _inr_fallback_warned
-    rate = config.INR_PER_USD
+    from app.fx_rate import rate_usd_inr
+
+    rate = rate_usd_inr()
     if not rate:
         if not _inr_fallback_warned:
             logger.warning(

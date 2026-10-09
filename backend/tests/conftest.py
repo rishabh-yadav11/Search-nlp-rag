@@ -55,6 +55,12 @@ os.environ.setdefault(
 os.environ.setdefault("AUTH_ADMIN_EMAIL", "admin@example.test")
 os.environ.setdefault("AUTH_ADMIN_PASSWORD", "admin-pass-2026")  # letter + digit, >= 8
 
+# The fx_rate loop must not hit the real network during the suite: point it at a
+# loopback URL that fails fast, so it logs a fetch failure and keeps the
+# configured fallback rate exactly as a real outage would.
+os.environ.setdefault("FX_RATE_API_URL", "http://127.0.0.1:1/fx")
+os.environ.setdefault("FX_RATE_REFRESH_SECONDS", "0")  # no background refresh
+
 # Rate limits: disabled (0) so a full test session can never trip a 429 and
 # never depends on wall-clock windows.
 for _env in (

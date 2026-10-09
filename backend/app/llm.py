@@ -58,12 +58,14 @@ class LLMResult:
 
     def cost(self) -> float:
         """Estimated cost of this call in INR, from config pricing per 1M tokens
-        (USD) converted at INR_PER_USD."""
+        (USD) converted at the current INR rate (live, fallback on failure)."""
         usd = (
             self.prompt_tokens / 1_000_000 * config.LLM_PRICE_INPUT_PER_1M
             + self.completion_tokens / 1_000_000 * config.LLM_PRICE_OUTPUT_PER_1M
         )
-        return usd * config.INR_PER_USD
+        from app.fx_rate import rate_usd_inr
+
+        return usd * rate_usd_inr()
 
 
 def _retry_after_seconds(exc: Exception) -> float | None:
