@@ -39,8 +39,10 @@ test('signed-in user can subscribe and gets a feed view', async ({ page }) => {
 
   // The feed refetched after the subscription: it renders either a matching
   // article link (a[href^="http"], the same anchor for-you.spec uses) or the
-  // backend's honest empty note — never an error state. Poll on visible text,
-  // not hashed classes.
+  // backend's honest empty note. (Do NOT use role="alert" as an error signal:
+  // Next.js injects a hidden route-announcer div with role="alert" on every
+  // page, so an alert query matches by default. The feed's error branch is the
+  // one that renders a "Retry" button, so that is the reliable error probe.)
   await expect
     .poll(
       async () => {
@@ -49,8 +51,8 @@ test('signed-in user can subscribe and gets a feed view', async ({ page }) => {
           .getByText(/No articles match your subscriptions yet|not following anything yet/)
           .isVisible()
           .catch(() => false)
-        const hasError = await page.getByRole('alert').isVisible().catch(() => false)
-        return hasError ? 'error' : hasCard || hasEmpty ? 'ok' : 'loading'
+        const hasRetry = await page.getByRole('button', { name: 'Retry' }).isVisible().catch(() => false)
+        return hasRetry ? 'error' : hasCard || hasEmpty ? 'ok' : 'loading'
       },
       { timeout: 20_000 },
     )
