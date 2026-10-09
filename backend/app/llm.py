@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass
 
 import openai
@@ -96,6 +97,16 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
+async def _record_llm_outcome(status: str, duration: float) -> None:
+    """Best-effort Prometheus hook for one LLM call; never breaks answering."""
+    try:
+        from app.metrics import inc_llm
+
+        inc_llm(status, duration)
+    except Exception:
+        logger.debug("prometheus llm hook failed", exc_info=True)
+
+
 async def generate_answer(llm_client, prompt: str, model: str, system_prompt: str | None = None) -> LLMResult:
     """Call the LLM with a timeout, retrying transient errors.
 
@@ -103,6 +114,7 @@ async def generate_answer(llm_client, prompt: str, model: str, system_prompt: st
     raises LLMUnavailableError wrapping the last error, so callers never surface
     raw SDK errors.
     """
+    started_at = time.perf_counter()
     last_error = None
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         try:
@@ -116,6 +128,7 @@ async def generate_answer(llm_client, prompt: str, model: str, system_prompt: st
             usage = response.usage
             if not response.choices:
                 raise LLMUnavailableError("LLM returned an empty choices list", attempts=attempt + 1) from None
+            await _record_llm_outcome("ok", time.perf_counter() - started_at)
             return LLMResult(
                 content=response.choices[0].message.content or "",
                 prompt_tokens=(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,

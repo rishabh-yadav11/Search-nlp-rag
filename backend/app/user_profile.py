@@ -191,12 +191,20 @@ async def record_interaction(
     article_id: int,
     interaction_type: str = InteractionType.CLICK,
     dwell_time_ms: int | None = None,
+    feed_type: str = "",
+    session_id: str = "",
 ) -> InteractionResult:
     """Record a user-article interaction in Redis, reporting why if it did not.
 
     Stores a ``user:interactions:{user_id}`` sorted set scored by timestamp, a
     per-article interaction detail hash for dwell-time analysis, and a
     per-interaction-kind article counter for trending.
+
+    ``feed_type`` (``personalized|trending|latest``) and ``session_id`` are
+    beacon context: feed_type is persisted in the interaction detail hash so the
+    feed a click came from stays recoverable, and session_id is stored alongside
+    so a search->click->interaction chain can be joined server-side. Both are
+    opaque and bounded.
 
     Rejects an unknown ``interaction_type``, an ``article_id`` that is not in the
     article index, and a user who has already interacted with
@@ -247,6 +255,8 @@ async def record_interaction(
             "type": kind,
             "timestamp": str(now),
             "dwell_time_ms": str(dwell_time_ms or 0),
+            "feed_type": (feed_type or "")[:64],
+            "session_id": (session_id or "")[:128],
         })
         pipe.expire(detail_key, config.USER_INTERACTION_TTL_DAYS * 86400)
 

@@ -124,6 +124,7 @@ class RequestIdMiddleware:
             with bound_request_id(request_id):
                 await self.app(scope, receive, send_with_request_id)
         finally:
+            duration = (time.perf_counter() - started_at)
             # `extra` rather than the ContextVar: an exception unwinding through
             # this `finally` has already reset the ContextVar, and RequestIdFilter
             # never overwrites a caller-set field -- without it this record, the
@@ -133,11 +134,26 @@ class RequestIdMiddleware:
                 scope.get("method", "-"),
                 scope.get("path", "-"),
                 500 if status_code is None else status_code,
-                (time.perf_counter() - started_at) * 1000,
+                duration * 1000,
                 request_id,
                 _user_id(scope),
                 extra={"request_id": request_id},
             )
+            # Prometheus hook stays in this middleware so EVERY route gets counted
+            # once, regardless of handler outcome. Imported lazily below the access
+            # log: /metrics itself passes through this same middleware, and eagerly
+            # importing metrics here would fight the router-import ordering in main.
+            try:
+                from app.metrics import inc_http_request
+
+                inc_http_request(
+                    scope.get("method", "-"),
+                    scope.get("path", "-"),
+                    500 if status_code is None else status_code,
+                    duration,
+                )
+            except Exception:
+                logger.debug("prometheus request hook failed", exc_info=True)
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:

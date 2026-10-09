@@ -6,6 +6,7 @@ import TopBar from './components/TopBar'
 import { API_BASE, API_BASE_TRUSTED } from './lib/auth'
 import { formatDate, parseLocalDate } from './lib/format'
 import { isSafeUrl } from './lib/safe-url'
+import { ensureSessionId } from './lib/session-id'
 
 type Result = {
   id: number | string
@@ -137,8 +138,9 @@ function sanitizeResponse(raw: unknown): ResponseData {
 
 function trackClick(query: string, position: number, id?: string | number) {
   if (typeof navigator === 'undefined' || !query) return
+  const sessionId = ensureSessionId()
   try {
-    const payload = JSON.stringify({ query, position, id })
+    const payload = JSON.stringify({ query, position, id, session_id: sessionId })
     const sent = navigator.sendBeacon(`${API_BASE}/analytics/click`, new Blob([payload], { type: 'application/json' }))
     if (sent) return
     fetch(`${API_BASE}/analytics/click`, {
@@ -229,6 +231,10 @@ export default function Page() {
     try {
       const res = await fetch(`${API_BASE}/search?${params.toString()}`, {
         signal: controller.signal,
+        // Analytics join key: created lazily so a visitor who never searches
+        // neither reads nor writes a cookie. The header (not a field on the
+        // query string) keeps every search cheap to join to its clicks.
+        headers: { 'X-Session-Id': ensureSessionId() },
       })
 
       if (!isLatest()) return

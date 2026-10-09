@@ -35,3 +35,7 @@ symspellpy==6.10.0
 # Fallback tz database for stdlib zoneinfo (app/query_intent.py resolves
 # Asia/Kolkata); used when the container has no system /usr/share/zoneinfo.
 tzdata==2026.3
+# Prometheus exposition (app/metrics.py: /metrics registry + instrumentation
+# hooks). Pinned exactly like the rest of this file; 0.26 bundles the
+# process/GC/platform default collectors as of 0.26.
+prometheus-client==0.26.0

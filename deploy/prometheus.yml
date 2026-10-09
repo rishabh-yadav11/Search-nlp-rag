@@ -1,0 +1,29 @@
+# Prometheus scrape config for the VCCircle Search backend.
+#
+# Installed by `./setup.sh prometheus` as a read-only mount into the prometheus
+# container (/etc/prometheus/prometheus.yml). Only the loopback backend is
+# scraped -- node-exporter and any other infra are out of scope for this
+# deployment.
+#
+# The backend binds to 127.0.0.1 (gunicorn in ecosystem.config.js), so this
+# target must be reached from the prometheus container's HOST network. setup.sh
+# therefore runs the container with --network=host (the docker bridge has its
+# own loopback and could not reach the host's 127.0.0.1). Do not "fix" the
+# target to a non-loopback address to work around a networking change: the API
+# is deliberately loopback-only, and the correct fix is to keep host networking.
+
+global:
+  # Scraping the loopback backend once every 30s is far below the rate limits
+  # (PUBLIC_READY etc. all default to per-minute budgets), but the /metrics
+  # handler itself refreshes the health gauges from app/health.py on every
+  # scrape, so a shorter interval would start polling Redis/Qdrant per scrape.
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: vccircle-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8001"]
+        labels:
+          instance: backend

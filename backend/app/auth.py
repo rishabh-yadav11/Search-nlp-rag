@@ -44,6 +44,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import ClassVar
 from urllib.parse import urlsplit
 
@@ -190,6 +191,9 @@ class StoredUser:
     role: str
     is_active: bool
     created_at: float
+    # Populated after the last_seen migration; None before the column exists or
+    # for a user who has never authenticated. Not surfaced in UserOut.
+    last_seen: float | None = None
 
 
 @dataclass
@@ -422,6 +426,12 @@ class AuthStore:
         self._db: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:
+        # Idempotent: connect() may be called more than once (the migration test
+        # re-runs it to prove re-entry is safe), and a second call must not
+        # clobber the live connection, which would abandon its aiosqlite worker
+        # thread (non-daemon) and hang interpreter shutdown.
+        if self._db is not None:
+            return
         parent = os.path.dirname(os.path.abspath(self._path))
         os.makedirs(parent, exist_ok=True)
         self._db = await aiosqlite.connect(self._path)
@@ -457,6 +467,19 @@ class AuthStore:
         )
         await self._db.execute(
             """
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )
+            """
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id)"
+        )
+        await self._db.execute(
+            """
             CREATE TABLE IF NOT EXISTS auth_service_tokens (
                 token_hash TEXT PRIMARY KEY,
                 scope TEXT NOT NULL,
@@ -466,6 +489,14 @@ class AuthStore:
             )
             """
         )
+        # Migration for existing databases created before the last_seen column:
+        # guard on its OWN name, exactly like the chat-store pattern, so a
+        # partial schema is repaired rather than relied on. Single statement, so
+        # no BEGIN IMMEDIATE needed; the shared connection autocommits DDL.
+        cols = await self._db.execute_fetchall("PRAGMA table_info(users)")
+        col_names = {row["name"] for row in cols} if cols else set()
+        if "last_seen" not in col_names:
+            await self._db.execute("ALTER TABLE users ADD COLUMN last_seen REAL")
         await self._db.commit()
 
     async def close(self) -> None:
@@ -515,6 +546,7 @@ class AuthStore:
 
     @staticmethod
     def _to_user(row) -> StoredUser:
+        last_seen = row["last_seen"] if "last_seen" in row.keys() else None  # noqa: SIM118 (sqlite3.Row `in` tests values, not keys)
         return StoredUser(
             id=row["id"],
             email=row["email"],
@@ -523,6 +555,7 @@ class AuthStore:
             role=row["role"],
             is_active=bool(row["is_active"]),
             created_at=float(row["created_at"]),
+            last_seen=float(last_seen) if last_seen is not None else None,
         )
 
     async def create_user(self, email: str, password: str, name: str, role: str) -> StoredUser:
@@ -682,6 +715,69 @@ class AuthStore:
     async def count_admins(self) -> int:
         row = await self._fetchone("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
         return int(row["n"]) if row else 0
+
+    async def touch_last_seen(self, user_id: str, now: float | None = None) -> None:
+        """Write ``users.last_seen`` for one user. Should only be called after the
+        caller has throttled (see ``_touch_last_seen``). Single statement, so it is
+        atomic on its own; the unit still wraps the write so a cancelled request
+        rolls back rather than stranding the connection on the WAL write lock."""
+        async with self._unit_of_work() as db:
+            await db.execute(
+                "UPDATE users SET last_seen = ? WHERE id = ?",
+                (now if now is not None else _now(), user_id),
+            )
+
+    async def account_stats(self, now: float | None = None) -> dict:
+        """SQLite-derived user/account counts for ``/analytics/users``.
+
+        None of these fields is per-user auth text -- they are aggregate counts
+        and the report is admin-only. ``now`` is injectable for tests."""
+        stamp = now if now is not None else _now()
+        today_start = int(stamp // 86400) * 86400
+
+        signup_total = await self._fetchone("SELECT COUNT(*) AS n FROM users")
+        signup_today = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM users WHERE created_at >= ?", (today_start,)
+        )
+        role_rows = await self._fetchall("SELECT role, COUNT(*) AS n FROM users GROUP BY role")
+        disabled = await self._fetchone(
+            "SELECT COUNT(*) AS n FROM users WHERE is_active = 0"
+        )
+        # active via last_seen; only rows that have a last_seen value count.
+        last_seen_rows = await self._fetchall(
+            "SELECT last_seen FROM users WHERE last_seen IS NOT NULL"
+        )
+        ls_vals = [float(r["last_seen"]) for r in last_seen_rows]
+        active_today = sum(1 for ls in ls_vals if ls >= today_start)
+        active_7d = sum(1 for ls in ls_vals if ls >= stamp - 7 * 86400)
+        active_30d = sum(1 for ls in ls_vals if ls >= stamp - 30 * 86400)
+
+        # last 14 days of signups, asc by date.
+        signup_days: dict[str, int] = {}
+        rows = await self._fetchall("SELECT created_at FROM users")
+        for r in rows:
+            day = time.strftime("%Y-%m-%d", time.gmtime(float(r["created_at"])))
+            signup_days[day] = signup_days.get(day, 0) + 1
+        today_iso = time.strftime("%Y-%m-%d", time.gmtime(stamp))
+        days = []
+        start = datetime.fromisoformat(today_iso).date() - timedelta(days=13)
+        for i in range(14):
+            d = (start + timedelta(days=i)).isoformat()
+            days.append([d, signup_days.get(d, 0)])
+
+        return {
+            "signups": {
+                "today": int(signup_today["n"]) if signup_today else 0,
+                "total": int(signup_total["n"]) if signup_total else 0,
+            },
+            "role_distribution": {r["role"]: int(r["n"]) for r in role_rows},
+            "disabled_accounts": int(disabled["n"]) if disabled else 0,
+            "active_today": active_today,
+            "active_last_7d": active_7d,
+            "active_last_30d": active_30d,
+            "signups_14d": days,
+        }
+
 
     async def issue_token(self, user_id: str, ttl_days: int) -> str:
         """Mint a bearer token and return it in plaintext (only its SHA-256 is
@@ -1587,6 +1683,74 @@ async def _resolve_service_token(raw: str) -> StoredServiceToken | None:
     return None
 
 
+# --- last_seen throttling + admin audit (analytics contract) ---
+
+# In-process per-user last_seen touch throttle. KEYED BY USER ID, so it can only
+# grow as large as the account table (a user id is only ever produced by a
+# successful authentication), never by an anonymous flood. A user authenticating
+# from several gunicorn workers touches each one's set, which only over-writes
+# (it can never under-report). Cleared only when the throttled interval elapses.
+_last_seen_touched: dict[str, float] = {}
+
+
+def _last_seen_due(user_id: str, now: float) -> bool:
+    interval = config.LAST_SEEN_TOUCH_INTERVAL_SECONDS
+    if interval <= 0:
+        return True
+    last = _last_seen_touched.get(user_id)
+    if last is None or now - last >= interval:
+        _last_seen_touched[user_id] = now
+        return True
+    return False
+
+
+async def _touch_last_seen(user_id: str) -> None:
+    """Best-effort, throttled write of ``users.last_seen``. Never raises."""
+    if not _last_seen_due(user_id, _now()):
+        return
+    s = store
+    if s is None:
+        return
+    try:
+        await s.touch_last_seen(user_id)
+    except Exception:
+        # A missed last_seen is a lost DAU tick, not an auth outage: the user is
+        # already authenticated by the time this runs, so the write can never
+        # fail the request.
+        logger.debug("last_seen touch failed for %s", user_id, exc_info=True)
+
+
+def _login_day_key(stamp: float | None = None) -> str:
+    """Redis key for the per-day successful-login counter."""
+    return f"analytics:login:day:{time.strftime('%Y-%m-%d', time.gmtime(stamp if stamp is not None else _now()))}"
+
+
+async def _count_login() -> None:
+    """INCR today's successful-login counter. Best-effort, never raises."""
+    try:
+        await _rate_redis().incr(_login_day_key())
+    except Exception:
+        logger.debug("login-day counter INCR failed", exc_info=True)
+
+
+def _chat_audit_store():
+    """Lazily resolve the chat store for the admin audit trail.
+
+    Avoids a module-load cycle (chat.py imports app.auth) by importing at call
+    time, once main.py has imported both modules."""
+    from app.chat import _require_store
+    return _require_store()
+
+
+async def _record_admin_audit(actor_id: str, action: str) -> None:
+    """Best-effort admin audit write. Never raises and never breaks the action."""
+    try:
+        await _chat_audit_store().record_admin_audit(actor_id, action)
+    except Exception:
+        logger.warning("admin audit write failed for %s", action, exc_info=True)
+
+
+
 async def require_auth(request: Request) -> None:
     """Validate the request's credentials and stash the user on request.state.
     Accepts the auth cookie (user tokens) or ``X-Service-Token`` (a scoped,
@@ -1624,6 +1788,9 @@ async def require_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="invalid or expired token")
     request.state.user = user
     request.state.user_id = user.id
+    # Real user credential: record activity (throttled, best-effort). The
+    # service-token path above returns early, so it is excluded here.
+    await _touch_last_seen(user.id)
 
 
 def require_permission(permission: str):
@@ -1758,6 +1925,10 @@ async def login(
         # The session is delivered ONLY as the HttpOnly cookie: nothing in the
         # body for script on the page to read and exfiltrate.
         _set_session_cookie(response, token)
+        # Analytics: a successful login is activity. Both are best-effort and
+        # must never fail the login.
+        await _touch_last_seen(user.id)
+        await _count_login()
         return AuthOut(user=UserOut.from_user(user))
 
     # Failed. Count it against the address, keyed on the submitted string alone
@@ -1917,6 +2088,7 @@ async def patch_user(
     rowcount = await s.update_user(user_id, name, body.role, body.is_active, guard_last_admin=is_demote)
     if is_demote and rowcount == 0:
         raise HTTPException(status_code=400, detail="cannot demote or deactivate the last admin")
+    await _record_admin_audit(request.state.user_id, "users.patch")
     return UserOut.from_user(await _get_user_or_404(s, user_id))
 
 
@@ -1933,6 +2105,7 @@ async def delete_user(
     n = await s.delete_user(user_id, guard_last_admin=(target.role == "admin"))
     if target.role == "admin" and n == 0:
         raise HTTPException(status_code=400, detail="cannot delete the last admin")
+    await _record_admin_audit(request.state.user_id, "users.delete")
     return {"ok": True}
 
 
@@ -1945,6 +2118,7 @@ async def revoke_user_tokens(
 ):
     """Revoke every token a user holds (forces re-login)."""
     await _require_auth_store().revoke_all_tokens(user_id)
+    await _record_admin_audit(request.state.user_id, "users.revoke_tokens")
     return {"ok": True}
 
 
@@ -1968,6 +2142,7 @@ async def mint_service_token(
     raw, record = await _require_auth_store().issue_service_token(
         set(_service_token_scope()), _service_token_ttl_seconds()
     )
+    await _record_admin_audit(request.state.user_id, "users.mint_service_token")
     return ServiceTokenOut(token=raw, scope=sorted(record.scope), expires_at=record.expires_at)
 
 
@@ -2006,6 +2181,7 @@ async def revoke_service_tokens(
     revoked = await s.revoke_all_service_tokens()
     if configured:
         revoked += await s.revoke_configured_service_token(configured, set(_service_token_scope()))
+    await _record_admin_audit(request.state.user_id, "users.revoke_service_tokens")
     return {"revoked": revoked}
 
 

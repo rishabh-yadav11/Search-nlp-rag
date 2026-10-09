@@ -139,16 +139,20 @@ I wrote `setup.sh` to provision everything in stages. Run `./setup.sh all`, or p
 ./setup.sh frontend     # npm ci + production build
 ./setup.sh services     # pm2 start gunicorn (API) + next (frontend)
 ./setup.sh pm2-startup  # systemd unit so services restore on reboot
+./setup.sh prometheus   # Prometheus container scraping 127.0.0.1:8001/metrics (loopback)
 ./setup.sh cron         # 15-min incremental sync
 ./setup.sh nginx        # reverse proxy + security headers on :80
 ./setup.sh tls          # HTTPS: certbot + :443 + http->https redirect (needs a domain; see [TLS](#tls-https))
 ./setup.sh logrotate    # render deploy/logrotate.conf for this host + install it
+./setup.sh stop         # stop backend + frontend + prometheus
 ./setup.sh all          # deps backend index frontend services pm2-startup cron nginx
 ```
 
-`tls` is deliberately not part of `./setup.sh all`: it needs a domain name, a contact address and network access that an unattended bootstrap must not require. Run it once, on purpose. `logrotate` is left out for the same spirit — it needs the `logrotate` binary, and the policy it installs names this host's paths, so it is a one-off operator step (see [Log Management](#log-management)).
+`tls` is deliberately not part of `./setup.sh all`: it needs a domain name, a contact address and network access that an unattended bootstrap must not require. Run it once, on purpose. `logrotate` is left out for the same spirit — it needs the `logrotate` binary, and the policy it installs names this host's paths, so it is a one-off operator step (see [Log Management](#log-management)). `prometheus` is also left out: it runs on the docker host network to reach the loopback API, which means Docker must be present on the box and the box must already have the backend on `127.0.0.1:$API_PORT` — both true after `./setup.sh backend`, so run it once after `services`, or not at all on a host that isn't being watched.
 
-Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `ALLOW_UNSUPPORTED_PY`, `LOGROTATE_CONF` (default `/etc/logrotate.d/vccircle`), plus the TLS knobs `NGINX_TLS` (`auto`/`on`/`off`), `LE_DOMAIN`, `LE_EMAIL`, `LE_ROOT`, `CERTBOT_WEBROOT`, `NGINX_CONF`, `NGINX_LINK`, and the edge chat-stream limit `NGINX_CHAT_LIMIT_RATE` (`10r/m`) / `NGINX_CHAT_LIMIT_BURST` (`10`). pm2 process tuning: `API_MAX_MEMORY` (5G), `FRONTEND_MAX_MEMORY` (1G), `API_MAX_RESTARTS` (10), `RESTART_BACKOFF_MS` (100), `MIN_UPTIME_MS` (30000) — these must stay equal to `ecosystem.config.js`, and nothing enforces that automatically any more, so a change to one file has to be made in the other by hand.
+Prometheus exposes `/metrics` on the loopback port with **no auth** (scraped by the container on host network); it is never behind nginx, so it is reachable only from `127.0.0.1`. The container is pinned by digest (`PROMETHEUS_IMAGE`), config lives in `deploy/prometheus.yml`, and data persists in `prometheus_data/`. Stop it with `./setup.sh stop-prometheus` (or as part of `stop`).
+
+Environment overrides: `QDRANT_PORT`, `REDIS_PORT`, `API_PORT`, `NEXT_PORT`, `PUBLIC_PORT`, `GUNICORN_WORKERS`, `PUBLIC_BASE_URL`, `QDRANT_IMAGE`, `REDIS_IMAGE`, `PROMETHEUS_IMAGE`, `PROMETHEUS_PORT`, `ALLOW_UNSUPPORTED_PY`, `LOGROTATE_CONF` (default `/etc/logrotate.d/vccircle`), plus the TLS knobs `NGINX_TLS` (`auto`/`on`/`off`), `LE_DOMAIN`, `LE_EMAIL`, `LE_ROOT`, `CERTBOT_WEBROOT`, `NGINX_CONF`, `NGINX_LINK`, and the edge chat-stream limit `NGINX_CHAT_LIMIT_RATE` (`10r/m`) / `NGINX_CHAT_LIMIT_BURST` (`10`). pm2 process tuning: `API_MAX_MEMORY` (5G), `FRONTEND_MAX_MEMORY` (1G), `API_MAX_RESTARTS` (10), `RESTART_BACKOFF_MS` (100), `MIN_UPTIME_MS` (30000) — these must stay equal to `ecosystem.config.js`, and nothing enforces that automatically any more, so a change to one file has to be made in t…
 
 If you'd rather run pieces manually, keep reading.
 

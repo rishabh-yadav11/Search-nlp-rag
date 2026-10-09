@@ -695,6 +695,18 @@ class Config:
     # guardrail survives brief outages, then auto-expires instead of accumulating.
     COST_DAY_TTL_SECONDS = int(os.getenv("COST_DAY_TTL_SECONDS", str(7 * 24 * 3600)))
 
+    # Search-analytics additions (see analytics.py): per-session zset TTL and the
+    # daily top-queries set TTL. Both are conservative and never nil.
+    ANALYTICS_SESSION_TTL_HOURS = _clamped_int("ANALYTICS_SESSION_TTL_HOURS", 24, 1, 24 * 365)
+    TOP_QUERIES_TODAY_TTL_DAYS = _clamped_int("TOP_QUERIES_TODAY_TTL_DAYS", 7, 1, 90)
+
+    # Throttle interval for the users.last_seen touch. An in-process per-user set
+    # suppresses a write for this many seconds between touches.
+    LAST_SEEN_TOUCH_INTERVAL_SECONDS = _clamped_int("LAST_SEEN_TOUCH_INTERVAL_SECONDS", 300, 0, 3600)
+
+    # How many admin_audit rows /analytics/users reports (last N, newest first).
+    AUDIT_RECENT_LIMIT = _clamped_int("AUDIT_RECENT_LIMIT", 20, 1, 100)
+
     # Chat-only "body rescue": when the top reranked score is below
     # BODY_RESCUE_THRESHOLD, re-score the candidates against the body region
     # with the most lexical query-token overlap and keep max(baseline, body).

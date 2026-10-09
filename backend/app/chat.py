@@ -119,8 +119,29 @@ class TurnOut(BaseModel):
     latency_ms: float = 0.0
 
 
+class RatingIn(BaseModel):
+    # Bounded on the model so an out-of-range rating is a 422 before the write:
+    # a value outside {-1, 0, 1} can never reach the store. The store re-checks
+    # anyway, so a direct caller bypassing HTTP stays safe too.
+    rating: int = Field(ge=-1, le=1)
+
+
 def _now() -> float:
     return time.time()
+
+
+def _percentile_offset(n: int, pct: float) -> int:
+    """0-based OFFSET that selects the ``pct``-th percentile of ``n`` sorted samples.
+
+    Nearest-rank: the p-th percentile is the element at ``ceil(p/100 * n)``
+    (1-based), so the index a ``LIMIT 1 OFFSET ?`` query wants is that rank minus
+    one. ``n == 0`` returns 0, which the caller must read as "no sample", and the
+    offset is clamped to the last element so a tiny sample never reads past the
+    end.
+    """
+    if n <= 0:
+        return 0
+    return min(max(0, math.ceil((pct / 100.0) * n) - 1), n - 1)
 
 
 class ChatStore:
@@ -163,7 +184,9 @@ class ChatStore:
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 cost REAL NOT NULL DEFAULT 0,
                 latency_ms REAL NOT NULL DEFAULT 0,
-                aborted INTEGER NOT NULL DEFAULT 0
+                aborted INTEGER NOT NULL DEFAULT 0,
+                model TEXT NOT NULL DEFAULT '',
+                rating INTEGER
             )
             """
         )
@@ -214,6 +237,20 @@ class ChatStore:
             # visible in history (aborted=1) instead of being silently erased.
             if "aborted" not in col_names:
                 await db.execute("ALTER TABLE messages ADD COLUMN aborted INTEGER NOT NULL DEFAULT 0")
+            # Chat analytics record which model answered each turn (model_usage)
+            # and whether the owner rated it (thumbs up/down). `model` is NOT NULL:
+            # rows that predate the column get the configured default as a backfill
+            # (quoted with single-quotes doubled, so a model name containing one is
+            # still a safe literal), while every new row supplies the real model via
+            # the INSERT in _append_authorized. `rating` is deliberately NULLable --
+            # an unrated message is NULL -- and values are validated to {-1, 0, 1}.
+            if "model" not in col_names:
+                _model_backfill = "'" + config.LLM_MODEL.replace("'", "''") + "'"
+                await db.execute(
+                    "ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT " + _model_backfill
+                )
+            if "rating" not in col_names:
+                await db.execute("ALTER TABLE messages ADD COLUMN rating INTEGER")
 
     async def close(self) -> None:
         if self._db is not None:
@@ -370,6 +407,7 @@ class ChatStore:
         cost: float = 0.0,
         latency_ms: float = 0.0,
         aborted: bool = False,
+        model: str = "",
         ts: float | None = None,
     ) -> MessageOut:
         """Append to a session whose ownership the caller has ALREADY proven.
@@ -389,14 +427,19 @@ class ChatStore:
         again later. A cancellation inside this call's own COMMIT returns no id,
         and the timestamp is what lets that cleanup find THIS turn's row rather
         than a concurrent one asking the same question.
+
+        An empty `model` means "the configured default": every caller currently
+        routes through the one configured model, so the stored name is resolved
+        here rather than at each call site spelling it out.
         """
         stamp = _now() if ts is None else ts
+        model = model or config.LLM_MODEL
         async with self._unit_of_work() as db:
             cur = await db.execute(
-                "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted)"
-                " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+                "INSERT INTO messages (session_id, role, content, sources, created_at, prompt_tokens, completion_tokens, cost, latency_ms, aborted, model)"
+                " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
                 " WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
-                (session.id, role, content, json_dumps(sources or []), stamp, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted), session.id),
+                (session.id, role, content, json_dumps(sources or []), stamp, prompt_tokens, completion_tokens, cost, latency_ms, int(aborted), model, session.id),
             )
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="conversation not found")
@@ -429,6 +472,7 @@ class ChatStore:
         cost: float = 0.0,
         latency_ms: float = 0.0,
         aborted: bool = False,
+        model: str = "",
     ) -> MessageOut:
         session = await self.get_session(session_id, user_id)
         if session is None:
@@ -443,6 +487,7 @@ class ChatStore:
             cost=cost,
             latency_ms=latency_ms,
             aborted=aborted,
+            model=model,
         )
 
     async def _rename_authorized(self, session: SessionOut, title: str) -> SessionOut:
@@ -604,7 +649,18 @@ class ChatStore:
                        COALESCE(SUM(CASE WHEN role='assistant' THEN prompt_tokens END), 0) AS pt,
                        COALESCE(SUM(CASE WHEN role='assistant' THEN completion_tokens END), 0) AS ct,
                        COALESCE(SUM(cost), 0) AS cost,
-                       COALESCE(AVG(CASE WHEN role='assistant' AND latency_ms > 0 THEN latency_ms END), 0) AS latency
+                       COALESCE(AVG(CASE WHEN role='assistant' AND latency_ms > 0 THEN latency_ms END), 0) AS latency,
+                       COALESCE(SUM(CASE WHEN aborted = 1 THEN 1 ELSE 0 END), 0) AS aborted_n,
+                       COALESCE(SUM(CASE WHEN role='assistant' THEN 1 ELSE 0 END), 0) AS assistant_n,
+                       COALESCE(SUM(CASE WHEN role='assistant' AND latency_ms > 0 THEN 1 ELSE 0 END), 0) AS lat_n,
+                       COALESCE(SUM(CASE WHEN role='assistant' AND sources IS NOT NULL
+                                         AND json_valid(sources)
+                                         AND json_array_length(sources) > 0 THEN 1 ELSE 0 END), 0) AS cited_n,
+                       COALESCE(SUM(CASE WHEN role='assistant' AND cost = 0
+                                         AND prompt_tokens = 0
+                                         AND completion_tokens = 0 THEN 1 ELSE 0 END), 0) AS non_llm_n,
+                       COALESCE(SUM(CASE WHEN date(created_at, 'unixepoch') = date('now')
+                                         THEN cost ELSE 0 END), 0) AS cost_today
                 FROM messages
                 """
             )
@@ -633,10 +689,64 @@ class ChatStore:
                 FROM sessions GROUP BY d ORDER BY d DESC LIMIT 14
                 """
             )
+            # Latency percentiles read the few ORDER BY'd rows they need, never
+            # the whole set: the count of valid samples decides each OFFSET and
+            # each query returns exactly one row (`LIMIT 1 OFFSET ?`).
+            lat_n = int(msgs_row["lat_n"]) if msgs_row else 0
+            p50_row = await self._fetchone(
+                "SELECT latency_ms FROM messages WHERE role='assistant' AND latency_ms > 0"
+                " ORDER BY latency_ms LIMIT 1 OFFSET ?",
+                (_percentile_offset(lat_n, 50),),
+            )
+            p90_row = await self._fetchone(
+                "SELECT latency_ms FROM messages WHERE role='assistant' AND latency_ms > 0"
+                " ORDER BY latency_ms LIMIT 1 OFFSET ?",
+                (_percentile_offset(lat_n, 90),),
+            )
+            p95_row = await self._fetchone(
+                "SELECT latency_ms FROM messages WHERE role='assistant' AND latency_ms > 0"
+                " ORDER BY latency_ms LIMIT 1 OFFSET ?",
+                (_percentile_offset(lat_n, 95),),
+            )
+            # Average sources across CITED assistant messages only. COUNT(*)
+            # per message over json_each() counts array elements without loading
+            # the payloads; an empty cited set yields no rows and AVG() is NULL.
+            cited_avg_row = await self._fetchone(
+                "SELECT AVG(cnt) AS avg FROM ("
+                " SELECT COUNT(*) AS cnt FROM messages m, json_each(m.sources)"
+                " WHERE m.role='assistant' AND m.sources IS NOT NULL"
+                " AND json_valid(m.sources) AND json_type(m.sources)='array'"
+                " AND json_array_length(m.sources) > 0 GROUP BY m.id)"
+            )
+            # Sessions whose whole conversation is a single message: the simplest
+            # abandon proxy. One grouped pass decides it, not a per-session scan.
+            abandon_row = await self._fetchone(
+                "SELECT COUNT(*) AS n FROM ("
+                " SELECT session_id FROM messages GROUP BY session_id HAVING COUNT(*) = 1)"
+            )
+            model_rows = await self._fetchall(
+                """
+                SELECT model, COUNT(*) AS messages,
+                       COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,
+                       COALESCE(SUM(cost), 0) AS cost
+                FROM messages WHERE role='assistant'
+                GROUP BY model ORDER BY cost DESC
+                """
+            )
+            daily_cost_rows = await self._fetchall(
+                """
+                SELECT date(created_at, 'unixepoch') AS d, COALESCE(SUM(cost), 0) AS cost
+                FROM messages GROUP BY d ORDER BY d DESC LIMIT 14
+                """
+            )
+            sessions_n = int(sessions_row["n"]) if sessions_row else 0
+            messages_n = int(msgs_row["n"]) if msgs_row else 0
+            assistant_n = int(msgs_row["assistant_n"]) if msgs_row else 0
+            cited_n = int(msgs_row["cited_n"]) if msgs_row else 0
             return {
-                "sessions": int(sessions_row["n"]) if sessions_row else 0,
+                "sessions": sessions_n,
                 "users": int(users_row["n"]) if users_row else 0,
-                "messages": int(msgs_row["n"]) if msgs_row else 0,
+                "messages": messages_n,
                 "total_tokens": min(
                     int(msgs_row["pt"] if msgs_row else 0) + int(msgs_row["ct"] if msgs_row else 0),
                     MAX_TOKEN_SUM,
@@ -647,6 +757,43 @@ class ChatStore:
                 "top_by_tokens": [[r["session_id"], int(r["messages"]), int(r["tokens"]), r["updated_at"]] for r in top_messages],
                 "sessions_today": sum(int(r["n"]) for r in day_rows if r["d"] == today),
                 "daily_sessions": [[r["d"], int(r["n"])] for r in day_rows],
+                "latency": {
+                    "p50": round(float(p50_row["latency_ms"] if p50_row else 0.0), 1),
+                    "p90": round(float(p90_row["latency_ms"] if p90_row else 0.0), 1),
+                    "p95": round(float(p95_row["latency_ms"] if p95_row else 0.0), 1),
+                },
+                "failed_turn_rate": round(
+                    (int(msgs_row["aborted_n"]) if msgs_row else 0) / messages_n, 4
+                ) if messages_n else 0.0,
+                "abandon_rate": round(
+                    (int(abandon_row["n"]) if abandon_row else 0) / sessions_n, 4
+                ) if sessions_n else 0.0,
+                "citation_rate": round(cited_n / assistant_n, 4) if assistant_n else 0.0,
+                "avg_sources_per_cited": round(
+                    float(cited_avg_row["avg"]) if cited_avg_row and cited_avg_row["avg"] is not None else 0.0, 4
+                ),
+                # Per AN ASSISTANT message, matching avg_latency_ms above: tokens
+                # and cost are only ever attached to assistant rows (user rows are
+                # stored with 0), so an all-messages denominator would dilute the
+                # real per-response figures by turns that carry no tokens at all.
+                "avg_tokens_per_message": round(
+                    (int(msgs_row["pt"] if msgs_row else 0) + int(msgs_row["ct"] if msgs_row else 0))
+                    / assistant_n, 4,
+                ) if assistant_n else 0.0,
+                "avg_cost_per_message": round(
+                    float(msgs_row["cost"] if msgs_row else 0.0) / assistant_n, 4,
+                ) if assistant_n else 0.0,
+                "budget": {
+                    "daily_limit_usd": config.LLM_DAILY_BUDGET_USD,
+                    "today_spent_usd": round(float(msgs_row["cost_today"] if msgs_row else 0.0), 4),
+                },
+                "model_usage": [
+                    [r["model"], int(r["messages"]), int(r["tokens"]), round(float(r["cost"]), 4)] for r in model_rows
+                ],
+                "daily_budget": [[r["d"], round(float(r["cost"]), 4)] for r in daily_cost_rows],
+                "non_llm_answer_rate": round(
+                    (int(msgs_row["non_llm_n"]) if msgs_row else 0) / assistant_n, 4
+                ) if assistant_n else 0.0,
             }
         except Exception as exc:
             logger.exception("chat global_stats failed; chat store unavailable")
@@ -675,6 +822,27 @@ class ChatStore:
             {"actor_id": r["actor_id"], "action": r["action"], "created_at": r["created_at"]}
             for r in rows
         ]
+
+    async def set_rating(self, message_id: int, user_id: str, rating: int) -> None:
+        """Record (or clear, with 0) one message's rating -- only the caller's own.
+
+        Ownership and write are ONE statement: the UPDATE's WHERE both selects the
+        message and proves it belongs to ``user_id``, so a row that is not the
+        caller's matches nothing and rowcount 0 -> 404, atomically and without a
+        re-read. ``rating`` is re-validated here even though the HTTP model already
+        constrains it, so the store stays safe when called directly.
+        """
+        if rating not in (-1, 0, 1):
+            raise HTTPException(status_code=422, detail="rating must be -1, 0 or 1")
+        async with self._unit_of_work() as db:
+            cur = await db.execute(
+                "UPDATE messages SET rating = ?"
+                " WHERE id = ?"
+                " AND session_id IN (SELECT id FROM sessions WHERE user_id = ?)",
+                (rating, message_id, user_id),
+            )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="message not found")
 
 
 def json_dumps(v) -> str:
@@ -2293,6 +2461,19 @@ async def rename_session(session_id: str, body: MessageIn, request: Request):
 async def delete_session(session_id: str, request: Request):
     user_id = request.state.user_id
     await _require_store().delete_session(session_id, user_id)
+    return {"ok": True}
+
+
+@router.post("/messages/{message_id}/rating")
+async def rate_message(message_id: int, body: RatingIn, request: Request):
+    """Set (or clear, with 0) one message's rating for a message the caller owns.
+
+    The router-level dependencies already require chat:use. A message that does
+    not exist or belongs to someone else is a 404 -- the store's single UPDATE
+    matches nothing and reports rowcount 0.
+    """
+    user_id = request.state.user_id
+    await _require_store().set_rating(message_id, user_id, body.rating)
     return {"ok": True}
 
 

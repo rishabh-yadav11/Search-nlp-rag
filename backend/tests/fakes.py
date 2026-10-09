@@ -498,8 +498,8 @@ class _FakePipeline:
         self._queue("zincrby", key, amount, member)
         return self
 
-    def incr(self, key):
-        self._queue("incr", key)
+    def incr(self, key, amount=1):
+        self._queue("incr", key, amount)
         return self
 
     def expire(self, key, ttl):
@@ -554,9 +554,9 @@ class FakeRedis:
                 n += 1
         return n
 
-    async def incr(self, key):
+    async def incr(self, key, amount=1):
         cur = int(self._data.get(key, "0"))
-        cur += 1
+        cur += amount
         self._data[key] = str(cur)
         return cur
 
