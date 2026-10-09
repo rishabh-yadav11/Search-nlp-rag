@@ -862,7 +862,11 @@ run_prometheus() {
     # The TSDB (data), not the config: the config is mounted read-only from the
     # deploy/ directory, while /prometheus is where Prometheus actually writes
     # WAL + blocks and must survive container recreation.
+    # The image runs as `nobody` (uid 65534), so the bind-mount dir must be
+    # owned by that uid or the container crashes on /prometheus/queries.active
+    # (open: permission denied). chown is idempotent and non-destructive.
     mkdir -p "$SCRIPT_DIR/prometheus_data"
+    chown -R 65534:65534 "$SCRIPT_DIR/prometheus_data"
     ensure_prometheus_container
     wait_http "http://localhost:$PROMETHEUS_PORT/-/healthy"
     echo "prometheus: http://localhost:$PROMETHEUS_PORT/"
