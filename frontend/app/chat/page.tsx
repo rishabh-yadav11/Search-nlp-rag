@@ -264,6 +264,9 @@ export default function ChatPage() {
   // Set when the server dropped older messages from the loaded thread.
   const [historyTruncated, setHistoryTruncated] = useState<{ hidden: number } | null>(null)
   const [error, setError] = useState('')
+  // Transient confirmation shown right after a thumb tap (like/dislike/cleared).
+  // Auto-dismisses after a beat (the effect resets on every new toast).
+  const [toast, setToast] = useState<string | null>(null)
   // Handed to the shared `TopBar` so it renders the account control from a value
   // this page already fetched. Seeded `undefined` so the bar shows no account
   // control until the answer lands — seeding `null` would flash "Sign in".
@@ -305,6 +308,13 @@ export default function ChatPage() {
           body: JSON.stringify({ rating }),
         })
         setMessages((msgs) => msgs.map((m) => (m.id === messageId ? { ...m, rating } : m)))
+        setToast(
+          rating === 1
+            ? 'Thanks — marked as helpful'
+            : rating === -1
+              ? 'Thanks — feedback noted'
+              : 'Rating cleared',
+        )
       } catch {
         /* rating is best-effort UX, not a hard failure */
       } finally {
@@ -352,6 +362,12 @@ export default function ChatPage() {
     const t = setInterval(() => setTick((n) => n + 1), 60000)
     return () => clearInterval(t)
   }, [])
+
+  useEffect(() => {
+    if (toast === null) return
+    const t = setTimeout(() => setToast(null), 2600)
+    return () => clearTimeout(t)
+  }, [toast])
 
   useEffect(() => {
     return () => {
@@ -804,6 +820,11 @@ export default function ChatPage() {
               </button>
             </form>
           </div>
+          {toast ? (
+            <div className="chat-toast" role="status" aria-live="polite">
+              {toast}
+            </div>
+          ) : null}
         </section>
       </div>
     </div>

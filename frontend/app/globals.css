@@ -1237,6 +1237,35 @@ input[type='text']:focus-visible,
   outline-offset: 2px;
 }
 
+.chat-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: var(--ink, #1f2937);
+  color: #fff;
+  font-size: 13.5px;
+  line-height: 1.4;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.25);
+  text-align: center;
+  animation: chat-toast-in 0.18s ease-out;
+}
+
+@keyframes chat-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
 .chat-sources-toggle {
   border: none;
   background: transparent;
