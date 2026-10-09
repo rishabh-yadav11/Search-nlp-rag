@@ -532,8 +532,15 @@ class Config:
     # Pricing in USD per 1M tokens, used by LLMResult.cost() for cost tracking.
     LLM_PRICE_INPUT_PER_1M = float(os.getenv("LLM_PRICE_INPUT_PER_1M", "0.25"))
     LLM_PRICE_OUTPUT_PER_1M = float(os.getenv("LLM_PRICE_OUTPUT_PER_1M", "1.50"))
-    # Conversion for displaying cost in Indian Rupees (INR). Approx market rate.
+    # Conversion for displaying cost in Indian Rupees (INR). Fallback rate used
+    # until the first live fetch succeeds and on feed failures (app/fx_rate.py).
     INR_PER_USD = float(os.getenv("INR_PER_USD", "95.60"))
+    # Free, keyless USD→INR feed (open.er-api.com/v6/latest/USD). The live rate
+    # replaces INR_PER_USD twice a day via the fx_rate background loop.
+    FX_RATE_API_URL = os.getenv("FX_RATE_API_URL", "https://open.er-api.com/v6/latest/USD")
+    # How often the fx_rate loop refreshes the USD→INR rate, in seconds.
+    # 12 * 3600 = twice a day.
+    FX_RATE_REFRESH_SECONDS = float(os.getenv("FX_RATE_REFRESH_SECONDS", "43200"))
     # Daily LLM spend cap in USD. Chat fails closed (no LLM calls) once today's
     # cumulative spend reaches this value (see app/cost_budget.py). 0 is a
     # deliberate opt-out for deployments that meter spend elsewhere; it is not

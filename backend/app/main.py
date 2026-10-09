@@ -328,6 +328,10 @@ async def lifespan(app: FastAPI):
     await auth_module.report_legacy_password_hashes()
     state["auth_token_purge"] = asyncio.create_task(auth_module.token_purge_loop())
 
+    from app import fx_rate
+
+    state["fx_rate"] = asyncio.create_task(fx_rate.fx_rate_loop())
+
     init_fixer(
         config.ENABLE_QUERY_FIX,
         config.QUERY_FIX_VOCAB_PATH,
@@ -352,6 +356,7 @@ async def lifespan(app: FastAPI):
         ("chat retention task", lambda: _cancel_and_wait("chat retention task", state["chat_retention"])),
         ("chat store", chat_store.close),
         ("auth token purge task", lambda: _cancel_and_wait("auth token purge task", state["auth_token_purge"])),
+        ("fx rate task", lambda: _cancel_and_wait("fx rate task", state["fx_rate"])),
         ("auth store", auth_store.close),
         ("qdrant client", state["qdrant"].close),
         ("cache client", lambda: cache.close()),
