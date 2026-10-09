@@ -453,6 +453,14 @@ app.include_router(health_router)
 app.include_router(auth_module.router)
 app.include_router(chat_module.router)
 
+# Prometheus metrics: scopes the gauges to this app's state, then serves /metrics.
+# router module imported after the state dict exists; /metrics reads the state lazily per
+# scrape via the provider, so there is no ordering hazard with the readiness probes.
+from app import metrics as metrics_module
+
+metrics_module.set_state_provider(lambda: state)
+app.include_router(metrics_module.router)
+
 
 class SourceArticle(BaseModel):
     id: int
@@ -651,6 +659,35 @@ def _effective_intent(
         if cleaned:
             retrieval_q = cleaned
     return retrieval_q, from_date, to_date, dealtype, industry
+
+
+def _search_intent(
+    q: str, *, q_fixed: str | None = None, from_date: str | None = None, to_date: str | None = None
+) -> str:
+    """Classify a query into one snake_case intent class for the analytics record.
+
+    The classes are the contract's five: ``timed`` (a hard calendar window),
+    ``category`` (dealtype/industry/content-type facet), ``flashback`` (a
+    year-in-review/flashback rewrite), ``recency`` (soft or rolling-recency
+    intent) and ``other``. Precedence favours the more specific reading; the
+    first match wins.
+    """
+    qf = q_fixed if q_fixed is not None else q
+    if from_date or to_date:
+        return "timed"
+    if extract_year_range(qf):
+        return "timed"
+    if re.search(r"\b(?:19|20)\d{2}\b", qf):
+        return "timed"
+    if extract_dealtype(qf) or extract_industry(qf) or extract_content_type(qf):
+        return "category"
+    if _FLASHBACK_PREFIX_RE.match(q):
+        return "flashback"
+    if rewrite_year_in_review(q)[1]:
+        return "flashback"
+    if is_recency_intent(q) or extract_recency_range(q):
+        return "recency"
+    return "other"
 
 
 def _merge_results(*groups: list[SourceArticle]) -> list[SourceArticle]:
@@ -1496,6 +1533,7 @@ async def retrieve_by_date_window(
     dependencies=[Depends(public_rate_limit("search", "PUBLIC_SEARCH_RATE_PER_MIN"))],
 )
 async def search(
+    request: Request,
     # max_length rejects an over-long query with 422 rather than truncating it:
     # a silently truncated query returns results for a query the caller never
     # asked, and the error names the limit so the UI can explain itself. The
@@ -1511,6 +1549,9 @@ async def search(
     to_date: str | None = Query(None),
 ):
     start = time.perf_counter()
+    # Opaque client session id: the X-Session-Id header wins, the vccircle_sid
+    # cookie is the fallback. Joins search->click->interaction server-side.
+    session_id = request.headers.get("x-session-id", "") or request.cookies.get("vccircle_sid", "") or ""
     # One normalised spelling of the query drives everything below -- the cache
     # key, the retrieval text, the analytics record and the echoed response --
     # so equivalent spellings share a cache entry and no control character from
@@ -1527,6 +1568,9 @@ async def search(
                                    ("tag", tag)):
         split_facet_values(facet_field, facet_raw)
     q_fixed, _ = fix_query(q)
+    # One snake_case intent class for the analytics record, computed from the
+    # same query_intent primitives driving retrieval (see _search_intent).
+    intent = _search_intent(q, q_fixed=q_fixed, from_date=from_date, to_date=to_date)
     retrieval_q, eff_from, eff_to, auto_dealtype, auto_industry = _effective_intent(q_fixed, from_date, to_date)
     auto_content_type = extract_content_type(q_fixed)
     # Auto-extracted category facets fill in only when the caller didn't pass an
@@ -1569,7 +1613,20 @@ async def search(
         summaries = [SourceSummary.model_validate(d) for d in cached_results]
         note = weak_results_note([s.score for s in summaries], date_label(eff_from, eff_to))
         await record_search(q, len(summaries), bool(note), cached=True,
-                            latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
+                            latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered,
+                            intent=intent, session_id=session_id)
+        if not summaries:
+            outcome = "zero"
+        elif note:
+            outcome = "weak"
+        else:
+            outcome = "ok"
+        try:
+            from app.metrics import inc_search
+
+            inc_search(outcome, time.perf_counter() - start)
+        except Exception:
+            logger.debug("prometheus search hook failed", exc_info=True)
         return SearchResponse(query=q, results=summaries, cached=True,
                               latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
@@ -1609,7 +1666,20 @@ async def search(
     # the cache-hit and cache-miss paths report the same semantics: the query
     # intent carried the facet even when the fallback relaxed it out.
     await record_search(q, len(results), bool(note), cached=False,
-                        latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered)
+                        latency_ms=(time.perf_counter() - start) * 1000, filtered=filtered,
+                        intent=intent, session_id=session_id)
+    if not results:
+        outcome = "zero"
+    elif note:
+        outcome = "weak"
+    else:
+        outcome = "ok"
+    try:
+        from app.metrics import inc_search
+
+        inc_search(outcome, time.perf_counter() - start)
+    except Exception:
+        logger.debug("prometheus search hook failed", exc_info=True)
     return SearchResponse(query=q, results=[to_summary(r) for r in results], cached=False,
                           latency_ms=(time.perf_counter() - start) * 1000, note=note)
 
@@ -1877,6 +1947,7 @@ class ClickEvent(BaseModel):
     query: str = ""
     position: int = 0
     id: int | None = None
+    session_id: str = ""
 
 
 async def _article_in_index(article_id: int | None) -> bool:
@@ -1925,7 +1996,8 @@ async def analytics_click(event: ClickEvent, request: Request):
     article_id = event.id if await _article_in_index(event.id) else None
     if event.id is not None and article_id is None:
         logger.info("click beacon id %s is not in the collection; recorded without a ranking vote", event.id)
-    await record_click(event.query, event.position, article_id, client_ip=_client_ip(request))
+    await record_click(event.query, event.position, article_id, client_ip=_client_ip(request),
+                       session_id=event.session_id)
     return {"ok": True}
 
 
@@ -1994,6 +2066,69 @@ async def get_analytics_chat(
         return _analytics_unavailable(str(exc))
 
 
+@app.get("/analytics/users")
+async def get_analytics_users(
+    request: Request,
+    _auth: None = Depends(require_auth),
+    _perm: None = Depends(require_permission("analytics:read")),
+):
+    """User/account analytics. Admin-only (analytics:read).
+
+    Returns aggregate user counts (signups, roles, disabled, activity windows via
+    users.last_seen), today's successful-login counter, top chat spenders, and the
+    latest admin_audit rows. The audit trail read is best-effort like the other
+    analytic feeds; if the chat store is unreachable the other fields still load.
+    """
+    try:
+        chat_store = chat_module._require_store()
+        await chat_store.record_admin_audit(request.state.user_id, "analytics.users.read")
+    except Exception:
+        logger.exception("admin audit write failed for analytics.users.read")
+
+    try:
+        auth = auth_module._require_auth_store()
+        stats = await auth.account_stats()
+    except Exception as exc:
+        logger.warning("users analytics unavailable: %s", exc, exc_info=True)
+        return _analytics_unavailable("users analytics unavailable")
+
+    # Today's successful-login counter (Redis). Best-effort: a missing value or
+    # a down Redis reads as 0 rather than failing the report.
+    login_count = 0
+    try:
+        from app.analytics import _client as _analytics_client
+        raw = await _analytics_client().get(auth_module._login_day_key())
+        login_count = int(raw or 0)
+    except Exception as exc:
+        logger.debug("login-day counter read failed: %s", exc, exc_info=True)
+        login_count = 0
+
+    top_spenders: list = []
+    audit_recent: list = []
+    try:
+        chat_store = chat_module._require_store()
+        # Top spenders: SUM(message cost) grouped by session's user. No user text.
+        rows = await chat_store._fetchall(
+            "SELECT s.user_id, COALESCE(SUM(m.cost), 0) AS total FROM messages m"
+            " JOIN sessions s ON s.id = m.session_id"
+            " GROUP BY s.user_id ORDER BY total DESC LIMIT 10"
+        )
+        # Map user_id -> display name from the auth store (admins only here).
+        names = {u.id: u.name for u in await auth_module._require_auth_store().list_users()}
+        top_spenders = [[r["user_id"], names.get(r["user_id"], ""), float(r["total"])] for r in rows]
+        audit = await chat_store.admin_audit_log(limit=config.AUDIT_RECENT_LIMIT)
+        audit_recent = [[r["actor_id"], r["action"], r["created_at"]] for r in audit]
+    except Exception:
+        logger.warning("top spenders / audit recent unavailable", exc_info=True)
+
+    return {
+        **stats,
+        "last_login_success": login_count,
+        "top_spenders": top_spenders,
+        "audit_recent": audit_recent,
+    }
+
+
 # Recommendation API
 
 # Dwell time is stored as a Redis hash VALUE, not a field name or a key, so it
@@ -2016,6 +2151,10 @@ class InteractionEvent(BaseModel):
     article_id: int = Field(..., ge=1, le=2**63 - 1, description="Indexed article id")
     interaction_type: InteractionType = InteractionType.CLICK
     dwell_time_ms: int | None = Field(None, ge=0, le=MAX_DWELL_TIME_MS)
+    # Beacon context: which feed produced the click, and the opaque session id
+    # shared with /search and /analytics/click for a server-side join.
+    feed_type: str = ""
+    session_id: str = ""
 
 
 class SimilarArticlesResponse(BaseModel):
@@ -2131,6 +2270,8 @@ async def record_user_interaction(
         article_id=event.article_id,
         interaction_type=event.interaction_type,
         dwell_time_ms=event.dwell_time_ms,
+        feed_type=event.feed_type,
+        session_id=event.session_id,
     )
     if result is InteractionResult.INVALID_TYPE:
         raise HTTPException(status_code=422, detail="Unknown interaction_type")

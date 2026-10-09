@@ -1194,6 +1194,49 @@ input[type='text']:focus-visible,
   letter-spacing: 0.02em;
 }
 
+.chat-thumbs {
+  display: flex;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.chat-thumb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: #6b7280;
+  cursor: pointer;
+}
+
+.chat-thumb:hover:not(:disabled) {
+  background: #eef1f6;
+}
+
+.chat-thumb:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.chat-thumb.up.active {
+  background: var(--blue-soft);
+  color: var(--blue-deep);
+}
+
+.chat-thumb.down.active {
+  background: #fde8e4;
+  color: #c2410c;
+}
+
+.chat-thumb:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
 .chat-sources-toggle {
   border: none;
   background: transparent;
@@ -1684,6 +1727,41 @@ input[type='text']:focus-visible,
   background: #0875ff;
   border-radius: 4px;
   vertical-align: middle;
+}
+
+/* Hourly search-volume histogram (24 columns). Columns align to the baseline
+ * and the bars grow upward; overflow scrolls rather than squishes on narrow
+ * screens. */
+.dash-hourly {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  min-height: 88px;
+  padding-top: 8px;
+  overflow-x: auto;
+}
+
+.dash-hour-col {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 18px;
+}
+
+.dash-hour-bar {
+  width: 100%;
+  min-height: 2px;
+  max-height: 64px;
+  background: #0875ff;
+  border-radius: 2px 2px 0 0;
+}
+
+.dash-hour-label {
+  font-size: 10px;
+  color: #484848;
+  white-space: nowrap;
 }
 
 .dash-empty {

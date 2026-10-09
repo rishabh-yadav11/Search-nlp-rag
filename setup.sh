@@ -136,6 +136,15 @@ MIN_UPTIME_MS="${MIN_UPTIME_MS:-30000}"
 QDRANT_IMAGE="${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499}"
 
+# Prometheus, resolved to a digest at setup time (not just a tag): the scrape
+# endpoint /metrics is loopback-only and the container reaches it via host
+# networking, so a mutable tag re-pointed upstream would be pulled silently on
+# the next redeploy. v3.13.4's manifest-list digest below was resolved from
+# quay.io at write time; `PROMETHEUS_IMAGE` is overrideable.
+PROMETHEUS_IMAGE="${PROMETHEUS_IMAGE:-quay.io/prometheus/prometheus:v3.13.4@sha256:87861b8cf91579109319ebc300f3f1060e6da9c05d6ae8ad15a20c879e84e32e}"
+# The prometheus web UI port, bound to loopback by the container command.
+PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
+
 VENV="$SCRIPT_DIR/backend/venv"
 VENV_PY="$VENV/bin/python"
 LOGS="$SCRIPT_DIR/logs"
@@ -153,9 +162,11 @@ stages (run in order):
   frontend   npm ci + production build (Next.js)
   services   start gunicorn + next (pm2) in the background
   pm2-startup   install systemd unit so pm2 restores the frontend on boot
+  prometheus    start the Prometheus container (scrapes 127.0.0.1:8001/metrics)
   stop-backend   stop gunicorn (API) only
   stop-frontend  stop next (frontend) only
-  stop       stop both backend + frontend
+  stop-prometheus stop the Prometheus container
+  stop       stop backend + frontend + prometheus
   cron       install the 15-minute incremental sync
   nginx      write + enable nginx config (public port -> app + API)
   tls        get a Let's Encrypt cert (webroot) and add the :443 server
@@ -810,6 +821,63 @@ run_pm2_startup() {
     fi
 }
 
+# --- Prometheus -----------------------------------------------------------
+# Prometheus runs on the HOST network, not the docker bridge, because its one
+# scrape target -- the backend's /metrics on 127.0.0.1:$API_PORT -- is bound to
+# loopback. A bridge-networked container has its own loopback namespace, so
+# "localhost:8001" inside it would not be the host's backend. Sharing the host
+# network is what makes the deploy/prometheus.yml target reachable; the trade
+# for that reachability is that the container must bind its OWN web port to
+# loopback explicitly, which the container command below does.
+#
+# The container is pinned by DIGEST (PROMETHEUS_IMAGE), like qdrant/redis, so an
+# upstream re-point of the tag cannot swap in a different binary on the next
+# redeploy.
+ensure_prometheus_container() {
+    local name="prometheus"
+    if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+        if [ "$(docker inspect -f '{{.State.Running}}' "$name")" = "true" ]; then
+            echo "container '$name' already running (host network)"
+            return
+        fi
+        echo "starting existing '$name' container..."
+        docker start "$name"
+        return
+    fi
+    echo "pulling + starting '$name'..."
+    docker run -d --name "$name" --network host --restart unless-stopped \
+        -v "$SCRIPT_DIR/deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+        -v "$SCRIPT_DIR/prometheus_data:/prometheus" \
+        $DOCKER_LOG_OPTS \
+        "$PROMETHEUS_IMAGE" \
+        --config.file=/etc/prometheus/prometheus.yml \
+        --storage.tsdb.path=/prometheus \
+        --web.listen-address=127.0.0.1:$PROMETHEUS_PORT
+    echo "container '$name' started (host network, bound to 127.0.0.1:$PROMETHEUS_PORT)"
+}
+
+run_prometheus() {
+    stage "prometheus"
+    docker_up
+    # The TSDB (data), not the config: the config is mounted read-only from the
+    # deploy/ directory, while /prometheus is where Prometheus actually writes
+    # WAL + blocks and must survive container recreation.
+    mkdir -p "$SCRIPT_DIR/prometheus_data"
+    ensure_prometheus_container
+    wait_http "http://localhost:$PROMETHEUS_PORT/-/healthy"
+    echo "prometheus: http://localhost:$PROMETHEUS_PORT/"
+}
+
+run_stop_prometheus() {
+    stage "stop-prometheus"
+    if docker ps -a --format '{{.Names}}' | grep -qx prometheus; then
+        docker stop prometheus >/dev/null 2>&1 || true
+        echo "'prometheus' container stopped"
+    else
+        echo "'prometheus' was not running"
+    fi
+}
+
 run_stop_backend() {
     stage "stop-backend"
     if have pm2; then
@@ -834,6 +902,7 @@ run_stop() {
     stage "stop"
     run_stop_backend
     run_stop_frontend
+    run_stop_prometheus
 }
 
 run_cron() {
@@ -1564,7 +1633,7 @@ main() {
         case "$1" in
             all) ALL=1 ;;
             -h|--help) usage; return 0 ;;
-            deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop|cron|nginx|tls|logrotate) STAGES+=("$1") ;;
+            deps|backend|index|frontend|services|pm2-startup|stop-backend|stop-frontend|stop-prometheus|stop|cron|nginx|tls|logrotate|prometheus) STAGES+=("$1") ;;
             *) echo "unknown stage: $1"; usage; return 1 ;;
         esac
         shift
@@ -1592,8 +1661,10 @@ main() {
             frontend) run_frontend ;;
             services) run_services ;;
             pm2-startup) run_pm2_startup ;;
+            prometheus) run_prometheus ;;
             stop-backend) run_stop_backend ;;
             stop-frontend) run_stop_frontend ;;
+            stop-prometheus) run_stop_prometheus ;;
             stop) run_stop ;;
             cron) run_cron ;;
             nginx) run_nginx ;;
@@ -1610,6 +1681,7 @@ main() {
     fi
     echo "api:        http://localhost:$API_PORT/health"
     echo "qdrant:     http://localhost:$QDRANT_PORT/"
+    echo "prometheus: http://localhost:$PROMETHEUS_PORT/"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

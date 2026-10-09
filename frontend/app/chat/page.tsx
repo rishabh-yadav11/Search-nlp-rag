@@ -32,6 +32,9 @@ type Message = {
   completion_tokens?: number
   cost?: number
   latency_ms?: number
+  // -1 | 0 | 1 thumb verdict on this assistant message, persisted server-side
+  // (messages.rating) and reloaded with history; undefined means "not yet rated".
+  rating?: number | null
 }
 
 // GET /api/chat/sessions/{id} returns only the most recent CHAT_SESSION_MESSAGE_LIMIT messages and flags the rest, so a long thread shows as a truncated tail.
@@ -204,6 +207,51 @@ const AnswerBody = memo(function AnswerBody({ content }: { content: string }) {
   )
 })
 
+/** Per-assistant-message thumbs (rating -1|0|1). Disabled while a request is
+ *  in flight, for messages the server has not persisted (synthetic/stream Ids),
+ *  and offline — a tap would otherwise silently no-op on a dropped socket. */
+function Thumbs({
+  current,
+  pending,
+  disabled,
+  onRate,
+}: {
+  current: number | null
+  pending: boolean
+  disabled: boolean
+  onRate: (rating: number) => void
+}) {
+  const cls = (value: number) => (current === value ? ' active' : '')
+  return (
+    <div className="chat-thumbs" role="group" aria-label="Rate this answer">
+      <button
+        type="button"
+        className={`chat-thumb up${cls(1)}`}
+        disabled={pending || disabled}
+        aria-label="Good answer"
+        aria-pressed={current === 1}
+        onClick={() => onRate(current === 1 ? 0 : 1)}
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+          <path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3zm2 11V10l5-6a1 1 0 0 1 1 .7l1 3.3h3a2 2 0 0 1 2 2v2l-2.6 7.4a2 2 0 0 1-1.9 1.6H9z" />
+        </svg>
+      </button>
+      <button
+        type="button"
+        className={`chat-thumb down${cls(-1)}`}
+        disabled={pending || disabled}
+        aria-label="Bad answer"
+        aria-pressed={current === -1}
+        onClick={() => onRate(current === -1 ? 0 : -1)}
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+          <path d="M17 13V3h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-3zm-2-11v11l-4 5a1 1 0 0 1-1-.7l-1-3.3H6a2 2 0 0 1-2-2v-2l2.6-7.4A2 2 0 0 1 8.5 3H15z" />
+        </svg>
+      </button>
+    </div>
+  )
+}
+
 export default function ChatPage() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -235,6 +283,36 @@ export default function ChatPage() {
   // after two awaits, leaving a re-entry window that would duplicate the
   // session/message and double-bill. This ref flips before any await.
   const sendingRef = useRef(false)
+  // In-flight rating requests per message id, so rapid taps cannot double-write.
+  const pendingRatingsRef = useRef<Set<number>>(new Set())
+
+  // Thumbs are disabled whenever the browser is offline — a tap that cannot
+  // reach the server must not look like it was recorded. `navigator` is
+  // undefined during SSR prerender, where the buttons render disabled too.
+  const offline = typeof navigator !== 'undefined' && navigator.onLine === false
+
+  // Persist a thumb (1 / -1) or clear it (0) on one assistant message. The
+  // backend owns validation + ownership; a failure just leaves the UI verdict
+  // unchanged rather than surfacing a banner.
+  const rateMessage = useCallback(
+    async (messageId: number, rating: number) => {
+      if (messageId <= 0 || pendingRatingsRef.current.has(messageId)) return
+      pendingRatingsRef.current.add(messageId)
+      try {
+        await api(`/api/chat/messages/${messageId}/rating`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rating }),
+        })
+        setMessages((msgs) => msgs.map((m) => (m.id === messageId ? { ...m, rating } : m)))
+      } catch {
+        /* rating is best-effort UX, not a hard failure */
+      } finally {
+        pendingRatingsRef.current.delete(messageId)
+      }
+    },
+    [],
+  )
 
   const loadSessions = useCallback(async () => {
     try {
@@ -653,6 +731,16 @@ export default function ChatPage() {
                       <div className="chat-msg-answer">
                         <AnswerBody content={m.content} />
                         <SourceList sources={m.sources ?? NO_SOURCES} msg={m} />
+                        {/* Only settled, server-persisted assistant answers are
+                            rateable: a streamed/synthetic message (id <= 0) or an
+                            offline tab disables the thumbs instead of silently
+                            dropping the tap. */}
+                        <Thumbs
+                          current={m.rating ?? null}
+                          pending={pendingRatingsRef.current.has(m.id)}
+                          disabled={offline || m.id <= 0}
+                          onRate={(r) => void rateMessage(m.id, r)}
+                        />
                       </div>
                     )}
                   </div>

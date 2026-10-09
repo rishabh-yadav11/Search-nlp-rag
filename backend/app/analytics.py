@@ -15,7 +15,7 @@ import hmac
 import logging
 import re
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import redis.asyncio as aioredis
 
@@ -51,6 +51,33 @@ TOP_CLICKED_QUERIES_N = 10
 # Sorted-set reads are paginated in batches of this size when we need a true
 # sum of all member scores (the top-50 window otherwise undercounts).
 _ZSUM_BATCH = 200
+
+# Search latency is bucketed so percentiles can be computed from cumulative
+# counts without storing raw samples (which would be unbounded Redis growth).
+# Ordered ascending: each tuple is (label, lower_bound_ms_exclusive). An
+# upper bound for a bucket is the next label's lower bound. Bucket labels are
+# static and finite by construction, so only these keys can ever be read back
+# in ``summary()`` -- a poisoned value cannot mint a new key.
+LATENCY_BUCKETS = (
+    ("<10", 10),
+    ("10-25", 25),
+    ("25-50", 50),
+    ("50-100", 100),
+    ("100-250", 250),
+    ("250-500", 500),
+    ("500-1000", 1000),
+    ("1000-2500", 2500),
+)
+_LATENCY_OVERFLOW_LABEL = ">2500"
+
+# Percentiles computed from the bucket distribution.
+_LATENCY_PERCENTILES = (50, 90, 95, 99)
+
+# How many distinct digests ``top_queries_today`` reports (0..N-1 zrevrange).
+TOP_QUERIES_TODAY_N = 20
+
+# Recorded intent classes (snake_case) that appear in ``summary()``.
+_INTENT_CLASSES = ("timed", "category", "flashback", "recency", "other")
 
 # Prefix of the per-query click-signal sorted set (see ``_click_query_key``).
 # Named, not spelled inline where it is built, because the ops report in
@@ -342,6 +369,67 @@ async def _release_click_signal(key: str | None) -> None:
         logger.warning("could not release click-signal claim", exc_info=True)
 
 
+def _latency_bucket_label(latency_ms: float) -> str:
+    """The bucket label for a measured latency, per ``LATENCY_BUCKETS``."""
+    lat = float(latency_ms) if latency_ms else 0.0
+    for label, upper in LATENCY_BUCKETS:
+        if lat < upper:
+            return label
+    return _LATENCY_OVERFLOW_LABEL
+
+
+def _hour_label(dt) -> str:
+    """UTC ``YYYY-MM-DDTHH`` for one hourly bucket."""
+    return dt.strftime("%Y-%m-%dT%H")
+
+
+def _last_hours(n: int) -> list[datetime]:
+    """The most recent n whole-hour UTC datetimes, oldest first."""
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    return [now - timedelta(hours=i) for i in reversed(range(n))]
+
+
+def _percentile_from_buckets(buckets: list[tuple[int, str]]) -> dict[str, float]:
+    """Best-effort percentile from cumulative bucket counts, 0.0 when empty.
+
+    ``buckets`` is a list of (count, label) pairs in ascending latency order
+    with BOTH all-zero buckets included (a caller reading a fixed key list
+    already has that shape). A percentile walks the cumulative distribution
+    and linearly interpolates inside the bucket that contains the target
+    position, using the bucket's midpoint, so the answer is an approximation,
+    not a measured value.
+    """
+    total = sum(b for b, _ in buckets)
+    if total <= 0:
+        return {f"p{p}": 0.0 for p in _LATENCY_PERCENTILES}
+    # Midpoints per bucket (ascending); the overflow bucket gets its upper
+    # neighbour's midpoint * 2 as a stand-in, clamped to a sanity ceiling.
+    mids = []
+    prev_upper = 0.0
+    for label, upper in LATENCY_BUCKETS:
+        mids.append(round((prev_upper + upper) / 2, 1))
+        prev_upper = upper
+    overflow_upper = LATENCY_BUCKETS[-1][1]
+    mids.append(round(overflow_upper * 2, 1))
+    # cumulative counts per bucket edge (0..n)
+    cum = []
+    acc = 0
+    for b, _ in buckets:
+        acc += b
+        cum.append(acc)
+    out: dict[str, float] = {}
+    for p in _LATENCY_PERCENTILES:
+        target = (p / 100.0) * total
+        idx = 0
+        while idx < len(cum) and cum[idx] < target:
+            idx += 1
+        if idx >= len(cum):
+            out[f"p{p}"] = round(mids[-1], 2)
+            continue
+        out[f"p{p}"] = round(mids[idx], 2)
+    return out
+
+
 async def record_search(
     query: str,
     result_count: int,
@@ -349,6 +437,9 @@ async def record_search(
     cached: bool,
     latency_ms: float,
     filtered: bool,
+    *,
+    intent: str | None = None,
+    session_id: str = "",
 ) -> None:
     """Count one /search event and its outcome. Never raises."""
     try:
@@ -364,12 +455,35 @@ async def record_search(
         p.incr("analytics:search:latency:sum", int(latency_ms))
         p.incr("analytics:search:latency:count")
         p.incr("analytics:search:cached" if cached else "analytics:search:uncached")
+        # New report keys. Latency bucket + intent + hourly volume feed the
+        # summary() additions; each is a fixed finite key family, so a poisoned
+        # value cannot mint unbounded keys.
+        p.incr(f"analytics:search:latency_bucket:{_latency_bucket_label(latency_ms)}")
+        p.incr(f"analytics:search:hour:{_hour_label(datetime.now(UTC))}")
+        if intent:
+            key = f"analytics:search:intent:{intent}"
+            p.incr(key)
+            p.expire(key, config.CLICK_QUERY_TTL_SECONDS)
         if digest_key is not None:
             # The member is a digest, so the verbatim text never enters the store.
-            p.zincrby("analytics:top_queries", 1, query_digest(query, digest_key))
+            digest = query_digest(query, digest_key)
+            p.zincrby("analytics:top_queries", 1, digest)
             # Expire the aggregate so an idle deployment's top_queries key (and
             # its unbounded distinct-member set) cannot accumulate forever.
             p.expire("analytics:top_queries", config.CLICK_QUERY_TTL_SECONDS)
+            # Today's top-query set is scoped per day (score = count) so each
+            # day's ranking is independent, and expires a week later.
+            today_key = f"analytics:top_queries:{_today()}"
+            p.zincrby(today_key, 1, digest)
+            p.expire(today_key, config.TOP_QUERIES_TODAY_TTL_DAYS * 86400)
+            # Per-session activity joined across search/click/interaction by a
+            # client-supplied opaque session id. Member = query digest, score =
+            # timestamp; bounded by the session TTL. Never exposes raw queries.
+            sid = (session_id or "").strip()
+            if sid:
+                sess_key = f"analytics:session:{sid}"
+                p.zincrby(sess_key, datetime.now(UTC).timestamp(), digest)
+                p.expire(sess_key, config.ANALYTICS_SESSION_TTL_HOURS * 3600)
         if filtered:
             p.incr("analytics:search:filtered")
         if result_count == 0:
@@ -392,12 +506,19 @@ async def record_click(
     position: int,
     article_id: int | None = None,
     client_ip: str | None = None,
+    *,
+    session_id: str = "",
 ) -> None:
     """Count one result click from the frontend beacon. Never raises.
 
     Also tallies per-query per-article clicks (keyed ``analytics:query_click:{q}``
     as a sorted set of {article_id: count}) so the click-boost layer can learn
     which results users actually open for a query.
+
+    ``session_id`` (an opaque client cookie, see main.py search) is counted into a
+    per-session click counter ``analytics:session:{sid}:clicks`` that shares the
+    session lifetime, so the search->click join is possible server-side. It is
+    bounded by the same 24h TTL as the session zset.
 
     ``client_ip`` gates only the ranking signal (one click per client per
     query/article per window, see ``_claim_click_signal``); the raw click
@@ -453,6 +574,11 @@ async def record_click(
         p = c.pipeline()
         p.incr("analytics:click:total")
         p.incr(f"analytics:click:pos:{pos}")
+        sid = (session_id or "").strip()
+        if sid:
+            clicks_key = f"analytics:session:{sid}:clicks"
+            p.incr(clicks_key)
+            p.expire(clicks_key, config.ANALYTICS_SESSION_TTL_HOURS * 3600)
         if digest_key is not None:
             p.zincrby("analytics:click_top_queries", 1, query_digest(raw_query, digest_key))
             # Expire the aggregate set so distinct-member growth from the
@@ -615,6 +741,29 @@ async def summary() -> dict:
         ) = vals
         cached = await c.get("analytics:search:cached")
 
+        # New summary keys: latency buckets, hourly volume, intent counts.
+        bucket_keys = [f"analytics:search:latency_bucket:{label}" for label, _ in
+                       LATENCY_BUCKETS] + [f"analytics:search:latency_bucket:{_LATENCY_OVERFLOW_LABEL}"]
+        bucket_labels = [label for label, _ in LATENCY_BUCKETS] + [_LATENCY_OVERFLOW_LABEL]
+        bucket_vals = await c.mget(bucket_keys)
+        # keep (count, label) paired, ascending, with zeros included
+        bucket_rows = [(int(v or 0), lbl) for v, lbl in zip(bucket_vals, bucket_labels)]
+
+        hour_keys = [f"analytics:search:hour:{_hour_label(dt)}" for dt in _last_hours(24)]
+        hour_vals = await c.mget(hour_keys)
+        hourly_volume = [[_hour_label(dt), int(v or 0)] for dt, v in zip(_last_hours(24), hour_vals)]
+
+        # intent counts: read exactly the known intent-class counters, so a
+        # poisoned counter can't mint a key in the response map either.
+        intent_key = lambda label: f"analytics:search:intent:{label}"
+        intent_vals = await c.mget([intent_key(l) for l in _INTENT_CLASSES])
+        intent_rows = {l: int(v or 0) for l, v in zip(_INTENT_CLASSES, intent_vals)}
+
+        top_today = await c.zrevrange(
+            f"analytics:top_queries:{_today()}", 0, TOP_QUERIES_TODAY_N - 1, withscores=True
+        )
+        top_queries_today = _digest_rows(top_today, TOP_QUERIES_TODAY_N)
+
         # Delete any pre-upgrade verbatim members before reading the window, so
         # the corpus is gone from the store and not merely withheld from this
         # response. Best-effort; the filter below still applies either way.
@@ -655,6 +804,10 @@ async def summary() -> dict:
             "top_queries": _digest_rows(top_queries, TOP_QUERIES_N),
             "click_positions": {str(i): _i(v) for i, v in zip(positions, pos_vals)},
             "click_top_queries": _digest_rows(click_top_queries, TOP_CLICKED_QUERIES_N),
+            "latency": _percentile_from_buckets(bucket_rows),
+            "hourly_volume": hourly_volume,
+            "intent_counts": intent_rows,
+            "top_queries_today": top_queries_today,
         }
     except Exception as exc:
         _latch.warn_degraded("analytics Redis unavailable (%s); recording paused", exc)
