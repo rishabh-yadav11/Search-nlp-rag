@@ -33,6 +33,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 # any inference library (torch/onnxruntime) is imported below.
 from app import auth as auth_module
 from app import chat as chat_module
+from app import feed as feed_module
 from app.analytics import AnalyticsUnavailableError, record_click, record_search
 from app.analytics import close as close_analytics
 from app.analytics import summary as analytics_data
@@ -321,6 +322,10 @@ async def lifespan(app: FastAPI):
     chat_module.store = chat_store
     state["chat_retention"] = asyncio.create_task(chat_module.retention_loop())
 
+    feed_store = feed_module.FeedStore(config.FEED_DB_PATH)
+    await feed_store.connect()
+    feed_module.store = feed_store
+
     auth_store = auth_module.AuthStore(config.AUTH_DB_PATH)
     await auth_store.connect()
     auth_module.store = auth_store
@@ -355,6 +360,7 @@ async def lifespan(app: FastAPI):
     teardown_steps = (
         ("chat retention task", lambda: _cancel_and_wait("chat retention task", state["chat_retention"])),
         ("chat store", chat_store.close),
+        ("feed store", feed_store.close),
         ("auth token purge task", lambda: _cancel_and_wait("auth token purge task", state["auth_token_purge"])),
         ("fx rate task", lambda: _cancel_and_wait("fx rate task", state["fx_rate"])),
         ("auth store", auth_store.close),
@@ -457,6 +463,7 @@ logger.warning("TrustedHost allowed hosts: %s", ", ".join(config.ALLOWED_HOSTS))
 app.include_router(health_router)
 app.include_router(auth_module.router)
 app.include_router(chat_module.router)
+app.include_router(feed_module.router)
 
 # Prometheus metrics: scopes the gauges to this app's state, then serves /metrics.
 # router module imported after the state dict exists; /metrics reads the state lazily per

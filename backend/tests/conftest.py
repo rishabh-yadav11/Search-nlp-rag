@@ -40,6 +40,7 @@ _DATA_DIR.mkdir(exist_ok=True)
 
 os.environ.setdefault("CHAT_DB_PATH", str(_DATA_DIR / "chat.db"))
 os.environ.setdefault("AUTH_DB_PATH", str(_DATA_DIR / "auth.db"))
+os.environ.setdefault("FEED_DB_PATH", str(_DATA_DIR / "feed.db"))
 os.environ.setdefault("QUERY_FIX_VOCAB_PATH", str(_DATA_DIR / "query_vocab.json.gz"))
 
 # Determinism switches (documented knobs, all optional):

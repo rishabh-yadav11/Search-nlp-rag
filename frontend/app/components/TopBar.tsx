@@ -8,6 +8,7 @@ import { AuthUser, getMe, logout } from '../lib/auth'
 const NAV: { href: string; label: string }[] = [
   { href: '/', label: 'Search' },
   { href: '/for-you', label: 'For You' },
+  { href: '/feed', label: 'Feed' },
   { href: '/chat', label: 'Chat' },
 ]
 

@@ -205,18 +205,25 @@ class FakeQdrant:
         return True
 
     def _filter_records(self, qfilter) -> list[FakePoint]:
-        """Apply a Qdrant ``Filter`` (must / must_not) to the corpus."""
+        """Apply a Qdrant ``Filter`` (must / should / must_not) to the corpus."""
         points = [FakePoint(a["id"], dict(a), score=a.get("_score", 0.9)) for a in self.articles.values()]
         if qfilter is None:
             return points
         must = getattr(qfilter, "must", None) or []
         must_not = getattr(qfilter, "must_not", None) or []
+        # Qdrant ``should`` semantics: a non-empty list is an OR — the point
+        # must match at least one should-condition. An empty/absent list is no
+        # constraint at all (it never *requires* a match).
+        should = getattr(qfilter, "should", None) or []
         out = []
         for p in points:
-            matches_must = all(self._payload_match_value(c, p.payload) for c in must)
-            blocked = any(self._payload_match_value(c, p.payload) for c in must_not)
-            if matches_must and not blocked:
-                out.append(p)
+            if not all(self._payload_match_value(c, p.payload) for c in must):
+                continue
+            if any(self._payload_match_value(c, p.payload) for c in must_not):
+                continue
+            if should and not any(self._payload_match_value(c, p.payload) for c in should):
+                continue
+            out.append(p)
         return out
 
     @staticmethod
