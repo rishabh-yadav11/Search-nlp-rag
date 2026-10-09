@@ -1288,6 +1288,10 @@ nginx_locations() {
         proxy_pass http://127.0.0.1:$API_PORT;
         proxy_set_header Host \$host;
     }
+    location /analytics/users {
+        proxy_pass http://127.0.0.1:$API_PORT;
+        proxy_set_header Host \$host;
+    }
     location /analytics { proxy_pass http://127.0.0.1:$NEXT_PORT; }
 
     location / {
