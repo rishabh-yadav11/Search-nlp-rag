@@ -386,6 +386,7 @@ def ensure_data_paths_ready(cfg: "Config") -> None:
     for env_var, path in (
         ("CHAT_DB_PATH", cfg.CHAT_DB_PATH),
         ("AUTH_DB_PATH", cfg.AUTH_DB_PATH),
+        ("FEED_DB_PATH", cfg.FEED_DB_PATH),
         ("QUERY_FIX_VOCAB_PATH", cfg.QUERY_FIX_VOCAB_PATH),
     ):
         _ensure_data_dir(path, env_var)
@@ -984,6 +985,18 @@ class Config:
     # third-party logger's INFO output stays off at every setting. An
     # unrecognised value falls back to INFO and says so in the log.
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+    # Personalized feed (app/feed.py). Users subscribe to tag/industry/dealtype
+    # values, and GET /api/feed returns the most recent articles matching ANY
+    # subscription. Subscriptions live in their own SQLite file (like chat and
+    # auth stores), keyed by (user_id, kind, value) so re-adding an existing
+    # subscription is a no-op. FEED_MAX_SUBSCRIPTIONS bounds how many a single
+    # account may hold (beyond the cap POST 400s on a NEW subscription);
+    # FEED_DEFAULT_LIMIT is the recency list page size (bounded 1..50 by the
+    # route's Query param).
+    FEED_DB_PATH = _data_path("FEED_DB_PATH", "data/feed.db")
+    FEED_MAX_SUBSCRIPTIONS = int(os.getenv("FEED_MAX_SUBSCRIPTIONS", "50"))
+    FEED_DEFAULT_LIMIT = int(os.getenv("FEED_DEFAULT_LIMIT", "20"))
 
 
 # A real Google API key is "AIza" followed by 35 URL-safe characters. That shape

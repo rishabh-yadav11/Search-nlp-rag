@@ -72,8 +72,8 @@ SIGNUP_ROLE = "user"
 # Role -> permissions. Single source of truth for access control; add a
 # resource-scoped permission here and assert it on the route that needs it.
 ROLE_PERMISSIONS: ClassVar[dict[str, set[str]]] = {
-    "admin": {"chat:use", "analytics:read", "users:read", "users:manage"},
-    "user": {"chat:use"},
+    "admin": {"chat:use", "analytics:read", "users:read", "users:manage", "feed:use"},
+    "user": {"chat:use", "feed:use"},
 }
 
 # Id used as the user_id for service-token requests (eval scripts, ops).
