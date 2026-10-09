@@ -18,6 +18,9 @@ backend/backups/
 qdrant_data/
 logs/
 
+# Prometheus TSDB written by setup.sh's prometheus stage
+prometheus_data/
+
 # Qdrant runtime artifacts
 qdrant_config.yaml
 .qdrant-initialized
