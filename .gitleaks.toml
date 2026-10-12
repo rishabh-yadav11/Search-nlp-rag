@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "standby-ok GEMINI_API_KEY fixture in backend/tests/conftest.py (never sent; AsyncOpenAI faked)"
+paths = ["backend/tests/conftest.py"]
+regexes = ["AIza0123456789AbCdEfGhIjKlMnOpQrStUvWxY"]
