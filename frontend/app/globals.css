@@ -312,6 +312,23 @@ input[type='text']:focus-visible,
   .topbar-inner {
     padding-left: 16px;
     padding-right: 16px;
+    flex-wrap: wrap;
+  }
+
+  .topbar-nav {
+    order: 3;
+    flex-basis: 100%;
+    justify-content: center;
+    margin: 0 0 8px;
+  }
+
+  .topbar-nav-link {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .topbar-right {
+    margin-left: auto;
   }
 
   .search-row {
