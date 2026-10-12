@@ -15,8 +15,12 @@ aiomysql==0.3.0
 redis==5.2.1
 qdrant-client==1.11.3
 fastembed==0.8.0
-sentence-transformers==5.3.0
+sentence-transformers==5.6.0
 torch==2.13.0
+# setuptools is a runtime dep of torch (>=77.0.3) and the fix for
+# PYSEC-2026-3447 lands in 83.0.0; pin explicitly so the pip-audit gate has
+# no --ignore-vuln suppressions, same as the fastapi/starlette pair above.
+setuptools==83.0.0
 transformers==5.10.1
 onnxruntime==1.28.0
 # ONNX cross-encoder (optimum[onnxruntime]) is intentionally NOT installed:
