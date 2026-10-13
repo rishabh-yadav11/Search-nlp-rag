@@ -1,5 +1,13 @@
+# fastapi is pinned together with starlette, and both are exact: starlette is
+# not a transitive to be resolved, because an unpinned one would make the fix
+# for its advisories depend on whatever the resolver happens to pick. Pinning
+# it here explicitly is what makes every fixed release reachable, so the
+# pip-audit gate runs with no --ignore-vuln suppressions.
 fastapi==0.141.1
 starlette==1.7.0
+# Pinned directly, not just inherited from starlette: app/chat.py uses a
+# shielded anyio.CancelScope to finish a cancelled chat turn's database
+# rollback, and it relies on anyio 4's level-cancellation semantics to do so.
 anyio==4.14.2
 uvicorn[standard]==0.30.6
 gunicorn==23.0.0
@@ -9,9 +17,18 @@ qdrant-client==1.11.3
 fastembed==0.8.0
 sentence-transformers==5.6.0
 torch==2.13.0
+# setuptools is a runtime dep of torch (>=77.0.3) and the fix for
+# PYSEC-2026-3447 lands in 83.0.0; pin explicitly so the pip-audit gate has
+# no --ignore-vuln suppressions, same as the fastapi/starlette pair above.
 setuptools==83.0.0
 transformers==5.10.1
 onnxruntime==1.28.0
+# ONNX cross-encoder (optimum[onnxruntime]) is intentionally NOT installed:
+# optimum-onnx pins transformers<4.58, which conflicts with the pinned
+# transformers 5.10.1 (required to fix CVE-2026-4372 / CVE-2026-5241 /
+# CVE-2026-1839). The reranker's ONNX path was therefore removed; it runs on
+# the torch CrossEncoder (app/reranker.py). onnxruntime stays pinned for
+# fastembed, which uses it for dense embeddings.
 openai==1.68.2
 python-dotenv==1.2.2
 cachetools==5.5.0
@@ -19,5 +36,10 @@ tqdm==4.66.5
 aiosqlite==0.20.0
 bcrypt==4.2.1
 symspellpy==6.10.0
+# Fallback tz database for stdlib zoneinfo (app/query_intent.py resolves
+# Asia/Kolkata); used when the container has no system /usr/share/zoneinfo.
 tzdata==2026.3
+# Prometheus exposition (app/metrics.py: /metrics registry + instrumentation
+# hooks). Pinned exactly like the rest of this file; 0.26 bundles the
+# process/GC/platform default collectors as of 0.26.
 prometheus-client==0.26.0
