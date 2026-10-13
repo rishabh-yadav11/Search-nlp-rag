@@ -9,7 +9,7 @@ import { isSafeRedirect } from '../lib/safe-url'
 function LoginForm() {
   const router = useRouter()
   const params = useSearchParams()
-  // Honor `next` only when it is a safe, same-origin, root-relative path; an unvalidated value would let an attacker redirect the victim off-site after login.
+  
   const rawNext = params.get('next') || '/chat'
   const next = isSafeRedirect(rawNext) ? rawNext : '/chat'
   const [email, setEmail] = useState('')
@@ -21,7 +21,7 @@ function LoginForm() {
 
   useEffect(() => {
     mountedRef.current = true
-    // The session is an httpOnly cookie JS cannot read, so `/api/auth/me` is the only way to know; a network failure is not a logout and must not redirect.
+    
     getMe()
       .then((me) => {
         if (me) router.replace(next)
@@ -64,14 +64,14 @@ function LoginForm() {
         setError((body as { detail?: string }).detail ?? `Login failed (${res.status}).`)
         return
       }
-      // The session arrives as an httpOnly cookie, so there is nothing to read or persist in JS; drop the previous session's cached user and any legacy token.
+      
       clearMeCache()
       clearLegacyToken()
       router.replace(next)
       return
     } catch (err) {
       clearTimeout(timeout)
-      // The cleanup may have aborted this request; don't set state on an unmounted component.
+      
       if (!mountedRef.current) return
       if (controller.signal.aborted) {
         setError('The request timed out. Please try again.')

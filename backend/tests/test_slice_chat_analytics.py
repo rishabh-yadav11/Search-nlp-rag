@@ -1,9 +1,4 @@
-"""Slice B: chat analytics (new global_stats keys) + rating endpoint tests.
 
-Covers the four required areas: byte-compatibility of existing global_stats
-keys, the rating endpoint round-trip and non-owner 404, the guarded model/rating
-column migration (idempotent), and the percentile-offset helper.
-"""
 
 from __future__ import annotations
 
@@ -20,11 +15,11 @@ _EMAIL_COUNTER = itertools.count()
 _QUESTION = "what happened with Ola Electric funding news"
 
 EXPECTED_STATS_KEYS = {
-    # existing keys (must stay byte-compatible)
+
     "sessions", "users", "messages", "total_tokens", "total_cost",
     "avg_latency_ms", "top_by_cost", "top_by_tokens", "sessions_today",
     "daily_sessions",
-    # new keys from the frozen contract section 3
+
     "latency", "failed_turn_rate", "abandon_rate", "citation_rate",
     "avg_sources_per_cited", "avg_tokens_per_message", "avg_cost_per_message",
     "budget", "model_usage", "daily_budget", "non_llm_answer_rate",
@@ -44,9 +39,9 @@ def _authed(app_client, tag: str = "rating") -> None:
     assert r.status_code == 200, r.text
 
 
-# ---------------------------------------------------------------------------
-# ChatStore-level helpers (async store, run each await via a fresh loop)
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def run(coro):
@@ -67,15 +62,15 @@ def _append(store, session: object, role: str, content: str, **kw):
     return run(store._append_authorized(session, role, content, **kw))
 
 
-# ---------------------------------------------------------------------------
-# global_stats: new keys + byte-compatibility of the existing ones
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def test_global_stats_new_keys_byte_compat(store):
     s1 = run(store.create_session("alice"))
     _append(store, s1, "user", "hello")
-    # Small-talk answer: no LLM -> no tokens, no cost, no sources.
+
     _append(store, s1, "assistant", "Hi! How can I help?", latency_ms=10.0)
 
     s2 = run(store.create_session("bob"))
@@ -86,44 +81,44 @@ def test_global_stats_new_keys_byte_compat(store):
              prompt_tokens=50, completion_tokens=50, cost=0.1, latency_ms=20.0,
              aborted=True)
 
-    # A session that was abandoned after exactly ONE message (never answered).
+
     s3 = run(store.create_session("carol"))
     _append(store, s3, "user", "abandoned question")
 
     stats = run(store.global_stats())
     assert set(stats.keys()) == EXPECTED_STATS_KEYS
 
-    # --- existing keys: byte-compatible values (unchanged semantics) ---
+
     assert stats["sessions"] == 3
     assert stats["users"] == 3
     assert stats["messages"] == 6
-    # assistant-only token/cost sums
+
     assert stats["total_tokens"] == 100 + 200 + 50 + 50
     assert stats["total_cost"] == 0.6
-    # assistant latency > 0 only, avg
+
     assert stats["avg_latency_ms"] == round((30.0 + 20.0 + 10.0) / 3, 1)
     assert stats["sessions_today"] == 3
     assert len(stats["daily_sessions"]) == 1
 
-    # --- new keys ---
-    # assistant latencies [10, 20, 30]; nearest-rank p50 -> offset 1 -> 20
+
+
     assert stats["latency"]["p50"] == 20.0
     assert stats["latency"]["p90"] == 30.0
     assert stats["latency"]["p95"] == 30.0
-    # one aborted assistant row out of 6 messages (rounded to 4 dp, as served)
+
     assert stats["failed_turn_rate"] == round(1 / 6, 4)
-    # exactly one session (s3) holds a single message
+
     assert stats["abandon_rate"] == round(1 / 3, 4)
-    # 2 of 3 assistant messages cite >= 1 source
+
     assert stats["citation_rate"] == round(2 / 3, 4)
-    # cited messages have 2 and 1 sources -> avg 1.5
+
     assert stats["avg_sources_per_cited"] == round(1.5, 4)
-    # tokens 400 / 3 assistant; cost 0.6 / 3 assistant
+
     assert stats["avg_tokens_per_message"] == round(400 / 3, 4)
     assert stats["avg_cost_per_message"] == round(0.6 / 3, 4)
-    # one non-LLM assistant answer (zero tokens+cost: the small-talk one)
+
     assert stats["non_llm_answer_rate"] == round(1 / 3, 4)
-    # model_usage: all assistant rows carry config.LLM_MODEL
+
     assert stats["model_usage"] == [[config.LLM_MODEL, 3, 400, round(0.6, 4)]]
     assert stats["budget"]["daily_limit_usd"] == config.LLM_DAILY_BUDGET_USD
     assert stats["budget"]["today_spent_usd"] == round(0.6, 4)
@@ -146,30 +141,30 @@ def test_global_stats_empty_store_zero_defaults(store):
 
 
 def test_percentile_offset_helper():
-    # n=0 -> 0 (no sample, caller returns 0.0)
+
     assert _percentile_offset(0, 50) == 0
-    # single sample: every percentile = that sample (offset 0)
+
     assert _percentile_offset(1, 50) == 0
     assert _percentile_offset(1, 95) == 0
-    # four samples [10,20,30,40]: p50 -> index 1 (20), p90 -> index 3 (40)
+
     assert _percentile_offset(4, 50) == 1
     assert _percentile_offset(4, 90) == 3
-    # p95 with only 4 samples clamps to the last element
+
     assert _percentile_offset(4, 95) == 3
-    # even n p50 picks index n/2 - 1
+
     assert _percentile_offset(6, 50) == 2
 
 
-# ---------------------------------------------------------------------------
-# Guarded migration: model/rating columns added idempotently, backfilled
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def test_migration_adds_model_and_rating_idempotently(tmp_path):
     import aiosqlite
 
     path = str(tmp_path / "legacy.db")
-    # A database from before the model/rating columns existed.
+
     async def make_legacy():
         db = await aiosqlite.connect(path)
         await db.execute(
@@ -218,16 +213,16 @@ def test_migration_adds_model_and_rating_idempotently(tmp_path):
     cols, legacy_model = run(_cols())
     assert "model" in cols
     assert "rating" in cols
-    # Legacy rows are backfilled with the configured default model.
+
     assert legacy_model == config.LLM_MODEL
 
-    # Reconnect (migration must be idempotent -- no duplicate-column error).
+
     run(store.close())
     run(store.connect())
     cols, _ = run(_cols())
     assert "model" in cols and "rating" in cols
 
-    # A fresh message inserted through the store carries the real model.
+
     async def _session_and_row():
         session = await store.create_session("alice2")
         row = await store._append_authorized(session, "assistant", "new answer")
@@ -245,15 +240,15 @@ def test_migration_adds_model_and_rating_idempotently(tmp_path):
 
 
 def test_store_adds_new_columns_on_connect(tmp_path):
-    """A brand-new store's schema includes model + rating without ALTER (CREATE)."""
+
     store = ChatStore(str(tmp_path / "fresh.db"))
     run(store.connect())
     run(store.close())
 
 
-# ---------------------------------------------------------------------------
-# Rating endpoint: round-trip + non-owner 404
-# ---------------------------------------------------------------------------
+
+
+
 
 
 def test_rating_round_trip_and_non_owner(app_client):
@@ -263,20 +258,20 @@ def test_rating_round_trip_and_non_owner(app_client):
     assert turn.status_code == 200, turn.text[:500]
     msg_id = turn.json()["assistant"]["id"]
 
-    # Round-trip: rate +1, clear with 0, then a negative rating.
+
     for rating in (1, 0, -1):
         r = app_client.post(f"/api/chat/messages/{msg_id}/rating", json={"rating": rating})
         assert r.status_code == 200, r.text
         assert r.json() == {"ok": True}
 
-    # Out of range -> 422, never a partial write.
+
     assert app_client.post(f"/api/chat/messages/{msg_id}/rating", json={"rating": 2}).status_code == 422
     assert app_client.post(f"/api/chat/messages/{msg_id}/rating", json={"rating": -2}).status_code == 422
 
-    # Non-owner: a second account cannot rate the first account's message.
+
     _authed(app_client, "other")
     assert app_client.post(f"/api/chat/messages/{msg_id}/rating", json={"rating": 1}).status_code == 404
-    # Nonexistent message id -> 404.
+
     assert app_client.post("/api/chat/messages/999999/rating", json={"rating": 1}).status_code == 404
 
 

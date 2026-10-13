@@ -18,17 +18,17 @@ interface Summary {
   top_queries: [string, number][]
   click_positions: Record<string, number>
   click_top_queries: [string, number][]
-  // NEW (contract §1): kept optional so an admin on an old backend still sees
-  // the byte-compatible keys instead of a crash; a missing key renders its
-  // panel as an empty state, never as zeroed data.
+  
+  
+  
   latency?: { p50: number; p90: number; p95: number; p99: number }
   hourly_volume?: [string, number][]
   intent_counts?: Record<string, number>
   top_queries_today?: [string, number][]
 }
 
-// The first element of each chat row is the OPAQUE session id, never the session
-// title, which is the first 60 characters of the user's own question.
+
+
 type ChatRow = [sessionId: string, messages: number, cost: number, updatedAt: number]
 type ChatTokenRow = [sessionId: string, messages: number, tokens: number, updatedAt: number]
 
@@ -42,7 +42,7 @@ interface ChatStats {
   sessions_today: number
   top_by_cost: ChatRow[]
   top_by_tokens: ChatTokenRow[]
-  // NEW (contract §3). Same optionality convention as Summary.
+  
   latency?: { p50: number; p90: number; p95: number }
   failed_turn_rate?: number
   abandon_rate?: number
@@ -51,12 +51,12 @@ interface ChatStats {
   avg_tokens_per_message?: number
   avg_cost_per_message?: number
   budget?: { daily_limit_usd: number; today_spent_usd: number }
-  model_usage?: [string, number, number, number][] // [model, messages, tokens, cost]
-  daily_budget?: [string, number][] // [date, costUsd]
+  model_usage?: [string, number, number, number][] 
+  daily_budget?: [string, number][] 
   non_llm_answer_rate?: number
 }
 
-// GET /analytics/users (contract §2).
+
 type SpenderRow = [userId: string, name: string, totalCostUsd: number]
 type AuditRow = [actorId: string, action: string, createdAt: string]
 
@@ -81,12 +81,10 @@ function pct(v: number | null | undefined): string {
   return v == null ? '0%' : `${v}%`
 }
 
-// A degraded feed is never rendered as data: the backend's counters are legitimately all zero on a quiet day, so a feed that failed to load must be shown as failed.
+
 type Feed<T> = { data: T } | { degraded: string }
 
-/**
- * Classify one analytics response. 503 is the primary signal, but a 200 body carrying `error` is exactly the failure to catch (an intermediary may rewrite the status line).
- */
+
 async function readFeed<T>(res: Response, label: string): Promise<Feed<T>> {
   if (!res.ok) return { degraded: `${label} (HTTP ${res.status})` }
   let body: unknown
@@ -146,17 +144,17 @@ function msLabel(ms: number): string {
   return `${Math.round(ms)}ms`
 }
 
-/** Hourly volume as a compact bar histogram: one column per hour, height = share of the busiest hour, tooltip = exact count. */
+
 function HourlyVolume({ rows }: { rows: [string, number][] | undefined }) {
   if (!rows || rows.length === 0) return <div className="dash-empty">No searches recorded yet.</div>
   const max = Math.max(1, ...rows.map(([, n]) => n))
-  // Simplify the axis label: the backend timestamps look like "2026-10-09T14"
-  // (UTC ISO); show the hour segment "14h" below each bar, full bucket in title.
+  
+  
   return (
     <div className="dash-hourly" role="img" aria-label="Searches per hour, last 24 hours">
       {rows.map(([bucket, n]) => {
-        // Backend buckets are UTC ISO hour tokens ("2026-10-09T14"); show the
-        // hour segment under the bar, or the whole token when it is not one.
+        
+        
         const hour = /T\d{2}$/.test(bucket) ? bucket.slice(-2) : bucket
         return (
           <div key={bucket} className="dash-hour-col">
@@ -169,7 +167,7 @@ function HourlyVolume({ rows }: { rows: [string, number][] | undefined }) {
   )
 }
 
-/** A date→value table with the count/cost bar, shared by signups_14d and daily_budget. */
+
 function DateBarTable({ rows, money }: { rows: [string, number][] | undefined; money: boolean }) {
   if (!rows || rows.length === 0) return <div className="dash-empty">No activity yet.</div>
   const max = Math.max(...rows.map(([, v]) => v), 1)
@@ -284,8 +282,7 @@ function AuditTable({ rows }: { rows: AuditRow[] | undefined }) {
           <tr key={`${actorId}-${createdAt}-${action}`}>
             <td title={actorId}>{actorId.slice(0, 8)}</td>
             <td>{action}</td>
-            {/* createdAt may be an epoch number serialized as text or an ISO
-                string depending on the slice; handle both for display. */}
+            
             <td>{/^\d+(\.\d+)?$/.test(String(createdAt)) ? formatEpochDateTime(Number(createdAt)) : String(createdAt)}</td>
           </tr>
         ))}
@@ -314,9 +311,9 @@ function ChatTable({
       </thead>
       <tbody>
         {rows.map(([sessionId, msgs, value, ts]) => (
-          // Keyed by the session id, never the timestamp: two updates within one poll would remount the row.
+          
           <tr key={sessionId}>
-            {/* A non-identifying surrogate: the full id stays in the `title` attribute, and conversation text must never reach this table. */}
+            
             <td title={sessionId}>Session {sessionId.slice(0, 8)}</td>
             <td className="num">{fmt(msgs)}</td>
             <td className="num">{cost ? formatCost(value) : fmt(value)}</td>
@@ -335,13 +332,13 @@ export default function AnalyticsDashboardPage() {
   const [updated, setUpdated] = useState('loading…')
   const [error, setError] = useState('')
   const [forbidden, setForbidden] = useState(false)
-  // The signed-in user, shared with the top bar so it does not run a second
-  // `/api/auth/me`. Seeded `undefined` so the bar renders no account control
-  // until the identity check answers, rather than flashing "Sign in" at an admin.
+  
+  
+  
   const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
 
-  // Which feeds the last poll could not read. A listed feed is NOT rendered as
-  // zeros, so a dead store is never mistaken for a quiet day.
+  
+  
   const [degraded, setDegraded] = useState<{
     summary: string | null
     chat: string | null
@@ -352,8 +349,8 @@ export default function AnalyticsDashboardPage() {
     users: null,
   })
 
-  // Tracks the in-flight load so a polling tick can't race a running load, and
-  // so the request can be aborted on unmount.
+  
+  
   const inFlight = useRef(false)
   const controllerRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
@@ -387,22 +384,22 @@ export default function AnalyticsDashboardPage() {
     try {
       const meResult = await withTimeout(getMe(false, controller.signal), GETME_TIMEOUT_MS)
       if (meResult.timedOut) {
-        // Abandoning the promise is not enough: abort so the in-flight
-        // `/api/auth/me` socket actually closes.
+        
+        
         controller.abort()
         if (mountedRef.current) setError('Analytics unavailable: identity check timed out')
         return
       }
       const user = meResult.value
       if (!user) {
-        // A network failure never reaches here: getMe rethrows it and it is
-        // surfaced as an error below, not mistaken for a logout.
+        
+        
         redirectToLogin('/analytics/dashboard')
         return
       }
       if (!mountedRef.current) return
       setMe(user)
-      // UX convenience only: the backend API is the authoritative enforcement.
+      
       if (user.role !== 'admin') {
         if (mountedRef.current) setForbidden(true)
         return
@@ -423,8 +420,8 @@ export default function AnalyticsDashboardPage() {
         readFeed<UsersStats>(uRes, 'User analytics'),
       ])
       if (!mountedRef.current) return
-      // A feed that failed is dropped, not kept: stale figures must not sit under
-      // a fresh-looking "Updated" stamp either.
+      
+      
       setSummary('data' in sFeed ? sFeed.data : null)
       setChat('data' in cFeed ? cFeed.data : null)
       setUsers('data' in uFeed ? uFeed.data : null)
@@ -545,7 +542,7 @@ export default function AnalyticsDashboardPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {/* The backend owns this bound, so don't cap here. */}
+                        
                         {Object.entries(d.click_positions)
                           .sort(([a], [b]) => Number(a) - Number(b))
                           .map(([k, n]) => (

@@ -32,16 +32,16 @@ export default function ForYouPage() {
   const [coldStart, setColdStart] = useState(false)
   const [limit] = useState(20)
   const [retryCount, setRetryCount] = useState(0)
-  // The dwell clock starts when the current feed finished rendering, so the
-  // click/read beacons measure time-on-page BEFORE the interaction. Reset on
-  // each feed load (each load is a fresh page-view).
+  
+  
+  
   const dwellStartRef = useRef<number | null>(null)
   const gridRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
 
-    // The deadline aborts the socket on its own; `controller` still owns the unmount path, and only that path suppresses the state updates below.
+    
     const deadline = createDeadline(RECOMMEND_DEADLINE_MS, controller.signal)
 
     const fetchFeed = async () => {
@@ -97,11 +97,11 @@ export default function ForYouPage() {
     return () => controller.abort()
   }, [feedType, limit, retryCount])
 
-  // One beacon writer, shared by the click and the scroll-depth `read` paths.
-  // Fire-and-forget, but bounded: an unbounded beacon would hold its socket open
-  // forever. The session is an httpOnly cookie, so this POST is credentialed;
-  // `authRequestInit` attaches the cookie only when API_BASE is a trusted
-  // backend.
+  
+  
+  
+  
+  
   const sendInteraction = useCallback(
     async (articleId: number | string, interactionType: 'click' | 'read') => {
       const deadline = createDeadline(RECOMMEND_DEADLINE_MS)
@@ -137,10 +137,10 @@ export default function ForYouPage() {
     await sendInteraction(articleId, 'click')
   }
 
-  // Scroll depth: at most ONE `read` interaction per page-view, once the first
-  // card that stays ~60% visible for a sustained beat is noticed. The local
-  // `fired` flag plus the effect's cleanup (which runs when the feed changes or
-  // the component unmounts) is what bounds it; touch-less pages never fire.
+  
+  
+  
+  
   useEffect(() => {
     if (loading || articles.length === 0) return
     const grid = gridRef.current
@@ -261,8 +261,8 @@ function ArticleCard({
   onInteraction: (e: MouseEvent) => void
 }) {
   return (
-    // data-article-id lets the scroll-depth observer locate this card's DOM
-    // node without forward refs or extra prop plumbing.
+    
+    
     <div className={styles['article-card']} data-article-id={String(article.id)} onClick={onInteraction}>
       <SafeArticleLink url={article.url} className={styles['article-link']}>
         <div className={styles['article-content']}>

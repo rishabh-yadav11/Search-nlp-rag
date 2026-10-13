@@ -1,13 +1,4 @@
-"""User interaction tracking and personalized profile generation.
 
-Records article interactions (clicks, reads, views) per user and builds a
-time-decayed preference profile stored in Redis. The profile consists of an
-aggregated dense embedding vector and top-category affinity scores, used by
-the recommender engine for personalized recommendations.
-
-Cold-start: when no interaction history exists, recommend() falls back to
-latest top stories across diverse industries.
-"""
 import json
 import logging
 import math
@@ -35,11 +26,11 @@ _latches = {
 }
 
 
-# Interaction types are a CLOSED set. ``article:interactions:{id}`` is a Redis
-# hash whose FIELD NAME is the interaction type, so every distinct type a caller
-# supplies mints a new field that only the key TTL ever expires. The set is a
-# deliberate superset of what callers send today ('view', 'click', 'read'), so no
-# working client breaks, while anything outside the set is refused.
+
+
+
+
+
 class InteractionType(StrEnum):
     VIEW = "view"
     CLICK = "click"
@@ -50,12 +41,7 @@ _INTERACTION_TYPE_VALUES = frozenset(t.value for t in InteractionType)
 
 
 class InteractionResult(StrEnum):
-    """Why one ``record_interaction`` call did or did not write.
 
-    Every decline mode is distinct because the caller must answer each one
-    truthfully: reporting a rejected interaction type or a spent quota as
-    "unknown article" would be a false statement about a real article.
-    """
 
     RECORDED = "recorded"
     INVALID_TYPE = "invalid_type"
@@ -65,48 +51,30 @@ class InteractionResult(StrEnum):
 
 
 class UnknownArticleError(ValueError):
-    """Raised when an interaction names an article that is not in the index."""
+    pass
 
 
 def _coerce_interaction_type(value: str) -> str:
-    """Return the canonical interaction type, or raise for anything unknown.
 
-    Last line of defence at the write layer: the HTTP model validates the field
-    too, but this value chooses a Redis hash field, so an unrecognised one must
-    never reach HINCRBY even if a future or internal caller skips the model. The
-    value is MATCHED against the enum, not merely length-capped -- a cap alone
-    would still admit an unbounded number of distinct fields.
-    """
     normalised = (value or "").strip().lower()
     if normalised not in _INTERACTION_TYPE_VALUES:
         raise ValueError(f"unknown interaction type: {value!r}")
     return normalised
 
 
-# How long a CONFIRMED article is remembered, so a reader clicking the same
-# article repeatedly does not re-query the index on every event.
+
+
 _ARTICLE_EXISTS_TTL_SECONDS = 300
 _ARTICLE_EXISTS_KEY = "user_profile:article_exists"
 
 
 async def _require_known_article(client: aioredis.Redis, article_id: int) -> None:
-    """Raise UnknownArticleError unless article_id is a real indexed article.
 
-    Every distinct id would otherwise mint an ``article:interactions:{id}`` hash
-    plus a per-user detail key that outlives the request by
-    USER_INTERACTION_TTL_DAYS, so an integer loop turns into unbounded key growth.
-
-    Only a CONFIRMED article is cached: caching a rejection would key it to the
-    caller-chosen id, so the flood this check exists to stop would still grow
-    the keyspace, and an index blip would be latched as "absent" for the whole
-    TTL. An unreachable index therefore propagates (reported as UNAVAILABLE)
-    instead of being mistaken for a negative answer.
-    """
     key = f"{_ARTICLE_EXISTS_KEY}:{article_id}"
     if await client.get(key) == "1":
         return
 
-    from app.main import state  # lazy import avoids a startup cycle
+    from app.main import state
 
     points = await state["qdrant"].retrieve(
         collection_name=config.QDRANT_COLLECTION,
@@ -120,14 +88,7 @@ async def _require_known_article(client: aioredis.Redis, article_id: int) -> Non
 
 
 async def _has_interaction_slot(client: aioredis.Redis, user_id: str, article_id: int) -> bool:
-    """Whether this user may mint one more distinct article-interaction key.
 
-    The user's existing ``user:interactions:{user_id}`` sorted set already holds
-    exactly the distinct article ids they have interacted with, so it doubles as
-    the ledger instead of introducing a second counter with its own TTL. A
-    re-interaction with a known article is always allowed: it rewrites existing
-    keys and mints nothing new.
-    """
     cap = config.USER_MAX_DISTINCT_INTERACTIONS
     if cap <= 0:
         return True
@@ -140,37 +101,37 @@ async def _has_interaction_slot(client: aioredis.Redis, user_id: str, article_id
         return True
     return int(distinct) < cap
 
-# Redis DB for user profiles (separate from the analytics DB so a deploy flush
-# of the query cache does not empty it).
+
+
 _PROFILE_REDIS_DB = config.USER_PROFILE_REDIS_DB
 
-# Lightweight cached client reuse so repeated calls share one socket-pooled
-# instance rather than re-creating connections on every call. Calls can arrive
-# before app startup sets it, so fall back to creating a short-lived client.
+
+
+
 _redis_client_instance: aioredis.Redis | None = None
 
-# TTL constants. ``_INTERACTION_SET_TTL_DAYS`` keeps raw interactions long-term
-# for profile building; the profile vector and categories are recomputed
-# periodically as new signals arrive.
+
+
+
 _INTERACTION_SET_TTL_DAYS = 365
 _PROFILE_VECTOR_TTL_HOURS = 6
 _CATEGORIES_TTL_HOURS = 6
 
-# Number of interaction records to consider for profile building (most recent N)
+
 _PROFILE_MAX_INTERACTIONS = 50
 
-# Trending index: a sorted set of article_id -> total interaction count, kept in
-# step by record_interaction so the trending read path ranks candidates without
-# walking the keyspace. Scores are always read back from the per-article
-# counters, so the index only decides which candidates get hydrated -- a score
-# that drifts can cost a candidate slot, never a wrong number. The index and its
-# ready marker share the counter TTL and are refreshed together, so they fall out
-# of step only if Redis evicts one of them.
+
+
+
+
+
+
+
 _TRENDING_INDEX_KEY = "trending:article_scores"
 _TRENDING_INDEX_READY_KEY = "trending:article_scores:ready"
 _TRENDING_CACHE_TTL_SECONDS = 3600
-_TRENDING_RANK_BATCH = 50      # candidates hydrated per pipelined HGETALL round trip
-_TRENDING_SCAN_COUNT = 500     # only used by the one-time index bootstrap
+_TRENDING_RANK_BATCH = 50
+_TRENDING_SCAN_COUNT = 500
 
 
 def _redis_client() -> aioredis.Redis:
@@ -194,25 +155,9 @@ async def record_interaction(
     feed_type: str = "",
     session_id: str = "",
 ) -> InteractionResult:
-    """Record a user-article interaction in Redis, reporting why if it did not.
 
-    Stores a ``user:interactions:{user_id}`` sorted set scored by timestamp, a
-    per-article interaction detail hash for dwell-time analysis, and a
-    per-interaction-kind article counter for trending.
 
-    ``feed_type`` (``personalized|trending|latest``) and ``session_id`` are
-    beacon context: feed_type is persisted in the interaction detail hash so the
-    feed a click came from stays recoverable, and session_id is stored alongside
-    so a search->click->interaction chain can be joined server-side. Both are
-    opaque and bounded.
 
-    Rejects an unknown ``interaction_type``, an ``article_id`` that is not in the
-    article index, and a user who has already interacted with
-    USER_MAX_DISTINCT_INTERACTIONS distinct articles. Each is checked BEFORE the
-    pipeline is built, so a declined call writes nothing at all.
-    """
-    # Validate the kind before anything is queued: this value becomes a Redis
-    # hash FIELD name, so an unchecked string is an unbounded field mint.
     try:
         kind = _coerce_interaction_type(interaction_type)
     except ValueError:
@@ -226,8 +171,8 @@ async def record_interaction(
         logger.warning("Rejected interaction for unknown article %s", article_id)
         return InteractionResult.UNKNOWN_ARTICLE
     except Exception as exc:  # noqa: BLE001
-        # The index could not be reached, so the id is unverified. That is NOT
-        # the same answer as "not indexed" and must not be reported as one.
+
+
         logger.warning("Interaction article check unavailable: %s", exc)
         return InteractionResult.UNAVAILABLE
 
@@ -239,10 +184,10 @@ async def record_interaction(
         article_key = f"article:interactions:{article_id}"
         pipe = client.pipeline()
 
-        # Queued first: pipeline results come back in command order, so results[0]
-        # is this HINCRBY's post-increment value. A value of 1 means the article's
-        # counters are brand new, so the trending index still holds this
-        # article's pre-expiry score and must be re-seeded, not incremented.
+
+
+
+
         pipe.hincrby(article_key, kind, 1)
         pipe.hset(article_key, "last_timestamp", str(now))
         pipe.expire(article_key, config.USER_INTERACTION_TTL_DAYS * 86400)
@@ -260,14 +205,14 @@ async def record_interaction(
         })
         pipe.expire(detail_key, config.USER_INTERACTION_TTL_DAYS * 86400)
 
-        # Advance the trending index in the same transaction, so trending never
-        # has to scan the keyspace to discover this article.
+
+
         pipe.zincrby(_TRENDING_INDEX_KEY, 1, str(article_id))
         pipe.expire(_TRENDING_INDEX_KEY, config.USER_INTERACTION_TTL_DAYS * 86400)
         pipe.expire(_TRENDING_INDEX_READY_KEY, config.USER_INTERACTION_TTL_DAYS * 86400)
 
-        # Derived data is only valid for the interaction snapshot it was built
-        # from. Invalidate it in the same Redis transaction as the new signal.
+
+
         pipe.delete(
             f"user:profile_vector:{user_id}",
             f"user:categories:{user_id}",
@@ -276,23 +221,23 @@ async def record_interaction(
         results = await pipe.execute()
         reseed_needed = results[0] == 1
     except Exception as exc:  # noqa: BLE001
-        # Warn on the transition into the outage, log one "recovered" line when
-        # it ends, then re-arm so the next outage is announced again. Volume
-        # is rate-limited by elapsed time, not by request count. See
-        # app/degraded.py.
+
+
+
+
         _latches["record_interaction"].warn_degraded(
             "Failed to record user interaction: %s", exc
         )
         return InteractionResult.UNAVAILABLE
-    # The interaction is durably recorded, so Redis answered: a real recovery
-    # observation, which is what re-arms the latch for the next outage.
+
+
     _latches["record_interaction"].log_recovered()
 
     if reseed_needed:
-        # Deliberately outside the guard above: the interaction is already durably
-        # recorded at this point, so a failed index repair must not turn a true
-        # RECORDED into a false UNAVAILABLE. The stale index entry is corrected by
-        # the next interaction regardless.
+
+
+
+
         try:
             await _reseed_trending_index(client, article_id, article_key)
         except Exception as exc:  # noqa: BLE001
@@ -301,15 +246,7 @@ async def record_interaction(
 
 
 async def _reseed_trending_index(client: aioredis.Redis, article_id: int, article_key: str) -> None:
-    """Re-seed the trending index when an article's counters start from scratch.
 
-    The counters expired (or never existed) while the index kept the article's
-    pre-expiry score, so overwrite it with the counters' real total instead of
-    incrementing the stale one. If a concurrent write lands in the gap between
-    the read and the write, the index is left one behind rather than one ahead:
-    scores are read back from the counters on every trending read, and the next
-    interaction increments the index to the correct value.
-    """
     total = _article_total(await client.hgetall(article_key))
     if total <= 0:
         return
@@ -320,10 +257,10 @@ async def _reseed_trending_index(client: aioredis.Redis, article_id: int, articl
 
 
 async def get_user_interactions(user_id: str, limit: int = _PROFILE_MAX_INTERACTIONS) -> list[tuple[int, float]]:
-    """Recent user interactions as (article_id, timestamp) tuples, newest first."""
+
     try:
         client = _redis_client()
-        # zrevrange returns members in descending score order (most recent first)
+
         items = await client.zrevrange(
             f"user:interactions:{user_id}",
             0,
@@ -340,11 +277,7 @@ async def get_user_interactions(user_id: str, limit: int = _PROFILE_MAX_INTERACT
 
 
 async def get_user_profile_vector(user_id: str) -> list[float] | None:
-    """Return the cached or newly-derived preference vector, if available.
 
-    Redis stores the vector as a JSON string so its dimension and ordered values
-    survive round trips. A missing or malformed value is a cold start.
-    """
     try:
         client = _redis_client()
         raw_vector = await client.get(f"user:profile_vector:{user_id}")
@@ -369,19 +302,14 @@ async def get_user_profile_vector(user_id: str) -> list[float] | None:
 
 
 async def build_user_profile(user_id: str) -> list[float] | None:
-    """Build and cache a deterministic profile from recent article interactions.
 
-    Article vectors and category payloads are read together from Qdrant. Any
-    storage or lookup failure leaves the user in the documented cold-start
-    path rather than serving an incomplete personalized profile.
-    """
     try:
         interactions = await get_user_interactions(user_id)
         if not interactions:
             _latches["build_user_profile"].log_recovered()
             return None
 
-        from app.main import state  # lazy import avoids a startup cycle
+        from app.main import state
 
         articles = await state["qdrant"].retrieve(
             collection_name=config.QDRANT_COLLECTION,
@@ -404,11 +332,11 @@ async def build_user_profile(user_id: str) -> list[float] | None:
             vector = [float(value) for value in raw_vector]
             if not vector or not all(math.isfinite(value) for value in vector):
                 continue
-            # Newer signals have higher influence while preserving determinism.
-            # The 30-day time constant is deliberate and matches the one in
-            # recommender._calculate_recency_score; it is a fixed constant rather
-            # than a config knob, so a stale environment variable cannot
-            # desynchronise the two decays.
+
+
+
+
+
             weight = math.exp(-max(0.0, now - timestamp) / (30 * 86400))
             weighted_values.append((vector, weight))
             payload = article.payload or {}
@@ -448,8 +376,7 @@ async def build_user_profile(user_id: str) -> list[float] | None:
         return None
 
 async def get_user_profile_categories(user_id: str) -> list[tuple[str, float]]:
-    """Get top affinity categories for a user from Redis cache, as
-    (category, score) tuples sorted by score descending."""
+
     try:
         client = _redis_client()
         items = await client.zrevrange(
@@ -468,7 +395,7 @@ async def get_user_profile_categories(user_id: str) -> list[tuple[str, float]]:
 
 
 async def invalidate_user_profile(user_id: str) -> None:
-    """Clear cached user profile to force recomputation on next request."""
+
     try:
         client = _redis_client()
         await client.delete(
@@ -484,14 +411,7 @@ async def invalidate_user_profile(user_id: str) -> None:
 
 
 def _article_total(counts: dict) -> int:
-    """Total interactions for an article from its per-article counter hash.
 
-    Summed by NAME against the known interaction kinds, ignoring bookkeeping
-    fields such as ``last_timestamp``. A name-blind sum over every digit-valued
-    field would credit junk fields, so any kind minted before the write-side enum
-    landed would keep inflating a chosen article's trending score for the full
-    USER_INTERACTION_TTL_DAYS.
-    """
     return sum(
         int(counts[kind_name])
         for kind_name in _INTERACTION_TYPE_VALUES
@@ -500,15 +420,7 @@ def _article_total(counts: dict) -> int:
 
 
 async def _ensure_trending_index(client: aioredis.Redis) -> None:
-    """Seed the trending index from the per-article counters if it is missing.
 
-    Installs with `article:interactions:*` hashes but no sorted set behind them
-    get one single scan, after which every read is served from the index. The
-    ready marker is written only here, never by the write path, so an install
-    that takes interactions before its first trending read still gets seeded. It
-    is written even when no counters are found, and carries the index's TTL so
-    the two cannot outlive each other.
-    """
     if await client.exists(_TRENDING_INDEX_READY_KEY):
         return
 
@@ -542,12 +454,7 @@ async def _ensure_trending_index(client: aioredis.Redis) -> None:
 
 
 async def get_trending_articles(limit: int = 10) -> list[dict]:
-    """Get trending articles based on click velocity over recent window.
 
-    Ranks candidates from the incrementally maintained trending index and
-    hydrates their scores with one pipelined HGETALL per rank batch, so the
-    result is the same as a full scan without walking the keyspace.
-    """
     try:
         client = _redis_client()
         window_start = datetime.now(UTC) - timedelta(days=config.TRENDING_VELOCITY_WINDOW_DAYS)
@@ -560,9 +467,9 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
 
         await _ensure_trending_index(client)
 
-        # Walk the index in bounded rank batches: an indexed article whose
-        # counters have since expired must be skipped, and the index is ranked by
-        # a score that may have moved on since.
+
+
+
         article_scores: dict[str, float] = {}
         rank = 0
         while len(article_scores) < limit:
@@ -571,8 +478,8 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
             )
             if not ranked:
                 break
-            # One pipelined HGETALL per rank batch instead of a round trip per
-            # key, which is the whole point of the index.
+
+
             pipe = client.pipeline()
             for article_id in ranked:
                 pipe.hgetall(f"article:interactions:{article_id}")
@@ -583,8 +490,8 @@ async def get_trending_articles(limit: int = 10) -> list[dict]:
                     article_scores[article_id] = float(total)
             rank += len(ranked)
 
-        # article_id breaks ties, so the order does not depend on where the
-        # keyspace scan happened to start
+
+
         sorted_articles = sorted(
             article_scores.items(), key=lambda x: (-x[1], int(x[0]))
         )[:limit]

@@ -1,4 +1,4 @@
-"""Smoke tests for /search and /facets over the real app (faked stores)."""
+
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ def test_search_returns_structured_payload(app_client, frozen_clock) -> None:
 
 
 def test_search_top_k_honored(app_client, frozen_clock) -> None:
-    # "top"-hinted queries are scaled up by suggested_top_k; use a plain query
-    # so the explicit top_k is the effective cap.
+
+
     resp = app_client.get("/search", params={"q": "anything capital general", "top_k": 2})
     assert resp.status_code == 200
     assert len(resp.json()["results"]) <= 2
@@ -41,7 +41,7 @@ def test_search_date_window_honest_empty(app_client, frozen_clock) -> None:
 
 
 def test_search_rejects_empty_after_normalise(app_client) -> None:
-    # A query that normalises away to nothing is a 400, never a silent search.
+
     resp = app_client.get("/search", params={"q": "\u0000\u0001\u0002"})
     assert resp.status_code == 400
 
@@ -51,15 +51,15 @@ def test_facets_returns_controlled_vocabularies(app_client) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) >= {"industry", "dealtype", "tags"}
-    # Every value is a non-empty string.
+
     for values in body.values():
         assert all(isinstance(v, str) and v for v in values)
-    # The seed corpus's controlled values must be discoverable.
+
     assert "Finance" in body["industry"]
     assert "Venture Capital" in body["dealtype"]
 
 
 def test_facets_reachable_unauthenticated(app_client) -> None:
-    # /facets is a public autocomplete surface (no auth dependency).
+
     resp = app_client.get("/facets")
     assert resp.status_code == 200

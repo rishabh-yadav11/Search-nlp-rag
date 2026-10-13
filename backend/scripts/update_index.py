@@ -1,24 +1,4 @@
-"""Incremental sync of the MySQL source table into the Qdrant index.
 
-Detects NEW, CHANGED, and DELETED articles since the last run and applies the
-delta without touching the collection schema, so a running API is unaffected.
-State lives in ``data/index_state.json``; a fingerprint is the md5 of the
-*indexed* row values, so any edit that would change the payload or the embedded
-text is caught.
-
-Adding a field to the fingerprint changes the hash of every record, so a state
-file written by an earlier version mismatches every row and the next run
-re-embeds the whole corpus. Run ``--init`` once to re-seed from current MySQL
-state -- but only when the stored text of already-indexed rows did not change;
-tag_names also enters the composed lead, so those points need the destructive
-rebuild documented in the README first. ``main()`` logs a WARNING on that
-signature.
-
-Durability: upserts are acknowledged (``wait=True``) and state fingerprints
-advance only after a successful upsert, so a failed batch is retried from the
-previous state. ``reconcile()`` then compares every point id in the collection
-against the DB row ids and logs sample missing/extra ids on any mismatch.
-"""
 import asyncio
 import fcntl
 import hashlib
@@ -74,16 +54,16 @@ def fingerprint(rec: dict, include_body: bool = True) -> str:
             ",".join(rec.get("dealtype_names") or []),
             rec.get("content_type") or "",
             ",".join(rec.get("tag_names") or []),
-            # content_type and tag_names are part of the stored payload (see
-            # _common.make_point), so they MUST be part of the change fingerprint:
-            # without a term a row whose tags alone changed hashes identically, is
-            # classified unchanged by sync_delta, and the stored payload -- plus the
-            # tag text now inside the embedded lead -- goes stale with nothing logged.
-            #
-            # Adding a term changes the hash of EVERY record, so every fingerprint
-            # in an index_state.json written by an earlier version now mismatches
-            # and the next run re-embeds the corpus. `--init` re-seeds without
-            # embedding -- see the module docstring for when that is safe.
+
+
+
+
+
+
+
+
+
+
         ]
     )
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
@@ -92,17 +72,11 @@ def fingerprint(rec: dict, include_body: bool = True) -> str:
 async def fetch_records(
     with_body: bool = True, ids: list[int] | None = None
 ) -> dict[int, dict]:
-    """Published rows mapped to the canonical indexed record.
 
-    `with_body=False` omits the (potentially large) body column for callers that
-    only need ids/metadata (e.g. delta detection), and `ids` restricts the
-    result set to a specific set of article ids (used to fetch full bodies only
-    for the rows that actually need (re)indexing).
-    """
     pool = await make_pool(connect_timeout=10)
-    # aiomysql 0.3.0 rejects read_timeout/write_timeout (TypeError before any
-    # socket opens) and exposes no equivalent. Do not restore them -- see
-    # make_pool in _common.py.
+
+
+
     body_select = "body," if with_body else ""
     where = "WHERE status = 1"
     params: list = []
@@ -215,11 +189,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
             )
 
         def drain_one():
-            """Gather one pending future, upsert it, and surface per-batch errors.
 
-            A failed batch is logged and skipped (its state stays unchanged so it
-            is retried next run) rather than aborting the whole index update.
-            """
             batch, future = pending.popleft()
             try:
                 dense_vecs, sparse_vecs = future.result()
@@ -254,14 +224,14 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
             for start in range(0, len(to_index), batch_size):
                 batch = [records[i] for i in to_index[start : start + batch_size]]
                 submit(batch)
-                # Bound in-flight work to the worker count so memory and
-                # concurrency stay bounded even when encoding outpaces upserts.
+
+
                 while len(pending) >= max_workers:
                     drain_one()
             while pending:
                 drain_one()
         finally:
-            # Wait for any still-running workers so no futures are dropped.
+
             executor.shutdown(wait=True)
     finally:
         if client is not None:
@@ -269,13 +239,7 @@ def apply_delta(records: dict[int, dict], new: set, changed: set, deleted: set, 
 
 
 def reconcile(state: dict, records: dict[int, dict]) -> bool:
-    """Compare the full Qdrant point-id set to the DB row id set.
 
-    Scrolls the whole collection in batches of 500 with payloads and vectors
-    disabled (bounded, fast). Logs a WARNING listing the count mismatch plus
-    sample missing/extra IDs. Returns True when in sync, False on any mismatch.
-    Never raises.
-    """
     from qdrant_client import QdrantClient
 
     client = None
@@ -339,10 +303,10 @@ async def main():
         log("no state found — run 'python scripts/update_index.py --init' after a full build first")
         return
 
-    # The FULL record (with body) for every published row: body must be in the
-    # fingerprint so body-only edits are detected, and deriving to_index and the
-    # reconcile check from this same fetch removes the TOCTOU race where a row
-    # unpublished between two fetches would KeyError.
+
+
+
+
     records = await fetch_records(with_body=True)
     log(f"fetched {len(records)} published rows (with body)")
 
@@ -362,10 +326,10 @@ async def main():
         f"{len(records) - len(new) - len(changed) - len(deleted)} unchanged"
     )
 
-    # A fingerprint-scheme change re-hashes every record, so a state file written
-    # by the previous version matches nothing. That is indistinguishable from
-    # "every row really was edited", and the cost is a full re-embed, so say so
-    # explicitly rather than quietly re-embedding.
+
+
+
+
 
     if len(records) > 1 and len(changed) == len(records):
         log(

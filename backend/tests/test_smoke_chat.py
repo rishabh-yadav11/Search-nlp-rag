@@ -1,9 +1,4 @@
-"""Smoke tests for the chat API: session create + message turns (JSON and SSE).
 
-The LLM is the FakeLLMClient, so answers are deterministic. A chat turn needs a
-strong retrieval hit, which the seed corpus + fake reranker (logit 1.0 ->
-~0.73) provide.
-"""
 
 from __future__ import annotations
 
@@ -42,9 +37,9 @@ def test_create_session_json_turn(app_client) -> None:
     assert body["assistant"]["role"] == "assistant"
     answer = body["assistant"]["content"]
     assert isinstance(answer, str) and answer.strip()
-    # The fake's canonical answer was routed to storage end to end.
+
     assert "Ola Electric" in answer or "PhonePe" in answer
-    # Sources were attached and persisted.
+
     assert isinstance(body["assistant"].get("sources"), list)
     assert len(body["assistant"].get("sources", [])) >= 1
 

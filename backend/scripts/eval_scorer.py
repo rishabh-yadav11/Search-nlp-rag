@@ -1,10 +1,4 @@
-"""LLM-as-judge scorer for eval_runner.py output.
 
-Scores each result on faithfulness, relevance, context precision, citation
-accuracy, recency, and refusal correctness with a Gemini judge model. Results
-are appended one-per-line to a crash-safe JSONL log and consolidated into a
-summary JSON + markdown report when the run completes.
-"""
 
 import argparse
 import fcntl
@@ -86,14 +80,14 @@ _MAX_BACKOFF_SECONDS = 60
 
 
 def _is_retryable_judge_error(exc: Exception) -> bool:
-    """Return True only for transient errors worth retrying."""
+
     if isinstance(exc, ApiError):
         return exc.status >= 500 or exc.status == 429
     return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, ConnectionResetError, json.JSONDecodeError))
 
 
 def _retry_after_seconds(exc: Exception) -> float | None:
-    """Parse Retry-After header from an ApiError (429), capped at 60s."""
+
     if not isinstance(exc, ApiError) or exc.status != 429:
         return None
     match = re.search(r"Retry-After:\s*(\d+)", exc.body, re.IGNORECASE)
@@ -121,7 +115,7 @@ def _req(url: str, payload: dict, timeout: int = REQUEST_TIMEOUT) -> dict:
 
 
 def _format_context(result: dict) -> str:
-    """Build the retrieved context string from sources + bodies."""
+
     parts = []
     sources = result.get("sources") or []
     bodies = result.get("bodies") or {}
@@ -138,7 +132,7 @@ def _format_context(result: dict) -> str:
 
 
 def _call_judge(prompt: str) -> dict | None:
-    """Call Gemini and return parsed JSON, or None on failure."""
+
     for attempt in range(MAX_RETRIES + 1):
         try:
             resp = _req(
@@ -165,7 +159,7 @@ def _call_judge(prompt: str) -> dict | None:
 
 
 def _extract_json(text: str) -> dict | None:
-    """Extract the first JSON object from the LLM response."""
+
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
         return None
@@ -176,7 +170,7 @@ def _extract_json(text: str) -> dict | None:
 
 
 def _score_entry(result: dict) -> dict:
-    """Score a single eval_runner result."""
+
     if not result.get("ok") or not result.get("answer"):
         return {
             "index": result.get("index"),
@@ -229,7 +223,7 @@ def _score_entry(result: dict) -> dict:
 
 
 class ScoreStore:
-    """Crash-safe JSONL append for scored results."""
+
 
     def __init__(self, json_path: str):
         self.json_path = json_path
@@ -265,7 +259,7 @@ class ScoreStore:
 
 
 def _build_report(meta: dict, scores: list[dict]) -> str:
-    """Generate markdown summary of scoring results."""
+
     scored = [s for s in scores if s.get("error") is None]
     errored = [s for s in scores if s.get("error") is not None]
 

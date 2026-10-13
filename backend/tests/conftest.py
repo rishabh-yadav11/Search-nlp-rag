@@ -1,20 +1,4 @@
-"""Shared fixtures for the backend test suite.
 
-Everything a test needs lives here so the test modules stay small and
-declarative:
-
-* environment is pinned BEFORE any ``app.*`` import (``app.config`` reads
-  ``os.getenv`` at import time) — rate limits disabled, data files redirected
-  into a scratch dir, a usable Gemini key configured;
-* the four external clients are replaced with fakes before the app's lifespan
-  runs: ``AsyncQdrantClient`` and ``AsyncOpenAI`` and the three model classes
-  on the ``app.main`` module, plus ``redis.asyncio.from_url`` (every module —
-  cache, health, auth limiter, analytics, cost_budget, user_profile — builds
-  its Redis client through that one seam);
-* a session-scoped ``TestClient`` runs the real FastAPI app with its real
-  lifespan, so middleware (TrustedHost, CORS, RequestId), routers and stores
-  are exercised for real.
-"""
 
 from __future__ import annotations
 
@@ -25,13 +9,9 @@ from pathlib import Path
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Environment: must be complete before any ``import app.config`` anywhere.
-# ---------------------------------------------------------------------------
-
 _here = Path(__file__).resolve().parent
 _backend_root = _here.parent
-# Make ``app`` importable regardless of how pytest is invoked.
+
 if str(_backend_root) not in sys.path:
     sys.path.insert(0, str(_backend_root))
 
@@ -43,27 +23,27 @@ os.environ.setdefault("AUTH_DB_PATH", str(_DATA_DIR / "auth.db"))
 os.environ.setdefault("FEED_DB_PATH", str(_DATA_DIR / "feed.db"))
 os.environ.setdefault("QUERY_FIX_VOCAB_PATH", str(_DATA_DIR / "query_vocab.json.gz"))
 
-# Determinism switches (documented knobs, all optional):
-os.environ.setdefault("ENABLE_QUERY_FIX", "false")          # no typo correction
-os.environ.setdefault("AUTH_TOKEN_PURGE_INTERVAL_SECONDS", "0")  # no background purge
-os.environ.setdefault("CHAT_PURGE_INTERVAL_SECONDS", "86400")   # retention loop sleeps
-os.environ.setdefault("LLM_DAILY_BUDGET_USD", "0")          # cost budget disabled
-os.environ.setdefault("AUTH_COOKIE_SECURE", "false")        # cookie travels over http
+
+os.environ.setdefault("ENABLE_QUERY_FIX", "false")
+os.environ.setdefault("AUTH_TOKEN_PURGE_INTERVAL_SECONDS", "0")
+os.environ.setdefault("CHAT_PURGE_INTERVAL_SECONDS", "86400")
+os.environ.setdefault("LLM_DAILY_BUDGET_USD", "0")
+os.environ.setdefault("AUTH_COOKIE_SECURE", "false")
 os.environ.setdefault("AUTH_SERVICE_TOKEN", "test-service-token-backend-suite-7f3")
 os.environ.setdefault(
     "AUTH_SERVICE_TOKEN_SCOPE", "chat:use,analytics:read,users:read,users:manage"
 )
 os.environ.setdefault("AUTH_ADMIN_EMAIL", "admin@example.test")
-os.environ.setdefault("AUTH_ADMIN_PASSWORD", "admin-pass-2026")  # letter + digit, >= 8
+os.environ.setdefault("AUTH_ADMIN_PASSWORD", "admin-pass-2026")
 
-# The fx_rate loop must not hit the real network during the suite: point it at a
-# loopback URL that fails fast, so it logs a fetch failure and keeps the
-# configured fallback rate exactly as a real outage would.
+
+
+
 os.environ.setdefault("FX_RATE_API_URL", "http://127.0.0.1:1/fx")
-os.environ.setdefault("FX_RATE_REFRESH_SECONDS", "0")  # no background refresh
+os.environ.setdefault("FX_RATE_REFRESH_SECONDS", "0")
 
-# Rate limits: disabled (0) so a full test session can never trip a 429 and
-# never depends on wall-clock windows.
+
+
 for _env in (
     "AUTH_SIGNUP_RATE_PER_MIN",
     "AUTH_LOGIN_RATE_PER_MIN",
@@ -79,19 +59,14 @@ for _env in (
 ):
     os.environ.setdefault(_env, "0")
 
-# A key that classifies as "ok" for readiness: AIza + 35 mixed chars, >= 12
-# distinct. It is never sent anywhere: AsyncOpenAI is faked.
+
+
 os.environ.setdefault("GEMINI_API_KEY", "AIza0123456789AbCdEfGhIjKlMnOpQrStUvWxY")
 
 
 @pytest.fixture(scope="session")
 def app_client():
-    """A TestClient over the real app whose external clients are all fakes.
 
-    Session-scoped: the lifespan (store connections, fake model/qdrant/llm
-    construction, background loops) runs exactly once, and the SQLite stores
-    live in the scratch data dir seeded clean at session start.
-    """
     import redis.asyncio as aioredis
     from fakes import (
         FakeDenseEncoder,
@@ -106,8 +81,8 @@ def app_client():
 
     from app import main
 
-    # Fresh scratch data (an existing DB from a previous run would append users
-    # and chats; delete before the lifespan opens them).
+
+
     for old in _DATA_DIR.glob("*.db"):
         old.unlink(missing_ok=True)
 
@@ -129,10 +104,10 @@ def app_client():
     main.Reranker = FakeReranker
 
     try:
-        # client=("127.0.0.1", ...) makes every request report a direct loopback
-        # peer, which is exactly what /ready/deep requires (it 403s any
-        # non-loopback caller). It does not weaken any other endpoint: rate
-        # limits are disabled and no test sends X-Forwarded-For.
+
+
+
+
         with TestClient(main.app, client=("127.0.0.1", 54321)) as client:
             yield client
     finally:
@@ -146,10 +121,7 @@ def app_client():
 
 @pytest.fixture(scope="function")
 def fake_qdrant(app_client):
-    """The in-memory Qdrant currently installed on ``app.main.state``.
 
-    Tests read/write ``articles`` on this to check filters reached the store.
-    """
     from app import main
 
     return main.state["qdrant"]
@@ -157,7 +129,7 @@ def fake_qdrant(app_client):
 
 @pytest.fixture(scope="function")
 def fake_redis_factory(app_client):
-    """The FakeRedisFactory installed at ``redis.asyncio.from_url``."""
+
     import redis.asyncio as aioredis
 
     return aioredis.from_url
@@ -165,11 +137,7 @@ def fake_redis_factory(app_client):
 
 @pytest.fixture(scope="function")
 def frozen_clock(monkeypatch):
-    """Freeze ``query_intent._now`` to one deterministic instant.
 
-    ``_today`` / ``_current_year`` are derived from ``_now`` (via the IST
-    tz conversion), so freezing the seam freezes every date-intent resolver.
-    """
     import app.query_intent as qi
 
     frozen = datetime(2026, 9, 15, 12, 0, 0, tzinfo=UTC)
@@ -179,7 +147,7 @@ def frozen_clock(monkeypatch):
 
 @pytest.fixture(scope="function")
 def unique_email():
-    """Deterministic-ish unique address so signup tests never collide."""
+
     import itertools
 
     counter = itertools.count()
@@ -188,7 +156,7 @@ def unique_email():
 
 @pytest.fixture(scope="function")
 def admin_headers(app_client):
-    """X-Service-Token header scoped for every admin surface."""
+
     import os as _os
 
     return {"X-Service-Token": _os.environ["AUTH_SERVICE_TOKEN"]}

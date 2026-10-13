@@ -1,9 +1,4 @@
-"""One-off backfill: populate the `summary` payload field for Qdrant points
-indexed before summaries were stored.
 
-Reads the same MySQL rows as the indexer, scrolls Qdrant for points with an empty
-summary, and sets the payload in small batches. Idempotent; safe to rerun.
-"""
 import asyncio
 import os
 import sys
@@ -24,7 +19,7 @@ BATCH_SIZE = 200
 
 
 def scroll_empty_points(client: QdrantClient) -> Iterator[int]:
-    """Yield point IDs whose summary payload is empty/absent, one page at a time."""
+
     next_offset = None
     while True:
         pts, next_offset = client.scroll(
@@ -43,11 +38,7 @@ def scroll_empty_points(client: QdrantClient) -> Iterator[int]:
 
 
 def set_summary(client: QdrantClient, records: dict[int, dict], batch: list[int]):
-    """Set each point's own summary.
 
-    set_payload applies one payload dict to many points, so points sharing a
-    summary value go in a single call.
-    """
     by_summary: dict[str, list[int]] = {}
     for pid in batch:
         s = records.get(pid, {}).get("summary") or ""

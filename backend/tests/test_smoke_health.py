@@ -1,9 +1,4 @@
-"""Smoke tests for the health/readiness probes over the real app.
 
-The session TestClient reports a loopback peer (see conftest), which is exactly
-what /ready/deep requires, so all four probes are reachable with the fakes
-reporting healthy.
-"""
 
 from __future__ import annotations
 

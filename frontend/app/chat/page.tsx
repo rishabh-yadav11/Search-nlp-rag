@@ -32,12 +32,12 @@ type Message = {
   completion_tokens?: number
   cost?: number
   latency_ms?: number
-  // -1 | 0 | 1 thumb verdict on this assistant message, persisted server-side
-  // (messages.rating) and reloaded with history; undefined means "not yet rated".
+  
+  
   rating?: number | null
 }
 
-// GET /api/chat/sessions/{id} returns only the most recent CHAT_SESSION_MESSAGE_LIMIT messages and flags the rest, so a long thread shows as a truncated tail.
+
 type SessionDetail = Session & {
   truncated?: boolean
   total_messages?: number
@@ -54,8 +54,8 @@ type Session = {
 
 const CITATION_RE = /\[\d+\]/
 
-// Sanitize untrusted LLM markdown: strip script/iframe/on* handlers and
-// javascript: URLs; `className` is allowed so citation <sup> markers survive.
+
+
 const sanitizeSchema = {
   ...defaultSchema,
   attributes: {
@@ -64,11 +64,11 @@ const sanitizeSchema = {
   },
 }
 
-// Re-parsing the accumulated markdown on every SSE token is O(n^2), so
-// streaming renders are throttled to this many ms apart; the last chunk is
-// always flushed when the stream ends.
+
+
+
 const STREAM_RENDER_MS = 50
-// SSE guardrails: total patience = SSE_TIMEOUT_MS × (SSE_MAX_RETRIES + 1), with linear backoff.
+
 const SSE_TIMEOUT_MS = 45000
 const SSE_MAX_RETRIES = 2
 
@@ -96,14 +96,14 @@ function walk(node: any, fn: (node: any, parent: any, index: number) => void) {
   }
 }
 
-// The deadline aborts the socket so a hung backend surfaces as a rejection the
-// caller's catch can turn into a message; it composes with any caller signal.
+
+
 async function api(path: string, init?: RequestInit) {
   const deadline = createDeadline(CHAT_API_DEADLINE_MS, init?.signal ?? null)
   try {
-    // The session is an httpOnly cookie the browser attaches for us, so this call is
-    // credentialed rather than header-bearing; `authRequestInit` omits `credentials`
-    // when API_BASE is not a trusted backend.
+    
+    
+    
     const res = await fetch(
       `${API_BASE}${path}`,
       authRequestInit({ ...init, signal: deadline.signal })
@@ -144,8 +144,8 @@ function UsageLine({ msg }: { msg: Message }) {
   )
 }
 
-// Shared empty array: a fresh `[]` identity each render would defeat the `memo`
-// on SourceList, re-rendering and re-parsing every settled answer each tick.
+
+
 const NO_SOURCES: Source[] = []
 
 const SourceList = memo(function SourceList({ sources, msg }: { sources: Source[]; msg: Message }) {
@@ -207,9 +207,7 @@ const AnswerBody = memo(function AnswerBody({ content }: { content: string }) {
   )
 })
 
-/** Per-assistant-message thumbs (rating -1|0|1). Disabled while a request is
- *  in flight, for messages the server has not persisted (synthetic/stream Ids),
- *  and offline — a tap would otherwise silently no-op on a dropped socket. */
+
 function Thumbs({
   current,
   pending,
@@ -261,42 +259,42 @@ export default function ChatPage() {
   const [streaming, setStreaming] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
   const [note, setNote] = useState('')
-  // Set when the server dropped older messages from the loaded thread.
+  
   const [historyTruncated, setHistoryTruncated] = useState<{ hidden: number } | null>(null)
   const [error, setError] = useState('')
-  // Transient confirmation shown right after a thumb tap (like/dislike/cleared).
-  // Auto-dismisses after a beat (the effect resets on every new toast).
+  
+  
   const [toast, setToast] = useState<string | null>(null)
-  // Handed to the shared `TopBar` so it renders the account control from a value
-  // this page already fetched. Seeded `undefined` so the bar shows no account
-  // control until the answer lands — seeding `null` would flash "Sign in".
+  
+  
+  
   const [me, setMe] = useState<AuthUser | null | undefined>(undefined)
-  // Re-renders each minute so relative timestamps ("5m ago") keep advancing. No fetch.
+  
   const [, setTick] = useState(0)
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
-  // Distinguishes an intentional cancel (unmount / new session / switch) from a
-  // real failure (e.g. timeout), so a cancel does not surface a spurious error.
+  
+  
   const cancelledRef = useRef(false)
-  // The live session id, independent of the render closure, so an in-flight
-  // stream's done/accumulated guards compare against the *current* session and a
-  // stale reply to a switched session is discarded.
+  
+  
+  
   const activeIdRef = useRef<string | null>(null)
-  // Synchronous in-flight guard: on the first turn `setSending(true)` happens only
-  // after two awaits, leaving a re-entry window that would duplicate the
-  // session/message and double-bill. This ref flips before any await.
+  
+  
+  
   const sendingRef = useRef(false)
-  // In-flight rating requests per message id, so rapid taps cannot double-write.
+  
   const pendingRatingsRef = useRef<Set<number>>(new Set())
 
-  // Thumbs are disabled whenever the browser is offline — a tap that cannot
-  // reach the server must not look like it was recorded. `navigator` is
-  // undefined during SSR prerender, where the buttons render disabled too.
+  
+  
+  
   const offline = typeof navigator !== 'undefined' && navigator.onLine === false
 
-  // Persist a thumb (1 / -1) or clear it (0) on one assistant message. The
-  // backend owns validation + ownership; a failure just leaves the UI verdict
-  // unchanged rather than surfacing a banner.
+  
+  
+  
   const rateMessage = useCallback(
     async (messageId: number, rating: number) => {
       if (messageId <= 0 || pendingRatingsRef.current.has(messageId)) return
@@ -315,9 +313,7 @@ export default function ChatPage() {
               ? 'Thanks — feedback noted'
               : 'Rating cleared',
         )
-      } catch {
-        /* rating is best-effort UX, not a hard failure */
-      } finally {
+      } catch {} finally {
         pendingRatingsRef.current.delete(messageId)
       }
     },
@@ -329,14 +325,12 @@ export default function ChatPage() {
       const data = await api('/api/chat/sessions')
       const list = Array.isArray(data) ? (data as Session[]) : []
       setSessions(list)
-    } catch {
-      /* sidebar is best-effort */
-    }
+    } catch {}
   }, [])
 
   useEffect(() => {
-    // The session is an httpOnly cookie JS cannot read, so `/api/auth/me` is the
-    // only way to know; a network failure is not a logout and must not redirect.
+    
+    
     getMe()
       .then((user) => {
         setMe(user)
@@ -446,8 +440,8 @@ export default function ChatPage() {
     setMessages((m) => [...m, optimistic])
     setInput('')
     setSending(true)
-    // Stream-loop watchdog flag, declared outside the try so the catch can read
-    // it: set when the read-loop watchdog decides the stream went silent.
+    
+    
     let timedOut = false
 
     try {
@@ -456,15 +450,15 @@ export default function ChatPage() {
       let accumulated = ""
       let receivedData = false
       let lastActivity = Date.now()
-      // The last attempted controller stays live past the retry loop so the
-      // read-loop watchdog can abort a stream that goes silent mid-flight.
+      
+      
       let ctrl: AbortController | null = null
       for (let attempt = 0; attempt <= SSE_MAX_RETRIES; attempt++) {
-        // Honor an intentional cancel even mid-retry, so we don't re-fetch the
-        // old session after a clear.
+        
+        
         if (cancelledRef.current) break
         ctrl = new AbortController()
-        abortRef.current = ctrl  // live controller for unmount/session-switch aborts
+        abortRef.current = ctrl  
         timedOut = false
         lastActivity = Date.now()
         const timer = setInterval(() => {
@@ -491,7 +485,7 @@ export default function ChatPage() {
             : e instanceof Error
               ? e
               : new Error('Network error')
-          // Don't retry if the user aborted (unmount / new session) or data already arrived — retrying would duplicate.
+          
           if (ctrl.signal.aborted && !timedOut) break
           if (receivedData) break
           if (attempt < SSE_MAX_RETRIES) {
@@ -503,7 +497,7 @@ export default function ChatPage() {
         }
       }
       if (!res) {
-        // No response at all (all retries failed or were abandoned); `receivedData` can only be true once a body exists, so throw the accumulated error.
+        
         throw lastErr ?? new Error('Streaming connection failed')
       }
       if (res.status === 401) redirectToLogin()
@@ -518,11 +512,11 @@ export default function ChatPage() {
       let streamError = ''
       let lastRender = 0
 
-      // The idle watchdog must survive the backend's post-delta work (nudge/ranking
-      // retries that re-invoke the LLM, _auto_title, settle) before 'done', so every
-      // chunk and the final 'done' refresh it. Silence for SSE_TIMEOUT_MS aborts
-      // before any content, and cancels the reader after content has streamed.
-      timedOut = false  // fresh flag: a slow-but-successful fetch may have set it
+      
+      
+      
+      
+      timedOut = false  
       lastActivity = Date.now()
       const streamTimer = setInterval(() => {
         if (Date.now() - lastActivity > SSE_TIMEOUT_MS) {
@@ -530,14 +524,14 @@ export default function ChatPage() {
           if (!receivedData) {
             ctrl?.abort()
           } else {
-            // Content already streamed: cancel the reader so the loop exits and the turn finalizes with the accumulated content.
+            
             reader.cancel().catch(() => {})
           }
         }
       }, 5000)
 
       try {
-        // Dispatch one parsed SSE event; extracted so the final in-buffer 'done' event is parsed identically.
+        
         const handleEventBlock = (block: string) => {
           const lines = block.split('\n')
           let type = ''
@@ -545,7 +539,7 @@ export default function ChatPage() {
           for (const line of lines) {
             if (line.startsWith('event:')) type = line.slice(6).trim()
             else if (line.startsWith('data:')) {
-              // Handle multi-line data: lines after first data: line get a newline prefix
+              
               const value = line.slice(5)
               if (data) data += '\n' + value
               else data = value
@@ -575,17 +569,15 @@ export default function ChatPage() {
             } else if (type === 'error') {
               streamError = payload.error ?? 'Something went wrong.'
             }
-          } catch {
-            /* skip malformed event */
-          }
+          } catch {}
         }
 
         while (true) {
           const { done, value } = await reader.read()
           if (done) {
-            // Flush decoder-internal bytes; the buffer may still hold a final 'done'
-            // event that arrived with no trailing blank line, so fall back to the
-            // synthetic accumulated message only if none is present.
+            
+            
+            
             buffer += decoder.decode()
             const remainder = buffer.replace(/\r\n/g, '\n').trim()
             if (remainder) handleEventBlock(remainder)
@@ -598,16 +590,16 @@ export default function ChatPage() {
           for (const evt of events) handleEventBlock(evt)
         }
 
-        // Flush the final text so a last chunk inside the throttle window still renders.
+        
         if (accumulated) setStreamingContent(accumulated)
 
         if (streamError) throw new Error(streamError)
         if (doneMsg) {
-          // Guard against the stale-session race: a switched session must not receive this turn's message.
+          
           if (activeIdRef.current === sessionId) {
             setMessages((m) => [...m.filter((x) => x.id !== optimistic.id), doneMsg!])
             if (note) setNote(note)
-            // Each committed turn adds two messages to a fixed-size tail, so the hidden count grows by two.
+            
             setHistoryTruncated((h) => (h ? { hidden: h.hidden + 2 } : h))
           }
           setStreamingContent('')
@@ -623,7 +615,7 @@ export default function ChatPage() {
         }
       } finally {
         clearInterval(streamTimer)
-        // Release the reader lock on every exit path so the connection is freed.
+        
         reader.cancel().catch(() => {})
       }
     } catch (err) {
@@ -634,7 +626,7 @@ export default function ChatPage() {
       }
       setMessages((m) => m.filter((x) => x.id !== optimistic.id))
       setStreamingContent('')
-      // Mirror the retry branch: a watchdog timeout shows a friendly message, not the raw AbortError text.
+      
       if (timedOut) {
         setError('Connection timed out. Please try again.')
         return
@@ -652,7 +644,7 @@ export default function ChatPage() {
       try {
         await api(`/api/chat/sessions/${id}`, { method: 'DELETE' })
       } catch (err) {
-        // Bounded, so this can reject on a timeout as well as an HTTP error; it must not escape as an unhandled rejection.
+        
         setError(
           err instanceof RequestTimeoutError
             ? err.message
@@ -747,10 +739,7 @@ export default function ChatPage() {
                       <div className="chat-msg-answer">
                         <AnswerBody content={m.content} />
                         <SourceList sources={m.sources ?? NO_SOURCES} msg={m} />
-                        {/* Only settled, server-persisted assistant answers are
-                            rateable: a streamed/synthetic message (id <= 0) or an
-                            offline tab disables the thumbs instead of silently
-                            dropping the tap. */}
+                        
                         <Thumbs
                           current={m.rating ?? null}
                           pending={pendingRatingsRef.current.has(m.id)}

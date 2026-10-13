@@ -8,12 +8,12 @@ import { formatArticleDate } from '../lib/format'
 import { createDeadline } from '../lib/deadline'
 import styles from './page.module.css'
 
-// ---- backend feed contract -------------------------------------------------
-// GET /api/feed/subscriptions → { subscriptions:[{kind,value,created_at}] }
-// POST /api/feed/subscriptions body {kind,value} → {ok,added}
-// DELETE /api/feed/subscriptions body {kind,value} → {ok,removed}
-// GET /api/feed?limit=N → { results:[SourceSummary], note: str|null }
-// GET /facets → { industry:[...], dealtype:[...], tags:[...] }
+
+
+
+
+
+
 
 type SubscriptionKind = 'tag' | 'industry' | 'dealtype'
 
@@ -52,17 +52,17 @@ const KIND_LABELS: Record<SubscriptionKind, string> = {
   dealtype: 'Deal type',
 }
 
-// Which /facets key feeds each kind's datalist.
+
 const FACET_KEY: Record<SubscriptionKind, keyof FacetOptions> = {
   tag: 'tags',
   industry: 'industry',
   dealtype: 'dealtype',
 }
 
-/** Empty facets response guard. */
+
 const EMPTY_FACETS: FacetOptions = { industry: [], dealtype: [], tags: [] }
 
-/** Views of the page that are worth a bound, so a hung socket turns into an error the user can act on. */
+
 const FEED_DEADLINE_MS = 15_000
 const SUBS_DEADLINE_MS = 15_000
 const FACETS_DEADLINE_MS = 10_000
@@ -94,12 +94,12 @@ export default function FeedPage() {
     dealtype: false,
   })
 
-  // Aborting a still-in-flight feed load whenever a newer one starts (e.g. a
-  // subscription change while the previous load is pending) keeps the page from
-  // letting a stale response overwrite a fresh one.
+  
+  
+  
   const feedControllerRef = useRef<AbortController | null>(null)
 
-  // ---- feed grid -----------------------------------------------------------
+  
   const loadFeed = useCallback(async () => {
     feedControllerRef.current?.abort()
     const controller = new AbortController()
@@ -138,7 +138,7 @@ export default function FeedPage() {
     }
   }, [])
 
-  // ---- subscription list ---------------------------------------------------
+  
   const loadSubscriptions = useCallback(async () => {
     const deadline = createDeadline(SUBS_DEADLINE_MS)
     try {
@@ -164,7 +164,7 @@ export default function FeedPage() {
     }
   }, [])
 
-  // ---- autocomplete vocab --------------------------------------------------
+  
   useEffect(() => {
     const deadline = createDeadline(FACETS_DEADLINE_MS)
     let live = true
@@ -186,15 +186,15 @@ export default function FeedPage() {
     }
   }, [])
 
-  // First load: subscriptions guard the page's auth, and the feed fills in once
-  // the backend responds.
+  
+  
   useEffect(() => {
     void loadSubscriptions()
     void loadFeed()
     return () => feedControllerRef.current?.abort()
   }, [loadSubscriptions, loadFeed])
 
-  // ---- actions -------------------------------------------------------------
+  
   async function addSubscription(kind: SubscriptionKind) {
     const value = addValues[kind].trim()
     if (!value) {
@@ -220,7 +220,7 @@ export default function FeedPage() {
       }
       if (!res.ok) throw new Error(`Failed to add subscription: ${res.status}`)
       setAddValues((v) => ({ ...v, [kind]: '' }))
-      // The subscription list is the single source of truth from the backend.
+      
       await Promise.all([loadSubscriptions(), loadFeed()])
     } catch (err) {
       if (!deadline.timedOut()) {

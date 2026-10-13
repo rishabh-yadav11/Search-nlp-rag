@@ -1,23 +1,4 @@
-"""Shared Qdrant snapshot/backup helpers.
 
-A backup is a directory under ``backend/backups/`` named
-``<collection>-<UTC-YYYYmmdd-HHMMSS-mmmmmm>`` holding the downloaded collection
-snapshot plus copies of ``data/articles.jsonl`` and ``data/index_state.json``.
-
-The *local* copy is the only durable artifact: a server-side snapshot lives in
-the Qdrant container's local storage and is destroyed by a container recreate,
-``docker rm``, or the port rebind in ``setup.sh``. A backup counts as successful
-only when a verified archive reached disk — ``reset_index.py`` hard-gates an
-irreversible delete on that signal, so an empty backup would turn a declared-safe
-rebuild into unrecoverable data loss.
-
-Download uses ``urllib.request`` because ``requests`` is not declared in
-``requirements.txt``: it was only ever an unpinned transitive artifact, and on a
-clean install the ``ImportError`` was swallowed into a success report.
-
-Only the newest ``BACKUP_RETENTION`` (default 5) backups per collection are
-kept; ``prune_backups`` drops the rest.
-"""
 import os
 import re
 import shutil
@@ -42,13 +23,7 @@ DOWNLOAD_CHUNK = 1 << 20
 
 
 class SnapshotResult(NamedTuple):
-    """Outcome of one create-snapshot + download attempt.
 
-    ``name`` is the server-side snapshot name when Qdrant created one, so an
-    operator can still retrieve it from the container. ``ok`` — and only
-    ``ok`` — means a verified local copy exists; ``local_path`` is then set.
-    ``detail`` is a human-readable reason, always populated when ``ok`` is false.
-    """
 
     name: str | None
     ok: bool
@@ -57,18 +32,12 @@ class SnapshotResult(NamedTuple):
 
     @property
     def server_side_only(self) -> bool:
-        """A snapshot exists in the container but nothing durable was written."""
+
         return self.name is not None and not self.ok
 
 
 class BackupResult(NamedTuple):
-    """Outcome of ``make_backup``.
 
-    ``dest`` is the backup directory (``None`` when nothing at all could be
-    backed up). ``snapshot_ok`` means a verified local snapshot archive exists;
-    ``snapshot_name`` is set whenever the server-side snapshot was created, and
-    ``artifacts`` lists the local data files copied.
-    """
 
     dest: str | None
     snapshot_ok: bool
@@ -91,7 +60,7 @@ LOCAL_ARTIFACTS = ["articles.jsonl", "index_state.json"]
 
 
 def new_backup_dir(collection_name: str) -> str:
-    """Create and return the backup dir ``backend/backups/<collection>-<ts>``."""
+
     ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
     dest = os.path.join(BACKUPS_DIR, f"{collection_name}-{ts}")
     os.makedirs(dest, exist_ok=True)
@@ -108,22 +77,7 @@ def _snapshot_download_url(collection_name: str, snapshot_name: str) -> str:
 
 
 def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
-    """Stream ``url`` to ``dest`` using only the stdlib.
 
-    ``urllib.request.urlopen`` follows 3xx redirects through the default opener
-    and raises ``HTTPError`` on any non-2xx status, and applies ``timeout`` to
-    both the connect and each socket read. The body is streamed in chunks so a
-    multi-gigabyte snapshot never lands in memory.
-
-    The bytes received are counted against the advertised ``Content-Length``.
-    This is not optional: ``http.client`` returns a short read as plain ``b""``
-    and closes the connection rather than raising ``IncompleteRead``, so
-    ``shutil.copyfileobj`` would write a truncated snapshot to disk and report
-    success -- the exact silent-data-loss shape this module exists to prevent.
-    That count is the *only* truncation defence: a close-delimited response
-    cannot be checked at all and ``_local_snapshot_is_valid`` does not make up
-    for it, since a half-delivered tar still parses as a complete archive.
-    """
     req = urllib.request.Request(url, method="GET")
     expected = None
     written = 0
@@ -150,14 +104,7 @@ def _download_to(url: str, dest: str, timeout: int = DOWNLOAD_TIMEOUT) -> None:
 
 
 def _local_snapshot_is_valid(path: str) -> tuple[bool, str]:
-    """Check that ``path`` is a readable, non-empty Qdrant snapshot archive.
 
-    A Qdrant collection snapshot is a tar archive (https://qdrant.tech/documentation/snapshots/),
-    so this walks the member headers; a zero-byte file and a file of unrelated
-    bytes both fail here rather than being reported as a backup. This is *not* a
-    truncation defence: a half-delivered tar still parses cleanly, so
-    ``_download_to``'s ``Content-Length`` count is what catches truncation.
-    """
     if not os.path.isfile(path):
         return False, f"no file at {path}"
     size = os.path.getsize(path)
@@ -174,13 +121,7 @@ def _local_snapshot_is_valid(path: str) -> tuple[bool, str]:
 
 
 def create_and_download_snapshot(client, collection_name: str, dest_dir: str) -> SnapshotResult:
-    """Create a server-side collection snapshot and download it locally.
 
-    ``ok`` is true only when a verified local archive reached ``dest_dir``. A
-    snapshot that exists solely in the Qdrant container is reported as
-    ``ok=False`` with the server-side ``name`` populated, because that artifact
-    does not survive a container recreate and must not be treated as a backup.
-    """
     try:
         snap = client.create_snapshot(collection_name=collection_name, wait=True)
     except Exception as e:
@@ -199,8 +140,8 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str) ->
         _download_to(url, dest)
     except Exception as e:
         err = str(e).replace(url, redact_url(url)) if url else str(e)
-        # A half-written file is not a backup either: remove it so the backup
-        # directory can never be mistaken for holding a snapshot.
+
+
         if os.path.exists(dest):
             os.remove(dest)
         log(
@@ -212,8 +153,8 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str) ->
 
     ok, detail = _local_snapshot_is_valid(dest)
     if not ok:
-        # A file that exists but does not verify is worse than none: a restore
-        # would pick it up. Remove it so only verified artifacts remain.
+
+
         os.remove(dest)
         log(f"ERROR: downloaded snapshot '{name}' failed verification: {detail}")
         return SnapshotResult(name, False, None, detail)
@@ -223,7 +164,7 @@ def create_and_download_snapshot(client, collection_name: str, dest_dir: str) ->
 
 
 def copy_local_artifacts(dest_dir: str) -> list:
-    """Copy data/articles.jsonl and data/index_state.json into dest_dir if present."""
+
     copied = []
     for artifact in LOCAL_ARTIFACTS:
         src = os.path.join(DATA_DIR, artifact)
@@ -235,11 +176,7 @@ def copy_local_artifacts(dest_dir: str) -> list:
 
 
 def backup_dirs(collection_name: str) -> list:
-    """Existing backup directories for a collection, oldest first.
 
-    Sorted by the timestamp encoded in the directory name, not by directory
-    mtime, which copies and restores can alter.
-    """
     prefix = f"{collection_name}-"
     if not os.path.isdir(BACKUPS_DIR):
         return []
@@ -254,7 +191,7 @@ def backup_dirs(collection_name: str) -> list:
 
 
 def prune_backups(collection_name: str, retention: int | None = None) -> list:
-    """Keep only the newest ``retention`` backups; return paths that were removed."""
+
     retention = retention if retention is not None else RETENTION
     if retention <= 0:
         return []
@@ -267,13 +204,7 @@ def prune_backups(collection_name: str, retention: int | None = None) -> list:
 
 
 def make_backup(client, collection_name: str) -> BackupResult:
-    """Create one backup (snapshot + local artifacts) and enforce retention.
 
-    ``snapshot_ok`` is true only when a verified local snapshot archive exists.
-    ``dest`` is ``None`` when nothing at all could be backed up; a non-``None``
-    ``dest`` with ``snapshot_ok`` false means the directory holds local artifacts
-    but no collection snapshot, and is therefore not a usable backup.
-    """
     dest = new_backup_dir(collection_name)
     result = create_and_download_snapshot(client, collection_name, dest)
     copied = copy_local_artifacts(dest)
@@ -299,9 +230,9 @@ def make_backup(client, collection_name: str) -> BackupResult:
         )
         outcome = BackupResult(dest, True, result.name, copied)
 
-    # Retention runs on every path, including a failed backup: a run of failing
-    # backups creates a directory each time, and those are exactly what would
-    # fill backend/backups/ if pruning only ran on success.
+
+
+
     for removed in prune_backups(collection_name):
         log(f"pruned old backup {os.path.relpath(removed, BACKUPS_DIR)}")
     return outcome

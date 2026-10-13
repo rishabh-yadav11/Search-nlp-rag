@@ -61,7 +61,7 @@ const SUGGESTIONS = [
 
 const TIMEOUT_MS = 30_000
 
-// A 422 is FastAPI's validation response and says WHICH field failed, so key on that: only the length case gets the length message, any other failure an honest generic one.
+
 function friendlyMessage(status: number, detail?: string): string {
   switch (status) {
     case 400:
@@ -79,9 +79,9 @@ function friendlyMessage(status: number, detail?: string): string {
   }
 }
 
-// Mirrors the backend's SEARCH_QUERY_MAX_CHARS DEFAULT, used for the input's
-// maxLength and the 422 message. Display-only: the length check itself reads the
-// backend's own 422 body, so the server bound stays authoritative.
+
+
+
 const SEARCH_QUERY_MAX_CHARS = 512
 
 function isQueryTooLong(detail?: string): boolean {
@@ -95,7 +95,7 @@ function isQueryTooLong(detail?: string): boolean {
       return err.type === 'string_too_long' && loc.includes('q')
     })
   } catch {
-    // A non-JSON body is not something we can attribute to the query's length.
+    
     return false
   }
 }
@@ -149,9 +149,7 @@ function trackClick(query: string, position: number, id?: string | number) {
       body: payload,
       keepalive: true,
     }).catch(() => {})
-  } catch {
-    /* analytics is best-effort; never block navigation */
-  }
+  } catch {}
 }
 
 export default function Page() {
@@ -231,9 +229,9 @@ export default function Page() {
     try {
       const res = await fetch(`${API_BASE}/search?${params.toString()}`, {
         signal: controller.signal,
-        // Analytics join key: created lazily so a visitor who never searches
-        // neither reads nor writes a cookie. The header (not a field on the
-        // query string) keeps every search cheap to join to its clicks.
+        
+        
+        
         headers: { 'X-Session-Id': ensureSessionId() },
       })
 
@@ -381,7 +379,7 @@ export default function Page() {
                   ))}
                 </datalist>
                 <label className="filter-field">
-                  {/* /facets ships only the 200 most-used tags, so the label itself carries the truncation note. */}
+                  
                   <span className="filter-label">tag &middot; top 200 by use</span>
                   <input
                     type="text"

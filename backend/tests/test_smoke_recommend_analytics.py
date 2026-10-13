@@ -1,8 +1,4 @@
-"""Smoke tests for the recommender family and the analytics endpoints.
 
-Recommenders run against the fake Qdrant; analytics use the in-memory fake
-Redis. Auth gating is asserted for the admin-read surfaces.
-"""
 
 from __future__ import annotations
 
@@ -90,7 +86,7 @@ def test_recommend_for_you_requires_auth(app_client) -> None:
 
 
 def test_trending_requires_auth(app_client) -> None:
-    # /recommend/trending is behind require_auth (a 401 without a session).
+
     app_client.cookies.clear()
     assert app_client.get("/recommend/trending").status_code == 401
 
@@ -100,25 +96,25 @@ def test_analytics_click_anonymous_beacon(app_client) -> None:
     r = app_client.post("/analytics/click", json={"query": "funding", "position": 1, "id": 1})
     assert r.status_code == 200
     assert r.json() == {"ok": True}
-    # An unknown article id is still a tolerated beacon (no ranking vote).
+
     r2 = app_client.post("/analytics/click", json={"query": "funding", "position": 2, "id": 9999})
     assert r2.status_code == 200
 
 
 def test_analytics_admin_reads_are_gated(app_client, admin_headers) -> None:
     app_client.cookies.clear()
-    # Admin (service token, analytics:read) can read both reports.
+
     summary = app_client.get("/analytics/summary", headers=admin_headers)
     assert summary.status_code == 200
     assert isinstance(summary.json(), dict)
     chat_report = app_client.get("/analytics/chat", headers=admin_headers)
     assert chat_report.status_code == 200
 
-    # A plain user (cookie only) is authenticated but not authorized.
+
     _authed(app_client)
     assert app_client.get("/analytics/summary").status_code == 403
     assert app_client.get("/analytics/chat").status_code == 403
 
-    # No credential at all -> 401.
+
     app_client.cookies.clear()
     assert app_client.get("/analytics/summary").status_code == 401

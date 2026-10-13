@@ -1,11 +1,4 @@
-"""Create a Qdrant collection snapshot backup and copy local artifacts.
 
-A directory without a verified *local* snapshot is not a backup of the
-collection, so a failed ``create_snapshot`` or download exits 1 even when the
-local artifacts were copied. Exit status is 0 only when a verified archive was
-written, or when ``--prune-only`` was requested (which writes no snapshot by
-design).
-"""
 import os
 import sys
 

@@ -10,20 +10,13 @@ from app.config import config
 
 logger = logging.getLogger("llm")
 
-# Upper bound (seconds) on a provider-supplied Retry-After wait so a huge or
-# malformed hint can never make a chat/SSE request hang instead of failing fast.
+
+
 MAX_BACKOFF_SECONDS = 60
 
 
 def build_messages(prompt: str, system_prompt: str | None = None) -> list[dict]:
-    """Chat messages for one turn, with the system prompt in its own role.
 
-    The system prompt must travel as a real ``system`` message: the chat
-    completions API treats that as the instruction channel, whereas a ``user``
-    message is indistinguishable from the untrusted article and conversation
-    text sharing that role, so attacker-supplied text could read as an
-    instruction. ``system_prompt`` is optional.
-    """
     messages: list[dict] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -32,12 +25,7 @@ def build_messages(prompt: str, system_prompt: str | None = None) -> list[dict]:
 
 
 class LLMUnavailableError(Exception):
-    """Raised when the LLM cannot be reached, after retries are exhausted.
 
-    ``attempts`` is how many requests were actually sent: the provider bills the
-    prompt of every attempt, retry or not, so a caller that charges for a failed
-    call needs the count, and zero means the request was never sent.
-    """
 
     def __init__(self, message: str = "LLM temporarily unavailable", attempts: int = 1):
         super().__init__(message)
@@ -46,7 +34,7 @@ class LLMUnavailableError(Exception):
 
 @dataclass
 class LLMResult:
-    """LLM answer plus reported token usage (for cost tracking)."""
+
 
     content: str
     prompt_tokens: int = 0
@@ -57,8 +45,7 @@ class LLMResult:
         return self.prompt_tokens + self.completion_tokens
 
     def cost(self) -> float:
-        """Estimated cost of this call in INR, from config pricing per 1M tokens
-        (USD) converted at the current INR rate (live, fallback on failure)."""
+
         usd = (
             self.prompt_tokens / 1_000_000 * config.LLM_PRICE_INPUT_PER_1M
             + self.completion_tokens / 1_000_000 * config.LLM_PRICE_OUTPUT_PER_1M
@@ -69,9 +56,7 @@ class LLMResult:
 
 
 def _retry_after_seconds(exc: Exception) -> float | None:
-    """Provider's suggested backoff (seconds) from a 429 ``Retry-After`` header,
-    or None when there is no usable hint and the caller falls back to its own
-    exponential backoff. Consulted only for transient failures."""
+
     resp = getattr(exc, "response", None)
     if resp is None:
         return None
@@ -93,14 +78,14 @@ def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
     if isinstance(exc, openai.APIStatusError):
-        # Retry only transient failures (5xx, 429); a 4xx such as 400 invalid
-        # request cannot succeed on retry and would just burn attempts/budget.
+
+
         return exc.status_code is not None and (exc.status_code >= 500 or exc.status_code == 429)
     return False
 
 
 async def _record_llm_outcome(status: str, duration: float) -> None:
-    """Best-effort Prometheus hook for one LLM call; never breaks answering."""
+
     try:
         from app.metrics import inc_llm
 
@@ -110,12 +95,7 @@ async def _record_llm_outcome(status: str, duration: float) -> None:
 
 
 async def generate_answer(llm_client, prompt: str, model: str, system_prompt: str | None = None) -> LLMResult:
-    """Call the LLM with a timeout, retrying transient errors.
 
-    Exponential backoff (LLM_RETRY_BACKOFF * 2^attempt) up to LLM_MAX_RETRIES;
-    raises LLMUnavailableError wrapping the last error, so callers never surface
-    raw SDK errors.
-    """
     started_at = time.perf_counter()
     last_error = None
     for attempt in range(config.LLM_MAX_RETRIES + 1):
@@ -155,7 +135,7 @@ async def generate_answer(llm_client, prompt: str, model: str, system_prompt: st
                 delay,
             )
             await asyncio.sleep(delay)
-    # The loop ran zero times (LLM_MAX_RETRIES < 0): nothing was sent or billed.
+
     raise LLMUnavailableError(attempts=0) from last_error
 
 
@@ -166,12 +146,7 @@ async def stream_answer(
     usage_holder: list | None = None,
     system_prompt: str | None = None,
 ):
-    """Yield answer text chunks as they arrive from the LLM.
 
-    Same retry policy as generate_answer, but only while the stream has yielded
-    no content: a mid-stream failure would otherwise duplicate sent text.
-    ``usage_holder``, when given, is filled with the final LLMResult.
-    """
     last_error = None
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         started = False
@@ -222,5 +197,5 @@ async def stream_answer(
                 delay,
             )
             await asyncio.sleep(delay)
-    # The loop ran zero times (LLM_MAX_RETRIES < 0): nothing was sent or billed.
+
     raise LLMUnavailableError(attempts=0) from last_error

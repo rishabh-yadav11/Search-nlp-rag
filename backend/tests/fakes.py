@@ -1,26 +1,4 @@
-"""In-memory fakes for the external services the backend talks to.
 
-These deliberately fake ONLY the four boundary objects the real app creates:
-an AsyncQdrantClient, an AsyncOpenAI LLM client, and redis.asyncio clients
-(every module builds them through ``redis.asyncio.from_url`` — cache, health,
-auth rate limiter, analytics, cost_budget, user_profile). Everything else runs
-for real: routers, middleware, stores, pydantic models.
-
-The fakes are self-contained (no ``app.*`` imports) so they can live in one
-module without circular-import surprises.
-
-* :class:`FakeQdrant` — an in-memory Qdrant over a tiny article list.
-  Supports the search path (``query_points`` with ``prefetch`` + Fusion),
-  body/point retrieval (``retrieve``), paginated scrolling (``scroll``) with
-  an optional ``order_by``, collection checks (``collection_exists``) and
-  enough filter semantics (MatchAny / DatetimeRange conditions) to make the
-  hard date-window tests meaningful.
-* :class:`FakeLLMClient` — AsyncOpenAI stand-in with a canned, deterministic
-  answer (and an SSE stream variant).
-* :class:`FakeRedis` — a small in-memory Redis covering the command surface
-  the app actually uses (strings, hashes, sorted sets, exists/expire/scan,
-  pipelines). ``redis.asyncio.from_url`` is monkeypatched to return it.
-"""
 
 from __future__ import annotations
 
@@ -31,7 +9,7 @@ from datetime import UTC, datetime
 
 
 class FakePoint:
-    """A qdrant ScoredPoint/Record substitute: id + payload + score."""
+
 
     def __init__(self, point_id: int, payload: dict | None = None, score: float = 0.5):
         self.id = point_id
@@ -45,12 +23,7 @@ class FakeQueryResponse:
 
 
 def seed_articles() -> dict[int, dict]:
-    """A tiny, assertable corpus spanning several years and facets.
 
-    Dates stay strictly ISO ``YYYY-MM-DD`` so the fake's date comparisons and
-    the app's ``_parse_date`` agree. ``body`` is short but present (the chat
-    path attaches bodies).
-    """
     return {
         1: {
             "id": 1,
@@ -140,7 +113,7 @@ def seed_articles() -> dict[int, dict]:
 
 
 def _coerce_dt(value: object) -> datetime | None:
-    """Parse a stored published_date (ISO date, or datetime string) to UTC aware."""
+
     if value is None:
         return None
     try:
@@ -154,16 +127,16 @@ def _coerce_dt(value: object) -> datetime | None:
 
 
 class FakeQdrant:
-    """In-memory AsyncQdrantClient substitute over a dict of article dicts."""
+
 
     def __init__(self, articles: dict[int, dict] | None = None):
         self.articles = dict(articles) if articles is not None else seed_articles()
         self.collection_prefix = "vccircle"
 
-    # -- helpers -----------------------------------------------------------
+
 
     def _payload_match_value(self, cond, payload: dict) -> bool:
-        """Does ``payload`` satisfy one FieldCondition's match/range?."""
+
         from qdrant_client.models import MatchValue
 
         match = getattr(cond, "match", None)
@@ -174,7 +147,7 @@ class FakeQdrant:
             if isinstance(match, MatchValue):
                 wanted = {match.value}
             else:
-                # MatchAny and everything else expose .any (a set/list)
+
                 wanted = set(getattr(match, "any", ()) or ())
             if isinstance(stored, list):
                 haystack = {str(v) for v in stored}
@@ -185,7 +158,7 @@ class FakeQdrant:
             stored_dt = _coerce_dt(payload.get(key))
             if stored_dt is None:
                 return False
-            # DatetimeRange exposes gte/lte/gt/lt as attributes.
+
             for attr, op in (("gte", ">="), ("lte", "<="), ("gt", ">"), ("lt", "<")):
                 bound = getattr(rng, attr, None)
                 if bound is None:
@@ -205,15 +178,15 @@ class FakeQdrant:
         return True
 
     def _filter_records(self, qfilter) -> list[FakePoint]:
-        """Apply a Qdrant ``Filter`` (must / should / must_not) to the corpus."""
+
         points = [FakePoint(a["id"], dict(a), score=a.get("_score", 0.9)) for a in self.articles.values()]
         if qfilter is None:
             return points
         must = getattr(qfilter, "must", None) or []
         must_not = getattr(qfilter, "must_not", None) or []
-        # Qdrant ``should`` semantics: a non-empty list is an OR — the point
-        # must match at least one should-condition. An empty/absent list is no
-        # constraint at all (it never *requires* a match).
+
+
+
         should = getattr(qfilter, "should", None) or []
         out = []
         for p in points:
@@ -234,13 +207,13 @@ class FakeQdrant:
             return FakePoint(point.id, {}, point.score)
         keys = set(with_payload or [])
         if "body" not in keys:
-            # list request carries only what the caller asked for; keep body only
-            # when explicitly wanted
+
+
             keys = keys - {"body"}
         payload = {k: v for k, v in (point.payload or {}).items() if k in keys}
         return FakePoint(point.id, payload, point.score)
 
-    # -- qdrant-client API surface used by the app --------------------------
+
 
     async def collection_exists(self, collection_name: str) -> bool:
         return collection_name.startswith(self.collection_prefix) or collection_name == "vccircle_articles"
@@ -251,10 +224,10 @@ class FakeQdrant:
         with_payload = kwargs.get("with_payload", True)
         points = self._filter_records(qfilter)
         query = kwargs.get("query")
-        # A point-id query (recommender similar/for-you) excludes the id itself.
+
         if isinstance(query, int):
             points = [p for p in points if p.id != query]
-        # Deterministic ordering: probe-first so repeated calls agree.
+
         points.sort(key=lambda p: (p.score, p.id), reverse=True)
         return FakeQueryResponse([
             self._select_payload(p, with_payload) for p in points[:limit]
@@ -302,9 +275,9 @@ class FakeQdrant:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Fake LLM
-# ---------------------------------------------------------------------------
+
+
+
 
 CANONICAL_ANSWER = (
     "Ola Electric filed draft papers for its mega IPO, and PhonePe closed a "
@@ -337,7 +310,7 @@ class _FakeResponse:
 
 
 class _FakeStreamChunk:
-    """One SSE chunk: choices with a delta, plus an optional usage trailer."""
+
 
     def __init__(self, text: str, usage: bool = False):
         self.choices = [_FakeChoice("", delta_content=text)] if text else []
@@ -366,13 +339,13 @@ class _FakeChat:
         self.completions = _FakeCompletions(owner)
 
 
-# ---------------------------------------------------------------------------
-# Fake model objects (the lifespan builds DenseEncoder / SparseTextEmbedding /
-# Reranker; they are replaced so no model weights are downloaded or loaded)
-# ---------------------------------------------------------------------------
+
+
+
+
 
 class _Vector:
-    """Thin numpy-like object exposing the ``.tolist()`` the app calls."""
+
 
     def __init__(self, values):
         self._values = list(values)
@@ -382,19 +355,19 @@ class _Vector:
 
 
 class FakeDenseEncoder:
-    """Stand-in for ``app.encoders.DenseEncoder``: deterministic unit vector."""
+
 
     def __init__(self, *args, **kwargs):
         del args, kwargs
 
     def encode(self, text: str) -> _Vector:
         del text
-        # A fixed-length vector; only its tolist() form is ever consumed.
+
         return _Vector([0.1, 0.2, 0.3, 0.4, 0.5])
 
 
 class FakeSparseVec:
-    """Sparse embedding stand-in with numpy-like indices/values."""
+
 
     def __init__(self):
         self.indices = _Vector([0, 1, 2, 3])
@@ -402,7 +375,7 @@ class FakeSparseVec:
 
 
 class FakeSparseModel:
-    """Stand-in for ``fastembed.SparseTextEmbedding``: lazy embed generator."""
+
 
     def __init__(self, *args, **kwargs):
         del args, kwargs
@@ -417,12 +390,7 @@ class FakeSparseModel:
 
 
 class FakeReranker:
-    """Stand-in for ``app.reranker.Reranker``: deterministic positive logits.
 
-    Sigmoid-normalized these land around 0.73, comfortably above the chat
-    relevance gate (ASK_MIN_SCORE=0.2), so a chat turn reaches the LLM with
-    real sources instead of the weak-results fallback.
-    """
 
     def __init__(self, *args, **kwargs):
         del args, kwargs
@@ -433,13 +401,7 @@ class FakeReranker:
 
 
 class FakeLLMClient:
-    """Minimal AsyncOpenAI substitute with a canned answer.
 
-    The real AsyncOpenAI requires a live network only on ``create``; the object
-    construction itself is cheap. ``app.main`` monkeypatches ``AsyncOpenAI`` to
-    return this, and the lifespan keeps calling the constructor with whatever
-    kwargs it is given.
-    """
 
     def __init__(self, *args: object, **kwargs: object):
         del args, kwargs
@@ -447,12 +409,12 @@ class FakeLLMClient:
         self.chat = _FakeChat(self)
 
 
-# ---------------------------------------------------------------------------
-# Fake Redis
-# ---------------------------------------------------------------------------
+
+
+
 
 class _FakePipeline:
-    """Collects commands, runs them at execute() in order."""
+
 
     def __init__(self, owner: FakeRedis):
         self._owner = owner
@@ -525,11 +487,7 @@ class _FakePipeline:
 
 
 class FakeRedis:
-    """In-memory Redis supporting the subset of commands the app uses.
 
-    All values stored as strings (decode_responses=True semantics). Shares one
-    keyspace across every ``from_url`` caller so cross-module reads see writes.
-    """
 
     def __init__(self):
         self._data: dict[str, str] = {}
@@ -537,12 +495,12 @@ class FakeRedis:
     def reset(self) -> None:
         self._data.clear()
 
-    # strings
+
     async def get(self, key):
         return self._data.get(key)
 
     async def set(self, key, value, ex=None, nx=False):
-        del ex  # TTLs are irrelevant in-memory; kept for interface parity
+        del ex
         if nx and key in self._data:
             return None
         self._data[key] = (
@@ -582,7 +540,7 @@ class FakeRedis:
                 keys.append(k)
         return (0, keys)
 
-    # hashes
+
     async def hset(self, key, *args, **kwargs):
         mapping = kwargs.get("mapping")
         if mapping is not None:
@@ -620,7 +578,7 @@ class FakeRedis:
         self._data[f"__h:{key}"] = json.dumps(store)
         return n
 
-    # sorted sets
+
     def _zset(self, key):
         data = {}
         raw = self._data.get(f"__z:{key}")
@@ -681,7 +639,7 @@ class FakeRedis:
         self._write_zset(key, data)
         return n
 
-    # generic
+
     def pipeline(self):
         return _FakePipeline(self)
 
@@ -693,7 +651,7 @@ class FakeRedis:
 
 
 class FakeRedisFactory:
-    """Callable standing in for ``redis.asyncio.from_url``; returns a shared fake."""
+
 
     def __init__(self):
         self.instance = FakeRedis()

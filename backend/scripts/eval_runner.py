@@ -1,21 +1,4 @@
-"""Unified chat eval runner over prompts_with_variations_flat.json.
 
-For every prompt: create a chat session, POST one message, capture the answer,
-sources, token usage and cost, fetch the cited articles' bodies from Qdrant,
-then delete the session. Results are appended one-per-line to a JSONL log after
-every prompt, so an interrupted run keeps partial data; --start/--limit resume.
-
-Chat turns make real (billed) LLM calls against the daily budget; use
-``--dry-run`` to validate loading only.
-
-Results land in eval_results/<timestamp>_<pid>.json plus a _report.md, relative
-to the working directory (override with EVAL_RESULTS_DIR). The pid suffix makes
-collisions impossible even when two runs start in the same second. During the
-run the .jsonl is written under an exclusive advisory lock and removed once the
-report exists; if a run dies before that, the OS releases the lock and the next
-invocation consolidates the orphaned .jsonl first. Recovery never touches a live
-run's log -- the lock attempt blocks it.
-"""
 
 import argparse
 import fcntl
@@ -41,7 +24,7 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(dotenv_path=os.path.join(_BACKEND_DIR, ".env"))
 
 
-# Mirrors the bootstrap in _common.py so ``app`` (one directory up) imports from any cwd.
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.lexical import jaccard
@@ -49,8 +32,8 @@ from app.lexical import jaccard
 CHAT_BASE = os.getenv("EVAL_CHAT_BASE", "http://localhost:8001/api/chat")
 SERVICE_TOKEN = os.getenv("AUTH_SERVICE_TOKEN", "")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-# None when the store runs unauthenticated; same rule as config.py, so an empty
-# env var does not become an empty api-key header.
+
+
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "vccircle_articles")
 RESULTS_DIR = os.getenv("EVAL_RESULTS_DIR", "eval_results")
@@ -115,7 +98,7 @@ _STOPWORDS = frozenset(
 
 
 class ApiError(Exception):
-    """HTTP failure with the response body preserved for diagnosis."""
+
 
     def __init__(self, status: int, body: str):
         super().__init__(f"HTTP {status}: {body[:500]}")
@@ -144,7 +127,7 @@ def _req(url: str, payload: dict | None = None, method: str | None = None, timeo
 
 
 def _delete(url: str) -> None:
-    """DELETE that never fails on a 2xx response with an empty/non-object JSON body."""
+
     try:
         _req(url, method="DELETE")
     except (json.JSONDecodeError, ValueError):
@@ -197,15 +180,7 @@ class _UnionFind:
 
 
 def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
-    """Map group label -> 1-based prompt indices.
 
-    The flat input lists each base prompt's variations in consecutive runs of
-    VARIATION_RUN, and a run's members restate identical content behind
-    interchangeable scaffolding ("Tell me X" / "List the most recent X"). So
-    merging is confined to a run, pairwise, on filler-stripped normalized
-    prompts whose content-word Jaccard similarity reaches SIMILARITY_THRESHOLD
-    -- which keeps neighboring runs about related topics apart.
-    """
     keys = [normalize_prompt(p) for p in prompts]
     tokens = [_content_tokens(k) for k in keys]
     uf = _UnionFind(len(prompts))
@@ -222,7 +197,7 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
     for members in clusters.values():
         base = min((keys[m - 1] for m in members), key=lambda k: (len(k), k))
         label, n = base, 2
-        while label in grouped:  # identical normalized text can occur in separate runs
+        while label in grouped:
             label = f"{base} ({n})"
             n += 1
         grouped[label] = sorted(members)
@@ -230,14 +205,7 @@ def group_prompts(prompts: list[str]) -> dict[str, list[int]]:
 
 
 class ResultStore:
-    """Appends one JSON line per prompt, so a long run can be interrupted without
-    losing earlier results and the growing document is never re-serialized.
 
-    An exclusive advisory lock is held on the log for the store's lifetime:
-    recovery uses lock acquisition to tell a dead run's log from a live one.
-    finish() consolidates the log into the <ts>.json document; cleanup_log()
-    releases the lock and removes the log once the report is safely on disk.
-    """
 
     def __init__(self, json_path: str, meta: dict):
         self.json_path = json_path
@@ -262,8 +230,7 @@ class ResultStore:
         os.fsync(self._log_fh.fileno())
 
     def log_meta_update(self, update: dict) -> None:
-        """Persist a mid-run meta mutation so recovery of a dead run's log
-        reconstructs the final meta (only result entries carry "index")."""
+
         self._log_fh.write(json.dumps(update, ensure_ascii=False) + "\n")
         self._log_fh.flush()
         os.fsync(self._log_fh.fileno())
@@ -307,9 +274,7 @@ def _failure_entry(index: int, group: str | None, prompt: str, error: str, sessi
 
 
 def _fsync_dir(path: str) -> None:
-    """Make a create/rename/remove in `path` durable across power loss; without
-    this the .jsonl can vanish while the renamed .json never materializes.
-    """
+
     fd = os.open(path or ".", os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -377,10 +342,7 @@ def run_prompt(client: "QdrantClient", index: int, group: str | None, prompt: st
 
 
 def _recover_orphan_logs(results_dir: str) -> None:
-    """Consolidate a <ts>.jsonl left behind by a run that died before its report
-    was written, so its completed prompts are not stranded in a log nothing
-    reads. A log held by a live run is skipped: the advisory lock attempt fails.
-    """
+
     if not os.path.isdir(results_dir):
         return
     for log_name in sorted(os.listdir(results_dir)):
@@ -517,8 +479,8 @@ def run_eval(
             except ApiError as exc:
                 entry = _failure_entry(index, group, prompt, f"session create failed: {exc!r}")
             except Exception as exc:
-                # A timeout/reset may have created the session server-side even
-                # though no id came back; the orphan can never be deleted.
+
+
                 meta["orphan_session_risk"] += 1
                 store.log_meta_update({"orphan_session_risk": meta["orphan_session_risk"]})
                 entry = _failure_entry(index, group, prompt, f"session create failed (possible orphan): {exc!r}")
@@ -569,7 +531,7 @@ def run_eval(
 
 
 def _p95(values: list[float]) -> float | None:
-    """Nearest-rank p95: the smallest value covering at least 95% of the data."""
+
     if not values:
         return None
     ordered = sorted(values)
@@ -578,9 +540,9 @@ def _p95(values: list[float]) -> float | None:
 
 def _pairwise_source_jaccard(results: list[dict]) -> float | None:
     sets = [frozenset(_citation_ids(r.get("sources") or [])) for r in results]
-    # Pairs where *neither* side cited a source are dropped rather than scored
-    # 0.0: "the model cited nothing" is missing data, not evidence of two
-    # disagreeing answers, and averaging it in would understate consistency.
+
+
+
     pairs = [(a, b) for i, a in enumerate(sets) for b in sets[i + 1 :] if a or b]
     if not pairs:
         return None

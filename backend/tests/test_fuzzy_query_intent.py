@@ -1,20 +1,4 @@
-"""Property-based tests for app.query_intent date/recency helpers.
 
-The module's single clock seam is ``_now()``; ``frozen_clock`` pins it so every
-regular expression resolves against one deterministic calendar (2026-09-15).
-
-Invariants (from the current source):
-
-* extract_recency_range / extract_year_range / extract_month_range: every
-  result is None or a (from, to) pair of ISO YYYY-MM-DD strings with
-  from <= to and both parseable.
-* _full_year: expands a 2-digit year to within 50 years of its pivot, and
-  passes 4-digit years through unchanged.
-* normalize_word_numbers: identity when there is no top/best hint; word form
-  counts after a hint become digits.
-* is_recency_intent: True implies a soft-recency expression was present.
-* strip_recency_window / strip_recency_intent are idempotent.
-"""
 
 from __future__ import annotations
 
@@ -150,20 +134,20 @@ def test_recency_intent_implies_soft_signal(q: str) -> None:
 
 @given(st.lists(st.sampled_from(_FILLER), min_size=1, max_size=5).map(lambda ws: " ".join(ws)))
 def test_recency_intent_false_without_signal(q: str) -> None:
-    # Filler words contain none of the soft signals, so intent must be False.
+
     assert qi.is_recency_intent(q) is False
 
 
 def test_recency_intent_latest_true() -> None:
     assert qi.is_recency_intent("latest funding news") is True
     assert qi.is_recency_intent("recent rounds") is True
-    # Hard-window phrases are NOT soft recency intent.
+
     assert qi.is_recency_intent("this week") is False
 
 
 def test_recency_range_this_week_anchored(frozen_clock) -> None:
     frm, to = qi.extract_recency_range("this week")
-    assert frm == "2026-09-14"  # Monday of the frozen week
+    assert frm == "2026-09-14"
     assert to == "2026-09-15"
 
 

@@ -14,13 +14,7 @@ const NAV: { href: string; label: string }[] = [
 
 const ANALYTICS_HREF = '/analytics/dashboard'
 
-/**
- * `me` is tri-state: `undefined` renders nothing in the account slot, `null` is
- * signed out. Whether the bar resolves the session ITSELF is decided by the
- * PRESENCE of the prop, not its value, so a page that already owns the request
- * can hand over a still-loading `undefined` without firing a second concurrent
- * `/api/auth/me` (`getMe` caches results, not in-flight calls).
- */
+
 export default function TopBar(props: { me?: AuthUser | null; subtitle?: string | null }) {
   const { me: meProp, subtitle } = props
   const callerOwnsSession = 'me' in props
@@ -35,7 +29,7 @@ export default function TopBar(props: { me?: AuthUser | null; subtitle?: string 
         if (live) setFetchedMe(u)
       })
       .catch(() => {
-        // A failed session check means signed out, not "still loading".
+        
         if (live) setFetchedMe(null)
       })
     return () => {
@@ -67,7 +61,7 @@ export default function TopBar(props: { me?: AuthUser | null; subtitle?: string 
           ))}
         </nav>
         <div className="topbar-right">
-          {/* On /chat the CTA would link to the page already on screen. */}
+          
           {pathname !== '/chat' ? (
             <Link href="/chat" className="topbar-cta" aria-label="Open chat assistant">
               ASK VCCircle

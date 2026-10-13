@@ -1,9 +1,4 @@
-"""Simple concurrent load test for /search.
 
-``--mode cold`` sends N DISTINCT queries so every request hits the full pipeline
-(encode + rerank + Qdrant); ``--mode hot`` sends the same query every time
-(cache hits). Prints total time, rps, and p50/p95/p99 latency in ms.
-"""
 import argparse
 import concurrent.futures as cf
 import http.client
@@ -15,12 +10,7 @@ import urllib.request
 
 
 class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
-    """Per-thread HTTP/1.1 keep-alive handler.
 
-    urllib's default opener opens and closes a socket per request and forces
-    ``Connection: close``. Each loader thread serves many requests, so this
-    keeps one live connection per thread and reuses it.
-    """
 
     _local = threading.local()
 
@@ -31,18 +21,18 @@ class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
         return self._open(req, "https")
 
     def _open(self, req, scheme):
-        netloc = req.host  # e.g. "localhost:8001"
+        netloc = req.host
         timeout = req.timeout or 120
         conn = self._conn(scheme, netloc, timeout)
         headers = dict(req.header_items())
-        # Preserve the caller's header names verbatim; .title() would mangle
-        # multi-word names like "Content-Type".
+
+
         headers["Connection"] = "keep-alive"
         try:
             return self._exchange(conn, req, headers)
         except (OSError, http.client.HTTPException):
-            # Server dropped the keep-alive socket: close the dead one so it
-            # doesn't leak, then reconnect once.
+
+
             conn.close()
             conn = self._new(scheme, netloc, timeout)
             self._set_conn(conn)
@@ -74,25 +64,25 @@ class _KeepAliveHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
             encode_chunked=req.has_header("Transfer-encoding"),
         )
         r = conn.getresponse()
-        # Keep the socket open for the next request on this thread; neuter the
-        # context-manager close() so the caller's `with` block doesn't tear it down.
+
+
         r.close = lambda: None
         return r
 
 
-# Built by hand so the default HTTPHandler/HTTPSHandler are NOT also registered:
-# build_opener would add them and let their http_open win over ours.
+
+
 _opener = urllib.request.OpenerDirector()
 _opener.add_handler(_KeepAliveHandler())
 _opener.add_handler(urllib.request.HTTPRedirectHandler())
 _opener.add_handler(urllib.request.HTTPErrorProcessor())
-# OpenerDirector needs an UnknownHandler to reject unsupported schemes cleanly.
+
 _opener.add_handler(urllib.request.UnknownHandler())
 
 
-# Each cold request gets a UNIQUE query (distinct queries can't hit the
-# search/retrieve cache); the per-run offset also defeats the per-worker
-# in-process TTLCache, which redis FLUSHDB does not clear.
+
+
+
 def cold_query(i: int, run_id: int) -> str:
     topics = [
         "venture debt providers", "fintech funding round", "AI startups raising capital",
@@ -104,13 +94,7 @@ def cold_query(i: int, run_id: int) -> str:
 
 
 def hit(url: str, q: str, hot: bool, run_id: int):
-    """Return (latency_ms, error).
 
-    On a successful request ``error`` is None and ``latency_ms`` holds the
-    measured round-trip time. On any failure (timeout, HTTP 429/500, connection
-    reset, ...) ``latency_ms`` is None and ``error`` carries a short status
-    string so the caller can record the failure and keep the run alive.
-    """
     query = "top startup funding deals of 2024" if hot else cold_query(int(q), run_id)
     u = f"{url}/search?top_k=8&q=" + urllib.parse.quote(query)
     t0 = time.perf_counter()
@@ -120,7 +104,7 @@ def hit(url: str, q: str, hot: bool, run_id: int):
         return (time.perf_counter() - t0) * 1000, None
     except urllib.error.HTTPError as e:
         return None, f"HTTP {e.code}"
-    except Exception as e:  # timeout / URLError / connection reset, etc.
+    except Exception as e:
         return None, type(e).__name__
 
 

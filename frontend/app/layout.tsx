@@ -3,7 +3,7 @@ import { headers } from 'next/headers'
 import { Montserrat } from 'next/font/google'
 import './globals.css'
 
-// The CSP nonce is minted per request and must be injected into the root <head>, so this layout must render dynamically.
+
 export const dynamic = 'force-dynamic'
 
 const montserrat = Montserrat({

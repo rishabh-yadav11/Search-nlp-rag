@@ -1,13 +1,4 @@
-"""Embed ``data/articles.jsonl`` (dense + BM25 sparse) and upsert into Qdrant.
 
-Checkpoints progress so an interrupted run resumes without re-embedding, and
-pipelines encode against upsert across thread pool workers (``INDEXER_WORKERS``).
-
-Durability: upserts are acknowledged (``wait=True``) and the checkpoint advances
-only after a successful upsert, so a partially-written batch is re-processed.
-Before an incompatible-schema recreate a best-effort snapshot backup is taken;
-a backup failure logs a WARNING rather than aborting the build.
-"""
 import json
 import os
 import sys
@@ -37,13 +28,7 @@ CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(_
 
 
 def load_checkpoint() -> tuple[int, int]:
-    """Return (resume_line, skipped) persisted together in one checkpoint.
 
-    `skipped` counts malformed jsonl lines seen on the way to `resume_line`.
-    Storing it alongside the position means an aborted run keeps the exact
-    cumulative count, so a resume neither loses nor double-counts it. A missing
-    checkpoint yields (0, 0).
-    """
     if os.path.exists(CHECKPOINT_PATH):
         with open(CHECKPOINT_PATH) as f:
             data = f.read().strip()
@@ -51,7 +36,7 @@ def load_checkpoint() -> tuple[int, int]:
             try:
                 obj = json.loads(data)
             except (json.JSONDecodeError, ValueError):
-                # Legacy plain-integer checkpoint (old code wrote a bare number).
+
                 try:
                     return int(data), 0
                 except (TypeError, ValueError):
@@ -60,17 +45,13 @@ def load_checkpoint() -> tuple[int, int]:
                 return obj, 0
             if isinstance(obj, dict):
                 return int(obj.get("line", 0)), int(obj.get("skipped", 0))
-            # Unknown but valid JSON content: fall back to a fresh start.
+
             return 0, 0
     return 0, 0
 
 
 def save_checkpoint(line_num: int, skipped: int):
-    """Persist the resume position together with the cumulative `skipped` count.
 
-    Called on every batch and on abort, so the count survives any interruption
-    rather than being written only at the very end of a run.
-    """
     tmp_path = f"{CHECKPOINT_PATH}.tmp"
     with open(tmp_path, "w") as f:
         f.write(json.dumps({"line": line_num, "skipped": skipped}))
@@ -80,11 +61,7 @@ def save_checkpoint(line_num: int, skipped: int):
 
 
 def backup_collection_best_effort(client: QdrantClient):
-    """Snapshot the collection + local artifacts before a destructive change.
 
-    Best-effort: a failure only logs a WARNING and the build continues, so a
-    transient Qdrant outage cannot block a rebuild.
-    """
     try:
         from qdrant_backup import make_backup
 
@@ -97,13 +74,7 @@ def backup_collection_best_effort(client: QdrantClient):
 
 
 def ensure_collection(client: QdrantClient) -> bool:
-    """Ensure the collection matches the current schema.
 
-    Returns True if the collection was (re)created empty this run. When that
-    happens the caller MUST reset the embed checkpoint to 0: the old checkpoint
-    refers to rows embedded into a collection that no longer exists, and
-    resuming from it silently skips the earlier rows in the new one.
-    """
     existing = [c.name for c in client.get_collections().collections]
     if config.QDRANT_COLLECTION not in existing:
         backup_collection_best_effort(client)
@@ -111,9 +82,9 @@ def ensure_collection(client: QdrantClient) -> bool:
         return True
 
     info = client.get_collection(collection_name=config.QDRANT_COLLECTION)
-    # Introspection is tolerant: some server/client combinations do not surface
-    # sparse_vectors_config/hnsw_config. When the schema cannot be confirmed,
-    # recreate so the vectors match config.
+
+
+
     vectors = info.config.params.vectors
     dense_size = vectors.get("dense").size if isinstance(vectors, dict) else vectors.size
     dim_matches = dense_size == config.EMBED_DIM
@@ -156,10 +127,10 @@ def main():
         print(f"No data file at {DATA_PATH} — run scripts/fetch_data.py first.")
         return
 
-    # Imported here, not at module scope: sentence_transformers pulls in torch, so
-    # importing this module should not require it. That keeps the collection and
-    # checkpoint helpers importable without the model stack. Same lazy pattern as
-    # apply_delta in update_index.py.
+
+
+
+
     from sentence_transformers import SentenceTransformer
 
     print(f"Loading dense embedding model {config.EMBED_MODEL} on {config.EMBED_DEVICE}...")
@@ -170,10 +141,10 @@ def main():
     client = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=60)
     recreated = ensure_collection(client)
 
-    # Index the payload fields on a resumed collection too: create_collection only
-    # runs when the collection is (re)created, so without this a collection that
-    # predates a new field keeps that field unfilterable until a full destructive
-    # rebuild. create_payload_indexes is idempotent, so a re-run costs nothing.
+
+
+
+
     try:
         create_payload_indexes(client)
     except Exception as e:
@@ -205,7 +176,7 @@ def main():
         return dense_vecs, sparse_vecs
 
     batch_rows, dense_texts, sparse_texts = [], [], []
-    pending = deque()  # (end_line, encode_batch future)
+    pending = deque()
 
     def submit_batch(end_line: int):
         pending.append((end_line, executor.submit(encode_batch, dense_texts, sparse_texts)))
@@ -271,9 +242,9 @@ def main():
     try:
         info = client.get_collection(config.QDRANT_COLLECTION)
         count = info.points_count or 0
-        # Expected = valid articles; malformed lines were skipped and can never be
-        # indexed, so comparing against the raw dataset size would wrongly flag
-        # INCOMPLETE whenever any line was skipped.
+
+
+
         expected = total - skipped
         if count < expected:
             log(

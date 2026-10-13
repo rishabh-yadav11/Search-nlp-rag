@@ -102,8 +102,8 @@ _BRAND_ENTITIES = [
     "Ashok Leyland",
 ]
 
-# Capitalized words never treated as entities, and stripped from a phrase tail:
-# a bare sector noun ("internet") would otherwise over-boost unrelated articles.
+
+
 _GENERIC_NOUNS = {
     "consumer", "internet", "sector", "sectors", "industry", "industries",
     "market", "markets", "funding", "news", "deal", "deals", "company",
@@ -116,17 +116,17 @@ _GENERIC_NOUNS = {
     "quarter", "month", "months",
 }
 
-# Legal-entity suffixes stripped from a phrase tail so "Banyan Netfaqs Pvt Ltd"
-# resolves to "banyan netfaqs", not the over-broad bare token "banyan".
+
+
 _ENTITY_SUFFIXES = {
     "pvt", "ltd", "private", "limited", "inc", "incorporated", "corp",
     "corporation", "co", "company", "llp", "llc", "plc", "sa", "ag",
 }
 
-# Trailing query-context nouns stripped from a phrase tail so "Banyan Netfaqs IPO
-# Price Band" resolves to "banyan netfaqs" and matches the company as other
-# articles name it. Stripping stops at len==1, so a context word can never
-# collapse a distinct multi-word entity into one bare token.
+
+
+
+
 _CONTEXT_NOUNS = {
     "ipo", "price", "band", "bands", "result", "results", "earnings",
     "share", "shares", "stock", "stocks", "outlook", "performance",
@@ -135,17 +135,17 @@ _CONTEXT_NOUNS = {
     "ventures", "capital", "partners", "enterprises", "industries",
 }
 
-# Two or more consecutive capitalized words are ONE entity, not tokens boosted
-# separately, which would conflate distinct entities sharing a headword.
+
+
 _RUN_RE = re.compile(r"[A-Z][A-Za-z0-9.']+(?:\s+[A-Z][A-Za-z0-9.']+)+")
 
-# A capitalized word outside any multi-word run becomes its own entity, so
-# single-word companies boost without being in the curated brand list; span
-# checks in extract_entities exclude matches inside a longer run.
+
+
+
 _SINGLE_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9.']+\b")
 
-# Never treated as standalone entities: question/function words capitalized at
-# a query's start, plus the generic-noun and query-context sets.
+
+
 _SINGLE_WORD_IGNORE = (
     _GENERIC_NOUNS
     | _CONTEXT_NOUNS
@@ -172,8 +172,7 @@ _BRAND_RE = re.compile(r"\b(?:" + "|".join(re.escape(b) for b in _NORMALIZED_BRA
 
 
 def _strip_entity_phrase(phrase: str) -> str:
-    """Lowercased base entity with legal-entity suffixes, generic nouns and
-    query-context nouns stripped; "" when nothing recognizable is left."""
+
     words = [_normalize(w) for w in phrase.split()]
     _strip_trail = _GENERIC_NOUNS | _ENTITY_SUFFIXES | _CONTEXT_NOUNS
     while len(words) > 1 and words[-1] in _strip_trail:
@@ -186,8 +185,7 @@ def _strip_entity_phrase(phrase: str) -> str:
 
 
 def extract_entities(q: str) -> list[str]:
-    """Extract distinct proper-noun-like entities from a query: known brands
-    plus multi-word capitalized runs, lowercased and apostrophe-stripped."""
+
     nq = _normalize(q)
     if not nq:
         return []
@@ -197,8 +195,8 @@ def extract_entities(q: str) -> list[str]:
         phrase = _strip_entity_phrase(run)
         if phrase and phrase not in raw:
             raw.append(phrase)
-    # Capitalized words outside a multi-word run and not in _SINGLE_WORD_IGNORE
-    # become their own entity, so single-word companies boost too.
+
+
     for m in _SINGLE_CAP_RE.finditer(q):
         s, e = m.span()
         if any(lo <= s < hi for lo, hi in run_spans):
@@ -212,9 +210,9 @@ def extract_entities(q: str) -> list[str]:
     for e in raw:
         if e not in ordered:
             ordered.append(e)
-    # Drop an entity fully contained in a longer kept one; descending-length
-    # order decides the longer one first. A known brand is never dropped by a
-    # longer non-brand run that subsumes it.
+
+
+
     ordered.sort(key=len, reverse=True)
     kept: list[str] = []
     for e in ordered:
@@ -228,14 +226,13 @@ def extract_entities(q: str) -> list[str]:
 
 
 def apply_entity_boost(q: str, results: list) -> list:
-    """Return NEW copies of `results` with `.score` boosted when a query entity
-    appears in the title (BOOST_TITLE) else the summary (BOOST_SUMMARY)."""
+
     entities = extract_entities(q)
     if not entities:
         return list(results)
-    # Word boundary at the START only ("ola" must not match "solar"), a trailing
-    # non-letter allowed ("tcs2024" matches, "tcsql" does not), and a possessive
-    # suffix tolerated so "Ola Electric" matches "ola electrics".
+
+
+
     entity_res = [
         re.compile(rf"\b{re.escape(e)}(?:['’]?s)?(?![a-zA-Z])", re.IGNORECASE)
         for e in entities

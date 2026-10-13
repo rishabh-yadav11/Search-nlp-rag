@@ -534,9 +534,7 @@ input[type='text']:focus-visible,
   font-weight: 700;
 }
 
-/* Wide tables scroll here rather than in the bubble: the table stays
- * display:table for border-collapse, and overflow-x on the table itself
- * cancels that and nests scrollbars. */
+
 .markdown-body {
   overflow-x: auto;
 }
@@ -863,10 +861,7 @@ input[type='text']:focus-visible,
   -ms-overflow-style: none;
 }
 
-/* Viewport-locked column: the top bar takes its natural height and the shell
- * absorbs the rest. Do NOT size the shell with calc(100vh - <bar height>) —
- * the bar grows past its nominal height (long account email, wrapping nav)
- * and a calc shell then clips the composer. */
+
 .chat-page {
   display: flex;
   flex-direction: column;
@@ -1775,9 +1770,7 @@ input[type='text']:focus-visible,
   vertical-align: middle;
 }
 
-/* Hourly search-volume histogram (24 columns). Columns align to the baseline
- * and the bars grow upward; overflow scrolls rather than squishes on narrow
- * screens. */
+
 .dash-hourly {
   display: flex;
   align-items: flex-end;

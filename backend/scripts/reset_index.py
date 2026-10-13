@@ -1,12 +1,4 @@
-"""Removes the entire index so the next run starts from zero.
 
-Drops the Qdrant collection and deletes the local data artifacts; the embedding
-model cache, venv, and .env are left untouched. A snapshot backup is taken
-first, and deletion only proceeds once a *verified local* snapshot archive is
-on disk -- unless ``--skip-backup`` is passed (dangerous). A snapshot that
-exists only inside the Qdrant container does not count: a container recreate or
-``docker rm`` destroys it. Exit status is 0 only on completion; 1 on any abort.
-"""
 import os
 import socket
 import sys
@@ -104,8 +96,8 @@ def main() -> int:
                     return 1
                 log(f"backup before reset: {backup.dest}")
             else:
-                # Collection is missing: still attempt a backup of any local artifacts
-                # so the reset leaves a recoverable record instead of silently doing nothing.
+
+
                 backup = make_backup(client, config.QDRANT_COLLECTION)
                 if backup.dest is None:
                     log(
@@ -133,7 +125,7 @@ def main() -> int:
         try:
             client.close()
         except Exception as e:
-            # Cleanup only: a close failure must not mask the reset result.
+
             log(f"warning: could not close the Qdrant client ({e})")
 
     print("\nNext steps to rebuild from zero:")

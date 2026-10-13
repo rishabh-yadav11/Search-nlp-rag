@@ -1,12 +1,4 @@
-"""Tests for the Prometheus metrics module (``app.metrics``).
 
-The router is mounted on a bare FastAPI app so this suite proves the exposition
-works independently of ``app.main`` (which the integrator wires up separately).
-Assertions are made against the exact exposition text ``generate_latest`` emits
--- the same bytes Prometheus scrapes -- so they exercise the real output rather
-than an in-process representation. Each numeric assertion compares against a
-baseline captured inside the same test, so ordering between tests never matters.
-"""
 
 from __future__ import annotations
 
@@ -33,7 +25,7 @@ from app.metrics import (
 
 @pytest.fixture()
 def metrics_client() -> TestClient:
-    """A bare FastAPI app with ONLY the metrics router mounted."""
+
     app = FastAPI()
     app.include_router(router)
     return TestClient(app)
@@ -44,18 +36,14 @@ def _body() -> str:
 
 
 def _count(metric_line_regex: str) -> float:
-    """Exact sample-line counts matching a full ``name{...} value`` sub-line.
 
-    ``metric_line_regex`` must already be an anchored regex with a capture group
-    for the value, e.g. ``http_requests_total\\{[^}]*\\}\\s+([0-9.]+)``.
-    """
     total = 0.0
     for match in re.finditer(metric_line_regex, _body()):
         total += float(match.group(1))
     return total
 
 
-# --- exposition endpoint ----------------------------------------------------
+
 
 
 def test_metrics_endpoint_returns_prometheus_text(metrics_client) -> None:
@@ -65,7 +53,7 @@ def test_metrics_endpoint_returns_prometheus_text(metrics_client) -> None:
     body = resp.text
     assert "# HELP http_requests_total" in body
     assert "# TYPE http_requests_total counter" in body
-    # The default self-collectors (process/GC) are present per the contract.
+
     assert "process_start_time_seconds" in body
     assert "python_gc_objects_collected_total" in body
 
@@ -88,11 +76,11 @@ def test_metrics_endpoint_lists_core_families(metrics_client) -> None:
 
 
 def test_metrics_endpoint_requires_no_auth(metrics_client) -> None:
-    """/metrics is mounted with no dependencies, so an anonymous scrape works."""
+
     assert metrics_client.get("/metrics").status_code == 200
 
 
-# --- per-family hooks --------------------------------------------------------
+
 
 
 def test_inc_http_request_records_bounded_labels() -> None:
@@ -115,7 +103,7 @@ def test_inc_http_request_records_bounded_labels() -> None:
 
 
 def test_route_label_cardinality_bound() -> None:
-    """Unknown paths always collapse to OTHER, so the series set never grows."""
+
     labels = {
         route_label("/search"),
         route_label("/api/auth/users/abc123/tokens/revoke"),
@@ -134,7 +122,7 @@ def test_route_label_cardinality_bound() -> None:
         "/ready/deep",
         "/metrics",
     }
-    # Unknown route (including one that leaks a query string) -> OTHER.
+
     assert route_label("/definitely/not/a/route") == OTHER_ROUTE
     assert route_label("/search?q=hello&page=2") == "/search"
     assert route_label("") == OTHER_ROUTE
@@ -143,13 +131,13 @@ def test_route_label_cardinality_bound() -> None:
 def test_inc_search_outcomes_bounded() -> None:
     start_ok = _count(r'search_requests_total\{outcome="ok"\}\s+([0-9.]+)')
     start_zero = _count(r'search_requests_total\{outcome="zero"\}\s+([0-9.]+)')
-    # No series for other outcomes yet.
+
     assert _count(r'search_requests_total\{outcome="weak"\}\s+([0-9.]+)') == 0
     assert _count(r'search_requests_total\{outcome="bogus"\}\s+([0-9.]+)') == 0
 
     inc_search("ok", 0.7)
     inc_search("zero", 0.2)
-    inc_search("bogus", 0.3)  # must collapse to "ok", not create a new series
+    inc_search("bogus", 0.3)
     assert _count(r'search_requests_total\{outcome="ok"\}\s+([0-9.]+)') == start_ok + 2
     assert _count(r'search_requests_total\{outcome="zero"\}\s+([0-9.]+)') == start_zero + 1
     assert _count(r'search_requests_total\{outcome="weak"\}\s+([0-9.]+)') == 0
@@ -159,36 +147,29 @@ def test_inc_search_outcomes_bounded() -> None:
 def test_inc_llm_status_bounded() -> None:
     start_ok = _count(r'llm_request_total\{status="ok"\}\s+([0-9.]+)')
     start_error = _count(r'llm_request_total\{status="error"\}\s+([0-9.]+)')
-    # No series for other statuses yet.
+
     assert _count(r'llm_request_total\{status="weird"\}\s+([0-9.]+)') == 0
 
     inc_llm("ok", 1.2)
     inc_llm("error", 0.1)
-    inc_llm("weird", 0.2)  # must collapse to "error"
+    inc_llm("weird", 0.2)
     assert _count(r'llm_request_total\{status="ok"\}\s+([0-9.]+)') == start_ok + 1
     assert _count(r'llm_request_total\{status="error"\}\s+([0-9.]+)') == start_error + 2
     assert _count(r'llm_request_total\{status="weird"\}\s+([0-9.]+)') == 0
 
 
 def test_route_label_full_known_set_stable() -> None:
-    """Every known template maps onto itself (round-trip), none becomes other."""
+
     for template in KNOWN_ROUTE_TEMPLATES:
         assert route_label(template) == template, template
 
 
 def test_refresh_dependency_gauges_without_provider_is_safe(metrics_client) -> None:
-    """No state provider -> /metrics succeeds; qdrant/models gauges are 0.
 
-    ``redis`` is probed from the app's own configured client (health._redis_status),
-    which an earlier app-booting test may have faked to healthy, so this test
-    asserts it is a clean 0/1 boolean rather than a fixed value. ``llm`` is read
-    from config only (no state needed), and conftest configures a healthy-looking
-    key, so it reports 1 exactly as the real app would with the same key.
-    """
-    # The test's premise is "no provider": integration wires main.set_state_provider
-    # at import, and an earlier app-booting test populates main.state, so without
-    # an explicit reset here qdrant/models would report 1.0 from the real app's
-    # state and this test would fail with a value it never set. Restore the premise.
+
+
+
+
     set_state_provider(None)
     resp = metrics_client.get("/metrics")
     assert resp.status_code == 200

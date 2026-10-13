@@ -1,12 +1,4 @@
-"""Deterministic, dependency-free query expansion for the VCCircle news corpus.
 
-There is a vocabulary gap between how users phrase a search and how articles are
-written: users ask about "startup layoffs" while the corpus says "job cuts" and
-"downsizing", or ask "who acquired X" while the article is framed as "X
-acquisition". expand_query() appends a small, bounded set of synonym phrases so
-semantic retrieval also matches the corpus's wording. Stdlib only, fully
-offline.
-"""
 
 import re
 
@@ -208,14 +200,7 @@ _TRIGGERS: list[tuple[list[str], list[str]]] = [
 
 
 def expand_query(q: str) -> str:
-    """Return ``q`` with a bounded set of corpus-friendly synonym phrases appended.
 
-    Triggers match on word boundaries, not raw substring containment, so short
-    ones like "ai"/"ml"/"ev" do not fire inside "email"/"small"/"every". Terms
-    already present in the query are dropped and the appended words never exceed
-    ``_MAX_EXTRA_TOKENS`` tokens; the original query text is preserved unchanged
-    at the front, and ``q`` is returned untouched when nothing matches.
-    """
     q_lower = q.lower()
     candidates: list[str] = []
     seen: set[str] = set()

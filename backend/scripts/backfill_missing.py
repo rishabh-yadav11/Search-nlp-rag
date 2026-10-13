@@ -1,12 +1,4 @@
-"""Backfill: bring Qdrant in sync with the DB by adding missing points.
 
-When the collection silently loses points, the incremental sync's reconcile warns
-but does not re-add them (they are not "new" relative to its state). This scrolls
-all Qdrant point ids, diffs against the published DB rows, and embeds + upserts
-only the missing articles -- a surgical fix with no full rebuild.
-
-Idempotent (only upserts ids absent from Qdrant). Does not remove extra points.
-"""
 import asyncio
 import os
 import sys

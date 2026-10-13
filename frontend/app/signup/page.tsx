@@ -9,7 +9,7 @@ import { isSafeRedirect } from '../lib/safe-url'
 function SignupForm() {
   const router = useRouter()
   const params = useSearchParams()
-  // Honor `next` only when it is a safe, same-origin, root-relative path; anything the shared guard refuses falls back to /chat.
+  
   const rawNext = params.get('next')
   const next = isSafeRedirect(rawNext) ? rawNext : '/chat'
   const [name, setName] = useState('')
@@ -21,7 +21,7 @@ function SignupForm() {
   const abortRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
-    // The session is an httpOnly cookie JS cannot read, so `/api/auth/me` is the only way to know; a network failure is not a logout and must not redirect.
+    
     getMe()
       .then((me) => {
         if (me) router.replace(next)
@@ -69,7 +69,7 @@ function SignupForm() {
         setError((body as { detail?: string }).detail ?? `Sign up failed (${res.status}).`)
         return
       }
-      // The server answers 200 identically for a fresh and an already-registered address, so this form cannot be used to probe which emails are registered.
+      
       const data = (await res.json()) as { message?: string }
       setSuccess(
         data.message ||

@@ -1,10 +1,4 @@
-"""Cross-encoder reranker backed by a torch ``CrossEncoder``.
 
-``backend`` is accepted so callers can keep passing ``config.RERANK_BACKEND``;
-only ``"torch"`` is implemented. Any other value logs a warning and uses torch,
-so a stale ``RERANK_BACKEND=onnx`` in a deployment's environment warns and uses
-torch instead of breaking startup.
-"""
 
 import logging
 

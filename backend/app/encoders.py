@@ -1,13 +1,4 @@
-"""Query-time dense encoder behind a single ``encode()`` interface.
 
-The index is built with a full-precision sentence-transformers bge model, but
-at query time fastembed's ONNX (INT8) variant of the same model runs roughly
-3-5x faster on CPU while producing L2-normalized vectors with the same
-direction, so cosine search against the existing index stays correct.
-
-If fastembed cannot load the model (not downloaded, or no network), we fall back
-to the torch sentence-transformers model so startup never fails.
-"""
 
 import logging
 from typing import Any
@@ -33,7 +24,7 @@ class DenseEncoder:
             self._fallback = SentenceTransformer(model_name, device=device)
 
     def encode(self, text: str) -> Any:
-        """Embed one query string into an L2-normalized vector."""
+
         if self._fallback is not None:
             return self._fallback.encode(text, normalize_embeddings=True)
         vec = next(iter(self._model.embed([text], batch_size=1)))

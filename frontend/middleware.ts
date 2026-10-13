@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { devApiBase, readApiBaseEnv, sanitizeApiBaseOrigin } from './app/lib/api-base'
 
-// The base still goes through `sanitizeApiBaseOrigin` because a `connect-src` source is an origin list: never emit an operator- or attacker-influenced value into a CSP directive.
+
 
 const buildCsp = (nonce: string, apiBase: string, devLoopback: string) => {
   const connectSrc = ["'self'", apiBase, devLoopback].filter(Boolean).join(' ')
   return [
     "default-src 'self'",
-    // No 'unsafe-eval': dev-mode React Fast Refresh evaluates a string, which this nonce-only script-src blocks.
+    
     `script-src 'self' 'nonce-${nonce}'`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
@@ -23,7 +23,7 @@ const buildCsp = (nonce: string, apiBase: string, devLoopback: string) => {
 export function middleware(request: NextRequest) {
   const nonce = crypto.randomUUID()
   const apiBase = sanitizeApiBaseOrigin(readApiBaseEnv())
-  // Emit the dev loopback origin only in development and only with no API base configured, so production CSP stays locked to 'self' or the configured origin.
+  
   const devLoopback = !apiBase ? sanitizeApiBaseOrigin(devApiBase()) : ''
 
   const csp = buildCsp(nonce, apiBase, devLoopback)

@@ -1,18 +1,4 @@
-"""Personalized feed: per-user subscriptions to tag/industry/dealtype values,
-surfaced as a recency-ordered article feed matching ANY subscription.
 
-Subscriptions live in their own SQLite file (``user_subscriptions``), keyed by
-(user_id, kind, value) so re-adding an existing subscription is a no-op
-(``INSERT OR IGNORE``) rather than an error. The feed itself is a plain Qdrant
-scroll ordered by ``published_date`` desc, with a ``should`` Filter built from
-the subscription values — one FieldCondition per kind that has subscribed
-values (tag/industry/dealtype map to payload tag_names/industry_names/
-dealtype_names respectively).
-
-The store mirrors ChatStore's discipline: WAL journaling, busy_timeout, foreign
-keys enabled, and a ``_unit_of_work`` context manager for atomic multi-statement
-writes. Reads use the shared connection.
-"""
 
 import logging
 import os
@@ -37,11 +23,11 @@ router = APIRouter(
     dependencies=[Depends(require_auth), Depends(require_permission("feed:use"))],
 )
 
-# Module-level store; set by main.lifespan (and by tests).
+
 store: "FeedStore | None" = None
 
 VALID_KINDS = ("tag", "industry", "dealtype")
-# kind -> payload field name carrying the subscribed facet values.
+
 KIND_FACET_KEY = {
     "tag": "tag_names",
     "industry": "industry_names",
@@ -88,9 +74,7 @@ class RemoveResponse(BaseModel):
 
 
 class FeedSummary(BaseModel):
-    """Same shape as main.SourceSummary; defined here to avoid a circular import
-    (feed is imported by main before SourceSummary exists). The feed has no real
-    scores, so this always carries score=0.0."""
+
 
     id: int
     title: str
@@ -131,7 +115,7 @@ def _group_by_kind(subscriptions: Sequence[SubscriptionOut]) -> dict[str, list[s
 
 
 def _point_to_summary(point) -> FeedSummary:
-    """Build a FeedSummary (SourceSummary-shaped) from one scroll point."""
+
     payload = point.payload or {}
     return FeedSummary(
         id=point.id,
@@ -150,21 +134,16 @@ def _point_to_summary(point) -> FeedSummary:
 
 
 class FeedStore:
-    """SQLite store of user subscriptions.
 
-    WAL mode + busy_timeout so multiple gunicorn workers can read/write
-    concurrently without "database is locked". Foreign keys are always enabled,
-    both on the shared connection and inside every unit of work.
-    """
 
     def __init__(self, path: str):
         self._path = path
         self._db: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:
-        # Idempotent: a second call must not clobber the live connection, which
-        # would abandon its aiosqlite worker thread (non-daemon) and hang
-        # interpreter shutdown.
+
+
+
         if self._db is not None:
             return
         parent = os.path.dirname(os.path.abspath(self._path))
@@ -198,14 +177,7 @@ class FeedStore:
 
     @asynccontextmanager
     async def _unit_of_work(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Run a group of statements as ONE atomic unit on a dedicated connection.
 
-        Mirrors ChatStore._unit_of_work: ``isolation_level=None`` keeps the
-        explicit BEGIN from nesting inside an implicit one, ``BEGIN IMMEDIATE``
-        takes the WAL write lock up front so a mid-transaction lock upgrade
-        cannot fail past the busy timeout, and ``foreign_keys`` is per-connection
-        so it must be set here too.
-        """
         db = await aiosqlite.connect(self._path, isolation_level=None)
         try:
             db.row_factory = aiosqlite.Row
@@ -233,13 +205,7 @@ class FeedStore:
         ]
 
     async def add_subscription(self, user_id: str, kind: str, value: str) -> bool:
-        """Insert (or no-op on duplicate). Returns True if actually added.
 
-        Ran in ONE unit of work so the cap CHECK and the INSERT share a single
-        write transaction (a dedicated connection could not see the other's lock):
-        a re-add of an existing subscription returns added=False and never counts
-        against the cap.
-        """
         ts = _now()
         async with self._unit_of_work() as db:
             count_rows = await db.execute_fetchall(
@@ -280,7 +246,7 @@ def _require_store() -> FeedStore:
 
 @router.get("/subscriptions", response_model=SubscriptionsResponse)
 async def list_subscriptions(request: Request) -> SubscriptionsResponse:
-    """All of the caller's subscriptions, oldest first."""
+
     user_id = request.state.user_id
     subs = await _require_store().list_subscriptions(user_id)
     return SubscriptionsResponse(subscriptions=subs)
@@ -288,8 +254,7 @@ async def list_subscriptions(request: Request) -> SubscriptionsResponse:
 
 @router.post("/subscriptions", response_model=AddResponse)
 async def add_subscription(body: SubscriptionIn, request: Request) -> AddResponse:
-    """Add a subscription. Idempotent: re-adding returns added=False, and adding
-    past the cap is a 400 only for a genuinely new (user_id, kind, value) row."""
+
     user_id = request.state.user_id
     added = await _require_store().add_subscription(user_id, body.kind, body.value)
     return AddResponse(ok=True, added=added)
@@ -297,8 +262,7 @@ async def add_subscription(body: SubscriptionIn, request: Request) -> AddRespons
 
 @router.delete("/subscriptions", response_model=RemoveResponse)
 async def remove_subscription(body: SubscriptionIn, request: Request) -> RemoveResponse:
-    """Remove a subscription. Idempotent: a missing (kind, value) returns
-    removed=False rather than an error."""
+
     user_id = request.state.user_id
     removed = await _require_store().remove_subscription(user_id, body.kind, body.value)
     return RemoveResponse(ok=True, removed=removed)
@@ -313,8 +277,8 @@ def _build_feed_filter(subs: Sequence[SubscriptionOut]) -> Filter:
 
 
 async def _scroll_feed(subs: Sequence[SubscriptionOut], limit: int) -> list[FeedSummary]:
-    """One Qdrant scroll ordered by published_date desc, filtered by ANY sub."""
-    from app import main  # lazy, avoids a module-level import app.main
+
+    from app import main
 
     points, _ = await main.state["qdrant"].scroll(
         collection_name=config.QDRANT_COLLECTION,
@@ -333,15 +297,7 @@ async def get_feed(
     request: Request,
     limit: int = Query(default=config.FEED_DEFAULT_LIMIT, ge=1, le=50),
 ) -> FeedResponse:
-    """Most recent articles matching ANY of the caller's subscriptions.
 
-    The response has the same shape as a search response (``results`` +
-    ``note``). With no subscriptions or no matches it returns an honest EMPTY
-    ``results`` list and an explanatory note -- never fabricated articles.
-
-    Scroll with ``order_by`` on ``published_date`` so the payload index returns
-    the newest ``limit`` directly instead of materialising the full corpus.
-    """
     user_id = request.state.user_id
     subs = await _require_store().list_subscriptions(user_id)
     if not subs:

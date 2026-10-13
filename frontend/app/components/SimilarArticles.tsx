@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import SafeArticleLink from './SafeArticleLink'
-// Auth rides the shared httpOnly cookie; `fetchSimilarArticles` applies `authRequestInit`.
+
 import { formatArticleDate } from '../lib/format'
 import { fetchSimilarArticles, peekSimilarArticles } from '../lib/similar'
 import type { SimilarArticle } from '../lib/similar'
@@ -32,9 +32,9 @@ export default function SimilarArticles({
   useEffect(() => {
     if (!articleId) return
 
-    // No AbortController on purpose: the request is shared with every other card in
-    // this view, so aborting it on THIS card's unmount would take the rest down.
-    // The deadline lives on the shared request in `app/lib/similar.ts`.
+    
+    
+    
     let active = true
     setLoading(true)
     setError(null)

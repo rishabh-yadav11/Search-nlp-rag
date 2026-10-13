@@ -1,10 +1,4 @@
-"""Tests for the live USD→INR rate refresh (app/fx_rate.py).
 
-The refresh path is a wrapper over a synchronous urllib call, so the tests pin
-the fetch and parse edge cases by swapping in a fake fetch and asserting the
-published rate and the fall-through on failure. The background loop's cadence is
-already covered by config semantics (0 disables it).
-"""
 
 from __future__ import annotations
 
@@ -18,7 +12,7 @@ from app.config import config
 
 
 def _monkeypatch_rate(monkeypatch, value):
-    """Serve ``value`` from _fetch (a float, or None to simulate failure)."""
+
     monkeypatch.setattr(fx_rate, "_rate", config.INR_PER_USD)
     monkeypatch.setattr(fx_rate, "_fetch", lambda: value)
 
@@ -40,8 +34,8 @@ def test_rate_usd_inr_starts_at_config_fallback() -> None:
 
 
 def test_fetch_parses_feed_shape(monkeypatch) -> None:
-    # A self-contained parse check via a fake urlopen: the real feed shape is
-    # {"result":"success","rates":{"INR":96.88,...}} (see the module docstring).
+
+
     payload = {"result": "success", "rates": {"INR": 96.883664, "USD": 1.0}}
 
     class _FakeResp:
