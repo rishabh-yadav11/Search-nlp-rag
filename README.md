@@ -299,7 +299,7 @@ curl "http://localhost:8001/search?q=fintech%20funding&top_k=3"
 curl "http://localhost:8001/search?q=funding&industry=Finance,TMT&from_date=2024-01-01"
 ```
 
-Responses use a slim `SourceSummary` DTO (`id`, `title`, `url`, `published_date`, `category`, `score`, facet arrays) — article `body`/`summary` text is used only internally for the LLM context and is never sent to clients.
+Responses use a slim `SourceSummary` DTO (`id`, `title`, `url`, `published_date`, `category`, `summary`, `score`, facet arrays) — article `body` text is never sent to clients. The public search surface, including `/facets`, rate limits, errors, and live-verified examples, is documented in [`docs/search-api.md`](docs/search-api.md).
 
 LLM calls are bounded: `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, and `LLM_RETRY_BACKOFF` control the timeout and exponential backoff; when the model is unreachable, chat turns return a clean `503` instead of a raw `500`. Chat conversations require the `X-User-Id` header (min 8 chars) — see `docs/API.md` for the full chat API.
 
